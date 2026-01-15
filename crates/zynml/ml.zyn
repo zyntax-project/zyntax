@@ -1350,7 +1350,49 @@ statement = {
 // Note: Simple `x = 42` without type annotation is handled by assign_stmt.
 // New variables must use `let`, `mut`, or include a type annotation.
 //
-let_stmt = { legacy_let | mut_typed_let | mut_let | typed_let }
+let_stmt = { let_pattern_stmt | legacy_let | mut_typed_let | mut_let | typed_let }
+
+// ============================================================================
+// Pattern Destructuring
+// ============================================================================
+
+// let (x, y) = expr or let (x, y, z) = point3d
+let_pattern_stmt = { "let" ~ pat:tuple_pattern ~ "=" ~ init:expr }
+  -> TypedStatement::LetPattern {
+      pattern: pat,
+      initializer: init,
+  }
+
+// Tuple pattern: (x, y) or (x, y, z)
+// Explicitly handle different arities for now
+tuple_pattern = { tuple_pattern_four | tuple_pattern_three | tuple_pattern_two }
+
+tuple_pattern_two = { "(" ~ p1:pattern_element ~ "," ~ p2:pattern_element ~ ")" }
+  -> TypedPattern::Tuple {
+      elements: [p1, p2],
+  }
+
+tuple_pattern_three = { "(" ~ p1:pattern_element ~ "," ~ p2:pattern_element ~ "," ~ p3:pattern_element ~ ")" }
+  -> TypedPattern::Tuple {
+      elements: [p1, p2, p3],
+  }
+
+tuple_pattern_four = { "(" ~ p1:pattern_element ~ "," ~ p2:pattern_element ~ "," ~ p3:pattern_element ~ "," ~ p4:pattern_element ~ ")" }
+  -> TypedPattern::Tuple {
+      elements: [p1, p2, p3, p4],
+  }
+
+// Pattern element: identifier or wildcard
+pattern_element = { pattern_identifier | pattern_wildcard }
+
+pattern_identifier = { name:identifier }
+  -> TypedPattern::Identifier {
+      name: intern(name),
+      is_mutable: false,
+  }
+
+pattern_wildcard = { "_" }
+  -> TypedPattern::Wildcard {}
 
 // let x = expr (standard syntax, mutable for backwards compatibility)
 legacy_let = { "let" ~ name:identifier ~ "=" ~ init:expr }
@@ -1652,7 +1694,8 @@ postfix_expr = { base:primary_expr ~ suffixes:postfix_suffix* }
   -> fold_postfix(base, suffixes)
 
 // Postfix suffix operations - order matters: method before field (to match `obj.method()` before `obj.method`)
-postfix_suffix = { suffix_method | suffix_field | suffix_call | suffix_index }
+// Note: suffix_slice must come before suffix_index to match arr[1:2] before arr[1]
+postfix_suffix = { suffix_method | suffix_field | suffix_call | suffix_slice | suffix_index }
 
 // Method call suffix: .method(args)
 suffix_method = { "." ~ method:identifier ~ "(" ~ args:call_args_list? ~ ")" }
@@ -1678,6 +1721,47 @@ suffix_index = { "[" ~ index:expr ~ "]" }
   -> SuffixIndex {
       index: index,
   }
+
+// Slice suffix: [start:end] or [start:end:step] or [:end] or [::step] etc.
+// Use explicit patterns without optional expressions before colons to avoid ambiguity
+// Note: fields are passed directly - interpreter handles None cases
+suffix_slice = {
+    slice_full |           // [start:end:step]
+    slice_start_step |     // [start::step]
+    slice_end_step |       // [:end:step]
+    slice_step_only |      // [::step]
+    slice_start_end |      // [start:end]
+    slice_end_only |       // [:end]
+    slice_start_only       // [start:]
+}
+
+// [start:end:step] - all three parts
+slice_full = { "[" ~ start:primary_expr ~ ":" ~ end:primary_expr ~ ":" ~ step:primary_expr ~ "]" }
+  -> SuffixSlice { start: start, end: end, step: step }
+
+// [start::step] - skip end
+slice_start_step = { "[" ~ start:primary_expr ~ "::" ~ step:primary_expr ~ "]" }
+  -> SuffixSlice { start: start, step: step }
+
+// [:end:step] - skip start
+slice_end_step = { "[:" ~ end:primary_expr ~ ":" ~ step:primary_expr ~ "]" }
+  -> SuffixSlice { end: end, step: step }
+
+// [::step] - only step
+slice_step_only = { "[::" ~ step:primary_expr ~ "]" }
+  -> SuffixSlice { step: step }
+
+// [start:end] - no step
+slice_start_end = { "[" ~ start:primary_expr ~ ":" ~ end:primary_expr ~ "]" }
+  -> SuffixSlice { start: start, end: end }
+
+// [:end] - from beginning
+slice_end_only = { "[:" ~ end:primary_expr ~ "]" }
+  -> SuffixSlice { end: end }
+
+// [start:] - to end
+slice_start_only = { "[" ~ start:primary_expr ~ ":]" }
+  -> SuffixSlice { start: start }
 
 // Legacy postfix_op rules (kept for reference but not used in main path)
 postfix_op = { call_op | index_op | member_op }
@@ -1734,6 +1818,7 @@ primary_expr = {
     extern_call |
     tensor_literal |
     struct_literal |
+    list_comprehension |  // Must come before array_literal (both start with '[')
     array_literal |
     float_literal |
     suffixed_literal |
@@ -1869,6 +1954,29 @@ struct_literal_field = { identifier ~ ":" ~ expr }
           }}
       ]
   }
+
+// ============================================================================
+// List Comprehension
+// ============================================================================
+
+// List comprehension: [expr for var in iter] or [expr for var in iter if cond]
+// Python-style syntax for data transformation
+// Examples:
+//   [x * 2 for x in items]           - Simple transformation
+//   [x for x in data if x > 0]       - With filter
+//   [x.name for x in users if x.active]
+//
+list_comprehension = { "[" ~ output:expr ~ "for" ~ var:identifier ~ "in" ~ iter:expr ~ cond:comprehension_filter? ~ "]" }
+  -> TypedExpression::ListComprehension {
+      output_expr: Box::new(output),
+      variable: intern(var),
+      iterator: Box::new(iter),
+      condition: cond,
+  }
+
+// Optional filter clause for comprehension
+comprehension_filter = { "if" ~ cond:expr }
+  -> cond
 
 // Array literal: [1, 2, 3] or [[1, 2], [3, 4]]
 array_literal = { "[" ~ (array_element ~ ("," ~ array_element)*)? ~ "]" }

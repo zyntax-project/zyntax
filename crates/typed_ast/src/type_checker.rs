@@ -1086,7 +1086,8 @@ impl TypeChecker {
             | TypedStatement::Try(_)
             | TypedStatement::Throw(_)
             | TypedStatement::Break(_)
-            | TypedStatement::Continue => {
+            | TypedStatement::Continue
+            | TypedStatement::LetPattern(_) => {
                 // Placeholder for now
                 Ok(Type::Primitive(PrimitiveType::Unit))
             }
@@ -1190,7 +1191,9 @@ impl TypeChecker {
             | TypedExpression::Reference(_)
             | TypedExpression::Dereference(_)
             | TypedExpression::Range(_)
-            | TypedExpression::Block(_) => {
+            | TypedExpression::Block(_)
+            | TypedExpression::ListComprehension(_)
+            | TypedExpression::Slice(_) => {
                 // Placeholder for now
                 Ok(self.inference.fresh_type_var())
             }

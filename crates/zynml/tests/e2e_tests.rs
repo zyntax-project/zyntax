@@ -1784,6 +1784,117 @@ mod grammar2_parsing {
         let result = grammar.parse("def test() { self.x }");
         assert!(result.is_ok(), "Should parse self.x: {:?}", result.err());
     }
+
+    // =========================================================================
+    // List Comprehension Tests
+    // =========================================================================
+
+    #[test]
+    fn test_grammar2_parse_list_comprehension_simple() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { [x for x in items] }");
+        assert!(result.is_ok(), "Should parse simple list comprehension: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_list_comprehension_with_expr() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { [x * 2 for x in items] }");
+        assert!(result.is_ok(), "Should parse list comp with expression: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_list_comprehension_with_filter() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { [x for x in items if x > 0] }");
+        assert!(result.is_ok(), "Should parse list comp with filter: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_list_comprehension_complex() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { [x * 2 for x in data if x > 0] }");
+        assert!(result.is_ok(), "Should parse complex list comprehension: {:?}", result.err());
+    }
+
+    // =========================================================================
+    // Slice Expression Tests
+    // =========================================================================
+
+    #[test]
+    fn test_grammar2_parse_slice_basic() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { arr[1:3] }");
+        assert!(result.is_ok(), "Should parse basic slice: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_slice_from_start() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { arr[:3] }");
+        assert!(result.is_ok(), "Should parse slice from start: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_slice_to_end() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { arr[1:] }");
+        assert!(result.is_ok(), "Should parse slice to end: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_slice_with_step() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { arr[::2] }");
+        assert!(result.is_ok(), "Should parse slice with step: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_slice_full() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { arr[1:10:2] }");
+        assert!(result.is_ok(), "Should parse full slice: {:?}", result.err());
+    }
+}
+
+// ============================================================================
+// Destructuring Pattern Tests
+// ============================================================================
+
+mod destructuring_patterns {
+    use super::*;
+
+    fn get_grammar2() -> Grammar2 {
+        Grammar2::from_source(ZYNML_GRAMMAR).expect("Grammar should compile")
+    }
+
+    #[test]
+    fn test_grammar2_parse_tuple_destructure_simple() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { let (x, y) = point }");
+        assert!(result.is_ok(), "Should parse simple tuple destructure: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_tuple_destructure_three() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { let (a, b, c) = triple }");
+        assert!(result.is_ok(), "Should parse three-element tuple destructure: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_tuple_destructure_with_wildcard() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { let (x, _) = pair }");
+        assert!(result.is_ok(), "Should parse tuple destructure with wildcard: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_tuple_destructure_with_expr() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { let (x, y) = get_point() }");
+        assert!(result.is_ok(), "Should parse tuple destructure with function call: {:?}", result.err());
+    }
 }
 
 // ============================================================================

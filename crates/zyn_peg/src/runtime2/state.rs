@@ -153,6 +153,8 @@ pub enum ParsedValue {
         kind: String,
         fields: std::collections::HashMap<String, Box<ParsedValue>>,
     },
+    /// A TypedPattern AST node
+    Pattern(Box<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedPattern>>),
 }
 
 /// Handle to an AST node (opaque, managed by builder)

@@ -119,7 +119,7 @@ pub use typed_ast::{
     TypedStatement, TypedExpression, TypedLiteral, BinaryOp, UnaryOp,
     typed_node,
     // Additional types for parser generation
-    TypedParameter, TypedLet, TypedIf, TypedWhile, TypedBlock,
+    TypedParameter, TypedLet, TypedLetPattern, TypedIf, TypedWhile, TypedBlock,
     TypedBinary, TypedUnary, TypedCall, TypedFieldAccess, TypedIndex,
     TypedFor, TypedMatch, TypedMatchExpr, TypedMatchArm, ParameterKind,
     // Lambda types
@@ -128,6 +128,8 @@ pub use typed_ast::{
     TypedMethodCall, TypedMethod, TypedMethodParam,
     // Range type
     TypedRange,
+    // List comprehension and slice types
+    TypedListComprehension, TypedSlice,
     // Struct type
     TypedStructLiteral, TypedFieldInit,
     // Pattern types

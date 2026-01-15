@@ -274,6 +274,8 @@ pub enum TypedStatement {
     Continue,
     Expression(Box<TypedNode<TypedExpression>>),
     Let(TypedLet),
+    /// Let with pattern destructuring: let (x, y) = expr
+    LetPattern(TypedLetPattern),
     Return(Option<Box<TypedNode<TypedExpression>>>),
     If(TypedIf),
     While(TypedWhile),
@@ -303,6 +305,14 @@ pub struct TypedLet {
     pub ty: Type,
     pub mutability: Mutability,
     pub initializer: Option<Box<TypedNode<TypedExpression>>>,
+    pub span: Span,
+}
+
+/// Let with pattern destructuring: let (x, y) = expr or let Point { x, y } = point
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedLetPattern {
+    pub pattern: Box<TypedNode<TypedPattern>>,
+    pub initializer: Box<TypedNode<TypedExpression>>,
     pub span: Span,
 }
 
@@ -355,6 +365,10 @@ pub enum TypedExpression {
     Range(TypedRange),
     MethodCall(TypedMethodCall),
     Block(TypedBlock),
+    /// List comprehension: [expr for var in iter if condition]
+    ListComprehension(TypedListComprehension),
+    /// Slice expression: arr[start:end:step]
+    Slice(TypedSlice),
 }
 
 impl Default for TypedExpression {
@@ -720,6 +734,32 @@ pub struct TypedRange {
     pub start: Option<Box<TypedNode<TypedExpression>>>,
     pub end: Option<Box<TypedNode<TypedExpression>>>,
     pub inclusive: bool,
+}
+
+/// List comprehension: [expr for var in iter if condition]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedListComprehension {
+    /// The output expression evaluated for each element
+    pub output_expr: Box<TypedNode<TypedExpression>>,
+    /// The loop variable name
+    pub variable: InternedString,
+    /// The iterable expression
+    pub iterator: Box<TypedNode<TypedExpression>>,
+    /// Optional filter condition
+    pub condition: Option<Box<TypedNode<TypedExpression>>>,
+}
+
+/// Slice expression: arr[start:end:step]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedSlice {
+    /// The object being sliced
+    pub object: Box<TypedNode<TypedExpression>>,
+    /// Start index (None = beginning)
+    pub start: Option<Box<TypedNode<TypedExpression>>>,
+    /// End index (None = end)
+    pub end: Option<Box<TypedNode<TypedExpression>>>,
+    /// Step value (None = 1)
+    pub step: Option<Box<TypedNode<TypedExpression>>>,
 }
 
 /// Method call with enhanced argument support

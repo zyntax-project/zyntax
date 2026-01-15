@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use log::{debug, trace};
 use zyntax_typed_ast::{
     TypedNode, TypedStatement, TypedExpression, TypedLiteral, TypedBlock,
-    TypedDeclaration, TypedFunction, TypedLet, TypedCall, TypedMethodCall, TypedProgram,
+    TypedDeclaration, TypedFunction, TypedLet, TypedLetPattern, TypedCall, TypedMethodCall, TypedProgram,
     TypedIf, TypedWhile, TypedFor, TypedUnary, TypedFieldAccess, TypedIndex,
     TypedRange, TypedStructLiteral, TypedFieldInit, TypedPattern,
     TypedParameter, TypedVariant, TypedVariantFields, TypedTypeAlias, ParameterKind,
@@ -253,8 +253,11 @@ impl<'g> GrammarInterpreter<'g> {
             ["TypedFieldInit"] => {
                 self.construct_field_init(fields, state, span)
             }
+            ["TypedPattern", variant] => {
+                self.construct_pattern(variant, fields, state, span)
+            }
             // Postfix suffix types for fold operations
-            ["SuffixField"] | ["SuffixMethod"] | ["SuffixCall"] | ["SuffixIndex"] => {
+            ["SuffixField"] | ["SuffixMethod"] | ["SuffixCall"] | ["SuffixIndex"] | ["SuffixSlice"] => {
                 self.construct_suffix(type_path, fields, state)
             }
             _ => Err(format!("unknown type path: {}", type_path)),
@@ -403,6 +406,16 @@ impl<'g> GrammarInterpreter<'g> {
             "Continue" => {
                 TypedStatement::Continue
             }
+            "LetPattern" => {
+                let pattern = self.get_field_as_pattern("pattern", fields, state)?;
+                let initializer = self.get_field_as_expr("initializer", fields, state)?;
+
+                TypedStatement::LetPattern(TypedLetPattern {
+                    pattern: Box::new(pattern),
+                    initializer: Box::new(initializer),
+                    span,
+                })
+            }
             _ => return Err(format!("unknown TypedStatement variant: {}", variant)),
         };
 
@@ -549,6 +562,34 @@ impl<'g> GrammarInterpreter<'g> {
                     condition: Box::new(condition),
                     then_branch: Box::new(then_expr),
                     else_branch: Box::new(else_expr),
+                })
+            }
+            "ListComprehension" => {
+                // List comprehension: [expr for var in iter if cond]
+                let output_expr = self.get_field_as_expr("output_expr", fields, state)?;
+                let variable = self.get_field_as_interned("variable", fields, state)?;
+                let iterator = self.get_field_as_expr("iterator", fields, state)?;
+                let condition = self.get_field_optional_expr("condition", fields, state)?;
+
+                TypedExpression::ListComprehension(zyntax_typed_ast::TypedListComprehension {
+                    output_expr: Box::new(output_expr),
+                    variable,
+                    iterator: Box::new(iterator),
+                    condition: condition.map(Box::new),
+                })
+            }
+            "Slice" => {
+                // Slice expression: arr[start:end:step]
+                let object = self.get_field_as_expr("object", fields, state)?;
+                let start = self.get_field_optional_expr("start", fields, state)?;
+                let end = self.get_field_optional_expr("end", fields, state)?;
+                let step = self.get_field_optional_expr("step", fields, state)?;
+
+                TypedExpression::Slice(zyntax_typed_ast::TypedSlice {
+                    object: Box::new(object),
+                    start: start.map(Box::new),
+                    end: end.map(Box::new),
+                    step: step.map(Box::new),
                 })
             }
             _ => return Err(format!("unknown TypedExpression variant: {}", variant)),
@@ -993,6 +1034,38 @@ impl<'g> GrammarInterpreter<'g> {
         })
     }
 
+    /// Construct a TypedPattern variant (for destructuring)
+    fn construct_pattern<'a>(
+        &self,
+        variant: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        span: Span,
+    ) -> Result<ParsedValue, String> {
+        let pattern = match variant {
+            "Identifier" => {
+                let name = self.get_field_as_interned("name", fields, state)?;
+                let is_mutable = self.get_field_as_bool("is_mutable", fields, state).unwrap_or(false);
+                let mutability = if is_mutable { Mutability::Mutable } else { Mutability::Immutable };
+                TypedPattern::Identifier { name, mutability }
+            }
+            "Wildcard" => {
+                TypedPattern::Wildcard
+            }
+            "Tuple" => {
+                let elements = self.get_field_as_pattern_list("elements", fields, state)?;
+                TypedPattern::Tuple(elements)
+            }
+            _ => return Err(format!("unknown TypedPattern variant: {}", variant)),
+        };
+
+        Ok(ParsedValue::Pattern(Box::new(typed_node(
+            pattern,
+            Type::Any,
+            span,
+        ))))
+    }
+
     /// Construct a TypedParameter (function parameter)
     fn construct_parameter<'a>(
         &self,
@@ -1296,6 +1369,49 @@ impl<'g> GrammarInterpreter<'g> {
                             TypedExpression::Index(TypedIndex {
                                 object: Box::new(acc_expr),
                                 index: Box::new(index_expr),
+                            }),
+                            Type::Unknown,
+                            span,
+                        ))))
+                    }
+                    "SuffixSlice" => {
+                        // Slice access: acc[start:end:step]
+                        let start_val = fields.get("start");
+                        let end_val = fields.get("end");
+                        let step_val = fields.get("step");
+
+                        // Convert acc to TypedExpression
+                        let acc_expr = self.parsed_value_to_expr(acc, state)?;
+
+                        // Convert optional slice components
+                        let start = match start_val {
+                            Some(v) => match v.as_ref() {
+                                ParsedValue::None | ParsedValue::Optional(None) => None,
+                                other => Some(Box::new(self.parsed_value_to_expr(other.clone(), state)?)),
+                            }
+                            None => None,
+                        };
+                        let end = match end_val {
+                            Some(v) => match v.as_ref() {
+                                ParsedValue::None | ParsedValue::Optional(None) => None,
+                                other => Some(Box::new(self.parsed_value_to_expr(other.clone(), state)?)),
+                            }
+                            None => None,
+                        };
+                        let step = match step_val {
+                            Some(v) => match v.as_ref() {
+                                ParsedValue::None | ParsedValue::Optional(None) => None,
+                                other => Some(Box::new(self.parsed_value_to_expr(other.clone(), state)?)),
+                            }
+                            None => None,
+                        };
+
+                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                            TypedExpression::Slice(zyntax_typed_ast::TypedSlice {
+                                object: Box::new(acc_expr),
+                                start,
+                                end,
+                                step,
                             }),
                             Type::Unknown,
                             span,
@@ -1784,6 +1900,55 @@ impl<'g> GrammarInterpreter<'g> {
             .ok_or_else(|| format!("missing field: {}", name))?;
         let val = self.eval_expr(expr, state)?;
         self.parsed_value_to_block(val, state)
+    }
+
+    fn get_field_as_pattern<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<TypedNode<TypedPattern>, String> {
+        let expr = self.get_field(name, fields)
+            .ok_or_else(|| format!("missing field: {}", name))?;
+        let val = self.eval_expr(expr, state)?;
+        self.parsed_value_to_pattern(val, state)
+    }
+
+    fn get_field_as_pattern_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedNode<TypedPattern>>, String> {
+        let expr = self.get_field(name, fields)
+            .ok_or_else(|| format!("missing field: {}", name))?;
+        let val = self.eval_expr(expr, state)?;
+
+        match val {
+            ParsedValue::List(items) => {
+                items.into_iter()
+                    .map(|item| self.parsed_value_to_pattern(item, state))
+                    .collect()
+            }
+            ParsedValue::Optional(None) | ParsedValue::None => Ok(vec![]),
+            ParsedValue::Optional(Some(inner)) => {
+                match *inner {
+                    ParsedValue::List(items) => {
+                        items.into_iter()
+                            .map(|item| self.parsed_value_to_pattern(item, state))
+                            .collect()
+                    }
+                    other => {
+                        let p = self.parsed_value_to_pattern(other, state)?;
+                        Ok(vec![p])
+                    }
+                }
+            }
+            other => {
+                let p = self.parsed_value_to_pattern(other, state)?;
+                Ok(vec![p])
+            }
+        }
     }
 
     fn get_field_as_field_init_list<'a>(
@@ -2279,6 +2444,14 @@ impl<'g> GrammarInterpreter<'g> {
         match val {
             ParsedValue::Statement(s) => Ok(*s),
             _ => Err("cannot convert value to statement".to_string()),
+        }
+    }
+
+    /// Convert ParsedValue to TypedPattern
+    fn parsed_value_to_pattern<'a>(&self, val: ParsedValue, _state: &mut ParserState<'a>) -> Result<TypedNode<TypedPattern>, String> {
+        match val {
+            ParsedValue::Pattern(p) => Ok(*p),
+            _ => Err("cannot convert value to pattern".to_string()),
         }
     }
 
