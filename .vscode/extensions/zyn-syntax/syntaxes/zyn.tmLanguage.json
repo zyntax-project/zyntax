@@ -5,8 +5,10 @@
     "patterns": [
         { "include": "#comments" },
         { "include": "#metadata-block" },
+        { "include": "#builtin-block" },
         { "include": "#rule-definition" },
-        { "include": "#semantic-action" },
+        { "include": "#typed-action" },
+        { "include": "#legacy-action" },
         { "include": "#strings" },
         { "include": "#operators" },
         { "include": "#keywords" }
@@ -51,31 +53,122 @@
                 }
             ]
         },
+        "builtin-block": {
+            "begin": "(@)(builtin)\\s*(\\{)",
+            "end": "\\}",
+            "beginCaptures": {
+                "1": { "name": "punctuation.definition.annotation.zyn" },
+                "2": { "name": "keyword.control.metadata.zyn" },
+                "3": { "name": "punctuation.section.block.begin.zyn" }
+            },
+            "endCaptures": {
+                "0": { "name": "punctuation.section.block.end.zyn" }
+            },
+            "patterns": [
+                { "include": "#comments" },
+                {
+                    "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*:",
+                    "captures": {
+                        "1": { "name": "variable.parameter.builtin.zyn" }
+                    }
+                },
+                { "include": "#strings" },
+                {
+                    "match": ",",
+                    "name": "punctuation.separator.comma.zyn"
+                }
+            ]
+        },
         "rule-definition": {
             "patterns": [
                 {
-                    "match": "^\\s*([a-z_][a-zA-Z0-9_]*)\\s*(=)",
+                    "match": "^\\s*([a-z_][a-zA-Z0-9_]*)\\s*(=)\\s*(@)?\\s*(\\{)",
                     "captures": {
                         "1": { "name": "entity.name.function.rule.zyn" },
-                        "2": { "name": "keyword.operator.assignment.zyn" }
+                        "2": { "name": "keyword.operator.assignment.zyn" },
+                        "3": { "name": "keyword.operator.atomic.zyn" },
+                        "4": { "name": "punctuation.section.block.begin.zyn" }
                     }
                 },
                 {
-                    "match": "\\b([a-z_][a-zA-Z0-9_]*)\\b(?!\\s*=)",
+                    "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*:",
+                    "captures": {
+                        "1": { "name": "variable.parameter.binding.zyn" }
+                    }
+                },
+                {
+                    "match": "\\b([a-z_][a-zA-Z0-9_]*)\\b(?!\\s*[=:])",
                     "name": "variable.other.rule-reference.zyn"
                 }
             ]
         },
-        "semantic-action": {
-            "begin": "->\\s*(TypedProgram|TypedDeclaration|TypedStatement|TypedExpression|TypedBlock|TypedParameter|TypedField|TypedVariant|Type|List|String)\\s*\\{",
+        "typed-action": {
+            "begin": "(->)\\s*(Typed[A-Z][a-zA-Z0-9_]*|Type|Box|Some)(::[A-Z][a-zA-Z0-9_]*)?\\s*(\\{)?",
+            "end": "\\}|(?=$|\\n\\s*[a-z_])",
+            "beginCaptures": {
+                "1": { "name": "keyword.operator.arrow.zyn" },
+                "2": { "name": "entity.name.type.return.zyn" },
+                "3": { "name": "entity.name.type.variant.zyn" },
+                "4": { "name": "punctuation.section.block.begin.zyn" }
+            },
+            "endCaptures": {
+                "0": { "name": "punctuation.section.block.end.zyn" }
+            },
+            "patterns": [
+                { "include": "#action-content" }
+            ]
+        },
+        "legacy-action": {
+            "begin": "(->)\\s*(List|String)\\s*(\\{)",
             "end": "\\}",
             "beginCaptures": {
-                "0": { "name": "keyword.operator.arrow.zyn" },
-                "1": { "name": "entity.name.type.return.zyn" }
+                "1": { "name": "keyword.operator.arrow.zyn" },
+                "2": { "name": "entity.name.type.return.zyn" },
+                "3": { "name": "punctuation.section.block.begin.zyn" }
             },
-            "contentName": "meta.embedded.block.json",
+            "endCaptures": {
+                "0": { "name": "punctuation.section.block.end.zyn" }
+            },
             "patterns": [
                 { "include": "#json-content" }
+            ]
+        },
+        "action-content": {
+            "patterns": [
+                { "include": "#comments" },
+                {
+                    "match": "\\b(intern|parse_int|parse_float|parse_bool|text|collect)\\s*\\(",
+                    "captures": {
+                        "1": { "name": "support.function.helper.zyn" }
+                    }
+                },
+                {
+                    "match": "\\b(Some|None|Box|true|false)\\b",
+                    "name": "constant.language.zyn"
+                },
+                {
+                    "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*:",
+                    "captures": {
+                        "1": { "name": "variable.parameter.field.zyn" }
+                    }
+                },
+                {
+                    "match": "\\b([a-z_][a-zA-Z0-9_]*)\\b",
+                    "name": "variable.other.binding.zyn"
+                },
+                {
+                    "match": "\\[|\\]",
+                    "name": "punctuation.bracket.square.zyn"
+                },
+                {
+                    "match": "\\(|\\)",
+                    "name": "punctuation.bracket.round.zyn"
+                },
+                {
+                    "match": ",",
+                    "name": "punctuation.separator.comma.zyn"
+                },
+                { "include": "#strings" }
             ]
         },
         "json-content": {
@@ -113,8 +206,19 @@
         "strings": {
             "patterns": [
                 {
+                    "name": "string.quoted.triple.zyn",
+                    "begin": "\"\"\"",
+                    "end": "\"\"\"",
+                    "patterns": [
+                        {
+                            "match": "\\\\.",
+                            "name": "constant.character.escape.zyn"
+                        }
+                    ]
+                },
+                {
                     "name": "string.quoted.double.zyn",
-                    "match": "\"[^\"]*\""
+                    "match": "\"([^\"]|\\\\\")*\""
                 }
             ]
         },
@@ -151,6 +255,10 @@
                 {
                     "match": "\\b(SOI|EOI|ANY|ASCII_DIGIT|ASCII_ALPHA|ASCII_ALPHANUMERIC|WHITESPACE|COMMENT|NEWLINE)\\b",
                     "name": "support.constant.builtin.zyn"
+                },
+                {
+                    "match": "\\b(Type|Typed[A-Z][a-zA-Z0-9_]*)\\b",
+                    "name": "entity.name.type.zyn"
                 }
             ]
         }
