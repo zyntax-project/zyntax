@@ -423,10 +423,10 @@ fn create_control_flow_function() -> HirFunction {
     let phi = HirPhi {
         result: phi_result,
         ty: HirType::I32,
-        // Fixed: phi incoming format is (block_id, value), not (value, block_id)
+        // Phi incoming format is (value, block) as defined in HirPhi
         incoming: vec![
-            (then_block, neg_result),
-            (else_block, param_x),
+            (neg_result, then_block),
+            (param_x, else_block),
         ],
     };
     
