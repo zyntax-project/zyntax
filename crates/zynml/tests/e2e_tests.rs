@@ -1635,6 +1635,78 @@ mod grammar2_parsing {
         let result = grammar.parse("fn test() { mut x: int = 0 }");
         assert!(result.is_ok(), "Should parse mut let: {:?}", result.err());
     }
+
+    #[test]
+    fn test_grammar2_parse_python_ternary() {
+        let grammar = get_grammar2();
+        // Python-style ternary: value if condition else other_value
+        let result = grammar.parse("def test(): int { 1 if true else 0 }");
+        assert!(result.is_ok(), "Should parse Python-style ternary: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_c_style_ternary() {
+        let grammar = get_grammar2();
+        // C-style ternary: condition ? value : other_value
+        let result = grammar.parse("def test(): int { true ? 1 : 0 }");
+        assert!(result.is_ok(), "Should parse C-style ternary: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_null_coalesce() {
+        let grammar = get_grammar2();
+        // Null-coalescing operator: a ?? b
+        let result = grammar.parse("def test(): int { x ?? 42 }");
+        assert!(result.is_ok(), "Should parse null-coalesce: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_chained_null_coalesce() {
+        let grammar = get_grammar2();
+        // Chained null-coalescing: a ?? b ?? c
+        let result = grammar.parse("def test(): int { a ?? b ?? 0 }");
+        assert!(result.is_ok(), "Should parse chained null-coalesce: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_ternary_with_expressions() {
+        let grammar = get_grammar2();
+        // Ternary with variable expressions (simpler case)
+        let result = grammar.parse("def test(): int { a if b else c }");
+        assert!(result.is_ok(), "Should parse ternary with variables: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_ternary_with_calls() {
+        let grammar = get_grammar2();
+        // Ternary with function calls (more complex)
+        let result = grammar.parse("def test(): int { foo() if bar() else baz() }");
+        assert!(result.is_ok(), "Should parse ternary with function calls: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_call_with_arg_in_def_body() {
+        let grammar = get_grammar2();
+        // Function call with argument in def body
+        let result = grammar.parse("def test(): int { foo(42) }");
+        assert!(result.is_ok(), "Should parse call with arg in def body: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_empty_call_in_def_body() {
+        let grammar = get_grammar2();
+        // Function call with no args in def body with return type
+        let result = grammar.parse("def test(): int { foo() }");
+        assert!(result.is_ok(), "Should parse empty call in def body: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_call_in_fn_body() {
+        let grammar = get_grammar2();
+        // Simple function call in fn body (no return type)
+        let result = grammar.parse("fn test() { foo() }");
+        assert!(result.is_ok(), "Should parse call in fn body: {:?}", result.err());
+    }
 }
 
 // ============================================================================

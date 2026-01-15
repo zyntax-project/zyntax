@@ -1511,6 +1511,22 @@ impl<'g> GrammarInterpreter<'g> {
                     .map(|item| self.parsed_value_to_expr(item, state))
                     .collect()
             }
+            // Handle optional fields that are None (e.g., empty argument lists)
+            ParsedValue::Optional(None) | ParsedValue::None => Ok(vec![]),
+            // Optional with a value - unwrap and process
+            ParsedValue::Optional(Some(inner)) => {
+                match *inner {
+                    ParsedValue::List(items) => {
+                        items.into_iter()
+                            .map(|item| self.parsed_value_to_expr(item, state))
+                            .collect()
+                    }
+                    other => {
+                        let e = self.parsed_value_to_expr(other, state)?;
+                        Ok(vec![e])
+                    }
+                }
+            }
             other => {
                 // Single expression becomes a list of one
                 let e = self.parsed_value_to_expr(other, state)?;
@@ -2087,6 +2103,13 @@ impl<'g> GrammarInterpreter<'g> {
             "&&" | "And" => Ok(zyntax_typed_ast::BinaryOp::And),
             "||" | "Or" => Ok(zyntax_typed_ast::BinaryOp::Or),
             "=" | "Assign" => Ok(zyntax_typed_ast::BinaryOp::Assign),
+            "??" | "Orelse" => Ok(zyntax_typed_ast::BinaryOp::Orelse),
+            "catch" | "Catch" => Ok(zyntax_typed_ast::BinaryOp::Catch),
+            "&" | "BitAnd" => Ok(zyntax_typed_ast::BinaryOp::BitAnd),
+            "|" | "BitOr" => Ok(zyntax_typed_ast::BinaryOp::BitOr),
+            "^" | "BitXor" => Ok(zyntax_typed_ast::BinaryOp::BitXor),
+            "<<" | "Shl" => Ok(zyntax_typed_ast::BinaryOp::Shl),
+            ">>" | "Shr" => Ok(zyntax_typed_ast::BinaryOp::Shr),
             _ => Err(format!("unknown binary operator: {}", op)),
         }
     }

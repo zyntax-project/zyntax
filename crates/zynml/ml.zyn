@@ -1554,27 +1554,35 @@ pipe_call = { callee:identifier ~ "(" ~ args:call_args? ~ ")" }
 ternary_expr = { python_ternary | ternary_with_branches | null_coalesce_expr }
 
 // Python-style ternary: value_a if condition else value_b
-python_ternary = { then_expr:null_coalesce_expr ~ "if" ~ cond:null_coalesce_expr ~ "else" ~ else_expr:null_coalesce_expr }
-  -> TypedExpression::Ternary {
+// Maps to TypedIfExpr (If in TypedExpression)
+python_ternary = { then_val:null_coalesce_expr ~ "if" ~ cond:null_coalesce_expr ~ "else" ~ else_val:null_coalesce_expr }
+  -> TypedExpression::If {
       condition: Box::new(cond),
-      then_branch: Box::new(then_expr),
-      else_branch: Box::new(else_expr),
+      then_expr: Box::new(then_val),
+      else_expr: Box::new(else_val),
   }
 
 // C-style ternary: condition ? true_expr : false_expr
-ternary_with_branches = { cond:null_coalesce_expr ~ "?" ~ then_expr:null_coalesce_expr ~ ":" ~ else_expr:null_coalesce_expr }
-  -> TypedExpression::Ternary {
+// Maps to TypedIfExpr (If in TypedExpression)
+ternary_with_branches = { cond:null_coalesce_expr ~ "?" ~ then_val:null_coalesce_expr ~ ":" ~ else_val:null_coalesce_expr }
+  -> TypedExpression::If {
       condition: Box::new(cond),
-      then_branch: Box::new(then_expr),
-      else_branch: Box::new(else_expr),
+      then_expr: Box::new(then_val),
+      else_expr: Box::new(else_val),
   }
 
 // Null-coalescing operator: a ?? b
 // Returns a if a is Some, otherwise returns b
 // Example: username = get_username() ?? "anonymous"
-// For now, pass through (NullCoalesce not in TypedAST yet)
-null_coalesce_expr = { inner:or_expr ~ ("??" ~ or_expr)* }
-  -> inner
+// Maps to TypedBinary with BinaryOp::Orelse
+null_coalesce_expr = { null_coalesce_binary | or_expr }
+
+null_coalesce_binary = { left:or_expr ~ "??" ~ right:null_coalesce_expr }
+  -> TypedExpression::Binary {
+      op: "Orelse",
+      left: Box::new(left),
+      right: Box::new(right),
+  }
 
 // Logical OR - simplified (just pass through inner expression for now)
 or_expr = { inner:and_expr ~ ("||" ~ and_expr)* }
@@ -1638,13 +1646,43 @@ unary_prefix_expr = { unary_op? ~ operand:postfix_expr }
 unary_op = @{ "-" | "!" }
 
 // Postfix: function calls, indexing, member access
-// Simplified - just pass through primary for now
-postfix_expr = { base:primary_expr ~ postfix_op* }
-  -> base
+// Priority order: direct_call > method_call > field_access > indexing > base
+// Note: method_call must come before field_access to match `obj.method()` before `obj.method`
+postfix_expr = { direct_call_expr | method_call_expr | field_access_expr | index_expr | primary_expr }
 
+// Direct function call: foo(args)
+direct_call_expr = { callee:identifier ~ "(" ~ args:call_args_list? ~ ")" }
+  -> TypedExpression::Call {
+      callee: Box::new(TypedExpression::Variable { name: intern(callee) }),
+      args: args,
+  }
+
+// Method call: obj.method(args)
+method_call_expr = { object:primary_expr ~ "." ~ method:identifier ~ "(" ~ args:call_args_list? ~ ")" }
+  -> TypedExpression::MethodCall {
+      object: Box::new(object),
+      method: intern(method),
+      args: args,
+  }
+
+// Field access: obj.field
+field_access_expr = { object:primary_expr ~ "." ~ field:identifier }
+  -> TypedExpression::Field {
+      object: Box::new(object),
+      field: intern(field),
+  }
+
+// Indexing: arr[idx]
+index_expr = { object:primary_expr ~ "[" ~ index:expr ~ "]" }
+  -> TypedExpression::Index {
+      object: Box::new(object),
+      index: Box::new(index),
+  }
+
+// Legacy postfix_op rules (kept for reference but not used in main path)
 postfix_op = { call_op | index_op | member_op }
 
-// Function call: f(args) - not used in simplified version
+// Function call: f(args)
 call_op = { "(" ~ args:call_args? ~ ")" }
   -> TypedExpression::CallArgs { args: args }
 
