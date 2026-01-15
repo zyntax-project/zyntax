@@ -10,6 +10,7 @@ use cranelift_codegen::ir::{Signature, UserFuncName, AbiParam};
 use cranelift_codegen::ir::condcodes::{IntCC, FloatCC};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
+use cranelift_codegen::verify_function;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use log::{warn, error, info, debug};
@@ -2581,6 +2582,18 @@ impl CraneliftBackend {
 
         // Debug: Print IR after finalize
         log::debug!("[Cranelift] IR after finalize (inside compile_function_body):\n{}", self.codegen_context.func);
+
+        // Verify the generated IR (catches errors before they become cryptic panics)
+        if let Err(errors) = verify_function(&self.codegen_context.func, self.module.isa()) {
+            error!("[Cranelift] IR verification failed for function '{}':", function.name);
+            error!("  {}", errors);
+            debug!("Function IR dump:\n{}", self.codegen_context.func.display());
+            return Err(CompilerError::Backend(format!(
+                "Cranelift IR verification failed for function '{}': {}",
+                function.name, errors
+            )));
+        }
+        log::debug!("[Cranelift] IR verification passed for '{}'", function.name);
 
         // Debug: Uncomment to dump IR for all functions
         // self.dump_cranelift_ir(&function.name.to_string());
