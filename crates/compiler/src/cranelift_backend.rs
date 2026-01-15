@@ -1010,6 +1010,101 @@ impl CraneliftBackend {
                                                 continue;
                                             }
                                         }
+                                        Intrinsic::Sin => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                // Inline libm sin call to avoid borrow issues
+                                                let mut sig = self.module.make_signature();
+                                                sig.params.push(AbiParam::new(types::F64));
+                                                sig.returns.push(AbiParam::new(types::F64));
+                                                let sin_id = self.module.declare_function("sin", Linkage::Import, &sig)
+                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare sin: {}", e)))?;
+                                                let sin_func = self.module.declare_func_in_func(sin_id, builder.func);
+                                                let call = builder.ins().call(sin_func, &[arg]);
+                                                builder.inst_results(call)[0]
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Cos => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                let mut sig = self.module.make_signature();
+                                                sig.params.push(AbiParam::new(types::F64));
+                                                sig.returns.push(AbiParam::new(types::F64));
+                                                let cos_id = self.module.declare_function("cos", Linkage::Import, &sig)
+                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare cos: {}", e)))?;
+                                                let cos_func = self.module.declare_func_in_func(cos_id, builder.func);
+                                                let call = builder.ins().call(cos_func, &[arg]);
+                                                builder.inst_results(call)[0]
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Log => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                let mut sig = self.module.make_signature();
+                                                sig.params.push(AbiParam::new(types::F64));
+                                                sig.returns.push(AbiParam::new(types::F64));
+                                                let log_id = self.module.declare_function("log", Linkage::Import, &sig)
+                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare log: {}", e)))?;
+                                                let log_func = self.module.declare_func_in_func(log_id, builder.func);
+                                                let call = builder.ins().call(log_func, &[arg]);
+                                                builder.inst_results(call)[0]
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Exp => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                let mut sig = self.module.make_signature();
+                                                sig.params.push(AbiParam::new(types::F64));
+                                                sig.returns.push(AbiParam::new(types::F64));
+                                                let exp_id = self.module.declare_function("exp", Linkage::Import, &sig)
+                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare exp: {}", e)))?;
+                                                let exp_func = self.module.declare_func_in_func(exp_id, builder.func);
+                                                let call = builder.ins().call(exp_func, &[arg]);
+                                                builder.inst_results(call)[0]
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Pow => {
+                                            if arg_values.len() >= 2 {
+                                                let base = arg_values[0];
+                                                let exp = arg_values[1];
+                                                let mut sig = self.module.make_signature();
+                                                sig.params.push(AbiParam::new(types::F64));
+                                                sig.params.push(AbiParam::new(types::F64));
+                                                sig.returns.push(AbiParam::new(types::F64));
+                                                let pow_id = self.module.declare_function("pow", Linkage::Import, &sig)
+                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare pow: {}", e)))?;
+                                                let pow_func = self.module.declare_func_in_func(pow_id, builder.func);
+                                                let call = builder.ins().call(pow_func, &[base, exp]);
+                                                builder.inst_results(call)[0]
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Ctlz => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                builder.ins().clz(arg)
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Cttz => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                builder.ins().ctz(arg)
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Intrinsic::Bswap => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                builder.ins().bswap(arg)
+                                            } else {
+                                                continue;
+                                            }
+                                        }
                                         _ => {
                                             // Other intrinsics not implemented yet
                                             continue;
