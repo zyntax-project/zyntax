@@ -103,13 +103,14 @@
             ]
         },
         "typed-action": {
-            "begin": "(->)\\s*(Typed[A-Z][a-zA-Z0-9_]*|Type|Box|Some)(::[A-Z][a-zA-Z0-9_]*)?\\s*(\\{)?",
+            "begin": "(->)\\s*(Typed[A-Z][a-zA-Z0-9_]*|Type|Box|Some)(?:(::)([A-Z][a-zA-Z0-9_]*))?\\s*(\\{)?",
             "end": "\\}|(?=$|\\n\\s*[a-z_])",
             "beginCaptures": {
                 "1": { "name": "keyword.operator.arrow.zyn" },
-                "2": { "name": "entity.name.type.return.zyn" },
-                "3": { "name": "entity.name.type.variant.zyn" },
-                "4": { "name": "punctuation.section.block.begin.zyn" }
+                "2": { "name": "entity.name.type.zyn" },
+                "3": { "name": "punctuation.accessor.zyn" },
+                "4": { "name": "entity.name.class.zyn" },
+                "5": { "name": "punctuation.section.block.begin.zyn" }
             },
             "endCaptures": {
                 "0": { "name": "punctuation.section.block.end.zyn" }
