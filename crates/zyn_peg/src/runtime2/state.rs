@@ -155,6 +155,12 @@ pub enum ParsedValue {
     },
     /// A TypedPattern AST node
     Pattern(Box<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedPattern>>),
+    /// A TypedAnnotation (e.g., @deprecated, @inline)
+    Annotation(zyntax_typed_ast::TypedAnnotation),
+    /// A TypedAnnotationArg (positional or named)
+    AnnotationArg(zyntax_typed_ast::TypedAnnotationArg),
+    /// A TypedAnnotationValue (string, int, bool, identifier, list)
+    AnnotationValue(zyntax_typed_ast::TypedAnnotationValue),
 }
 
 /// Handle to an AST node (opaque, managed by builder)

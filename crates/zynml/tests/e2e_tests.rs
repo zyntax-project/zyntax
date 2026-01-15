@@ -1898,6 +1898,89 @@ mod destructuring_patterns {
 }
 
 // ============================================================================
+// Annotations Tests (Tier 3: Annotations & Effects System)
+// ============================================================================
+
+mod annotations {
+    use super::*;
+
+    fn get_grammar2() -> Grammar2 {
+        Grammar2::from_source(ZYNML_GRAMMAR).expect("Grammar should compile")
+    }
+
+    #[test]
+    fn test_grammar2_parse_simple_annotation() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@inline def fast() { x + 1 }");
+        assert!(result.is_ok(), "Should parse simple annotation: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_annotation_with_string_arg() {
+        let grammar = get_grammar2();
+        let result = grammar.parse(r#"@deprecated("Use new_function instead") def old_function() { 0 }"#);
+        assert!(result.is_ok(), "Should parse annotation with string arg: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_annotation_with_named_args() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@validate(min=1, max=100) def bounded(x: int): int { x }");
+        assert!(result.is_ok(), "Should parse annotation with named args: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_multiple_annotations() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@inline @jit def optimized(x: int): int { x * 2 }");
+        assert!(result.is_ok(), "Should parse multiple annotations: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_annotation_with_identifier_args() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@derive(Debug, Clone) def serializable(): str { \"hello\" }");
+        assert!(result.is_ok(), "Should parse annotation with identifier args: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_annotation_with_bool_arg() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@feature(enabled=true) def feature_flag(): bool { true }");
+        assert!(result.is_ok(), "Should parse annotation with bool arg: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_annotation_with_int_arg() {
+        let grammar = get_grammar2();
+        // Simplified test to isolate the annotation parsing
+        let result = grammar.parse("@retry(count=3) def test() { 1 }");
+        assert!(result.is_ok(), "Should parse annotation with int arg: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_jit_annotation() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@jit def forward(x: Tensor): Tensor { relu(x) }");
+        assert!(result.is_ok(), "Should parse @jit annotation: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_device_annotation() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@device(GPU) def gpu_compute(x: Tensor): Tensor { x * 2 }");
+        assert!(result.is_ok(), "Should parse @device annotation: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_effect_annotation() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("@effect(IO) def read_file(path: str): str { load(path) }");
+        assert!(result.is_ok(), "Should parse @effect annotation: {:?}", result.err());
+    }
+}
+
+// ============================================================================
 // Runtime Tests
 // ============================================================================
 

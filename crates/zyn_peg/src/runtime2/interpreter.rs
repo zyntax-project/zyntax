@@ -20,6 +20,7 @@ use zyntax_typed_ast::{
     TypedRange, TypedStructLiteral, TypedFieldInit, TypedPattern,
     TypedParameter, TypedVariant, TypedVariantFields, TypedTypeAlias, ParameterKind,
     TypedInterface,
+    TypedAnnotation, TypedAnnotationArg, TypedAnnotationValue,
     UnaryOp,
     typed_node, Span,
     type_registry::{Type, PrimitiveType, Mutability, Visibility, CallingConvention, NullabilityKind, ConstValue},
@@ -255,6 +256,15 @@ impl<'g> GrammarInterpreter<'g> {
             }
             ["TypedPattern", variant] => {
                 self.construct_pattern(variant, fields, state, span)
+            }
+            ["TypedAnnotation"] => {
+                self.construct_annotation(fields, state, span)
+            }
+            ["TypedAnnotationArg", variant] => {
+                self.construct_annotation_arg(variant, fields, state, span)
+            }
+            ["TypedAnnotationValue", variant] => {
+                self.construct_annotation_value(variant, fields, state, span)
             }
             // Postfix suffix types for fold operations
             ["SuffixField"] | ["SuffixMethod"] | ["SuffixCall"] | ["SuffixIndex"] | ["SuffixSlice"] => {
@@ -802,6 +812,20 @@ impl<'g> GrammarInterpreter<'g> {
                     span,
                 })
             }
+            "AnnotatedFunction" => {
+                // An annotated function: merge annotations into the function
+                let annotations = self.get_field_as_annotation_list("annotations", fields, state)?;
+                let func_decl = self.get_field_as_declaration("function", fields, state)?;
+
+                // Extract function and add annotations
+                match func_decl.node {
+                    TypedDeclaration::Function(mut func) => {
+                        func.annotations = annotations;
+                        TypedDeclaration::Function(func)
+                    }
+                    _ => return Err("AnnotatedFunction requires a Function declaration".to_string()),
+                }
+            }
             _ => return Err(format!("unknown TypedDeclaration variant: {}", variant)),
         };
 
@@ -1067,6 +1091,86 @@ impl<'g> GrammarInterpreter<'g> {
         ))))
     }
 
+    /// Construct a TypedAnnotation (e.g., @deprecated, @inline)
+    fn construct_annotation<'a>(
+        &self,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        span: Span,
+    ) -> Result<ParsedValue, String> {
+        let name = self.get_field_as_interned("name", fields, state)?;
+        let args = self.get_field_as_annotation_arg_list("args", fields, state)?;
+
+        Ok(ParsedValue::Annotation(TypedAnnotation {
+            name,
+            args,
+            span,
+        }))
+    }
+
+    /// Construct a TypedAnnotationArg (positional or named)
+    fn construct_annotation_arg<'a>(
+        &self,
+        variant: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        _span: Span,
+    ) -> Result<ParsedValue, String> {
+        let arg = match variant {
+            "Positional" => {
+                let value = self.get_field_as_annotation_value("value", fields, state)?;
+                TypedAnnotationArg::Positional(value)
+            }
+            "Named" => {
+                let name = self.get_field_as_interned("name", fields, state)?;
+                let value = self.get_field_as_annotation_value("value", fields, state)?;
+                TypedAnnotationArg::Named { name, value }
+            }
+            _ => return Err(format!("unknown TypedAnnotationArg variant: {}", variant)),
+        };
+
+        Ok(ParsedValue::AnnotationArg(arg))
+    }
+
+    /// Construct a TypedAnnotationValue (string, int, bool, identifier, list)
+    fn construct_annotation_value<'a>(
+        &self,
+        variant: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        _span: Span,
+    ) -> Result<ParsedValue, String> {
+        let value = match variant {
+            "String" => {
+                let s = self.get_field_as_interned("value", fields, state)?;
+                TypedAnnotationValue::String(s)
+            }
+            "Integer" => {
+                let n = self.get_field_as_int("value", fields, state)?;
+                TypedAnnotationValue::Integer(n)
+            }
+            "Float" => {
+                let f = self.get_field_as_float("value", fields, state)?;
+                TypedAnnotationValue::Float(f)
+            }
+            "Bool" => {
+                let b = self.get_field_as_bool("value", fields, state)?;
+                TypedAnnotationValue::Bool(b)
+            }
+            "Identifier" => {
+                let id = self.get_field_as_interned("value", fields, state)?;
+                TypedAnnotationValue::Identifier(id)
+            }
+            "List" => {
+                let items = self.get_field_as_annotation_value_list("items", fields, state)?;
+                TypedAnnotationValue::List(items)
+            }
+            _ => return Err(format!("unknown TypedAnnotationValue variant: {}", variant)),
+        };
+
+        Ok(ParsedValue::AnnotationValue(value))
+    }
+
     /// Construct a TypedParameter (function parameter)
     fn construct_parameter<'a>(
         &self,
@@ -1151,6 +1255,18 @@ impl<'g> GrammarInterpreter<'g> {
                 let value: f64 = text.parse()
                     .map_err(|_| format!("cannot parse '{}' as float", text))?;
                 Ok(ParsedValue::Float(value))
+            }
+            "parse_bool" => {
+                if args.len() != 1 {
+                    return Err("parse_bool() requires exactly 1 argument".to_string());
+                }
+                let text = self.eval_expr_as_string(&args[0], state)?;
+                let value = match text.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(format!("cannot parse '{}' as boolean", text)),
+                };
+                Ok(ParsedValue::Bool(value))
             }
             "text" => {
                 // Get the text of the current match (typically used in atomic rules)
@@ -2469,6 +2585,149 @@ impl<'g> GrammarInterpreter<'g> {
                 log::error!("Cannot convert value to declaration. Got: {:?}", std::mem::discriminant(&other));
                 Err("cannot convert value to declaration".to_string())
             }
+        }
+    }
+
+    /// Get a field as a TypedDeclaration
+    fn get_field_as_declaration<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<TypedNode<TypedDeclaration>, String> {
+        let expr = self.get_field(name, fields)
+            .ok_or_else(|| format!("missing field: {}", name))?;
+        let val = self.eval_expr(expr, state)?;
+        self.parsed_value_to_decl(val)
+    }
+
+    /// Get a field as a list of TypedAnnotation
+    fn get_field_as_annotation_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedAnnotation>, String> {
+        match self.get_field(name, fields) {
+            Some(expr) => {
+                let val = self.eval_expr(expr, state)?;
+                match val {
+                    ParsedValue::List(items) => {
+                        let mut result = Vec::new();
+                        for item in items {
+                            let ann = self.parsed_value_to_annotation(item)?;
+                            result.push(ann);
+                        }
+                        Ok(result)
+                    }
+                    ParsedValue::None => Ok(vec![]),
+                    ParsedValue::Optional(None) => Ok(vec![]),
+                    ParsedValue::Annotation(a) => Ok(vec![a]),
+                    other => Err(format!("field '{}' is not an annotation list: {:?}", name, other)),
+                }
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Get a field as a list of TypedAnnotationArg
+    fn get_field_as_annotation_arg_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedAnnotationArg>, String> {
+        match self.get_field(name, fields) {
+            Some(expr) => {
+                let val = self.eval_expr(expr, state)?;
+                match val {
+                    ParsedValue::List(items) => {
+                        let mut result = Vec::new();
+                        for item in items {
+                            let arg = self.parsed_value_to_annotation_arg(item)?;
+                            result.push(arg);
+                        }
+                        Ok(result)
+                    }
+                    ParsedValue::None => Ok(vec![]),
+                    ParsedValue::Optional(None) => Ok(vec![]),
+                    ParsedValue::AnnotationArg(a) => Ok(vec![a]),
+                    other => Err(format!("field '{}' is not an annotation arg list: {:?}", name, other)),
+                }
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Get a field as a TypedAnnotationValue
+    fn get_field_as_annotation_value<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<TypedAnnotationValue, String> {
+        let expr = self.get_field(name, fields)
+            .ok_or_else(|| format!("missing field: {}", name))?;
+        let val = self.eval_expr(expr, state)?;
+        self.parsed_value_to_annotation_value(val)
+    }
+
+    /// Get a field as a list of TypedAnnotationValue
+    fn get_field_as_annotation_value_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedAnnotationValue>, String> {
+        match self.get_field(name, fields) {
+            Some(expr) => {
+                let val = self.eval_expr(expr, state)?;
+                match val {
+                    ParsedValue::List(items) => {
+                        let mut result = Vec::new();
+                        for item in items {
+                            let v = self.parsed_value_to_annotation_value(item)?;
+                            result.push(v);
+                        }
+                        Ok(result)
+                    }
+                    ParsedValue::None => Ok(vec![]),
+                    ParsedValue::Optional(None) => Ok(vec![]),
+                    ParsedValue::AnnotationValue(v) => Ok(vec![v]),
+                    other => Err(format!("field '{}' is not an annotation value list: {:?}", name, other)),
+                }
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Convert ParsedValue to TypedAnnotation
+    fn parsed_value_to_annotation(&self, val: ParsedValue) -> Result<TypedAnnotation, String> {
+        match val {
+            ParsedValue::Annotation(a) => Ok(a),
+            _ => Err(format!("cannot convert value to annotation: {:?}", val)),
+        }
+    }
+
+    /// Convert ParsedValue to TypedAnnotationArg
+    fn parsed_value_to_annotation_arg(&self, val: ParsedValue) -> Result<TypedAnnotationArg, String> {
+        match val {
+            ParsedValue::AnnotationArg(a) => Ok(a),
+            _ => Err(format!("cannot convert value to annotation arg: {:?}", val)),
+        }
+    }
+
+    /// Convert ParsedValue to TypedAnnotationValue
+    fn parsed_value_to_annotation_value(&self, val: ParsedValue) -> Result<TypedAnnotationValue, String> {
+        match val {
+            ParsedValue::AnnotationValue(v) => Ok(v),
+            // Allow direct conversion from primitives
+            ParsedValue::Int(i) => Ok(TypedAnnotationValue::Integer(i)),
+            ParsedValue::Bool(b) => Ok(TypedAnnotationValue::Bool(b)),
+            ParsedValue::Float(f) => Ok(TypedAnnotationValue::Float(f)),
+            ParsedValue::Text(s) => Ok(TypedAnnotationValue::String(zyntax_typed_ast::InternedString::new_global(&s))),
+            ParsedValue::Interned(s) => Ok(TypedAnnotationValue::Identifier(s)),
+            _ => Err(format!("cannot convert value to annotation value: {:?}", val)),
         }
     }
 

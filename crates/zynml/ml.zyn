@@ -346,49 +346,117 @@ pipeline_def = { "pipeline" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ ("->" ~ type
   }
 
 // ============================================================================
-// Decorated Items (@cache, @memoize, @kernel, @workgroup, @device)
+// Annotations (@deprecated, @inline, @derive, etc.)
 // ============================================================================
 
-// @cache(ttl=1h) fn expensive() { ... }
-// @memoize fn compute() { ... }
-// @kernel elementwise
-decorated_item = { decorator+ ~ (fn_def | pipeline_def) }
-  -> TypedDeclaration {
-      "commands": [
-          { "define": "decorated", "args": {
-              "decorators": "$1",
-              "item": "$2"
-          }}
-      ]
+// @deprecated("Use new_function instead")
+// @inline
+// @derive(Debug, Clone)
+// @jit
+// Supports both function and pipeline definitions
+decorated_item = { decorated_function | decorated_pipeline }
+
+decorated_function = { ann:annotation+ ~ func:fn_def }
+  -> TypedDeclaration::AnnotatedFunction {
+      annotations: ann,
+      function: func,
   }
 
-// Decorator: @name or @name(args)
-decorator = { "@" ~ identifier ~ decorator_args? }
-  -> TypedExpression {
-      "commands": [
-          { "define": "decorator", "args": {
-              "name": "$1",
-              "args": "$2"
-          }}
-      ]
+// @cache(ttl=1h)
+// pipeline search(query) { ... }
+decorated_pipeline = { ann:annotation+ ~ pipe:pipeline_def }
+  -> TypedDeclaration::AnnotatedFunction {
+      annotations: ann,
+      function: pipe,
   }
 
-decorator_args = { "(" ~ decorator_arg_list ~ ")" }
-  -> List {
-      "get_child": { "index": 0 }
+// Annotation: @name or @name(args)
+annotation = { annotation_with_args | annotation_simple }
+
+// @deprecated("message") or @derive(Debug, Clone) or @validate(min=1, max=100)
+annotation_with_args = { "@" ~ name:identifier ~ "(" ~ args:annotation_arg_list ~ ")" }
+  -> TypedAnnotation {
+      name: intern(name),
+      args: args,
   }
 
-decorator_arg_list = { decorator_arg ~ ("," ~ decorator_arg)* }
-  -> List {
-      "get_all_children": true
+// @inline or @jit
+annotation_simple = { "@" ~ name:identifier }
+  -> TypedAnnotation {
+      name: intern(name),
+      args: [],
   }
 
-// ttl=1h or just identifier for kernel types
-decorator_arg = { identifier ~ "=" ~ expr | identifier | expr }
-  -> TypedExpression {
-      "get_all_children": true,
-      "define": "decorator_arg"
+// Annotation argument list
+annotation_arg_list = { arg:annotation_arg ~ ("," ~ arg:annotation_arg)* }
+  -> arg
+
+// Annotation argument: named (key=value) or positional
+annotation_arg = { annotation_named_arg | annotation_positional_arg }
+
+// Named argument: min=1
+annotation_named_arg = { name:identifier ~ "=" ~ value:annotation_value }
+  -> TypedAnnotationArg::Named {
+      name: intern(name),
+      value: value,
   }
+
+// Positional argument: "message" or Debug or 100
+annotation_positional_arg = { value:annotation_value }
+  -> TypedAnnotationArg::Positional {
+      value: value,
+  }
+
+// Annotation values: literals, identifiers
+// Note: These use separate atomic rules to capture raw text for annotation-specific parsing
+// Order matters: duration must come before int (both start with digits)
+annotation_value = {
+    annotation_string_value |
+    annotation_duration_value |
+    annotation_int_value |
+    annotation_bool_value |
+    annotation_ident_value
+}
+
+// String value in annotation - use raw string rule for proper parsing
+annotation_string_value = { value:annotation_string_raw }
+  -> TypedAnnotationValue::String {
+      value: intern(value),
+  }
+
+annotation_string_raw = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+
+// Duration value in annotation - e.g., 1h, 5m, 30s, 500ms, 2d
+annotation_duration_value = { value:annotation_duration_raw }
+  -> TypedAnnotationValue::String {
+      value: intern(value),
+  }
+
+annotation_duration_raw = @{ ASCII_DIGIT+ ~ ("ms" | "s" | "m" | "h" | "d") }
+
+// Integer value in annotation - atomic rule for raw integer text
+annotation_int_value = { value:annotation_int_raw }
+  -> TypedAnnotationValue::Integer {
+      value: parse_int(value),
+  }
+
+annotation_int_raw = @{ "-"? ~ ASCII_DIGIT+ }
+
+// Boolean value in annotation
+annotation_bool_value = { value:annotation_bool_raw }
+  -> TypedAnnotationValue::Bool {
+      value: parse_bool(value),
+  }
+
+annotation_bool_raw = @{ "true" | "false" }
+
+annotation_ident_value = { name:identifier }
+  -> TypedAnnotationValue::Identifier {
+      value: intern(name),
+  }
+
+// Decorator alias for backward compatibility (same as annotation)
+decorator = { annotation }
 
 // ============================================================================
 // Render Statement (Visualization for ZynBook)
