@@ -148,6 +148,11 @@ pub enum ParsedValue {
     Variant(zyntax_typed_ast::TypedVariant),
     /// A struct/class field
     Field(zyntax_typed_ast::TypedField),
+    /// A postfix suffix for fold operations (field access, method call, etc.)
+    Suffix {
+        kind: String,
+        fields: std::collections::HashMap<String, Box<ParsedValue>>,
+    },
 }
 
 /// Handle to an AST node (opaque, managed by builder)

@@ -1707,6 +1707,83 @@ mod grammar2_parsing {
         let result = grammar.parse("fn test() { foo() }");
         assert!(result.is_ok(), "Should parse call in fn body: {:?}", result.err());
     }
+
+    // =========================================================================
+    // Chained Operations Tests
+    // =========================================================================
+
+    #[test]
+    fn test_grammar2_parse_field_access() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { obj.field }");
+        assert!(result.is_ok(), "Should parse field access: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_chained_field_access() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { obj.field.subfield }");
+        assert!(result.is_ok(), "Should parse chained field access: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_method_call() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { obj.method() }");
+        assert!(result.is_ok(), "Should parse method call: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_chained_method_calls() {
+        let grammar = get_grammar2();
+        // Test without array literal first (simpler case)
+        let result = grammar.parse("def test() { tensor.normalize().transpose() }");
+        assert!(result.is_ok(), "Should parse chained method calls: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_chained_method_with_args() {
+        let grammar = get_grammar2();
+        // Test with simple numeric arguments
+        let result = grammar.parse("def test() { tensor.reshape(2).transpose() }");
+        assert!(result.is_ok(), "Should parse chained methods with args: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_mixed_chains() {
+        let grammar = get_grammar2();
+        // field -> method -> field
+        let result = grammar.parse("def test() { obj.data.process().result }");
+        assert!(result.is_ok(), "Should parse mixed chains: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_index_access() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { arr[0] }");
+        assert!(result.is_ok(), "Should parse index access: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_chained_index_access() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { matrix[0][1] }");
+        assert!(result.is_ok(), "Should parse chained index access: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_field_and_index() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { obj.items[0] }");
+        assert!(result.is_ok(), "Should parse field then index: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_grammar2_parse_self_field_access() {
+        let grammar = get_grammar2();
+        let result = grammar.parse("def test() { self.x }");
+        assert!(result.is_ok(), "Should parse self.x: {:?}", result.err());
+    }
 }
 
 // ============================================================================

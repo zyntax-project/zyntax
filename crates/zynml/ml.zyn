@@ -1646,37 +1646,37 @@ unary_prefix_expr = { unary_op? ~ operand:postfix_expr }
 unary_op = @{ "-" | "!" }
 
 // Postfix: function calls, indexing, member access
-// Priority order: direct_call > method_call > field_access > indexing > base
-// Note: method_call must come before field_access to match `obj.method()` before `obj.method`
-postfix_expr = { direct_call_expr | method_call_expr | field_access_expr | index_expr | primary_expr }
+// Uses folding approach to support chained operations like obj.field.method().field
+// The base expression is parsed first, then zero or more suffixes are folded left-to-right
+postfix_expr = { base:primary_expr ~ suffixes:postfix_suffix* }
+  -> fold_postfix(base, suffixes)
 
-// Direct function call: foo(args)
-direct_call_expr = { callee:identifier ~ "(" ~ args:call_args_list? ~ ")" }
-  -> TypedExpression::Call {
-      callee: Box::new(TypedExpression::Variable { name: intern(callee) }),
-      args: args,
-  }
+// Postfix suffix operations - order matters: method before field (to match `obj.method()` before `obj.method`)
+postfix_suffix = { suffix_method | suffix_field | suffix_call | suffix_index }
 
-// Method call: obj.method(args)
-method_call_expr = { object:primary_expr ~ "." ~ method:identifier ~ "(" ~ args:call_args_list? ~ ")" }
-  -> TypedExpression::MethodCall {
-      object: Box::new(object),
+// Method call suffix: .method(args)
+suffix_method = { "." ~ method:identifier ~ "(" ~ args:call_args_list? ~ ")" }
+  -> SuffixMethod {
       method: intern(method),
       args: args,
   }
 
-// Field access: obj.field
-field_access_expr = { object:primary_expr ~ "." ~ field:identifier }
-  -> TypedExpression::Field {
-      object: Box::new(object),
+// Field access suffix: .field
+suffix_field = { "." ~ field:identifier }
+  -> SuffixField {
       field: intern(field),
   }
 
-// Indexing: arr[idx]
-index_expr = { object:primary_expr ~ "[" ~ index:expr ~ "]" }
-  -> TypedExpression::Index {
-      object: Box::new(object),
-      index: Box::new(index),
+// Function call suffix: (args) - for things like foo()(42) or (lambda)(args)
+suffix_call = { "(" ~ args:call_args_list? ~ ")" }
+  -> SuffixCall {
+      args: args,
+  }
+
+// Index suffix: [index]
+suffix_index = { "[" ~ index:expr ~ "]" }
+  -> SuffixIndex {
+      index: index,
   }
 
 // Legacy postfix_op rules (kept for reference but not used in main path)

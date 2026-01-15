@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use log::{debug, trace};
 use zyntax_typed_ast::{
     TypedNode, TypedStatement, TypedExpression, TypedLiteral, TypedBlock,
-    TypedDeclaration, TypedFunction, TypedLet, TypedCall, TypedProgram,
+    TypedDeclaration, TypedFunction, TypedLet, TypedCall, TypedMethodCall, TypedProgram,
     TypedIf, TypedWhile, TypedFor, TypedUnary, TypedFieldAccess, TypedIndex,
     TypedRange, TypedStructLiteral, TypedFieldInit, TypedPattern,
     TypedParameter, TypedVariant, TypedVariantFields, TypedTypeAlias, ParameterKind,
@@ -253,8 +253,30 @@ impl<'g> GrammarInterpreter<'g> {
             ["TypedFieldInit"] => {
                 self.construct_field_init(fields, state, span)
             }
+            // Postfix suffix types for fold operations
+            ["SuffixField"] | ["SuffixMethod"] | ["SuffixCall"] | ["SuffixIndex"] => {
+                self.construct_suffix(type_path, fields, state)
+            }
             _ => Err(format!("unknown type path: {}", type_path)),
         }
+    }
+
+    /// Construct a postfix suffix for fold operations
+    fn construct_suffix<'a>(
+        &self,
+        type_path: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<ParsedValue, String> {
+        let mut suffix_fields = std::collections::HashMap::new();
+        for (name, expr) in fields {
+            let value = self.eval_expr(expr, state)?;
+            suffix_fields.insert(name.clone(), Box::new(value));
+        }
+        Ok(ParsedValue::Suffix {
+            kind: type_path.to_string(),
+            fields: suffix_fields,
+        })
     }
 
     /// Construct a TypedBlock
@@ -1119,7 +1141,197 @@ impl<'g> GrammarInterpreter<'g> {
                 }
                 Ok(ParsedValue::List(result))
             }
+            "fold_postfix" => {
+                // fold_postfix(base, suffixes) - fold postfix operations into nested expressions
+                // base: the base expression (TypedExpression)
+                // suffixes: list of suffix operations, each with a "kind" field
+                // Returns the folded TypedExpression
+                if args.len() != 2 {
+                    return Err("fold_postfix() requires exactly 2 arguments (base, suffixes)".to_string());
+                }
+                let base = self.eval_expr(&args[0], state)?;
+                let suffixes = self.eval_expr(&args[1], state)?;
+
+                // Get the suffixes as a list
+                let suffix_list = match suffixes {
+                    ParsedValue::List(items) => items,
+                    ParsedValue::Optional(None) | ParsedValue::None => vec![],
+                    ParsedValue::Optional(Some(inner)) => {
+                        match *inner {
+                            ParsedValue::List(items) => items,
+                            other => vec![other],
+                        }
+                    }
+                    other => vec![other],
+                };
+
+                // If no suffixes, return base as-is
+                if suffix_list.is_empty() {
+                    return Ok(base);
+                }
+
+                // Fold left over suffixes
+                let mut acc = base;
+                for suffix in suffix_list {
+                    acc = self.apply_postfix_suffix(acc, suffix, state, span)?;
+                }
+
+                Ok(acc)
+            }
             _ => Err(format!("unknown helper function: {}", function)),
+        }
+    }
+
+    /// Apply a postfix suffix to an accumulator expression
+    /// The suffix should be a Suffix value with a kind like "SuffixField", "SuffixMethod", etc.
+    fn apply_postfix_suffix<'a>(
+        &self,
+        acc: ParsedValue,
+        suffix: ParsedValue,
+        state: &mut ParserState<'a>,
+        span: Span,
+    ) -> Result<ParsedValue, String> {
+        // The suffix should be a Suffix variant with kind and fields
+        match suffix {
+            ParsedValue::Suffix { kind, fields } => {
+                match kind.as_str() {
+                    "SuffixField" => {
+                        // Field access: acc.field
+                        let field = fields.get("field")
+                            .ok_or("SuffixField missing 'field'")?;
+
+                        // Convert acc to TypedExpression
+                        let acc_expr = self.parsed_value_to_expr(acc, state)?;
+
+                        // Get the field name
+                        let field_name = match field.as_ref() {
+                            ParsedValue::Interned(s) => *s,
+                            ParsedValue::Text(s) => state.intern(s),
+                            other => return Err(format!("SuffixField field must be interned, got {:?}", other)),
+                        };
+
+                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                            TypedExpression::Field(TypedFieldAccess {
+                                object: Box::new(acc_expr),
+                                field: field_name,
+                            }),
+                            Type::Unknown,
+                            span,
+                        ))))
+                    }
+                    "SuffixMethod" => {
+                        // Method call: acc.method(args)
+                        let method = fields.get("method")
+                            .ok_or("SuffixMethod missing 'method'")?;
+                        let args_val = fields.get("args");
+
+                        // Convert acc to TypedExpression
+                        let acc_expr = self.parsed_value_to_expr(acc, state)?;
+
+                        // Get the method name
+                        let method_name = match method.as_ref() {
+                            ParsedValue::Interned(s) => *s,
+                            ParsedValue::Text(s) => state.intern(s),
+                            other => return Err(format!("SuffixMethod method must be interned, got {:?}", other)),
+                        };
+
+                        // Get args as expression list
+                        let args = match args_val {
+                            Some(expr_val) => {
+                                self.parsed_value_list_to_expr_vec(expr_val.as_ref().clone(), state)?
+                            }
+                            None => vec![],
+                        };
+
+                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                            TypedExpression::MethodCall(TypedMethodCall {
+                                receiver: Box::new(acc_expr),
+                                method: method_name,
+                                type_args: vec![],
+                                positional_args: args,
+                                named_args: vec![],
+                            }),
+                            Type::Unknown,
+                            span,
+                        ))))
+                    }
+                    "SuffixCall" => {
+                        // Function call: acc(args) - this treats acc as the callee
+                        let args_val = fields.get("args");
+
+                        // Convert acc to TypedExpression
+                        let acc_expr = self.parsed_value_to_expr(acc, state)?;
+
+                        // Get args as expression list
+                        let args = match args_val {
+                            Some(expr_val) => {
+                                self.parsed_value_list_to_expr_vec(expr_val.as_ref().clone(), state)?
+                            }
+                            None => vec![],
+                        };
+
+                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                            TypedExpression::Call(TypedCall {
+                                callee: Box::new(acc_expr),
+                                positional_args: args,
+                                named_args: vec![],
+                                type_args: vec![],
+                            }),
+                            Type::Unknown,
+                            span,
+                        ))))
+                    }
+                    "SuffixIndex" => {
+                        // Index access: acc[index]
+                        let index = fields.get("index")
+                            .ok_or("SuffixIndex missing 'index'")?;
+
+                        // Convert acc to TypedExpression
+                        let acc_expr = self.parsed_value_to_expr(acc, state)?;
+
+                        // Convert index to TypedExpression
+                        let index_expr = self.parsed_value_to_expr(index.as_ref().clone(), state)?;
+
+                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                            TypedExpression::Index(TypedIndex {
+                                object: Box::new(acc_expr),
+                                index: Box::new(index_expr),
+                            }),
+                            Type::Unknown,
+                            span,
+                        ))))
+                    }
+                    other => Err(format!("Unknown postfix suffix type: {}", other)),
+                }
+            }
+            other => Err(format!("Postfix suffix must be a Suffix, got {:?}", other)),
+        }
+    }
+
+    /// Convert a ParsedValue list directly to a Vec of TypedExpression
+    fn parsed_value_list_to_expr_vec<'a>(
+        &self,
+        val: ParsedValue,
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedNode<TypedExpression>>, String> {
+        match val {
+            ParsedValue::List(items) => {
+                items.into_iter()
+                    .map(|item| self.parsed_value_to_expr(item, state))
+                    .collect()
+            }
+            ParsedValue::Optional(None) | ParsedValue::None => Ok(vec![]),
+            ParsedValue::Optional(Some(inner)) => {
+                match *inner {
+                    ParsedValue::List(items) => {
+                        items.into_iter()
+                            .map(|item| self.parsed_value_to_expr(item, state))
+                            .collect()
+                    }
+                    other => Ok(vec![self.parsed_value_to_expr(other, state)?]),
+                }
+            }
+            other => Ok(vec![self.parsed_value_to_expr(other, state)?]),
         }
     }
 
