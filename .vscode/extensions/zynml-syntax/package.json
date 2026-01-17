@@ -1,0 +1,30 @@
+{
+  "name": "zynml-syntax",
+  "displayName": "ZynML Language Support",
+  "description": "Syntax highlighting for ZynML - Machine Learning DSL for Zyntax",
+  "version": "0.1.0",
+  "publisher": "zyntax",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "zynml",
+        "aliases": ["ZynML", "zynml"],
+        "extensions": [".zynml", ".zyn"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "zynml",
+        "scopeName": "source.zynml",
+        "path": "./syntaxes/zynml.tmLanguage.json"
+      }
+    ]
+  }
+}

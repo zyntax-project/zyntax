@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "*.zyn": "zyn"
+        "*.zyn": "zynml",
+        "*.zynml": "zynml"
     }
 }
