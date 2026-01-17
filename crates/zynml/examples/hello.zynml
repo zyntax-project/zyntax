@@ -1,35 +1,59 @@
+// ============================================================================
 // ZynML Example: Hello World
+// ============================================================================
 // Run with: zynml run examples/hello.zynml
+//
+// Demonstrates:
+// - Importing the standard library
+// - Creating tensors using static methods
+// - Basic arithmetic operations via operator overloading
+// - Method calls on tensors
+// ============================================================================
 
-fn main() {
-    // Print a welcome message
+import prelude
+import tensor
+
+def main() {
     println("Hello from ZynML!")
 
-    // Basic tensor operations
-    let x = tensor([1.0, 2.0, 3.0, 4.0])
-    let y = tensor([5.0, 6.0, 7.0, 8.0])
+    // Create tensors using static methods
+    let a = Tensor::arange(1.0, 5.0, 1.0)  // [1.0, 2.0, 3.0, 4.0]
+    let b = Tensor::arange(5.0, 9.0, 1.0)  // [5.0, 6.0, 7.0, 8.0]
 
-    // Compute dot product using @ operator (like Python's matrix multiply)
-    let dot = x @ y
-    println("Dot product (x @ y): ")
+    println("Tensor a:")
+    println(a)
 
-    // Or use method syntax: x.dot(y)
-    let dot2 = x.dot(y)
-    println("Dot product (x.dot(y)): ")
+    println("Tensor b:")
+    println(b)
 
-    // Create a 2D tensor
-    let matrix = tensor([[1.0, 2.0], [3.0, 4.0]])
+    // Arithmetic operations using operator overloading
+    let sum = a + b
+    println("a + b:")
+    println(sum)
 
-    // Tensor operations using method syntax
-    let s = matrix.sum()
-    let m = matrix.mean()
+    let diff = b - a
+    println("b - a:")
+    println(diff)
 
-    println("Sum (matrix.sum()): ")
-    println("Mean (matrix.mean()): ")
+    let prod = a * b
+    println("a * b (element-wise):")
+    println(prod)
 
-    // Can also use function syntax
-    let s2 = tensor_sum(matrix)
-    println("Sum (tensor_sum(matrix)): ")
+    // Reduction operations
+    let total = a.sum()
+    println(f"Sum of a: {total}")
+
+    let avg = a.mean()
+    println(f"Mean of a: {avg}")
+
+    // Create a matrix
+    let matrix = Tensor::zeros([2, 3])
+    println("2x3 zeros matrix:")
+    println(matrix)
+
+    let ones = Tensor::ones([3, 2])
+    println("3x2 ones matrix:")
+    println(ones)
 
     println("Done!")
 }

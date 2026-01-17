@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0] - 2026-01-17
+
+### Changed
+
+- Removed `pub` keyword (all items are public by default)
+- Added Python-style private item convention (`_` prefix)
+- Private functions, methods, and variables now have distinct scopes:
+  - `entity.name.function.private.zynml` for private function definitions
+  - `entity.name.function.call.private.zynml` for private function calls
+  - `entity.name.function.method.private.zynml` for private method calls
+  - `variable.other.private.zynml` for private variables
+  - `variable.parameter.private.zynml` for private parameters
+
 ## [0.1.0] - 2026-01-17
 
 ### Added

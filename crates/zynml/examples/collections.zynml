@@ -1,0 +1,234 @@
+// ============================================================================
+// ZynML Example: Collections and Error Handling
+// ============================================================================
+// Run with: zynml run examples/collections.zynml
+//
+// Demonstrates:
+// - Option<T> type and methods (Some, None, unwrap_or)
+// - Result<T, E> type and methods (Ok, Err, unwrap_or)
+// - HashMap<K, V> for key-value storage
+// - HashSet<T> for unique collections
+// - Pattern matching with match expressions
+// ============================================================================
+
+import prelude
+
+// ============================================================================
+// Option<T> Examples
+// ============================================================================
+
+def find_even(numbers: List<i64>): ?i64 {
+    // Find first even number in list
+    for n in numbers {
+        if n % 2 == 0 {
+            return Some(n)
+        }
+    }
+    None
+}
+
+def safe_divide(a: f64, b: f64): ?f64 {
+    if b == 0.0 {
+        None
+    } else {
+        Some(a / b)
+    }
+}
+
+def test_option() {
+    println("=== Option<T> Examples ===")
+
+    // Creating Option values
+    let some_value: ?i64 = Some(42)
+    let no_value: ?i64 = None
+
+    // Check if value exists
+    println(f"some_value.is_some(): {some_value.is_some()}")
+    println(f"no_value.is_none(): {no_value.is_none()}")
+
+    // Get value with default
+    let v1 = some_value.unwrap_or(0)
+    let v2 = no_value.unwrap_or(-1)
+    println(f"some_value.unwrap_or(0): {v1}")
+    println(f"no_value.unwrap_or(-1): {v2}")
+
+    // Safe division
+    let result = safe_divide(10.0, 2.0)
+    println(f"10.0 / 2.0 = {result.unwrap_or(0.0)}")
+
+    // Division by zero returns None
+    let bad_result = safe_divide(10.0, 0.0)
+    println(f"10.0 / 0.0 = {bad_result.unwrap_or(-999.0)} (None -> -999)")
+
+    // Pattern matching
+    match some_value {
+        case Some(v) { println(f"Got value: {v}") }
+        case None() { println("No value") }
+    }
+}
+
+// ============================================================================
+// Result<T, E> Examples
+// ============================================================================
+
+def validate_range(n: i64, min: i64, max: i64): Result<i64, String> {
+    if n < min {
+        Err(f"Value {n} is below minimum {min}")
+    } else if n > max {
+        Err(f"Value {n} is above maximum {max}")
+    } else {
+        Ok(n)
+    }
+}
+
+def test_result() {
+    println("\n=== Result<T, E> Examples ===")
+
+    // Creating Result values
+    let success: Result<i64, String> = Ok(100)
+    let failure: Result<i64, String> = Err("Something went wrong")
+
+    // Check result type
+    println(f"success.is_ok(): {success.is_ok()}")
+    println(f"failure.is_err(): {failure.is_err()}")
+
+    // Get value with default
+    let v1 = success.unwrap_or(0)
+    let v2 = failure.unwrap_or(-1)
+    println(f"success.unwrap_or(0): {v1}")
+    println(f"failure.unwrap_or(-1): {v2}")
+
+    // Convert to Option
+    let opt = success.ok()
+    println(f"success.ok().is_some(): {opt.is_some()}")
+
+    // Pattern matching
+    match validate_range(150, 0, 100) {
+        case Ok(v) { println(f"Valid: {v}") }
+        case Err(e) { println(f"Invalid: {e}") }
+    }
+
+    match validate_range(50, 0, 100) {
+        case Ok(v) { println(f"Valid: {v}") }
+        case Err(e) { println(f"Invalid: {e}") }
+    }
+}
+
+// ============================================================================
+// HashMap<K, V> Examples
+// ============================================================================
+
+def test_hashmap() {
+    println("\n=== HashMap<K, V> Examples ===")
+
+    // Create a new HashMap
+    mut scores: HashMap<String, i64> = HashMap::new()
+
+    // Insert key-value pairs
+    scores.insert("Alice", 95)
+    scores.insert("Bob", 87)
+    scores.insert("Charlie", 92)
+
+    println(f"HashMap size: {scores.len()}")
+
+    // Get values
+    let alice_score = scores.get("Alice")
+    match alice_score {
+        case Some(s) { println(f"Alice's score: {s}") }
+        case None() { println("Alice not found") }
+    }
+
+    // Check for key
+    let has_bob = scores.contains_key("Bob")
+    let has_dave = scores.contains_key("Dave")
+    println(f"Contains Bob: {has_bob}")
+    println(f"Contains Dave: {has_dave}")
+
+    // Update a value
+    scores.insert("Bob", 90)  // Overwrites existing
+    let new_bob = scores.get("Bob")
+    println(f"Bob's new score: {new_bob.unwrap_or(0)}")
+
+    // Remove a key
+    let removed = scores.remove("Charlie")
+    println(f"Removed Charlie with score: {removed.unwrap_or(0)}")
+    println(f"HashMap size after remove: {scores.len()}")
+
+    // Clear the map
+    scores.clear()
+    println(f"Is empty after clear: {scores.is_empty()}")
+}
+
+// ============================================================================
+// HashSet<T> Examples
+// ============================================================================
+
+def test_hashset() {
+    println("\n=== HashSet<T> Examples ===")
+
+    // Create a new HashSet
+    mut tags: HashSet<String> = HashSet::new()
+
+    // Insert elements (returns true if new, false if already present)
+    let inserted1 = tags.insert("rust")
+    let inserted2 = tags.insert("ml")
+    let inserted3 = tags.insert("rust")  // Duplicate
+
+    println(f"Inserted 'rust' first time: {inserted1}")
+    println(f"Inserted 'ml': {inserted2}")
+    println(f"Inserted 'rust' second time: {inserted3}")
+
+    println(f"HashSet size: {tags.len()}")
+
+    // Check membership
+    let has_rust = tags.contains("rust")
+    let has_python = tags.contains("python")
+    println(f"Contains rust: {has_rust}")
+    println(f"Contains python: {has_python}")
+
+    // Add more elements
+    tags.insert("tensor")
+    tags.insert("neural")
+
+    // Remove element
+    let removed = tags.remove("ml")
+    println(f"Removed 'ml': {removed}")
+    println(f"HashSet size after remove: {tags.len()}")
+
+    // Clear
+    tags.clear()
+    println(f"Is empty after clear: {tags.is_empty()}")
+}
+
+// ============================================================================
+// Null Coalescing Operator (??)
+// ============================================================================
+
+def test_null_coalescing() {
+    println("\n=== Null Coalescing (??) ===")
+
+    let maybe_name: ?String = None
+    let name = maybe_name ?? "Anonymous"
+    println(f"Name: {name}")
+
+    let maybe_value: ?i64 = Some(42)
+    let value = maybe_value ?? 0
+    println(f"Value: {value}")
+
+    // Chaining
+    let first: ?i64 = None
+    let second: ?i64 = None
+    let third: ?i64 = Some(100)
+    let result = first ?? second ?? third ?? 0
+    println(f"First non-null: {result}")
+}
+
+def main() {
+    test_option()
+    test_result()
+    test_hashmap()
+    test_hashset()
+    test_null_coalescing()
+
+    println("\n=== All collection examples completed! ===")
+}

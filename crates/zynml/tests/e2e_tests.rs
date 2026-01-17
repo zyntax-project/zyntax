@@ -345,6 +345,29 @@ mod type_system {
         assert!(result.is_ok(), "Should parse opaque type: {:?}", result.err());
     }
 
+    // --- Extern Struct ---
+
+    #[test]
+    fn test_parse_extern_struct_simple() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json(r#"extern struct Tensor"#);
+        assert!(result.is_ok(), "Should parse simple extern struct: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_extern_struct_generic() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json(r#"extern struct HashMap<K, V>"#);
+        assert!(result.is_ok(), "Should parse generic extern struct: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_extern_struct_single_param() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json(r#"extern struct List<T>"#);
+        assert!(result.is_ok(), "Should parse extern struct with single type param: {:?}", result.err());
+    }
+
     // --- Generics with Bounds ---
 
     #[test]
@@ -1108,6 +1131,59 @@ mod pipeline_definitions {
         "#);
         assert!(result.is_ok(), "Should parse pipeline as function: {:?}", result.err());
     }
+
+    // --- Lambda Expressions ---
+
+    #[test]
+    fn test_parse_lambda_simple() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json("let double = def(x): x * 2");
+        assert!(result.is_ok(), "Should parse simple lambda: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_lambda_multiple_params() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json("let add = def(x, y): x + y");
+        assert!(result.is_ok(), "Should parse lambda with multiple params: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_lambda_no_params() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json("let unit = def(): 42");
+        assert!(result.is_ok(), "Should parse lambda with no params: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_lambda_in_call() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json("let result = map(items, def(x): x * 2)");
+        assert!(result.is_ok(), "Should parse lambda as function argument: {:?}", result.err());
+    }
+
+    // --- Import Modifier Expressions ---
+
+    #[test]
+    fn test_parse_import_asset() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json(r#"let img = import asset("image.jpg") as Image"#);
+        assert!(result.is_ok(), "Should parse import asset expression: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_import_audio() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json(r#"let audio = import audio("sound.wav") as AudioBuffer"#);
+        assert!(result.is_ok(), "Should parse import audio expression: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_import_model() {
+        let grammar = get_grammar();
+        let result = grammar.parse_to_json(r#"let model = import model("bert.onnx") as TextModel"#);
+        assert!(result.is_ok(), "Should parse import model expression: {:?}", result.err());
+    }
 }
 
 // ============================================================================
@@ -1440,58 +1516,33 @@ mod example_files {
     }
 
     #[test]
-    fn test_parse_basic_tensor_example() {
+    fn test_parse_tensor_ops_example() {
         let grammar = get_grammar();
-        let source = std::fs::read_to_string(examples_dir().join("basic_tensor.zynml"))
-            .expect("Should read basic_tensor.zynml");
+        let source = std::fs::read_to_string(examples_dir().join("tensor_ops.zynml"))
+            .expect("Should read tensor_ops.zynml");
 
         let result = grammar.parse_to_json(&source);
-        assert!(result.is_ok(), "Should parse basic_tensor.zynml: {:?}", result.err());
+        assert!(result.is_ok(), "Should parse tensor_ops.zynml: {:?}", result.err());
     }
 
     #[test]
-    fn test_parse_audio_pipeline_example() {
+    fn test_parse_collections_example() {
         let grammar = get_grammar();
-        let path = examples_dir().join("audio_pipeline.zynml");
-        if path.exists() {
-            let source = std::fs::read_to_string(&path)
-                .expect("Should read audio_pipeline.zynml");
+        let source = std::fs::read_to_string(examples_dir().join("collections.zynml"))
+            .expect("Should read collections.zynml");
 
-            let result = grammar.parse_to_json(&source);
-            assert!(result.is_ok(), "Should parse audio_pipeline.zynml: {:?}", result.err());
-        }
+        let result = grammar.parse_to_json(&source);
+        assert!(result.is_ok(), "Should parse collections.zynml: {:?}", result.err());
     }
 
     #[test]
-    fn test_parse_vector_search_example() {
+    fn test_parse_neural_network_example() {
         let grammar = get_grammar();
-        let path = examples_dir().join("vector_search.zynml");
-        if path.exists() {
-            let source = std::fs::read_to_string(&path)
-                .expect("Should read vector_search.zynml");
+        let source = std::fs::read_to_string(examples_dir().join("neural_network.zynml"))
+            .expect("Should read neural_network.zynml");
 
-            let result = grammar.parse_to_json(&source);
-            assert!(result.is_ok(), "Should parse vector_search.zynml: {:?}", result.err());
-        }
-    }
-
-    #[test]
-    fn test_parse_abstract_types_example() {
-        let grammar = get_grammar();
-        let path = examples_dir().join("abstract_types.zynml");
-        if path.exists() {
-            let source = std::fs::read_to_string(&path)
-                .expect("Should read abstract_types.zynml");
-
-            let result = grammar.parse_to_json(&source);
-            // Note: abstract_types.zynml may use Python-style colon syntax
-            // which may not be currently supported by the grammar
-            if result.is_err() {
-                println!("abstract_types.zynml uses unsupported syntax (colon-style blocks)");
-            } else {
-                println!("abstract_types.zynml parsed successfully");
-            }
-        }
+        let result = grammar.parse_to_json(&source);
+        assert!(result.is_ok(), "Should parse neural_network.zynml: {:?}", result.err());
     }
 }
 

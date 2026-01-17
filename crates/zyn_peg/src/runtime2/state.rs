@@ -165,6 +165,8 @@ pub enum ParsedValue {
     EffectOp(zyntax_typed_ast::TypedEffectOp),
     /// A TypedEffectHandlerImpl (handler operation implementation)
     EffectHandlerImpl(zyntax_typed_ast::TypedEffectHandlerImpl),
+    /// A lambda parameter
+    LambdaParam(zyntax_typed_ast::TypedLambdaParam),
 }
 
 /// Handle to an AST node (opaque, managed by builder)

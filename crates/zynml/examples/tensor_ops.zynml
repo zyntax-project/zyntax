@@ -1,0 +1,245 @@
+// ============================================================================
+// ZynML Example: Tensor Operations
+// ============================================================================
+// Run with: zynml run examples/tensor_ops.zynml
+//
+// Demonstrates:
+// - Tensor creation methods (zeros, ones, arange, linspace, rand, eye, full)
+// - Arithmetic operators (+, -, *, /, @)
+// - Shape manipulation (reshape, transpose, flatten)
+// - Element-wise math operations (sqrt, exp, log, sin, cos, tanh)
+// - Reduction operations (sum, mean, max, min, std, var)
+// - Activation functions (relu, sigmoid, softmax)
+// ============================================================================
+
+import prelude
+import tensor
+
+// Test arithmetic operations
+def test_arithmetic() {
+    println("=== Arithmetic Operations ===")
+
+    let a = Tensor::arange(1.0, 7.0, 1.0)  // [1, 2, 3, 4, 5, 6]
+    let b = Tensor::full([6], 2.0)         // [2, 2, 2, 2, 2, 2]
+
+    println("a:")
+    println(a)
+    println("b:")
+    println(b)
+
+    // Addition: a + b -> calls Add trait
+    let sum = a + b
+    println("a + b:")
+    println(sum)
+
+    // Subtraction: a - b -> calls Sub trait
+    let diff = a - b
+    println("a - b:")
+    println(diff)
+
+    // Multiplication: a * b -> calls Mul trait (element-wise)
+    let prod = a * b
+    println("a * b:")
+    println(prod)
+
+    // Division: a / b -> calls Div trait (element-wise)
+    let quot = a / b
+    println("a / b:")
+    println(quot)
+
+    // Negation: -a -> calls Neg trait
+    let neg = -a
+    println("-a:")
+    println(neg)
+}
+
+// Test matrix operations
+def test_matrix_ops() {
+    println("\n=== Matrix Operations ===")
+
+    // Create 2x3 matrix
+    let m1 = Tensor::arange(1.0, 7.0, 1.0).reshape([2, 3])
+    println("m1 (2x3):")
+    println(m1)
+
+    // Create 3x2 matrix
+    let m2 = Tensor::arange(1.0, 7.0, 1.0).reshape([3, 2])
+    println("m2 (3x2):")
+    println(m2)
+
+    // Matrix multiplication: m1 @ m2 -> calls MatMul trait
+    let result = m1 @ m2
+    println("m1 @ m2 (2x2):")
+    println(result)
+
+    // Or use function syntax
+    let result2 = matmul(m1, m2)
+    println("matmul(m1, m2):")
+    println(result2)
+
+    // Transpose
+    let m1_t = m1.transpose()
+    println("m1.transpose() (3x2):")
+    println(m1_t)
+}
+
+// Test shape manipulation
+def test_shapes() {
+    println("\n=== Shape Manipulation ===")
+
+    let t = Tensor::arange(0.0, 24.0, 1.0)
+    println(f"Original shape: {t.shape()}")
+    println(f"ndim: {t.ndim()}")
+    println(f"numel: {t.numel()}")
+
+    // Reshape to 2x3x4
+    let reshaped = t.reshape([2, 3, 4])
+    println(f"Reshaped to: {reshaped.shape()}")
+
+    // Flatten back to 1D
+    let flat = reshaped.flatten()
+    println(f"Flattened: {flat.shape()}")
+
+    // Add dimension
+    let expanded = t.unsqueeze(0)
+    println(f"Unsqueezed at 0: {expanded.shape()}")
+
+    // Remove singleton dimensions
+    let squeezed = expanded.squeeze()
+    println(f"Squeezed: {squeezed.shape()}")
+}
+
+// Test reduction operations
+def test_reductions() {
+    println("\n=== Reduction Operations ===")
+
+    let t = Tensor::arange(1.0, 11.0, 1.0)  // [1, 2, ..., 10]
+    println("Tensor:")
+    println(t)
+
+    println(f"sum: {t.sum()}")
+    println(f"mean: {t.mean()}")
+    println(f"max: {t.max()}")
+    println(f"min: {t.min()}")
+    println(f"std: {t.std()}")
+    println(f"var: {t.var()}")
+
+    // Axis-wise reduction
+    let m = t.reshape([2, 5])
+    println("\nMatrix (2x5):")
+    println(m)
+
+    let row_sums = m.sum_axis(1)
+    println("Sum along axis 1 (row sums):")
+    println(row_sums)
+
+    let col_means = m.mean_axis(0)
+    println("Mean along axis 0 (column means):")
+    println(col_means)
+}
+
+// Test element-wise math
+def test_math() {
+    println("\n=== Element-wise Math ===")
+
+    let t = Tensor::linspace(0.0, 3.14159, 5)
+    println("Tensor (0 to pi):")
+    println(t)
+
+    println("sin(t):")
+    println(t.sin())
+
+    println("cos(t):")
+    println(t.cos())
+
+    let positive = Tensor::arange(1.0, 5.0, 1.0)
+    println("\nPositive values:")
+    println(positive)
+
+    println("sqrt:")
+    println(positive.sqrt())
+
+    println("exp:")
+    println(positive.exp())
+
+    println("log:")
+    println(positive.log())
+
+    // Clamping
+    let values = Tensor::arange(-2.0, 3.0, 1.0)
+    println("\nValues:")
+    println(values)
+
+    let clamped = values.clamp(0.0, 1.0)
+    println("Clamped to [0, 1]:")
+    println(clamped)
+}
+
+// Test activation functions
+def test_activations() {
+    println("\n=== Activation Functions ===")
+
+    let x = Tensor::arange(-2.0, 3.0, 1.0)
+    println("Input:")
+    println(x)
+
+    println("relu(x):")
+    println(relu(x))
+
+    println("sigmoid(x):")
+    println(sigmoid(x))
+
+    println("tanh(x):")
+    println(x.tanh())
+
+    // Softmax for probability distribution
+    let logits = Tensor::arange(0.0, 5.0, 1.0)
+    println("\nLogits:")
+    println(logits)
+
+    let probs = softmax(logits)
+    println("softmax(logits):")
+    println(probs)
+    println(f"Sum of probs: {probs.sum()}")  // Should be ~1.0
+}
+
+// Test tensor creation methods
+def test_creation() {
+    println("\n=== Tensor Creation ===")
+
+    println("zeros([3, 3]):")
+    println(Tensor::zeros([3, 3]))
+
+    println("\nones([2, 4]):")
+    println(Tensor::ones([2, 4]))
+
+    println("\neye(3):")
+    println(Tensor::eye(3))
+
+    println("\nfull([2, 3], 7.0):")
+    println(Tensor::full([2, 3], 7.0))
+
+    println("\narange(0.0, 10.0, 2.0):")
+    println(Tensor::arange(0.0, 10.0, 2.0))
+
+    println("\nlinspace(0.0, 1.0, 5):")
+    println(Tensor::linspace(0.0, 1.0, 5))
+
+    println("\nrand([2, 3]):")
+    println(Tensor::rand([2, 3]))
+
+    println("\nrandn([2, 3]):")
+    println(Tensor::randn([2, 3]))
+}
+
+def main() {
+    test_creation()
+    test_arithmetic()
+    test_matrix_ops()
+    test_shapes()
+    test_reductions()
+    test_math()
+    test_activations()
+
+    println("\n=== All tensor operations completed! ===")
+}

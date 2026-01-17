@@ -1,0 +1,231 @@
+// ============================================================================
+// ZynML Example: Simple Neural Network
+// ============================================================================
+// Run with: zynml run examples/neural_network.zynml
+//
+// Demonstrates:
+// - Struct definitions for model components
+// - Method syntax with impl blocks
+// - Tensor operations for forward pass
+// - Activation functions (relu, sigmoid, softmax)
+// - Loss computation
+// - Clean ML-like syntax
+// ============================================================================
+
+import prelude
+import tensor
+
+// ============================================================================
+// Linear Layer
+// ============================================================================
+
+struct Linear {
+    weights: Tensor,
+    bias: Tensor,
+    in_features: i64,
+    out_features: i64
+}
+
+impl Linear {
+    // Create a new linear layer with random weights
+    def new(in_features: i64, out_features: i64): Linear {
+        // Xavier initialization: use a simple scale factor
+        // For proper initialization, scale would be sqrt(1/in_features)
+        let scale = 0.1
+        let weights = Tensor::randn([in_features, out_features]) * Tensor::full([in_features, out_features], scale)
+        let bias = Tensor::zeros([out_features])
+
+        Linear {
+            weights: weights,
+            bias: bias,
+            in_features: in_features,
+            out_features: out_features
+        }
+    }
+
+    // Forward pass: y = xW + b
+    def forward(self, x: Tensor): Tensor {
+        let output = x @ self.weights
+        output + self.bias
+    }
+}
+
+// ============================================================================
+// Simple MLP (Multi-Layer Perceptron)
+// ============================================================================
+
+struct MLP {
+    layer1: Linear,
+    layer2: Linear,
+    layer3: Linear
+}
+
+impl MLP {
+    // Create a 3-layer MLP: input -> hidden1 -> hidden2 -> output
+    def new(input_size: i64, hidden_size: i64, output_size: i64): MLP {
+        MLP {
+            layer1: Linear::new(input_size, hidden_size),
+            layer2: Linear::new(hidden_size, hidden_size),
+            layer3: Linear::new(hidden_size, output_size)
+        }
+    }
+
+    // Forward pass with ReLU activations
+    def forward(self, x: Tensor): Tensor {
+        // Layer 1: Linear + ReLU
+        let h1 = self.layer1.forward(x)
+        let a1 = relu(h1)
+
+        // Layer 2: Linear + ReLU
+        let h2 = self.layer2.forward(a1)
+        let a2 = relu(h2)
+
+        // Layer 3: Linear (no activation for output layer)
+        self.layer3.forward(a2)
+    }
+
+    // Forward pass with softmax for classification
+    def predict(self, x: Tensor): Tensor {
+        let logits = self.forward(x)
+        softmax(logits)
+    }
+}
+
+// ============================================================================
+// Loss Functions
+// ============================================================================
+
+// Mean Squared Error loss
+def mse_loss(pred: Tensor, target: Tensor): f64 {
+    let diff = pred - target
+    let squared = diff * diff
+    squared.mean()
+}
+
+// Binary Cross Entropy loss (for binary classification)
+def bce_loss(pred: Tensor, target: Tensor): f64 {
+    // -[y * log(p) + (1-y) * log(1-p)]
+    let ones = Tensor::ones(pred.shape())
+    let log_pred = pred.log()
+    let log_1_minus_pred = (ones - pred).log()
+
+    let term1 = target * log_pred
+    let term2 = (ones - target) * log_1_minus_pred
+
+    let loss = -(term1 + term2)
+    loss.mean()
+}
+
+// ============================================================================
+// Training Utilities
+// ============================================================================
+
+// Generate synthetic classification data
+def generate_data(n_samples: i64, n_features: i64): (Tensor, Tensor) {
+    // Random input features
+    let x = Tensor::randn([n_samples, n_features])
+
+    // Simple rule: if sum of features > 0, class 1, else class 0
+    mut labels = Tensor::zeros([n_samples, 1])
+    for i in 0..n_samples {
+        let row = x.slice([i, 0], [i + 1, n_features])
+        if row.sum() > 0.0 {
+            labels.set([i, 0], 1.0)
+        }
+    }
+
+    (x, labels)
+}
+
+// Compute accuracy (returns value between 0 and 1)
+def accuracy(pred: Tensor, target: Tensor): f64 {
+    // Threshold predictions at 0.5
+    let pred_classes = pred.clamp(0.0, 1.0)
+    mut correct: f64 = 0.0
+    let n = target.numel()
+    let n_float: f64 = 100.0  // Assuming n_samples = 100
+
+    for i in 0..n {
+        let p = pred_classes.get([i])
+        let t = target.get([i])
+        // Python-style ternary expression
+        let p_class = 1.0 if p >= 0.5 else 0.0
+        if p_class == t {
+            correct = correct + 1.0
+        }
+    }
+
+    correct / n_float
+}
+
+// ============================================================================
+// Main: Demo Training Loop
+// ============================================================================
+
+def main() {
+    println("=== ZynML Neural Network Demo ===\n")
+
+    // Create a simple binary classifier
+    let input_size = 4
+    let hidden_size = 8
+    let output_size = 1
+
+    println(f"Creating MLP: {input_size} -> {hidden_size} -> {hidden_size} -> {output_size}")
+    let model = MLP::new(input_size, hidden_size, output_size)
+
+    // Generate synthetic data
+    let n_samples = 100
+    println(f"Generating {n_samples} samples with {input_size} features")
+    let (x, y) = generate_data(n_samples, input_size)
+
+    println(f"\nInput shape: {x.shape()}")
+    println(f"Target shape: {y.shape()}")
+
+    // Forward pass
+    println("\n=== Forward Pass ===")
+    let logits = model.forward(x)
+    println(f"Logits shape: {logits.shape()}")
+    println(f"Logits mean: {logits.mean()}")
+    println(f"Logits std: {logits.std()}")
+
+    // Apply sigmoid for binary classification
+    let predictions = sigmoid(logits)
+    println(f"\nPredictions (sigmoid) shape: {predictions.shape()}")
+    println(f"Predictions mean: {predictions.mean()}")
+
+    // Compute loss
+    let loss = bce_loss(predictions, y)
+    println(f"\nBinary Cross Entropy Loss: {loss}")
+
+    // Compute accuracy
+    let acc = accuracy(predictions, y)
+    println(f"Accuracy: {acc * 100.0}%")
+
+    // Demo: Single sample prediction
+    println("\n=== Single Sample Prediction ===")
+    let sample = Tensor::randn([1, input_size])
+    println(f"Input: {sample}")
+
+    let sample_pred = sigmoid(model.forward(sample))
+    let prob = sample_pred.item()
+    // Python-style ternary for class label
+    let class_label = "positive" if prob >= 0.5 else "negative"
+    println(f"Prediction probability: {prob}")
+    println(f"Predicted class: {class_label}")
+
+    // Demo: Matrix multiplication sizes
+    println("\n=== Layer Dimensions ===")
+    println(f"Layer 1: [{input_size}] -> [{hidden_size}]")
+    println(f"  weights: {model.layer1.weights.shape()}")
+    println(f"  bias: {model.layer1.bias.shape()}")
+
+    println(f"\nLayer 2: [{hidden_size}] -> [{hidden_size}]")
+    println(f"  weights: {model.layer2.weights.shape()}")
+    println(f"  bias: {model.layer2.bias.shape()}")
+
+    println(f"\nLayer 3: [{hidden_size}] -> [{output_size}]")
+    println(f"  weights: {model.layer3.weights.shape()}")
+    println(f"  bias: {model.layer3.bias.shape()}")
+
+    println("\n=== Neural Network Demo Complete! ===")
+}

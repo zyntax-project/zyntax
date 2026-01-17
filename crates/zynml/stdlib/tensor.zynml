@@ -3,35 +3,35 @@
 // ============================================================================
 //
 // Tensor type for multi-dimensional numerical arrays.
-// Wraps the zrtl_tensor plugin with a high-level ZynML interface.
+// Backed by the zrtl_tensor ZRTL plugin.
 //
-// Builtin functions use the "extern" keyword to call ZRTL plugin functions.
-// Example: extern tensor_to_string(x) calls the builtin "tensor_to_string"
+// Usage:
+//   let t = Tensor::zeros([3, 4])
+//   let t2 = Tensor::arange(0.0, 10.0, 1.0)
+//   let result = t + t2
+//   println(t.sum())
 //
 // ============================================================================
 
 import prelude
 
-// Internal opaque type from the plugin
-@opaque("$Tensor")
-type TensorPtr
+// Extern struct backed by ZRTL tensor implementation
+extern struct Tensor
 
-// Tensor is a struct that wraps the opaque pointer
-struct Tensor { ptr: TensorPtr }
+// ============================================================================
+// Display and Clone Traits
+// ============================================================================
 
-// Implement Display trait for Tensor
 impl Display for Tensor {
-    fn to_string(self) -> String: extern tensor_to_string(self.ptr)
+    def to_string(self): String {
+        extern tensor_to_string(self)
+    }
 }
 
-// Implement Clone trait for Tensor
 impl Clone for Tensor {
-    fn clone(self) -> Tensor: Tensor { ptr: extern tensor_clone(self.ptr) }
-}
-
-// Implement Drop trait for Tensor
-impl Drop for Tensor {
-    fn drop(self): extern tensor_free(self.ptr)
+    def clone(self): Tensor {
+        extern tensor_clone(self)
+    }
 }
 
 // ============================================================================
@@ -41,112 +41,333 @@ impl Drop for Tensor {
 // Tensor + Tensor
 impl Add<Tensor> for Tensor {
     type Output = Tensor
-    fn add(self, rhs: Tensor) -> Tensor: Tensor { ptr: extern tensor_add(self.ptr, rhs.ptr) }
+
+    def add(self, rhs: Tensor): Tensor {
+        extern tensor_add(self, rhs)
+    }
 }
 
 // Tensor - Tensor
 impl Sub<Tensor> for Tensor {
     type Output = Tensor
-    fn sub(self, rhs: Tensor) -> Tensor: Tensor { ptr: extern tensor_sub(self.ptr, rhs.ptr) }
+
+    def sub(self, rhs: Tensor): Tensor {
+        extern tensor_sub(self, rhs)
+    }
 }
 
 // Tensor * Tensor (element-wise)
 impl Mul<Tensor> for Tensor {
     type Output = Tensor
-    fn mul(self, rhs: Tensor) -> Tensor: Tensor { ptr: extern tensor_mul(self.ptr, rhs.ptr) }
+
+    def mul(self, rhs: Tensor): Tensor {
+        extern tensor_mul(self, rhs)
+    }
 }
 
 // Tensor / Tensor (element-wise)
 impl Div<Tensor> for Tensor {
     type Output = Tensor
-    fn div(self, rhs: Tensor) -> Tensor: Tensor { ptr: extern tensor_div(self.ptr, rhs.ptr) }
+
+    def div(self, rhs: Tensor): Tensor {
+        extern tensor_div(self, rhs)
+    }
 }
 
-// Tensor @ Tensor (matrix multiplication / dot product)
+// Tensor @ Tensor (matrix multiplication)
 impl MatMul<Tensor> for Tensor {
-    type Output = f32  // Returns scalar for vector dot product
-    fn matmul(self, rhs: Tensor) -> f32: extern tensor_dot(self.ptr, rhs.ptr)
+    type Output = Tensor
+
+    def matmul(self, rhs: Tensor): Tensor {
+        extern tensor_matmul(self, rhs)
+    }
 }
 
 // Tensor negation (-x)
 impl Neg for Tensor {
     type Output = Tensor
-    fn neg(self) -> Tensor: Tensor { ptr: extern tensor_neg(self.ptr) }
+
+    def neg(self): Tensor {
+        extern tensor_neg(self)
+    }
 }
 
 // ============================================================================
-// Tensor Creation Functions
+// Tensor Creation (Static Methods)
 // ============================================================================
 
-// Create tensor from array literal
-// Usage: from_array([1.0, 2.0, 3.0])
-fn from_array(data: Array<f32>) -> Tensor {
-    Tensor { ptr: extern tensor_from_array(data) }
-}
+impl Tensor {
+    // Create tensor from array literal
+    // Usage: Tensor::from_array([1.0, 2.0, 3.0])
+    def from_array(data: List<f64>): Tensor {
+        extern tensor_from_array(data)
+    }
 
-// Create tensor filled with zeros
-// Usage: zeros([3, 4])  // 3x4 matrix of zeros
-fn zeros(shape: Array<i64>, dtype: i32) -> Tensor {
-    Tensor { ptr: extern tensor_zeros(shape, dtype) }
-}
+    // Create tensor filled with zeros
+    // Usage: Tensor::zeros([3, 4])
+    def zeros(shape: List<i64>): Tensor {
+        extern tensor_zeros(shape)
+    }
 
-// Create tensor filled with ones
-// Usage: ones([3, 4])
-fn ones(shape: Array<i64>, dtype: i32) -> Tensor {
-    Tensor { ptr: extern tensor_ones(shape, dtype) }
-}
+    // Create tensor filled with ones
+    // Usage: Tensor::ones([3, 4])
+    def ones(shape: List<i64>): Tensor {
+        extern tensor_ones(shape)
+    }
 
-// Create tensor with values in range [start, end) with step
-// Usage: arange(0.0, 10.0, 1.0)
-fn arange(start: f32, end: f32, step: f32) -> Tensor {
-    Tensor { ptr: extern tensor_arange(start, end, step) }
-}
+    // Create tensor with values in range [start, end) with step
+    // Usage: Tensor::arange(0.0, 10.0, 1.0)
+    def arange(start: f64, end: f64, step: f64 = 1.0): Tensor {
+        extern tensor_arange(start, end, step)
+    }
 
-// Create tensor with n evenly spaced values between start and end
-// Usage: linspace(0.0, 1.0, 100)
-fn linspace(start: f32, end: f32, n: i64) -> Tensor {
-    Tensor { ptr: extern tensor_linspace(start, end, n) }
-}
+    // Create tensor with n evenly spaced values between start and end
+    // Usage: Tensor::linspace(0.0, 1.0, 100)
+    def linspace(start: f64, end: f64, n: i64): Tensor {
+        extern tensor_linspace(start, end, n)
+    }
 
-// Create tensor with random values in [0, 1)
-// Usage: rand([3, 4], seed)
-fn rand(shape: Array<i64>, seed: i64) -> Tensor {
-    Tensor { ptr: extern tensor_rand(shape, seed) }
-}
+    // Create tensor with random values in [0, 1)
+    // Usage: Tensor::rand([3, 4])
+    def rand(shape: List<i64>): Tensor {
+        extern tensor_rand(shape)
+    }
 
-// Create tensor with random normal values (mean=0, std=1)
-// Usage: randn([3, 4], seed)
-fn randn(shape: Array<i64>, seed: i64) -> Tensor {
-    Tensor { ptr: extern tensor_randn(shape, seed) }
+    // Create tensor with random normal values (mean=0, std=1)
+    // Usage: Tensor::randn([3, 4])
+    def randn(shape: List<i64>): Tensor {
+        extern tensor_randn(shape)
+    }
+
+    // Create identity matrix
+    // Usage: Tensor::eye(3)
+    def eye(n: i64): Tensor {
+        extern tensor_eye(n)
+    }
+
+    // Create tensor filled with a constant value
+    // Usage: Tensor::full([3, 4], 2.5)
+    def full(shape: List<i64>, value: f64): Tensor {
+        extern tensor_full(shape, value)
+    }
 }
 
 // ============================================================================
-// Tensor Methods
+// Tensor Instance Methods
 // ============================================================================
-//
-// TODO: These should use @method attribute when that's implemented
-// For now, they can be called as regular functions: sum(tensor)
 
-fn sum(t: Tensor) -> f32 {
-    extern tensor_sum(t.ptr)
+impl Tensor {
+    // Shape and dimensions
+    def shape(self): List<i64> {
+        extern tensor_shape(self)
+    }
+
+    def ndim(self): i64 {
+        extern tensor_ndim(self)
+    }
+
+    def numel(self): i64 {
+        extern tensor_numel(self)
+    }
+
+    // Reduction operations
+    def sum(self): f64 {
+        extern tensor_sum(self)
+    }
+
+    def mean(self): f64 {
+        extern tensor_mean(self)
+    }
+
+    def max(self): f64 {
+        extern tensor_max(self)
+    }
+
+    def min(self): f64 {
+        extern tensor_min(self)
+    }
+
+    def std(self): f64 {
+        extern tensor_std(self)
+    }
+
+    def var(self): f64 {
+        extern tensor_var(self)
+    }
+
+    // Axis-wise reductions
+    def sum_axis(self, axis: i64): Tensor {
+        extern tensor_sum_axis(self, axis)
+    }
+
+    def mean_axis(self, axis: i64): Tensor {
+        extern tensor_mean_axis(self, axis)
+    }
+
+    def max_axis(self, axis: i64): Tensor {
+        extern tensor_max_axis(self, axis)
+    }
+
+    def min_axis(self, axis: i64): Tensor {
+        extern tensor_min_axis(self, axis)
+    }
+
+    // Shape manipulation
+    def reshape(self, shape: List<i64>): Tensor {
+        extern tensor_reshape(self, shape)
+    }
+
+    def transpose(self): Tensor {
+        extern tensor_transpose(self)
+    }
+
+    def transpose_axes(self, dim0: i64, dim1: i64): Tensor {
+        extern tensor_transpose_axes(self, dim0, dim1)
+    }
+
+    def flatten(self): Tensor {
+        extern tensor_flatten(self)
+    }
+
+    def squeeze(self): Tensor {
+        extern tensor_squeeze(self)
+    }
+
+    def unsqueeze(self, dim: i64): Tensor {
+        extern tensor_unsqueeze(self, dim)
+    }
+
+    // Element-wise math operations
+    def abs(self): Tensor {
+        extern tensor_abs(self)
+    }
+
+    def sqrt(self): Tensor {
+        extern tensor_sqrt(self)
+    }
+
+    def exp(self): Tensor {
+        extern tensor_exp(self)
+    }
+
+    def log(self): Tensor {
+        extern tensor_log(self)
+    }
+
+    def sin(self): Tensor {
+        extern tensor_sin(self)
+    }
+
+    def cos(self): Tensor {
+        extern tensor_cos(self)
+    }
+
+    def tanh(self): Tensor {
+        extern tensor_tanh(self)
+    }
+
+    def pow(self, exponent: f64): Tensor {
+        extern tensor_pow(self, exponent)
+    }
+
+    // Clipping
+    def clamp(self, min_val: f64, max_val: f64): Tensor {
+        extern tensor_clamp(self, min_val, max_val)
+    }
+
+    // Indexing and slicing
+    def get(self, indices: List<i64>): f64 {
+        extern tensor_get(self, indices)
+    }
+
+    def set(self, indices: List<i64>, value: f64) {
+        extern tensor_set(self, indices, value)
+    }
+
+    def slice(self, start: List<i64>, end: List<i64>): Tensor {
+        extern tensor_slice(self, start, end)
+    }
+
+    // Comparison (returns boolean tensor)
+    def eq(self, other: Tensor): Tensor {
+        extern tensor_eq(self, other)
+    }
+
+    def ne(self, other: Tensor): Tensor {
+        extern tensor_ne(self, other)
+    }
+
+    def lt(self, other: Tensor): Tensor {
+        extern tensor_lt(self, other)
+    }
+
+    def le(self, other: Tensor): Tensor {
+        extern tensor_le(self, other)
+    }
+
+    def gt(self, other: Tensor): Tensor {
+        extern tensor_gt(self, other)
+    }
+
+    def ge(self, other: Tensor): Tensor {
+        extern tensor_ge(self, other)
+    }
+
+    // Type conversion
+    def to_list(self): List<f64> {
+        extern tensor_to_list(self)
+    }
+
+    def item(self): f64 {
+        extern tensor_item(self)
+    }
 }
 
-fn mean(t: Tensor) -> f32 {
-    extern tensor_mean(t.ptr)
+// ============================================================================
+// Standalone Tensor Functions (for convenience)
+// ============================================================================
+
+// Dot product of two 1D tensors
+def dot(a: Tensor, b: Tensor): f64 {
+    extern tensor_dot(a, b)
 }
 
-fn max(t: Tensor) -> f32 {
-    extern tensor_max(t.ptr)
+// Matrix multiplication
+def matmul(a: Tensor, b: Tensor): Tensor {
+    extern tensor_matmul(a, b)
 }
 
-fn min(t: Tensor) -> f32 {
-    extern tensor_min(t.ptr)
+// Concatenate tensors along axis
+def concat(tensors: List<Tensor>, axis: i64 = 0): Tensor {
+    extern tensor_concat(tensors, axis)
 }
 
-fn reshape(t: Tensor, shape: Array<i64>) -> Tensor {
-    Tensor { ptr: extern tensor_reshape(t.ptr, shape) }
+// Stack tensors along new axis
+def stack(tensors: List<Tensor>, axis: i64 = 0): Tensor {
+    extern tensor_stack(tensors, axis)
 }
 
-fn transpose(t: Tensor, dim0: i32, dim1: i32) -> Tensor {
-    Tensor { ptr: extern tensor_transpose(t.ptr, dim0, dim1) }
+// Split tensor into chunks
+def split(t: Tensor, chunks: i64, axis: i64 = 0): List<Tensor> {
+    extern tensor_split(t, chunks, axis)
+}
+
+// Softmax along axis
+def softmax(t: Tensor, axis: i64 = -1): Tensor {
+    extern tensor_softmax(t, axis)
+}
+
+// Cross entropy loss
+def cross_entropy(pred: Tensor, target: Tensor): f64 {
+    extern tensor_cross_entropy(pred, target)
+}
+
+// ReLU activation
+def relu(t: Tensor): Tensor {
+    extern tensor_relu(t)
+}
+
+// Sigmoid activation
+def sigmoid(t: Tensor): Tensor {
+    extern tensor_sigmoid(t)
 }

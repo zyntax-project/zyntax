@@ -258,6 +258,7 @@ top_level_item = {
     abstract_def |
     enum_def |
     struct_def |
+    extern_struct_def |
     type_def |
     fn_def |
     let_stmt |
@@ -657,10 +658,12 @@ type_def = { decl:type_opaque | decl:type_alias | decl:type_struct }
 
 // Opaque type wrapping external (ZRTL) type
 // Match @opaque as two separate tokens to avoid conflict with @ operator
-// For now, we emit a TypeAlias - the actual opaque behavior is handled elsewhere
+// @opaque and extern struct are equivalent - both declare ZRTL-backed opaque types
+// The string argument (e.g., "$Tensor") specifies the ZRTL type name
 type_opaque = { "@" ~ "opaque" ~ "(" ~ string_literal ~ ")" ~ "type" ~ name:identifier }
-  -> TypedDeclaration::TypeAlias {
+  -> TypedDeclaration::ExternStruct {
       name: intern(name),
+      type_params: [],
   }
 
 // Type alias: type Scalar = f32
@@ -764,6 +767,39 @@ struct_field = { name:identifier ~ ":" ~ ty:type_expr }
 // Struct Definition (Both Brace and Colon Syntax)
 // ============================================================================
 
+// ========== Extern Struct Definitions ==========
+// Extern structs are ZRTL-backed types with no visible fields.
+// They can have generic parameters and impl blocks with methods.
+//
+// Examples:
+//   extern struct HashMap<K, V>
+//   extern struct Tensor
+//
+// Usage:
+//   extern struct HashMap<K, V>
+//   impl<K, V> HashMap<K, V> {
+//       def new(): HashMap<K, V> { extern hashmap_new() }
+//       def insert(self, key: K, value: V) { extern hashmap_insert(self, key, value) }
+//   }
+
+extern_struct_def = { decl:extern_struct_generic | decl:extern_struct_simple }
+  -> decl
+
+// extern struct HashMap<K, V>
+extern_struct_generic = { "extern" ~ "struct" ~ name:identifier ~ params:type_params }
+  -> TypedDeclaration::ExternStruct {
+      name: intern(name),
+      type_params: params,
+  }
+
+// extern struct Tensor
+extern_struct_simple = { "extern" ~ "struct" ~ name:identifier }
+  -> TypedDeclaration::ExternStruct {
+      name: intern(name),
+      type_params: [],
+  }
+
+// ========== Regular Struct Definitions ==========
 // Brace style: struct Point { x: float, y: float }
 // Colon style: struct Point:
 //                  x: float
@@ -2170,10 +2206,11 @@ member_op = { "." ~ field:identifier }
 
 // Primary expressions
 primary_expr = {
-    load_as_expr |
+    import_modifier_expr |  // import asset("image.jpg") as Image
     model_config_expr |
     compute_expr |
     extern_call |
+    lambda_expr |         // Lambda: def(x): x * 2
     tensor_literal |
     struct_literal |
     list_comprehension |  // Must come before array_literal (both start with '[')
@@ -2215,18 +2252,68 @@ tuple_expr_4 = { "(" ~ e1:expr ~ "," ~ e2:expr ~ "," ~ e3:expr ~ "," ~ e4:expr ~
   }
 
 // ============================================================================
-// Load with Type Cast
+// Lambda Expressions
 // ============================================================================
 
-// load("image.jpg") as image
-load_as_expr = { "load" ~ "(" ~ string_literal ~ ")" ~ "as" ~ identifier }
-  -> TypedExpression {
-      "commands": [
-          { "define": "load_as", "args": {
-              "path": "$1",
-              "type": "$2"
-          }}
-      ]
+// Lambda expression: def(x): x * 2
+// Anonymous function that can be passed to higher-order functions
+// Syntax: def(params): body_expr
+lambda_expr = { l:lambda_with_params | l:lambda_no_params }
+  -> l
+
+// Lambda with parameters: def(x): x * 2, def(x, y): x + y
+lambda_with_params = { "def" ~ "(" ~ params:lambda_params ~ ")" ~ ":" ~ body:expr }
+  -> TypedExpression::Lambda {
+      params: params,
+      body: body,
+  }
+
+// Lambda without parameters: def(): 42
+lambda_no_params = { "def" ~ "(" ~ ")" ~ ":" ~ body:expr }
+  -> TypedExpression::Lambda {
+      params: [],
+      body: body,
+  }
+
+// Lambda parameters (simple identifiers)
+lambda_params = { p:lambda_param ~ ("," ~ p:lambda_param)* }
+  -> p
+
+lambda_param = { name:identifier }
+  -> TypedLambdaParam {
+      name: intern(name),
+      ty: None,
+  }
+
+// ============================================================================
+// Import Asset Expression
+// ============================================================================
+//
+// Syntax: import loader("path") as Type
+//
+// The loader specifies a domain-specific asset loading extern function:
+//   - asset: generic asset loader
+//   - image: image-specific loader (returns Image)
+//   - audio: audio-specific loader (returns AudioBuffer)
+//   - model: model-specific loader (returns Model)
+//   - font: font-specific loader (returns Font)
+//
+// Examples:
+//   import asset("image.jpg") as Image
+//   import audio("sound.wav") as AudioBuffer
+//   import model("bert.onnx") as TextModel
+//
+// Semantics:
+//   The loader function (e.g., `asset`) is called with the path.
+//   The result is cast to the specified type (e.g., `Image`).
+//   This generates a call like: asset("image.jpg") as Image
+
+// Generic form: import loader("path") as Type
+import_modifier_expr = { "import" ~ loader:identifier ~ "(" ~ path:string_literal ~ ")" ~ "as" ~ type_name:identifier }
+  -> TypedExpression::ImportModifier {
+      loader: intern(loader),
+      path: path,
+      target_type: intern(type_name),
   }
 
 // ============================================================================

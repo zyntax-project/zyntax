@@ -522,6 +522,8 @@ pub enum TypedExpression {
     ListComprehension(TypedListComprehension),
     /// Slice expression: arr[start:end:step]
     Slice(TypedSlice),
+    /// Import modifier expression: import loader("path") as Type
+    ImportModifier(TypedImportModifier),
 }
 
 impl Default for TypedExpression {
@@ -913,6 +915,24 @@ pub struct TypedSlice {
     pub end: Option<Box<TypedNode<TypedExpression>>>,
     /// Step value (None = 1)
     pub step: Option<Box<TypedNode<TypedExpression>>>,
+}
+
+/// Import modifier expression: import loader("path") as Type
+///
+/// Loads an asset file using a specified loader function and returns it
+/// as an opaque type. The loader (e.g., `asset`, `image`, `audio`, `model`)
+/// determines how the file is loaded, and the target type specifies the
+/// expected return type.
+///
+/// Example: `import asset("image.jpg") as Image`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedImportModifier {
+    /// The loader function name (e.g., "asset", "image", "audio")
+    pub loader: InternedString,
+    /// Path to the asset file
+    pub path: InternedString,
+    /// Expected return type name
+    pub target_type: InternedString,
 }
 
 /// Method call with enhanced argument support

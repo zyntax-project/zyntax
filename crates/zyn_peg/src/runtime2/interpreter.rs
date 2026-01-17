@@ -19,8 +19,9 @@ use zyntax_typed_ast::{
     TypedIf, TypedWhile, TypedFor, TypedUnary, TypedFieldAccess, TypedIndex,
     TypedRange, TypedStructLiteral, TypedFieldInit, TypedPattern,
     TypedParameter, TypedVariant, TypedVariantFields, TypedTypeAlias, ParameterKind,
-    TypedInterface,
+    TypedInterface, TypedExtern, TypedExternStruct, TypedTypeParam,
     TypedAnnotation, TypedAnnotationArg, TypedAnnotationValue,
+    TypedLambda, TypedLambdaBody, TypedLambdaParam, TypedImportModifier,
     UnaryOp,
     typed_node, Span,
     type_registry::{Type, PrimitiveType, Mutability, Visibility, CallingConvention, NullabilityKind, ConstValue},
@@ -276,6 +277,10 @@ impl<'g> GrammarInterpreter<'g> {
             // Postfix suffix types for fold operations
             ["SuffixField"] | ["SuffixMethod"] | ["SuffixCall"] | ["SuffixIndex"] | ["SuffixSlice"] => {
                 self.construct_suffix(type_path, fields, state)
+            }
+            // Lambda parameter
+            ["TypedLambdaParam"] => {
+                self.construct_lambda_param(fields, state, span)
             }
             _ => Err(format!("unknown type path: {}", type_path)),
         }
@@ -609,6 +614,29 @@ impl<'g> GrammarInterpreter<'g> {
                     step: step.map(Box::new),
                 })
             }
+            "Lambda" => {
+                // Lambda expression: def(x): x * 2
+                let params = self.get_field_as_lambda_param_list("params", fields, state)?;
+                let body = self.get_field_as_expr("body", fields, state)?;
+
+                TypedExpression::Lambda(TypedLambda {
+                    params,
+                    body: TypedLambdaBody::Expression(Box::new(body)),
+                    captures: vec![],
+                })
+            }
+            "ImportModifier" => {
+                // Import modifier expression: import asset("image.jpg") as Image
+                let loader = self.get_field_as_interned("loader", fields, state)?;
+                let path = self.get_field_as_interned("path", fields, state)?;
+                let target_type = self.get_field_as_interned("target_type", fields, state)?;
+
+                TypedExpression::ImportModifier(TypedImportModifier {
+                    loader,
+                    path,
+                    target_type,
+                })
+            }
             _ => return Err(format!("unknown TypedExpression variant: {}", variant)),
         };
 
@@ -863,6 +891,16 @@ impl<'g> GrammarInterpreter<'g> {
                     handlers,
                     span,
                 })
+            }
+            "ExternStruct" => {
+                let name = self.get_field_as_interned("name", fields, state)?;
+                let type_params = self.get_field_as_type_param_list("type_params", fields, state)?;
+
+                TypedDeclaration::Extern(TypedExtern::Struct(TypedExternStruct {
+                    name,
+                    runtime_prefix: name, // Use name as default runtime prefix
+                    type_params,
+                }))
             }
             _ => return Err(format!("unknown TypedDeclaration variant: {}", variant)),
         };
@@ -1285,6 +1323,22 @@ impl<'g> GrammarInterpreter<'g> {
             default_value: None,
             attributes: vec![],
             span,
+        }))
+    }
+
+    /// Construct a TypedLambdaParam (lambda parameter)
+    fn construct_lambda_param<'a>(
+        &self,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        _span: Span,
+    ) -> Result<ParsedValue, String> {
+        let name = self.get_field_as_interned("name", fields, state)?;
+        let ty = self.get_field_optional("ty", fields, state)?;
+
+        Ok(ParsedValue::LambdaParam(TypedLambdaParam {
+            name,
+            ty,
         }))
     }
 
@@ -2870,6 +2924,108 @@ impl<'g> GrammarInterpreter<'g> {
                 }
             }
             None => Ok(vec![]),
+        }
+    }
+
+    /// Get a field as a list of TypedTypeParam
+    fn get_field_as_type_param_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedTypeParam>, String> {
+        match self.get_field(name, fields) {
+            Some(expr) => {
+                let val = self.eval_expr(expr, state)?;
+                match val {
+                    ParsedValue::List(items) => {
+                        let mut result = Vec::new();
+                        for item in items {
+                            let interned = self.parsed_value_to_interned(item, state)?;
+                            result.push(TypedTypeParam {
+                                name: interned,
+                                bounds: vec![],
+                                default: None,
+                                span: Span::default(),
+                            });
+                        }
+                        Ok(result)
+                    }
+                    ParsedValue::None => Ok(vec![]),
+                    ParsedValue::Optional(None) => Ok(vec![]),
+                    ParsedValue::Interned(i) => Ok(vec![TypedTypeParam {
+                        name: i,
+                        bounds: vec![],
+                        default: None,
+                        span: Span::default(),
+                    }]),
+                    ParsedValue::Text(s) => Ok(vec![TypedTypeParam {
+                        name: state.intern(&s),
+                        bounds: vec![],
+                        default: None,
+                        span: Span::default(),
+                    }]),
+                    _ => Err(format!("field '{}' is not a type param list", name)),
+                }
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Get a field as a list of lambda parameters
+    fn get_field_as_lambda_param_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedLambdaParam>, String> {
+        match self.get_field(name, fields) {
+            Some(expr) => {
+                let val = self.eval_expr(expr, state)?;
+                match val {
+                    ParsedValue::List(items) => {
+                        let mut result = Vec::new();
+                        for item in items {
+                            let param = self.parsed_value_to_lambda_param(item, state)?;
+                            result.push(param);
+                        }
+                        Ok(result)
+                    }
+                    ParsedValue::None => Ok(vec![]),
+                    ParsedValue::Optional(None) => Ok(vec![]),
+                    ParsedValue::LambdaParam(p) => Ok(vec![p]),
+                    ParsedValue::Interned(i) => Ok(vec![TypedLambdaParam {
+                        name: i,
+                        ty: None,
+                    }]),
+                    ParsedValue::Text(s) => Ok(vec![TypedLambdaParam {
+                        name: state.intern(&s),
+                        ty: None,
+                    }]),
+                    _ => Err(format!("field '{}' is not a lambda param list: {:?}", name, val)),
+                }
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Convert ParsedValue to TypedLambdaParam
+    fn parsed_value_to_lambda_param<'a>(
+        &self,
+        val: ParsedValue,
+        state: &mut ParserState<'a>,
+    ) -> Result<TypedLambdaParam, String> {
+        match val {
+            ParsedValue::LambdaParam(p) => Ok(p),
+            ParsedValue::Interned(i) => Ok(TypedLambdaParam {
+                name: i,
+                ty: None,
+            }),
+            ParsedValue::Text(s) => Ok(TypedLambdaParam {
+                name: state.intern(&s),
+                ty: None,
+            }),
+            _ => Err(format!("cannot convert value to lambda param: {:?}", val)),
         }
     }
 

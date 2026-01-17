@@ -9,6 +9,29 @@
 // - Operator traits: enables operator overloading (+, -, *, /, @, etc.)
 //
 // ============================================================================
+// Visibility Convention (Python-style)
+// ============================================================================
+//
+// All items (functions, methods, fields) are PUBLIC by default.
+// Items prefixed with underscore (_) are considered PRIVATE:
+//
+//   def process(data: Tensor): Tensor     // Public function
+//   def _validate(data: Tensor): bool     // Private helper function
+//
+//   struct Model {
+//       weights: Tensor,                  // Public field
+//       _cache: ?Tensor                   // Private field
+//   }
+//
+//   impl Model {
+//       def forward(self, x: Tensor): Tensor    // Public method
+//       def _compute_grad(self): Tensor         // Private method
+//   }
+//
+// Private items should not be accessed from outside their defining module.
+// The compiler will warn about external access to private items.
+//
+// ============================================================================
 
 // ============================================================================
 // Formatting Traits
@@ -266,74 +289,85 @@ impl<T> IntoIterator for List<T> {
 // HashMap and HashSet - Collection Types
 // ============================================================================
 //
-// Note: HashMap<K, V> and HashSet<T> are built-in generic types recognized
-// by the compiler. They are backed by ZRTL runtime implementations.
-// Factory functions are provided below for creating instances.
+// HashMap<K, V> and HashSet<T> are extern generic types backed by ZRTL.
 //
 // Usage:
-//   let map = hashmap_new()
-//   hashmap_insert(map, "key", 42)
-//   let value = hashmap_get(map, "key")
+//   let map: HashMap<str, i64> = HashMap::new()
+//   map.insert("key", 42)
+//   let value = map.get("key")
 //
 // ============================================================================
 
-// HashMap factory and operations (wrapper functions for ZRTL externs)
-// These call through to ZRTL hashmap functions - mappings defined in grammar
-def hashmap_new(): i64 {
-    extern hashmap_new_impl()
+// Extern generic struct declarations - ZRTL provides the implementation
+extern struct HashMap<K, V>
+extern struct HashSet<T>
+
+impl<K, V> HashMap<K, V> {
+    def new(): HashMap<K, V> {
+        extern hashmap_new()
+    }
+
+    def with_capacity(capacity: i64): HashMap<K, V> {
+        extern hashmap_with_capacity(capacity)
+    }
+
+    def insert(self, key: K, value: V) {
+        extern hashmap_insert(self, key, value)
+    }
+
+    def get(self, key: K): ?V {
+        extern hashmap_get(self, key)
+    }
+
+    def remove(self, key: K): ?V {
+        extern hashmap_remove(self, key)
+    }
+
+    def contains_key(self, key: K): bool {
+        extern hashmap_contains_key(self, key)
+    }
+
+    def len(self): i64 {
+        extern hashmap_len(self)
+    }
+
+    def is_empty(self): bool {
+        self.len() == 0
+    }
+
+    def clear(self) {
+        extern hashmap_clear(self)
+    }
 }
 
-def hashmap_with_capacity(capacity: i64): i64 {
-    extern hashmap_with_capacity_impl(capacity)
-}
+impl<T> HashSet<T> {
+    def new(): HashSet<T> {
+        extern hashset_new()
+    }
 
-def hashmap_insert(map: i64, key: i64, value: i64): i64 {
-    extern hashmap_insert_impl(map, key, value)
-}
+    def insert(self, value: T): bool {
+        extern hashset_insert(self, value)
+    }
 
-def hashmap_get(map: i64, key: i64): i64 {
-    extern hashmap_get_impl(map, key)
-}
+    def remove(self, value: T): bool {
+        extern hashset_remove(self, value)
+    }
 
-def hashmap_remove(map: i64, key: i64): i64 {
-    extern hashmap_remove_impl(map, key)
-}
+    def contains(self, value: T): bool {
+        extern hashset_contains(self, value)
+    }
 
-def hashmap_contains_key(map: i64, key: i64): bool {
-    extern hashmap_contains_key_impl(map, key)
-}
+    def len(self): i64 {
+        extern hashset_len(self)
+    }
 
-def hashmap_len(map: i64): i64 {
-    extern hashmap_len_impl(map)
-}
+    def is_empty(self): bool {
+        self.len() == 0
+    }
 
-def hashmap_clear(map: i64) {
-    extern hashmap_clear_impl(map)
-}
-
-// HashSet factory and operations (wrapper functions for ZRTL externs)
-def hashset_new(): i64 {
-    extern hashset_new_impl()
-}
-
-def hashset_insert(set: i64, value: i64): bool {
-    extern hashset_insert_impl(set, value)
-}
-
-def hashset_remove(set: i64, value: i64): bool {
-    extern hashset_remove_impl(set, value)
-}
-
-def hashset_contains(set: i64, value: i64): bool {
-    extern hashset_contains_impl(set, value)
-}
-
-def hashset_len(set: i64): i64 {
-    extern hashset_len_impl(set)
-}
-
-def hashset_clear(set: i64) {
-    extern hashset_clear_impl(set)
+    def clear(self) {
+        extern hashset_clear(self)
+    }
 }
 
 // ============================================================================

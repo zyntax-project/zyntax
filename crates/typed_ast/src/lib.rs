@@ -123,13 +123,13 @@ pub use typed_ast::{
     TypedBinary, TypedUnary, TypedCall, TypedFieldAccess, TypedIndex,
     TypedFor, TypedMatch, TypedMatchExpr, TypedMatchArm, ParameterKind,
     // Lambda types
-    TypedLambda, TypedLambdaBody,
+    TypedLambda, TypedLambdaBody, TypedLambdaParam,
     // Method types
     TypedMethodCall, TypedMethod, TypedMethodParam,
     // Range type
     TypedRange,
-    // List comprehension and slice types
-    TypedListComprehension, TypedSlice,
+    // List comprehension, slice, and import modifier types
+    TypedListComprehension, TypedSlice, TypedImportModifier,
     // Struct type
     TypedStructLiteral, TypedFieldInit,
     // Pattern types

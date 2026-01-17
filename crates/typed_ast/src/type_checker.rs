@@ -1209,6 +1209,10 @@ impl TypeChecker {
                 Ok(self.inference.fresh_type_var())
             }
             TypedExpression::MethodCall(method_call) => self.check_method_call(method_call),
+            TypedExpression::ImportModifier(import) => {
+                // The type is resolved to the target_type (e.g., Image, AudioBuffer)
+                Ok(Type::Unresolved(import.target_type))
+            }
         }
     }
 

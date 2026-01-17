@@ -2,7 +2,7 @@
   "name": "zynml-syntax",
   "displayName": "ZynML Language Support",
   "description": "Syntax highlighting for ZynML - Machine Learning DSL for Zyntax",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "zyntax",
   "engines": {
     "vscode": "^1.75.0"
