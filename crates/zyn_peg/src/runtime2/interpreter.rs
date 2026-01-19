@@ -1798,6 +1798,73 @@ impl<'g> GrammarInterpreter<'g> {
 
                 Ok(acc)
             }
+            "fold_concat" => {
+                // fold_concat(parts) - fold string parts into nested concat calls
+                // e.g., fold_concat(["a", "b", "c"]) -> concat(concat("a", "b"), "c")
+                // Used by f-string desugaring
+                if args.len() != 1 {
+                    return Err("fold_concat() requires exactly 1 argument (parts list)".to_string());
+                }
+                let parts = self.eval_expr(&args[0], state)?;
+
+                // Get the parts as a list
+                let parts_list = match parts {
+                    ParsedValue::List(items) => items,
+                    ParsedValue::Optional(None) | ParsedValue::None => vec![],
+                    ParsedValue::Optional(Some(inner)) => {
+                        match *inner {
+                            ParsedValue::List(items) => items,
+                            other => vec![other],
+                        }
+                    }
+                    other => vec![other],
+                };
+
+                // Handle edge cases
+                if parts_list.is_empty() {
+                    // Return empty string
+                    return Ok(ParsedValue::Expression(Box::new(typed_node(
+                        TypedExpression::Literal(zyntax_typed_ast::TypedLiteral::String(
+                            state.intern(""),
+                        )),
+                        Type::Primitive(zyntax_typed_ast::PrimitiveType::String),
+                        span,
+                    ))));
+                }
+
+                if parts_list.len() == 1 {
+                    // Just return the single part as an expression
+                    return self.parsed_value_to_expr(parts_list.into_iter().next().unwrap(), state)
+                        .map(|e| ParsedValue::Expression(Box::new(e)));
+                }
+
+                // Fold left: concat(concat(a, b), c)
+                let concat_name = state.intern("concat");
+                let mut iter = parts_list.into_iter();
+                let first = iter.next().unwrap();
+                let mut acc = self.parsed_value_to_expr(first, state)?;
+
+                for part in iter {
+                    let part_expr = self.parsed_value_to_expr(part, state)?;
+                    // Create concat(acc, part)
+                    acc = typed_node(
+                        TypedExpression::Call(TypedCall {
+                            callee: Box::new(typed_node(
+                                TypedExpression::Variable(concat_name),
+                                Type::Unknown,
+                                span,
+                            )),
+                            positional_args: vec![acc, part_expr],
+                            named_args: vec![],
+                            type_args: vec![],
+                        }),
+                        Type::Primitive(zyntax_typed_ast::PrimitiveType::String),
+                        span,
+                    );
+                }
+
+                Ok(ParsedValue::Expression(Box::new(acc)))
+            }
             _ => Err(format!("unknown helper function: {}", function)),
         }
     }

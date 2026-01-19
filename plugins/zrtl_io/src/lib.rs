@@ -918,7 +918,7 @@ zrtl_plugin! {
         ("$IO$println_array_f64", io_println_array_f64),
 
         // String operations
-        ("$IO$string_concat", io_string_concat),
+        ("$IO$string_concat", io_string_concat, (i64, i64) -> i64),
     ]
 }
 

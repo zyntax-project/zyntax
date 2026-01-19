@@ -1,0 +1,9 @@
+// Test basic string concat
+import prelude
+
+def main() {
+    let a = "Hello"
+    let b = " World"
+    let c = extern string_concat(a, b)
+    println(c)
+}

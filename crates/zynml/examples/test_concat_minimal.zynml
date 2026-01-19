@@ -1,0 +1,7 @@
+// Minimal concat test without prelude
+def main() {
+    let a = "Hello"
+    let b = " World"
+    let c = extern concat(a, b)
+    extern println_str(c)
+}

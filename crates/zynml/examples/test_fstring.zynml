@@ -1,0 +1,14 @@
+// Test f-string functionality
+import prelude
+
+def main() {
+    let name = "World"
+    println(f"Hello {name}!")
+
+    let x = 42
+    println(f"The answer is {x}")
+
+    let a = 10
+    let b = 20
+    println(f"a={a}, b={b}, sum={a}")
+}

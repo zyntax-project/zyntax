@@ -1,0 +1,9 @@
+// Test direct concat call
+import prelude
+
+def main() {
+    let a = "Hello"
+    let b = " World"
+    let c = extern concat(a, b)
+    println(c)
+}

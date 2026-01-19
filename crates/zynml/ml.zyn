@@ -217,9 +217,10 @@
     println_array_f64: "$IO$println_array_f64",
 
     // String operations
-    concat: "$IO$string_concat",         // Used by f-string desugaring
+    concat: "$IO$string_concat",         // Used by f-string desugaring (binary concat)
     string_concat: "$IO$string_concat",
     string_free: "$IO$string_free",
+    to_string: "$IO$format_dynamic",     // Used by f-string desugaring for interpolations
 
     // === File Operations (zrtl_fs) ===
     file_read: "$FS$read_string",
@@ -2683,24 +2684,18 @@ duration_unit = { "ms" | "s" | "m" | "h" | "d" }
 //   """
 //
 // Format specifiers (after colon) are supported:
-// F-strings desugar to concat(parts...) where each interpolation is wrapped in to_string()
-// Example: f"Hello {name}!" -> concat("Hello ", to_string(name), "!")
+// F-strings desugar to nested concat(a, b) calls where each interpolation is wrapped in to_string()
+// Example: f"Hello {name}!" -> concat(concat("Hello ", to_string(name)), "!")
 //
 f_string_literal = { f_string_triple | f_string_regular }
 
 // f"""multiline {expr} string"""
 f_string_triple = { "f\"\"\"" ~ parts:f_string_part* ~ "\"\"\"" }
-  -> TypedExpression::Call {
-      callee: TypedExpression::Variable { name: intern("concat") },
-      args: parts,
-  }
+  -> fold_concat(parts)
 
 // f"single line {expr} string"
 f_string_regular = { "f\"" ~ parts:f_string_part* ~ "\"" }
-  -> TypedExpression::Call {
-      callee: TypedExpression::Variable { name: intern("concat") },
-      args: parts,
-  }
+  -> fold_concat(parts)
 
 // Parts of an f-string: either text or interpolated expression
 f_string_part = { f_string_interp | f_string_text }
