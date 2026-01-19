@@ -1,0 +1,6 @@
+// Test 01: Basic println with string
+import prelude
+
+def main() {
+    println("Hello World!")
+}

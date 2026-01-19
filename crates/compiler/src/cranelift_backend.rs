@@ -109,6 +109,8 @@ pub struct CraneliftBackend {
     runtime_symbols: Vec<(String, *const u8)>,
     /// Symbol signatures for auto-boxing support (symbol_name → signature)
     symbol_signatures: HashMap<String, crate::zrtl::ZrtlSymbolSig>,
+    /// External function link names (HirId → symbol name) for boxing support
+    external_link_names: HashMap<HirId, String>,
     /// Effect codegen context for algebraic effects
     effect_context: EffectCodegenContext,
 }
@@ -207,6 +209,7 @@ impl CraneliftBackend {
             exported_symbols: HashMap::new(),
             runtime_symbols,
             symbol_signatures: HashMap::new(),
+            external_link_names: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
         })
     }
@@ -249,7 +252,12 @@ impl CraneliftBackend {
         // Pass 2: Compile all function bodies
         for (id, function) in &module.functions {
             if !function.is_external {
-                self.compile_function_body(*id, function, module)?;
+                // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
+                if let Err(e) = self.compile_function_body(*id, function, module) {
+                    eprintln!("[CRANELIFT WARN] Skipping function '{}': {:?}", function.name, e);
+                    // Remove from function_map to prevent later lookup failures
+                    self.function_map.remove(id);
+                }
             }
         }
 
@@ -368,6 +376,9 @@ impl CraneliftBackend {
                     function.name.resolve_global()
                         .unwrap_or_else(|| format!("{:?}", function.name))
                 });
+
+            log::debug!("[Cranelift] Declaring external function: {:?} -> '{}'", function.name, link_name);
+
             let func_id = self.module.declare_function(
                 &link_name,
                 Linkage::Import,
@@ -375,6 +386,10 @@ impl CraneliftBackend {
             ).map_err(|e| CompilerError::Backend(format!("Failed to declare extern function: {}", e)))?;
 
             self.function_map.insert(id, func_id);
+            // Store link_name for external function boxing support
+            self.external_link_names.insert(id, link_name.clone());
+
+            log::debug!("[Cranelift] External function registered: '{}' with HirId {:?} -> FuncId {:?}", link_name, id, func_id);
         } else {
             // Regular functions use Export linkage with unique name
             // Use resolve_global to get the actual function name
@@ -597,13 +612,27 @@ impl CraneliftBackend {
             let mut symbol_boxing: HashMap<(String, usize), bool> = HashMap::new();
             for block in function.blocks.values() {
                 for inst in &block.instructions {
-                    if let HirInstruction::Call { callee: HirCallable::Symbol(symbol_name), args, .. } = inst {
-                        for param_index in 0..args.len() {
-                            let key = (symbol_name.clone(), param_index);
-                            if !symbol_boxing.contains_key(&key) {
-                                symbol_boxing.insert(key, self.param_needs_boxing(symbol_name, param_index));
+                    match inst {
+                        HirInstruction::Call { callee: HirCallable::Symbol(symbol_name), args, .. } => {
+                            for param_index in 0..args.len() {
+                                let key = (symbol_name.clone(), param_index);
+                                if !symbol_boxing.contains_key(&key) {
+                                    symbol_boxing.insert(key, self.param_needs_boxing(symbol_name, param_index));
+                                }
                             }
                         }
+                        HirInstruction::Call { callee: HirCallable::Function(func_id), args, .. } => {
+                            // Also check external functions
+                            if let Some(link_name) = self.external_link_names.get(func_id) {
+                                for param_index in 0..args.len() {
+                                    let key = (link_name.clone(), param_index);
+                                    if !symbol_boxing.contains_key(&key) {
+                                        symbol_boxing.insert(key, self.param_needs_boxing(link_name, param_index));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -850,15 +879,19 @@ impl CraneliftBackend {
                                         builder.ins().ushr(lhs, rhs)
                                     }
                                 }
-                                // Comparisons
+                                // Comparisons - use operand type (not result type) to determine signed/unsigned
                                 BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                                    // Get operand type from left value, not result type
+                                    let operand_ty = function.values.get(left)
+                                        .map(|v| &v.ty)
+                                        .unwrap_or(ty);
                                     let cc = match op {
                                         BinaryOp::Eq => IntCC::Equal,
                                         BinaryOp::Ne => IntCC::NotEqual,
-                                        BinaryOp::Lt => if ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan },
-                                        BinaryOp::Le => if ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual },
-                                        BinaryOp::Gt => if ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan },
-                                        BinaryOp::Ge => if ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual },
+                                        BinaryOp::Lt => if operand_ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan },
+                                        BinaryOp::Le => if operand_ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual },
+                                        BinaryOp::Gt => if operand_ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan },
+                                        BinaryOp::Ge => if operand_ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual },
                                         _ => unreachable!(),
                                     };
                                     let cmp = builder.ins().icmp(cc, lhs, rhs);
@@ -1116,24 +1149,167 @@ impl CraneliftBackend {
                                     }
                                 }
                                 HirCallable::Function(func_id) => {
-                                    // Call another HIR function
-                                    if let Some(&cranelift_func_id) = self.function_map.get(func_id) {
-                                        let local_callee = self.module
-                                            .declare_func_in_func(cranelift_func_id, builder.func);
+                                    // Check if this is an external function with boxing requirements
+                                    if let Some(link_name) = self.external_link_names.get(func_id).cloned() {
+                                        // External function - check if boxing is needed
+                                        let mut boxed_args = Vec::new();
+                                        for (param_index, &arg_val) in arg_values.iter().enumerate() {
+                                            let needs_boxing = symbol_boxing
+                                                .get(&(link_name.clone(), param_index))
+                                                .copied()
+                                                .unwrap_or(false);
 
-                                        let call = builder.ins().call(local_callee, &arg_values);
+                                            if needs_boxing {
+                                                // Apply DynamicBox wrapping - same logic as HirCallable::Symbol
+                                                let arg_hir_id = args[param_index];
+                                                // Check if this is a pointer type (opaque or string) - pass value directly
+                                                let is_pointer_type = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                    match &hir_value.ty {
+                                                        HirType::Opaque(_) => true,
+                                                        HirType::Ptr(inner) => matches!(inner.as_ref(), HirType::Opaque(_) | HirType::I8),
+                                                        _ => false,
+                                                    }
+                                                } else {
+                                                    false
+                                                };
 
-                                        if let Some(result_id) = result {
-                                            // Get first return value (we only support single returns for now)
-                                            if let Some(&ret_val) = builder.inst_results(call).first() {
-                                                self.value_map.insert(*result_id, ret_val);
+                                                let (tag_value, size_value) = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                    // TypeTag format: (type_id << 8) | category
+                                                    // PrimitiveSize: Bits8=1, Bits16=2, Bits32=3, Bits64=4
+                                                    match &hir_value.ty {
+                                                        HirType::I8 => (0x0102u32, 1u32),   // Int(Bits8)
+                                                        HirType::I16 => (0x0202u32, 2u32),  // Int(Bits16)
+                                                        HirType::I32 => (0x0302u32, 4u32),  // Int(Bits32)
+                                                        HirType::I64 => (0x0402u32, 8u32),  // Int(Bits64)
+                                                        HirType::U8 => (0x0103u32, 1u32),   // UInt(Bits8)
+                                                        HirType::U16 => (0x0203u32, 2u32),  // UInt(Bits16)
+                                                        HirType::U32 => (0x0303u32, 4u32),  // UInt(Bits32)
+                                                        HirType::U64 => (0x0403u32, 8u32),  // UInt(Bits64)
+                                                        HirType::F32 => (0x0304u32, 4u32),  // Float(Bits32)
+                                                        HirType::F64 => (0x0404u32, 8u32),  // Float(Bits64)
+                                                        HirType::Bool => (0x0001u32, 1u32), // Bool
+                                                        HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::I8) => (0x0005u32, 8u32), // String
+                                                        HirType::Opaque(_) => (0x0012u32, 8u32), // Opaque
+                                                        HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_)) => (0x0012u32, 8u32),
+                                                        other => {
+                                                            eprintln!("[DEBUG Boxing Function] Unhandled type: {:?}, defaulting to Opaque", other);
+                                                            (0x0012u32, 8u32)  // Opaque
+                                                        },
+                                                    }
+                                                } else {
+                                                    eprintln!("[DEBUG Boxing Function] No HirValue found for arg_hir_id {:?}", arg_hir_id);
+                                                    (0x0012u32, 8u32)  // Opaque
+                                                };
+
+                                                let data_ptr_value = if is_pointer_type {
+                                                    // Pointer types (opaque, string): value IS the pointer
+                                                    match builder.func.dfg.value_type(arg_val) {
+                                                        types::I64 => arg_val,
+                                                        _ => builder.ins().uextend(types::I64, arg_val),
+                                                    }
+                                                } else {
+                                                    // Primitives: allocate stack slot and store pointer to it
+                                                    let value_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                                        8,
+                                                    ));
+                                                    let value_addr = builder.ins().stack_addr(types::I64, value_slot, 0);
+                                                    let data_value = match builder.func.dfg.value_type(arg_val) {
+                                                        types::I8 | types::I16 | types::I32 => builder.ins().sextend(types::I64, arg_val),
+                                                        types::F32 => {
+                                                            let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), arg_val);
+                                                            builder.ins().uextend(types::I64, as_i32)
+                                                        }
+                                                        _ => arg_val
+                                                    };
+                                                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_value, value_addr, 0);
+                                                    value_addr
+                                                };
+
+                                                // Create DynamicBox on stack
+                                                let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                                    32,
+                                                ));
+                                                let box_addr = builder.ins().stack_addr(types::I64, slot, 0);
+                                                let tag_val = builder.ins().iconst(types::I32, tag_value as i64);
+                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), tag_val, box_addr, 0);
+                                                let size_val = builder.ins().iconst(types::I32, size_value as i64);
+                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), size_val, box_addr, 4);
+                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_ptr_value, box_addr, 8);
+                                                let null_dropper = builder.ins().iconst(types::I64, 0);
+                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), null_dropper, box_addr, 16);
+
+                                                // Check for Display trait impl
+                                                let display_fn_value = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                    let opaque_name = match &hir_value.ty {
+                                                        HirType::Opaque(type_name) => Some(type_name),
+                                                        HirType::Ptr(inner) => {
+                                                            if let HirType::Opaque(type_name) = inner.as_ref() {
+                                                                Some(type_name)
+                                                            } else { None }
+                                                        }
+                                                        _ => None,
+                                                    };
+                                                    if let Some(type_name) = opaque_name {
+                                                        let type_name_str = type_name.resolve_global().unwrap_or_default();
+                                                        // Strip leading $ if present (opaque types may have $ prefix)
+                                                        let clean_type_name = if type_name_str.starts_with('$') {
+                                                            &type_name_str[1..]
+                                                        } else {
+                                                            &type_name_str
+                                                        };
+                                                        if !clean_type_name.is_empty() {
+                                                            let display_symbol = format!("${}$to_string", clean_type_name);
+                                                            if let Some((_, func_ptr)) = self.runtime_symbols.iter().find(|(n, _)| n == &display_symbol) {
+                                                                builder.ins().iconst(types::I64, *func_ptr as i64)
+                                                            } else {
+                                                                builder.ins().iconst(types::I64, 0)
+                                                            }
+                                                        } else {
+                                                            builder.ins().iconst(types::I64, 0)
+                                                        }
+                                                    } else {
+                                                        builder.ins().iconst(types::I64, 0)
+                                                    }
+                                                } else {
+                                                    builder.ins().iconst(types::I64, 0)
+                                                };
+                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), display_fn_value, box_addr, 24);
+                                                boxed_args.push(box_addr);
+                                            } else {
+                                                boxed_args.push(arg_val);
+                                            }
+                                        }
+
+                                        // Call the external function with boxed args
+                                        if let Some(&cranelift_func_id) = self.function_map.get(func_id) {
+                                            let local_callee = self.module.declare_func_in_func(cranelift_func_id, builder.func);
+                                            let call = builder.ins().call(local_callee, &boxed_args);
+                                            if let Some(result_id) = result {
+                                                if let Some(&ret_val) = builder.inst_results(call).first() {
+                                                    self.value_map.insert(*result_id, ret_val);
+                                                }
                                             }
                                         }
                                     } else {
-                                        warn!(" Function {:?} not in function_map", func_id);
-                                        // Create a dummy value to avoid unmapped error
-                                        if let Some(result_id) = result {
-                                            self.value_map.insert(*result_id, builder.ins().iconst(types::I32, 0));
+                                        // Regular (non-external) function call - no boxing needed
+                                        if let Some(&cranelift_func_id) = self.function_map.get(func_id) {
+                                            let local_callee = self.module
+                                                .declare_func_in_func(cranelift_func_id, builder.func);
+
+                                            let call = builder.ins().call(local_callee, &arg_values);
+
+                                            if let Some(result_id) = result {
+                                                if let Some(&ret_val) = builder.inst_results(call).first() {
+                                                    self.value_map.insert(*result_id, ret_val);
+                                                }
+                                            }
+                                        } else {
+                                            warn!(" Function {:?} not in function_map", func_id);
+                                            if let Some(result_id) = result {
+                                                self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                            }
                                         }
                                     }
                                 }
@@ -1152,8 +1328,8 @@ impl CraneliftBackend {
                                         let arg_ty = builder.func.dfg.value_type(*arg_val);
                                         sig.params.push(cranelift_codegen::ir::AbiParam::new(arg_ty));
                                     }
-                                    // Add return type (assume i32 for now)
-                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I32));
+                                    // Use i64 for return type (pointer-sized for opaque types)
+                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64));
 
                                     let sig_ref = builder.import_signature(sig);
                                     let call = builder.ins().call_indirect(sig_ref, func_ptr_val, &arg_values);
@@ -1190,46 +1366,82 @@ impl CraneliftBackend {
                                             // Determine TypeTag and size based on HIR type
                                             let arg_hir_id = args[param_index];
                                             let (tag_value, size_value) = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                // TypeTag format: (type_id << 8) | category
+                                                // PrimitiveSize: Bits8=1, Bits16=2, Bits32=3, Bits64=4
                                                 match &hir_value.ty {
-                                                    HirType::I8 => (0x0200u32, 1u32),    // Int, Bits8
-                                                    HirType::I16 => (0x0201u32, 2u32),   // Int, Bits16
-                                                    HirType::I32 => (0x0202u32, 4u32),   // Int, Bits32
-                                                    HirType::I64 => (0x0203u32, 8u32),   // Int, Bits64
-                                                    HirType::U8 => (0x0300u32, 1u32),    // UInt, Bits8
-                                                    HirType::U16 => (0x0301u32, 2u32),   // UInt, Bits16
-                                                    HirType::U32 => (0x0302u32, 4u32),   // UInt, Bits32
-                                                    HirType::U64 => (0x0303u32, 8u32),   // UInt, Bits64
-                                                    HirType::F32 => (0x0402u32, 4u32),   // Float, Bits32
-                                                    HirType::F64 => (0x0403u32, 8u32),   // Float, Bits64
-                                                    HirType::Bool => (0x0100u32, 1u32),  // Bool
-                                                    _ => (0x1200u32, 8u32),               // Opaque for others
+                                                    HirType::I8 => (0x0102u32, 1u32),   // Int(Bits8)
+                                                    HirType::I16 => (0x0202u32, 2u32),  // Int(Bits16)
+                                                    HirType::I32 => (0x0302u32, 4u32),  // Int(Bits32)
+                                                    HirType::I64 => (0x0402u32, 8u32),  // Int(Bits64)
+                                                    HirType::U8 => (0x0103u32, 1u32),   // UInt(Bits8)
+                                                    HirType::U16 => (0x0203u32, 2u32),  // UInt(Bits16)
+                                                    HirType::U32 => (0x0303u32, 4u32),  // UInt(Bits32)
+                                                    HirType::U64 => (0x0403u32, 8u32),  // UInt(Bits64)
+                                                    HirType::F32 => (0x0304u32, 4u32),  // Float(Bits32)
+                                                    HirType::F64 => (0x0404u32, 8u32),  // Float(Bits64)
+                                                    HirType::Bool => (0x0001u32, 1u32), // Bool
+                                                    HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::I8) => {
+                                                        (0x0005u32, 8u32)  // String
+                                                    }
+                                                    HirType::Opaque(_) => (0x0012u32, 8u32),  // Opaque
+                                                    HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_)) => {
+                                                        (0x0012u32, 8u32)  // Ptr to Opaque
+                                                    }
+                                                    other => {
+                                                        log::warn!("[Boxing] Unhandled type: {:?}, defaulting to Opaque", other);
+                                                        (0x0012u32, 8u32)  // Opaque
+                                                    }
                                                 }
                                             } else {
-                                                (0x1200u32, 8u32)  // Default to Opaque
+                                                log::warn!("[Boxing] No HirValue found for arg_hir_id {:?}", arg_hir_id);
+                                                (0x0012u32, 8u32)  // Opaque
                                             };
 
-                                            // Allocate stack space for the VALUE (8 bytes max for primitives)
-                                            let value_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                                8,
-                                            ));
-                                            let value_addr = builder.ins().stack_addr(types::I64, value_slot, 0);
-
-                                            // Store the actual value in the value slot
-                                            // Extend smaller integers to i64 for storage
-                                            let data_value = match builder.func.dfg.value_type(arg_val) {
-                                                types::I8 | types::I16 | types::I32 => {
-                                                    // Sign-extend to i64
-                                                    builder.ins().sextend(types::I64, arg_val)
+                                            // Check if this is a pointer type (opaque types or strings that should be passed directly)
+                                            let is_pointer_type = if let Some(hir_value) = function.values.get(&args[param_index]) {
+                                                match &hir_value.ty {
+                                                    HirType::Opaque(_) => true,
+                                                    HirType::Ptr(inner) => matches!(inner.as_ref(), HirType::Opaque(_) | HirType::I8),
+                                                    _ => false,
                                                 }
-                                                types::F32 => {
-                                                    // Bitcast f32 to i32, then zero-extend to i64
-                                                    let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), arg_val);
-                                                    builder.ins().uextend(types::I64, as_i32)
-                                                }
-                                                _ => arg_val  // Already i64 or pointer
+                                            } else {
+                                                false
                                             };
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_value, value_addr, 0);
+
+                                            // For pointer types, the value IS already a pointer - store directly
+                                            // For primitives, allocate stack space and store a pointer to the value
+                                            let data_ptr_value = if is_pointer_type {
+                                                // Pointer types: the i64 value is the pointer itself
+                                                // Cast to i64 if needed
+                                                match builder.func.dfg.value_type(arg_val) {
+                                                    types::I64 => arg_val,
+                                                    _ => builder.ins().uextend(types::I64, arg_val),
+                                                }
+                                            } else {
+                                                // Primitives: allocate stack space and store pointer to it
+                                                let value_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                                    8,
+                                                ));
+                                                let value_addr = builder.ins().stack_addr(types::I64, value_slot, 0);
+
+                                                // Store the actual value in the value slot
+                                                // Extend smaller integers to i64 for storage
+                                                let data_value = match builder.func.dfg.value_type(arg_val) {
+                                                    types::I8 | types::I16 | types::I32 => {
+                                                        // Sign-extend to i64
+                                                        builder.ins().sextend(types::I64, arg_val)
+                                                    }
+                                                    types::F32 => {
+                                                        // Bitcast f32 to i32, then zero-extend to i64
+                                                        let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), arg_val);
+                                                        builder.ins().uextend(types::I64, as_i32)
+                                                    }
+                                                    _ => arg_val  // Already i64 or pointer
+                                                };
+                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_value, value_addr, 0);
+                                                value_addr
+                                            };
 
                                             // Allocate stack space for DynamicBox (32 bytes on 64-bit)
                                             let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
@@ -1246,24 +1458,19 @@ impl CraneliftBackend {
                                             let size_val = builder.ins().iconst(types::I32, size_value as i64);
                                             builder.ins().store(cranelift_codegen::ir::MemFlags::new(), size_val, box_addr, 4);
 
-                                            // Set data POINTER (pointer to the value slot)
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), value_addr, box_addr, 8);
+                                            // Set data - for opaque types this IS the pointer, for primitives it's pointer to value
+                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_ptr_value, box_addr, 8);
 
                                             // Set dropper to null (0)
                                             let null_dropper = builder.ins().iconst(types::I64, 0);
                                             builder.ins().store(cranelift_codegen::ir::MemFlags::new(), null_dropper, box_addr, 16);
 
                                             // Set display_fn - check if this opaque type implements Display trait
-                                            // Convention: Display::to_string is at symbol {type_name}$to_string
+                                            // Convention: Display::to_string is at symbol ${type_name}$to_string
                                             let display_fn_value = {
                                                 // Get the HIR value to check if it's an opaque type
                                                 let arg_hir_id = args[param_index];
-                                                eprintln!("[DEBUG DynamicBox] Checking arg_hir_id: {:?}", arg_hir_id);
-                                                eprintln!("[DEBUG DynamicBox] args list: {:?}", args);
                                                 if let Some(hir_value) = function.values.get(&arg_hir_id) {
-                                                    eprintln!("[DEBUG DynamicBox] HIR value: {:?}", hir_value);
-                                                    eprintln!("[DEBUG DynamicBox] HIR value type: {:?}", hir_value.ty);
-
                                                     // Extract opaque type name, handling both Opaque and Ptr(Opaque(...))
                                                     let opaque_name = match &hir_value.ty {
                                                         HirType::Opaque(type_name) => Some(type_name),
@@ -1281,33 +1488,33 @@ impl CraneliftBackend {
                                                         // Extract the type name string
                                                         let type_name_str = type_name.resolve_global()
                                                             .unwrap_or_else(|| String::new());
-                                                        eprintln!("[DEBUG DynamicBox] Opaque type name: {}", type_name_str);
+                                                        // Strip leading $ if present (opaque types may have $ prefix)
+                                                        let clean_type_name = if type_name_str.starts_with('$') {
+                                                            &type_name_str[1..]
+                                                        } else {
+                                                            type_name_str.as_str()
+                                                        };
 
-                                                        if !type_name_str.is_empty() {
-                                                            // Construct Display method symbol: {type_name}$to_string
-                                                            let display_symbol = format!("{}$to_string", type_name_str);
-                                                            eprintln!("[DEBUG DynamicBox] Looking for Display symbol: {}", display_symbol);
+                                                        if !clean_type_name.is_empty() {
+                                                            // Construct Display method symbol: ${type_name}$to_string
+                                                            let display_symbol = format!("${}$to_string", clean_type_name);
 
                                                             // Look up in runtime symbols
                                                             if let Some((_, func_ptr)) = self.runtime_symbols
                                                                 .iter()
                                                                 .find(|(name, _)| name == &display_symbol)
                                                             {
-                                                                eprintln!("[DEBUG DynamicBox] Found Display impl: {} -> {:p}", display_symbol, *func_ptr);
                                                                 // Found Display implementation!
                                                                 builder.ins().iconst(types::I64, *func_ptr as i64)
                                                             } else {
-                                                                eprintln!("[DEBUG DynamicBox] No Display impl found for: {}", display_symbol);
                                                                 // No Display implementation
                                                                 builder.ins().iconst(types::I64, 0)
                                                             }
                                                         } else {
-                                                            eprintln!("[DEBUG DynamicBox] Empty type name");
                                                             // Empty type name
                                                             builder.ins().iconst(types::I64, 0)
                                                         }
                                                     } else {
-                                                        eprintln!("[DEBUG DynamicBox] Not an opaque type (or Ptr to opaque)");
                                                         // Not an opaque type
                                                         builder.ins().iconst(types::I64, 0)
                                                     }
@@ -3340,24 +3547,22 @@ impl CraneliftBackend {
                         let cmp = builder.ins().icmp(IntCC::NotEqual, lhs, rhs);
                         builder.ins().uextend(types::I32, cmp)
                     }
+                    // For comparisons, default to signed since ZynML uses signed integers
+                    // (The result type `ty` is Bool, so we can't use it for signedness)
                     BinaryOp::Lt => {
-                        let cc = if ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan };
-                        let cmp = builder.ins().icmp(cc, lhs, rhs);
+                        let cmp = builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs);
                         builder.ins().uextend(types::I32, cmp)
                     }
                     BinaryOp::Le => {
-                        let cc = if ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual };
-                        let cmp = builder.ins().icmp(cc, lhs, rhs);
+                        let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs);
                         builder.ins().uextend(types::I32, cmp)
                     }
                     BinaryOp::Gt => {
-                        let cc = if ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan };
-                        let cmp = builder.ins().icmp(cc, lhs, rhs);
+                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs);
                         builder.ins().uextend(types::I32, cmp)
                     }
                     BinaryOp::Ge => {
-                        let cc = if ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual };
-                        let cmp = builder.ins().icmp(cc, lhs, rhs);
+                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs);
                         builder.ins().uextend(types::I32, cmp)
                     }
                     // Floating point operations
@@ -4387,8 +4592,8 @@ impl CraneliftBackend {
                 // In a real implementation, we'd call through the function pointer
                 // For now, this is a placeholder that demonstrates the structure
                 if let Some(result_id) = result {
-                    // Create a dummy result for now
-                    let dummy_result = builder.ins().iconst(types::I32, 0);
+                    // Create a dummy result for now (use i64 for pointer-sized values)
+                    let dummy_result = builder.ins().iconst(types::I64, 0);
                     self.value_map.insert(*result_id, dummy_result);
                 }
             }
@@ -4511,15 +4716,19 @@ impl CraneliftBackend {
                             builder.ins().ushr(lhs, rhs)
                         }
                     }
-                    // Comparison operations - extend based on result type
+                    // Comparison operations - use operand type to determine signed/unsigned
                     BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                        // Get operand type from left value, not result type
+                        let operand_ty = function.values.get(left)
+                            .map(|v| &v.ty)
+                            .unwrap_or(ty);
                         let cc = match op {
                             BinaryOp::Eq => IntCC::Equal,
                             BinaryOp::Ne => IntCC::NotEqual,
-                            BinaryOp::Lt => if ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan },
-                            BinaryOp::Le => if ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual },
-                            BinaryOp::Gt => if ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan },
-                            BinaryOp::Ge => if ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual },
+                            BinaryOp::Lt => if operand_ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan },
+                            BinaryOp::Le => if operand_ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual },
+                            BinaryOp::Gt => if operand_ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan },
+                            BinaryOp::Ge => if operand_ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual },
                             _ => unreachable!(),
                         };
                         let cmp = builder.ins().icmp(cc, lhs, rhs);

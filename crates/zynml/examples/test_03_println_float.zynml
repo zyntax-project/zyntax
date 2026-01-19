@@ -1,0 +1,8 @@
+// Test 03: Basic println with floats
+import prelude
+
+def main() {
+    println(3.14)
+    println(-2.5)
+    println(0.0)
+}

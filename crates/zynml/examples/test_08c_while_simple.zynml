@@ -1,0 +1,12 @@
+// Test 08c: Simple while loop
+import prelude
+
+def main() {
+    let mut i = 0
+    println("before loop")
+    while i < 2 {
+        println("in loop")
+        i = i + 1
+    }
+    println("after loop")
+}

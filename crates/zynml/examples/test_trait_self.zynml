@@ -1,0 +1,8 @@
+// Test parsing trait with self parameter
+trait WithSelf {
+    def test(self): i32
+}
+
+def main() {
+    println("Hello")
+}

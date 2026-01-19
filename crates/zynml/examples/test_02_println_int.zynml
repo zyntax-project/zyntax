@@ -1,0 +1,8 @@
+// Test 02: Basic println with integers
+import prelude
+
+def main() {
+    println(42)
+    println(-10)
+    println(0)
+}

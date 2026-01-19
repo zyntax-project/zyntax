@@ -1,0 +1,6 @@
+// Test parsing empty trait
+trait Empty {}
+
+def main() {
+    println("Hello")
+}

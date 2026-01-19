@@ -1,0 +1,7 @@
+// Test 10: Simple f-string
+import prelude
+
+def main() {
+    let name = "Alice"
+    println(f"Hello {name}")
+}

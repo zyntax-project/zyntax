@@ -1,0 +1,16 @@
+// Test 06: Function definitions and calls
+import prelude
+
+def add(a: int, b: int): int {
+    a + b
+}
+
+def greet(name: str) {
+    println(name)
+}
+
+def main() {
+    let result = add(5, 7)
+    println(result)
+    greet("Hello from function!")
+}

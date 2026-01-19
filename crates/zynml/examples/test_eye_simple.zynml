@@ -1,0 +1,8 @@
+// Simpler test: just create identity tensor with Tensor::eye (single param)
+import tensor
+
+def main() {
+    println("Creating identity tensor with Tensor::eye...")
+    let t = Tensor::eye(3)
+    println("Identity tensor created!")
+}

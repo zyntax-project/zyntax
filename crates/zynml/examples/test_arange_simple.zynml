@@ -1,0 +1,8 @@
+// Simple test: just create a tensor with Tensor::arange
+import tensor
+
+def main() {
+    println("Creating tensor with Tensor::arange...")
+    let t = Tensor::arange(1.0, 5.0, 1.0)
+    println("Tensor created successfully!")
+}

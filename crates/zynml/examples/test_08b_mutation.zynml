@@ -1,0 +1,11 @@
+// Test 08b: Simple mutation
+import prelude
+
+def main() {
+    let mut x = 1
+    println(x)
+    x = 2
+    println(x)
+    x = 3
+    println(x)
+}

@@ -1,0 +1,9 @@
+// Test tensor with import and static method call
+import tensor
+
+def main() {
+    println("Testing Tensor::arange:")
+    let t = Tensor::arange(1.0, 5.0, 1.0)
+    println(t)
+    println("Done!")
+}

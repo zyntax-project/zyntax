@@ -1,0 +1,12 @@
+// Test 04: Let bindings
+import prelude
+
+def main() {
+    let x = 42
+    let name = "Alice"
+    let pi = 3.14159
+
+    println(x)
+    println(name)
+    println(pi)
+}

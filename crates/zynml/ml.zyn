@@ -2200,8 +2200,19 @@ or_expr = { inner:and_expr ~ ("||" ~ and_expr)* }
 and_expr = { inner:comparison_expr ~ ("&&" ~ comparison_expr)* }
   -> inner
 
-// Comparison - simplified (just pass through inner expression for now)
-comparison_expr = { inner:range_expr ~ (comparison_op ~ range_expr)? }
+// Comparison expressions - properly build Binary expressions
+// comparison_with_op handles: a < b, a == b, etc.
+// comparison_no_op passes through when no comparison operator
+comparison_expr = { comparison_with_op | comparison_no_op }
+
+comparison_with_op = { left:range_expr ~ op:comparison_op ~ right:range_expr }
+  -> TypedExpression::Binary {
+      op: op,
+      left: Box::new(left),
+      right: Box::new(right),
+  }
+
+comparison_no_op = { inner:range_expr }
   -> inner
 
 comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">" }

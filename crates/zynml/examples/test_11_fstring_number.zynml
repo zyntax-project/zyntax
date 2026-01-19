@@ -1,0 +1,7 @@
+// Test 11: F-string with number
+import prelude
+
+def main() {
+    let x = 42
+    println(f"The answer is {x}")
+}

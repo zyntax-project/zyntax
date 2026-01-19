@@ -1,0 +1,22 @@
+// Test 12: Comparison operators
+import prelude
+
+def main() {
+    let a = 5
+    let b = 10
+
+    // Test if conditions with comparisons
+    if a < b {
+        println("a < b is true")
+    }
+
+    if a > b {
+        println("a > b is true")
+    } else {
+        println("a > b is false")
+    }
+
+    if a == a {
+        println("a == a is true")
+    }
+}

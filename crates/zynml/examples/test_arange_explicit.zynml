@@ -1,0 +1,9 @@
+// Test with all explicit parameters (no defaults)
+import tensor
+
+def main() {
+    println("Creating tensor with explicit params...")
+    // Explicitly pass all 3 f64 params
+    let t = Tensor::arange(1.0, 5.0, 1.0)
+    println("Tensor created!")
+}

@@ -1,0 +1,11 @@
+// Test 05: Basic arithmetic
+import prelude
+
+def main() {
+    let a = 10
+    let b = 3
+
+    println(a + b)
+    println(a - b)
+    println(a * b)
+}

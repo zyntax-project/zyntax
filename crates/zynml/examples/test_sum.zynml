@@ -1,0 +1,18 @@
+// Test basic tensor method calls
+import tensor
+
+def main() {
+    println("Creating tensor...")
+    let a = Tensor::arange(1.0, 5.0, 1.0)  // [1.0, 2.0, 3.0, 4.0]
+    println("Tensor created!")
+
+    println("Calling sum...")
+    let total = a.sum()
+    println("Sum calculated!")
+
+    println("Calling mean...")
+    let avg = a.mean()
+    println("Mean calculated!")
+
+    println("Done!")
+}

@@ -1,0 +1,10 @@
+// Test using builtin aliases directly (no wrapper functions)
+// This tests if the @builtin mapping works correctly
+
+def main() {
+    println("Testing builtin tensor_arange:")
+    // Using builtin alias directly - tensor_arange -> $Tensor$arange
+    let t = tensor_arange(1.0, 5.0, 1.0)
+    println(t)
+    println("Done!")
+}

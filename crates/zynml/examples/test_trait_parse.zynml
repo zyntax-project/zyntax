@@ -1,0 +1,12 @@
+// Test parsing trait definitions
+trait Display {
+    def to_string(self): String
+}
+
+trait Clone {
+    def clone(self): Self
+}
+
+def main() {
+    println("Hello")
+}

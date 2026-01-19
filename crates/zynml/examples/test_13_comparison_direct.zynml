@@ -1,0 +1,25 @@
+// Test 13: Direct comparison test
+import prelude
+
+def main() {
+    // Testing: is 5 < 10?
+    if 5 < 10 {
+        println("5 < 10: true")
+    } else {
+        println("5 < 10: false")
+    }
+
+    // Testing: is 10 < 5?
+    if 10 < 5 {
+        println("10 < 5: true")
+    } else {
+        println("10 < 5: false")
+    }
+
+    // Testing: is 0 < 2?
+    if 0 < 2 {
+        println("0 < 2: true")
+    } else {
+        println("0 < 2: false")
+    }
+}

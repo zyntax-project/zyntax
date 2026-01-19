@@ -1,0 +1,7 @@
+// Test importing tensor without calling methods
+import tensor
+
+def main() {
+    println("Imported tensor module!")
+    println("Done!")
+}

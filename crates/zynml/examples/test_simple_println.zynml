@@ -1,0 +1,6 @@
+// Minimal test - just println
+def main() {
+    println("Hello, world!")
+    println("This is line 2")
+    println("Done!")
+}

@@ -1343,7 +1343,7 @@ impl SsaBuilder {
     ) -> CompilerResult<HirId> {
         use zyntax_typed_ast::typed_ast::TypedExpression;
         use crate::hir::{BinaryOp, UnaryOp};
-        
+
         match &expr.node {
             TypedExpression::Variable(name) => {
                 // Check if this is an address-taken variable - need to load from stack
@@ -1484,12 +1484,24 @@ impl SsaBuilder {
                 let result_type = self.convert_type(&expr.ty);
 
                 let hir_op = self.convert_binary_op(op);
+
+                // For comparisons, use the operand type (not Bool result type) for the instruction
+                let inst_type = match hir_op {
+                    crate::hir::BinaryOp::Lt | crate::hir::BinaryOp::Le |
+                    crate::hir::BinaryOp::Gt | crate::hir::BinaryOp::Ge |
+                    crate::hir::BinaryOp::Eq | crate::hir::BinaryOp::Ne => {
+                        // Use the left operand type so cranelift can determine signed/unsigned
+                        self.convert_type(&left.ty)
+                    }
+                    _ => result_type.clone()
+                };
+
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let inst = HirInstruction::Binary {
                     op: hir_op,
                     result,
-                    ty: result_type,
+                    ty: inst_type,
                     left: left_val,
                     right: right_val,
                 };

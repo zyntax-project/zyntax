@@ -1,0 +1,12 @@
+// Test 07: If-else control flow
+import prelude
+
+def main() {
+    let x = 10
+
+    if x > 5 {
+        println("x is greater than 5")
+    } else {
+        println("x is not greater than 5")
+    }
+}

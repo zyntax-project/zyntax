@@ -1,0 +1,8 @@
+// Test parsing trait with method
+trait WithMethod {
+    def test(): i32
+}
+
+def main() {
+    println("Hello")
+}
