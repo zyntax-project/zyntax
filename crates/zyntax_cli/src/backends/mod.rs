@@ -3,14 +3,14 @@
 pub mod cranelift_jit;
 pub mod llvm_aot;
 
+use log::info;
 use std::path::PathBuf;
 use zyntax_compiler::hir::HirModule;
 use zyntax_compiler::zpack::ZPack;
-use zyntax_typed_ast::{ModuleArchitecture, EntryPointResolver};
-use log::info;
+use zyntax_typed_ast::{EntryPointResolver, ModuleArchitecture};
 
 pub use cranelift_jit::compile_jit;
-pub use llvm_aot::{compile_llvm, compile_and_run_llvm};
+pub use llvm_aot::{compile_and_run_llvm, compile_llvm};
 
 /// Backend type (compiler infrastructure)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +54,9 @@ pub fn compile(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create entry point resolver based on module architecture
     let entry_resolver = EntryPointResolver::new(resolver_arch.clone());
-    let entry = entry_point.as_deref().unwrap_or(entry_resolver.default_entry());
+    let entry = entry_point
+        .as_deref()
+        .unwrap_or(entry_resolver.default_entry());
     let candidates = entry_resolver.resolve_candidates(entry);
 
     // Collect runtime symbols from all packs (for JIT mode)
@@ -71,17 +73,41 @@ pub fn compile(
 
     match (backend, jit) {
         // JIT execution - uses dynamic runtime symbols from ZPack
-        (Backend::Cranelift, true) => compile_jit(module, opt_level, true, &candidates, &pack_symbols, &pack_symbols_with_sigs, verbose),
+        (Backend::Cranelift, true) => compile_jit(
+            module,
+            opt_level,
+            true,
+            &candidates,
+            &pack_symbols,
+            &pack_symbols_with_sigs,
+            verbose,
+        ),
         (Backend::Llvm, true) => {
             compile_and_run_llvm(module, opt_level, Some(entry), &pack_symbols, verbose)?;
             Ok(())
         }
         // AOT compilation - users link static libraries directly
-        (Backend::Cranelift, false) => compile_jit(module, opt_level, false, &candidates, &pack_symbols, &pack_symbols_with_sigs, verbose),
+        (Backend::Cranelift, false) => compile_jit(
+            module,
+            opt_level,
+            false,
+            &candidates,
+            &pack_symbols,
+            &pack_symbols_with_sigs,
+            verbose,
+        ),
         (Backend::Llvm, false) => {
             // Static libraries are provided directly by the user via --lib flag
             // ZPack is for JIT only - AOT users link their runtime libraries directly
-            compile_llvm(module, output, opt_level, Some(entry), &pack_symbols, static_libs, verbose)
+            compile_llvm(
+                module,
+                output,
+                opt_level,
+                Some(entry),
+                &pack_symbols,
+                static_libs,
+                verbose,
+            )
         }
     }
 }

@@ -1,8 +1,8 @@
 //! # AST Conversion Traits
-//! 
+//!
 //! Traits and utilities for converting from language-specific ASTs
 //! to the Zyntax TypedAST without creating intermediate representations.
-//! 
+//!
 //! ## Design Philosophy
 //! - Language developers already have their own AST
 //! - Direct conversion avoids unnecessary allocations
@@ -11,8 +11,10 @@
 
 use crate::arena::InternedString;
 use crate::source::Span;
-use crate::type_registry::{Type, Mutability, Visibility};
-use crate::typed_ast::{ParameterKind, TypedDeclaration, TypedExpression, TypedNode, TypedProgram, TypedStatement};
+use crate::type_registry::{Mutability, Type, Visibility};
+use crate::typed_ast::{
+    ParameterKind, TypedDeclaration, TypedExpression, TypedNode, TypedProgram, TypedStatement,
+};
 // All types are now in typed_ast module
 use std::error::Error;
 use std::fmt;
@@ -64,7 +66,10 @@ pub trait StringInterner {
 }
 
 impl ConversionContext {
-    pub fn new(type_registry: Box<crate::type_registry::TypeRegistry>, strings: Box<dyn StringInterner>) -> Self {
+    pub fn new(
+        type_registry: Box<crate::type_registry::TypeRegistry>,
+        strings: Box<dyn StringInterner>,
+    ) -> Self {
         Self {
             type_registry,
             strings,
@@ -72,22 +77,22 @@ impl ConversionContext {
             type_cache: std::collections::HashMap::new(),
         }
     }
-    
+
     /// Enter a module scope
     pub fn enter_module(&mut self, name: InternedString) {
         self.module_path.push(name);
     }
-    
+
     /// Leave a module scope
     pub fn leave_module(&mut self) {
         self.module_path.pop();
     }
-    
+
     /// Cache a resolved type
     pub fn cache_type(&mut self, key: String, ty: Type) {
         self.type_cache.insert(key, ty);
     }
-    
+
     /// Get a cached type
     pub fn get_cached_type(&self, key: &str) -> Option<&Type> {
         self.type_cache.get(key)
@@ -107,50 +112,64 @@ impl StringInterner for StringInternerWrapper {
 pub trait ToTypedAst<T> {
     /// The source AST type
     type Source;
-    
+
     /// Convert to TypedAST node with type and span
-    fn to_typed_ast(&self, source: &Self::Source, ctx: &mut ConversionContext) 
-        -> ConversionResult<T>;
+    fn to_typed_ast(
+        &self,
+        source: &Self::Source,
+        ctx: &mut ConversionContext,
+    ) -> ConversionResult<T>;
 }
 
 /// Trait for converting programs
 pub trait ProgramConverter {
     type Program;
-    
-    fn convert_program(&self, program: &Self::Program, ctx: &mut ConversionContext)
-        -> ConversionResult<TypedProgram>;
+
+    fn convert_program(
+        &self,
+        program: &Self::Program,
+        ctx: &mut ConversionContext,
+    ) -> ConversionResult<TypedProgram>;
 }
 
 /// Trait for converting declarations
 pub trait DeclarationConverter {
     type Declaration;
-    
-    fn convert_declaration(&self, decl: &Self::Declaration, ctx: &mut ConversionContext)
-        -> ConversionResult<TypedNode<TypedDeclaration>>;
+
+    fn convert_declaration(
+        &self,
+        decl: &Self::Declaration,
+        ctx: &mut ConversionContext,
+    ) -> ConversionResult<TypedNode<TypedDeclaration>>;
 }
 
 /// Trait for converting statements
 pub trait StatementConverter {
     type Statement;
-    
-    fn convert_statement(&self, stmt: &Self::Statement, ctx: &mut ConversionContext)
-        -> ConversionResult<TypedNode<TypedStatement>>;
+
+    fn convert_statement(
+        &self,
+        stmt: &Self::Statement,
+        ctx: &mut ConversionContext,
+    ) -> ConversionResult<TypedNode<TypedStatement>>;
 }
 
 /// Trait for converting expressions
 pub trait ExpressionConverter {
     type Expression;
-    
-    fn convert_expression(&self, expr: &Self::Expression, ctx: &mut ConversionContext)
-        -> ConversionResult<TypedNode<TypedExpression>>;
+
+    fn convert_expression(
+        &self,
+        expr: &Self::Expression,
+        ctx: &mut ConversionContext,
+    ) -> ConversionResult<TypedNode<TypedExpression>>;
 }
 
 /// Trait for converting types
 pub trait TypeConverter {
     type Type;
-    
-    fn convert_type(&self, ty: &Self::Type, ctx: &mut ConversionContext)
-        -> ConversionResult<Type>;
+
+    fn convert_type(&self, ty: &Self::Type, ctx: &mut ConversionContext) -> ConversionResult<Type>;
 }
 
 /// Trait for extracting source location information
@@ -170,7 +189,7 @@ pub trait ConversionHelpers {
             _ => Visibility::Private,
         }
     }
-    
+
     /// Convert mutability
     fn convert_mutability(&self, is_mutable: bool) -> Mutability {
         if is_mutable {
@@ -184,53 +203,64 @@ pub trait ConversionHelpers {
 /// Example implementation for a hypothetical TypeScript AST
 pub mod typescript_example {
     use super::*;
-    
+
     // Hypothetical TypeScript AST types
     pub struct TSProgram {
         pub statements: Vec<TSStatement>,
     }
-    
+
     pub enum TSStatement {
-        Function { name: String, params: Vec<TSParam>, body: TSBlock },
-        Variable { name: String, ty: Option<TSType>, init: Option<TSExpression> },
+        Function {
+            name: String,
+            params: Vec<TSParam>,
+            body: TSBlock,
+        },
+        Variable {
+            name: String,
+            ty: Option<TSType>,
+            init: Option<TSExpression>,
+        },
     }
-    
+
     pub struct TSParam {
         pub name: String,
         pub ty: TSType,
     }
-    
+
     pub struct TSType {
         pub kind: String,
     }
-    
+
     pub struct TSBlock {
         pub statements: Vec<TSStatement>,
     }
-    
+
     pub struct TSExpression {
         pub kind: String,
     }
-    
+
     // Converter implementation
     pub struct TypeScriptConverter;
-    
+
     impl ProgramConverter for TypeScriptConverter {
         type Program = TSProgram;
-        
-        fn convert_program(&self, program: &TSProgram, ctx: &mut ConversionContext)
-            -> ConversionResult<TypedProgram> {
+
+        fn convert_program(
+            &self,
+            program: &TSProgram,
+            ctx: &mut ConversionContext,
+        ) -> ConversionResult<TypedProgram> {
             let mut declarations = Vec::new();
-            
+
             for stmt in &program.statements {
                 // Convert each statement to declaration
                 // This is where the actual conversion logic would go
             }
-            
+
             Ok(TypedProgram {
                 declarations,
                 span: Span::new(0, 0), // Would get from source
-                source_files: vec![], // TODO: Add source file info
+                source_files: vec![],  // TODO: Add source file info
                 type_registry: crate::TypeRegistry::new(),
             })
         }
@@ -246,17 +276,17 @@ impl<'a> TypedAstBuilder<'a> {
     pub fn new(ctx: &'a mut ConversionContext) -> Self {
         Self { ctx }
     }
-    
+
     /// Build a typed node
     pub fn typed_node<T>(&mut self, node: T, ty: Type, span: Span) -> TypedNode<T> {
         TypedNode::new(node, ty, span)
     }
-    
+
     /// Intern a string
     pub fn intern(&mut self, s: &str) -> InternedString {
         self.ctx.strings.intern(s)
     }
-    
+
     /// Build a function declaration
     pub fn function(
         &mut self,
@@ -268,18 +298,19 @@ impl<'a> TypedAstBuilder<'a> {
         span: Span,
     ) -> TypedNode<TypedDeclaration> {
         let name = self.intern(name);
-        let params = params.into_iter().map(|(n, t, m)| {
-            crate::typed_ast::TypedParameter {
+        let params = params
+            .into_iter()
+            .map(|(n, t, m)| crate::typed_ast::TypedParameter {
                 name: self.intern(&n),
                 ty: t,
                 mutability: m,
                 span: span.clone(),
-                 kind: ParameterKind::Regular,
-                default_value: None, 
-                attributes: vec![]
-            }
-        }).collect();
-        
+                kind: ParameterKind::Regular,
+                default_value: None,
+                attributes: vec![],
+            })
+            .collect();
+
         let func = crate::typed_ast::TypedFunction {
             name,
             annotations: vec![],
@@ -295,14 +326,10 @@ impl<'a> TypedAstBuilder<'a> {
             calling_convention: crate::type_registry::CallingConvention::Default,
             link_name: None,
         };
-        
-        self.typed_node(
-            TypedDeclaration::Function(func),
-            return_type,
-            span,
-        )
+
+        self.typed_node(TypedDeclaration::Function(func), return_type, span)
     }
-    
+
     /// Build a variable declaration
     pub fn variable(
         &mut self,
@@ -314,7 +341,7 @@ impl<'a> TypedAstBuilder<'a> {
         span: Span,
     ) -> TypedNode<TypedDeclaration> {
         let name = self.intern(name);
-        
+
         let var = crate::typed_ast::TypedVariable {
             name,
             ty: ty.clone(),
@@ -322,11 +349,7 @@ impl<'a> TypedAstBuilder<'a> {
             initializer,
             visibility,
         };
-        
-        self.typed_node(
-            TypedDeclaration::Variable(var),
-            ty,
-            span,
-        )
+
+        self.typed_node(TypedDeclaration::Variable(var), ty, span)
     }
 }

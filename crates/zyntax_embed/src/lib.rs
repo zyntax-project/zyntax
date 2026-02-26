@@ -53,69 +53,96 @@
 //! let program = grammar.parse("fn main() { 42 }")?;
 //! ```
 
+mod array;
 mod convert;
 mod error;
-mod string;
-mod array;
-mod value;
-mod runtime;
 mod grammar;
 mod grammar2;
 pub mod iterator;
+mod runtime;
+mod string;
+mod value;
 
+pub use array::ZyntaxArray;
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};
 pub use error::{ConversionError, ZyntaxError};
-pub use string::ZyntaxString;
-pub use array::ZyntaxArray;
-pub use value::ZyntaxValue;
-pub use runtime::{
-    ZyntaxRuntime, ZyntaxPromise, PromiseState, RuntimeError, RuntimeResult,
-    TieredRuntime, ImportResolverCallback,
-    // Re-export import resolver types for advanced use cases
-    ImportResolverTrait, ImportContext, ImportManager, ImportError,
-    ResolvedImport, ExportedSymbol, SymbolKind, ModuleArchitecture,
-    ChainedResolver, BuiltinResolver,
-    // Native calling interface
-    NativeType, NativeSignature,
-    // Async ABI types
-    AsyncPollResult,
-    // Promise combinators (Promise.all, Promise.race, etc.)
-    PromiseAll, PromiseAllState,
-    PromiseRace, PromiseRaceState,
-    PromiseAllSettled, SettledResult,
-};
-pub use grammar::{LanguageGrammar, GrammarError, GrammarResult};
+pub use grammar::{GrammarError, GrammarResult, LanguageGrammar};
 pub use grammar2::{Grammar2, Grammar2Error, Grammar2Result};
 pub use iterator::{
-    ZrtlIterable, ZrtlIterator,
-    ZyntaxArrayIterator, ZyntaxStringCharsIterator, ZyntaxStringBytesIterator,
-    ZyntaxValueIterator, ZrtlRangeIterator,
-    StdIteratorAdapter, ZrtlIteratorAdapter,
-    IntoZrtlIterator, ZrtlIteratorExt,
+    IntoZrtlIterator, StdIteratorAdapter, ZrtlIterable, ZrtlIterator, ZrtlIteratorAdapter,
+    ZrtlIteratorExt, ZrtlRangeIterator, ZyntaxArrayIterator, ZyntaxStringBytesIterator,
+    ZyntaxStringCharsIterator, ZyntaxValueIterator,
 };
+pub use runtime::{
+    // Async ABI types
+    AsyncPollResult,
+    BuiltinResolver,
+    ChainedResolver,
+    ExportedSymbol,
+    ImportContext,
+    ImportError,
+    ImportManager,
+    ImportResolverCallback,
+    // Re-export import resolver types for advanced use cases
+    ImportResolverTrait,
+    ModuleArchitecture,
+    NativeSignature,
+    // Native calling interface
+    NativeType,
+    // Promise combinators (Promise.all, Promise.race, etc.)
+    PromiseAll,
+    PromiseAllSettled,
+    PromiseAllState,
+    PromiseRace,
+    PromiseRaceState,
+    PromiseState,
+    ResolvedImport,
+    RuntimeError,
+    RuntimeResult,
+    SettledResult,
+    SymbolKind,
+    TieredRuntime,
+    ZyntaxPromise,
+    ZyntaxRuntime,
+};
+pub use string::ZyntaxString;
+pub use value::ZyntaxValue;
 
 // Re-export zyn_peg types for custom AST builders and advanced grammar use
 pub use zyn_peg::runtime::{
-    AstHostFunctions, CommandInterpreter, RuntimeValue, TypedAstBuilder,
-    ZpegModule, ZpegMetadata, RuleCommands, AstCommand, NodeHandle,
+    AstCommand, AstHostFunctions, CommandInterpreter, NodeHandle, RuleCommands, RuntimeValue,
+    TypedAstBuilder, ZpegMetadata, ZpegModule,
 };
 
 // Re-export TypedProgram for users who parse to TypedAST
 pub use zyntax_typed_ast::TypedProgram;
 
 // Re-export tiered compilation types
-pub use zyntax_compiler::tiered_backend::{TieredConfig, OptimizationTier, TieredStatistics};
+pub use zyntax_compiler::tiered_backend::{OptimizationTier, TieredConfig, TieredStatistics};
 
 // Re-export core types from zyntax_compiler for convenience
 pub use zyntax_compiler::zrtl::{
-    DynamicValue, TypeId, TypeCategory, TypeFlags, TypeTag, TypeMeta,
-    GenericTypeArgs, GenericValue, TypeInfo, TypeRegistry,
+    DynamicValue,
+    GenericTypeArgs,
+    GenericValue,
+    TypeCategory,
+    TypeFlags,
+    TypeId,
+    TypeInfo,
+    TypeMeta,
+    TypeRegistry,
+    TypeTag,
+    ZrtlError,
+    ZrtlInfo,
     // ZRTL plugin loading
-    ZrtlPlugin, ZrtlRegistry, ZrtlError, ZrtlSymbol, ZrtlInfo, ZRTL_VERSION,
+    ZrtlPlugin,
+    ZrtlRegistry,
+    ZrtlSymbol,
+    ZRTL_VERSION,
 };
 
 // Re-export compiler types needed for module compilation
 pub use zyntax_compiler::{
-    CompilationConfig, HirModule, HirFunction, CompilerError, CompilerResult,
-    compile_to_hir, compile_to_jit,
+    compile_to_hir, compile_to_jit, CompilationConfig, CompilerError, CompilerResult, HirFunction,
+    HirModule,
 };

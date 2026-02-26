@@ -2,11 +2,11 @@
 //!
 //! These tests verify the async primitives work correctly.
 
-use zrtl::async_support::*;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use zrtl::async_support::*;
 
 // ============================================================================
 // PollResult Tests
@@ -201,7 +201,9 @@ fn test_future_adapter_yielding() {
 
 #[test]
 fn test_future_adapter_take_result() {
-    async fn compute() -> i32 { 42 }
+    async fn compute() -> i32 {
+        42
+    }
 
     let mut adapter = FutureAdapter::new(compute());
     adapter.poll(); // Complete the future
@@ -248,9 +250,7 @@ extern "C" fn counting_poll(state: *mut u8) -> i64 {
 #[test]
 fn test_promise_poll_pending() {
     let mut state = [0u8; 16];
-    let mut promise = unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_pending_poll)
-    };
+    let mut promise = unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_pending_poll) };
 
     let result = unsafe { promise.poll() };
     assert_eq!(result, PollResult::Pending);
@@ -259,9 +259,7 @@ fn test_promise_poll_pending() {
 #[test]
 fn test_promise_poll_ready() {
     let mut state = [0u8; 16];
-    let mut promise = unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll)
-    };
+    let mut promise = unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll) };
 
     let result = unsafe { promise.poll() };
     assert_eq!(result, PollResult::Ready(42));
@@ -270,9 +268,7 @@ fn test_promise_poll_ready() {
 #[test]
 fn test_promise_poll_failed() {
     let mut state = [0u8; 16];
-    let mut promise = unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_failed_poll)
-    };
+    let mut promise = unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_failed_poll) };
 
     let result = unsafe { promise.poll() };
     assert_eq!(result, PollResult::Failed(-1));
@@ -281,9 +277,7 @@ fn test_promise_poll_failed() {
 #[test]
 fn test_promise_block_on() {
     let mut state = [0u8; 16];
-    let mut promise = unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll)
-    };
+    let mut promise = unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll) };
 
     let result = promise.block_on();
     assert_eq!(result, Ok(42));
@@ -291,10 +285,11 @@ fn test_promise_block_on() {
 
 #[test]
 fn test_promise_counting() {
-    let mut state = MockStateMachine { counter: 0, target: 3 };
-    let mut promise = unsafe {
-        ZrtlPromise::new(&mut state as *mut _ as *mut u8, counting_poll)
+    let mut state = MockStateMachine {
+        counter: 0,
+        target: 3,
     };
+    let mut promise = unsafe { ZrtlPromise::new(&mut state as *mut _ as *mut u8, counting_poll) };
 
     // Should need 4 polls (0->1, 1->2, 2->3, then ready at 3)
     assert_eq!(unsafe { promise.poll() }, PollResult::Pending);
@@ -312,9 +307,7 @@ fn test_promise_counting() {
 #[test]
 fn test_promise_block_on_timeout() {
     let mut state = [0u8; 16];
-    let mut promise = unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll)
-    };
+    let mut promise = unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll) };
 
     let result = promise.block_on_timeout(Duration::from_secs(1));
     assert_eq!(result, Ok(42));
@@ -323,9 +316,7 @@ fn test_promise_block_on_timeout() {
 #[test]
 fn test_promise_timeout_on_pending() {
     let mut state = [0u8; 16];
-    let mut promise = unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_pending_poll)
-    };
+    let mut promise = unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_pending_poll) };
 
     let result = promise.block_on_timeout(Duration::from_millis(10));
     assert!(matches!(result, Err(PromiseError::Timeout)));
@@ -345,9 +336,7 @@ fn test_promise_all_empty() {
 #[test]
 fn test_promise_all_single() {
     let mut state = [0u8; 16];
-    let promises = vec![unsafe {
-        ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll)
-    }];
+    let promises = vec![unsafe { ZrtlPromise::new(state.as_mut_ptr(), mock_ready_poll) }];
 
     let mut all = PromiseAll::new(promises);
     let result = all.poll();
@@ -496,6 +485,12 @@ fn test_next_task_id_increments() {
 #[test]
 fn test_promise_error_display() {
     assert_eq!(format!("{}", PromiseError::Timeout), "Promise timed out");
-    assert_eq!(format!("{}", PromiseError::Failed(-1)), "Promise failed with code -1");
-    assert_eq!(format!("{}", PromiseError::InvalidPromise), "Invalid promise");
+    assert_eq!(
+        format!("{}", PromiseError::Failed(-1)),
+        "Promise failed with code -1"
+    );
+    assert_eq!(
+        format!("{}", PromiseError::InvalidPromise),
+        "Invalid promise"
+    );
 }

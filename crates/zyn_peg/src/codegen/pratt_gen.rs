@@ -180,7 +180,10 @@ impl PrattGenerator {
             self.line("None");
         } else {
             for (op, prec) in &config.prefix_ops {
-                self.line(&format!("if self.state.check({:?}) {{ return Some({}); }}", op, prec));
+                self.line(&format!(
+                    "if self.state.check({:?}) {{ return Some({}); }}",
+                    op, prec
+                ));
             }
             self.line("None");
         }
@@ -196,7 +199,10 @@ impl PrattGenerator {
             self.line("None");
         } else {
             for (op, prec) in &config.postfix_ops {
-                self.line(&format!("if self.state.check({:?}) {{ return Some({}); }}", op, prec));
+                self.line(&format!(
+                    "if self.state.check({:?}) {{ return Some({}); }}",
+                    op, prec
+                ));
             }
             self.line("None");
         }
@@ -216,7 +222,10 @@ impl PrattGenerator {
             sorted_ops.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
             for (op, info) in &sorted_ops {
-                self.line(&format!("if self.state.check({:?}) {{ return Some(({}, {})); }}", op, info.lbp, info.rbp));
+                self.line(&format!(
+                    "if self.state.check({:?}) {{ return Some(({}, {})); }}",
+                    op, info.lbp, info.rbp
+                ));
             }
             self.line("None");
         }
@@ -231,7 +240,10 @@ impl PrattGenerator {
         self.line("let start = self.state.pos();");
 
         // Try all operators (longest first)
-        let mut all_ops: Vec<&str> = config.binary_ops.iter().map(|(s, _)| s.as_str())
+        let mut all_ops: Vec<&str> = config
+            .binary_ops
+            .iter()
+            .map(|(s, _)| s.as_str())
             .chain(config.prefix_ops.iter().map(|(s, _)| s.as_str()))
             .chain(config.postfix_ops.iter().map(|(s, _)| s.as_str()))
             .collect();
@@ -296,9 +308,13 @@ impl PrattGenerator {
         self.line("");
         self.line("TypedExpression::Binary(TypedBinary {");
         self.indent += 1;
-        self.line("left: Box::new(TypedNode { node: left, ty: Type::Unknown, span: Span::new(0, 0) }),");
+        self.line(
+            "left: Box::new(TypedNode { node: left, ty: Type::Unknown, span: Span::new(0, 0) }),",
+        );
         self.line("op: binary_op,");
-        self.line("right: Box::new(TypedNode { node: right, ty: Type::Unknown, span: Span::new(0, 0) }),");
+        self.line(
+            "right: Box::new(TypedNode { node: right, ty: Type::Unknown, span: Span::new(0, 0) }),",
+        );
         self.indent -= 1;
         self.line("})");
         self.indent -= 1;
@@ -306,7 +322,9 @@ impl PrattGenerator {
         self.line("");
 
         self.line("/// Create unary expression node");
-        self.line("fn make_unary(&mut self, op: String, operand: TypedExpression) -> TypedExpression {");
+        self.line(
+            "fn make_unary(&mut self, op: String, operand: TypedExpression) -> TypedExpression {",
+        );
         self.indent += 1;
         self.line("let unary_op = match op.as_str() {");
         self.indent += 1;
@@ -330,7 +348,9 @@ impl PrattGenerator {
         self.line("");
 
         self.line("/// Create postfix expression node");
-        self.line("fn make_postfix(&mut self, operand: TypedExpression, op: String) -> TypedExpression {");
+        self.line(
+            "fn make_postfix(&mut self, operand: TypedExpression, op: String) -> TypedExpression {",
+        );
         self.indent += 1;
         self.line("// TODO: Handle postfix operators like ++, --, etc.");
         self.line("operand");

@@ -15,9 +15,9 @@
 //! }
 //! ```
 
+use crate::hir::*;
 use std::collections::HashMap;
 use std::fmt::Write;
-use crate::hir::*;
 
 /// Maps HirIds to human-readable sequential names.
 struct IdMapper {
@@ -63,7 +63,10 @@ impl IdMapper {
     }
 
     fn func_name(&self, id: &HirId) -> String {
-        self.functions.get(id).cloned().unwrap_or_else(|| format!("fn?({:?})", id))
+        self.functions
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| format!("fn?({:?})", id))
     }
 }
 
@@ -90,7 +93,9 @@ fn fmt_type(ty: &HirType) -> String {
         HirType::F32 => "f32".into(),
         HirType::F64 => "f64".into(),
         HirType::Ptr(inner) => format!("*{}", fmt_type(inner)),
-        HirType::Ref { pointee, mutable, .. } => {
+        HirType::Ref {
+            pointee, mutable, ..
+        } => {
             if *mutable {
                 format!("&mut {}", fmt_type(pointee))
             } else {
@@ -109,7 +114,9 @@ fn fmt_type(ty: &HirType) -> String {
         }
         HirType::Union(u) => {
             let name = u.name.as_ref().map(|n| resolve(n));
-            let variants: Vec<String> = u.variants.iter()
+            let variants: Vec<String> = u
+                .variants
+                .iter()
                 .map(|v| format!("{}: {}", resolve(&v.name), fmt_type(&v.ty)))
                 .collect();
             match name {
@@ -120,18 +127,40 @@ fn fmt_type(ty: &HirType) -> String {
         HirType::Function(ft) => {
             let params: Vec<String> = ft.params.iter().map(|p| fmt_type(p)).collect();
             let rets: Vec<String> = ft.returns.iter().map(|r| fmt_type(r)).collect();
-            let ret = if rets.is_empty() { "void".into() } else { rets.join(", ") };
+            let ret = if rets.is_empty() {
+                "void".into()
+            } else {
+                rets.join(", ")
+            };
             format!("fn({}) -> {}", params.join(", "), ret)
         }
         HirType::Closure(ct) => {
-            let params: Vec<String> = ct.function_type.params.iter().map(|p| fmt_type(p)).collect();
-            let rets: Vec<String> = ct.function_type.returns.iter().map(|r| fmt_type(r)).collect();
-            let ret = if rets.is_empty() { "void".into() } else { rets.join(", ") };
+            let params: Vec<String> = ct
+                .function_type
+                .params
+                .iter()
+                .map(|p| fmt_type(p))
+                .collect();
+            let rets: Vec<String> = ct
+                .function_type
+                .returns
+                .iter()
+                .map(|r| fmt_type(r))
+                .collect();
+            let ret = if rets.is_empty() {
+                "void".into()
+            } else {
+                rets.join(", ")
+            };
             format!("closure({}) -> {}", params.join(", "), ret)
         }
         HirType::Opaque(name) => format!("opaque({})", resolve(name)),
         HirType::ConstGeneric(name) => format!("const_generic({})", resolve(name)),
-        HirType::Generic { base, type_args, const_args } => {
+        HirType::Generic {
+            base,
+            type_args,
+            const_args,
+        } => {
             let mut args: Vec<String> = type_args.iter().map(|t| fmt_type(t)).collect();
             for c in const_args {
                 args.push(fmt_constant(c));
@@ -139,16 +168,39 @@ fn fmt_type(ty: &HirType) -> String {
             format!("{}<{}>", fmt_type(base), args.join(", "))
         }
         HirType::TraitObject { trait_id, .. } => format!("dyn trait#{}", trait_id.as_u32()),
-        HirType::Interface { methods, is_structural } => {
-            let kind = if *is_structural { "structural" } else { "nominal" };
+        HirType::Interface {
+            methods,
+            is_structural,
+        } => {
+            let kind = if *is_structural {
+                "structural"
+            } else {
+                "nominal"
+            };
             format!("interface({}, {} methods)", kind, methods.len())
         }
         HirType::Promise(inner) => format!("promise<{}>", fmt_type(inner)),
-        HirType::AssociatedType { trait_id, self_ty, name } => {
-            format!("<{} as trait#{}>::{}", fmt_type(self_ty), trait_id.as_u32(), resolve(name))
+        HirType::AssociatedType {
+            trait_id,
+            self_ty,
+            name,
+        } => {
+            format!(
+                "<{} as trait#{}>::{}",
+                fmt_type(self_ty),
+                trait_id.as_u32(),
+                resolve(name)
+            )
         }
-        HirType::Continuation { resume_ty, result_ty } => {
-            format!("continuation({} -> {})", fmt_type(resume_ty), fmt_type(result_ty))
+        HirType::Continuation {
+            resume_ty,
+            result_ty,
+        } => {
+            format!(
+                "continuation({} -> {})",
+                fmt_type(resume_ty),
+                fmt_type(result_ty)
+            )
         }
         HirType::EffectRow { effects, tail } => {
             let effs: Vec<String> = effects.iter().map(|e| resolve(e)).collect();
@@ -187,7 +239,11 @@ fn fmt_constant(c: &HirConstant) -> String {
         }
         HirConstant::String(s) => format!("\"{}\"", resolve(s)),
         HirConstant::VTable(vt) => {
-            format!("vtable(trait#{}, {} methods)", vt.trait_id.as_u32(), vt.methods.len())
+            format!(
+                "vtable(trait#{}, {} methods)",
+                vt.trait_id.as_u32(),
+                vt.methods.len()
+            )
         }
     }
 }
@@ -326,7 +382,9 @@ fn fmt_callable(c: &HirCallable, mapper: &IdMapper) -> String {
     match c {
         HirCallable::Function(id) => format!("@{}", mapper.func_name(id)),
         HirCallable::Indirect(id) => {
-            let name = mapper.values.get(id)
+            let name = mapper
+                .values
+                .get(id)
                 .cloned()
                 .unwrap_or_else(|| format!("?({:?})", id));
             format!("indirect {}", name)
@@ -339,46 +397,112 @@ fn fmt_callable(c: &HirCallable, mapper: &IdMapper) -> String {
 /// Format an instruction.
 fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
     match inst {
-        HirInstruction::Binary { op, result, ty, left, right } => {
+        HirInstruction::Binary {
+            op,
+            result,
+            ty,
+            left,
+            right,
+        } => {
             let r = mapper.value(result);
             let l = mapper.value(left);
             let ri = mapper.value(right);
-            format!("{}: {} = {} {}, {}", r, fmt_type(ty), fmt_binary_op(op), l, ri)
+            format!(
+                "{}: {} = {} {}, {}",
+                r,
+                fmt_type(ty),
+                fmt_binary_op(op),
+                l,
+                ri
+            )
         }
-        HirInstruction::Unary { op, result, ty, operand } => {
+        HirInstruction::Unary {
+            op,
+            result,
+            ty,
+            operand,
+        } => {
             let r = mapper.value(result);
             let o = mapper.value(operand);
             format!("{}: {} = {} {}", r, fmt_type(ty), fmt_unary_op(op), o)
         }
-        HirInstruction::Alloca { result, ty, count, align } => {
+        HirInstruction::Alloca {
+            result,
+            ty,
+            count,
+            align,
+        } => {
             let r = mapper.value(result);
             match count {
                 Some(c) => {
                     let cv = mapper.value(c);
-                    format!("{}: *{} = alloca {}, count {}, align {}", r, fmt_type(ty), fmt_type(ty), cv, align)
+                    format!(
+                        "{}: *{} = alloca {}, count {}, align {}",
+                        r,
+                        fmt_type(ty),
+                        fmt_type(ty),
+                        cv,
+                        align
+                    )
                 }
-                None => format!("{}: *{} = alloca {}, align {}", r, fmt_type(ty), fmt_type(ty), align)
+                None => format!(
+                    "{}: *{} = alloca {}, align {}",
+                    r,
+                    fmt_type(ty),
+                    fmt_type(ty),
+                    align
+                ),
             }
         }
-        HirInstruction::Load { result, ty, ptr, align, volatile } => {
+        HirInstruction::Load {
+            result,
+            ty,
+            ptr,
+            align,
+            volatile,
+        } => {
             let r = mapper.value(result);
             let p = mapper.value(ptr);
             let vol = if *volatile { ", volatile" } else { "" };
-            format!("{}: {} = load {}, align {}{}", r, fmt_type(ty), p, align, vol)
+            format!(
+                "{}: {} = load {}, align {}{}",
+                r,
+                fmt_type(ty),
+                p,
+                align,
+                vol
+            )
         }
-        HirInstruction::Store { value, ptr, align, volatile } => {
+        HirInstruction::Store {
+            value,
+            ptr,
+            align,
+            volatile,
+        } => {
             let v = mapper.value(value);
             let p = mapper.value(ptr);
             let vol = if *volatile { ", volatile" } else { "" };
             format!("store {}, {}, align {}{}", v, p, align, vol)
         }
-        HirInstruction::GetElementPtr { result, ty, ptr, indices } => {
+        HirInstruction::GetElementPtr {
+            result,
+            ty,
+            ptr,
+            indices,
+        } => {
             let r = mapper.value(result);
             let p = mapper.value(ptr);
             let idxs: Vec<String> = indices.iter().map(|i| mapper.value(i)).collect();
             format!("{}: {} = gep {}, [{}]", r, fmt_type(ty), p, idxs.join(", "))
         }
-        HirInstruction::Call { result, callee, args, type_args, const_args, is_tail } => {
+        HirInstruction::Call {
+            result,
+            callee,
+            args,
+            type_args,
+            const_args,
+            is_tail,
+        } => {
             let arg_strs: Vec<String> = args.iter().map(|a| mapper.value(a)).collect();
             let callee_str = fmt_callable(callee, mapper);
             let tail = if *is_tail { "tail " } else { "" };
@@ -392,116 +516,276 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
                 extras.push(format!("const<{}>", cas.join(", ")));
             }
             let extra = extras.join(" ");
-            let extra_sp = if extra.is_empty() { String::new() } else { format!(" {}", extra) };
+            let extra_sp = if extra.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", extra)
+            };
             match result {
                 Some(res) => {
                     let r = mapper.value(res);
                     // We don't have a return type field on Call, infer "?" or use callee info
-                    format!("{} = {}call {}{}({})", r, tail, callee_str, extra_sp, arg_strs.join(", "))
+                    format!(
+                        "{} = {}call {}{}({})",
+                        r,
+                        tail,
+                        callee_str,
+                        extra_sp,
+                        arg_strs.join(", ")
+                    )
                 }
                 None => {
-                    format!("{}call {}{}({})", tail, callee_str, extra_sp, arg_strs.join(", "))
+                    format!(
+                        "{}call {}{}({})",
+                        tail,
+                        callee_str,
+                        extra_sp,
+                        arg_strs.join(", ")
+                    )
                 }
             }
         }
-        HirInstruction::IndirectCall { result, func_ptr, args, return_ty } => {
+        HirInstruction::IndirectCall {
+            result,
+            func_ptr,
+            args,
+            return_ty,
+        } => {
             let fp = mapper.value(func_ptr);
             let arg_strs: Vec<String> = args.iter().map(|a| mapper.value(a)).collect();
             match result {
                 Some(res) => {
                     let r = mapper.value(res);
-                    format!("{}: {} = call_indirect {}({})", r, fmt_type(return_ty), fp, arg_strs.join(", "))
+                    format!(
+                        "{}: {} = call_indirect {}({})",
+                        r,
+                        fmt_type(return_ty),
+                        fp,
+                        arg_strs.join(", ")
+                    )
                 }
                 None => {
                     format!("call_indirect {}({})", fp, arg_strs.join(", "))
                 }
             }
         }
-        HirInstruction::Cast { op, result, ty, operand } => {
+        HirInstruction::Cast {
+            op,
+            result,
+            ty,
+            operand,
+        } => {
             let r = mapper.value(result);
             let o = mapper.value(operand);
             format!("{}: {} = {} {}", r, fmt_type(ty), fmt_cast_op(op), o)
         }
-        HirInstruction::Select { result, ty, condition, true_val, false_val } => {
+        HirInstruction::Select {
+            result,
+            ty,
+            condition,
+            true_val,
+            false_val,
+        } => {
             let r = mapper.value(result);
             let c = mapper.value(condition);
             let t = mapper.value(true_val);
             let f = mapper.value(false_val);
             format!("{}: {} = select {}, {}, {}", r, fmt_type(ty), c, t, f)
         }
-        HirInstruction::ExtractValue { result, ty, aggregate, indices } => {
+        HirInstruction::ExtractValue {
+            result,
+            ty,
+            aggregate,
+            indices,
+        } => {
             let r = mapper.value(result);
             let a = mapper.value(aggregate);
             let idxs: Vec<String> = indices.iter().map(|i| format!("{}", i)).collect();
-            format!("{}: {} = extractvalue {}, [{}]", r, fmt_type(ty), a, idxs.join(", "))
+            format!(
+                "{}: {} = extractvalue {}, [{}]",
+                r,
+                fmt_type(ty),
+                a,
+                idxs.join(", ")
+            )
         }
-        HirInstruction::InsertValue { result, ty, aggregate, value, indices } => {
+        HirInstruction::InsertValue {
+            result,
+            ty,
+            aggregate,
+            value,
+            indices,
+        } => {
             let r = mapper.value(result);
             let a = mapper.value(aggregate);
             let v = mapper.value(value);
             let idxs: Vec<String> = indices.iter().map(|i| format!("{}", i)).collect();
-            format!("{}: {} = insertvalue {}, {}, [{}]", r, fmt_type(ty), a, v, idxs.join(", "))
+            format!(
+                "{}: {} = insertvalue {}, {}, [{}]",
+                r,
+                fmt_type(ty),
+                a,
+                v,
+                idxs.join(", ")
+            )
         }
-        HirInstruction::Atomic { op, result, ty, ptr, value, ordering } => {
+        HirInstruction::Atomic {
+            op,
+            result,
+            ty,
+            ptr,
+            value,
+            ordering,
+        } => {
             let r = mapper.value(result);
             let p = mapper.value(ptr);
             let v_str = match value {
                 Some(v) => format!(", {}", mapper.value(v)),
                 None => String::new(),
             };
-            format!("{}: {} = {} {}{}, {}", r, fmt_type(ty), fmt_atomic_op(op), p, v_str, fmt_atomic_ordering(ordering))
+            format!(
+                "{}: {} = {} {}{}, {}",
+                r,
+                fmt_type(ty),
+                fmt_atomic_op(op),
+                p,
+                v_str,
+                fmt_atomic_ordering(ordering)
+            )
         }
         HirInstruction::Fence { ordering } => {
             format!("fence {}", fmt_atomic_ordering(ordering))
         }
-        HirInstruction::CreateUnion { result, union_ty, variant_index, value } => {
+        HirInstruction::CreateUnion {
+            result,
+            union_ty,
+            variant_index,
+            value,
+        } => {
             let r = mapper.value(result);
             let v = mapper.value(value);
-            format!("{}: {} = create_union variant {}, {}", r, fmt_type(union_ty), variant_index, v)
+            format!(
+                "{}: {} = create_union variant {}, {}",
+                r,
+                fmt_type(union_ty),
+                variant_index,
+                v
+            )
         }
         HirInstruction::GetUnionDiscriminant { result, union_val } => {
             let r = mapper.value(result);
             let u = mapper.value(union_val);
             format!("{} = get_discriminant {}", r, u)
         }
-        HirInstruction::ExtractUnionValue { result, ty, union_val, variant_index } => {
+        HirInstruction::ExtractUnionValue {
+            result,
+            ty,
+            union_val,
+            variant_index,
+        } => {
             let r = mapper.value(result);
             let u = mapper.value(union_val);
-            format!("{}: {} = extract_union_value {}, variant {}", r, fmt_type(ty), u, variant_index)
+            format!(
+                "{}: {} = extract_union_value {}, variant {}",
+                r,
+                fmt_type(ty),
+                u,
+                variant_index
+            )
         }
-        HirInstruction::CreateTraitObject { result, trait_id, data_ptr, vtable_id } => {
+        HirInstruction::CreateTraitObject {
+            result,
+            trait_id,
+            data_ptr,
+            vtable_id,
+        } => {
             let r = mapper.value(result);
             let d = mapper.value(data_ptr);
             let vt = mapper.value(vtable_id);
-            format!("{} = create_trait_object trait#{}, data {}, vtable {}", r, trait_id.as_u32(), d, vt)
+            format!(
+                "{} = create_trait_object trait#{}, data {}, vtable {}",
+                r,
+                trait_id.as_u32(),
+                d,
+                vt
+            )
         }
-        HirInstruction::UpcastTraitObject { result, sub_trait_object, sub_trait_id, super_trait_id, super_vtable_id } => {
+        HirInstruction::UpcastTraitObject {
+            result,
+            sub_trait_object,
+            sub_trait_id,
+            super_trait_id,
+            super_vtable_id,
+        } => {
             let r = mapper.value(result);
             let s = mapper.value(sub_trait_object);
             let svt = mapper.value(super_vtable_id);
-            format!("{} = upcast_trait_object {}, trait#{} -> trait#{}, vtable {}", r, s, sub_trait_id.as_u32(), super_trait_id.as_u32(), svt)
+            format!(
+                "{} = upcast_trait_object {}, trait#{} -> trait#{}, vtable {}",
+                r,
+                s,
+                sub_trait_id.as_u32(),
+                super_trait_id.as_u32(),
+                svt
+            )
         }
-        HirInstruction::TraitMethodCall { result, trait_object, method_index, method_sig, args, return_ty } => {
+        HirInstruction::TraitMethodCall {
+            result,
+            trait_object,
+            method_index,
+            method_sig,
+            args,
+            return_ty,
+        } => {
             let to = mapper.value(trait_object);
             let arg_strs: Vec<String> = args.iter().map(|a| mapper.value(a)).collect();
             let mname = resolve(&method_sig.name);
             match result {
                 Some(res) => {
                     let r = mapper.value(res);
-                    format!("{}: {} = trait_call {}.{}[{}]({})", r, fmt_type(return_ty), to, mname, method_index, arg_strs.join(", "))
+                    format!(
+                        "{}: {} = trait_call {}.{}[{}]({})",
+                        r,
+                        fmt_type(return_ty),
+                        to,
+                        mname,
+                        method_index,
+                        arg_strs.join(", ")
+                    )
                 }
                 None => {
-                    format!("trait_call {}.{}[{}]({})", to, mname, method_index, arg_strs.join(", "))
+                    format!(
+                        "trait_call {}.{}[{}]({})",
+                        to,
+                        mname,
+                        method_index,
+                        arg_strs.join(", ")
+                    )
                 }
             }
         }
-        HirInstruction::CreateClosure { result, closure_ty, function, captures } => {
+        HirInstruction::CreateClosure {
+            result,
+            closure_ty,
+            function,
+            captures,
+        } => {
             let r = mapper.value(result);
             let f = mapper.value(function);
             let caps: Vec<String> = captures.iter().map(|c| mapper.value(c)).collect();
-            format!("{}: {} = create_closure {}, captures [{}]", r, fmt_type(closure_ty), f, caps.join(", "))
+            format!(
+                "{}: {} = create_closure {}, captures [{}]",
+                r,
+                fmt_type(closure_ty),
+                f,
+                caps.join(", ")
+            )
         }
-        HirInstruction::CallClosure { result, closure, args } => {
+        HirInstruction::CallClosure {
+            result,
+            closure,
+            args,
+        } => {
             let cl = mapper.value(closure);
             let arg_strs: Vec<String> = args.iter().map(|a| mapper.value(a)).collect();
             match result {
@@ -514,13 +798,22 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
                 }
             }
         }
-        HirInstruction::CreateRef { result, value, lifetime: _, mutable } => {
+        HirInstruction::CreateRef {
+            result,
+            value,
+            lifetime: _,
+            mutable,
+        } => {
             let r = mapper.value(result);
             let v = mapper.value(value);
             let kind = if *mutable { "&mut" } else { "&" };
             format!("{} = create_ref {} {}", r, kind, v)
         }
-        HirInstruction::Deref { result, ty, reference } => {
+        HirInstruction::Deref {
+            result,
+            ty,
+            reference,
+        } => {
             let r = mapper.value(result);
             let rf = mapper.value(reference);
             format!("{}: {} = deref {}", r, fmt_type(ty), rf)
@@ -538,21 +831,41 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
         HirInstruction::BeginLifetime { .. } => "begin_lifetime".into(),
         HirInstruction::EndLifetime { .. } => "end_lifetime".into(),
         HirInstruction::LifetimeConstraint { .. } => "lifetime_constraint".into(),
-        HirInstruction::PerformEffect { result, effect_id, op_name, args, return_ty } => {
+        HirInstruction::PerformEffect {
+            result,
+            effect_id,
+            op_name,
+            args,
+            return_ty,
+        } => {
             let eid = mapper.value(effect_id);
             let arg_strs: Vec<String> = args.iter().map(|a| mapper.value(a)).collect();
             let oname = resolve(op_name);
             match result {
                 Some(res) => {
                     let r = mapper.value(res);
-                    format!("{}: {} = perform {}.{}({})", r, fmt_type(return_ty), eid, oname, arg_strs.join(", "))
+                    format!(
+                        "{}: {} = perform {}.{}({})",
+                        r,
+                        fmt_type(return_ty),
+                        eid,
+                        oname,
+                        arg_strs.join(", ")
+                    )
                 }
                 None => {
                     format!("perform {}.{}({})", eid, oname, arg_strs.join(", "))
                 }
             }
         }
-        HirInstruction::HandleEffect { result, handler_id, handler_state, body_block, continuation_block, return_ty } => {
+        HirInstruction::HandleEffect {
+            result,
+            handler_id,
+            handler_state,
+            body_block,
+            continuation_block,
+            return_ty,
+        } => {
             let hid = mapper.value(handler_id);
             let state: Vec<String> = handler_state.iter().map(|s| mapper.value(s)).collect();
             let body = mapper.block(body_block);
@@ -560,26 +873,50 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
             match result {
                 Some(res) => {
                     let r = mapper.value(res);
-                    format!("{}: {} = handle_effect {}, state [{}], body {}, cont {}", r, fmt_type(return_ty), hid, state.join(", "), body, cont)
+                    format!(
+                        "{}: {} = handle_effect {}, state [{}], body {}, cont {}",
+                        r,
+                        fmt_type(return_ty),
+                        hid,
+                        state.join(", "),
+                        body,
+                        cont
+                    )
                 }
                 None => {
-                    format!("handle_effect {}, state [{}], body {}, cont {}", hid, state.join(", "), body, cont)
+                    format!(
+                        "handle_effect {}, state [{}], body {}, cont {}",
+                        hid,
+                        state.join(", "),
+                        body,
+                        cont
+                    )
                 }
             }
         }
-        HirInstruction::Resume { value, continuation } => {
+        HirInstruction::Resume {
+            value,
+            continuation,
+        } => {
             let v = mapper.value(value);
             let c = mapper.value(continuation);
             format!("resume {}, {}", v, c)
         }
-        HirInstruction::AbortEffect { value, handler_scope } => {
+        HirInstruction::AbortEffect {
+            value,
+            handler_scope,
+        } => {
             let v = mapper.value(value);
             let h = mapper.value(handler_scope);
             format!("abort_effect {}, scope {}", v, h)
         }
         HirInstruction::CaptureContinuation { result, resume_ty } => {
             let r = mapper.value(result);
-            format!("{}: continuation = capture_continuation resume_ty {}", r, fmt_type(resume_ty))
+            format!(
+                "{}: continuation = capture_continuation resume_ty {}",
+                r,
+                fmt_type(resume_ty)
+            )
         }
     }
 }
@@ -599,34 +936,61 @@ fn fmt_terminator(term: &HirTerminator, mapper: &mut IdMapper) -> String {
             let t = mapper.block(target);
             format!("br {}", t)
         }
-        HirTerminator::CondBranch { condition, true_target, false_target } => {
+        HirTerminator::CondBranch {
+            condition,
+            true_target,
+            false_target,
+        } => {
             let c = mapper.value(condition);
             let tt = mapper.block(true_target);
             let ft = mapper.block(false_target);
             format!("brcond {}, {}, {}", c, tt, ft)
         }
-        HirTerminator::Switch { value, default, cases } => {
+        HirTerminator::Switch {
+            value,
+            default,
+            cases,
+        } => {
             let v = mapper.value(value);
             let d = mapper.block(default);
-            let case_strs: Vec<String> = cases.iter().map(|(c, b)| {
-                format!("{} => {}", fmt_constant(c), mapper.block(b))
-            }).collect();
+            let case_strs: Vec<String> = cases
+                .iter()
+                .map(|(c, b)| format!("{} => {}", fmt_constant(c), mapper.block(b)))
+                .collect();
             format!("switch {}, default {}, [{}]", v, d, case_strs.join(", "))
         }
         HirTerminator::Unreachable => "unreachable".into(),
-        HirTerminator::Invoke { callee, args, normal, unwind } => {
+        HirTerminator::Invoke {
+            callee,
+            args,
+            normal,
+            unwind,
+        } => {
             let callee_str = fmt_callable(callee, mapper);
             let arg_strs: Vec<String> = args.iter().map(|a| mapper.value(a)).collect();
             let n = mapper.block(normal);
             let u = mapper.block(unwind);
-            format!("invoke {}({}) normal {}, unwind {}", callee_str, arg_strs.join(", "), n, u)
+            format!(
+                "invoke {}({}) normal {}, unwind {}",
+                callee_str,
+                arg_strs.join(", "),
+                n,
+                u
+            )
         }
-        HirTerminator::PatternMatch { value, patterns, default } => {
+        HirTerminator::PatternMatch {
+            value,
+            patterns,
+            default,
+        } => {
             let v = mapper.value(value);
-            let pats: Vec<String> = patterns.iter().map(|p| {
-                let target = mapper.block(&p.target);
-                format!("{:?} => {}", p.kind, target)
-            }).collect();
+            let pats: Vec<String> = patterns
+                .iter()
+                .map(|p| {
+                    let target = mapper.block(&p.target);
+                    format!("{:?} => {}", p.kind, target)
+                })
+                .collect();
             let def = match default {
                 Some(d) => format!(", default {}", mapper.block(d)),
                 None => String::new(),
@@ -639,11 +1003,15 @@ fn fmt_terminator(term: &HirTerminator, mapper: &mut IdMapper) -> String {
 /// Format a phi node.
 fn fmt_phi(phi: &HirPhi, mapper: &mut IdMapper) -> String {
     let r = mapper.value(&phi.result);
-    let incoming: Vec<String> = phi.incoming.iter().map(|(val, blk)| {
-        let v = mapper.value(val);
-        let b = mapper.block(blk);
-        format!("[{}, {}]", v, b)
-    }).collect();
+    let incoming: Vec<String> = phi
+        .incoming
+        .iter()
+        .map(|(val, blk)| {
+            let v = mapper.value(val);
+            let b = mapper.block(blk);
+            format!("[{}, {}]", v, b)
+        })
+        .collect();
     format!("{}: {} = phi {}", r, fmt_type(&phi.ty), incoming.join(", "))
 }
 
@@ -665,7 +1033,10 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
         let mut param_vals: Vec<(u32, HirId, String)> = Vec::new();
         for (vid, value) in &func.values {
             if let HirValueKind::Parameter(idx) = value.kind {
-                let name = func.signature.params.get(idx as usize)
+                let name = func
+                    .signature
+                    .params
+                    .get(idx as usize)
                     .map(|p| resolve(&p.name))
                     .unwrap_or_else(|| format!("p{}", idx));
                 param_vals.push((idx, *vid, name));
@@ -685,18 +1056,34 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
 
     // Function header
     let func_name = resolve(&func.name);
-    let params: Vec<String> = func.signature.params.iter().map(|p| {
-        let pname = resolve(&p.name);
-        format!("{} %{}", fmt_type(&p.ty), pname)
-    }).collect();
+    let params: Vec<String> = func
+        .signature
+        .params
+        .iter()
+        .map(|p| {
+            let pname = resolve(&p.name);
+            format!("{} %{}", fmt_type(&p.ty), pname)
+        })
+        .collect();
     let returns: Vec<String> = func.signature.returns.iter().map(|r| fmt_type(r)).collect();
-    let ret_str = if returns.is_empty() { "void".into() } else { returns.join(", ") };
+    let ret_str = if returns.is_empty() {
+        "void".into()
+    } else {
+        returns.join(", ")
+    };
 
     let ext = if func.is_external { " extern" } else { "" };
     let cc = fmt_calling_convention(&func.calling_convention);
 
-    let _ = writeln!(out, "function @{}({}) -> {} {} {{{}",
-        func_name, params.join(", "), ret_str, cc, ext);
+    let _ = writeln!(
+        out,
+        "function @{}({}) -> {} {} {{{}",
+        func_name,
+        params.join(", "),
+        ret_str,
+        cc,
+        ext
+    );
 
     // Link name
     if let Some(ref link) = func.link_name {
@@ -710,7 +1097,13 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
         match &value.kind {
             HirValueKind::Constant(c) => {
                 let name = mapper.value(vid);
-                let _ = writeln!(out, "    {}: {} = const {}", name, fmt_type(&value.ty), fmt_constant(c));
+                let _ = writeln!(
+                    out,
+                    "    {}: {} = const {}",
+                    name,
+                    fmt_type(&value.ty),
+                    fmt_constant(c)
+                );
                 has_decls = true;
             }
             HirValueKind::Undef => {
@@ -720,7 +1113,13 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
             }
             HirValueKind::Global(gid) => {
                 let name = mapper.value(vid);
-                let _ = writeln!(out, "    {}: {} = global @{:?}", name, fmt_type(&value.ty), gid);
+                let _ = writeln!(
+                    out,
+                    "    {}: {} = global @{:?}",
+                    name,
+                    fmt_type(&value.ty),
+                    gid
+                );
                 has_decls = true;
             }
             _ => {} // Parameters and Instructions shown elsewhere
@@ -757,7 +1156,11 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
         }
 
         // Terminator
-        let _ = writeln!(out, "    {}", fmt_terminator(&block.terminator, &mut mapper));
+        let _ = writeln!(
+            out,
+            "    {}",
+            fmt_terminator(&block.terminator, &mut mapper)
+        );
         let _ = writeln!(out);
     }
 

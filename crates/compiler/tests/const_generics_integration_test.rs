@@ -2,11 +2,7 @@
 //!
 //! Tests the full pipeline: Generic HIR → Monomorphization → Cranelift Compilation → JIT Execution
 
-use zyntax_compiler::{
-    hir::*,
-    cranelift_backend::CraneliftBackend,
-    MonomorphizationContext,
-};
+use zyntax_compiler::{cranelift_backend::CraneliftBackend, hir::*, MonomorphizationContext};
 use zyntax_typed_ast::arena::AstArena;
 
 fn create_test_arena() -> AstArena {
@@ -26,21 +22,17 @@ fn test_monomorphized_function_compilation() {
     let t_param = intern_str(&mut arena, "T");
 
     let signature = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: intern_str(&mut arena, "value"),
-                ty: HirType::Opaque(t_param),
-                attributes: ParamAttributes::default(),
-            }
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: intern_str(&mut arena, "value"),
+            ty: HirType::Opaque(t_param),
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::Opaque(t_param)],
-        type_params: vec![
-            HirTypeParam {
-                name: t_param,
-                constraints: vec![],
-            }
-        ],
+        type_params: vec![HirTypeParam {
+            name: t_param,
+            constraints: vec![],
+        }],
         const_params: vec![],
         lifetime_params: vec![],
         is_variadic: false,
@@ -59,11 +51,9 @@ fn test_monomorphized_function_compilation() {
     let type_args = vec![HirType::I32];
     let const_args = vec![];
 
-    let instance_id = mono_ctx.get_or_create_instance(
-        generic_id,
-        type_args,
-        const_args
-    ).unwrap();
+    let instance_id = mono_ctx
+        .get_or_create_instance(generic_id, type_args, const_args)
+        .unwrap();
 
     // Verify the instance was created
     assert_ne!(instance_id, generic_id);
@@ -84,23 +74,19 @@ fn test_const_generic_array_compilation() {
     let n_param = intern_str(&mut arena, "N");
 
     let signature = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: intern_str(&mut arena, "arr"),
-                ty: HirType::Array(Box::new(HirType::I32), 0), // Size will be substituted
-                attributes: ParamAttributes::default(),
-            }
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: intern_str(&mut arena, "arr"),
+            ty: HirType::Array(Box::new(HirType::I32), 0), // Size will be substituted
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
-        const_params: vec![
-            HirConstParam {
-                name: n_param,
-                ty: HirType::U64,
-                default: None,
-            }
-        ],
+        const_params: vec![HirConstParam {
+            name: n_param,
+            ty: HirType::U64,
+            default: None,
+        }],
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
@@ -156,7 +142,7 @@ fn test_const_generic_struct_after_monomorphization() {
         name: Some(intern_str(&mut arena, "Buffer")),
         fields: vec![
             HirType::Array(Box::new(HirType::U8), 256), // data: [u8; 256]
-            HirType::U64, // len: u64
+            HirType::U64,                               // len: u64
         ],
         packed: false,
     };
@@ -192,35 +178,38 @@ fn test_nested_const_generics() {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "a"),
                 // [[f32; N]; M] - will be substituted
-                ty: HirType::Array(
-                    Box::new(HirType::Array(Box::new(HirType::F32), 0)),
-                    0
-                ),
+                ty: HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
                 attributes: ParamAttributes::default(),
             },
             HirParam {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "b"),
                 // [[f32; P]; N] - will be substituted
-                ty: HirType::Array(
-                    Box::new(HirType::Array(Box::new(HirType::F32), 0)),
-                    0
-                ),
+                ty: HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
                 attributes: ParamAttributes::default(),
-            }
+            },
         ],
         returns: vec![
             // [[f32; P]; M] - will be substituted
-            HirType::Array(
-                Box::new(HirType::Array(Box::new(HirType::F32), 0)),
-                0
-            )
+            HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
         ],
         type_params: vec![],
         const_params: vec![
-            HirConstParam { name: m_param, ty: HirType::U64, default: None },
-            HirConstParam { name: n_param, ty: HirType::U64, default: None },
-            HirConstParam { name: p_param, ty: HirType::U64, default: None },
+            HirConstParam {
+                name: m_param,
+                ty: HirType::U64,
+                default: None,
+            },
+            HirConstParam {
+                name: n_param,
+                ty: HirType::U64,
+                default: None,
+            },
+            HirConstParam {
+                name: p_param,
+                ty: HirType::U64,
+                default: None,
+            },
         ],
         lifetime_params: vec![],
         is_variadic: false,
@@ -249,13 +238,11 @@ fn test_const_generic_default_values() {
             HirType::Array(Box::new(HirType::U8), 0), // Will be substituted
         ],
         type_params: vec![],
-        const_params: vec![
-            HirConstParam {
-                name: size_param,
-                ty: HirType::U64,
-                default: Some(HirConstant::U64(1024)), // Default value
-            }
-        ],
+        const_params: vec![HirConstParam {
+            name: size_param,
+            ty: HirType::U64,
+            default: Some(HirConstant::U64(1024)), // Default value
+        }],
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
@@ -266,5 +253,8 @@ fn test_const_generic_default_values() {
     let func = HirFunction::new(intern_str(&mut arena, "create_buffer"), signature);
 
     // Verify default value is present
-    assert_eq!(func.signature.const_params[0].default, Some(HirConstant::U64(1024)));
+    assert_eq!(
+        func.signature.const_params[0].default,
+        Some(HirConstant::U64(1024))
+    );
 }

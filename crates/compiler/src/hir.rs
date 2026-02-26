@@ -1,23 +1,23 @@
 //! # High-level Intermediate Representation (HIR)
-//! 
+//!
 //! Platform-agnostic IR that can be lowered to both Cranelift IR and LLVM IR.
 //! This representation maintains high-level type information while being close
 //! enough to machine semantics for efficient code generation.
 //!
 //! ## Design Goals
-//! 
+//!
 //! - Compatible with both Cranelift and LLVM type systems
 //! - Supports SSA form with explicit phi nodes
 //! - Preserves type information for optimization
 //! - Enables hot-reloading via function versioning
 //! - Memory safe with explicit lifetime tracking
 
-use std::collections::HashSet;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
-use zyntax_typed_ast::{Type, TypeId, InternedString, Span};
 use uuid::Uuid;
-use serde::{Serialize, Deserialize};
+use zyntax_typed_ast::{InternedString, Span, Type, TypeId};
 
 // ============================================================================
 // Algebraic Effects - HIR Types
@@ -109,12 +109,12 @@ impl LifetimeId {
     pub fn new() -> Self {
         LifetimeId(Uuid::new_v4())
     }
-    
+
     /// Static lifetime (lives for the entire program)
     pub fn static_lifetime() -> Self {
         LifetimeId(Uuid::from_bytes([0; 16]))
     }
-    
+
     /// Anonymous lifetime (inferred)
     pub fn anonymous() -> Self {
         LifetimeId(Uuid::from_bytes([1; 16]))
@@ -146,7 +146,7 @@ impl HirLifetime {
             bounds: Vec::new(),
         }
     }
-    
+
     pub fn static_lifetime() -> Self {
         // For now, create a placeholder static lifetime name
         // TODO: Use proper string interning from arena
@@ -156,7 +156,7 @@ impl HirLifetime {
             bounds: vec![LifetimeBound::Static],
         }
     }
-    
+
     pub fn anonymous() -> Self {
         Self {
             id: LifetimeId::anonymous(),
@@ -235,7 +235,7 @@ pub struct HirFunctionSignature {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HirMethodSignature {
     pub name: InternedString,
-    pub params: Vec<HirType>,  // Parameter types only (no names/IDs)
+    pub params: Vec<HirType>, // Parameter types only (no names/IDs)
     pub return_type: HirType,
     pub is_static: bool,
     pub is_async: bool,
@@ -254,9 +254,9 @@ pub struct HirParam {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParamAttributes {
     pub by_ref: bool,
-    pub sret: bool,  // Structure return
-    pub zext: bool,  // Zero extend
-    pub sext: bool,  // Sign extend
+    pub sret: bool, // Structure return
+    pub zext: bool, // Zero extend
+    pub sext: bool, // Sign extend
     pub noalias: bool,
     pub nonnull: bool,
     pub readonly: bool,
@@ -298,7 +298,7 @@ pub enum HirInstruction {
         left: HirId,
         right: HirId,
     },
-    
+
     /// Unary operations
     Unary {
         op: UnaryOp,
@@ -306,7 +306,7 @@ pub enum HirInstruction {
         ty: HirType,
         operand: HirId,
     },
-    
+
     /// Memory allocation
     Alloca {
         result: HirId,
@@ -314,7 +314,7 @@ pub enum HirInstruction {
         count: Option<HirId>,
         align: u32,
     },
-    
+
     /// Memory load
     Load {
         result: HirId,
@@ -323,7 +323,7 @@ pub enum HirInstruction {
         align: u32,
         volatile: bool,
     },
-    
+
     /// Memory store
     Store {
         value: HirId,
@@ -331,7 +331,7 @@ pub enum HirInstruction {
         align: u32,
         volatile: bool,
     },
-    
+
     /// Get element pointer (GEP)
     GetElementPtr {
         result: HirId,
@@ -339,7 +339,7 @@ pub enum HirInstruction {
         ptr: HirId,
         indices: Vec<HirId>,
     },
-    
+
     /// Function call
     Call {
         result: Option<HirId>,
@@ -367,7 +367,7 @@ pub enum HirInstruction {
         ty: HirType,
         operand: HirId,
     },
-    
+
     /// Select (ternary conditional)
     Select {
         result: HirId,
@@ -376,7 +376,7 @@ pub enum HirInstruction {
         true_val: HirId,
         false_val: HirId,
     },
-    
+
     /// Extract value from aggregate
     ExtractValue {
         result: HirId,
@@ -384,7 +384,7 @@ pub enum HirInstruction {
         aggregate: HirId,
         indices: Vec<u32>,
     },
-    
+
     /// Insert value into aggregate
     InsertValue {
         result: HirId,
@@ -393,7 +393,7 @@ pub enum HirInstruction {
         value: HirId,
         indices: Vec<u32>,
     },
-    
+
     /// Atomic operations
     Atomic {
         op: AtomicOp,
@@ -403,12 +403,10 @@ pub enum HirInstruction {
         value: Option<HirId>,
         ordering: AtomicOrdering,
     },
-    
+
     /// Memory fence
-    Fence {
-        ordering: AtomicOrdering,
-    },
-    
+    Fence { ordering: AtomicOrdering },
+
     /// Create a union value with specified variant
     CreateUnion {
         result: HirId,
@@ -416,13 +414,10 @@ pub enum HirInstruction {
         variant_index: u32,
         value: HirId,
     },
-    
+
     /// Get discriminant value from a union
-    GetUnionDiscriminant {
-        result: HirId,
-        union_val: HirId,
-    },
-    
+    GetUnionDiscriminant { result: HirId, union_val: HirId },
+
     /// Extract value from union variant (unsafe - assumes correct variant)
     ExtractUnionValue {
         result: HirId,
@@ -430,13 +425,13 @@ pub enum HirInstruction {
         union_val: HirId,
         variant_index: u32,
     },
-    
+
     /// Create a trait object (fat pointer) with data and vtable pointers
     CreateTraitObject {
         result: HirId,
         trait_id: zyntax_typed_ast::TypeId,
         data_ptr: HirId,
-        vtable_id: HirId,  // Global vtable ID
+        vtable_id: HirId, // Global vtable ID
     },
 
     /// Upcast a trait object to a super-trait
@@ -456,10 +451,10 @@ pub enum HirInstruction {
     /// 3. Create new fat pointer { data_ptr, super_vtable_ptr }
     UpcastTraitObject {
         result: HirId,
-        sub_trait_object: HirId,         // Source fat pointer (dyn SubTrait)
+        sub_trait_object: HirId, // Source fat pointer (dyn SubTrait)
         sub_trait_id: zyntax_typed_ast::TypeId,
         super_trait_id: zyntax_typed_ast::TypeId,
-        super_vtable_id: HirId,          // Global ID of super-trait vtable
+        super_vtable_id: HirId, // Global ID of super-trait vtable
     },
 
     /// Call a method on a trait object (dynamic dispatch)
@@ -471,28 +466,28 @@ pub enum HirInstruction {
     /// 4. Call function pointer with (self=data_ptr, ...args)
     TraitMethodCall {
         result: Option<HirId>,
-        trait_object: HirId,     // Fat pointer { *data, *vtable }
-        method_index: usize,     // Index into vtable
-        method_sig: HirMethodSignature,  // Method signature for type-safe call
-        args: Vec<HirId>,        // Arguments (not including self)
-        return_ty: HirType,      // Redundant with method_sig.return_type but kept for backward compat
+        trait_object: HirId,            // Fat pointer { *data, *vtable }
+        method_index: usize,            // Index into vtable
+        method_sig: HirMethodSignature, // Method signature for type-safe call
+        args: Vec<HirId>,               // Arguments (not including self)
+        return_ty: HirType, // Redundant with method_sig.return_type but kept for backward compat
     },
 
     /// Create a closure with captured values
     CreateClosure {
         result: HirId,
         closure_ty: HirType,
-        function: HirId, // Function that implements the closure
+        function: HirId,      // Function that implements the closure
         captures: Vec<HirId>, // Values to capture
     },
-    
+
     /// Call a closure
     CallClosure {
         result: Option<HirId>,
         closure: HirId,
         args: Vec<HirId>,
     },
-    
+
     /// Create a reference with lifetime tracking
     CreateRef {
         result: HirId,
@@ -500,38 +495,34 @@ pub enum HirInstruction {
         lifetime: HirLifetime,
         mutable: bool,
     },
-    
+
     /// Dereference a reference
     Deref {
         result: HirId,
         ty: HirType,
         reference: HirId,
     },
-    
+
     /// Move a value (transfer ownership)
     Move {
         result: HirId,
         ty: HirType,
         source: HirId,
     },
-    
+
     /// Copy a value (for Copy types)
     Copy {
         result: HirId,
         ty: HirType,
         source: HirId,
     },
-    
+
     /// Begin a lifetime scope
-    BeginLifetime {
-        lifetime: HirLifetime,
-    },
-    
+    BeginLifetime { lifetime: HirLifetime },
+
     /// End a lifetime scope
-    EndLifetime {
-        lifetime: HirLifetime,
-    },
-    
+    EndLifetime { lifetime: HirLifetime },
+
     /// Assert that a lifetime outlives another
     LifetimeConstraint {
         longer: HirLifetime,
@@ -541,7 +532,6 @@ pub enum HirInstruction {
     // ========================================================================
     // Algebraic Effects Instructions
     // ========================================================================
-
     /// Perform an effect operation
     ///
     /// Invokes an effect operation, which will be handled by the nearest
@@ -634,32 +624,28 @@ pub enum HirInstruction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HirTerminator {
     /// Return from function
-    Return {
-        values: Vec<HirId>,
-    },
-    
+    Return { values: Vec<HirId> },
+
     /// Unconditional branch
-    Branch {
-        target: HirId,
-    },
-    
+    Branch { target: HirId },
+
     /// Conditional branch
     CondBranch {
         condition: HirId,
         true_target: HirId,
         false_target: HirId,
     },
-    
+
     /// Multi-way branch (switch)
     Switch {
         value: HirId,
         default: HirId,
         cases: Vec<(HirConstant, HirId)>,
     },
-    
+
     /// Unreachable code
     Unreachable,
-    
+
     /// Exception handling
     Invoke {
         callee: HirCallable,
@@ -667,7 +653,7 @@ pub enum HirTerminator {
         normal: HirId,
         unwind: HirId,
     },
-    
+
     /// Pattern match on a value
     PatternMatch {
         value: HirId,
@@ -725,7 +711,12 @@ impl HirInstruction {
             HirInstruction::Cast { operand, .. } => {
                 replace(operand, replacements);
             }
-            HirInstruction::Select { condition, true_val, false_val, .. } => {
+            HirInstruction::Select {
+                condition,
+                true_val,
+                false_val,
+                ..
+            } => {
                 replace(condition, replacements);
                 replace(true_val, replacements);
                 replace(false_val, replacements);
@@ -733,7 +724,9 @@ impl HirInstruction {
             HirInstruction::ExtractValue { aggregate, .. } => {
                 replace(aggregate, replacements);
             }
-            HirInstruction::InsertValue { aggregate, value, .. } => {
+            HirInstruction::InsertValue {
+                aggregate, value, ..
+            } => {
                 replace(aggregate, replacements);
                 replace(value, replacements);
             }
@@ -753,21 +746,33 @@ impl HirInstruction {
             HirInstruction::ExtractUnionValue { union_val, .. } => {
                 replace(union_val, replacements);
             }
-            HirInstruction::CreateTraitObject { data_ptr, vtable_id, .. } => {
+            HirInstruction::CreateTraitObject {
+                data_ptr,
+                vtable_id,
+                ..
+            } => {
                 replace(data_ptr, replacements);
                 replace(vtable_id, replacements);
             }
-            HirInstruction::UpcastTraitObject { sub_trait_object, super_vtable_id, .. } => {
+            HirInstruction::UpcastTraitObject {
+                sub_trait_object,
+                super_vtable_id,
+                ..
+            } => {
                 replace(sub_trait_object, replacements);
                 replace(super_vtable_id, replacements);
             }
-            HirInstruction::TraitMethodCall { trait_object, args, .. } => {
+            HirInstruction::TraitMethodCall {
+                trait_object, args, ..
+            } => {
                 replace(trait_object, replacements);
                 for arg in args {
                     replace(arg, replacements);
                 }
             }
-            HirInstruction::CreateClosure { function, captures, .. } => {
+            HirInstruction::CreateClosure {
+                function, captures, ..
+            } => {
                 replace(function, replacements);
                 for cap in captures {
                     replace(cap, replacements);
@@ -791,17 +796,25 @@ impl HirInstruction {
             HirInstruction::Copy { source, .. } => {
                 replace(source, replacements);
             }
-            HirInstruction::BeginLifetime { .. } |
-            HirInstruction::EndLifetime { .. } |
-            HirInstruction::LifetimeConstraint { .. } => {}
+            HirInstruction::BeginLifetime { .. }
+            | HirInstruction::EndLifetime { .. }
+            | HirInstruction::LifetimeConstraint { .. } => {}
             // Algebraic effects
-            HirInstruction::PerformEffect { effect_id, args, .. } => {
+            HirInstruction::PerformEffect {
+                effect_id, args, ..
+            } => {
                 replace(effect_id, replacements);
                 for arg in args {
                     replace(arg, replacements);
                 }
             }
-            HirInstruction::HandleEffect { handler_id, handler_state, body_block, continuation_block, .. } => {
+            HirInstruction::HandleEffect {
+                handler_id,
+                handler_state,
+                body_block,
+                continuation_block,
+                ..
+            } => {
                 replace(handler_id, replacements);
                 for s in handler_state {
                     replace(s, replacements);
@@ -809,11 +822,17 @@ impl HirInstruction {
                 replace(body_block, replacements);
                 replace(continuation_block, replacements);
             }
-            HirInstruction::Resume { value, continuation } => {
+            HirInstruction::Resume {
+                value,
+                continuation,
+            } => {
                 replace(value, replacements);
                 replace(continuation, replacements);
             }
-            HirInstruction::AbortEffect { value, handler_scope } => {
+            HirInstruction::AbortEffect {
+                value,
+                handler_scope,
+            } => {
                 replace(value, replacements);
                 replace(handler_scope, replacements);
             }
@@ -858,7 +877,12 @@ impl HirInstruction {
             HirInstruction::Cast { operand, .. } => {
                 ops.push(*operand);
             }
-            HirInstruction::Select { condition, true_val, false_val, .. } => {
+            HirInstruction::Select {
+                condition,
+                true_val,
+                false_val,
+                ..
+            } => {
                 ops.push(*condition);
                 ops.push(*true_val);
                 ops.push(*false_val);
@@ -866,7 +890,9 @@ impl HirInstruction {
             HirInstruction::ExtractValue { aggregate, .. } => {
                 ops.push(*aggregate);
             }
-            HirInstruction::InsertValue { aggregate, value, .. } => {
+            HirInstruction::InsertValue {
+                aggregate, value, ..
+            } => {
                 ops.push(*aggregate);
                 ops.push(*value);
             }
@@ -886,19 +912,31 @@ impl HirInstruction {
             HirInstruction::ExtractUnionValue { union_val, .. } => {
                 ops.push(*union_val);
             }
-            HirInstruction::CreateTraitObject { data_ptr, vtable_id, .. } => {
+            HirInstruction::CreateTraitObject {
+                data_ptr,
+                vtable_id,
+                ..
+            } => {
                 ops.push(*data_ptr);
                 ops.push(*vtable_id);
             }
-            HirInstruction::UpcastTraitObject { sub_trait_object, super_vtable_id, .. } => {
+            HirInstruction::UpcastTraitObject {
+                sub_trait_object,
+                super_vtable_id,
+                ..
+            } => {
                 ops.push(*sub_trait_object);
                 ops.push(*super_vtable_id);
             }
-            HirInstruction::TraitMethodCall { trait_object, args, .. } => {
+            HirInstruction::TraitMethodCall {
+                trait_object, args, ..
+            } => {
                 ops.push(*trait_object);
                 ops.extend(args.iter().copied());
             }
-            HirInstruction::CreateClosure { function, captures, .. } => {
+            HirInstruction::CreateClosure {
+                function, captures, ..
+            } => {
                 ops.push(*function);
                 ops.extend(captures.iter().copied());
             }
@@ -918,25 +956,39 @@ impl HirInstruction {
             HirInstruction::Copy { source, .. } => {
                 ops.push(*source);
             }
-            HirInstruction::BeginLifetime { .. } |
-            HirInstruction::EndLifetime { .. } |
-            HirInstruction::LifetimeConstraint { .. } => {}
+            HirInstruction::BeginLifetime { .. }
+            | HirInstruction::EndLifetime { .. }
+            | HirInstruction::LifetimeConstraint { .. } => {}
             // Algebraic effects
-            HirInstruction::PerformEffect { effect_id, args, .. } => {
+            HirInstruction::PerformEffect {
+                effect_id, args, ..
+            } => {
                 ops.push(*effect_id);
                 ops.extend(args.iter().copied());
             }
-            HirInstruction::HandleEffect { handler_id, handler_state, body_block, continuation_block, .. } => {
+            HirInstruction::HandleEffect {
+                handler_id,
+                handler_state,
+                body_block,
+                continuation_block,
+                ..
+            } => {
                 ops.push(*handler_id);
                 ops.extend(handler_state.iter().copied());
                 ops.push(*body_block);
                 ops.push(*continuation_block);
             }
-            HirInstruction::Resume { value, continuation } => {
+            HirInstruction::Resume {
+                value,
+                continuation,
+            } => {
                 ops.push(*value);
                 ops.push(*continuation);
             }
-            HirInstruction::AbortEffect { value, handler_scope } => {
+            HirInstruction::AbortEffect {
+                value,
+                handler_scope,
+            } => {
                 ops.push(*value);
                 ops.push(*handler_scope);
             }
@@ -1011,51 +1063,60 @@ pub enum HirValueKind {
 pub enum HirType {
     /// Void type
     Void,
-    
+
     /// Boolean (i1)
     Bool,
-    
+
     /// Integer types
-    I8, I16, I32, I64, I128,
-    U8, U16, U32, U64, U128,
-    
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+
     /// Floating point types
-    F32, F64,
-    
+    F32,
+    F64,
+
     /// Pointer type
     Ptr(Box<HirType>),
-    
+
     /// Reference type with lifetime
     Ref {
         lifetime: HirLifetime,
         pointee: Box<HirType>,
         mutable: bool,
     },
-    
+
     /// Array type
     Array(Box<HirType>, u64),
-    
+
     /// Vector type (SIMD)
     Vector(Box<HirType>, u32),
-    
+
     /// Structure type
     Struct(HirStructType),
-    
+
     /// Union type (tagged union with discriminant)
     Union(Box<HirUnionType>),
-    
+
     /// Function type
     Function(Box<HirFunctionType>),
-    
+
     /// Closure type (function with captured environment)
     Closure(Box<HirClosureType>),
-    
+
     /// Opaque type (for forward declarations)
     Opaque(InternedString),
-    
+
     /// Const generic parameter reference
     ConstGeneric(InternedString),
-    
+
     /// Type with const generic arguments
     Generic {
         base: Box<HirType>,
@@ -1067,14 +1128,14 @@ pub enum HirType {
     /// Represents a trait object with dynamic dispatch
     TraitObject {
         trait_id: zyntax_typed_ast::TypeId,
-        vtable: Option<HirId>,  // vtable global ID (resolved during lowering)
+        vtable: Option<HirId>, // vtable global ID (resolved during lowering)
     },
 
     /// Interface type (structural or nominal)
     /// Used for both Go-style structural interfaces and Java-style nominal interfaces
     Interface {
         methods: Vec<HirMethodSignature>,
-        is_structural: bool,  // true for duck-typing, false for nominal
+        is_structural: bool, // true for duck-typing, false for nominal
     },
 
     /// Promise type for async functions
@@ -1124,8 +1185,8 @@ pub enum HirType {
     /// Which resolves to `HirType::I32` during monomorphization.
     AssociatedType {
         trait_id: zyntax_typed_ast::TypeId,
-        self_ty: Box<HirType>,  // The implementing type
-        name: InternedString,    // Associated type name (e.g., "Item")
+        self_ty: Box<HirType>, // The implementing type
+        name: InternedString,  // Associated type name (e.g., "Item")
     },
 
     /// Continuation type for algebraic effects
@@ -1187,7 +1248,7 @@ pub struct HirUnionVariant {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HirPattern {
     pub kind: HirPatternKind,
-    pub target: HirId, // Block to jump to if pattern matches
+    pub target: HirId,                    // Block to jump to if pattern matches
     pub bindings: Vec<HirPatternBinding>, // Variables to bind if pattern matches
 }
 
@@ -1272,9 +1333,18 @@ pub enum HirClosureCallMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HirConstant {
     Bool(bool),
-    I8(i8), I16(i16), I32(i32), I64(i64), I128(i128),
-    U8(u8), U16(u16), U32(u32), U64(u64), U128(u128),
-    F32(f32), F64(f64),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    F32(f32),
+    F64(f64),
     Null(HirType),
     Array(Vec<HirConstant>),
     Struct(Vec<HirConstant>),
@@ -1308,7 +1378,7 @@ impl std::hash::Hash for HirConstant {
             Array(vals) => vals.hash(state),
             Struct(vals) => vals.hash(state),
             String(s) => s.hash(state),
-            VTable(vtable) => vtable.id.hash(state),  // Hash by ID
+            VTable(vtable) => vtable.id.hash(state), // Hash by ID
         }
     }
 }
@@ -1317,34 +1387,65 @@ impl std::hash::Hash for HirConstant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     // Arithmetic
-    Add, Sub, Mul, Div, Rem,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     // Bitwise
-    And, Or, Xor, Shl, Shr,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
     // Comparison
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // Floating point
-    FAdd, FSub, FMul, FDiv, FRem,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    FRem,
     // Floating point comparison
-    FEq, FNe, FLt, FLe, FGt, FGe,
+    FEq,
+    FNe,
+    FLt,
+    FLe,
+    FGt,
+    FGe,
 }
 
 /// Unary operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
-    Neg, Not, FNeg,
+    Neg,
+    Not,
+    FNeg,
 }
 
 /// Cast operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CastOp {
     // Integer casts
-    Trunc, ZExt, SExt,
+    Trunc,
+    ZExt,
+    SExt,
     // Float casts
-    FpTrunc, FpExt,
+    FpTrunc,
+    FpExt,
     // Float/Int conversions
-    FpToUi, FpToSi, UiToFp, SiToFp,
+    FpToUi,
+    FpToSi,
+    UiToFp,
+    SiToFp,
     // Pointer casts
-    PtrToInt, IntToPtr,
+    PtrToInt,
+    IntToPtr,
     // Bitcast (reinterpret)
     Bitcast,
 }
@@ -1352,24 +1453,34 @@ pub enum CastOp {
 /// Atomic operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AtomicOp {
-    Load, Store, Exchange, 
-    Add, Sub, And, Or, Xor,
+    Load,
+    Store,
+    Exchange,
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
     CompareExchange,
 }
 
 /// Memory ordering for atomics
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AtomicOrdering {
-    Relaxed, Acquire, Release, AcqRel, SeqCst,
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
 }
 
 /// Calling conventions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallingConvention {
-    Fast,     // Internal functions
-    C,        // C calling convention
-    System,   // Platform default
-    WebKit,   // For JS interop
+    Fast,   // Internal functions
+    C,      // C calling convention
+    System, // Platform default
+    WebKit, // For JS interop
 }
 
 /// Function attributes
@@ -1424,7 +1535,7 @@ pub struct HirVTable {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HirVTableEntry {
     pub method_name: InternedString,
-    pub function_id: HirId,  // ID of the implementing function
+    pub function_id: HirId, // ID of the implementing function
     pub signature: HirMethodSignature,
 }
 
@@ -1507,33 +1618,46 @@ pub enum HirCallable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Intrinsic {
     // Memory
-    Memcpy, Memset, Memmove,
+    Memcpy,
+    Memset,
+    Memmove,
     // Math
-    Sqrt, Sin, Cos, Pow, Log, Exp,
+    Sqrt,
+    Sin,
+    Cos,
+    Pow,
+    Log,
+    Exp,
     // Bit manipulation
-    Ctpop, Ctlz, Cttz, Bswap,
+    Ctpop,
+    Ctlz,
+    Cttz,
+    Bswap,
     // Type queries
-    SizeOf, AlignOf,
+    SizeOf,
+    AlignOf,
     // Overflow checking
-    AddWithOverflow, SubWithOverflow, MulWithOverflow,
+    AddWithOverflow,
+    SubWithOverflow,
+    MulWithOverflow,
     // Memory management
-    Malloc,    // Allocate heap memory
-    Free,      // Free heap memory
-    Realloc,   // Resize allocation
-    Drop,      // Call destructor
+    Malloc,  // Allocate heap memory
+    Free,    // Free heap memory
+    Realloc, // Resize allocation
+    Drop,    // Call destructor
     // Reference counting (optional)
-    IncRef,    // Increment reference count
-    DecRef,    // Decrement reference count
+    IncRef, // Increment reference count
+    DecRef, // Decrement reference count
     // Stack allocation (already exists as instruction)
-    Alloca,    // Stack allocation
+    Alloca, // Stack allocation
     // Garbage collection
     GCSafepoint, // GC safepoint for collection
     // Async/coroutine support
-    Await,     // Await a future
-    Yield,     // Yield a value (generators)
+    Await, // Await a future
+    Yield, // Yield a value (generators)
     // Error handling (Gap 8)
-    Panic,     // Panic with message (unrecoverable error)
-    Abort,     // Abort execution immediately (no cleanup)
+    Panic, // Panic with message (unrecoverable error)
+    Abort, // Abort execution immediately (no cleanup)
 
     // ZRTL Value Conversion (for extern/plugin calls)
     /// Convert closure to ZrtlClosure: (fn_ptr, env_ptr, env_size) -> *ZrtlClosure
@@ -1646,30 +1770,36 @@ impl BorrowCheckContext {
             local_lifetimes: IndexMap::new(),
         }
     }
-    
+
     /// Add a new borrow
     pub fn add_borrow(&mut self, point: HirId, borrow: BorrowInfo) {
-        self.active_borrows.entry(point).or_insert_with(Vec::new).push(borrow);
+        self.active_borrows
+            .entry(point)
+            .or_insert_with(Vec::new)
+            .push(borrow);
     }
-    
+
     /// Record a move operation
     pub fn add_move(&mut self, moved_value: HirId, move_info: MoveInfo) {
         self.moves.insert(moved_value, move_info);
     }
-    
+
     /// Add a lifetime constraint
     pub fn add_lifetime_constraint(&mut self, constraint: LifetimeConstraint) {
         self.lifetime_constraints.push(constraint);
     }
-    
+
     /// Check if a value has been moved
     pub fn is_moved(&self, value: HirId) -> bool {
         self.moves.contains_key(&value)
     }
-    
+
     /// Get active borrows at a program point
     pub fn get_active_borrows(&self, point: HirId) -> &[BorrowInfo] {
-        self.active_borrows.get(&point).map(|v| v.as_slice()).unwrap_or(&[])
+        self.active_borrows
+            .get(&point)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -1709,7 +1839,7 @@ impl HirModule {
     pub fn add_global(&mut self, global: HirGlobal) {
         self.globals.insert(global.id, global);
     }
-    
+
     /// Increment version for hot-reloading
     pub fn increment_version(&mut self) {
         self.version += 1;
@@ -1737,14 +1867,14 @@ impl HirFunction {
             link_name: None,
         }
     }
-    
+
     /// Create a new basic block
     pub fn create_block(&mut self) -> HirId {
         let block_id = HirId::new();
         self.blocks.insert(block_id, HirBlock::new(block_id));
         block_id
     }
-    
+
     /// Create a new SSA value
     pub fn create_value(&mut self, ty: HirType, kind: HirValueKind) -> HirId {
         let value_id = HirId::new();
@@ -1773,17 +1903,17 @@ impl HirBlock {
             successors: Vec::new(),
         }
     }
-    
+
     /// Add a phi node
     pub fn add_phi(&mut self, phi: HirPhi) {
         self.phis.push(phi);
     }
-    
+
     /// Add an instruction
     pub fn add_instruction(&mut self, inst: HirInstruction) {
         self.instructions.push(inst);
     }
-    
+
     /// Set the terminator
     pub fn set_terminator(&mut self, term: HirTerminator) {
         self.terminator = term;

@@ -8,7 +8,7 @@
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{InternedString, arena::AstArena};
+use zyntax_typed_ast::{arena::AstArena, InternedString};
 
 fn create_test_string(s: &str) -> InternedString {
     let mut arena = AstArena::new();
@@ -25,9 +25,7 @@ fn test_simple_addition_execution() {
     let func_ptr = func_ptr.expect("Failed to get function pointer for add");
 
     // Execute the compiled function
-    let add_fn: extern "C" fn(i32, i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let add_fn: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(add_fn(5, 3), 8, "5 + 3 should equal 8");
@@ -47,9 +45,7 @@ fn test_simple_subtraction_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for sub");
 
-    let sub_fn: extern "C" fn(i32, i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let sub_fn: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(sub_fn(10, 3), 7, "10 - 3 should equal 7");
@@ -69,9 +65,7 @@ fn test_simple_multiplication_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for mul");
 
-    let mul_fn: extern "C" fn(i32, i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let mul_fn: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(mul_fn(5, 3), 15, "5 * 3 should equal 15");
@@ -91,9 +85,7 @@ fn test_simple_division_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for div");
 
-    let div_fn: extern "C" fn(i32, i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let div_fn: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(div_fn(10, 2), 5, "10 / 2 should equal 5");
@@ -113,15 +105,25 @@ fn test_float_addition_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for fadd");
 
-    let fadd_fn: extern "C" fn(f64, f64) -> f64 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let fadd_fn: extern "C" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
-    assert!((fadd_fn(5.5, 3.2) - 8.7).abs() < 1e-10, "5.5 + 3.2 should equal 8.7");
-    assert!((fadd_fn(10.0, -5.0) - 5.0).abs() < 1e-10, "10.0 + (-5.0) should equal 5.0");
-    assert!((fadd_fn(0.0, 0.0) - 0.0).abs() < 1e-10, "0.0 + 0.0 should equal 0.0");
-    assert!((fadd_fn(-10.5, -20.5) - (-31.0)).abs() < 1e-10, "-10.5 + (-20.5) should equal -31.0");
+    assert!(
+        (fadd_fn(5.5, 3.2) - 8.7).abs() < 1e-10,
+        "5.5 + 3.2 should equal 8.7"
+    );
+    assert!(
+        (fadd_fn(10.0, -5.0) - 5.0).abs() < 1e-10,
+        "10.0 + (-5.0) should equal 5.0"
+    );
+    assert!(
+        (fadd_fn(0.0, 0.0) - 0.0).abs() < 1e-10,
+        "0.0 + 0.0 should equal 0.0"
+    );
+    assert!(
+        (fadd_fn(-10.5, -20.5) - (-31.0)).abs() < 1e-10,
+        "-10.5 + (-20.5) should equal -31.0"
+    );
 
     println!("✅ Float addition executed correctly via JIT");
 }
@@ -134,9 +136,7 @@ fn test_comparison_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for eq");
 
-    let eq_fn: extern "C" fn(i32, i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let eq_fn: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results (Cranelift returns 1 for true, 0 for false)
     assert_eq!(eq_fn(5, 5), 1, "5 == 5 should be true");
@@ -157,14 +157,15 @@ fn compile_and_get_ptr(func: HirFunction) -> (CraneliftBackend, Option<*const u8
     use cranelift_module::Module;
 
     let func_id = func.id;
-    let mut backend = CraneliftBackend::new()
-        .expect("Failed to create Cranelift backend");
-    backend.compile_function(func_id, &func)
+    let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
+    backend
+        .compile_function(func_id, &func)
         .expect("Failed to compile function");
 
     // Manually finalize and get function pointer
     // This is what compile_module does internally
-    backend.finalize_definitions()
+    backend
+        .finalize_definitions()
         .expect("Failed to finalize definitions");
 
     let func_ptr = backend.get_function_ptr(func_id);
@@ -222,7 +223,9 @@ fn create_binary_op_function(name: &str, op: BinaryOp) -> HirFunction {
     // Add instruction to entry block
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(bin_inst);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -274,7 +277,9 @@ fn create_float_binary_op_function(name: &str, op: BinaryOp) -> HirFunction {
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(bin_inst);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }

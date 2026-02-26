@@ -39,14 +39,14 @@
 use pest_derive::Parser;
 
 pub mod ast;
-pub mod generator;
 pub mod error;
+pub mod generator;
 pub mod runtime;
 
 // ZynPEG 2.0 - New grammar IR with named bindings
+pub mod codegen;
 pub mod grammar;
 pub mod runtime2;
-pub mod codegen;
 pub mod typed_ast;
 
 // Parser for .zyn grammar files
@@ -143,9 +143,9 @@ pub struct RuleDef {
 /// Rule modifiers (@ for atomic, ! for silent, etc.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleModifier {
-    Atomic,   // @
-    Silent,   // _
-    Compound, // $
+    Atomic,    // @
+    Silent,    // _
+    Compound,  // $
     NonAtomic, // !
 }
 
@@ -177,7 +177,11 @@ mod tests {
         // Test that "//" inside a string literal doesn't start a comment
         let input = r#"COMMENT = _{ "//" ~ ANY* }"#;
         let result = ZynGrammarParser::parse(Rule::rule_def, input);
-        assert!(result.is_ok(), "Failed to parse rule with // in string: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to parse rule with // in string: {:?}",
+            result.err()
+        );
     }
 
     #[test]

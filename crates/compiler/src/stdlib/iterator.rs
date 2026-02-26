@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, HirId, HirType};
 /// Iterator-style functions for Vec<T>
 ///
 /// Provides functional programming patterns for working with vectors.
@@ -5,9 +6,7 @@
 /// For now, we implement simple functional-style iterator functions rather than
 /// a full Iterator trait, since full trait dispatch would require more complex
 /// type registry integration.
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirType, HirId, BinaryOp};
 
 /// Build: fn vec_for_each<T>(vec: *Vec<T>, f: fn(*T) -> void)
 /// Applies a function to each element in the vector
@@ -27,12 +26,10 @@ pub fn build_vec_for_each(builder: &mut HirBuilder) {
     let ptr_vec_ty = builder.ptr_type(vec_t_ty.clone());
 
     // fn(*T) -> void
-    let callback_ty = builder.function_type(
-        vec![ptr_t_ty.clone()],
-        void_ty.clone(),
-    );
+    let callback_ty = builder.function_type(vec![ptr_t_ty.clone()], void_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_for_each", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_for_each", vec!["T"])
         .param("vec", ptr_vec_ty.clone())
         .param("f", callback_ty)
         .returns(void_ty)
@@ -117,12 +114,10 @@ pub fn build_vec_map(builder: &mut HirBuilder) {
     let ptr_vec_t_ty = builder.ptr_type(vec_t_ty.clone());
 
     // fn(*T) -> U
-    let callback_ty = builder.function_type(
-        vec![ptr_t_ty.clone()],
-        u_param.clone(),
-    );
+    let callback_ty = builder.function_type(vec![ptr_t_ty.clone()], u_param.clone());
 
-    let func_id = builder.begin_generic_function("vec_map", vec!["T", "U"])
+    let func_id = builder
+        .begin_generic_function("vec_map", vec!["T", "U"])
         .param("vec", ptr_vec_t_ty.clone())
         .param("f", callback_ty)
         .returns(vec_u_ty.clone())
@@ -204,10 +199,7 @@ pub fn build_vec_map(builder: &mut HirBuilder) {
     builder.set_insert_point(loop_exit);
 
     // Build Vec<U> { ptr: result_ptr, len: len, cap: len }
-    let result_vec = builder.create_struct(
-        vec_u_ty,
-        vec![result_ptr, len, len],
-    );
+    let result_vec = builder.create_struct(vec_u_ty, vec![result_ptr, len, len]);
 
     builder.ret(result_vec);
 }
@@ -230,12 +222,10 @@ pub fn build_vec_filter(builder: &mut HirBuilder) {
     let ptr_vec_t_ty = builder.ptr_type(vec_t_ty.clone());
 
     // fn(*T) -> bool
-    let predicate_ty = builder.function_type(
-        vec![ptr_t_ty.clone()],
-        bool_ty.clone(),
-    );
+    let predicate_ty = builder.function_type(vec![ptr_t_ty.clone()], bool_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_filter", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_filter", vec!["T"])
         .param("vec", ptr_vec_t_ty.clone())
         .param("pred", predicate_ty)
         .returns(vec_t_ty.clone())
@@ -332,7 +322,7 @@ pub fn build_vec_filter(builder: &mut HirBuilder) {
     let final_len = builder.load(output_counter, usize_ty.clone());
     let result_vec = builder.create_struct(
         vec_t_ty,
-        vec![result_ptr, final_len, len],  // cap = original len, len = filtered count
+        vec![result_ptr, final_len, len], // cap = original len, len = filtered count
     );
 
     builder.ret(result_vec);
@@ -356,12 +346,11 @@ pub fn build_vec_fold(builder: &mut HirBuilder) {
     let ptr_vec_t_ty = builder.ptr_type(vec_t_ty.clone());
 
     // fn(Acc, *T) -> Acc
-    let callback_ty = builder.function_type(
-        vec![acc_param.clone(), ptr_t_ty.clone()],
-        acc_param.clone(),
-    );
+    let callback_ty =
+        builder.function_type(vec![acc_param.clone(), ptr_t_ty.clone()], acc_param.clone());
 
-    let func_id = builder.begin_generic_function("vec_fold", vec!["T", "Acc"])
+    let func_id = builder
+        .begin_generic_function("vec_fold", vec!["T", "Acc"])
         .param("vec", ptr_vec_t_ty.clone())
         .param("init", acc_param.clone())
         .param("f", callback_ty)
@@ -415,7 +404,9 @@ pub fn build_vec_fold(builder: &mut HirBuilder) {
     let acc_val = builder.load(acc_alloc, acc_param.clone());
 
     // Call callback with (accumulator, element_ptr)
-    let new_acc = builder.call(callback_param, vec![acc_val, elem_ptr]).unwrap();
+    let new_acc = builder
+        .call(callback_param, vec![acc_val, elem_ptr])
+        .unwrap();
 
     // Store new accumulator
     builder.store(new_acc, acc_alloc);
@@ -462,19 +453,25 @@ mod tests {
         assert!(!module.functions.is_empty());
 
         // Check function names
-        let func_names: Vec<String> = module.functions.values()
+        let func_names: Vec<String> = module
+            .functions
+            .values()
             .map(|f| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
         assert!(func_names.contains(&"vec_for_each".to_string()));
 
         // Verify it's generic
-        let for_each_func = module.functions.values()
+        let for_each_func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("vec_for_each"))
             .expect("vec_for_each should exist");
 
-        assert!(!for_each_func.signature.type_params.is_empty(),
-            "vec_for_each should be generic");
+        assert!(
+            !for_each_func.signature.type_params.is_empty(),
+            "vec_for_each should be generic"
+        );
     }
 
     #[test]
@@ -487,13 +484,19 @@ mod tests {
         let module = builder.finish();
 
         // Find the vec_for_each function
-        let func = module.functions.values()
+        let func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("vec_for_each"))
             .expect("vec_for_each function should exist");
 
         // Should have 4 blocks: entry, loop_header, loop_body, loop_exit
         // Note: May have 5 blocks due to PHI node creation, but should have at least 4
-        assert!(func.blocks.len() >= 4, "Expected at least 4 blocks, got {}", func.blocks.len());
+        assert!(
+            func.blocks.len() >= 4,
+            "Expected at least 4 blocks, got {}",
+            func.blocks.len()
+        );
 
         // Should have 2 parameters (vec and callback)
         assert_eq!(func.signature.params.len(), 2);
@@ -518,7 +521,9 @@ mod tests {
         let module = builder.finish();
 
         // Find the vec_map function
-        let func = module.functions.values()
+        let func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("vec_map"))
             .expect("vec_map function should exist");
 
@@ -548,7 +553,9 @@ mod tests {
         let module = builder.finish();
 
         // Find the vec_filter function
-        let func = module.functions.values()
+        let func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("vec_filter"))
             .expect("vec_filter function should exist");
 
@@ -575,7 +582,9 @@ mod tests {
         let module = builder.finish();
 
         // Find the vec_fold function
-        let func = module.functions.values()
+        let func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("vec_fold"))
             .expect("vec_fold function should exist");
 
@@ -605,7 +614,9 @@ mod tests {
         let module = builder.finish();
 
         // Should have created all 4 iterator functions
-        let func_names: Vec<String> = module.functions.values()
+        let func_names: Vec<String> = module
+            .functions
+            .values()
             .map(|f| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
@@ -615,7 +626,8 @@ mod tests {
         assert!(func_names.contains(&"vec_fold".to_string()));
 
         // Count iterator functions (filter out memory functions)
-        let iter_count = func_names.iter()
+        let iter_count = func_names
+            .iter()
             .filter(|name| name.starts_with("vec_"))
             .count();
         assert_eq!(iter_count, 4, "Should have exactly 4 iterator functions");

@@ -242,13 +242,21 @@ impl TypeTag {
     /// Create a nullable version of this tag
     #[inline]
     pub fn nullable(self) -> Self {
-        Self::new(self.category(), self.type_id(), self.flags().with(TypeFlags::NULLABLE))
+        Self::new(
+            self.category(),
+            self.type_id(),
+            self.flags().with(TypeFlags::NULLABLE),
+        )
     }
 
     /// Create a version with Display trait
     #[inline]
     pub fn with_display(self) -> Self {
-        Self::new(self.category(), self.type_id(), self.flags().with(TypeFlags::DISPLAY))
+        Self::new(
+            self.category(),
+            self.type_id(),
+            self.flags().with(TypeFlags::DISPLAY),
+        )
     }
 
     /// Check if type implements Display
@@ -260,41 +268,123 @@ impl TypeTag {
     // Pre-defined type tags for primitives
     pub const VOID: Self = Self::new(TypeCategory::Void, 0, TypeFlags::NONE);
     pub const BOOL: Self = Self::new(TypeCategory::Bool, 0, TypeFlags::NONE);
-    pub const I8: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits8 as u16, TypeFlags::NONE);
-    pub const I16: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits16 as u16, TypeFlags::NONE);
-    pub const I32: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits32 as u16, TypeFlags::NONE);
-    pub const I64: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits64 as u16, TypeFlags::NONE);
-    pub const ISIZE: Self = Self::new(TypeCategory::Int, PrimitiveSize::Pointer as u16, TypeFlags::NONE);
-    pub const U8: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits8 as u16, TypeFlags::NONE);
-    pub const U16: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits16 as u16, TypeFlags::NONE);
-    pub const U32: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits32 as u16, TypeFlags::NONE);
-    pub const U64: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits64 as u16, TypeFlags::NONE);
-    pub const USIZE: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Pointer as u16, TypeFlags::NONE);
-    pub const F32: Self = Self::new(TypeCategory::Float, PrimitiveSize::Bits32 as u16, TypeFlags::NONE);
-    pub const F64: Self = Self::new(TypeCategory::Float, PrimitiveSize::Bits64 as u16, TypeFlags::NONE);
+    pub const I8: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits8 as u16,
+        TypeFlags::NONE,
+    );
+    pub const I16: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits16 as u16,
+        TypeFlags::NONE,
+    );
+    pub const I32: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    );
+    pub const I64: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    );
+    pub const ISIZE: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Pointer as u16,
+        TypeFlags::NONE,
+    );
+    pub const U8: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits8 as u16,
+        TypeFlags::NONE,
+    );
+    pub const U16: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits16 as u16,
+        TypeFlags::NONE,
+    );
+    pub const U32: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    );
+    pub const U64: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    );
+    pub const USIZE: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Pointer as u16,
+        TypeFlags::NONE,
+    );
+    pub const F32: Self = Self::new(
+        TypeCategory::Float,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    );
+    pub const F64: Self = Self::new(
+        TypeCategory::Float,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    );
     pub const STRING: Self = Self::new(TypeCategory::String, 0, TypeFlags::NONE);
 }
 
 /// Macro to create a type tag at compile time
 #[macro_export]
 macro_rules! zrtl_tag {
-    (void) => { $crate::TypeTag::VOID };
-    (bool) => { $crate::TypeTag::BOOL };
-    (i8) => { $crate::TypeTag::I8 };
-    (i16) => { $crate::TypeTag::I16 };
-    (i32) => { $crate::TypeTag::I32 };
-    (i64) => { $crate::TypeTag::I64 };
-    (isize) => { $crate::TypeTag::ISIZE };
-    (u8) => { $crate::TypeTag::U8 };
-    (u16) => { $crate::TypeTag::U16 };
-    (u32) => { $crate::TypeTag::U32 };
-    (u64) => { $crate::TypeTag::U64 };
-    (usize) => { $crate::TypeTag::USIZE };
-    (f32) => { $crate::TypeTag::F32 };
-    (f64) => { $crate::TypeTag::F64 };
-    (string) => { $crate::TypeTag::STRING };
+    (void) => {
+        $crate::TypeTag::VOID
+    };
+    (bool) => {
+        $crate::TypeTag::BOOL
+    };
+    (i8) => {
+        $crate::TypeTag::I8
+    };
+    (i16) => {
+        $crate::TypeTag::I16
+    };
+    (i32) => {
+        $crate::TypeTag::I32
+    };
+    (i64) => {
+        $crate::TypeTag::I64
+    };
+    (isize) => {
+        $crate::TypeTag::ISIZE
+    };
+    (u8) => {
+        $crate::TypeTag::U8
+    };
+    (u16) => {
+        $crate::TypeTag::U16
+    };
+    (u32) => {
+        $crate::TypeTag::U32
+    };
+    (u64) => {
+        $crate::TypeTag::U64
+    };
+    (usize) => {
+        $crate::TypeTag::USIZE
+    };
+    (f32) => {
+        $crate::TypeTag::F32
+    };
+    (f64) => {
+        $crate::TypeTag::F64
+    };
+    (string) => {
+        $crate::TypeTag::STRING
+    };
     ($category:ident, $type_id:expr) => {
-        $crate::TypeTag::new($crate::TypeCategory::$category, $type_id, $crate::TypeFlags::NONE)
+        $crate::TypeTag::new(
+            $crate::TypeCategory::$category,
+            $type_id,
+            $crate::TypeFlags::NONE,
+        )
     };
     ($category:ident, $type_id:expr, $flags:expr) => {
         $crate::TypeTag::new($crate::TypeCategory::$category, $type_id, $flags)

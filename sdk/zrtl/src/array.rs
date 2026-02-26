@@ -25,7 +25,11 @@ pub const ARRAY_HEADER_BYTES: usize = ARRAY_HEADER_SIZE * std::mem::size_of::<i3
 /// The pointer must be valid.
 #[inline]
 pub unsafe fn array_capacity(ptr: ArrayConstPtr) -> i32 {
-    if ptr.is_null() { 0 } else { *ptr }
+    if ptr.is_null() {
+        0
+    } else {
+        *ptr
+    }
 }
 
 /// Get array length from pointer
@@ -34,7 +38,11 @@ pub unsafe fn array_capacity(ptr: ArrayConstPtr) -> i32 {
 /// The pointer must be valid.
 #[inline]
 pub unsafe fn array_length(ptr: ArrayConstPtr) -> i32 {
-    if ptr.is_null() { 0 } else { *ptr.add(1) }
+    if ptr.is_null() {
+        0
+    } else {
+        *ptr.add(1)
+    }
 }
 
 /// Set array length
@@ -84,16 +92,21 @@ pub const fn array_alloc_size(capacity: usize, elem_size: usize) -> usize {
 ///
 /// Returns a pointer that must be freed with `array_free`.
 pub fn array_new<T>(initial_capacity: usize) -> ArrayPtr {
-    let cap = if initial_capacity > 0 { initial_capacity } else { 8 };
+    let cap = if initial_capacity > 0 {
+        initial_capacity
+    } else {
+        8
+    };
     let size = array_alloc_size(cap, std::mem::size_of::<T>());
 
     unsafe {
-        let layout = std::alloc::Layout::from_size_align(size, std::mem::align_of::<T>().max(4)).unwrap();
+        let layout =
+            std::alloc::Layout::from_size_align(size, std::mem::align_of::<T>().max(4)).unwrap();
         let ptr = std::alloc::alloc(layout) as ArrayPtr;
 
         if !ptr.is_null() {
-            *ptr = cap as i32;        // capacity
-            *ptr.add(1) = 0;          // length
+            *ptr = cap as i32; // capacity
+            *ptr.add(1) = 0; // length
         }
 
         ptr
@@ -108,10 +121,8 @@ pub unsafe fn array_free<T>(ptr: ArrayPtr) {
     if !ptr.is_null() {
         let cap = array_capacity(ptr) as usize;
         let size = array_alloc_size(cap, std::mem::size_of::<T>());
-        let layout = std::alloc::Layout::from_size_align_unchecked(
-            size,
-            std::mem::align_of::<T>().max(4),
-        );
+        let layout =
+            std::alloc::Layout::from_size_align_unchecked(size, std::mem::align_of::<T>().max(4));
         std::alloc::dealloc(ptr as *mut u8, layout);
     }
 }
@@ -311,7 +322,10 @@ impl<T: Copy> OwnedArray<T> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, _marker: PhantomData })
+            Some(Self {
+                ptr,
+                _marker: PhantomData,
+            })
         }
     }
 
@@ -321,7 +335,10 @@ impl<T: Copy> OwnedArray<T> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, _marker: PhantomData })
+            Some(Self {
+                ptr,
+                _marker: PhantomData,
+            })
         }
     }
 
@@ -403,7 +420,10 @@ impl<T: Copy> OwnedArray<T> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, _marker: PhantomData })
+            Some(Self {
+                ptr,
+                _marker: PhantomData,
+            })
         }
     }
 }

@@ -4,7 +4,10 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn, LitBool, Token, parse::{Parse, ParseStream}};
+use syn::{
+    parse::{Parse, ParseStream},
+    parse_macro_input, ItemFn, LitBool, Token,
+};
 
 /// Attribute macro to export a runtime function with automatic plugin registration
 ///
@@ -226,7 +229,7 @@ pub fn runtime_plugin(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as PluginArgs);
     let plugin_struct_name = syn::Ident::new(
         &format!("{}Plugin", capitalize(&args.name)),
-        proc_macro2::Span::call_site()
+        proc_macro2::Span::call_site(),
     );
 
     let plugin_name = &args.name;

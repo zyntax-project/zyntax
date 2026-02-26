@@ -15,10 +15,7 @@ pub enum ConversionError {
 
     /// Specific type ID mismatch
     #[error("Type ID mismatch: expected {expected:?}, found {found:?}")]
-    TypeIdMismatch {
-        expected: TypeId,
-        found: TypeId,
-    },
+    TypeIdMismatch { expected: TypeId, found: TypeId },
 
     /// Null pointer where a value was expected
     #[error("Unexpected null value")]
@@ -50,9 +47,7 @@ pub enum ConversionError {
 
     /// Integer overflow during conversion
     #[error("Integer overflow: value {value} doesn't fit in target type")]
-    IntegerOverflow {
-        value: i128,
-    },
+    IntegerOverflow { value: i128 },
 
     /// Float precision loss warning (not fatal)
     #[error("Float precision loss converting {from} to {to}")]
@@ -63,16 +58,11 @@ pub enum ConversionError {
 
     /// Missing generic type arguments
     #[error("Missing generic type arguments for {type_name}")]
-    MissingGenericArgs {
-        type_name: String,
-    },
+    MissingGenericArgs { type_name: String },
 
     /// Unsupported type conversion
     #[error("Unsupported conversion from {from:?} to {to}")]
-    UnsupportedConversion {
-        from: TypeCategory,
-        to: String,
-    },
+    UnsupportedConversion { from: TypeCategory, to: String },
 
     /// Memory allocation failed
     #[error("Memory allocation failed")]
@@ -88,21 +78,15 @@ pub enum ZyntaxError {
 
     /// Runtime error from Zyntax execution
     #[error("Runtime error: {message}")]
-    Runtime {
-        message: String,
-    },
+    Runtime { message: String },
 
     /// Plugin loading error
     #[error("Plugin error: {message}")]
-    Plugin {
-        message: String,
-    },
+    Plugin { message: String },
 
     /// Compilation error
     #[error("Compilation error: {message}")]
-    Compilation {
-        message: String,
-    },
+    Compilation { message: String },
 }
 
 impl ConversionError {

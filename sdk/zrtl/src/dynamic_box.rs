@@ -5,7 +5,7 @@
 //!
 //! This is equivalent to `ZrtlDynamicBox` in the C SDK.
 
-use crate::type_system::{TypeTag, TypeCategory};
+use crate::type_system::{TypeCategory, TypeTag};
 
 /// Drop function type for custom types (C ABI compatible)
 pub type DropFn = extern "C" fn(*mut u8);

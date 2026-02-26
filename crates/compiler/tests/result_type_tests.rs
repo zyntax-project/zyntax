@@ -7,7 +7,7 @@
 
 use zyntax_typed_ast::arena::AstArena;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::type_registry::{Type, TypeRegistry, PrimitiveType, TypeKind, VariantFields};
+use zyntax_typed_ast::type_registry::{PrimitiveType, Type, TypeKind, TypeRegistry, VariantFields};
 
 #[test]
 fn test_result_type_in_type_registry() {
@@ -83,13 +83,14 @@ fn test_result_enum_structure() {
 
             // Check Ok variant
             let ok_name = arena.intern_string("Ok");
-            let ok_variant = variants.iter()
+            let ok_variant = variants
+                .iter()
                 .find(|v| v.name == ok_name)
                 .expect("Ok variant should exist");
 
             match &ok_variant.fields {
                 VariantFields::Tuple(fields) => {
-                    assert_eq!(fields.len(), 1);  // Contains T
+                    assert_eq!(fields.len(), 1); // Contains T
                     println!("✅ Ok variant has correct structure (tuple with 1 field)");
                 }
                 _ => panic!("Ok should be a tuple variant"),
@@ -97,13 +98,14 @@ fn test_result_enum_structure() {
 
             // Check Err variant
             let err_name = arena.intern_string("Err");
-            let err_variant = variants.iter()
+            let err_variant = variants
+                .iter()
                 .find(|v| v.name == err_name)
                 .expect("Err variant should exist");
 
             match &err_variant.fields {
                 VariantFields::Tuple(fields) => {
-                    assert_eq!(fields.len(), 1);  // Contains E
+                    assert_eq!(fields.len(), 1); // Contains E
                     println!("✅ Err variant has correct structure (tuple with 1 field)");
                 }
                 _ => panic!("Err should be a tuple variant"),
@@ -151,11 +153,19 @@ fn test_multiple_result_instantiations() {
     // Both should reference the same generic Result type
     match (&result_i32_string, &result_f64_i32) {
         (
-            Type::Named { id: id1, type_args: args1, .. },
-            Type::Named { id: id2, type_args: args2, .. }
+            Type::Named {
+                id: id1,
+                type_args: args1,
+                ..
+            },
+            Type::Named {
+                id: id2,
+                type_args: args2,
+                ..
+            },
         ) => {
-            assert_eq!(*id1, *id2);  // Same Result type ID
-            assert_ne!(args1, args2);  // Different type arguments
+            assert_eq!(*id1, *id2); // Same Result type ID
+            assert_ne!(args1, args2); // Different type arguments
 
             println!("✅ Multiple Result instantiations use same generic type");
             println!("   - Result<i32, String>");
@@ -188,10 +198,7 @@ fn test_nested_result_types() {
 
     let outer_result = Type::Named {
         id: result_type_id,
-        type_args: vec![
-            inner_result.clone(),
-            Type::Primitive(PrimitiveType::String),
-        ],
+        type_args: vec![inner_result.clone(), Type::Primitive(PrimitiveType::String)],
         const_args: vec![],
         variance: vec![],
         nullability: Default::default(),
@@ -204,7 +211,11 @@ fn test_nested_result_types() {
 
             // Check inner Result
             match &type_args[0] {
-                Type::Named { id, type_args: inner_type_args, .. } => {
+                Type::Named {
+                    id,
+                    type_args: inner_type_args,
+                    ..
+                } => {
                     assert_eq!(*id, result_type_id);
                     assert_eq!(inner_type_args.len(), 2);
                     println!("✅ Nested Result<Result<i32, String>, String> verified");
@@ -230,7 +241,7 @@ fn test_option_type_for_comparison() {
     let type_def = registry.get_type_by_name(option_name).unwrap();
 
     assert_eq!(type_def.id, option_type_id);
-    assert_eq!(type_def.type_params.len(), 1);  // Only T, not E
+    assert_eq!(type_def.type_params.len(), 1); // Only T, not E
 
     println!("✅ Option<T> registered for comparison with Result<T, E>");
 }

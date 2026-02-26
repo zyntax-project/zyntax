@@ -5,17 +5,16 @@
 //!
 //! Type checking is skipped to avoid hangs.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
     hir::HirConstant,
-    lowering::{LoweringContext, LoweringConfig, AstLowering},
+    lowering::{AstLowering, LoweringConfig, LoweringContext},
 };
 use zyntax_typed_ast::{
-    TypedProgram, Span, TypeRegistry,
-    arena::AstArena, ImplDef, Type, TypeId, MethodImpl, MethodSig,
-    ParamDef, Visibility,
+    arena::AstArena, ImplDef, MethodImpl, MethodSig, ParamDef, Span, Type, TypeId, TypeRegistry,
+    TypedProgram, Visibility,
 };
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 
 fn test_span() -> Span {
     Span::new(0, 10)
@@ -38,20 +37,18 @@ fn test_vtable_generation_simple() {
         name: trait_name,
         type_params: vec![],
         super_traits: vec![],
-        methods: vec![
-            MethodSig {
-                name: method_name,
-                type_params: vec![],
-                params: vec![],
-                return_type: Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
-                where_clause: vec![],
-                is_static: true,
-                is_async: false,
-                visibility: Visibility::Public,
-                span: test_span(),
-                is_extension: false,
-            },
-        ],
+        methods: vec![MethodSig {
+            name: method_name,
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
+            where_clause: vec![],
+            is_static: true,
+            is_async: false,
+            visibility: Visibility::Public,
+            span: test_span(),
+            is_extension: false,
+        }],
         associated_types: vec![],
         is_object_safe: true,
         span: test_span(),
@@ -83,23 +80,21 @@ fn test_vtable_generation_simple() {
             nullability: zyntax_typed_ast::NullabilityKind::NonNull,
         },
         type_args: vec![],
-        methods: vec![
-            MethodImpl {
-                signature: MethodSig {
-                    name: method_name,
-                    type_params: vec![],
-                    params: vec![],
-                    return_type: Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
-                    where_clause: vec![],
-                    is_static: true,
-                    is_async: false,
-                    visibility: Visibility::Public,
-                    span: test_span(),
-                    is_extension: false,
-                },
-                is_default: false,
+        methods: vec![MethodImpl {
+            signature: MethodSig {
+                name: method_name,
+                type_params: vec![],
+                params: vec![],
+                return_type: Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
+                where_clause: vec![],
+                is_static: true,
+                is_async: false,
+                visibility: Visibility::Public,
+                span: test_span(),
+                is_extension: false,
             },
-        ],
+            is_default: false,
+        }],
         associated_types: HashMap::new(),
         where_clause: vec![],
         span: test_span(),
@@ -130,15 +125,13 @@ fn test_vtable_generation_simple() {
     };
 
     // 5. Create program with the method function
-    use zyntax_typed_ast::{TypedNode, typed_node, TypedDeclaration};
+    use zyntax_typed_ast::{typed_node, TypedDeclaration, TypedNode};
     let mut program = TypedProgram {
-        declarations: vec![
-            typed_node(
-                TypedDeclaration::Function(impl_function),
-                Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
-                test_span(),
-            ),
-        ],
+        declarations: vec![typed_node(
+            TypedDeclaration::Function(impl_function),
+            Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
+            test_span(),
+        )],
         span: test_span(),
         source_files: vec![],
         type_registry: type_registry.clone(),
@@ -149,19 +142,18 @@ fn test_vtable_generation_simple() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry.clone(),
-        arena_arc,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry.clone(), arena_arc, config);
 
     let result = ctx.lower_program(&mut program);
 
     // Clean up env var
     std::env::remove_var("SKIP_TYPE_CHECK");
 
-    assert!(result.is_ok(), "Failed to lower program: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower program: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -170,12 +162,22 @@ fn test_vtable_generation_simple() {
     println!("Module has {} functions", module.functions.len());
 
     // Check that we have at least one vtable global
-    let vtable_count = module.globals.values()
-        .filter(|g| matches!(g.initializer, Some(zyntax_compiler::hir::HirConstant::VTable(_))))
+    let vtable_count = module
+        .globals
+        .values()
+        .filter(|g| {
+            matches!(
+                g.initializer,
+                Some(zyntax_compiler::hir::HirConstant::VTable(_))
+            )
+        })
         .count();
 
     println!("Found {} vtable(s)", vtable_count);
-    assert_eq!(vtable_count, 1, "Expected exactly 1 vtable for SimpleTrait implementation");
+    assert_eq!(
+        vtable_count, 1,
+        "Expected exactly 1 vtable for SimpleTrait implementation"
+    );
 
     // Verify the method function was lowered
     println!("All function names:");
@@ -183,28 +185,43 @@ fn test_vtable_generation_simple() {
         println!("  - {}", func.name.to_string());
     }
 
-    let method_func_count = module.functions.values()
+    let method_func_count = module
+        .functions
+        .values()
         .filter(|f| {
             let name = f.name.to_string();
             name.contains("SimpleType") || name.contains("method")
         })
         .count();
 
-    println!("Found {} method function(s) matching filter", method_func_count);
+    println!(
+        "Found {} method function(s) matching filter",
+        method_func_count
+    );
     // Don't assert on function count - just verify vtable exists
     // The function name mangling might be different than expected
 
     // Get the vtable and verify its structure
-    if let Some(vtable_global) = module.globals.values()
-        .find(|g| matches!(g.initializer, Some(zyntax_compiler::hir::HirConstant::VTable(_))))
-    {
-        if let Some(zyntax_compiler::hir::HirConstant::VTable(vtable)) = &vtable_global.initializer {
+    if let Some(vtable_global) = module.globals.values().find(|g| {
+        matches!(
+            g.initializer,
+            Some(zyntax_compiler::hir::HirConstant::VTable(_))
+        )
+    }) {
+        if let Some(zyntax_compiler::hir::HirConstant::VTable(vtable)) = &vtable_global.initializer
+        {
             println!("Vtable trait_id: {:?}", vtable.trait_id);
             println!("Vtable has {} methods", vtable.methods.len());
 
-            assert_eq!(vtable.trait_id, trait_id, "Vtable should be for SimpleTrait");
+            assert_eq!(
+                vtable.trait_id, trait_id,
+                "Vtable should be for SimpleTrait"
+            );
             assert_eq!(vtable.methods.len(), 1, "Vtable should have 1 method");
-            assert_eq!(vtable.methods[0].method_name, method_name, "Method name should match");
+            assert_eq!(
+                vtable.methods[0].method_name, method_name,
+                "Method name should match"
+            );
 
             println!("✅ Vtable structure verified!");
             println!("  - Trait ID: {:?}", vtable.trait_id);

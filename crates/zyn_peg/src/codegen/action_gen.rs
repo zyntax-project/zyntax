@@ -49,9 +49,7 @@ impl ActionGenerator {
             }
 
             ActionIR::HelperCall { function, args } => {
-                let args_code: Vec<String> = args.iter()
-                    .map(|e| self.generate_expr(e))
-                    .collect();
+                let args_code: Vec<String> = args.iter().map(|e| self.generate_expr(e)).collect();
                 self.line(&format!("{}({})", function, args_code.join(", ")));
             }
 
@@ -74,7 +72,11 @@ impl ActionGenerator {
                 self.line("}");
             }
 
-            ActionIR::Conditional { condition, then_action, else_action } => {
+            ActionIR::Conditional {
+                condition,
+                then_action,
+                else_action,
+            } => {
                 let cond_code = self.generate_expr(condition);
                 self.line(&format!("if {} {{", cond_code));
                 self.indent += 1;
@@ -89,7 +91,10 @@ impl ActionGenerator {
                 self.line("}");
             }
 
-            ActionIR::LegacyJson { return_type, json_content } => {
+            ActionIR::LegacyJson {
+                return_type,
+                json_content,
+            } => {
                 // For legacy JSON actions, we generate a comment and placeholder
                 // The actual execution uses the runtime interpreter
                 self.line(&format!("// Legacy JSON action for {}", return_type));
@@ -108,17 +113,22 @@ impl ActionGenerator {
                 format!("{}.{}", self.generate_expr(base), field)
             }
 
-            ExprIR::MethodCall { receiver, method, args } => {
-                let args_code: Vec<String> = args.iter()
-                    .map(|e| self.generate_expr(e))
-                    .collect();
-                format!("{}.{}({})", self.generate_expr(receiver), method, args_code.join(", "))
+            ExprIR::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                let args_code: Vec<String> = args.iter().map(|e| self.generate_expr(e)).collect();
+                format!(
+                    "{}.{}({})",
+                    self.generate_expr(receiver),
+                    method,
+                    args_code.join(", ")
+                )
             }
 
             ExprIR::FunctionCall { function, args } => {
-                let args_code: Vec<String> = args.iter()
-                    .map(|e| self.generate_expr(e))
-                    .collect();
+                let args_code: Vec<String> = args.iter().map(|e| self.generate_expr(e)).collect();
                 format!("{}({})", function, args_code.join(", "))
             }
 
@@ -129,28 +139,44 @@ impl ActionGenerator {
             ExprIR::BoolLit(b) => format!("{}", b),
 
             ExprIR::List(items) => {
-                let items_code: Vec<String> = items.iter()
-                    .map(|e| self.generate_expr(e))
-                    .collect();
+                let items_code: Vec<String> = items.iter().map(|e| self.generate_expr(e)).collect();
                 format!("vec![{}]", items_code.join(", "))
             }
 
             ExprIR::UnwrapOr { optional, default } => {
-                format!("{}.unwrap_or({})", self.generate_expr(optional), self.generate_expr(default))
+                format!(
+                    "{}.unwrap_or({})",
+                    self.generate_expr(optional),
+                    self.generate_expr(default)
+                )
             }
 
-            ExprIR::MapOption { optional, param, body } => {
-                format!("{}.map(|{}| {})", self.generate_expr(optional), param, self.generate_expr(body))
+            ExprIR::MapOption {
+                optional,
+                param,
+                body,
+            } => {
+                format!(
+                    "{}.map(|{}| {})",
+                    self.generate_expr(optional),
+                    param,
+                    self.generate_expr(body)
+                )
             }
 
             ExprIR::StructLit { type_name, fields } => {
-                let fields_code: Vec<String> = fields.iter()
+                let fields_code: Vec<String> = fields
+                    .iter()
                     .map(|(name, expr)| format!("{}: {}", name, self.generate_expr(expr)))
                     .collect();
                 format!("{} {{ {} }}", type_name, fields_code.join(", "))
             }
 
-            ExprIR::EnumVariant { type_name, variant, value } => {
+            ExprIR::EnumVariant {
+                type_name,
+                variant,
+                value,
+            } => {
                 if let Some(v) = value {
                     format!("{}::{}({})", type_name, variant, self.generate_expr(v))
                 } else {
@@ -179,7 +205,12 @@ impl ActionGenerator {
             }
 
             ExprIR::Binary { left, op, right } => {
-                format!("({} {} {})", self.generate_expr(left), op, self.generate_expr(right))
+                format!(
+                    "({} {} {})",
+                    self.generate_expr(left),
+                    op,
+                    self.generate_expr(right)
+                )
             }
 
             ExprIR::Default(type_name) => {
@@ -235,9 +266,7 @@ mod tests {
     fn test_generate_helper_call() {
         let action = ActionIR::HelperCall {
             function: "fold_binary_left".to_string(),
-            args: vec![
-                ExprIR::Binding("items".to_string()),
-            ],
+            args: vec![ExprIR::Binding("items".to_string())],
         };
 
         let mut gen = ActionGenerator::new();

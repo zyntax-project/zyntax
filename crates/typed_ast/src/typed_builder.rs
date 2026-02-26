@@ -1,5 +1,5 @@
 //! # Comprehensive TypedAST Builder
-//! 
+//!
 //! Fluent builder API for constructing well-formed TypedAST nodes.
 //! Provides type-safe construction methods for all TypedAST patterns including:
 //! - Enhanced parameter system with named arguments
@@ -9,7 +9,9 @@
 
 use crate::arena::{AstArena, InternedString};
 use crate::source::Span;
-use crate::type_registry::{Type, Mutability, Visibility, PrimitiveType, ParamInfo, CallingConvention};
+use crate::type_registry::{
+    CallingConvention, Mutability, ParamInfo, PrimitiveType, Type, Visibility,
+};
 use crate::typed_ast::*;
 
 use crate::type_registry::TypeRegistry;
@@ -269,7 +271,7 @@ impl TypedASTBuilder {
             .into_iter()
             .map(|(name, expr)| TypedNamedArg::new(self.intern(name), expr, span))
             .collect();
-        
+
         typed_node(
             TypedExpression::Call(TypedCall::named_only(callee, named_args)),
             return_type,
@@ -291,7 +293,7 @@ impl TypedASTBuilder {
             .into_iter()
             .map(|(name, expr)| TypedNamedArg::new(self.intern(name), expr, span))
             .collect();
-        
+
         typed_node(
             TypedExpression::Call(TypedCall::mixed(callee, positional, named_args, type_args)),
             return_type,
@@ -431,11 +433,7 @@ impl TypedASTBuilder {
         result_type: Type,
         span: Span,
     ) -> TypedNode<TypedExpression> {
-        typed_node(
-            TypedExpression::Try(Box::new(expr)),
-            result_type,
-            span,
-        )
+        typed_node(TypedExpression::Try(Box::new(expr)), result_type, span)
     }
 
     /// Build await expression (for async)
@@ -445,11 +443,7 @@ impl TypedASTBuilder {
         result_type: Type,
         span: Span,
     ) -> TypedNode<TypedExpression> {
-        typed_node(
-            TypedExpression::Await(Box::new(expr)),
-            result_type,
-            span,
-        )
+        typed_node(TypedExpression::Await(Box::new(expr)), result_type, span)
     }
 
     /// Build reference expression (&x)
@@ -511,11 +505,7 @@ impl TypedASTBuilder {
         tuple_type: Type,
         span: Span,
     ) -> TypedNode<TypedExpression> {
-        typed_node(
-            TypedExpression::Tuple(elements),
-            tuple_type,
-            span,
-        )
+        typed_node(TypedExpression::Tuple(elements), tuple_type, span)
     }
 
     /// Build array literal expression
@@ -525,11 +515,7 @@ impl TypedASTBuilder {
         array_type: Type,
         span: Span,
     ) -> TypedNode<TypedExpression> {
-        typed_node(
-            TypedExpression::Array(elements),
-            array_type,
-            span,
-        )
+        typed_node(TypedExpression::Array(elements), array_type, span)
     }
 
     // ====== STATEMENT BUILDERS ======
@@ -606,7 +592,11 @@ impl TypedASTBuilder {
         let var_name = self.intern(variable);
         typed_node(
             TypedStatement::For(TypedFor {
-                pattern: Box::new(typed_node(TypedPattern::immutable_var(var_name), Type::Never, span)),
+                pattern: Box::new(typed_node(
+                    TypedPattern::immutable_var(var_name),
+                    Type::Never,
+                    span,
+                )),
                 iterator: Box::new(iterable),
                 body,
             }),
@@ -619,7 +609,11 @@ impl TypedASTBuilder {
     pub fn match_statement(
         &mut self,
         scrutinee: TypedNode<TypedExpression>,
-        arms: Vec<(TypedNode<TypedPattern>, Option<TypedNode<TypedExpression>>, TypedNode<TypedExpression>)>,
+        arms: Vec<(
+            TypedNode<TypedPattern>,
+            Option<TypedNode<TypedExpression>>,
+            TypedNode<TypedExpression>,
+        )>,
         result_type: Type,
         span: Span,
     ) -> TypedNode<TypedStatement> {
@@ -656,11 +650,7 @@ impl TypedASTBuilder {
     }
 
     /// Build block
-    pub fn block(
-        &mut self,
-        statements: Vec<TypedNode<TypedStatement>>,
-        span: Span,
-    ) -> TypedBlock {
+    pub fn block(&mut self, statements: Vec<TypedNode<TypedStatement>>, span: Span) -> TypedBlock {
         TypedBlock { statements, span }
     }
 
@@ -731,11 +721,7 @@ impl TypedASTBuilder {
     }
 
     /// Build loop statement (infinite loop)
-    pub fn loop_stmt(
-        &mut self,
-        body: TypedBlock,
-        span: Span,
-    ) -> TypedNode<TypedStatement> {
+    pub fn loop_stmt(&mut self, body: TypedBlock, span: Span) -> TypedNode<TypedStatement> {
         typed_node(
             TypedStatement::Loop(TypedLoop::Infinite { body }),
             Type::Primitive(PrimitiveType::Unit),
@@ -781,7 +767,7 @@ impl TypedASTBuilder {
     ) -> TypedNode<TypedPattern> {
         let enum_interned = self.intern(enum_name);
         let variant_interned = self.intern(variant);
-        
+
         typed_node(
             TypedPattern::Enum {
                 name: enum_interned,
@@ -830,7 +816,7 @@ impl TypedASTBuilder {
         span: Span,
     ) -> TypedNode<TypedPattern> {
         let mut pattern_entries = Vec::new();
-        
+
         // Add key-value entries
         for (key, pattern) in entries {
             pattern_entries.push(TypedMapPatternEntry::KeyValue {
@@ -842,7 +828,7 @@ impl TypedASTBuilder {
                 pattern: Box::new(pattern),
             });
         }
-        
+
         // Add rest pattern if specified
         if let Some((rest_name, mutability)) = rest {
             pattern_entries.push(TypedMapPatternEntry::Rest {
@@ -1019,11 +1005,7 @@ impl TypedASTBuilder {
     /// // import prelude
     /// builder.import("prelude", span)
     /// ```
-    pub fn import(
-        &mut self,
-        module_name: &str,
-        span: Span,
-    ) -> TypedNode<TypedDeclaration> {
+    pub fn import(&mut self, module_name: &str, span: Span) -> TypedNode<TypedDeclaration> {
         use crate::typed_ast::{TypedImport, TypedImportItem};
 
         let module_path = vec![self.intern(module_name)];
@@ -1202,11 +1184,12 @@ impl TypedASTBuilder {
         use crate::source::SourceFile;
 
         // Create SourceFile if we have source information
-        let source_files = if let (Some(name), Some(content)) = (self.source_file(), self.source_content()) {
-            vec![SourceFile::new(name.to_string(), content.to_string())]
-        } else {
-            vec![]
-        };
+        let source_files =
+            if let (Some(name), Some(content)) = (self.source_file(), self.source_content()) {
+                vec![SourceFile::new(name.to_string(), content.to_string())]
+            } else {
+                vec![]
+            };
 
         TypedProgram {
             declarations,
@@ -1234,7 +1217,7 @@ impl FluentFunctionBuilder {
     pub fn new(builder: TypedASTBuilder, name: &str, span: Span) -> Self {
         let mut inner_builder = builder;
         let interned_name = inner_builder.intern(name);
-        
+
         Self {
             builder: inner_builder,
             name: interned_name,
@@ -1249,25 +1232,35 @@ impl FluentFunctionBuilder {
 
     /// Add a regular parameter
     pub fn param(mut self, name: &str, ty: impl Into<Type>) -> Self {
-        let param = self.builder.parameter(name, ty.into(), Mutability::Immutable, self.span);
+        let param = self
+            .builder
+            .parameter(name, ty.into(), Mutability::Immutable, self.span);
         self.params.push(param);
         self
     }
 
     /// Add a mutable parameter
     pub fn mut_param(mut self, name: &str, ty: impl Into<Type>) -> Self {
-        let param = self.builder.parameter(name, ty.into(), Mutability::Mutable, self.span);
+        let param = self
+            .builder
+            .parameter(name, ty.into(), Mutability::Mutable, self.span);
         self.params.push(param);
         self
     }
 
     /// Add an optional parameter with default value
-    pub fn optional_param<T>(mut self, name: &str, ty: impl Into<Type>, default: T) -> Self 
+    pub fn optional_param<T>(mut self, name: &str, ty: impl Into<Type>, default: T) -> Self
     where
         T: Into<DefaultValue>,
     {
         let default_expr = default.into().to_expression(&mut self.builder, self.span);
-        let param = self.builder.optional_parameter(name, ty.into(), Mutability::Immutable, default_expr, self.span);
+        let param = self.builder.optional_parameter(
+            name,
+            ty.into(),
+            Mutability::Immutable,
+            default_expr,
+            self.span,
+        );
         self.params.push(param);
         self
     }
@@ -1281,7 +1274,9 @@ impl FluentFunctionBuilder {
 
     /// Add a rest/varargs parameter
     pub fn rest_param(mut self, name: &str, ty: impl Into<Type>) -> Self {
-        let param = self.builder.rest_parameter(name, ty.into(), Mutability::Immutable, self.span);
+        let param = self
+            .builder
+            .rest_parameter(name, ty.into(), Mutability::Immutable, self.span);
         self.params.push(param);
         self
     }
@@ -1350,8 +1345,10 @@ impl FluentFunctionBuilder {
     /// Build function and also return the function type for variable declarations
     pub fn build_with_type(self) -> (TypedNode<TypedDeclaration>, Type) {
         // Convert parameters to ParamInfo for function type
-        let param_infos: Vec<ParamInfo> = self.params.iter().map(|p| {
-            ParamInfo {
+        let param_infos: Vec<ParamInfo> = self
+            .params
+            .iter()
+            .map(|p| ParamInfo {
                 name: Some(p.name),
                 ty: p.ty.clone(),
                 is_optional: matches!(p.kind, ParameterKind::Optional),
@@ -1361,12 +1358,18 @@ impl FluentFunctionBuilder {
                 is_out: matches!(p.kind, ParameterKind::Out),
                 is_ref: matches!(p.kind, ParameterKind::Ref),
                 is_inout: matches!(p.kind, ParameterKind::InOut),
-            }
-        }).collect();
+            })
+            .collect();
 
         let has_named_params = true; // For flexibility
-        let has_default_params = self.params.iter().any(|p| matches!(p.kind, ParameterKind::Optional));
-        let is_varargs = self.params.iter().any(|p| matches!(p.kind, ParameterKind::Rest));
+        let has_default_params = self
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ParameterKind::Optional));
+        let is_varargs = self
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ParameterKind::Rest));
 
         let func_type = Type::Function {
             params: param_infos,
@@ -1423,7 +1426,11 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
-    fn to_expression(self, builder: &mut TypedASTBuilder, span: Span) -> TypedNode<TypedExpression> {
+    fn to_expression(
+        self,
+        builder: &mut TypedASTBuilder,
+        span: Span,
+    ) -> TypedNode<TypedExpression> {
         match self {
             DefaultValue::Integer(i) => builder.int_literal(i, span),
             DefaultValue::Bool(b) => builder.bool_literal(b, span),
@@ -1531,7 +1538,10 @@ mod tests {
         );
 
         // Verify structure
-        assert!(matches!(int_lit.node, TypedExpression::Literal(TypedLiteral::Integer(42))));
+        assert!(matches!(
+            int_lit.node,
+            TypedExpression::Literal(TypedLiteral::Integer(42))
+        ));
         assert!(matches!(binary.node, TypedExpression::Binary(_)));
     }
 
@@ -1564,7 +1574,12 @@ mod tests {
         let span = Span::new(0, 10);
 
         // Test different parameter types
-        let regular = builder.parameter("x", Type::Primitive(PrimitiveType::I32), Mutability::Immutable, span);
+        let regular = builder.parameter(
+            "x",
+            Type::Primitive(PrimitiveType::I32),
+            Mutability::Immutable,
+            span,
+        );
         let opt_default = builder.int_literal(42, span);
         let optional = builder.optional_parameter(
             "y",
@@ -1573,7 +1588,12 @@ mod tests {
             opt_default,
             span,
         );
-        let rest = builder.rest_parameter("args", Type::Primitive(PrimitiveType::I32), Mutability::Immutable, span);
+        let rest = builder.rest_parameter(
+            "args",
+            Type::Primitive(PrimitiveType::I32),
+            Mutability::Immutable,
+            span,
+        );
         let out = builder.out_parameter("result", Type::Primitive(PrimitiveType::I32), span);
 
         assert_eq!(regular.kind, ParameterKind::Regular);
@@ -1594,8 +1614,14 @@ mod tests {
         let struct_pattern = builder.struct_pattern(
             "Point",
             vec![
-                ("x", typed_node(TypedPattern::immutable_var(px_name), Type::Never, span)),
-                ("y", typed_node(TypedPattern::immutable_var(py_name), Type::Never, span)),
+                (
+                    "x",
+                    typed_node(TypedPattern::immutable_var(px_name), Type::Never, span),
+                ),
+                (
+                    "y",
+                    typed_node(TypedPattern::immutable_var(py_name), Type::Never, span),
+                ),
             ],
             span,
         );
@@ -1604,7 +1630,11 @@ mod tests {
         let enum_pattern = builder.enum_pattern(
             "Option",
             "Some",
-            vec![typed_node(TypedPattern::immutable_var(value_name), Type::Never, span)],
+            vec![typed_node(
+                TypedPattern::immutable_var(value_name),
+                Type::Never,
+                span,
+            )],
             span,
         );
 
@@ -1644,7 +1674,12 @@ mod tests {
         let span = Span::new(0, 100);
 
         // Build a simple function with enhanced parameters
-        let param1 = builder.parameter("x", Type::Primitive(PrimitiveType::I32), Mutability::Immutable, span);
+        let param1 = builder.parameter(
+            "x",
+            Type::Primitive(PrimitiveType::I32),
+            Mutability::Immutable,
+            span,
+        );
         let default_val = builder.int_literal(0, span);
         let param2 = builder.optional_parameter(
             "y",
@@ -1721,7 +1756,10 @@ mod tests {
         // Test infinite loop
         let body = builder.block(vec![], span);
         let loop_stmt = builder.loop_stmt(body, span);
-        assert!(matches!(loop_stmt.node, TypedStatement::Loop(TypedLoop::Infinite { .. })));
+        assert!(matches!(
+            loop_stmt.node,
+            TypedStatement::Loop(TypedLoop::Infinite { .. })
+        ));
     }
 
     #[test]
@@ -1796,7 +1834,10 @@ mod tests {
         assert_eq!(builder.i32_type(), Type::Primitive(PrimitiveType::I32));
         assert_eq!(builder.i64_type(), Type::Primitive(PrimitiveType::I64));
         assert_eq!(builder.bool_type(), Type::Primitive(PrimitiveType::Bool));
-        assert_eq!(builder.string_type(), Type::Primitive(PrimitiveType::String));
+        assert_eq!(
+            builder.string_type(),
+            Type::Primitive(PrimitiveType::String)
+        );
         assert_eq!(builder.unit_type(), Type::Primitive(PrimitiveType::Unit));
         assert_eq!(builder.char_type(), Type::Primitive(PrimitiveType::Char));
         assert_eq!(builder.f32_type(), Type::Primitive(PrimitiveType::F32));

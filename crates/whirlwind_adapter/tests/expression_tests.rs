@@ -1,18 +1,19 @@
+use std::path::PathBuf;
 /// Tests for expression and statement conversion
 /// Focuses on function bodies, control flow, and runtime behavior
-
 use whirlwind_adapter::WhirlwindAdapter;
 use whirlwind_analyzer::{Module, Standpoint};
-use std::path::PathBuf;
 use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedStatement};
 use zyntax_typed_ast::Type;
 
 /// Helper to convert source and extract the first function's body
-fn convert_and_extract_function(source: &str) -> Result<Vec<zyntax_typed_ast::TypedNode<TypedStatement>>, Box<dyn std::error::Error>> {
+fn convert_and_extract_function(
+    source: &str,
+) -> Result<Vec<zyntax_typed_ast::TypedNode<TypedStatement>>, Box<dyn std::error::Error>> {
     let mut module = Module::from_text(source);
     module.module_path = Some(PathBuf::from("testing://expr_test.wrl"));
-    let standpoint = Standpoint::build_from_module(module, false)
-        .ok_or("Failed to build standpoint")?;
+    let standpoint =
+        Standpoint::build_from_module(module, false).ok_or("Failed to build standpoint")?;
 
     let mut adapter = WhirlwindAdapter::new();
     let typed_program = adapter.convert_standpoint(&standpoint)?;
@@ -30,7 +31,11 @@ fn convert_and_extract_function(source: &str) -> Result<Vec<zyntax_typed_ast::Ty
 }
 
 /// Helper to print expression tree
-fn print_expr(expr: &zyntax_typed_ast::TypedNode<TypedExpression>, adapter: &WhirlwindAdapter, indent: usize) {
+fn print_expr(
+    expr: &zyntax_typed_ast::TypedNode<TypedExpression>,
+    adapter: &WhirlwindAdapter,
+    indent: usize,
+) {
     let prefix = "  ".repeat(indent);
     match &expr.node {
         TypedExpression::Literal(lit) => {
@@ -64,7 +69,12 @@ fn print_expr(expr: &zyntax_typed_ast::TypedNode<TypedExpression>, adapter: &Whi
             }
         }
         _ => {
-            println!("{}Other({:?}) : {:?}", prefix, std::mem::discriminant(&expr.node), expr.ty);
+            println!(
+                "{}Other({:?}) : {:?}",
+                prefix,
+                std::mem::discriminant(&expr.node),
+                expr.ty
+            );
         }
     }
 }
@@ -182,7 +192,10 @@ function createVar() -> int {
                 println!("Initializer type: {:?}", init.ty);
             }
         }
-        _ => panic!("Expected let statement, got {:?}", std::mem::discriminant(&statements[0].node)),
+        _ => panic!(
+            "Expected let statement, got {:?}",
+            std::mem::discriminant(&statements[0].node)
+        ),
     }
 }
 
@@ -218,13 +231,19 @@ function checkValue(x: int) -> int {
     match &statements[0].node {
         TypedStatement::If(if_stmt) => {
             println!("Condition type: {:?}", if_stmt.condition.ty);
-            println!("Then block statements: {}", if_stmt.then_block.statements.len());
+            println!(
+                "Then block statements: {}",
+                if_stmt.then_block.statements.len()
+            );
             if let Some(else_block) = &if_stmt.else_block {
                 println!("Else block statements: {}", else_block.statements.len());
             }
         }
         _ => {
-            println!("First statement is not If, it's: {:?}", std::mem::discriminant(&statements[0].node));
+            println!(
+                "First statement is not If, it's: {:?}",
+                std::mem::discriminant(&statements[0].node)
+            );
             // Don't panic, just note it for now
         }
     }
@@ -340,11 +359,11 @@ model Point {
         if let Some(body) = &method.body {
             if body.statements.len() > 0 {
                 if let TypedStatement::Return(Some(expr)) = &body.statements[0].node {
-                print_expr(&expr, &adapter, 0);
+                    print_expr(&expr, &adapter, 0);
 
-                if let TypedExpression::Field(_field) = &expr.node {
-                    println!("Field access result type: {:?}", expr.ty);
-                }
+                    if let TypedExpression::Field(_field) = &expr.node {
+                        println!("Field access result type: {:?}", expr.ty);
+                    }
                 }
             }
         }

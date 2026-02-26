@@ -5,9 +5,9 @@
 
 use crate::arena::{AstArena, InternedString};
 use crate::source::Span;
-use crate::type_registry::{Type, Mutability, Visibility, PrimitiveType, ParamInfo};
-use crate::{typed_ast::*, ConstValue};
+use crate::type_registry::{Mutability, ParamInfo, PrimitiveType, Type, Visibility};
 use crate::typed_builder::TypedASTBuilder;
+use crate::{typed_ast::*, ConstValue};
 use std::collections::HashMap;
 
 /// A test context that tracks declarations and provides fluent building
@@ -38,9 +38,12 @@ impl TestContext {
 
     /// Reference a previously defined function
     pub fn function_ref(&mut self, name: &str) -> TypedNode<TypedExpression> {
-        let (_, func_type) = self.functions.get(name)
+        let (_, func_type) = self
+            .functions
+            .get(name)
             .expect(&format!("Function '{}' not defined", name));
-        self.builder.variable(name, func_type.clone(), self.default_span)
+        self.builder
+            .variable(name, func_type.clone(), self.default_span)
     }
 
     /// Define a variable with optional initialization
@@ -50,14 +53,19 @@ impl TestContext {
 
     /// Reference a previously defined variable
     pub fn var_ref(&mut self, name: &str) -> TypedNode<TypedExpression> {
-        let (_, var_type) = self.variables.get(name)
+        let (_, var_type) = self
+            .variables
+            .get(name)
             .expect(&format!("Variable '{}' not defined", name));
-        self.builder.variable(name, var_type.clone(), self.default_span)
+        self.builder
+            .variable(name, var_type.clone(), self.default_span)
     }
 
     /// Create a literal value
     pub fn literal(&mut self, value: impl Into<Literal>) -> TypedNode<TypedExpression> {
-        value.into().to_expression(&mut self.builder, self.default_span)
+        value
+            .into()
+            .to_expression(&mut self.builder, self.default_span)
     }
 
     /// Create a function call
@@ -69,7 +77,7 @@ impl TestContext {
     /// Build a program from all defined functions
     pub fn build_program(&mut self) -> TypedProgram {
         let mut declarations = Vec::new();
-        
+
         // Add all functions
         for (_, (func_decl, _)) in &self.functions {
             declarations.push(func_decl.clone());
@@ -77,11 +85,12 @@ impl TestContext {
 
         // Create main function if needed
         if !self.functions.contains_key("main") {
-            let main_stmts: Vec<TypedNode<TypedStatement>> = self.variables
+            let main_stmts: Vec<TypedNode<TypedStatement>> = self
+                .variables
                 .values()
                 .map(|(stmt, _)| stmt.clone())
                 .collect();
-            
+
             let main_body = self.builder.block(main_stmts, self.default_span);
             let main_func = self.builder.function(
                 "main",
@@ -150,8 +159,15 @@ impl<'a> FunctionDefiner<'a> {
     }
 
     /// Add an optional parameter
-    pub fn optional(mut self, name: &str, ty: impl Into<TypeDef>, default: impl Into<Literal>) -> Self {
-        let default_expr = default.into().to_expression(&mut self.ctx.builder, self.ctx.default_span);
+    pub fn optional(
+        mut self,
+        name: &str,
+        ty: impl Into<TypeDef>,
+        default: impl Into<Literal>,
+    ) -> Self {
+        let default_expr = default
+            .into()
+            .to_expression(&mut self.ctx.builder, self.ctx.default_span);
         self.params.push(ParamDef {
             name: name.to_string(),
             ty: ty.into().to_type(),
@@ -196,10 +212,12 @@ impl<'a> FunctionDefiner<'a> {
     pub fn end(self) -> &'a mut TestContext {
         let span = self.ctx.default_span;
         let builder = &mut self.ctx.builder;
-        
+
         // Convert params to TypedParameter
-        let typed_params: Vec<TypedParameter> = self.params.into_iter().map(|p| {
-            match p.kind {
+        let typed_params: Vec<TypedParameter> = self
+            .params
+            .into_iter()
+            .map(|p| match p.kind {
                 ParamKind::Regular(mutability) => {
                     builder.parameter(&p.name, p.ty, mutability, span)
                 }
@@ -209,21 +227,18 @@ impl<'a> FunctionDefiner<'a> {
                 ParamKind::Rest => {
                     builder.rest_parameter(&p.name, p.ty, Mutability::Immutable, span)
                 }
-                ParamKind::Out => {
-                    builder.out_parameter(&p.name, p.ty, span)
-                }
+                ParamKind::Out => builder.out_parameter(&p.name, p.ty, span),
                 ParamKind::Ref(mutability) => {
                     builder.ref_parameter(&p.name, p.ty, mutability, span)
                 }
-                ParamKind::InOut => {
-                    builder.inout_parameter(&p.name, p.ty, span)
-                }
-            }
-        }).collect();
+                ParamKind::InOut => builder.inout_parameter(&p.name, p.ty, span),
+            })
+            .collect();
 
         // Build function type
-        let param_infos: Vec<ParamInfo> = typed_params.iter().map(|p| {
-            ParamInfo {
+        let param_infos: Vec<ParamInfo> = typed_params
+            .iter()
+            .map(|p| ParamInfo {
                 name: Some(p.name),
                 ty: p.ty.clone(),
                 is_optional: matches!(p.kind, ParameterKind::Optional),
@@ -233,15 +248,19 @@ impl<'a> FunctionDefiner<'a> {
                 is_out: matches!(p.kind, ParameterKind::Out),
                 is_ref: matches!(p.kind, ParameterKind::Ref),
                 is_inout: matches!(p.kind, ParameterKind::InOut),
-            }
-        }).collect();
+            })
+            .collect();
 
         let func_type = Type::Function {
             params: param_infos,
             return_type: Box::new(self.return_type.clone()),
-            is_varargs: typed_params.iter().any(|p| matches!(p.kind, ParameterKind::Rest)),
+            is_varargs: typed_params
+                .iter()
+                .any(|p| matches!(p.kind, ParameterKind::Rest)),
             has_named_params: true,
-            has_default_params: typed_params.iter().any(|p| matches!(p.kind, ParameterKind::Optional)),
+            has_default_params: typed_params
+                .iter()
+                .any(|p| matches!(p.kind, ParameterKind::Optional)),
             async_kind: crate::AsyncKind::Sync,
             calling_convention: crate::CallingConvention::Default,
             nullability: crate::NullabilityKind::Unknown,
@@ -293,7 +312,11 @@ impl<'a> VarDefiner<'a> {
 
     /// Initialize with a value
     pub fn init(mut self, value: impl Into<Literal>) -> Self {
-        self.init = Some(value.into().to_expression(&mut self.ctx.builder, self.ctx.default_span));
+        self.init = Some(
+            value
+                .into()
+                .to_expression(&mut self.ctx.builder, self.ctx.default_span),
+        );
         self
     }
 
@@ -312,7 +335,7 @@ impl<'a> VarDefiner<'a> {
             self.init,
             self.ctx.default_span,
         );
-        
+
         self.ctx.variables.insert(self.name, (stmt, self.ty));
         self.ctx
     }
@@ -334,7 +357,7 @@ impl<'a> CallBuilder<'a> {
         } else {
             Type::Never
         };
-        
+
         Self {
             ctx,
             callee,
@@ -346,7 +369,9 @@ impl<'a> CallBuilder<'a> {
 
     /// Add a positional argument
     pub fn arg(mut self, value: impl Into<Literal>) -> Self {
-        let expr = value.into().to_expression(&mut self.ctx.builder, self.ctx.default_span);
+        let expr = value
+            .into()
+            .to_expression(&mut self.ctx.builder, self.ctx.default_span);
         self.positional_args.push(expr);
         self
     }
@@ -359,7 +384,9 @@ impl<'a> CallBuilder<'a> {
 
     /// Add a named argument
     pub fn named(mut self, name: &str, value: impl Into<Literal>) -> Self {
-        let expr = value.into().to_expression(&mut self.ctx.builder, self.ctx.default_span);
+        let expr = value
+            .into()
+            .to_expression(&mut self.ctx.builder, self.ctx.default_span);
         self.named_args.push((name.to_string(), expr));
         self
     }
@@ -367,7 +394,7 @@ impl<'a> CallBuilder<'a> {
     /// Build the call expression
     pub fn build(self) -> TypedNode<TypedExpression> {
         let span = self.ctx.default_span;
-        
+
         if self.named_args.is_empty() {
             self.ctx.builder.call_positional(
                 self.callee,
@@ -376,18 +403,17 @@ impl<'a> CallBuilder<'a> {
                 span,
             )
         } else if self.positional_args.is_empty() {
-            let named_args: Vec<(&str, TypedNode<TypedExpression>)> = self.named_args
+            let named_args: Vec<(&str, TypedNode<TypedExpression>)> = self
+                .named_args
                 .iter()
                 .map(|(name, expr)| (name.as_str(), expr.clone()))
                 .collect();
-            self.ctx.builder.call_named(
-                self.callee,
-                named_args,
-                self.return_type,
-                span,
-            )
+            self.ctx
+                .builder
+                .call_named(self.callee, named_args, self.return_type, span)
         } else {
-            let named_args: Vec<(&str, TypedNode<TypedExpression>)> = self.named_args
+            let named_args: Vec<(&str, TypedNode<TypedExpression>)> = self
+                .named_args
                 .iter()
                 .map(|(name, expr)| (name.as_str(), expr.clone()))
                 .collect();
@@ -476,7 +502,11 @@ pub enum Literal {
 }
 
 impl Literal {
-    fn to_expression(self, builder: &mut TypedASTBuilder, span: Span) -> TypedNode<TypedExpression> {
+    fn to_expression(
+        self,
+        builder: &mut TypedASTBuilder,
+        span: Span,
+    ) -> TypedNode<TypedExpression> {
         match self {
             Literal::Int(i) => builder.int_literal(i, span),
             Literal::Float(f) => typed_node(

@@ -55,25 +55,29 @@ pub fn build_poll_helpers(builder: &mut HirBuilder) {
 
     // Build poll_ready<T>(value: T) -> Poll<T>
     // This creates a Poll in the Ready state
-    builder.begin_generic_function("poll_ready", vec!["T"])
+    builder
+        .begin_generic_function("poll_ready", vec!["T"])
         .param("value", HirType::Opaque(t_name))
         .returns(HirType::Opaque(poll_name))
         .build();
 
     // Build poll_pending<T>() -> Poll<T>
     // This creates a Poll in the Pending state
-    builder.begin_generic_function("poll_pending", vec!["T"])
+    builder
+        .begin_generic_function("poll_pending", vec!["T"])
         .returns(HirType::Opaque(poll_name))
         .build();
 
     // Build poll_is_ready<T>(poll: Poll<T>) -> bool
-    builder.begin_generic_function("poll_is_ready", vec!["T"])
+    builder
+        .begin_generic_function("poll_is_ready", vec!["T"])
         .param("poll", HirType::Opaque(poll_name))
         .returns(HirType::Bool)
         .build();
 
     // Build poll_unwrap<T>(poll: Poll<T>) -> T
-    builder.begin_generic_function("poll_unwrap", vec!["T"])
+    builder
+        .begin_generic_function("poll_unwrap", vec!["T"])
         .param("poll", HirType::Opaque(poll_name))
         .returns(HirType::Opaque(t_name))
         .build();
@@ -89,13 +93,15 @@ pub fn build_waker_functions(builder: &mut HirBuilder) {
     let waker_ty = HirType::Opaque(waker_name);
 
     // Build waker_wake(waker: *Waker)
-    builder.begin_function("waker_wake")
+    builder
+        .begin_function("waker_wake")
         .param("waker", HirType::Ptr(Box::new(waker_ty.clone())))
         .returns(HirType::Void)
         .build();
 
     // Build waker_clone(waker: *Waker) -> *Waker
-    builder.begin_function("waker_clone")
+    builder
+        .begin_function("waker_clone")
         .param("waker", HirType::Ptr(Box::new(waker_ty.clone())))
         .returns(HirType::Ptr(Box::new(waker_ty)))
         .build();
@@ -112,7 +118,8 @@ pub fn build_context_functions(builder: &mut HirBuilder) {
     let waker_ty = HirType::Opaque(waker_name);
 
     // Build context_waker(cx: *Context) -> *Waker
-    builder.begin_function("context_waker")
+    builder
+        .begin_function("context_waker")
         .param("cx", HirType::Ptr(Box::new(context_ty)))
         .returns(HirType::Ptr(Box::new(waker_ty)))
         .build();

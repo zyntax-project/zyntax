@@ -3,13 +3,13 @@
 //! This module provides a flexible type registry for built-in complex types
 //! like `List<T>`, `HashMap<K,V>`, `Set<T>`, etc. It complements the basic
 //! `PrimitiveType` enum, which handles simple atomic types.
-//! 
+//!
 //! ## Purpose
-//! 
+//!
 //! - **Primitive types** (int, bool, string): Use `Type::Primitive(PrimitiveType::*)`
 //! - **Complex built-in types** (List, Map, etc.): Use `Type::Named` with TypeRegistry
 //! - **User-defined types** (classes, structs): Also use TypeRegistry
-//! 
+//!
 //! This separation allows language implementers to:
 //! 1. Use universal primitive types without registration
 //! 2. Register their language's specific complex built-in types
@@ -32,11 +32,11 @@ impl TypeId {
     pub fn new(id: u32) -> Self {
         Self(id)
     }
-    
+
     pub fn next() -> Self {
         Self(NEXT_TYPE_ID.fetch_add(1, Ordering::SeqCst))
     }
-    
+
     pub fn as_u32(self) -> u32 {
         self.0
     }
@@ -46,18 +46,28 @@ impl TypeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PrimitiveType {
     // Numeric types
-    I8, I16, I32, I64, I128,
-    U8, U16, U32, U64, U128,
-    F32, F64,
-    
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F32,
+    F64,
+
     // Other primitives
     Bool,
     Char,
     String,
-    
+
     // Platform-specific integers
-    ISize, USize,
-    
+    ISize,
+    USize,
+
     // Special
     Unit, // void/unit type
 }
@@ -65,27 +75,49 @@ pub enum PrimitiveType {
 impl PrimitiveType {
     /// Check if this is a numeric type
     pub fn is_numeric(self) -> bool {
-        matches!(self, 
-            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 | PrimitiveType::I128 |
-            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 | PrimitiveType::U128 |
-            PrimitiveType::F32 | PrimitiveType::F64 | PrimitiveType::ISize | PrimitiveType::USize
+        matches!(
+            self,
+            PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::I128
+                | PrimitiveType::U8
+                | PrimitiveType::U16
+                | PrimitiveType::U32
+                | PrimitiveType::U64
+                | PrimitiveType::U128
+                | PrimitiveType::F32
+                | PrimitiveType::F64
+                | PrimitiveType::ISize
+                | PrimitiveType::USize
         )
     }
-    
+
     /// Check if this is an integral type
     pub fn is_integral(self) -> bool {
-        matches!(self,
-            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 | PrimitiveType::I128 |
-            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 | PrimitiveType::U128 |
-            PrimitiveType::ISize | PrimitiveType::USize
+        matches!(
+            self,
+            PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::I128
+                | PrimitiveType::U8
+                | PrimitiveType::U16
+                | PrimitiveType::U32
+                | PrimitiveType::U64
+                | PrimitiveType::U128
+                | PrimitiveType::ISize
+                | PrimitiveType::USize
         )
     }
-    
+
     /// Check if this is a floating point type
     pub fn is_float(self) -> bool {
         matches!(self, PrimitiveType::F32 | PrimitiveType::F64)
     }
-    
+
     /// Get the size of this type in bytes (if known)
     pub fn size_of(self) -> Option<usize> {
         match self {
@@ -109,7 +141,7 @@ pub enum NullabilityKind {
     /// Explicitly non-null
     NonNull,
     /// Explicitly nullable
-    Nullable, 
+    Nullable,
     /// Nullability unknown (for gradual typing)
     Unknown,
     /// Platform-dependent nullability
@@ -198,17 +230,32 @@ pub enum ConstValue {
 /// Binary operators for const expressions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ConstBinaryOp {
-    Add, Sub, Mul, Div, Mod,
-    And, Or, Xor,
-    Shl, Shr,
-    Eq, Ne, Lt, Le, Gt, Ge,
-    LogicalAnd, LogicalOr,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    LogicalAnd,
+    LogicalOr,
 }
 
 /// Unary operators for const expressions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ConstUnaryOp {
-    Neg, Not, LogicalNot,
+    Neg,
+    Not,
+    LogicalNot,
 }
 
 /// Const constraint for const-dependent types
@@ -242,7 +289,7 @@ impl ConstVarId {
         static NEXT_CONST_VAR: AtomicU32 = AtomicU32::new(1);
         Self(NEXT_CONST_VAR.fetch_add(1, Ordering::SeqCst))
     }
-    
+
     pub fn as_u32(self) -> u32 {
         self.0
     }
@@ -286,7 +333,7 @@ pub enum Type {
     /// The bottom type (never/empty) - default for uninitialized types
     #[default]
     Never,
-    
+
     /// A type registered in the type registry by ID
     Named {
         id: TypeId,
@@ -295,10 +342,10 @@ pub enum Type {
         variance: Vec<Variance>,
         nullability: NullabilityKind,
     },
-    
+
     /// Type variable for inference (e.g., T, U)
     TypeVar(TypeVar),
-    
+
     /// Function type: (params) -> return_type with enhanced parameter info
     Function {
         params: Vec<ParamInfo>,
@@ -310,17 +357,17 @@ pub enum Type {
         calling_convention: CallingConvention,
         nullability: NullabilityKind,
     },
-    
+
     /// Tuple type: (T1, T2, ..., Tn)
     Tuple(Vec<Type>),
-    
+
     /// Array type: [T; size] or T[]
     Array {
         element_type: Box<Type>,
         size: Option<ConstValue>, // None for dynamic arrays, ConstValue for const generics
         nullability: NullabilityKind,
     },
-    
+
     /// Reference/Pointer type
     Reference {
         ty: Box<Type>,
@@ -328,7 +375,7 @@ pub enum Type {
         lifetime: Option<Lifetime>,
         nullability: NullabilityKind,
     },
-    
+
     /// Optional/Nullable type: T? or Option<T>
     Optional(Box<Type>),
 
@@ -340,89 +387,86 @@ pub enum Type {
 
     /// Union type: T1 | T2 | ... | Tn
     Union(Vec<Type>),
-    
+
     /// Intersection type: T1 & T2 & ... & Tn
     Intersection(Vec<Type>),
-    
+
     /// Type alias (resolved to target type)
     Alias {
         name: InternedString,
         target: Box<Type>,
     },
-    
+
     /// Associated type (for traits/interfaces)
     Associated {
         trait_name: InternedString,
         type_name: InternedString,
     },
-    
+
     /// Higher-kinded type: F<_> where F is a type constructor
     HigherKinded {
         constructor: InternedString,
         arity: usize,
         kind: Kind,
     },
-    
+
     /// Projection type: T::AssocType
     Projection {
         base: Box<Type>,
         item: InternedString,
     },
-    
+
     /// Index type: T[K]
-    Index {
-        base: Box<Type>,
-        index: Box<Type>,
-    },
-    
+    Index { base: Box<Type>, index: Box<Type> },
+
     /// The top type (any/unknown)
     Any,
-    
+
     /// Error type (for error recovery)
     Error,
-    
+
     /// Self type (for trait method definitions)
     SelfType,
-    
+
     /// Explicit nullable type: T? or Option<T>
     Nullable(Box<Type>),
-    
+
     /// Explicit non-null type
     NonNull(Box<Type>),
-    
+
     /// Const variable for const generics
     ConstVar {
         id: ConstVarId,
         name: Option<InternedString>,
         const_type: Box<Type>,
     },
-    
+
     /// Const-dependent type with constraints
     ConstDependent {
         base_type: Box<Type>,
         constraint: ConstConstraint,
     },
-    
+
     /// Dynamic type for gradual typing
     Dynamic,
-    
+
     /// Unknown type for gradual typing (TypeScript unknown)
     Unknown,
-    
+
     /// Structural interface type (Go/TypeScript style)
     Interface {
         methods: Vec<MethodSig>,
         is_structural: bool, // true for Go-style, false for nominal
         nullability: NullabilityKind,
     },
-    
+
     /// Anonymous struct type (structural typing)
     Struct {
         fields: Vec<FieldDef>,
         is_anonymous: bool,
         nullability: NullabilityKind,
     },
-    
+
     /// Trait type (Rust-style)
     Trait {
         id: TypeId,
@@ -471,7 +515,7 @@ impl TypeVarId {
     pub fn unknown() -> Self {
         TypeVarId(0)
     }
-    
+
     pub fn as_u32(self) -> u32 {
         self.0
     }
@@ -486,7 +530,7 @@ impl TypeVar {
             kind: TypeVarKind::Type,
         }
     }
-    
+
     /// Create a new anonymous unbound type variable
     pub fn fresh() -> Self {
         Self {
@@ -548,9 +592,7 @@ pub enum TypeKind {
         super_traits: Vec<Type>,
     },
     /// Enum/Sum type
-    Enum {
-        variants: Vec<VariantDef>,
-    },
+    Enum { variants: Vec<VariantDef> },
     /// Type alias
     Alias { target: Type },
     /// Abstract type (like Haxe's abstract) - wrapper with implicit conversions
@@ -594,11 +636,18 @@ pub enum TypeConstraint {
     /// Trait/Interface implementation: T : Trait
     Implementation { ty: Type, trait_id: TypeId },
     /// Has member constraint: T has field/method
-    HasMember { ty: Type, member: InternedString, member_type: Type },
+    HasMember {
+        ty: Type,
+        member: InternedString,
+        member_type: Type,
+    },
     /// Callable constraint: T is callable with signature
     Callable { ty: Type, signature: Type },
     /// Custom constraint (language-specific)
-    Custom { name: InternedString, args: Vec<Type> },
+    Custom {
+        name: InternedString,
+        args: Vec<Type>,
+    },
 }
 
 /// Field definition
@@ -649,7 +698,7 @@ pub struct ParamDef {
     pub name: InternedString,
     pub ty: Type,
     pub is_self: bool,
-    pub is_varargs:bool,
+    pub is_varargs: bool,
     pub is_mut: bool,
 }
 
@@ -740,7 +789,10 @@ pub enum LifetimeBound {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeBound {
     /// Trait bound: T: Trait
-    Trait { name: InternedString, args: Vec<Type> },
+    Trait {
+        name: InternedString,
+        args: Vec<Type>,
+    },
     /// Lifetime bound: T: 'a
     Lifetime(Lifetime),
     /// Equality bound: T::Assoc = Type
@@ -773,7 +825,10 @@ pub enum TypeBound {
         bound: Box<TypeBound>,
     },
     /// Custom bound with parameters
-    Custom { name: InternedString, args: Vec<Type> },
+    Custom {
+        name: InternedString,
+        args: Vec<Type>,
+    },
 }
 
 /// Variance for type parameters
@@ -816,12 +871,12 @@ pub struct Lifetime {
 
 impl Lifetime {
     pub fn named(name: InternedString) -> Self {
-        Self { 
+        Self {
             name,
             bounds: Vec::new(),
         }
     }
-    
+
     pub fn with_bounds(name: InternedString, bounds: Vec<LifetimeBound>) -> Self {
         Self { name, bounds }
     }
@@ -869,17 +924,17 @@ pub struct TypeRegistry {
     types: HashMap<TypeId, TypeDefinition>,
     name_to_id: HashMap<InternedString, TypeId>,
     aliases: HashMap<InternedString, Type>,
-    
+
     // Trait system
     traits: HashMap<TypeId, TraitDef>,
     trait_name_to_id: HashMap<InternedString, TypeId>,
     implementations: HashMap<TypeId, Vec<ImplDef>>, // trait_id -> implementations
-    impl_cache: HashMap<(TypeId, Type), ImplDef>, // (trait_id, for_type) -> impl for fast lookup
-    trait_hierarchy: HashMap<TypeId, Vec<TypeId>>, // trait -> super traits
-    
+    impl_cache: HashMap<(TypeId, Type), ImplDef>,   // (trait_id, for_type) -> impl for fast lookup
+    trait_hierarchy: HashMap<TypeId, Vec<TypeId>>,  // trait -> super traits
+
     // Coherence and constraints
     coherence_graph: HashMap<(TypeId, TypeId), Vec<TypeConstraint>>, // (type, trait) -> constraints
-    type_implementations: HashMap<TypeId, HashSet<TypeId>>, // type -> implemented traits
+    type_implementations: HashMap<TypeId, HashSet<TypeId>>,          // type -> implemented traits
 }
 
 impl TypeRegistry {
@@ -897,7 +952,7 @@ impl TypeRegistry {
             type_implementations: HashMap::new(),
         }
     }
-    
+
     /// Register a new type definition
     pub fn register_type(&mut self, type_def: TypeDefinition) -> TypeId {
         let id = type_def.id;
@@ -905,13 +960,13 @@ impl TypeRegistry {
         self.types.insert(id, type_def);
         id
     }
-    
+
     /// Create and register a new atomic type (like int, bool, string)
     pub fn register_atomic_type(
         &mut self,
         name: InternedString,
         metadata: TypeMetadata,
-        span: Span
+        span: Span,
     ) -> TypeId {
         let id = TypeId::next();
         let type_def = TypeDefinition {
@@ -928,7 +983,7 @@ impl TypeRegistry {
         };
         self.register_type(type_def)
     }
-    
+
     /// Create and register a new struct type
     pub fn register_struct_type(
         &mut self,
@@ -938,7 +993,7 @@ impl TypeRegistry {
         methods: Vec<MethodSig>,
         constructors: Vec<ConstructorSig>,
         metadata: TypeMetadata,
-        span: Span
+        span: Span,
     ) -> TypeId {
         let id = TypeId::next();
         let type_def = TypeDefinition {
@@ -958,7 +1013,7 @@ impl TypeRegistry {
         };
         self.register_type(type_def)
     }
-    
+
     /// Create and register a new enum type
     pub fn register_enum_type(
         &mut self,
@@ -967,7 +1022,7 @@ impl TypeRegistry {
         variants: Vec<VariantDef>,
         methods: Vec<MethodSig>,
         metadata: TypeMetadata,
-        span: Span
+        span: Span,
     ) -> TypeId {
         let id = TypeId::next();
         let type_def = TypeDefinition {
@@ -996,9 +1051,11 @@ impl TypeRegistry {
     pub fn register_trait(&mut self, trait_def: TraitDef) -> TypeId {
         let id = trait_def.id;
         self.trait_name_to_id.insert(trait_def.name, id);
-        
+
         // Build trait hierarchy
-        let super_trait_ids: Vec<TypeId> = trait_def.super_traits.iter()
+        let super_trait_ids: Vec<TypeId> = trait_def
+            .super_traits
+            .iter()
             .filter_map(|super_trait| {
                 if let Type::Named { id, .. } = super_trait {
                     Some(*id)
@@ -1008,25 +1065,30 @@ impl TypeRegistry {
             })
             .collect();
         self.trait_hierarchy.insert(id, super_trait_ids);
-        
+
         self.traits.insert(id, trait_def);
         id
     }
-    
+
     /// Register a trait implementation
     pub fn register_implementation(&mut self, impl_def: ImplDef) {
         let trait_id = impl_def.trait_id;
         let for_type = impl_def.for_type.clone();
 
         // Add to implementations list
-        self.implementations.entry(trait_id).or_insert_with(Vec::new).push(impl_def.clone());
+        self.implementations
+            .entry(trait_id)
+            .or_insert_with(Vec::new)
+            .push(impl_def.clone());
 
         // Add to cache for fast lookup
-        self.impl_cache.insert((trait_id, for_type.clone()), impl_def);
+        self.impl_cache
+            .insert((trait_id, for_type.clone()), impl_def);
 
         // Update type implementations tracking
         if let Type::Named { id: type_id, .. } = &for_type {
-            self.type_implementations.entry(*type_id)
+            self.type_implementations
+                .entry(*type_id)
                 .or_insert_with(HashSet::new)
                 .insert(trait_id);
         }
@@ -1053,14 +1115,19 @@ impl TypeRegistry {
 
         // Merge trait implementations
         for (trait_id, impls) in &other.implementations {
-            let impl_list = self.implementations.entry(*trait_id).or_insert_with(Vec::new);
+            let impl_list = self
+                .implementations
+                .entry(*trait_id)
+                .or_insert_with(Vec::new);
             for impl_def in impls {
                 impl_list.push(impl_def.clone());
-                self.impl_cache.insert((*trait_id, impl_def.for_type.clone()), impl_def.clone());
+                self.impl_cache
+                    .insert((*trait_id, impl_def.for_type.clone()), impl_def.clone());
 
                 // Update type implementations tracking
                 if let Type::Named { id: type_id, .. } = &impl_def.for_type {
-                    self.type_implementations.entry(*type_id)
+                    self.type_implementations
+                        .entry(*type_id)
                         .or_insert_with(HashSet::new)
                         .insert(*trait_id);
                 }
@@ -1069,7 +1136,10 @@ impl TypeRegistry {
 
         // Merge trait hierarchy
         for (trait_id, super_traits) in &other.trait_hierarchy {
-            let hierarchy = self.trait_hierarchy.entry(*trait_id).or_insert_with(Vec::new);
+            let hierarchy = self
+                .trait_hierarchy
+                .entry(*trait_id)
+                .or_insert_with(Vec::new);
             for super_trait in super_traits {
                 if !hierarchy.contains(super_trait) {
                     hierarchy.push(*super_trait);
@@ -1079,7 +1149,10 @@ impl TypeRegistry {
 
         // Merge coherence graph
         for ((type_id, trait_id), constraints) in &other.coherence_graph {
-            let constraint_list = self.coherence_graph.entry((*type_id, *trait_id)).or_insert_with(Vec::new);
+            let constraint_list = self
+                .coherence_graph
+                .entry((*type_id, *trait_id))
+                .or_insert_with(Vec::new);
             for constraint in constraints {
                 constraint_list.push(constraint.clone());
             }
@@ -1090,22 +1163,24 @@ impl TypeRegistry {
     pub fn get_type_by_name(&self, name: InternedString) -> Option<&TypeDefinition> {
         self.name_to_id.get(&name).and_then(|id| self.types.get(id))
     }
-    
+
     /// Look up a type by ID
     pub fn get_type_by_id(&self, id: TypeId) -> Option<&TypeDefinition> {
         self.types.get(&id)
     }
-    
+
     /// Resolve a type alias
     pub fn resolve_alias(&self, name: InternedString) -> Option<&Type> {
         self.aliases.get(&name)
     }
-    
+
     /// Look up a trait by name
     pub fn get_trait_by_name(&self, name: InternedString) -> Option<&TraitDef> {
-        self.trait_name_to_id.get(&name).and_then(|id| self.traits.get(id))
+        self.trait_name_to_id
+            .get(&name)
+            .and_then(|id| self.traits.get(id))
     }
-    
+
     /// Look up a trait by ID
     pub fn get_trait_by_id(&self, id: TypeId) -> Option<&TraitDef> {
         self.traits.get(&id)
@@ -1122,7 +1197,7 @@ impl TypeRegistry {
         if self.impl_cache.contains_key(&(trait_id, for_type.clone())) {
             return true;
         }
-        
+
         // Check super-traits recursively
         if let Some(super_traits) = self.trait_hierarchy.get(&trait_id) {
             for super_trait_id in super_traits {
@@ -1131,36 +1206,36 @@ impl TypeRegistry {
                 }
             }
         }
-        
+
         false
     }
-    
+
     /// Get all traits/interfaces implemented by a type
     pub fn get_implementations(&self, for_type: &Type) -> Vec<TypeId> {
         let mut implemented_traits = HashSet::new();
-        
+
         // Find direct implementations
         for (trait_id, impls) in &self.implementations {
             for impl_def in impls {
                 if impl_def.for_type == *for_type {
                     implemented_traits.insert(*trait_id);
-                    
+
                     // Add super-traits recursively
                     self.collect_super_traits(*trait_id, &mut implemented_traits);
                 }
             }
         }
-        
+
         implemented_traits.into_iter().collect()
     }
-    
+
     /// Get super-traits of a trait recursively
     pub fn get_super_traits(&self, trait_id: TypeId) -> Vec<TypeId> {
         let mut super_traits = HashSet::new();
         self.collect_super_traits(trait_id, &mut super_traits);
         super_traits.into_iter().collect()
     }
-    
+
     /// Helper method to recursively collect super-traits
     fn collect_super_traits(&self, trait_id: TypeId, collected: &mut HashSet<TypeId>) {
         if let Some(super_traits) = self.trait_hierarchy.get(&trait_id) {
@@ -1171,12 +1246,12 @@ impl TypeRegistry {
             }
         }
     }
-    
+
     /// Get all registered types
     pub fn get_all_types(&self) -> impl Iterator<Item = &TypeDefinition> {
         self.types.values()
     }
-    
+
     /// Get the implementation of a trait for a specific type
     pub fn get_implementation(&self, for_type: &Type, trait_id: TypeId) -> Option<&ImplDef> {
         self.impl_cache.get(&(trait_id, for_type.clone()))
@@ -1197,26 +1272,26 @@ impl TypeRegistry {
 
     /// Create a Type::Named instance for a given type
     pub fn make_type(&self, type_id: TypeId, type_args: Vec<Type>) -> Type {
-        Type::Named { 
-            id: type_id, 
+        Type::Named {
+            id: type_id,
             type_args,
             const_args: Vec::new(),
             variance: Vec::new(),
             nullability: NullabilityKind::default(),
         }
     }
-    
+
     /// Create a Type::Named instance for a given type name
     pub fn make_type_by_name(&self, name: InternedString, type_args: Vec<Type>) -> Option<Type> {
-        self.name_to_id.get(&name).map(|&id| Type::Named { 
-            id, 
+        self.name_to_id.get(&name).map(|&id| Type::Named {
+            id,
             type_args,
             const_args: Vec::new(),
             variance: Vec::new(),
             nullability: NullabilityKind::default(),
         })
     }
-    
+
     /// Create a Type::Named instance with full universal features
     pub fn make_universal_type(
         &self,
@@ -1243,7 +1318,7 @@ impl TypeRegistry {
     pub fn register_result_type(
         &mut self,
         arena: &mut crate::arena::AstArena,
-        span: Span
+        span: Span,
     ) -> TypeId {
         let result_name = arena.intern_string("Result");
         let t_param_name = arena.intern_string("T");
@@ -1303,7 +1378,7 @@ impl TypeRegistry {
     pub fn register_option_type(
         &mut self,
         arena: &mut crate::arena::AstArena,
-        span: Span
+        span: Span,
     ) -> TypeId {
         let option_name = arena.intern_string("Option");
         let t_param_name = arena.intern_string("T");
@@ -1311,15 +1386,13 @@ impl TypeRegistry {
         let none_variant_name = arena.intern_string("None");
 
         // Define type parameter: T
-        let type_params = vec![
-            TypeParam {
-                name: t_param_name,
-                bounds: vec![],
-                variance: Variance::Covariant,
-                default: None,
-                span,
-            },
-        ];
+        let type_params = vec![TypeParam {
+            name: t_param_name,
+            bounds: vec![],
+            variance: Variance::Covariant,
+            default: None,
+            span,
+        }];
 
         // Define variants: Some(T) and None
         let variants = vec![
@@ -1363,7 +1436,7 @@ impl Type {
             _ => false,
         }
     }
-    
+
     /// Make this type nullable
     pub fn make_nullable(self) -> Self {
         if self.is_nullable() {
@@ -1372,7 +1445,7 @@ impl Type {
             Type::Nullable(Box::new(self))
         }
     }
-    
+
     /// Make this type non-null
     pub fn make_non_null(self) -> Self {
         match self {
@@ -1380,7 +1453,7 @@ impl Type {
             _ => Type::NonNull(Box::new(self)),
         }
     }
-    
+
     /// Get the underlying type, stripping nullability wrappers
     pub fn underlying_type(&self) -> &Self {
         match self {
@@ -1388,7 +1461,7 @@ impl Type {
             _ => self,
         }
     }
-    
+
     /// Check if this type supports const generics
     pub fn supports_const_generics(&self) -> bool {
         match self {
@@ -1398,7 +1471,7 @@ impl Type {
             _ => false,
         }
     }
-    
+
     /// Check if this type is async
     pub fn is_async(&self) -> bool {
         match self {
@@ -1406,7 +1479,7 @@ impl Type {
             _ => false,
         }
     }
-    
+
     /// Check if this is a structural type
     pub fn is_structural(&self) -> bool {
         match self {
@@ -1415,7 +1488,7 @@ impl Type {
             _ => false,
         }
     }
-    
+
     /// Check if this is a gradual typing type (dynamic/unknown)
     pub fn is_gradual(&self) -> bool {
         matches!(self, Type::Any | Type::Dynamic | Type::Unknown)
@@ -1462,7 +1535,10 @@ impl TypeRegistry {
     /// This creates the standard operator traits that the compiler uses
     /// for operator overloading. When seeing `a + b`, the compiler looks
     /// for `Add` trait impl on the type of `a`.
-    pub fn register_builtin_traits(&mut self, arena: &mut crate::arena::AstArena) -> BuiltinTraitIds {
+    pub fn register_builtin_traits(
+        &mut self,
+        arena: &mut crate::arena::AstArena,
+    ) -> BuiltinTraitIds {
         let span = Span::default();
 
         // Create common type names
@@ -1477,39 +1553,31 @@ impl TypeRegistry {
         // --- Arithmetic Operators ---
 
         // Add<Rhs> trait - enables a + b
-        let add_id = self.register_operator_trait(
-            arena, "Add", rhs_name, output_name, "add", &span
-        );
+        let add_id =
+            self.register_operator_trait(arena, "Add", rhs_name, output_name, "add", &span);
 
         // Sub<Rhs> trait - enables a - b
-        let sub_id = self.register_operator_trait(
-            arena, "Sub", rhs_name, output_name, "sub", &span
-        );
+        let sub_id =
+            self.register_operator_trait(arena, "Sub", rhs_name, output_name, "sub", &span);
 
         // Mul<Rhs> trait - enables a * b
-        let mul_id = self.register_operator_trait(
-            arena, "Mul", rhs_name, output_name, "mul", &span
-        );
+        let mul_id =
+            self.register_operator_trait(arena, "Mul", rhs_name, output_name, "mul", &span);
 
         // Div<Rhs> trait - enables a / b
-        let div_id = self.register_operator_trait(
-            arena, "Div", rhs_name, output_name, "div", &span
-        );
+        let div_id =
+            self.register_operator_trait(arena, "Div", rhs_name, output_name, "div", &span);
 
         // Mod<Rhs> trait - enables a % b
-        let modulo_id = self.register_operator_trait(
-            arena, "Mod", rhs_name, output_name, "mod", &span
-        );
+        let modulo_id =
+            self.register_operator_trait(arena, "Mod", rhs_name, output_name, "mod", &span);
 
         // MatMul<Rhs> trait - enables a @ b (matrix multiplication)
-        let matmul_id = self.register_operator_trait(
-            arena, "MatMul", rhs_name, output_name, "matmul", &span
-        );
+        let matmul_id =
+            self.register_operator_trait(arena, "MatMul", rhs_name, output_name, "matmul", &span);
 
         // Neg trait - enables -a (unary negation)
-        let neg_id = self.register_unary_operator_trait(
-            arena, "Neg", output_name, "neg", &span
-        );
+        let neg_id = self.register_unary_operator_trait(arena, "Neg", output_name, "neg", &span);
 
         // --- Comparison Operators ---
 
@@ -1539,8 +1607,20 @@ impl TypeRegistry {
                         name: eq_method,
                         type_params: vec![],
                         params: vec![
-                            ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                            ParamDef { name: rhs_name, ty: rhs_type.clone(), is_self: false, is_varargs: false, is_mut: false },
+                            ParamDef {
+                                name: self_name,
+                                ty: self_type.clone(),
+                                is_self: true,
+                                is_varargs: false,
+                                is_mut: false,
+                            },
+                            ParamDef {
+                                name: rhs_name,
+                                ty: rhs_type.clone(),
+                                is_self: false,
+                                is_varargs: false,
+                                is_mut: false,
+                            },
                         ],
                         return_type: bool_type.clone(),
                         where_clause: vec![],
@@ -1554,8 +1634,20 @@ impl TypeRegistry {
                         name: ne_method,
                         type_params: vec![],
                         params: vec![
-                            ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                            ParamDef { name: rhs_name, ty: rhs_type, is_self: false, is_varargs: false, is_mut: false },
+                            ParamDef {
+                                name: self_name,
+                                ty: self_type.clone(),
+                                is_self: true,
+                                is_varargs: false,
+                                is_mut: false,
+                            },
+                            ParamDef {
+                                name: rhs_name,
+                                ty: rhs_type,
+                                is_self: false,
+                                is_varargs: false,
+                                is_mut: false,
+                            },
                         ],
                         return_type: bool_type,
                         where_clause: vec![],
@@ -1589,8 +1681,20 @@ impl TypeRegistry {
                 name,
                 type_params: vec![],
                 params: vec![
-                    ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                    ParamDef { name: rhs_name, ty: rhs_type.clone(), is_self: false, is_varargs: false, is_mut: false },
+                    ParamDef {
+                        name: self_name,
+                        ty: self_type.clone(),
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: false,
+                    },
+                    ParamDef {
+                        name: rhs_name,
+                        ty: rhs_type.clone(),
+                        is_self: false,
+                        is_varargs: false,
+                        is_mut: false,
+                    },
                 ],
                 return_type: bool_type.clone(),
                 where_clause: vec![],
@@ -1628,24 +1732,19 @@ impl TypeRegistry {
         // --- Bitwise Operators ---
 
         // BitAnd<Rhs> trait - enables a & b
-        let bit_and_id = self.register_operator_trait(
-            arena, "BitAnd", rhs_name, output_name, "bitand", &span
-        );
+        let bit_and_id =
+            self.register_operator_trait(arena, "BitAnd", rhs_name, output_name, "bitand", &span);
 
         // BitOr<Rhs> trait - enables a | b
-        let bit_or_id = self.register_operator_trait(
-            arena, "BitOr", rhs_name, output_name, "bitor", &span
-        );
+        let bit_or_id =
+            self.register_operator_trait(arena, "BitOr", rhs_name, output_name, "bitor", &span);
 
         // BitXor<Rhs> trait - enables a ^ b
-        let bit_xor_id = self.register_operator_trait(
-            arena, "BitXor", rhs_name, output_name, "bitxor", &span
-        );
+        let bit_xor_id =
+            self.register_operator_trait(arena, "BitXor", rhs_name, output_name, "bitxor", &span);
 
         // Not trait - enables !a (logical/bitwise not)
-        let not_id = self.register_unary_operator_trait(
-            arena, "Not", output_name, "not", &span
-        );
+        let not_id = self.register_unary_operator_trait(arena, "Not", output_name, "not", &span);
 
         // --- Indexing Operators ---
 
@@ -1674,8 +1773,20 @@ impl TypeRegistry {
                     name: index_method,
                     type_params: vec![],
                     params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                        ParamDef { name: idx_name, ty: idx_type, is_self: false, is_varargs: false, is_mut: false },
+                        ParamDef {
+                            name: self_name,
+                            ty: self_type.clone(),
+                            is_self: true,
+                            is_varargs: false,
+                            is_mut: false,
+                        },
+                        ParamDef {
+                            name: idx_name,
+                            ty: idx_type,
+                            is_self: false,
+                            is_varargs: false,
+                            is_mut: false,
+                        },
                     ],
                     return_type: output_type,
                     where_clause: vec![],
@@ -1721,8 +1832,20 @@ impl TypeRegistry {
                     name: index_mut_method,
                     type_params: vec![],
                     params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: true },
-                        ParamDef { name: idx_name, ty: idx_type, is_self: false, is_varargs: false, is_mut: false },
+                        ParamDef {
+                            name: self_name,
+                            ty: self_type.clone(),
+                            is_self: true,
+                            is_varargs: false,
+                            is_mut: true,
+                        },
+                        ParamDef {
+                            name: idx_name,
+                            ty: idx_type,
+                            is_self: false,
+                            is_varargs: false,
+                            is_mut: false,
+                        },
                     ],
                     return_type: Type::Reference {
                         ty: Box::new(output_type),
@@ -1764,9 +1887,13 @@ impl TypeRegistry {
                 methods: vec![MethodSig {
                     name: to_string_method,
                     type_params: vec![],
-                    params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                    ],
+                    params: vec![ParamDef {
+                        name: self_name,
+                        ty: self_type.clone(),
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: false,
+                    }],
                     return_type: Type::Primitive(PrimitiveType::String),
                     where_clause: vec![],
                     is_static: false,
@@ -1796,9 +1923,13 @@ impl TypeRegistry {
                 methods: vec![MethodSig {
                     name: debug_string_method,
                     type_params: vec![],
-                    params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                    ],
+                    params: vec![ParamDef {
+                        name: self_name,
+                        ty: self_type.clone(),
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: false,
+                    }],
                     return_type: Type::Primitive(PrimitiveType::String),
                     where_clause: vec![],
                     is_static: false,
@@ -1830,9 +1961,13 @@ impl TypeRegistry {
                 methods: vec![MethodSig {
                     name: clone_method,
                     type_params: vec![],
-                    params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: false },
-                    ],
+                    params: vec![ParamDef {
+                        name: self_name,
+                        ty: self_type.clone(),
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: false,
+                    }],
                     return_type: self_type.clone(),
                     where_clause: vec![],
                     is_static: false,
@@ -1862,9 +1997,13 @@ impl TypeRegistry {
                 methods: vec![MethodSig {
                     name: drop_method,
                     type_params: vec![],
-                    params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: true },
-                    ],
+                    params: vec![ParamDef {
+                        name: self_name,
+                        ty: self_type.clone(),
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: true,
+                    }],
                     return_type: Type::Primitive(PrimitiveType::Unit),
                     where_clause: vec![],
                     is_static: false,
@@ -1908,9 +2047,13 @@ impl TypeRegistry {
                 methods: vec![MethodSig {
                     name: next_method,
                     type_params: vec![],
-                    params: vec![
-                        ParamDef { name: self_name, ty: self_type.clone(), is_self: true, is_varargs: false, is_mut: true },
-                    ],
+                    params: vec![ParamDef {
+                        name: self_name,
+                        ty: self_type.clone(),
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: true,
+                    }],
                     return_type: option_type,
                     where_clause: vec![],
                     is_static: false,
@@ -1948,9 +2091,13 @@ impl TypeRegistry {
                 methods: vec![MethodSig {
                     name: into_iter_method,
                     type_params: vec![],
-                    params: vec![
-                        ParamDef { name: self_name, ty: self_type, is_self: true, is_varargs: false, is_mut: false },
-                    ],
+                    params: vec![ParamDef {
+                        name: self_name,
+                        ty: self_type,
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: false,
+                    }],
                     return_type: into_iter_type,
                     where_clause: vec![],
                     is_static: false,
@@ -2039,8 +2186,20 @@ impl TypeRegistry {
                 name: method_name,
                 type_params: vec![],
                 params: vec![
-                    ParamDef { name: self_name, ty: self_type, is_self: true, is_varargs: false, is_mut: false },
-                    ParamDef { name: rhs_param_name, ty: rhs_type, is_self: false, is_varargs: false, is_mut: false },
+                    ParamDef {
+                        name: self_name,
+                        ty: self_type,
+                        is_self: true,
+                        is_varargs: false,
+                        is_mut: false,
+                    },
+                    ParamDef {
+                        name: rhs_param_name,
+                        ty: rhs_type,
+                        is_self: false,
+                        is_varargs: false,
+                        is_mut: false,
+                    },
                 ],
                 return_type: output_type,
                 where_clause: vec![],
@@ -2087,9 +2246,13 @@ impl TypeRegistry {
             methods: vec![MethodSig {
                 name: method_name,
                 type_params: vec![],
-                params: vec![
-                    ParamDef { name: self_name, ty: self_type, is_self: true, is_varargs: false, is_mut: false },
-                ],
+                params: vec![ParamDef {
+                    name: self_name,
+                    ty: self_type,
+                    is_self: true,
+                    is_varargs: false,
+                    is_mut: false,
+                }],
                 return_type: output_type,
                 where_clause: vec![],
                 is_static: false,

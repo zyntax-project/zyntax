@@ -6,12 +6,12 @@
 //! - `combinator.rs`: Parser combinator functions
 //! - `interpreter.rs`: Runtime interpreter for GrammarIR
 
-pub mod state;
-pub mod memo;
 pub mod combinator;
 pub mod interpreter;
+pub mod memo;
+pub mod state;
 
-pub use state::*;
-pub use memo::*;
 pub use combinator::*;
 pub use interpreter::*;
+pub use memo::*;
+pub use state::*;

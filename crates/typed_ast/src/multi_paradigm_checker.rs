@@ -12,7 +12,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust
+//! ```rust,ignore
 //! // Default: Uses optimized TypeRegistry + type_inference
 //! let mut checker = TypeChecker::new();
 //!

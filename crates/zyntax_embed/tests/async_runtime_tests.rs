@@ -18,8 +18,8 @@
 
 use std::sync::Arc;
 use zyntax_embed::{
-    ZyntaxPromise, PromiseState, ZyntaxValue, AsyncPollResult, DynamicValue,
-    LanguageGrammar, ZyntaxRuntime,
+    AsyncPollResult, DynamicValue, LanguageGrammar, PromiseState, ZyntaxPromise, ZyntaxRuntime,
+    ZyntaxValue,
 };
 
 // ============================================================================
@@ -57,7 +57,7 @@ extern "C" fn create_immediate_state_machine(buffer: *mut u8) {
     unsafe {
         let sm = &mut *(buffer as *mut SimulatedStateMachineLayout);
         sm.state = 0;
-        sm.value = 1;  // Return 1 so it's distinguishable from Pending
+        sm.value = 1; // Return 1 so it's distinguishable from Pending
         sm.polls_to_complete = 0;
     }
 }
@@ -147,7 +147,7 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Initially pending
@@ -161,7 +161,7 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_immediate_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // First poll initializes, second should complete
@@ -191,24 +191,40 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // First poll initializes the state machine (no poll_fn call yet)
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 1 (init): {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 1 (init): {:?}",
+            state
+        );
 
         // Second poll advances state (state 0->1, value 10)
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 2: {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 2: {:?}",
+            state
+        );
 
         // Third poll advances state (state 1->2, value 20)
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 3: {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 3: {:?}",
+            state
+        );
 
         // Fourth poll advances state (state 2->3, value 30, still pending)
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 4: {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 4: {:?}",
+            state
+        );
 
         // Fifth poll should complete with accumulated value (30)
         let state = promise.poll();
@@ -223,7 +239,7 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         assert_eq!(promise.poll_count(), 0);
@@ -241,9 +257,9 @@ mod async_promise_tests {
     #[test]
     fn test_promise_poll_with_limit() {
         let promise = ZyntaxPromise::with_poll_fn(
-            create_long_state_machine as *const u8,  // Requires 5 polls
+            create_long_state_machine as *const u8, // Requires 5 polls
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Poll a few times
@@ -267,20 +283,32 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_failing_state_machine as *const u8,
             poll_failing_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // First poll initializes
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 1 (init): {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 1 (init): {:?}",
+            state
+        );
 
         // Second poll is still pending (current = 0)
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 2: {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 2: {:?}",
+            state
+        );
 
         // Third poll is still pending (current = 1)
         let state = promise.poll();
-        assert!(matches!(state, PromiseState::Pending), "Poll 3: {:?}", state);
+        assert!(
+            matches!(state, PromiseState::Pending),
+            "Poll 3: {:?}",
+            state
+        );
 
         // Fourth poll should fail (current = 2 >= 2)
         let state = promise.poll();
@@ -305,7 +333,7 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Block until complete
@@ -318,7 +346,7 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Should complete within timeout
@@ -334,7 +362,7 @@ mod async_promise_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_immediate_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Run to completion
@@ -368,7 +396,7 @@ mod async_chaining_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Chain: multiply result by 2
@@ -404,7 +432,7 @@ mod async_chaining_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_immediate_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Catch handler should not be called on success
@@ -434,7 +462,7 @@ mod async_chaining_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_failing_state_machine as *const u8,
             poll_failing_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Catch handler converts error to value
@@ -478,19 +506,19 @@ mod async_concurrent_tests {
         let promise1 = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         let promise2 = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         let promise3 = ZyntaxPromise::with_poll_fn(
             create_immediate_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Poll all promises
@@ -513,7 +541,7 @@ mod async_concurrent_tests {
         let promise = Arc::new(ZyntaxPromise::with_poll_fn(
             create_long_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         ));
 
         // Spawn multiple threads to poll the same promise
@@ -553,23 +581,17 @@ mod async_abi_tests {
     fn test_async_poll_result_layout() {
         // Pending should be discriminant 0
         let pending = AsyncPollResult::Pending;
-        let discriminant = unsafe {
-            *(&pending as *const AsyncPollResult as *const u8)
-        };
+        let discriminant = unsafe { *(&pending as *const AsyncPollResult as *const u8) };
         assert_eq!(discriminant, 0);
 
         // Ready should be discriminant 1
         let ready = AsyncPollResult::Ready(DynamicValue::from_i32(42));
-        let discriminant = unsafe {
-            *(&ready as *const AsyncPollResult as *const u8)
-        };
+        let discriminant = unsafe { *(&ready as *const AsyncPollResult as *const u8) };
         assert_eq!(discriminant, 1);
 
         // Failed should be discriminant 2
         let failed = AsyncPollResult::Failed(std::ptr::null(), 0);
-        let discriminant = unsafe {
-            *(&failed as *const AsyncPollResult as *const u8)
-        };
+        let discriminant = unsafe { *(&failed as *const AsyncPollResult as *const u8) };
         assert_eq!(discriminant, 2);
     }
 
@@ -615,11 +637,8 @@ mod async_error_tests {
 
     #[test]
     fn test_promise_with_null_init_fn() {
-        let promise = ZyntaxPromise::with_poll_fn(
-            std::ptr::null(),
-            poll_state_machine as *const u8,
-            vec![]
-        );
+        let promise =
+            ZyntaxPromise::with_poll_fn(std::ptr::null(), poll_state_machine as *const u8, vec![]);
 
         let state = promise.poll();
         match state {
@@ -682,7 +701,7 @@ mod async_args_tests {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine_with_args as *const u8,
             poll_state_machine_with_args as *const u8,
-            vec![]
+            vec![],
         );
 
         // Run to completion
@@ -980,11 +999,14 @@ fn sync_helper(x: i32) i32 {
         // Note: This may fail if the grammar's AST builder commands aren't fully wired
         // or if the compiler doesn't yet support this grammar's output format.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("async_test", r#"
+            runtime.load_module(
+                "async_test",
+                r#"
 fn simple_add(a: i32, b: i32) i32 {
     return a + b;
 }
-"#)
+"#,
+            )
         }));
 
         match result {
@@ -1012,11 +1034,14 @@ fn simple_add(a: i32, b: i32) i32 {
         // Try to compile an async function
         // Catch panics from Cranelift compilation
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("async_test", r#"
+            runtime.load_module(
+                "async_test",
+                r#"
 async fn async_compute(x: i32) i32 {
     return x * 2;
 }
-"#)
+"#,
+            )
         }));
 
         match result {
@@ -1079,7 +1104,7 @@ async fn compute_value(x: i32) i32 {
         let promise = ZyntaxPromise::with_poll_fn(
             create_state_machine as *const u8,
             poll_state_machine as *const u8,
-            vec![]
+            vec![],
         );
 
         // Step 4: Poll to completion
@@ -1089,7 +1114,10 @@ async fn compute_value(x: i32) i32 {
             polls += 1;
             match state {
                 PromiseState::Ready(value) => {
-                    println!("Async function completed with {:?} after {} polls", value, polls);
+                    println!(
+                        "Async function completed with {:?} after {} polls",
+                        value, polls
+                    );
                     break;
                 }
                 PromiseState::Failed(err) => {
@@ -1134,7 +1162,10 @@ async fn fetch_and_process(id: i32) i32 {
 
         match grammar.parse(source) {
             Ok(program) => {
-                println!("Parsed async-await-async pattern: {} declarations", program.declarations.len());
+                println!(
+                    "Parsed async-await-async pattern: {} declarations",
+                    program.declarations.len()
+                );
             }
             Err(e) => {
                 eprintln!("Parse failed: {}", e);
@@ -1197,10 +1228,11 @@ fn add(a: i32, b: i32) i32 {
                 // Try to call the function
                 if runtime.has_function("add") {
                     let sig = NativeSignature::parse("(i32, i32) -> i32").unwrap();
-                    let result = runtime.call_function("add", &[
-                        ZyntaxValue::Int(10),
-                        ZyntaxValue::Int(32),
-                    ], &sig);
+                    let result = runtime.call_function(
+                        "add",
+                        &[ZyntaxValue::Int(10), ZyntaxValue::Int(32)],
+                        &sig,
+                    );
 
                     match result {
                         Ok(value) => {
@@ -1212,7 +1244,10 @@ fn add(a: i32, b: i32) i32 {
                         }
                     }
                 } else {
-                    eprintln!("Function 'add' not found. Available: {:?}", runtime.functions());
+                    eprintln!(
+                        "Function 'add' not found. Available: {:?}",
+                        runtime.functions()
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -1253,8 +1288,8 @@ async fn get_value() i32 {
                 // Async functions should generate:
                 // - get_value_new (constructor)
                 // - async_wrapper (poll function)
-                let has_constructor = runtime.has_function("get_value_new") ||
-                                      functions.iter().any(|f| f.contains("_new"));
+                let has_constructor = runtime.has_function("get_value_new")
+                    || functions.iter().any(|f| f.contains("_new"));
                 let has_wrapper = runtime.has_function("async_wrapper");
 
                 println!("Has constructor (_new): {}", has_constructor);
@@ -1308,10 +1343,22 @@ async fn compute(x: i32) i32 {
                 // Verify async functions with new Promise-based ABI:
                 // - `double` and `compute` are entry functions returning Promise<T>
                 // - `__double_poll` and `__compute_poll` are internal poll functions
-                assert!(functions.contains(&"double".to_string()), "double (entry function) should be generated");
-                assert!(functions.contains(&"__double_poll".to_string()), "__double_poll (internal poll) should be generated");
-                assert!(functions.contains(&"compute".to_string()), "compute (entry function) should be generated");
-                assert!(functions.contains(&"__compute_poll".to_string()), "__compute_poll (internal poll) should be generated");
+                assert!(
+                    functions.contains(&"double".to_string()),
+                    "double (entry function) should be generated"
+                );
+                assert!(
+                    functions.contains(&"__double_poll".to_string()),
+                    "__double_poll (internal poll) should be generated"
+                );
+                assert!(
+                    functions.contains(&"compute".to_string()),
+                    "compute (entry function) should be generated"
+                );
+                assert!(
+                    functions.contains(&"__compute_poll".to_string()),
+                    "__compute_poll (internal poll) should be generated"
+                );
 
                 // Now actually EXECUTE the async function via call_async
                 // This tests the full async state machine execution path
@@ -1329,7 +1376,10 @@ async fn compute(x: i32) i32 {
                             PromiseState::Ready(ZyntaxValue::Int(result)) => {
                                 // double(21) should return 42
                                 assert_eq!(result, 42, "double(21) should return 42");
-                                println!("SUCCESS: Async execution of double(21) returned {}", result);
+                                println!(
+                                    "SUCCESS: Async execution of double(21) returned {}",
+                                    result
+                                );
                             }
                             PromiseState::Failed(msg) => {
                                 panic!("Async execution failed: {}", msg);
@@ -1387,8 +1437,14 @@ async fn sum_to_ten() i32 {
                 // With the new Promise-based async ABI:
                 // - `sum_to_ten` is the entry function that returns Promise<i32>
                 // - `__sum_to_ten_poll` is the internal poll function
-                assert!(functions.contains(&"sum_to_ten".to_string()), "sum_to_ten (entry function) should be generated");
-                assert!(functions.contains(&"__sum_to_ten_poll".to_string()), "__sum_to_ten_poll (internal poll) should be generated");
+                assert!(
+                    functions.contains(&"sum_to_ten".to_string()),
+                    "sum_to_ten (entry function) should be generated"
+                );
+                assert!(
+                    functions.contains(&"__sum_to_ten_poll".to_string()),
+                    "__sum_to_ten_poll (internal poll) should be generated"
+                );
                 println!("Async function compilation successful!");
             }
             Ok(Err(e)) => {
@@ -1431,8 +1487,14 @@ async fn sum_range(n: i32) i32 {
         match result {
             Ok(Ok(functions)) => {
                 println!("Compiled async sum_range function: {:?}", functions);
-                assert!(functions.contains(&"sum_range".to_string()), "sum_range (entry function) should be generated");
-                assert!(functions.contains(&"__sum_range_poll".to_string()), "__sum_range_poll (internal poll) should be generated");
+                assert!(
+                    functions.contains(&"sum_range".to_string()),
+                    "sum_range (entry function) should be generated"
+                );
+                assert!(
+                    functions.contains(&"__sum_range_poll".to_string()),
+                    "__sum_range_poll (internal poll) should be generated"
+                );
 
                 // Execute: sum_range(100) should return 1+2+3+...+100 = 5050
                 let promise = runtime.call_async("sum_range", &[ZyntaxValue::Int(100)]);
@@ -1511,11 +1573,26 @@ async fn sum_doubled(n: i32) i32 {
 
         match result {
             Ok(Ok(functions)) => {
-                println!("Compiled async functions with await in loop: {:?}", functions);
-                assert!(functions.contains(&"double".to_string()), "double should be generated");
-                assert!(functions.contains(&"sum_doubled".to_string()), "sum_doubled should be generated");
-                assert!(functions.contains(&"__double_poll".to_string()), "__double_poll should be generated");
-                assert!(functions.contains(&"__sum_doubled_poll".to_string()), "__sum_doubled_poll should be generated");
+                println!(
+                    "Compiled async functions with await in loop: {:?}",
+                    functions
+                );
+                assert!(
+                    functions.contains(&"double".to_string()),
+                    "double should be generated"
+                );
+                assert!(
+                    functions.contains(&"sum_doubled".to_string()),
+                    "sum_doubled should be generated"
+                );
+                assert!(
+                    functions.contains(&"__double_poll".to_string()),
+                    "__double_poll should be generated"
+                );
+                assert!(
+                    functions.contains(&"__sum_doubled_poll".to_string()),
+                    "__sum_doubled_poll should be generated"
+                );
 
                 // Execute: sum_doubled(5) should compute:
                 // double(1) + double(2) + double(3) + double(4) + double(5)
@@ -1535,7 +1612,10 @@ async fn sum_doubled(n: i32) i32 {
                             PromiseState::Ready(ZyntaxValue::Int(result)) => {
                                 // sum of doubled values 1..5 = 2+4+6+8+10 = 30
                                 assert_eq!(result, 30, "sum_doubled(5) should return 30");
-                                println!("SUCCESS: sum_doubled(5) = {} (after {} polls)", result, polls);
+                                println!(
+                                    "SUCCESS: sum_doubled(5) = {} (after {} polls)",
+                                    result, polls
+                                );
                             }
                             PromiseState::Failed(msg) => {
                                 panic!("Async execution failed: {}", msg);
@@ -1674,16 +1754,17 @@ async fn count_up(n: i32) i32 {
         match result {
             Ok(Ok(functions)) => {
                 println!("Compiled async count_up function: {:?}", functions);
-                assert!(functions.contains(&"count_up".to_string()), "count_up (entry function) should be generated");
-                assert!(functions.contains(&"__count_up_poll".to_string()), "__count_up_poll (internal poll) should be generated");
+                assert!(
+                    functions.contains(&"count_up".to_string()),
+                    "count_up (entry function) should be generated"
+                );
+                assert!(
+                    functions.contains(&"__count_up_poll".to_string()),
+                    "__count_up_poll (internal poll) should be generated"
+                );
 
                 // Test count_up: count_up(n) returns n
-                let test_cases = vec![
-                    (1, 1),
-                    (5, 5),
-                    (10, 10),
-                    (20, 20),
-                ];
+                let test_cases = vec![(1, 1), (5, 5), (10, 10), (20, 20)];
 
                 for (input, expected) in test_cases {
                     let promise = runtime.call_async("count_up", &[ZyntaxValue::Int(input)]);
@@ -1697,8 +1778,15 @@ async fn count_up(n: i32) i32 {
 
                             match promise.state() {
                                 PromiseState::Ready(ZyntaxValue::Int(result)) => {
-                                    assert_eq!(result, expected, "count_up({}) should return {}, got {}", input, expected, result);
-                                    println!("SUCCESS: count_up({}) = {} (after {} polls)", input, result, polls);
+                                    assert_eq!(
+                                        result, expected,
+                                        "count_up({}) should return {}, got {}",
+                                        input, expected, result
+                                    );
+                                    println!(
+                                        "SUCCESS: count_up({}) = {} (after {} polls)",
+                                        input, result, polls
+                                    );
                                 }
                                 PromiseState::Failed(msg) => {
                                     panic!("count_up({}) failed: {}", input, msg);
@@ -1753,16 +1841,22 @@ async fn sum_with_multiplier(start: i32, end: i32, multiplier: i32) i32 {
 
         match result {
             Ok(Ok(functions)) => {
-                println!("Compiled async sum_with_multiplier function: {:?}", functions);
+                println!(
+                    "Compiled async sum_with_multiplier function: {:?}",
+                    functions
+                );
                 assert!(functions.contains(&"sum_with_multiplier".to_string()));
                 assert!(functions.contains(&"__sum_with_multiplier_poll".to_string()));
 
                 // sum_with_multiplier(1, 5, 2) = (1*2) + (2*2) + (3*2) + (4*2) + (5*2) = 2+4+6+8+10 = 30
-                let promise = runtime.call_async("sum_with_multiplier", &[
-                    ZyntaxValue::Int(1),
-                    ZyntaxValue::Int(5),
-                    ZyntaxValue::Int(2),
-                ]);
+                let promise = runtime.call_async(
+                    "sum_with_multiplier",
+                    &[
+                        ZyntaxValue::Int(1),
+                        ZyntaxValue::Int(5),
+                        ZyntaxValue::Int(2),
+                    ],
+                );
 
                 match promise {
                     Ok(promise) => {
@@ -1774,8 +1868,14 @@ async fn sum_with_multiplier(start: i32, end: i32, multiplier: i32) i32 {
 
                         match promise.state() {
                             PromiseState::Ready(ZyntaxValue::Int(result)) => {
-                                assert_eq!(result, 30, "sum_with_multiplier(1, 5, 2) should return 30");
-                                println!("SUCCESS: sum_with_multiplier(1, 5, 2) = {} (after {} polls)", result, polls);
+                                assert_eq!(
+                                    result, 30,
+                                    "sum_with_multiplier(1, 5, 2) should return 30"
+                                );
+                                println!(
+                                    "SUCCESS: sum_with_multiplier(1, 5, 2) = {} (after {} polls)",
+                                    result, polls
+                                );
                             }
                             PromiseState::Failed(msg) => {
                                 panic!("Async execution failed: {}", msg);
@@ -1845,11 +1945,26 @@ async fn add_to_sum(n: i32) i32 {
 
         match result {
             Ok(Ok(functions)) => {
-                println!("Compiled async long-running process functions: {:?}", functions);
-                assert!(functions.contains(&"long_sum".to_string()), "long_sum should be generated");
-                assert!(functions.contains(&"add_to_sum".to_string()), "add_to_sum should be generated");
-                assert!(functions.contains(&"__long_sum_poll".to_string()), "__long_sum_poll should be generated");
-                assert!(functions.contains(&"__add_to_sum_poll".to_string()), "__add_to_sum_poll should be generated");
+                println!(
+                    "Compiled async long-running process functions: {:?}",
+                    functions
+                );
+                assert!(
+                    functions.contains(&"long_sum".to_string()),
+                    "long_sum should be generated"
+                );
+                assert!(
+                    functions.contains(&"add_to_sum".to_string()),
+                    "add_to_sum should be generated"
+                );
+                assert!(
+                    functions.contains(&"__long_sum_poll".to_string()),
+                    "__long_sum_poll should be generated"
+                );
+                assert!(
+                    functions.contains(&"__add_to_sum_poll".to_string()),
+                    "__add_to_sum_poll should be generated"
+                );
 
                 // Test 1: long_sum(100) = 1+2+...+100 = 5050
                 println!("\n=== Test 1: long_sum(100) ===");
@@ -1865,7 +1980,10 @@ async fn add_to_sum(n: i32) i32 {
                         match promise.state() {
                             PromiseState::Ready(ZyntaxValue::Int(result)) => {
                                 assert_eq!(result, 5050, "long_sum(100) should return 5050");
-                                println!("SUCCESS: long_sum(100) = {} (after {} polls)", result, polls);
+                                println!(
+                                    "SUCCESS: long_sum(100) = {} (after {} polls)",
+                                    result, polls
+                                );
                             }
                             PromiseState::Failed(msg) => {
                                 panic!("long_sum(100) failed: {}", msg);
@@ -1897,7 +2015,10 @@ async fn add_to_sum(n: i32) i32 {
                             PromiseState::Ready(ZyntaxValue::Int(result)) => {
                                 // sum(1..50) = 50*51/2 = 1275, so 1275 + 100 = 1375
                                 assert_eq!(result, 1375, "add_to_sum(50) should return 1375");
-                                println!("SUCCESS: add_to_sum(50) = {} (after {} polls)", result, polls);
+                                println!(
+                                    "SUCCESS: add_to_sum(50) = {} (after {} polls)",
+                                    result, polls
+                                );
                             }
                             PromiseState::Failed(msg) => {
                                 panic!("add_to_sum(50) failed: {}", msg);
@@ -1929,7 +2050,10 @@ async fn add_to_sum(n: i32) i32 {
                             PromiseState::Ready(ZyntaxValue::Int(result)) => {
                                 // sum(1..10) = 55, so 55 + 100 = 155
                                 assert_eq!(result, 155, "add_to_sum(10) should return 155");
-                                println!("SUCCESS: add_to_sum(10) = {} (after {} polls)", result, polls);
+                                println!(
+                                    "SUCCESS: add_to_sum(10) = {} (after {} polls)",
+                                    result, polls
+                                );
                             }
                             PromiseState::Failed(msg) => {
                                 panic!("add_to_sum(10) failed: {}", msg);
@@ -1965,8 +2089,8 @@ async fn add_to_sum(n: i32) i32 {
 mod promise_combinator_tests {
     use super::*;
     use zyntax_embed::{
-        PromiseAll, PromiseAllState, PromiseRace, PromiseRaceState,
-        PromiseAllSettled, SettledResult,
+        PromiseAll, PromiseAllSettled, PromiseAllState, PromiseRace, PromiseRaceState,
+        SettledResult,
     };
 
     fn setup_async_runtime() -> Option<ZyntaxRuntime> {
@@ -1977,14 +2101,18 @@ mod promise_combinator_tests {
             "../zyn_peg/grammars/zig.zyn",
         ];
 
-        let grammar_path = grammar_paths.iter()
+        let grammar_path = grammar_paths
+            .iter()
             .map(std::path::Path::new)
             .find(|p| p.exists());
 
         let grammar_path = match grammar_path {
             Some(p) => p,
             None => {
-                eprintln!("Grammar not found at any of: {:?}, skipping test", grammar_paths);
+                eprintln!(
+                    "Grammar not found at any of: {:?}, skipping test",
+                    grammar_paths
+                );
                 return None;
             }
         };
@@ -2032,7 +2160,11 @@ async fn compute(x: i32) i32 {
             Ok(Ok(_functions)) => {
                 // Create multiple promises for the same function with different args
                 let promises: Vec<ZyntaxPromise> = (1..=5)
-                    .map(|i| runtime.call_async("compute", &[ZyntaxValue::Int(i)]).unwrap())
+                    .map(|i| {
+                        runtime
+                            .call_async("compute", &[ZyntaxValue::Int(i)])
+                            .unwrap()
+                    })
                     .collect();
 
                 println!("Created {} promises", promises.len());
@@ -2041,8 +2173,11 @@ async fn compute(x: i32) i32 {
                 let mut all = PromiseAll::new(promises);
                 let results = all.await_all().expect("PromiseAll should succeed");
 
-                println!("PromiseAll completed with {} results after {} polls",
-                    results.len(), all.poll_count());
+                println!(
+                    "PromiseAll completed with {} results after {} polls",
+                    results.len(),
+                    all.poll_count()
+                );
 
                 // Verify results: compute(i) = i * 2
                 assert_eq!(results.len(), 5);
@@ -2103,9 +2238,15 @@ async fn sum_range(n: i32) i32 {
             Ok(Ok(_functions)) => {
                 // Create promises for different functions
                 let promises = vec![
-                    runtime.call_async("add_ten", &[ZyntaxValue::Int(5)]).unwrap(),      // 15
-                    runtime.call_async("multiply_two", &[ZyntaxValue::Int(7)]).unwrap(), // 14
-                    runtime.call_async("sum_range", &[ZyntaxValue::Int(10)]).unwrap(),   // 55
+                    runtime
+                        .call_async("add_ten", &[ZyntaxValue::Int(5)])
+                        .unwrap(), // 15
+                    runtime
+                        .call_async("multiply_two", &[ZyntaxValue::Int(7)])
+                        .unwrap(), // 14
+                    runtime
+                        .call_async("sum_range", &[ZyntaxValue::Int(10)])
+                        .unwrap(), // 55
                 ];
 
                 let mut all = PromiseAll::new(promises);
@@ -2158,21 +2299,34 @@ async fn sum_range(n: i32) i32 {
             Ok(Ok(_functions)) => {
                 // Create promises with different iteration counts
                 let promises = vec![
-                    runtime.call_async("sum_range", &[ZyntaxValue::Int(10)]).unwrap(),  // 55
-                    runtime.call_async("sum_range", &[ZyntaxValue::Int(50)]).unwrap(),  // 1275
-                    runtime.call_async("sum_range", &[ZyntaxValue::Int(100)]).unwrap(), // 5050
+                    runtime
+                        .call_async("sum_range", &[ZyntaxValue::Int(10)])
+                        .unwrap(), // 55
+                    runtime
+                        .call_async("sum_range", &[ZyntaxValue::Int(50)])
+                        .unwrap(), // 1275
+                    runtime
+                        .call_async("sum_range", &[ZyntaxValue::Int(100)])
+                        .unwrap(), // 5050
                 ];
 
                 let mut all = PromiseAll::new(promises);
                 let results = all.await_all().expect("PromiseAll should succeed");
 
-                println!("Long-running results after {} polls: {:?}", all.poll_count(), results);
+                println!(
+                    "Long-running results after {} polls: {:?}",
+                    all.poll_count(),
+                    results
+                );
 
                 assert_eq!(results[0], ZyntaxValue::Int(55));
                 assert_eq!(results[1], ZyntaxValue::Int(1275));
                 assert_eq!(results[2], ZyntaxValue::Int(5050));
 
-                println!("SUCCESS: PromiseAll with long-running functions (poll_count={})", all.poll_count());
+                println!(
+                    "SUCCESS: PromiseAll with long-running functions (poll_count={})",
+                    all.poll_count()
+                );
             }
             Ok(Err(e)) => {
                 panic!("Module load failed: {}", e);
@@ -2217,15 +2371,23 @@ async fn slow(n: i32) i32 {
             Ok(Ok(_functions)) => {
                 // Create promises - quick should win
                 let promises = vec![
-                    runtime.call_async("slow", &[ZyntaxValue::Int(100)]).unwrap(), // Takes many polls
-                    runtime.call_async("quick", &[ZyntaxValue::Int(21)]).unwrap(), // Completes quickly
+                    runtime
+                        .call_async("slow", &[ZyntaxValue::Int(100)])
+                        .unwrap(), // Takes many polls
+                    runtime
+                        .call_async("quick", &[ZyntaxValue::Int(21)])
+                        .unwrap(), // Completes quickly
                 ];
 
                 let mut race = PromiseRace::new(promises);
                 let (winner_index, value) = race.await_first().expect("PromiseRace should succeed");
 
-                println!("Race winner: index={}, value={:?} (after {} polls)",
-                    winner_index, value, race.poll_count());
+                println!(
+                    "Race winner: index={}, value={:?} (after {} polls)",
+                    winner_index,
+                    value,
+                    race.poll_count()
+                );
 
                 // Either could win depending on polling order, but both are valid
                 match winner_index {
@@ -2273,9 +2435,15 @@ async fn compute(x: i32) i32 {
             Ok(Ok(_functions)) => {
                 // All these should succeed
                 let promises = vec![
-                    runtime.call_async("compute", &[ZyntaxValue::Int(1)]).unwrap(),
-                    runtime.call_async("compute", &[ZyntaxValue::Int(2)]).unwrap(),
-                    runtime.call_async("compute", &[ZyntaxValue::Int(3)]).unwrap(),
+                    runtime
+                        .call_async("compute", &[ZyntaxValue::Int(1)])
+                        .unwrap(),
+                    runtime
+                        .call_async("compute", &[ZyntaxValue::Int(2)])
+                        .unwrap(),
+                    runtime
+                        .call_async("compute", &[ZyntaxValue::Int(3)])
+                        .unwrap(),
                 ];
 
                 let mut settled = PromiseAllSettled::new(promises);
@@ -2332,15 +2500,23 @@ async fn outer(x: i32) i32 {
             Ok(Ok(_functions)) => {
                 // Create multiple outer promises - each awaits inner internally
                 let promises = vec![
-                    runtime.call_async("outer", &[ZyntaxValue::Int(5)]).unwrap(),  // (5+10)*2 = 30
-                    runtime.call_async("outer", &[ZyntaxValue::Int(10)]).unwrap(), // (10+10)*2 = 40
-                    runtime.call_async("outer", &[ZyntaxValue::Int(15)]).unwrap(), // (15+10)*2 = 50
+                    runtime.call_async("outer", &[ZyntaxValue::Int(5)]).unwrap(), // (5+10)*2 = 30
+                    runtime
+                        .call_async("outer", &[ZyntaxValue::Int(10)])
+                        .unwrap(), // (10+10)*2 = 40
+                    runtime
+                        .call_async("outer", &[ZyntaxValue::Int(15)])
+                        .unwrap(), // (15+10)*2 = 50
                 ];
 
                 let mut all = PromiseAll::new(promises);
                 let results = all.await_all().expect("PromiseAll should succeed");
 
-                println!("Nested await results: {:?} (polls={})", results, all.poll_count());
+                println!(
+                    "Nested await results: {:?} (polls={})",
+                    results,
+                    all.poll_count()
+                );
 
                 assert_eq!(results[0], ZyntaxValue::Int(30));
                 assert_eq!(results[1], ZyntaxValue::Int(40));
@@ -2390,9 +2566,9 @@ async fn compute(x: i32) i32 {
 
         match result {
             Ok(Ok(_functions)) => {
-                let promises = vec![
-                    runtime.call_async("compute", &[ZyntaxValue::Int(7)]).unwrap(),
-                ];
+                let promises = vec![runtime
+                    .call_async("compute", &[ZyntaxValue::Int(7)])
+                    .unwrap()];
 
                 let mut all = PromiseAll::new(promises);
                 let results = all.await_all().expect("Single PromiseAll should succeed");

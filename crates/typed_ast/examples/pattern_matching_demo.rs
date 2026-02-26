@@ -4,7 +4,7 @@
 //! of the Zyntax TypedAST, inspired by Rust and Haxe pattern matching systems.
 
 use zyntax_typed_ast::{type_registry::*, typed_ast::*, AstArena, Span};
-use zyntax_typed_ast::{NullabilityKind, AsyncKind, CallingConvention, ConstValue};
+use zyntax_typed_ast::{AsyncKind, CallingConvention, ConstValue, NullabilityKind};
 
 /// Demonstrates basic pattern matching constructs
 fn basic_patterns_demo() {
@@ -314,10 +314,10 @@ fn haxe_style_patterns() {
                 return_type: Box::new(Type::Named {
                     id: TypeId::next(), // "Option",
                     type_args: vec![Type::Primitive(PrimitiveType::I32)],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
                 is_varargs: false,
                 has_named_params: false,
                 has_default_params: false,
@@ -348,10 +348,10 @@ fn haxe_style_patterns() {
         constructor: Type::Named {
             id: TypeId::next(), // "Vec",
             type_args: vec![Type::Primitive(PrimitiveType::String)],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            },
+            const_args: Vec::new(),
+            variance: Vec::new(),
+            nullability: NullabilityKind::NonNull,
+        },
         pattern: Box::new(typed_node(
             TypedPattern::Array(vec![
                 typed_node(
@@ -442,10 +442,10 @@ fn advanced_features_demo() {
         error_type: Some(Type::Named {
             id: TypeId::next(), // "IOError",
             type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+            const_args: Vec::new(),
+            variance: Vec::new(),
+            nullability: NullabilityKind::NonNull,
+        }),
         pattern: Box::new(typed_node(
             TypedPattern::Tuple(vec![
                 typed_node(
@@ -664,8 +664,8 @@ mod tests {
                 Type::Array {
                     element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
                     size: None,
-                nullability: NullabilityKind::NonNull,
-            },
+                    nullability: NullabilityKind::NonNull,
+                },
                 Span::new(7, 16),
             ))),
             suffix: vec![typed_node(

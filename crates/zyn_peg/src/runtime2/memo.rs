@@ -3,8 +3,8 @@
 //! Implements packrat parsing with memoization to achieve O(n) parsing time.
 //! Each (position, rule) pair is memoized to avoid re-parsing.
 
-use std::collections::HashMap;
 use super::state::ParsedValue;
+use std::collections::HashMap;
 
 /// Key for memoization cache
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,10 +19,7 @@ pub struct MemoKey {
 #[derive(Debug, Clone)]
 pub enum MemoEntry {
     /// Rule matched, consumed up to `end_pos`, produced `value`
-    Success {
-        value: ParsedValue,
-        end_pos: usize,
-    },
+    Success { value: ParsedValue, end_pos: usize },
     /// Rule failed at this position
     Failure,
     /// Currently being computed (for left recursion detection)
@@ -162,10 +159,13 @@ mod tests {
         assert!(cache.is_in_progress(key));
 
         // Store success
-        cache.insert(key, MemoEntry::Success {
-            value: ParsedValue::Text("test".to_string()),
-            end_pos: 4,
-        });
+        cache.insert(
+            key,
+            MemoEntry::Success {
+                value: ParsedValue::Text("test".to_string()),
+                end_pos: 4,
+            },
+        );
 
         // Retrieve
         match cache.get(key) {
@@ -183,7 +183,7 @@ mod tests {
 
         let id1 = gen.get_id("expr");
         let id2 = gen.get_id("stmt");
-        let id3 = gen.get_id("expr");  // Same as id1
+        let id3 = gen.get_id("expr"); // Same as id1
 
         assert_eq!(id1, id3);
         assert_ne!(id1, id2);

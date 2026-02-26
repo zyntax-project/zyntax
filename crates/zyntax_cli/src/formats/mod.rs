@@ -29,7 +29,10 @@ pub fn detect_format(
             if grammar.is_some() && source.is_some() {
                 Ok(InputFormat::ZynGrammar)
             } else if grammar.is_some() || source.is_some() {
-                Err("Both --grammar and --source must be provided for grammar-based compilation".into())
+                Err(
+                    "Both --grammar and --source must be provided for grammar-based compilation"
+                        .into(),
+                )
             } else {
                 auto_detect_format(inputs)
             }
@@ -67,7 +70,9 @@ fn auto_detect_format(inputs: &[PathBuf]) -> Result<InputFormat, Box<dyn std::er
     }
 }
 
-fn scan_directory_for_format(dir: &PathBuf) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
+fn scan_directory_for_format(
+    dir: &PathBuf,
+) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
     let mut has_zbc = false;
     let mut has_json = false;
 
@@ -86,7 +91,10 @@ fn scan_directory_for_format(dir: &PathBuf) -> Result<Option<&'static str>, Box<
     }
 
     if has_zbc && has_json {
-        return Err("Directory contains both .zbc and .json files. Please specify format explicitly.".into());
+        return Err(
+            "Directory contains both .zbc and .json files. Please specify format explicitly."
+                .into(),
+        );
     } else if has_zbc {
         Ok(Some("zbc"))
     } else if has_json {

@@ -3,12 +3,11 @@
 use crate::error::{AdapterError, AdapterResult};
 use crate::expression_converter::ExpressionConverter;
 use crate::type_converter::TypeConverter;
-use zyntax_typed_ast::{
-    TypedStatement, Type, TypedNode,
-    Span, AstArena, Mutability, PrimitiveType,
-};
-use zyntax_typed_ast::typed_ast::{TypedLet, TypedWhile, TypedBlock};
 use whirlwind_ast::Statement;
+use zyntax_typed_ast::typed_ast::{TypedBlock, TypedLet, TypedWhile};
+use zyntax_typed_ast::{
+    AstArena, Mutability, PrimitiveType, Span, Type, TypedNode, TypedStatement,
+};
 
 /// Converts Whirlwind statements to TypedAST statements
 pub struct StatementConverter {
@@ -58,53 +57,56 @@ impl StatementConverter {
     ///
     /// **Testing:**
     /// - **Test** → `TypedStatement::Test` (or custom attribute)
-    pub fn convert_statement(&mut self, whirlwind_stmt: &Statement) -> AdapterResult<TypedNode<TypedStatement>> {
+    pub fn convert_statement(
+        &mut self,
+        whirlwind_stmt: &Statement,
+    ) -> AdapterResult<TypedNode<TypedStatement>> {
         match whirlwind_stmt {
             Statement::FunctionDeclaration(_func_decl) => {
                 // TODO: Implement function declaration
                 // This requires converting the function signature, parameters, and body
-                Err(AdapterError::unsupported("Function declaration not yet implemented"))
+                Err(AdapterError::unsupported(
+                    "Function declaration not yet implemented",
+                ))
             }
-            Statement::VariableDeclaration(var_decl) => {
-                self.convert_variable_declaration(var_decl)
-            }
+            Statement::VariableDeclaration(var_decl) => self.convert_variable_declaration(var_decl),
             Statement::ShorthandVariableDeclaration(short_decl) => {
                 self.convert_shorthand_variable(short_decl)
             }
-            Statement::ModelDeclaration(_model) => {
-                Err(AdapterError::unsupported("Model/Class declaration not yet implemented"))
-            }
-            Statement::InterfaceDeclaration(_interface) => {
-                Err(AdapterError::unsupported("Interface declaration not yet implemented"))
-            }
-            Statement::EnumDeclaration(_enum_decl) => {
-                Err(AdapterError::unsupported("Enum declaration not yet implemented"))
-            }
-            Statement::RecordDeclaration => {
-                Err(AdapterError::unsupported("Record declaration not yet implemented"))
-            }
+            Statement::ModelDeclaration(_model) => Err(AdapterError::unsupported(
+                "Model/Class declaration not yet implemented",
+            )),
+            Statement::InterfaceDeclaration(_interface) => Err(AdapterError::unsupported(
+                "Interface declaration not yet implemented",
+            )),
+            Statement::EnumDeclaration(_enum_decl) => Err(AdapterError::unsupported(
+                "Enum declaration not yet implemented",
+            )),
+            Statement::RecordDeclaration => Err(AdapterError::unsupported(
+                "Record declaration not yet implemented",
+            )),
             Statement::TypeEquation(_type_eq) => {
                 Err(AdapterError::unsupported("Type alias not yet implemented"))
             }
-            Statement::WhileStatement(while_stmt) => {
-                self.convert_while_statement(while_stmt)
-            }
+            Statement::WhileStatement(while_stmt) => self.convert_while_statement(while_stmt),
             Statement::ForStatement(_for_stmt) => {
                 Err(AdapterError::unsupported("For loop not yet implemented"))
             }
-            Statement::ReturnStatement(ret_stmt) => {
-                self.convert_return_statement(ret_stmt)
-            }
+            Statement::ReturnStatement(ret_stmt) => self.convert_return_statement(ret_stmt),
             Statement::ContinueStatement(_cont) => {
                 let span = Span::default(); // TODO: Get actual span
-                Ok(TypedNode::new(TypedStatement::Continue, Type::Primitive(PrimitiveType::Unit), span))
+                Ok(TypedNode::new(
+                    TypedStatement::Continue,
+                    Type::Primitive(PrimitiveType::Unit),
+                    span,
+                ))
             }
             Statement::BreakStatement(_brk) => {
                 let span = Span::default(); // TODO: Get actual span
                 Ok(TypedNode::new(
                     TypedStatement::Break(None),
                     Type::Primitive(PrimitiveType::Unit),
-                    span
+                    span,
                 ))
             }
             Statement::ExpressionStatement(expr) => {
@@ -114,7 +116,7 @@ impl StatementConverter {
                 Ok(TypedNode::new(
                     TypedStatement::Expression(Box::new(typed_expr)),
                     ty,
-                    span
+                    span,
                 ))
             }
             Statement::FreeExpression(expr) => {
@@ -125,21 +127,21 @@ impl StatementConverter {
                 Ok(TypedNode::new(
                     TypedStatement::Expression(Box::new(typed_expr)),
                     ty,
-                    span
+                    span,
                 ))
             }
-            Statement::UseDeclaration(_use_decl) => {
-                Err(AdapterError::unsupported("Use declaration not yet implemented"))
-            }
-            Statement::ImportDeclaration(_import) => {
-                Err(AdapterError::unsupported("Import declaration not yet implemented"))
-            }
-            Statement::TestDeclaration(_test) => {
-                Err(AdapterError::unsupported("Test declaration not yet implemented"))
-            }
-            Statement::ModuleDeclaration(_module) => {
-                Err(AdapterError::unsupported("Module declaration not yet implemented"))
-            }
+            Statement::UseDeclaration(_use_decl) => Err(AdapterError::unsupported(
+                "Use declaration not yet implemented",
+            )),
+            Statement::ImportDeclaration(_import) => Err(AdapterError::unsupported(
+                "Import declaration not yet implemented",
+            )),
+            Statement::TestDeclaration(_test) => Err(AdapterError::unsupported(
+                "Test declaration not yet implemented",
+            )),
+            Statement::ModuleDeclaration(_module) => Err(AdapterError::unsupported(
+                "Module declaration not yet implemented",
+            )),
         }
     }
 
@@ -151,15 +153,21 @@ impl StatementConverter {
         // Whirlwind allows multiple variables in one declaration
         // For now, just handle the first one
         if var_decl.addresses.is_empty() {
-            return Err(AdapterError::statement_conversion("Empty variable declaration"));
+            return Err(AdapterError::statement_conversion(
+                "Empty variable declaration",
+            ));
         }
 
         let first_addr = &var_decl.addresses[0];
         // TODO: Look up actual name from symbol table using scope address
-        let var_name = self.arena.intern_string(&format!("var_{}", first_addr.entry_no));
+        let var_name = self
+            .arena
+            .intern_string(&format!("var_{}", first_addr.entry_no));
 
         let initializer = if let Some(ref expr) = var_decl.value {
-            Some(Box::new(self.expression_converter.convert_expression(expr)?))
+            Some(Box::new(
+                self.expression_converter.convert_expression(expr)?,
+            ))
         } else {
             None
         };
@@ -182,7 +190,7 @@ impl StatementConverter {
                 span,
             }),
             ty,
-            span
+            span,
         ))
     }
 
@@ -192,8 +200,12 @@ impl StatementConverter {
         short_decl: &whirlwind_ast::ShorthandVariableDeclaration,
     ) -> AdapterResult<TypedNode<TypedStatement>> {
         // TODO: Look up actual name from symbol table using scope address
-        let var_name = self.arena.intern_string(&format!("var_{}", short_decl.address.entry_no));
-        let initializer = self.expression_converter.convert_expression(&short_decl.value)?;
+        let var_name = self
+            .arena
+            .intern_string(&format!("var_{}", short_decl.address.entry_no));
+        let initializer = self
+            .expression_converter
+            .convert_expression(&short_decl.value)?;
         let ty = initializer.ty.clone();
         let span = Span::default(); // TODO: Convert actual span
 
@@ -206,7 +218,7 @@ impl StatementConverter {
                 span,
             }),
             ty,
-            span
+            span,
         ))
     }
 
@@ -215,7 +227,10 @@ impl StatementConverter {
         &mut self,
         while_stmt: &whirlwind_ast::WhileStatement,
     ) -> AdapterResult<TypedNode<TypedStatement>> {
-        let condition = Box::new(self.expression_converter.convert_expression(&while_stmt.condition)?);
+        let condition = Box::new(
+            self.expression_converter
+                .convert_expression(&while_stmt.condition)?,
+        );
         let body = self.convert_block(&while_stmt.body)?;
         let span = Span::default(); // TODO: Convert actual span
 
@@ -226,7 +241,7 @@ impl StatementConverter {
                 span,
             }),
             Type::Primitive(PrimitiveType::Unit),
-            span
+            span,
         ))
     }
 
@@ -247,13 +262,15 @@ impl StatementConverter {
         Ok(TypedNode::new(
             TypedStatement::Return(value),
             Type::Primitive(PrimitiveType::Unit),
-            span
+            span,
         ))
     }
 
     /// Convert a Whirlwind Block to TypedBlock
     fn convert_block(&mut self, block: &whirlwind_ast::Block) -> AdapterResult<TypedBlock> {
-        let statements: AdapterResult<Vec<TypedNode<TypedStatement>>> = block.statements.iter()
+        let statements: AdapterResult<Vec<TypedNode<TypedStatement>>> = block
+            .statements
+            .iter()
             .map(|stmt| self.convert_statement(stmt))
             .collect();
 

@@ -1,12 +1,11 @@
+use crate::hir::{BinaryOp, CallingConvention, HirId, HirType, HirUnionVariant};
 /// Memory management functions using HIR Builder
 ///
 /// Provides safe wrappers around C memory allocation functions:
 /// - malloc/free wrappers
 /// - Box<T> heap allocation (conceptually)
 /// - Memory utilities
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirType, HirUnionVariant, HirId, BinaryOp, CallingConvention};
 
 /// Builds memory management functions
 pub fn build_memory_functions(builder: &mut HirBuilder) {
@@ -28,13 +27,15 @@ fn declare_c_memory_functions(builder: &mut HirBuilder) {
     let void_ty = builder.void_type();
 
     // extern "C" fn malloc(size: u64) -> *u8
-    let _malloc = builder.begin_extern_function("malloc", CallingConvention::C)
+    let _malloc = builder
+        .begin_extern_function("malloc", CallingConvention::C)
         .param("size", usize_ty.clone())
         .returns(ptr_u8_ty.clone())
         .build();
 
     // extern "C" fn free(ptr: *u8) -> void
-    let _free = builder.begin_extern_function("free", CallingConvention::C)
+    let _free = builder
+        .begin_extern_function("free", CallingConvention::C)
         .param("ptr", ptr_u8_ty)
         .returns(void_ty)
         .build();
@@ -63,7 +64,8 @@ fn build_safe_allocate(builder: &mut HirBuilder) {
     ];
     let option_ptr_ty = builder.union_type(Some("Option_ptr_u8"), option_ptr_variants);
 
-    let func_id = builder.begin_function("allocate")
+    let func_id = builder
+        .begin_function("allocate")
         .param("size", usize_ty)
         .returns(option_ptr_ty.clone())
         .build();
@@ -92,7 +94,8 @@ fn build_safe_allocate(builder: &mut HirBuilder) {
     let malloc_ref = builder.function_ref(malloc_id);
 
     // Call malloc and get the returned pointer
-    let ptr = builder.call(malloc_ref, vec![size])
+    let ptr = builder
+        .call(malloc_ref, vec![size])
         .expect("malloc should return a value");
 
     builder.br(check_null);
@@ -123,7 +126,8 @@ fn build_safe_deallocate(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty);
     let void_ty = builder.void_type();
 
-    let func_id = builder.begin_function("deallocate")
+    let func_id = builder
+        .begin_function("deallocate")
         .param("ptr", ptr_u8_ty)
         .returns(void_ty.clone())
         .build();
@@ -156,7 +160,8 @@ fn build_alloc_i32(builder: &mut HirBuilder) {
     let u8_ty = builder.u8_type();
     let ptr_i32_ty = builder.ptr_type(i32_ty.clone());
 
-    let func_id = builder.begin_function("alloc_i32")
+    let func_id = builder
+        .begin_function("alloc_i32")
         .param("value", i32_ty.clone())
         .returns(ptr_i32_ty.clone())
         .build();
@@ -178,7 +183,8 @@ fn build_alloc_i32(builder: &mut HirBuilder) {
     let malloc_ref = builder.function_ref(malloc_id);
 
     // Call malloc(4) to allocate 4 bytes
-    let ptr_u8 = builder.call(malloc_ref, vec![size_u64])
+    let ptr_u8 = builder
+        .call(malloc_ref, vec![size_u64])
         .expect("malloc should return a value");
 
     // Cast *u8 to *i32 using bitcast
@@ -200,7 +206,8 @@ fn build_dealloc_i32(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty);
     let void_ty = builder.void_type();
 
-    let func_id = builder.begin_function("dealloc_i32")
+    let func_id = builder
+        .begin_function("dealloc_i32")
         .param("ptr", ptr_i32_ty.clone())
         .returns(void_ty.clone())
         .build();
@@ -247,7 +254,9 @@ mod tests {
         assert!(module.functions.len() >= 6);
 
         // Check function names
-        let func_names: Vec<String> = module.functions.values()
+        let func_names: Vec<String> = module
+            .functions
+            .values()
             .map(|f| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
@@ -269,7 +278,9 @@ mod tests {
         let module = builder.finish();
 
         // Find malloc function
-        let malloc_func = module.functions.values()
+        let malloc_func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("malloc"))
             .expect("malloc function should exist");
 
@@ -294,7 +305,9 @@ mod tests {
         let module = builder.finish();
 
         // Find the allocate function
-        let allocate_func = module.functions.values()
+        let allocate_func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("allocate"))
             .expect("allocate function should exist");
 

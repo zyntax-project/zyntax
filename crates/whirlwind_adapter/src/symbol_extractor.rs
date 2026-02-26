@@ -2,12 +2,16 @@
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::type_converter::TypeConverter;
-use whirlwind_analyzer::{SemanticSymbol, SemanticSymbolKind, SymbolLibrary, SymbolIndex, IntermediateType, EvaluatedType};
+use whirlwind_analyzer::{
+    EvaluatedType, IntermediateType, SemanticSymbol, SemanticSymbolKind, SymbolIndex, SymbolLibrary,
+};
 use zyntax_typed_ast::{
-    Type, AstArena, InternedString, TypeRegistry,
-    typed_ast::{TypedParameter, TypedMethodParam, TypedTypeBound, TypedVariantFields, ParameterKind, ParameterAttribute},
-    Mutability, Visibility, PrimitiveType, NullabilityKind, TypeVar, TypeVarId, TypeVarKind,
-    ParamInfo, AsyncKind, CallingConvention,
+    typed_ast::{
+        ParameterAttribute, ParameterKind, TypedMethodParam, TypedParameter, TypedTypeBound,
+        TypedVariantFields,
+    },
+    AstArena, AsyncKind, CallingConvention, InternedString, Mutability, NullabilityKind, ParamInfo,
+    PrimitiveType, Type, TypeRegistry, TypeVar, TypeVarId, TypeVarKind, Visibility,
 };
 
 pub struct SymbolExtractor {
@@ -30,7 +34,11 @@ impl SymbolExtractor {
         arena: &mut AstArena,
     ) -> AdapterResult<Type> {
         match &symbol.kind {
-            SemanticSymbolKind::Variable { declared_type, inferred_type, .. } => {
+            SemanticSymbolKind::Variable {
+                declared_type,
+                inferred_type,
+                ..
+            } => {
                 // Prefer declared type, fall back to inferred
                 if let Some(declared) = declared_type {
                     self.convert_intermediate_type(declared, symbol_library, type_registry, arena)
@@ -54,8 +62,13 @@ impl SymbolExtractor {
         arena: &mut AstArena,
     ) -> AdapterResult<(Vec<TypedParameter>, Type)> {
         match &symbol.kind {
-            SemanticSymbolKind::Function { params, return_type, .. } => {
-                let typed_params = self.extract_parameters(params, symbol_library, type_registry, arena)?;
+            SemanticSymbolKind::Function {
+                params,
+                return_type,
+                ..
+            } => {
+                let typed_params =
+                    self.extract_parameters(params, symbol_library, type_registry, arena)?;
                 let return_ty = if let Some(ret_type) = return_type {
                     self.convert_intermediate_type(ret_type, symbol_library, type_registry, arena)?
                 } else {
@@ -76,8 +89,15 @@ impl SymbolExtractor {
         arena: &mut AstArena,
     ) -> AdapterResult<(Vec<TypedMethodParam>, Type, bool, bool)> {
         match &symbol.kind {
-            SemanticSymbolKind::Method { params, return_type, is_static, is_async, .. } => {
-                let typed_params = self.extract_method_parameters(params, symbol_library, type_registry, arena)?;
+            SemanticSymbolKind::Method {
+                params,
+                return_type,
+                is_static,
+                is_async,
+                ..
+            } => {
+                let typed_params =
+                    self.extract_method_parameters(params, symbol_library, type_registry, arena)?;
                 let return_ty = if let Some(ret_type) = return_type {
                     self.convert_intermediate_type(ret_type, symbol_library, type_registry, arena)?
                 } else {
@@ -106,18 +126,29 @@ impl SymbolExtractor {
                         let variant_name = arena.intern_string(&variant_symbol.name);
 
                         // Extract associated types if any
-                        let variant_fields = if let SemanticSymbolKind::Variant { tagged_types, .. } = &variant_symbol.kind {
-                            if tagged_types.is_empty() {
-                                TypedVariantFields::Unit
+                        let variant_fields =
+                            if let SemanticSymbolKind::Variant { tagged_types, .. } =
+                                &variant_symbol.kind
+                            {
+                                if tagged_types.is_empty() {
+                                    TypedVariantFields::Unit
+                                } else {
+                                    let types = tagged_types
+                                        .iter()
+                                        .map(|ty| {
+                                            self.convert_intermediate_type(
+                                                ty,
+                                                symbol_library,
+                                                type_registry,
+                                                arena,
+                                            )
+                                        })
+                                        .collect::<AdapterResult<Vec<_>>>()?;
+                                    TypedVariantFields::Tuple(types)
+                                }
                             } else {
-                                let types = tagged_types.iter()
-                                    .map(|ty| self.convert_intermediate_type(ty, symbol_library, type_registry, arena))
-                                    .collect::<AdapterResult<Vec<_>>>()?;
-                                TypedVariantFields::Tuple(types)
-                            }
-                        } else {
-                            TypedVariantFields::Unit
-                        };
+                                TypedVariantFields::Unit
+                            };
 
                         typed_variants.push(zyntax_typed_ast::typed_ast::TypedVariant {
                             name: variant_name,
@@ -195,9 +226,15 @@ impl SymbolExtractor {
                 let param_name = arena.intern_string(&param_symbol.name);
 
                 // Extract bounds if any
-                let bounds = if let SemanticSymbolKind::GenericParameter { interfaces, .. } = &param_symbol.kind {
-                    interfaces.iter()
-                        .map(|ty| self.convert_intermediate_type(ty, symbol_library, type_registry, arena).map(|t| TypedTypeBound::Trait(t)))
+                let bounds = if let SemanticSymbolKind::GenericParameter { interfaces, .. } =
+                    &param_symbol.kind
+                {
+                    interfaces
+                        .iter()
+                        .map(|ty| {
+                            self.convert_intermediate_type(ty, symbol_library, type_registry, arena)
+                                .map(|t| TypedTypeBound::Trait(t))
+                        })
                         .collect::<AdapterResult<Vec<_>>>()?
                 } else {
                     vec![]
@@ -225,8 +262,11 @@ impl SymbolExtractor {
     ) -> AdapterResult<(Option<Type>, Vec<Type>)> {
         match &symbol.kind {
             SemanticSymbolKind::Model { interfaces, .. } => {
-                let implements = interfaces.iter()
-                    .map(|ty| self.convert_intermediate_type(ty, symbol_library, type_registry, arena))
+                let implements = interfaces
+                    .iter()
+                    .map(|ty| {
+                        self.convert_intermediate_type(ty, symbol_library, type_registry, arena)
+                    })
                     .collect::<AdapterResult<Vec<_>>>()?;
                 Ok((None, implements)) // Whirlwind doesn't have base classes, only interfaces
             }
@@ -243,11 +283,10 @@ impl SymbolExtractor {
         arena: &mut AstArena,
     ) -> AdapterResult<Vec<Type>> {
         match &symbol.kind {
-            SemanticSymbolKind::Interface { interfaces, .. } => {
-                interfaces.iter()
-                    .map(|ty| self.convert_intermediate_type(ty, symbol_library, type_registry, arena))
-                    .collect::<AdapterResult<Vec<_>>>()
-            }
+            SemanticSymbolKind::Interface { interfaces, .. } => interfaces
+                .iter()
+                .map(|ty| self.convert_intermediate_type(ty, symbol_library, type_registry, arena))
+                .collect::<AdapterResult<Vec<_>>>(),
             _ => Ok(vec![]),
         }
     }
@@ -261,9 +300,17 @@ impl SymbolExtractor {
         arena: &mut AstArena,
     ) -> AdapterResult<Option<Vec<TypedMethodParam>>> {
         match &symbol.kind {
-            SemanticSymbolKind::Model { constructor_parameters, .. } => {
+            SemanticSymbolKind::Model {
+                constructor_parameters,
+                ..
+            } => {
                 if let Some(param_indices) = constructor_parameters {
-                    let params = self.extract_method_parameters(param_indices, symbol_library, type_registry, arena)?;
+                    let params = self.extract_method_parameters(
+                        param_indices,
+                        symbol_library,
+                        type_registry,
+                        arena,
+                    )?;
                     Ok(Some(params))
                 } else {
                     Ok(None)
@@ -288,11 +335,26 @@ impl SymbolExtractor {
             if let Some(param_symbol) = symbol_library.get(*param_idx) {
                 let param_name = arena.intern_string(&param_symbol.name);
 
-                let param_type = if let SemanticSymbolKind::Parameter { param_type, inferred_type, .. } = &param_symbol.kind {
+                let param_type = if let SemanticSymbolKind::Parameter {
+                    param_type,
+                    inferred_type,
+                    ..
+                } = &param_symbol.kind
+                {
                     if let Some(declared) = param_type {
-                        self.convert_intermediate_type(declared, symbol_library, type_registry, arena)?
+                        self.convert_intermediate_type(
+                            declared,
+                            symbol_library,
+                            type_registry,
+                            arena,
+                        )?
                     } else {
-                        self.convert_evaluated_type(inferred_type, symbol_library, type_registry, arena)?
+                        self.convert_evaluated_type(
+                            inferred_type,
+                            symbol_library,
+                            type_registry,
+                            arena,
+                        )?
                     }
                 } else {
                     Type::Unknown
@@ -326,11 +388,27 @@ impl SymbolExtractor {
             if let Some(param_symbol) = symbol_library.get(*param_idx) {
                 let param_name = arena.intern_string(&param_symbol.name);
 
-                let (param_type, is_optional) = if let SemanticSymbolKind::Parameter { param_type, inferred_type, is_optional, .. } = &param_symbol.kind {
+                let (param_type, is_optional) = if let SemanticSymbolKind::Parameter {
+                    param_type,
+                    inferred_type,
+                    is_optional,
+                    ..
+                } = &param_symbol.kind
+                {
                     let ty = if let Some(declared) = param_type {
-                        self.convert_intermediate_type(declared, symbol_library, type_registry, arena)?
+                        self.convert_intermediate_type(
+                            declared,
+                            symbol_library,
+                            type_registry,
+                            arena,
+                        )?
                     } else {
-                        self.convert_evaluated_type(inferred_type, symbol_library, type_registry, arena)?
+                        self.convert_evaluated_type(
+                            inferred_type,
+                            symbol_library,
+                            type_registry,
+                            arena,
+                        )?
                     };
                     (ty, *is_optional)
                 } else {
@@ -341,7 +419,7 @@ impl SymbolExtractor {
                     name: param_name,
                     ty: param_type,
                     mutability: Mutability::Immutable,
-                    is_self: false, // TODO: Detect self parameter
+                    is_self: false,               // TODO: Detect self parameter
                     kind: ParameterKind::Regular, // TODO: Handle optional parameters
                     default_value: None,
                     attributes: vec![],
@@ -363,7 +441,11 @@ impl SymbolExtractor {
         use whirlwind_analyzer::IntermediateType;
 
         match int_type {
-            IntermediateType::SimpleType { value, generic_args, .. } => {
+            IntermediateType::SimpleType {
+                value,
+                generic_args,
+                ..
+            } => {
                 // Get the symbol from the symbol library
                 if let Some(symbol) = symbol_library.get(*value) {
                     let type_name = arena.intern_string(&symbol.name);
@@ -376,8 +458,16 @@ impl SymbolExtractor {
                     // Look up in type registry
                     if let Some(type_def) = type_registry.get_type_by_name(type_name) {
                         // Convert generic args if any
-                        let type_args = generic_args.iter()
-                            .map(|arg| self.convert_intermediate_type(arg, symbol_library, type_registry, arena))
+                        let type_args = generic_args
+                            .iter()
+                            .map(|arg| {
+                                self.convert_intermediate_type(
+                                    arg,
+                                    symbol_library,
+                                    type_registry,
+                                    arena,
+                                )
+                            })
                             .collect::<AdapterResult<Vec<_>>>()?;
 
                         return Ok(Type::Named {
@@ -399,11 +489,21 @@ impl SymbolExtractor {
                 Ok(Type::Unknown)
             }
 
-            IntermediateType::FunctionType { params, return_type, .. } => {
-                let param_infos = params.iter()
+            IntermediateType::FunctionType {
+                params,
+                return_type,
+                ..
+            } => {
+                let param_infos = params
+                    .iter()
                     .map(|p| {
                         let param_ty = if let Some(ref type_label) = p.type_label {
-                            self.convert_intermediate_type(type_label, symbol_library, type_registry, arena)?
+                            self.convert_intermediate_type(
+                                type_label,
+                                symbol_library,
+                                type_registry,
+                                arena,
+                            )?
                         } else {
                             Type::Unknown
                         };
@@ -440,7 +540,12 @@ impl SymbolExtractor {
             }
 
             IntermediateType::ArrayType { element_type, .. } => {
-                let elem_ty = self.convert_intermediate_type(element_type, symbol_library, type_registry, arena)?;
+                let elem_ty = self.convert_intermediate_type(
+                    element_type,
+                    symbol_library,
+                    type_registry,
+                    arena,
+                )?;
                 Ok(Type::Array {
                     element_type: Box::new(elem_ty),
                     size: None,
@@ -449,14 +554,18 @@ impl SymbolExtractor {
             }
 
             IntermediateType::MaybeType { value, .. } => {
-                let inner_ty = self.convert_intermediate_type(value, symbol_library, type_registry, arena)?;
+                let inner_ty =
+                    self.convert_intermediate_type(value, symbol_library, type_registry, arena)?;
                 // MaybeType represents optional/nullable types - wrap in Optional
                 Ok(Type::Optional(Box::new(inner_ty)))
             }
 
             IntermediateType::UnionType { types, .. } => {
-                let variant_types = types.iter()
-                    .map(|t| self.convert_intermediate_type(t, symbol_library, type_registry, arena))
+                let variant_types = types
+                    .iter()
+                    .map(|t| {
+                        self.convert_intermediate_type(t, symbol_library, type_registry, arena)
+                    })
                     .collect::<AdapterResult<Vec<_>>>()?;
 
                 Ok(Type::Union(variant_types))
@@ -525,7 +634,8 @@ impl SymbolExtractor {
             EvaluatedType::Never => Ok(Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)),
             EvaluatedType::Unknown => Ok(Type::Unknown),
             EvaluatedType::Partial { types } => {
-                let converted_types: Vec<_> = types.iter()
+                let converted_types: Vec<_> = types
+                    .iter()
                     .map(|t| self.convert_evaluated_type(t, symbol_library, type_registry, arena))
                     .collect::<AdapterResult<_>>()?;
                 Ok(Type::Union(converted_types))

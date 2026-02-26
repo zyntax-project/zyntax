@@ -1,16 +1,14 @@
 //! Command execution logic
 
 use colored::Colorize;
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::backends::{self, Backend};
-use crate::cli::{ModuleArch, CacheAction, PackAction, default_cache_dir};
+use crate::cli::{default_cache_dir, CacheAction, ModuleArch, PackAction};
 use crate::formats::{self, InputFormat};
 
-use zyntax_typed_ast::{
-    ImportContext, ModuleArchitecture,
-};
+use zyntax_typed_ast::{ImportContext, ModuleArchitecture};
 
 /// Convert CLI ModuleArch to typed_ast ModuleArchitecture
 fn to_module_architecture(resolver: ModuleArch, cache_dir: &PathBuf) -> ModuleArchitecture {
@@ -46,8 +44,7 @@ fn build_import_context(
 ) -> Result<ImportContext, Box<dyn std::error::Error>> {
     let architecture = to_module_architecture(resolver, cache_dir);
 
-    let mut ctx = ImportContext::new()
-        .with_architecture(architecture);
+    let mut ctx = ImportContext::new().with_architecture(architecture);
 
     // Add source roots
     for root in source_roots {
@@ -69,7 +66,11 @@ fn build_import_context(
     if let Some(source) = source_file {
         if let Some(parent) = source.parent() {
             if verbose {
-                println!("{} Auto-added source root: {}", "info:".blue(), parent.display());
+                println!(
+                    "{} Auto-added source root: {}",
+                    "info:".blue(),
+                    parent.display()
+                );
             }
             ctx = ctx.with_source_root(parent.to_path_buf());
         }
@@ -78,7 +79,11 @@ fn build_import_context(
     // Load import map if specified (for Deno-style imports)
     if let Some(import_map_path) = import_map {
         if verbose {
-            println!("{} Loading import map: {}", "info:".blue(), import_map_path.display());
+            println!(
+                "{} Loading import map: {}",
+                "info:".blue(),
+                import_map_path.display()
+            );
         }
         let import_map_content = std::fs::read_to_string(&import_map_path)?;
         let map: HashMap<String, String> = serde_json::from_str(&import_map_content)?;
@@ -128,24 +133,28 @@ pub fn compile(
     )?;
 
     if verbose {
-        println!("{} Module resolver architecture: {:?}", "info:".blue(), resolver);
+        println!(
+            "{} Module resolver architecture: {:?}",
+            "info:".blue(),
+            resolver
+        );
         if let Some(ref entry) = entry_point {
             println!("{} Entry point: {}", "info:".blue(), entry);
         }
         if !no_cache {
-            println!("{} Cache directory: {}", "info:".blue(), cache_dir.display());
+            println!(
+                "{} Cache directory: {}",
+                "info:".blue(),
+                cache_dir.display()
+            );
         } else {
             println!("{} Caching disabled", "info:".blue());
         }
     }
 
     // Detect input format
-    let input_format = formats::detect_format(
-        &format_str,
-        &inputs,
-        grammar.as_ref(),
-        source.as_ref(),
-    )?;
+    let input_format =
+        formats::detect_format(&format_str, &inputs, grammar.as_ref(), source.as_ref())?;
 
     if verbose {
         println!("{} Input format: {:?}", "info:".blue(), input_format);
@@ -231,7 +240,18 @@ pub fn compile(
     // Compile with selected backend
     // - JIT mode: uses ZPack (.zpack) for runtime symbols
     // - AOT mode: uses static libraries (--lib) for linker
-    backends::compile(hir_module, backend, output, opt_level, jit, entry_point, &module_arch, &loaded_packs, &static_libs, verbose)
+    backends::compile(
+        hir_module,
+        backend,
+        output,
+        opt_level,
+        jit,
+        entry_point,
+        &module_arch,
+        &loaded_packs,
+        &static_libs,
+        verbose,
+    )
 }
 
 /// Display version information
@@ -269,7 +289,10 @@ pub fn cache(action: &CacheAction, verbose: bool) -> Result<(), Box<dyn std::err
             let dir = cache_dir.clone().unwrap_or_else(default_cache_dir);
             cache_stats(&dir, verbose)
         }
-        CacheAction::List { cache_dir, verbose: list_verbose } => {
+        CacheAction::List {
+            cache_dir,
+            verbose: list_verbose,
+        } => {
             let dir = cache_dir.clone().unwrap_or_else(default_cache_dir);
             cache_list(&dir, *list_verbose || verbose)
         }
@@ -279,7 +302,11 @@ pub fn cache(action: &CacheAction, verbose: bool) -> Result<(), Box<dyn std::err
 /// Clear the compilation cache
 fn cache_clear(cache_dir: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     if !cache_dir.exists() {
-        println!("{} Cache directory does not exist: {}", "info:".blue(), cache_dir.display());
+        println!(
+            "{} Cache directory does not exist: {}",
+            "info:".blue(),
+            cache_dir.display()
+        );
         return Ok(());
     }
 
@@ -407,7 +434,8 @@ fn cache_list(cache_dir: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         if verbose {
             let metadata = entry.metadata()?;
             let size = metadata.len();
-            let modified = metadata.modified()
+            let modified = metadata
+                .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| {
@@ -415,7 +443,9 @@ fn cache_list(cache_dir: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
                     let hours_ago = (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
-                        .as_secs() - secs) / 3600;
+                        .as_secs()
+                        - secs)
+                        / 3600;
                     if hours_ago < 24 {
                         format!("{}h ago", hours_ago)
                     } else {
@@ -523,7 +553,8 @@ pub fn repl(
         zpeg_module.metadata.name.clone()
     };
 
-    println!("{} {} grammar loaded ({} rules)",
+    println!(
+        "{} {} grammar loaded ({} rules)",
         "✓".green(),
         lang_name,
         zpeg_module.rules.len()
@@ -548,7 +579,11 @@ pub fn repl(
     let mut in_multiline = false;
 
     loop {
-        let current_prompt = if in_multiline { &continuation_prompt } else { &prompt };
+        let current_prompt = if in_multiline {
+            &continuation_prompt
+        } else {
+            &prompt
+        };
         let readline = rl.readline(current_prompt);
         match readline {
             Ok(line) => {
@@ -608,7 +643,11 @@ pub fn repl(
                         match eval_input(&zpeg_module, &input, &backend, opt_level, verbose_mode) {
                             Ok(result) => {
                                 if let Some(value) = result {
-                                    println!("{} = {}", format!("[{}]", line_number).dimmed(), value.to_string().yellow());
+                                    println!(
+                                        "{} = {}",
+                                        format!("[{}]", line_number).dimmed(),
+                                        value.to_string().yellow()
+                                    );
                                 }
                                 line_number += 1;
                             }
@@ -622,7 +661,7 @@ pub fn repl(
                     // Handle backslash continuation in multi-line mode
                     let line_to_append = if trimmed.ends_with('\\') {
                         // Continue on next line, strip the backslash
-                        &trimmed[..trimmed.len()-1]
+                        &trimmed[..trimmed.len() - 1]
                     } else {
                         &line
                     };
@@ -650,10 +689,20 @@ pub fn repl(
 
                             let _ = rl.add_history_entry(&input);
 
-                            match eval_input(&zpeg_module, &input, &backend, opt_level, verbose_mode) {
+                            match eval_input(
+                                &zpeg_module,
+                                &input,
+                                &backend,
+                                opt_level,
+                                verbose_mode,
+                            ) {
                                 Ok(result) => {
                                     if let Some(value) = result {
-                                        println!("{} = {}", format!("[{}]", line_number).dimmed(), value.to_string().yellow());
+                                        println!(
+                                            "{} = {}",
+                                            format!("[{}]", line_number).dimmed(),
+                                            value.to_string().yellow()
+                                        );
                                     }
                                     line_number += 1;
                                 }
@@ -670,7 +719,7 @@ pub fn repl(
                 if trimmed.ends_with('\\') {
                     in_multiline = true;
                     // Remove the trailing backslash
-                    input_buffer = trimmed[..trimmed.len()-1].to_string();
+                    input_buffer = trimmed[..trimmed.len() - 1].to_string();
                     continue;
                 }
 
@@ -692,7 +741,11 @@ pub fn repl(
                 match eval_input(&zpeg_module, trimmed, &backend, opt_level, verbose_mode) {
                     Ok(result) => {
                         if let Some(value) = result {
-                            println!("{} = {}", format!("[{}]", line_number).dimmed(), value.to_string().yellow());
+                            println!(
+                                "{} = {}",
+                                format!("[{}]", line_number).dimmed(),
+                                value.to_string().yellow()
+                            );
                         }
                         line_number += 1;
                     }
@@ -778,9 +831,9 @@ fn compile_grammar_for_repl(
     verbose: bool,
 ) -> Result<zyn_peg::runtime::ZpegModule, Box<dyn std::error::Error>> {
     use pest::Parser;
-    use zyn_peg::{ZynGrammarParser, Rule as ZynRule};
     use zyn_peg::ast::build_grammar;
     use zyn_peg::runtime::ZpegCompiler;
+    use zyn_peg::{Rule as ZynRule, ZynGrammarParser};
 
     if verbose {
         println!("{} Parsing .zyn grammar with ZynPEG...", "info:".blue());
@@ -790,8 +843,7 @@ fn compile_grammar_for_repl(
     let pairs = ZynGrammarParser::parse(ZynRule::program, grammar_code)
         .map_err(|e| format!("Failed to parse .zyn grammar: {}", e))?;
 
-    let grammar = build_grammar(pairs)
-        .map_err(|e| format!("Failed to build grammar: {}", e))?;
+    let grammar = build_grammar(pairs).map_err(|e| format!("Failed to build grammar: {}", e))?;
 
     if verbose {
         println!("{} Found {} rules", "info:".blue(), grammar.rules.len());
@@ -812,12 +864,12 @@ fn eval_input(
     opt_level: u8,
     verbose: bool,
 ) -> Result<Option<i64>, Box<dyn std::error::Error>> {
-    use std::sync::{Arc, Mutex};
     use pest::iterators::Pairs;
-    use pest_meta::parser;
     use pest_meta::optimizer;
+    use pest_meta::parser;
     use pest_vm::Vm;
-    use zyn_peg::runtime::{TypedAstBuilder, AstHostFunctions, CommandInterpreter, RuntimeValue};
+    use std::sync::{Arc, Mutex};
+    use zyn_peg::runtime::{AstHostFunctions, CommandInterpreter, RuntimeValue, TypedAstBuilder};
     use zyntax_compiler::hir::HirModule;
     use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
     use zyntax_typed_ast::{AstArena, InternedString, TypeRegistry, TypedProgram};
@@ -833,7 +885,8 @@ fn eval_input(
 
     // Create VM and parse input
     let vm = Vm::new(optimized);
-    let parse_result: Pairs<'_, &str> = vm.parse("program", input)
+    let parse_result: Pairs<'_, &str> = vm
+        .parse("program", input)
         .map_err(|e| format!("Parse error: {}", e))?;
 
     if verbose {
@@ -849,9 +902,7 @@ fn eval_input(
 
     // Finalize the AST
     let json = match result {
-        RuntimeValue::Node(handle) => {
-            interpreter.host_mut().finalize_program(handle)
-        }
+        RuntimeValue::Node(handle) => interpreter.host_mut().finalize_program(handle),
         _ => {
             let handle = interpreter.host_mut().create_program();
             interpreter.host_mut().finalize_program(handle)
@@ -859,7 +910,11 @@ fn eval_input(
     };
 
     if verbose {
-        println!("{} Generated TypedAST JSON ({} bytes)", "info:".blue(), json.len());
+        println!(
+            "{} Generated TypedAST JSON ({} bytes)",
+            "info:".blue(),
+            json.len()
+        );
     }
 
     // Deserialize to TypedProgram
@@ -869,11 +924,14 @@ fn eval_input(
     // Rebuild type registry from declarations (TypeRegistry is not serializable)
     // Scan for struct definitions (TypedDeclaration::Class) and register them
     // IMPORTANT: Only register types that don't already exist (abstract types are pre-registered by parser)
-    use zyntax_typed_ast::{TypedDeclaration, type_registry::*};
+    use zyntax_typed_ast::{type_registry::*, TypedDeclaration};
     for decl_node in &typed_program.declarations {
         eprintln!("[DEBUG] Checking declaration, type: {:?}", decl_node.ty);
         if let TypedDeclaration::Class(class) = &decl_node.node {
-            eprintln!("[DEBUG] Found Class declaration: {}, ty={:?}", class.name, decl_node.ty);
+            eprintln!(
+                "[DEBUG] Found Class declaration: {}, ty={:?}",
+                class.name, decl_node.ty
+            );
 
             // Check if type is already registered (e.g., abstract types from parser)
             if let Some(existing_type) = typed_program.type_registry.get_type_by_name(class.name) {
@@ -886,17 +944,21 @@ fn eval_input(
             // Check if this is a struct (no methods, just fields)
             // Create TypeDefinition and register it
             if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
-                let field_defs: Vec<FieldDef> = class.fields.iter().map(|f| FieldDef {
-                    name: f.name,
-                    ty: f.ty.clone(),
-                    visibility: f.visibility,
-                    mutability: f.mutability,
-                    is_static: f.is_static,
-                    span: f.span,
-                    getter: None,
-                    setter: None,
-                    is_synthetic: false,
-                }).collect();
+                let field_defs: Vec<FieldDef> = class
+                    .fields
+                    .iter()
+                    .map(|f| FieldDef {
+                        name: f.name,
+                        ty: f.ty.clone(),
+                        visibility: f.visibility,
+                        mutability: f.mutability,
+                        is_static: f.is_static,
+                        span: f.span,
+                        getter: None,
+                        setter: None,
+                        is_synthetic: false,
+                    })
+                    .collect();
 
                 let type_def = TypeDefinition {
                     id: *id,
@@ -914,7 +976,10 @@ fn eval_input(
                     span: class.span,
                 };
                 typed_program.type_registry.register_type(type_def);
-                eprintln!("[DEBUG] Reconstructed struct type: {} with TypeId: {:?}", class.name, *id);
+                eprintln!(
+                    "[DEBUG] Reconstructed struct type: {} with TypeId: {:?}",
+                    class.name, *id
+                );
             }
         }
     }
@@ -962,7 +1027,11 @@ fn eval_input(
         .map_err(|e| format!("Monomorphization error: {:?}", e))?;
 
     if verbose {
-        println!("{} HIR module ready ({} functions)", "info:".blue(), hir_module.functions.len());
+        println!(
+            "{} HIR module ready ({} functions)",
+            "info:".blue(),
+            hir_module.functions.len()
+        );
     }
 
     // Compile and run
@@ -985,12 +1054,14 @@ fn walk_parse_tree_repl<H: zyn_peg::runtime::AstHostFunctions>(
         let text = pair.as_str().to_string();
 
         // Recursively process children first
-        let children: Vec<RuntimeValue> = pair.into_inner()
+        let children: Vec<RuntimeValue> = pair
+            .into_inner()
             .map(|child| walk_pair_to_value_repl(child, interpreter))
             .collect();
 
         // Execute commands for this rule
-        let result = interpreter.execute_rule(&rule_name, &text, children)
+        let result = interpreter
+            .execute_rule(&rule_name, &text, children)
             .map_err(|e| format!("Error executing rule '{}': {}", rule_name, e))?;
 
         results.push(result);
@@ -1009,13 +1080,19 @@ fn walk_pair_to_value_repl<H: zyn_peg::runtime::AstHostFunctions>(
     let rule_name = pair.as_rule().to_string();
     let text = pair.as_str().to_string();
 
-    eprintln!("[walk_pair] rule='{}', text='{}'", rule_name, text.chars().take(50).collect::<String>());
+    eprintln!(
+        "[walk_pair] rule='{}', text='{}'",
+        rule_name,
+        text.chars().take(50).collect::<String>()
+    );
 
-    let children: Vec<RuntimeValue> = pair.into_inner()
+    let children: Vec<RuntimeValue> = pair
+        .into_inner()
         .map(|c| walk_pair_to_value_repl(c, interpreter))
         .collect();
 
-    interpreter.execute_rule(&rule_name, &text, children)
+    interpreter
+        .execute_rule(&rule_name, &text, children)
         .unwrap_or(RuntimeValue::Null)
 }
 
@@ -1042,12 +1119,11 @@ pub fn pack(action: &PackAction, verbose: bool) -> Result<(), Box<dyn std::error
             entry_point.as_deref(),
             verbose,
         ),
-        PackAction::List { zpack, verbose: list_verbose } => {
-            pack_list(zpack, *list_verbose || verbose)
-        }
-        PackAction::Extract { zpack, output } => {
-            pack_extract(zpack, output.as_ref(), verbose)
-        }
+        PackAction::List {
+            zpack,
+            verbose: list_verbose,
+        } => pack_list(zpack, *list_verbose || verbose),
+        PackAction::Extract { zpack, output } => pack_extract(zpack, output.as_ref(), verbose),
         PackAction::Target => pack_target(),
     }
 }
@@ -1066,7 +1142,7 @@ fn pack_create(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::File;
-    use zyntax_compiler::zpack::{ZPackWriter, ZPackManifest, ZPACK_VERSION};
+    use zyntax_compiler::zpack::{ZPackManifest, ZPackWriter, ZPACK_VERSION};
 
     println!("{}", "Creating ZPack archive...".green().bold());
 
@@ -1093,14 +1169,21 @@ fn pack_create(
             for entry in walkdir::WalkDir::new(module_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|ext| ext == "zbc").unwrap_or(false))
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "zbc")
+                        .unwrap_or(false)
+                })
             {
                 let path = entry.path();
                 let rel_path = path
                     .strip_prefix(module_path)
                     .unwrap_or(path)
                     .with_extension("");
-                let module_name = rel_path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                let module_name = rel_path
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
 
                 if verbose {
                     println!("  Adding module: {}", module_name);
@@ -1110,7 +1193,11 @@ fn pack_create(
                 writer.add_module_bytes(&module_name, &data)?;
                 module_count += 1;
             }
-        } else if module_path.extension().map(|ext| ext == "zbc").unwrap_or(false) {
+        } else if module_path
+            .extension()
+            .map(|ext| ext == "zbc")
+            .unwrap_or(false)
+        {
             // Single .zbc file
             let module_name = module_path
                 .file_stem()
@@ -1235,7 +1322,11 @@ fn pack_list(zpack_path: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
                 .strip_suffix(".zbc")
                 .unwrap_or(name);
             if verbose {
-                println!("  {} {}", module_name, format!("[{}]", format_bytes(*size)).dimmed());
+                println!(
+                    "  {} {}",
+                    module_name,
+                    format!("[{}]", format_bytes(*size)).dimmed()
+                );
             } else {
                 println!("  {}", module_name);
             }
@@ -1253,7 +1344,11 @@ fn pack_list(zpack_path: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
                 .and_then(|s| s.strip_suffix("/runtime.zrtl"))
                 .unwrap_or(name);
             if verbose {
-                println!("  {} {}", target, format!("[{}]", format_bytes(*size)).dimmed());
+                println!(
+                    "  {} {}",
+                    target,
+                    format!("[{}]", format_bytes(*size)).dimmed()
+                );
             } else {
                 println!("  {}", target);
             }
@@ -1297,7 +1392,12 @@ fn pack_extract(
 
     let output = output_dir.cloned().unwrap_or_else(|| PathBuf::from("."));
 
-    println!("{} {} to {}", "Extracting".green().bold(), zpack_path.display(), output.display());
+    println!(
+        "{} {} to {}",
+        "Extracting".green().bold(),
+        zpack_path.display(),
+        output.display()
+    );
 
     let file = std::fs::File::open(zpack_path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -1357,7 +1457,10 @@ fn pack_target() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("{}", "Usage:".dimmed());
     println!("  When creating a zpack, use --runtime to add platform-specific runtimes:");
-    println!("  zyntax pack create -o my.zpack -n mylib --runtime {}:/path/to/runtime.zrtl", current);
+    println!(
+        "  zyntax pack create -o my.zpack -n mylib --runtime {}:/path/to/runtime.zrtl",
+        current
+    );
 
     Ok(())
 }

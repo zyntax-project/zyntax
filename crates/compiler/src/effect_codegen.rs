@@ -240,18 +240,18 @@
 //! - Generate runtime dispatch for dynamic handlers
 //! - (Future) Generate CPS-transformed code for resumable handlers
 
-use std::collections::HashMap;
-use indexmap::IndexMap;
-use crate::hir::{
-    HirModule, HirFunction, HirBlock, HirId, HirInstruction, HirType,
-    HirEffect, HirEffectHandler, HirEffectHandlerImpl,
-};
 use crate::effect_handler_resolution::{
-    ModuleHandlerResolution, FunctionHandlerResolution, HandlerResolution,
-    HandlerOptimization, ResolvedHandler,
+    FunctionHandlerResolution, HandlerOptimization, HandlerResolution, ModuleHandlerResolution,
+    ResolvedHandler,
 };
-use crate::CompilerResult;
+use crate::hir::{
+    HirBlock, HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirFunction, HirId,
+    HirInstruction, HirModule, HirType,
+};
 use crate::CompilerError;
+use crate::CompilerResult;
+use indexmap::IndexMap;
+use std::collections::HashMap;
 use zyntax_typed_ast::InternedString;
 
 /// Effect codegen context
@@ -327,7 +327,10 @@ impl EffectCodegenContext {
     /// Find the handler for an effect
     pub fn find_handler(&self, effect_id: HirId) -> Option<&HandlerStackEntry> {
         // Search from innermost (last) to outermost (first)
-        self.handler_stack.iter().rev().find(|h| h.effect_id == effect_id)
+        self.handler_stack
+            .iter()
+            .rev()
+            .find(|h| h.effect_id == effect_id)
     }
 }
 
@@ -381,8 +384,9 @@ pub fn analyze_perform_effect(
                 {
                     if let Some(handler) = &res.resolved_handler {
                         let strategy = match handler.optimization {
-                            HandlerOptimization::Inline |
-                            HandlerOptimization::SimpleReturn => PerformStrategy::Inline,
+                            HandlerOptimization::Inline | HandlerOptimization::SimpleReturn => {
+                                PerformStrategy::Inline
+                            }
                             HandlerOptimization::StaticDispatch => PerformStrategy::DirectCall,
                             HandlerOptimization::Pure => PerformStrategy::DirectCall,
                             HandlerOptimization::Dynamic => PerformStrategy::RuntimeDispatch,
@@ -462,10 +466,7 @@ pub fn analyze_handle_effect(
 }
 
 /// Generate mangled name for a handler operation
-pub fn mangle_handler_op_name(
-    handler_name: InternedString,
-    op_name: InternedString,
-) -> String {
+pub fn mangle_handler_op_name(handler_name: InternedString, op_name: InternedString) -> String {
     let handler_str = handler_name.resolve_global().unwrap_or_default();
     let op_str = op_name.resolve_global().unwrap_or_default();
     format!("{}$effect${}", handler_str, op_str)
@@ -492,14 +493,16 @@ pub struct HandlerOpInfo {
 
 /// Get codegen info for all operations of a handler
 pub fn get_handler_ops_info(handler: &HirEffectHandler) -> Vec<HandlerOpInfo> {
-    handler.implementations.iter().map(|impl_| {
-        HandlerOpInfo {
+    handler
+        .implementations
+        .iter()
+        .map(|impl_| HandlerOpInfo {
             function_name: mangle_handler_op_name(handler.name, impl_.op_name),
             param_types: impl_.params.iter().map(|p| p.ty.clone()).collect(),
             return_type: impl_.return_type.clone(),
             uses_continuation: impl_.is_resumable,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Runtime effect operations (for dynamic dispatch)

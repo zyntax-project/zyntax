@@ -180,18 +180,12 @@ fn serialize_raw_header(header: &BytecodeHeader) -> Vec<u8> {
 pub fn serialize_module(module: &HirModule, format: Format) -> Result<Vec<u8>> {
     // Serialize the module payload
     let payload = match format {
-        Format::Postcard => {
-            postcard::to_allocvec(module)
-                .map_err(|e| BytecodeError::SerializationError(e.to_string()))?
-        }
-        Format::Json => {
-            serde_json::to_vec_pretty(module)
-                .map_err(|e| BytecodeError::SerializationError(e.to_string()))?
-        }
-        Format::Bincode => {
-            bincode::serialize(module)
-                .map_err(|e| BytecodeError::SerializationError(e.to_string()))?
-        }
+        Format::Postcard => postcard::to_allocvec(module)
+            .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
+        Format::Json => serde_json::to_vec_pretty(module)
+            .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
+        Format::Bincode => bincode::serialize(module)
+            .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
     };
 
     // Calculate checksum
@@ -329,18 +323,12 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
     // Deserialize payload
     let format = Format::from_u8(header.format)?;
     let module = match format {
-        Format::Postcard => {
-            postcard::from_bytes(payload)
-                .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?
-        }
-        Format::Json => {
-            serde_json::from_slice(payload)
-                .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?
-        }
-        Format::Bincode => {
-            bincode::deserialize(payload)
-                .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?
-        }
+        Format::Postcard => postcard::from_bytes(payload)
+            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
+        Format::Json => serde_json::from_slice(payload)
+            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
+        Format::Bincode => bincode::deserialize(payload)
+            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
     };
 
     Ok(module)

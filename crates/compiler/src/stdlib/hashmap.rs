@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, CallingConvention, HirId, HirType};
 /// HashMap<K,V>: Generic hash table with open addressing
 ///
 /// Structure:
@@ -21,9 +22,7 @@
 /// Load factor: Resize when len > cap * 0.75
 /// Growth strategy: Double capacity (16 → 32 → 64)
 /// Initial capacity: 16 buckets
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirId, HirType, CallingConvention, BinaryOp};
 
 /// Declare memset extern function
 fn declare_c_memset(builder: &mut HirBuilder) {
@@ -40,7 +39,8 @@ fn declare_c_memset(builder: &mut HirBuilder) {
     let usize_ty = builder.u64_type();
 
     // extern "C" fn memset(ptr: *u8, value: i32, size: usize) -> *u8
-    let _memset = builder.begin_extern_function("memset", CallingConvention::C)
+    let _memset = builder
+        .begin_extern_function("memset", CallingConvention::C)
         .param("ptr", ptr_u8_ty.clone())
         .param("value", i32_ty)
         .param("size", usize_ty)
@@ -62,7 +62,8 @@ fn declare_c_realloc(builder: &mut HirBuilder) {
     let usize_ty = builder.u64_type();
 
     // extern "C" fn realloc(ptr: *u8, new_size: usize) -> *u8
-    let _realloc = builder.begin_extern_function("realloc", CallingConvention::C)
+    let _realloc = builder
+        .begin_extern_function("realloc", CallingConvention::C)
         .param("ptr", ptr_u8_ty.clone())
         .param("new_size", usize_ty)
         .returns(ptr_u8_ty)
@@ -78,7 +79,7 @@ pub fn build_hashmap_type(builder: &mut HirBuilder) {
     // Build HashMap<K,V> methods
     build_hashmap_new(builder);
     build_hashmap_with_capacity(builder);
-    build_hashmap_resize(builder);  // Resize helper
+    build_hashmap_resize(builder); // Resize helper
     build_hashmap_insert(builder);
     build_hashmap_get(builder);
     build_hashmap_remove(builder);
@@ -127,7 +128,8 @@ fn build_hash_i32(builder: &mut HirBuilder) {
     let ptr_i32_ty = builder.ptr_type(i32_ty.clone());
     let u64_ty = builder.u64_type();
 
-    let func_id = builder.begin_function("hash_i32")
+    let func_id = builder
+        .begin_function("hash_i32")
         .param("key", ptr_i32_ty.clone())
         .returns(u64_ty.clone())
         .build();
@@ -161,7 +163,8 @@ fn build_hash_i64(builder: &mut HirBuilder) {
     let ptr_i64_ty = builder.ptr_type(i64_ty.clone());
     let u64_ty = builder.u64_type();
 
-    let func_id = builder.begin_function("hash_i64")
+    let func_id = builder
+        .begin_function("hash_i64")
         .param("key", ptr_i64_ty.clone())
         .returns(u64_ty.clone())
         .build();
@@ -193,7 +196,8 @@ fn build_hash_u32(builder: &mut HirBuilder) {
     let ptr_u32_ty = builder.ptr_type(u32_ty.clone());
     let u64_ty = builder.u64_type();
 
-    let func_id = builder.begin_function("hash_u32")
+    let func_id = builder
+        .begin_function("hash_u32")
         .param("key", ptr_u32_ty.clone())
         .returns(u64_ty.clone())
         .build();
@@ -223,7 +227,8 @@ fn build_hash_u64(builder: &mut HirBuilder) {
     let u64_ty = builder.u64_type();
     let ptr_u64_ty = builder.ptr_type(u64_ty.clone());
 
-    let func_id = builder.begin_function("hash_u64")
+    let func_id = builder
+        .begin_function("hash_u64")
         .param("key", ptr_u64_ty.clone())
         .returns(u64_ty.clone())
         .build();
@@ -251,7 +256,8 @@ fn build_hash_bool(builder: &mut HirBuilder) {
     let ptr_bool_ty = builder.ptr_type(bool_ty.clone());
     let u64_ty = builder.u64_type();
 
-    let func_id = builder.begin_function("hash_bool")
+    let func_id = builder
+        .begin_function("hash_bool")
         .param("key", ptr_bool_ty.clone())
         .returns(u64_ty.clone())
         .build();
@@ -279,7 +285,8 @@ fn build_hash_u8(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty.clone());
     let u64_ty = builder.u64_type();
 
-    let func_id = builder.begin_function("hash_u8")
+    let func_id = builder
+        .begin_function("hash_u8")
         .param("key", ptr_u8_ty.clone())
         .returns(u64_ty.clone())
         .build();
@@ -315,7 +322,8 @@ fn build_eq_i32(builder: &mut HirBuilder) {
     let ptr_i32_ty = builder.ptr_type(i32_ty.clone());
     let bool_ty = builder.bool_type();
 
-    let func_id = builder.begin_function("eq_i32")
+    let func_id = builder
+        .begin_function("eq_i32")
         .param("a", ptr_i32_ty.clone())
         .param("b", ptr_i32_ty.clone())
         .returns(bool_ty.clone())
@@ -341,7 +349,8 @@ fn build_eq_i64(builder: &mut HirBuilder) {
     let ptr_i64_ty = builder.ptr_type(i64_ty.clone());
     let bool_ty = builder.bool_type();
 
-    let func_id = builder.begin_function("eq_i64")
+    let func_id = builder
+        .begin_function("eq_i64")
         .param("a", ptr_i64_ty.clone())
         .param("b", ptr_i64_ty.clone())
         .returns(bool_ty.clone())
@@ -365,7 +374,8 @@ fn build_eq_u32(builder: &mut HirBuilder) {
     let ptr_u32_ty = builder.ptr_type(u32_ty.clone());
     let bool_ty = builder.bool_type();
 
-    let func_id = builder.begin_function("eq_u32")
+    let func_id = builder
+        .begin_function("eq_u32")
         .param("a", ptr_u32_ty.clone())
         .param("b", ptr_u32_ty.clone())
         .returns(bool_ty.clone())
@@ -389,7 +399,8 @@ fn build_eq_u64(builder: &mut HirBuilder) {
     let ptr_u64_ty = builder.ptr_type(u64_ty.clone());
     let bool_ty = builder.bool_type();
 
-    let func_id = builder.begin_function("eq_u64")
+    let func_id = builder
+        .begin_function("eq_u64")
         .param("a", ptr_u64_ty.clone())
         .param("b", ptr_u64_ty.clone())
         .returns(bool_ty.clone())
@@ -412,7 +423,8 @@ fn build_eq_bool(builder: &mut HirBuilder) {
     let bool_ty = builder.bool_type();
     let ptr_bool_ty = builder.ptr_type(bool_ty.clone());
 
-    let func_id = builder.begin_function("eq_bool")
+    let func_id = builder
+        .begin_function("eq_bool")
         .param("a", ptr_bool_ty.clone())
         .param("b", ptr_bool_ty.clone())
         .returns(bool_ty.clone())
@@ -436,7 +448,8 @@ fn build_eq_u8(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty.clone());
     let bool_ty = builder.bool_type();
 
-    let func_id = builder.begin_function("eq_u8")
+    let func_id = builder
+        .begin_function("eq_u8")
         .param("a", ptr_u8_ty.clone())
         .param("b", ptr_u8_ty.clone())
         .returns(bool_ty.clone())
@@ -479,7 +492,8 @@ fn build_hashmap_new(builder: &mut HirBuilder) {
         vec![ptr_bucket_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_generic_function("hashmap_new", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_new", vec!["K", "V"])
         .returns(hashmap_kv_ty.clone())
         .build();
 
@@ -519,10 +533,8 @@ fn build_hashmap_new(builder: &mut HirBuilder) {
 
     // Build struct: { buckets: buckets_ptr, len: 0, cap: 16 }
     let zero_len = builder.const_u64(0);
-    let hashmap_value = builder.create_struct(
-        hashmap_kv_ty,
-        vec![buckets_ptr, zero_len, initial_cap],
-    );
+    let hashmap_value =
+        builder.create_struct(hashmap_kv_ty, vec![buckets_ptr, zero_len, initial_cap]);
 
     builder.ret(hashmap_value);
 }
@@ -548,7 +560,8 @@ fn build_hashmap_with_capacity(builder: &mut HirBuilder) {
         vec![ptr_bucket_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_generic_function("hashmap_with_capacity", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_with_capacity", vec!["K", "V"])
         .param("capacity", usize_ty.clone())
         .returns(hashmap_kv_ty.clone())
         .build();
@@ -584,10 +597,7 @@ fn build_hashmap_with_capacity(builder: &mut HirBuilder) {
 
     // Build struct: { buckets: buckets_ptr, len: 0, cap: capacity }
     let zero_len = builder.const_u64(0);
-    let hashmap_value = builder.create_struct(
-        hashmap_kv_ty,
-        vec![buckets_ptr, zero_len, capacity],
-    );
+    let hashmap_value = builder.create_struct(hashmap_kv_ty, vec![buckets_ptr, zero_len, capacity]);
 
     builder.ret(hashmap_value);
 }
@@ -620,7 +630,8 @@ fn build_hashmap_resize(builder: &mut HirBuilder) {
     // Hash function type
     let hash_fn_ty = builder.function_type(vec![ptr_k_ty.clone()], u64_ty.clone());
 
-    let func_id = builder.begin_generic_function("hashmap_resize", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_resize", vec!["K", "V"])
         .param("map", ptr_hashmap_ty.clone())
         .param("hash_fn", hash_fn_ty)
         .returns(void_ty.clone())
@@ -836,7 +847,8 @@ fn build_hashmap_insert(builder: &mut HirBuilder) {
     // Equality function type: fn(*K, *K) -> bool
     let eq_fn_ty = builder.function_type(vec![ptr_k_ty.clone(), ptr_k_ty.clone()], bool_ty.clone());
 
-    let func_id = builder.begin_generic_function("hashmap_insert", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_insert", vec!["K", "V"])
         .param("map", ptr_hashmap_ty.clone())
         .param("key", k_param.clone())
         .param("value", v_param.clone())
@@ -971,7 +983,9 @@ fn build_hashmap_insert(builder: &mut HirBuilder) {
     let bucket_key_ptr = builder.get_element_ptr(bucket_ptr, 1, k_param.clone());
 
     // Call eq_fn(&input_key, &bucket_key)
-    let keys_equal = builder.call(eq_fn_param, vec![key_alloc, bucket_key_ptr]).unwrap();
+    let keys_equal = builder
+        .call(eq_fn_param, vec![key_alloc, bucket_key_ptr])
+        .unwrap();
 
     // If keys match, update the value; otherwise continue probing
     builder.cond_br(keys_equal, update_value, next_probe);
@@ -1052,10 +1066,7 @@ fn build_hashmap_get(builder: &mut HirBuilder) {
     let ptr_hashmap_ty = builder.ptr_type(hashmap_kv_ty.clone());
 
     // Option<V> = enum { None, Some(V) } = struct { tag: u8, value: V }
-    let option_v_ty = builder.struct_type(
-        Some("Option"),
-        vec![u8_ty.clone(), v_param.clone()],
-    );
+    let option_v_ty = builder.struct_type(Some("Option"), vec![u8_ty.clone(), v_param.clone()]);
 
     // Hash function type
     let hash_fn_ty = builder.function_type(vec![ptr_k_ty.clone()], u64_ty.clone());
@@ -1063,7 +1074,8 @@ fn build_hashmap_get(builder: &mut HirBuilder) {
     // Equality function type
     let eq_fn_ty = builder.function_type(vec![ptr_k_ty.clone(), ptr_k_ty.clone()], bool_ty.clone());
 
-    let func_id = builder.begin_generic_function("hashmap_get", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_get", vec!["K", "V"])
         .param("map", ptr_hashmap_ty.clone())
         .param("key", ptr_k_ty.clone())
         .param("hash_fn", hash_fn_ty)
@@ -1156,7 +1168,9 @@ fn build_hashmap_get(builder: &mut HirBuilder) {
     let bucket_key_ptr = builder.get_element_ptr(bucket_ptr, 1, k_param.clone());
 
     // Call eq_fn(search_key, bucket_key)
-    let keys_equal = builder.call(eq_fn_param, vec![key_param, bucket_key_ptr]).unwrap();
+    let keys_equal = builder
+        .call(eq_fn_param, vec![key_param, bucket_key_ptr])
+        .unwrap();
 
     // If keys match, return the value; otherwise continue probing
     builder.cond_br(keys_equal, found_value, next_probe);
@@ -1168,10 +1182,7 @@ fn build_hashmap_get(builder: &mut HirBuilder) {
     let value = builder.load(value_ptr, v_param.clone());
 
     // Build Option::Some(value) = { tag: 1, value: value }
-    let some_option = builder.create_struct(
-        option_v_ty.clone(),
-        vec![one_u8, value],
-    );
+    let some_option = builder.create_struct(option_v_ty.clone(), vec![one_u8, value]);
 
     builder.ret(some_option);
 
@@ -1191,10 +1202,7 @@ fn build_hashmap_get(builder: &mut HirBuilder) {
     // Build Option::None = { tag: 0, value: undefined }
     // We need a default value for V
     let zero_v = builder.unit_value(); // Placeholder - should use default for V
-    let none_option = builder.create_struct(
-        option_v_ty,
-        vec![zero_u8, zero_v],
-    );
+    let none_option = builder.create_struct(option_v_ty, vec![zero_u8, zero_v]);
 
     builder.ret(none_option);
 }
@@ -1218,7 +1226,8 @@ fn build_hashmap_len(builder: &mut HirBuilder) {
     );
     let ptr_hashmap_ty = builder.ptr_type(hashmap_kv_ty);
 
-    let func_id = builder.begin_generic_function("hashmap_len", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_len", vec!["K", "V"])
         .param("map", ptr_hashmap_ty)
         .returns(usize_ty.clone())
         .build();
@@ -1255,7 +1264,8 @@ fn build_hashmap_capacity(builder: &mut HirBuilder) {
     );
     let ptr_hashmap_ty = builder.ptr_type(hashmap_kv_ty);
 
-    let func_id = builder.begin_generic_function("hashmap_capacity", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_capacity", vec!["K", "V"])
         .param("map", ptr_hashmap_ty)
         .returns(usize_ty.clone())
         .build();
@@ -1298,7 +1308,8 @@ fn build_hashmap_contains_key(builder: &mut HirBuilder) {
     let hash_fn_ty = builder.function_type(vec![ptr_k_ty.clone()], u64_ty.clone());
     let eq_fn_ty = builder.function_type(vec![ptr_k_ty.clone(), ptr_k_ty.clone()], bool_ty.clone());
 
-    let func_id = builder.begin_generic_function("hashmap_contains_key", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_contains_key", vec!["K", "V"])
         .param("map", ptr_hashmap_ty)
         .param("key", ptr_k_ty.clone())
         .param("hash_fn", hash_fn_ty)
@@ -1383,7 +1394,9 @@ fn build_hashmap_contains_key(builder: &mut HirBuilder) {
     // found_key: Compare keys using eq_fn
     builder.set_insert_point(found_key);
     let bucket_key_ptr = builder.get_element_ptr(bucket_ptr, 1, k_param);
-    let keys_equal = builder.call(eq_fn_param, vec![key_param, bucket_key_ptr]).unwrap();
+    let keys_equal = builder
+        .call(eq_fn_param, vec![key_param, bucket_key_ptr])
+        .unwrap();
 
     // If keys match, return true; otherwise continue probing
     builder.cond_br(keys_equal, return_true, next_probe);
@@ -1432,7 +1445,8 @@ fn build_hashmap_remove(builder: &mut HirBuilder) {
     let hash_fn_ty = builder.function_type(vec![ptr_k_ty.clone()], u64_ty.clone());
     let eq_fn_ty = builder.function_type(vec![ptr_k_ty.clone(), ptr_k_ty.clone()], bool_ty.clone());
 
-    let func_id = builder.begin_generic_function("hashmap_remove", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_remove", vec!["K", "V"])
         .param("map", ptr_hashmap_ty.clone())
         .param("key", ptr_k_ty.clone())
         .param("hash_fn", hash_fn_ty)
@@ -1519,7 +1533,9 @@ fn build_hashmap_remove(builder: &mut HirBuilder) {
     builder.set_insert_point(compare_keys);
 
     let bucket_key_ptr = builder.get_element_ptr(bucket_ptr, 1, k_param.clone());
-    let keys_equal = builder.call(eq_fn_param, vec![key_param, bucket_key_ptr]).unwrap();
+    let keys_equal = builder
+        .call(eq_fn_param, vec![key_param, bucket_key_ptr])
+        .unwrap();
     builder.cond_br(keys_equal, found_key, next_probe);
 
     // found_key: Mark as tombstone and decrement len
@@ -1565,10 +1581,7 @@ fn build_hashmap_clear(builder: &mut HirBuilder) {
     let usize_ty = builder.u64_type();
     let void_ty = builder.void_type();
 
-    let bucket_kv_ty = builder.struct_type(
-        Some("Bucket"),
-        vec![u8_ty.clone(), k_param, v_param],
-    );
+    let bucket_kv_ty = builder.struct_type(Some("Bucket"), vec![u8_ty.clone(), k_param, v_param]);
     let ptr_bucket_ty = builder.ptr_type(bucket_kv_ty);
 
     let hashmap_kv_ty = builder.struct_type(
@@ -1577,7 +1590,8 @@ fn build_hashmap_clear(builder: &mut HirBuilder) {
     );
     let ptr_hashmap_ty = builder.ptr_type(hashmap_kv_ty);
 
-    let func_id = builder.begin_generic_function("hashmap_clear", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_clear", vec!["K", "V"])
         .param("map", ptr_hashmap_ty)
         .returns(void_ty.clone())
         .build();
@@ -1607,10 +1621,7 @@ fn build_hashmap_free(builder: &mut HirBuilder) {
     let usize_ty = builder.u64_type();
     let void_ty = builder.void_type();
 
-    let bucket_kv_ty = builder.struct_type(
-        Some("Bucket"),
-        vec![u8_ty.clone(), k_param, v_param],
-    );
+    let bucket_kv_ty = builder.struct_type(Some("Bucket"), vec![u8_ty.clone(), k_param, v_param]);
     let ptr_bucket_ty = builder.ptr_type(bucket_kv_ty);
 
     let hashmap_kv_ty = builder.struct_type(
@@ -1619,7 +1630,8 @@ fn build_hashmap_free(builder: &mut HirBuilder) {
     );
     let ptr_hashmap_ty = builder.ptr_type(hashmap_kv_ty);
 
-    let func_id = builder.begin_generic_function("hashmap_free", vec!["K", "V"])
+    let func_id = builder
+        .begin_generic_function("hashmap_free", vec!["K", "V"])
         .param("map", ptr_hashmap_ty)
         .returns(void_ty.clone())
         .build();
@@ -1666,7 +1678,9 @@ mod tests {
         assert_eq!(module.functions.len(), 6);
 
         // Verify function names
-        let func_names: Vec<String> = module.functions.iter()
+        let func_names: Vec<String> = module
+            .functions
+            .iter()
             .map(|(_, f)| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
@@ -1695,7 +1709,9 @@ mod tests {
         assert!(module.functions.len() >= 1);
 
         // Find hashmap_new
-        let (_, hashmap_new) = module.functions.iter()
+        let (_, hashmap_new) = module
+            .functions
+            .iter()
             .find(|(_, f)| arena.resolve_string(f.name) == Some("hashmap_new"))
             .expect("hashmap_new not found");
 
@@ -1724,7 +1740,9 @@ mod tests {
 
         let module = builder.finish();
 
-        let (_, hashmap_insert) = module.functions.iter()
+        let (_, hashmap_insert) = module
+            .functions
+            .iter()
             .find(|(_, f)| arena.resolve_string(f.name) == Some("hashmap_insert"))
             .expect("hashmap_insert not found");
 
@@ -1749,7 +1767,9 @@ mod tests {
 
         let module = builder.finish();
 
-        let (_, hashmap_get) = module.functions.iter()
+        let (_, hashmap_get) = module
+            .functions
+            .iter()
             .find(|(_, f)| arena.resolve_string(f.name) == Some("hashmap_get"))
             .expect("hashmap_get not found");
 
@@ -1773,21 +1793,28 @@ mod tests {
 
         let module = builder.finish();
 
-        let func_names: Vec<String> = module.functions.iter()
+        let func_names: Vec<String> = module
+            .functions
+            .iter()
             .map(|(_, f)| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
         // Count hash functions
-        let hash_count = func_names.iter()
+        let hash_count = func_names
+            .iter()
             .filter(|name| name.starts_with("hash_"))
             .count();
         assert_eq!(hash_count, 6, "Should have exactly 6 hash functions");
 
         // Count hashmap functions
-        let hashmap_count = func_names.iter()
+        let hashmap_count = func_names
+            .iter()
             .filter(|name| name.starts_with("hashmap_"))
             .count();
-        assert_eq!(hashmap_count, 11, "Should have exactly 11 hashmap functions");
+        assert_eq!(
+            hashmap_count, 11,
+            "Should have exactly 11 hashmap functions"
+        );
 
         // Verify specific hashmap functions exist
         assert!(func_names.contains(&"hashmap_new".to_string()));

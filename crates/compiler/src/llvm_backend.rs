@@ -14,23 +14,25 @@
 // 2. Tiered JIT: Optimize hot functions while keeping cold paths in Cranelift/VM
 // 3. Profile-guided optimization: Recompile based on runtime profiling
 
-use crate::{CompilerError, CompilerResult};
 use crate::hir::{
-    HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirType, HirConstant,
-    BinaryOp, UnaryOp, CastOp, HirCallable, HirValueKind, HirTerminator, HirPhi,
-    HirGlobal, HirVTable,
+    BinaryOp, CastOp, HirBlock, HirCallable, HirConstant, HirFunction, HirGlobal, HirId,
+    HirInstruction, HirModule, HirPhi, HirTerminator, HirType, HirVTable, HirValueKind, UnaryOp,
 };
+use crate::{CompilerError, CompilerResult};
+use indexmap::IndexMap;
 use inkwell::{
+    basic_block::BasicBlock,
     builder::Builder,
     context::Context,
     module::Module,
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType},
-    values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue, PhiValue, ValueKind},
-    basic_block::BasicBlock,
-    AddressSpace, IntPredicate, FloatPredicate,
-    AtomicOrdering as LLVMAtomicOrdering, AtomicRMWBinOp,
+    values::{
+        BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PhiValue, PointerValue,
+        ValueKind,
+    },
+    AddressSpace, AtomicOrdering as LLVMAtomicOrdering, AtomicRMWBinOp, FloatPredicate,
+    IntPredicate,
 };
-use indexmap::IndexMap;
 
 // Helper macro to convert inkwell errors to CompilerError
 macro_rules! llvm_try {
@@ -38,7 +40,6 @@ macro_rules! llvm_try {
         $expr.map_err(|e| CompilerError::CodeGen(format!("LLVM error: {}", e)))?
     };
 }
-
 
 /// Main LLVM backend compiler
 ///
@@ -108,7 +109,8 @@ impl<'ctx> LLVMBackend<'ctx> {
     pub fn register_symbol_signatures(&mut self, symbols: &[crate::zrtl::RuntimeSymbolInfo]) {
         for sym in symbols {
             if let Some(sig) = &sym.sig {
-                self.symbol_signatures.insert(sym.name.to_string(), sig.clone());
+                self.symbol_signatures
+                    .insert(sym.name.to_string(), sig.clone());
             }
         }
     }
@@ -183,7 +185,11 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// Declare a function signature without compiling its body
     ///
     /// This allows other functions to call this one before it's fully compiled.
-    fn declare_function(&mut self, id: HirId, func: &HirFunction) -> CompilerResult<FunctionValue<'ctx>> {
+    fn declare_function(
+        &mut self,
+        id: HirId,
+        func: &HirFunction,
+    ) -> CompilerResult<FunctionValue<'ctx>> {
         // Translate parameter types
         let param_types: Vec<BasicMetadataTypeEnum> = func
             .signature
@@ -202,7 +208,9 @@ impl<'ctx> LLVMBackend<'ctx> {
             return_type.fn_type(&param_types, false)
         } else {
             // Multiple return values - represent as struct (tuple)
-            let return_types: Vec<BasicTypeEnum> = func.signature.returns
+            let return_types: Vec<BasicTypeEnum> = func
+                .signature
+                .returns
                 .iter()
                 .map(|ty| self.translate_type(ty))
                 .collect::<CompilerResult<Vec<_>>>()?;
@@ -216,7 +224,9 @@ impl<'ctx> LLVMBackend<'ctx> {
         // - External functions (for linking with C libraries)
         // - Main function (for linker entry point in AOT compilation)
         // Otherwise use mangled name with HirId for internal functions
-        let actual_name = func.name.resolve_global()
+        let actual_name = func
+            .name
+            .resolve_global()
             .unwrap_or_else(|| format!("{:?}", func.name));
         let fn_name = if func.is_external || actual_name == "main" {
             actual_name
@@ -229,7 +239,10 @@ impl<'ctx> LLVMBackend<'ctx> {
         // Set parameter names (helps with debugging IR)
         for (i, param) in func.signature.params.iter().enumerate() {
             let param_name = format!("param_{}", i);
-            fn_value.get_nth_param(i as u32).unwrap().set_name(&param_name);
+            fn_value
+                .get_nth_param(i as u32)
+                .unwrap()
+                .set_name(&param_name);
         }
 
         // Store for later reference
@@ -252,8 +265,8 @@ impl<'ctx> LLVMBackend<'ctx> {
         // Clear block, value, and phi maps for this function
         self.block_map.clear();
         self.phi_map.clear();
-        self.value_map.clear();  // Clear value_map between functions
-        self.type_map.clear();   // Clear type_map between functions
+        self.value_map.clear(); // Clear value_map between functions
+        self.type_map.clear(); // Clear type_map between functions
 
         // Map function parameters to HIR value IDs and store their types
         for (i, param) in func.signature.params.iter().enumerate() {
@@ -331,21 +344,35 @@ impl<'ctx> LLVMBackend<'ctx> {
         // Now that all blocks are compiled and all values are in value_map,
         // we can add the incoming edges to phi nodes
         // Iterate in insertion order (IndexMap preserves this)
-        log::debug!("[LLVM] Phase 3: Adding phi incoming edges. value_map has {} entries", self.value_map.len());
+        log::debug!(
+            "[LLVM] Phase 3: Adding phi incoming edges. value_map has {} entries",
+            self.value_map.len()
+        );
 
         for (block_id, hir_block) in func.blocks.iter() {
             for phi in &hir_block.phis {
-                log::debug!("[LLVM] Processing phi {:?} in block {:?}", phi.result, block_id);
+                log::debug!(
+                    "[LLVM] Processing phi {:?} in block {:?}",
+                    phi.result,
+                    block_id
+                );
                 if let Some(phi_value) = self.phi_map.get(&phi.result) {
                     // Iterate phi incoming in original order (preserved by data structure)
                     for (value_id, pred_block_id) in &phi.incoming {
-                        log::debug!("[LLVM]   incoming: value={:?} from block={:?}", value_id, pred_block_id);
+                        log::debug!(
+                            "[LLVM]   incoming: value={:?} from block={:?}",
+                            value_id,
+                            pred_block_id
+                        );
                         let incoming_value = self.get_value(*value_id)?;
                         log::debug!("[LLVM]     resolved to: {:?}", incoming_value);
-                        let incoming_block = self.block_map.get(pred_block_id)
-                            .ok_or_else(|| CompilerError::CodeGen(
-                                format!("Phi node references unknown block: {:?}", pred_block_id)
-                            ))?;
+                        let incoming_block =
+                            self.block_map.get(pred_block_id).ok_or_else(|| {
+                                CompilerError::CodeGen(format!(
+                                    "Phi node references unknown block: {:?}",
+                                    pred_block_id
+                                ))
+                            })?;
                         phi_value.add_incoming(&[(&incoming_value, *incoming_block)]);
                     }
                 }
@@ -383,7 +410,9 @@ impl<'ctx> LLVMBackend<'ctx> {
             // The struct is { i32, [N x i8] }
             let i32_type = self.context.i32_type();
             let byte_array_type = self.context.i8_type().array_type(bytes.len() as u32);
-            let haxe_string_type = self.context.struct_type(&[i32_type.into(), byte_array_type.into()], false);
+            let haxe_string_type = self
+                .context
+                .struct_type(&[i32_type.into(), byte_array_type.into()], false);
 
             // Create the length constant
             let length_const = i32_type.const_int(length as u64, false);
@@ -392,14 +421,20 @@ impl<'ctx> LLVMBackend<'ctx> {
             let byte_const = self.context.const_string(bytes, false);
 
             // Create the struct constant
-            let haxe_string_const = haxe_string_type.const_named_struct(&[length_const.into(), byte_const.into()]);
+            let haxe_string_const =
+                haxe_string_type.const_named_struct(&[length_const.into(), byte_const.into()]);
 
-            let global_value = self.module.add_global(haxe_string_type, Some(AddressSpace::default()), &global_name);
+            let global_value = self.module.add_global(
+                haxe_string_type,
+                Some(AddressSpace::default()),
+                &global_name,
+            );
             global_value.set_linkage(inkwell::module::Linkage::External);
             global_value.set_initializer(&haxe_string_const);
 
             // Store the pointer to the global (address of the Haxe string struct)
-            self.globals_map.insert(id, global_value.as_pointer_value().into());
+            self.globals_map
+                .insert(id, global_value.as_pointer_value().into());
             return Ok(());
         }
 
@@ -407,7 +442,9 @@ impl<'ctx> LLVMBackend<'ctx> {
         let llvm_ty = self.translate_type(&global.ty)?;
 
         // Add global variable to module
-        let global_value = self.module.add_global(llvm_ty, Some(AddressSpace::default()), &global_name);
+        let global_value =
+            self.module
+                .add_global(llvm_ty, Some(AddressSpace::default()), &global_name);
 
         // Set linkage (export for now - could be internal for private globals)
         global_value.set_linkage(inkwell::module::Linkage::External);
@@ -425,7 +462,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                     let func_ptr = func_value.as_global_value().as_pointer_value();
                     func_ptrs.push(func_ptr);
                 } else {
-                    eprintln!("WARNING: Vtable method function {:?} not found", method_entry.function_id);
+                    eprintln!(
+                        "WARNING: Vtable method function {:?} not found",
+                        method_entry.function_id
+                    );
                     // Use null pointer as fallback
                     func_ptrs.push(ptr_type.const_null());
                 }
@@ -441,7 +481,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                     global_value.set_initializer(&const_value);
                 }
                 Err(e) => {
-                    eprintln!("WARNING: Failed to compile global initializer for {:?}: {}", id, e);
+                    eprintln!(
+                        "WARNING: Failed to compile global initializer for {:?}: {}",
+                        id, e
+                    );
                     // Fall back to zero initializer
                     global_value.set_initializer(&llvm_ty.const_zero());
                 }
@@ -452,14 +495,18 @@ impl<'ctx> LLVMBackend<'ctx> {
         }
 
         // Store the global in globals_map so it can be referenced across functions
-        self.globals_map.insert(id, global_value.as_pointer_value().into());
+        self.globals_map
+            .insert(id, global_value.as_pointer_value().into());
 
         Ok(())
     }
 
     /// Compile a basic block (instructions only, no terminator)
     fn compile_block(&mut self, block: &HirBlock) -> CompilerResult<()> {
-        log::debug!("[LLVM] compile_block: {} instructions", block.instructions.len());
+        log::debug!(
+            "[LLVM] compile_block: {} instructions",
+            block.instructions.len()
+        );
         for instruction in &block.instructions {
             log::debug!("[LLVM]   inst: {:?}", std::mem::discriminant(instruction));
             self.compile_instruction(instruction)?;
@@ -474,8 +521,12 @@ impl<'ctx> LLVMBackend<'ctx> {
         block: &HirBlock,
         function: &HirFunction,
     ) -> CompilerResult<()> {
-        log::debug!("[LLVM] compile_block_with_terminator: block={:?}, {} phis, {} instructions",
-                   block_id, block.phis.len(), block.instructions.len());
+        log::debug!(
+            "[LLVM] compile_block_with_terminator: block={:?}, {} phis, {} instructions",
+            block_id,
+            block.phis.len(),
+            block.instructions.len()
+        );
 
         // Compile phi nodes first
         for phi in &block.phis {
@@ -507,7 +558,8 @@ impl<'ctx> LLVMBackend<'ctx> {
         // Store the phi value in both maps:
         // - value_map: so other instructions can use it
         // - phi_map: so we can add incoming edges later (Phase 3)
-        self.value_map.insert(phi.result, phi_value.as_basic_value());
+        self.value_map
+            .insert(phi.result, phi_value.as_basic_value());
         self.phi_map.insert(phi.result, phi_value);
 
         // Note: Incoming edges will be added in Phase 3 of compile_function
@@ -535,77 +587,107 @@ impl<'ctx> LLVMBackend<'ctx> {
                     // Get the function's return type (should be a struct)
                     let fn_value = self.current_function.expect("No current function");
                     let fn_type = fn_value.get_type();
-                    let return_type = fn_type.get_return_type()
+                    let return_type = fn_type
+                        .get_return_type()
                         .expect("Function should have a return type");
 
                     // Build the struct value
                     let mut tuple_value = return_type.into_struct_type().get_undef();
                     for (i, val) in return_values.iter().enumerate() {
-                        tuple_value = self.builder.build_insert_value(
-                            tuple_value,
-                            *val,
-                            i as u32,
-                            &format!("tuple_field_{}", i)
-                        )?.into_struct_value();
+                        tuple_value = self
+                            .builder
+                            .build_insert_value(
+                                tuple_value,
+                                *val,
+                                i as u32,
+                                &format!("tuple_field_{}", i),
+                            )?
+                            .into_struct_value();
                     }
 
-                    self.builder.build_return(Some(&tuple_value.as_basic_value_enum()))?;
+                    self.builder
+                        .build_return(Some(&tuple_value.as_basic_value_enum()))?;
                 }
             }
 
             HirTerminator::Branch { target } => {
-                let target_block = self.block_map.get(target)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("Branch target block not found: {:?}", target)
-                    ))?;
+                let target_block = self.block_map.get(target).ok_or_else(|| {
+                    CompilerError::CodeGen(format!("Branch target block not found: {:?}", target))
+                })?;
                 self.builder.build_unconditional_branch(*target_block)?;
             }
 
-            HirTerminator::CondBranch { condition, true_target, false_target } => {
+            HirTerminator::CondBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
                 let cond = self.get_value(*condition)?;
-                let true_block = self.block_map.get(true_target)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("True branch target block not found: {:?}", true_target)
-                    ))?;
-                let false_block = self.block_map.get(false_target)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("False branch target block not found: {:?}", false_target)
-                    ))?;
+                let true_block = self.block_map.get(true_target).ok_or_else(|| {
+                    CompilerError::CodeGen(format!(
+                        "True branch target block not found: {:?}",
+                        true_target
+                    ))
+                })?;
+                let false_block = self.block_map.get(false_target).ok_or_else(|| {
+                    CompilerError::CodeGen(format!(
+                        "False branch target block not found: {:?}",
+                        false_target
+                    ))
+                })?;
                 self.builder.build_conditional_branch(
                     cond.into_int_value(),
                     *true_block,
-                    *false_block
+                    *false_block,
                 )?;
             }
 
-            HirTerminator::Switch { value, default, cases } => {
+            HirTerminator::Switch {
+                value,
+                default,
+                cases,
+            } => {
                 let switch_val = self.get_value(*value)?;
-                let default_block = self.block_map.get(default)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("Switch default block not found: {:?}", default)
-                    ))?;
+                let default_block = self.block_map.get(default).ok_or_else(|| {
+                    CompilerError::CodeGen(format!("Switch default block not found: {:?}", default))
+                })?;
 
                 // Build switch instruction with all cases at once
-                let case_values: Vec<_> = cases.iter()
+                let case_values: Vec<_> = cases
+                    .iter()
                     .map(|(const_val, target)| {
-                        let target_block = self.block_map.get(target)
-                            .ok_or_else(|| CompilerError::CodeGen(
-                                format!("Switch case target block not found: {:?}", target)
-                            ))?;
+                        let target_block = self.block_map.get(target).ok_or_else(|| {
+                            CompilerError::CodeGen(format!(
+                                "Switch case target block not found: {:?}",
+                                target
+                            ))
+                        })?;
 
                         // Convert HIR constant to LLVM constant
                         let llvm_const = match const_val {
                             HirConstant::I8(v) => self.context.i8_type().const_int(*v as u64, true),
-                            HirConstant::I16(v) => self.context.i16_type().const_int(*v as u64, true),
-                            HirConstant::I32(v) => self.context.i32_type().const_int(*v as u64, true),
-                            HirConstant::I64(v) => self.context.i64_type().const_int(*v as u64, true),
-                            HirConstant::U8(v) => self.context.i8_type().const_int(*v as u64, false),
-                            HirConstant::U16(v) => self.context.i16_type().const_int(*v as u64, false),
-                            HirConstant::U32(v) => self.context.i32_type().const_int(*v as u64, false),
+                            HirConstant::I16(v) => {
+                                self.context.i16_type().const_int(*v as u64, true)
+                            }
+                            HirConstant::I32(v) => {
+                                self.context.i32_type().const_int(*v as u64, true)
+                            }
+                            HirConstant::I64(v) => {
+                                self.context.i64_type().const_int(*v as u64, true)
+                            }
+                            HirConstant::U8(v) => {
+                                self.context.i8_type().const_int(*v as u64, false)
+                            }
+                            HirConstant::U16(v) => {
+                                self.context.i16_type().const_int(*v as u64, false)
+                            }
+                            HirConstant::U32(v) => {
+                                self.context.i32_type().const_int(*v as u64, false)
+                            }
                             HirConstant::U64(v) => self.context.i64_type().const_int(*v, false),
                             _ => {
                                 return Err(CompilerError::CodeGen(
-                                    "Switch cases must be integer constants".to_string()
+                                    "Switch cases must be integer constants".to_string(),
                                 ));
                             }
                         };
@@ -617,7 +699,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.builder.build_switch(
                     switch_val.into_int_value(),
                     *default_block,
-                    &case_values
+                    &case_values,
                 )?;
             }
 
@@ -650,31 +732,46 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
 
-            HirTerminator::PatternMatch { value, patterns, default } => {
+            HirTerminator::PatternMatch {
+                value,
+                patterns,
+                default,
+            } => {
                 // Pattern matching is lowered to a switch for now
                 // Extract constant patterns
                 let switch_val = self.get_value(*value)?;
 
-                let default_target = default.ok_or_else(|| CompilerError::CodeGen(
-                    "PatternMatch requires a default target".to_string()
-                ))?;
+                let default_target = default.ok_or_else(|| {
+                    CompilerError::CodeGen("PatternMatch requires a default target".to_string())
+                })?;
 
-                let default_block = self.block_map.get(&default_target)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("Pattern match default block not found: {:?}", default_target)
-                    ))?;
+                let default_block = self.block_map.get(&default_target).ok_or_else(|| {
+                    CompilerError::CodeGen(format!(
+                        "Pattern match default block not found: {:?}",
+                        default_target
+                    ))
+                })?;
 
                 // Build switch with pattern cases
-                let pattern_cases: Vec<_> = patterns.iter()
+                let pattern_cases: Vec<_> = patterns
+                    .iter()
                     .filter_map(|pattern| {
                         if let crate::hir::HirPatternKind::Constant(ref const_val) = pattern.kind {
                             let target_block = self.block_map.get(&pattern.target)?;
 
                             let llvm_const = match const_val {
-                                HirConstant::I8(v) => self.context.i8_type().const_int(*v as u64, true),
-                                HirConstant::I16(v) => self.context.i16_type().const_int(*v as u64, true),
-                                HirConstant::I32(v) => self.context.i32_type().const_int(*v as u64, true),
-                                HirConstant::I64(v) => self.context.i64_type().const_int(*v as u64, true),
+                                HirConstant::I8(v) => {
+                                    self.context.i8_type().const_int(*v as u64, true)
+                                }
+                                HirConstant::I16(v) => {
+                                    self.context.i16_type().const_int(*v as u64, true)
+                                }
+                                HirConstant::I32(v) => {
+                                    self.context.i32_type().const_int(*v as u64, true)
+                                }
+                                HirConstant::I64(v) => {
+                                    self.context.i64_type().const_int(*v as u64, true)
+                                }
                                 _ => return None, // Skip non-integer patterns for now
                             };
 
@@ -688,14 +785,15 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.builder.build_switch(
                     switch_val.into_int_value(),
                     *default_block,
-                    &pattern_cases
+                    &pattern_cases,
                 )?;
             }
 
             _ => {
-                return Err(CompilerError::CodeGen(
-                    format!("Terminator not yet implemented: {:?}", terminator)
-                ));
+                return Err(CompilerError::CodeGen(format!(
+                    "Terminator not yet implemented: {:?}",
+                    terminator
+                )));
             }
         }
 
@@ -706,7 +804,13 @@ impl<'ctx> LLVMBackend<'ctx> {
     fn compile_instruction(&mut self, instruction: &HirInstruction) -> CompilerResult<()> {
         match instruction {
             // ========== Arithmetic & Logic ==========
-            HirInstruction::Binary { result, op, ty: _, left, right } => {
+            HirInstruction::Binary {
+                result,
+                op,
+                ty: _,
+                left,
+                right,
+            } => {
                 log::debug!("[LLVM] compile_instruction: Binary op={:?}, result={:?}, left={:?}, right={:?}", op, result, left, right);
                 let left_val = self.get_value(*left)?;
                 log::debug!("[LLVM]   left_val = {:?}", left_val);
@@ -718,27 +822,40 @@ impl<'ctx> LLVMBackend<'ctx> {
                 log::debug!("[LLVM]   inserted result={:?} into value_map", result);
             }
 
-            HirInstruction::Unary { result, op, ty: _, operand } => {
+            HirInstruction::Unary {
+                result,
+                op,
+                ty: _,
+                operand,
+            } => {
                 let operand_val = self.get_value(*operand)?;
                 let result_val = self.compile_unary_op(*op, operand_val)?;
                 self.value_map.insert(*result, result_val);
             }
 
-            HirInstruction::Select { result, ty, condition, true_val, false_val } => {
+            HirInstruction::Select {
+                result,
+                ty,
+                condition,
+                true_val,
+                false_val,
+            } => {
                 let cond = self.get_value(*condition)?;
                 let true_v = self.get_value(*true_val)?;
                 let false_v = self.get_value(*false_val)?;
-                let selected = self.builder.build_select(
-                    cond.into_int_value(),
-                    true_v,
-                    false_v,
-                    "select"
-                )?;
+                let selected =
+                    self.builder
+                        .build_select(cond.into_int_value(), true_v, false_v, "select")?;
                 self.value_map.insert(*result, selected);
             }
 
             // ========== Type Conversions ==========
-            HirInstruction::Cast { result, ty, op, operand } => {
+            HirInstruction::Cast {
+                result,
+                ty,
+                op,
+                operand,
+            } => {
                 let operand_val = self.get_value(*operand)?;
                 let target_ty = self.translate_type(ty)?;
                 let casted = self.compile_cast(*op, operand_val, target_ty)?;
@@ -746,7 +863,14 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
 
             // ========== Function Calls ==========
-            HirInstruction::Call { result, callee, args, type_args: _, const_args: _, is_tail: _ } => {
+            HirInstruction::Call {
+                result,
+                callee,
+                args,
+                type_args: _,
+                const_args: _,
+                is_tail: _,
+            } => {
                 let result_val = self.compile_call(callee, args)?;
                 if let Some(res_id) = result {
                     self.value_map.insert(*res_id, result_val);
@@ -754,7 +878,13 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
 
             // ========== Memory Operations ==========
-            HirInstruction::Load { result, ty, ptr, align: _, volatile: _ } => {
+            HirInstruction::Load {
+                result,
+                ty,
+                ptr,
+                align: _,
+                volatile: _,
+            } => {
                 let addr = self.get_value(*ptr)?;
                 let ptr_val = addr.into_pointer_value();
                 let llvm_ty = self.translate_type(ty)?;
@@ -762,29 +892,49 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.value_map.insert(*result, loaded);
             }
 
-            HirInstruction::Store { value, ptr, align: _, volatile: _ } => {
+            HirInstruction::Store {
+                value,
+                ptr,
+                align: _,
+                volatile: _,
+            } => {
                 let addr = self.get_value(*ptr)?;
                 let val = self.get_value(*value)?;
                 let ptr_val = addr.into_pointer_value();
                 self.builder.build_store(ptr_val, val)?;
             }
 
-            HirInstruction::Alloca { result, ty, count, align: _ } => {
+            HirInstruction::Alloca {
+                result,
+                ty,
+                count,
+                align: _,
+            } => {
                 let llvm_ty = self.translate_type(ty)?;
                 let alloca = if let Some(count_id) = count {
                     // Array allocation
                     let count_val = self.get_value(*count_id)?;
-                    self.builder.build_array_alloca(llvm_ty, count_val.into_int_value(), "array_alloca")?
+                    self.builder.build_array_alloca(
+                        llvm_ty,
+                        count_val.into_int_value(),
+                        "array_alloca",
+                    )?
                 } else {
                     // Single value allocation
                     self.builder.build_alloca(llvm_ty, "alloca")?
                 };
                 self.value_map.insert(*result, alloca.into());
                 // Record the type as a pointer to the allocated type
-                self.type_map.insert(*result, HirType::Ptr(Box::new(ty.clone())));
+                self.type_map
+                    .insert(*result, HirType::Ptr(Box::new(ty.clone())));
             }
 
-            HirInstruction::GetElementPtr { result, ty, ptr, indices } => {
+            HirInstruction::GetElementPtr {
+                result,
+                ty,
+                ptr,
+                indices,
+            } => {
                 let ptr_val = self.get_value(*ptr)?;
                 let llvm_ty = self.translate_type(ty)?;
 
@@ -800,14 +950,19 @@ impl<'ctx> LLVMBackend<'ctx> {
                         llvm_ty,
                         ptr_val.into_pointer_value(),
                         &index_values,
-                        "gep"
+                        "gep",
                     )?
                 };
                 self.value_map.insert(*result, gep_result.into());
             }
 
             // ========== Aggregate Operations ==========
-            HirInstruction::ExtractValue { result, ty, aggregate, indices } => {
+            HirInstruction::ExtractValue {
+                result,
+                ty,
+                aggregate,
+                indices,
+            } => {
                 let agg_value = self.get_value(*aggregate)?;
 
                 // Extract value from struct or array using chained extraction
@@ -815,7 +970,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // apply it iteratively for nested access
                 if indices.is_empty() {
                     return Err(CompilerError::CodeGen(
-                        "ExtractValue requires at least one index".to_string()
+                        "ExtractValue requires at least one index".to_string(),
                     ));
                 }
 
@@ -846,25 +1001,22 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                     // Build GEP indices: first index is always 0 to dereference the pointer
                     // then follow with the struct field indices
-                    let mut gep_indices: Vec<inkwell::values::IntValue> = vec![
-                        self.context.i32_type().const_int(0, false)
-                    ];
+                    let mut gep_indices: Vec<inkwell::values::IntValue> =
+                        vec![self.context.i32_type().const_int(0, false)];
                     for &idx in indices {
                         gep_indices.push(self.context.i32_type().const_int(idx as u64, false));
                     }
 
                     // GEP to get address of the field
                     let field_ptr = unsafe {
-                        self.builder.build_gep(
-                            pointee_type,
-                            ptr,
-                            &gep_indices,
-                            "field_ptr"
-                        )?
+                        self.builder
+                            .build_gep(pointee_type, ptr, &gep_indices, "field_ptr")?
                     };
 
                     // Load the field value using the result type
-                    let loaded = self.builder.build_load(result_ty, field_ptr, "field_load")?;
+                    let loaded = self
+                        .builder
+                        .build_load(result_ty, field_ptr, "field_load")?;
                     self.value_map.insert(*result, loaded);
                 } else {
                     // Original behavior: work on value types
@@ -880,25 +1032,24 @@ impl<'ctx> LLVMBackend<'ctx> {
                         };
 
                         // Try to extract from struct
-                        if let Ok(struct_val) = TryInto::<inkwell::values::StructValue>::try_into(current_value) {
-                            let extracted = self.builder.build_extract_value(
-                                struct_val,
-                                index,
-                                name
-                            )?;
+                        if let Ok(struct_val) =
+                            TryInto::<inkwell::values::StructValue>::try_into(current_value)
+                        {
+                            let extracted =
+                                self.builder.build_extract_value(struct_val, index, name)?;
                             current_value = extracted.as_basic_value_enum();
-                        } else if let Ok(array_val) = TryInto::<inkwell::values::ArrayValue>::try_into(current_value) {
+                        } else if let Ok(array_val) =
+                            TryInto::<inkwell::values::ArrayValue>::try_into(current_value)
+                        {
                             // For arrays, we can also use extract_value
-                            let extracted = self.builder.build_extract_value(
-                                array_val,
-                                index,
-                                name
-                            )?;
+                            let extracted =
+                                self.builder.build_extract_value(array_val, index, name)?;
                             current_value = extracted.as_basic_value_enum();
                         } else {
-                            return Err(CompilerError::CodeGen(
-                                format!("ExtractValue can only be used on struct or array types, got: {:?}", current_value.get_type())
-                            ));
+                            return Err(CompilerError::CodeGen(format!(
+                                "ExtractValue can only be used on struct or array types, got: {:?}",
+                                current_value.get_type()
+                            )));
                         }
                     }
 
@@ -906,13 +1057,19 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
 
-            HirInstruction::InsertValue { result, ty, aggregate, value, indices } => {
+            HirInstruction::InsertValue {
+                result,
+                ty,
+                aggregate,
+                value,
+                indices,
+            } => {
                 let current_agg = self.get_value(*aggregate)?;
                 let val = self.get_value(*value)?;
 
                 if indices.is_empty() {
                     return Err(CompilerError::CodeGen(
-                        "InsertValue requires at least one index".to_string()
+                        "InsertValue requires at least one index".to_string(),
                     ));
                 }
 
@@ -924,21 +1081,16 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                     // Build GEP indices: first index is always 0 to dereference the pointer
                     // then follow with the struct field indices
-                    let mut gep_indices: Vec<inkwell::values::IntValue> = vec![
-                        self.context.i32_type().const_int(0, false)
-                    ];
+                    let mut gep_indices: Vec<inkwell::values::IntValue> =
+                        vec![self.context.i32_type().const_int(0, false)];
                     for &idx in indices {
                         gep_indices.push(self.context.i32_type().const_int(idx as u64, false));
                     }
 
                     // GEP to get address of the field
                     let field_ptr = unsafe {
-                        self.builder.build_gep(
-                            llvm_ty,
-                            ptr,
-                            &gep_indices,
-                            "field_ptr"
-                        )?
+                        self.builder
+                            .build_gep(llvm_ty, ptr, &gep_indices, "field_ptr")?
                     };
 
                     // Store the value
@@ -948,26 +1100,24 @@ impl<'ctx> LLVMBackend<'ctx> {
                     self.value_map.insert(*result, current_agg);
                 } else if indices.len() == 1 {
                     // Simple case: single-level insertion on a value
-                    let inserted = if let Ok(struct_val) = TryInto::<inkwell::values::StructValue>::try_into(current_agg) {
-                        self.builder.build_insert_value(
-                            struct_val,
-                            val,
-                            indices[0],
-                            "insert"
-                        )?
-                    } else if let Ok(array_val) = TryInto::<inkwell::values::ArrayValue>::try_into(current_agg) {
-                        self.builder.build_insert_value(
-                            array_val,
-                            val,
-                            indices[0],
-                            "insert"
-                        )?
+                    let inserted = if let Ok(struct_val) =
+                        TryInto::<inkwell::values::StructValue>::try_into(current_agg)
+                    {
+                        self.builder
+                            .build_insert_value(struct_val, val, indices[0], "insert")?
+                    } else if let Ok(array_val) =
+                        TryInto::<inkwell::values::ArrayValue>::try_into(current_agg)
+                    {
+                        self.builder
+                            .build_insert_value(array_val, val, indices[0], "insert")?
                     } else {
-                        return Err(CompilerError::CodeGen(
-                            format!("InsertValue can only be used on struct or array types, got: {:?}", current_agg.get_type())
-                        ));
+                        return Err(CompilerError::CodeGen(format!(
+                            "InsertValue can only be used on struct or array types, got: {:?}",
+                            current_agg.get_type()
+                        )));
                     };
-                    self.value_map.insert(*result, inserted.as_basic_value_enum());
+                    self.value_map
+                        .insert(*result, inserted.as_basic_value_enum());
                 } else {
                     // Nested insertion: extract nested aggregate, insert value, then insert back
                     let mut extracted_path = Vec::new();
@@ -975,49 +1125,59 @@ impl<'ctx> LLVMBackend<'ctx> {
                     // Extract the nested aggregate at all indices except the last
                     let mut nested_agg = current_agg;
                     for &index in &indices[..indices.len() - 1] {
-                        if let Ok(struct_val) = TryInto::<inkwell::values::StructValue>::try_into(nested_agg) {
+                        if let Ok(struct_val) =
+                            TryInto::<inkwell::values::StructValue>::try_into(nested_agg)
+                        {
                             let extracted = self.builder.build_extract_value(
                                 struct_val,
                                 index,
-                                "nested_extract_for_insert"
+                                "nested_extract_for_insert",
                             )?;
                             extracted_path.push(index);
                             nested_agg = extracted.as_basic_value_enum();
-                        } else if let Ok(array_val) = TryInto::<inkwell::values::ArrayValue>::try_into(nested_agg) {
+                        } else if let Ok(array_val) =
+                            TryInto::<inkwell::values::ArrayValue>::try_into(nested_agg)
+                        {
                             let extracted = self.builder.build_extract_value(
                                 array_val,
                                 index,
-                                "nested_extract_for_insert"
+                                "nested_extract_for_insert",
                             )?;
                             extracted_path.push(index);
                             nested_agg = extracted.as_basic_value_enum();
                         } else {
-                            return Err(CompilerError::CodeGen(
-                                format!("Nested InsertValue path contains non-aggregate type: {:?}", nested_agg.get_type())
-                            ));
+                            return Err(CompilerError::CodeGen(format!(
+                                "Nested InsertValue path contains non-aggregate type: {:?}",
+                                nested_agg.get_type()
+                            )));
                         }
                     }
 
                     // Insert the value at the final index in the nested aggregate
                     let final_index = indices[indices.len() - 1];
-                    let modified_nested = if let Ok(struct_val) = TryInto::<inkwell::values::StructValue>::try_into(nested_agg) {
+                    let modified_nested = if let Ok(struct_val) =
+                        TryInto::<inkwell::values::StructValue>::try_into(nested_agg)
+                    {
                         self.builder.build_insert_value(
                             struct_val,
                             val,
                             final_index,
-                            "nested_insert"
+                            "nested_insert",
                         )?
-                    } else if let Ok(array_val) = TryInto::<inkwell::values::ArrayValue>::try_into(nested_agg) {
+                    } else if let Ok(array_val) =
+                        TryInto::<inkwell::values::ArrayValue>::try_into(nested_agg)
+                    {
                         self.builder.build_insert_value(
                             array_val,
                             val,
                             final_index,
-                            "nested_insert"
+                            "nested_insert",
                         )?
                     } else {
-                        return Err(CompilerError::CodeGen(
-                            format!("Cannot insert into non-aggregate type: {:?}", nested_agg.get_type())
-                        ));
+                        return Err(CompilerError::CodeGen(format!(
+                            "Cannot insert into non-aggregate type: {:?}",
+                            nested_agg.get_type()
+                        )));
                     };
 
                     // Now insert the modified nested aggregate back into the original
@@ -1034,41 +1194,53 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Extract up to this depth
                         let mut temp_agg = current_agg;
                         for &idx in &extracted_path[..depth] {
-                            if let Ok(struct_val) = TryInto::<inkwell::values::StructValue>::try_into(temp_agg) {
+                            if let Ok(struct_val) =
+                                TryInto::<inkwell::values::StructValue>::try_into(temp_agg)
+                            {
                                 let extracted = self.builder.build_extract_value(
                                     struct_val,
                                     idx,
-                                    "rebuild_extract"
+                                    "rebuild_extract",
                                 )?;
                                 temp_agg = extracted.as_basic_value_enum();
-                            } else if let Ok(array_val) = TryInto::<inkwell::values::ArrayValue>::try_into(temp_agg) {
+                            } else if let Ok(array_val) =
+                                TryInto::<inkwell::values::ArrayValue>::try_into(temp_agg)
+                            {
                                 let extracted = self.builder.build_extract_value(
                                     array_val,
                                     idx,
-                                    "rebuild_extract"
+                                    "rebuild_extract",
                                 )?;
                                 temp_agg = extracted.as_basic_value_enum();
                             }
                         }
 
                         // Insert the current value at this index
-                        current_value = if let Ok(struct_val) = TryInto::<inkwell::values::StructValue>::try_into(temp_agg) {
-                            self.builder.build_insert_value(
-                                struct_val,
-                                current_value,
-                                index,
-                                &format!("rebuild_insert_{}", depth)
-                            )?.as_basic_value_enum()
-                        } else if let Ok(array_val) = TryInto::<inkwell::values::ArrayValue>::try_into(temp_agg) {
-                            self.builder.build_insert_value(
-                                array_val,
-                                current_value,
-                                index,
-                                &format!("rebuild_insert_{}", depth)
-                            )?.as_basic_value_enum()
+                        current_value = if let Ok(struct_val) =
+                            TryInto::<inkwell::values::StructValue>::try_into(temp_agg)
+                        {
+                            self.builder
+                                .build_insert_value(
+                                    struct_val,
+                                    current_value,
+                                    index,
+                                    &format!("rebuild_insert_{}", depth),
+                                )?
+                                .as_basic_value_enum()
+                        } else if let Ok(array_val) =
+                            TryInto::<inkwell::values::ArrayValue>::try_into(temp_agg)
+                        {
+                            self.builder
+                                .build_insert_value(
+                                    array_val,
+                                    current_value,
+                                    index,
+                                    &format!("rebuild_insert_{}", depth),
+                                )?
+                                .as_basic_value_enum()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "InsertValue rebuild failed: non-aggregate type".to_string()
+                                "InsertValue rebuild failed: non-aggregate type".to_string(),
                             ));
                         };
                     }
@@ -1078,7 +1250,14 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
 
             // ========== Atomic Operations ==========
-            HirInstruction::Atomic { op, result, ty, ptr, value, ordering } => {
+            HirInstruction::Atomic {
+                op,
+                result,
+                ty,
+                ptr,
+                value,
+                ordering,
+            } => {
                 // Atomic operations with proper LLVM support
                 let ptr_val = self.get_value(*ptr)?.into_pointer_value();
                 let llvm_ty = self.translate_type(ty)?;
@@ -1089,7 +1268,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                     crate::hir::AtomicOrdering::Acquire => LLVMAtomicOrdering::Acquire,
                     crate::hir::AtomicOrdering::Release => LLVMAtomicOrdering::Release,
                     crate::hir::AtomicOrdering::AcqRel => LLVMAtomicOrdering::AcquireRelease,
-                    crate::hir::AtomicOrdering::SeqCst => LLVMAtomicOrdering::SequentiallyConsistent,
+                    crate::hir::AtomicOrdering::SeqCst => {
+                        LLVMAtomicOrdering::SequentiallyConsistent
+                    }
                 };
 
                 let atomic_result = match op {
@@ -1100,7 +1281,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                             self.builder.build_load(int_ty, ptr_val, "atomic_load")?
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "Atomic load requires integer type".to_string()
+                                "Atomic load requires integer type".to_string(),
                             ));
                         }
                     }
@@ -1113,7 +1294,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                             val
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicStore requires a value".to_string()
+                                "AtomicStore requires a value".to_string(),
                             ));
                         }
                     }
@@ -1121,15 +1302,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Atomic exchange using LLVM's atomicrmw xchg
                         if let Some(val_id) = value {
                             let val = self.get_value(*val_id)?.into_int_value();
-                            self.builder.build_atomicrmw(
-                                AtomicRMWBinOp::Xchg,
-                                ptr_val,
-                                val,
-                                llvm_ordering
-                            )?.into()
+                            self.builder
+                                .build_atomicrmw(AtomicRMWBinOp::Xchg, ptr_val, val, llvm_ordering)?
+                                .into()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicExchange requires a value".to_string()
+                                "AtomicExchange requires a value".to_string(),
                             ));
                         }
                     }
@@ -1137,15 +1315,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Atomic add
                         if let Some(val_id) = value {
                             let val = self.get_value(*val_id)?.into_int_value();
-                            self.builder.build_atomicrmw(
-                                AtomicRMWBinOp::Add,
-                                ptr_val,
-                                val,
-                                llvm_ordering
-                            )?.into()
+                            self.builder
+                                .build_atomicrmw(AtomicRMWBinOp::Add, ptr_val, val, llvm_ordering)?
+                                .into()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicAdd requires a value".to_string()
+                                "AtomicAdd requires a value".to_string(),
                             ));
                         }
                     }
@@ -1153,15 +1328,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Atomic sub
                         if let Some(val_id) = value {
                             let val = self.get_value(*val_id)?.into_int_value();
-                            self.builder.build_atomicrmw(
-                                AtomicRMWBinOp::Sub,
-                                ptr_val,
-                                val,
-                                llvm_ordering
-                            )?.into()
+                            self.builder
+                                .build_atomicrmw(AtomicRMWBinOp::Sub, ptr_val, val, llvm_ordering)?
+                                .into()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicSub requires a value".to_string()
+                                "AtomicSub requires a value".to_string(),
                             ));
                         }
                     }
@@ -1169,15 +1341,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Atomic and
                         if let Some(val_id) = value {
                             let val = self.get_value(*val_id)?.into_int_value();
-                            self.builder.build_atomicrmw(
-                                AtomicRMWBinOp::And,
-                                ptr_val,
-                                val,
-                                llvm_ordering
-                            )?.into()
+                            self.builder
+                                .build_atomicrmw(AtomicRMWBinOp::And, ptr_val, val, llvm_ordering)?
+                                .into()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicAnd requires a value".to_string()
+                                "AtomicAnd requires a value".to_string(),
                             ));
                         }
                     }
@@ -1185,15 +1354,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Atomic or
                         if let Some(val_id) = value {
                             let val = self.get_value(*val_id)?.into_int_value();
-                            self.builder.build_atomicrmw(
-                                AtomicRMWBinOp::Or,
-                                ptr_val,
-                                val,
-                                llvm_ordering
-                            )?.into()
+                            self.builder
+                                .build_atomicrmw(AtomicRMWBinOp::Or, ptr_val, val, llvm_ordering)?
+                                .into()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicOr requires a value".to_string()
+                                "AtomicOr requires a value".to_string(),
                             ));
                         }
                     }
@@ -1201,15 +1367,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Atomic xor
                         if let Some(val_id) = value {
                             let val = self.get_value(*val_id)?.into_int_value();
-                            self.builder.build_atomicrmw(
-                                AtomicRMWBinOp::Xor,
-                                ptr_val,
-                                val,
-                                llvm_ordering
-                            )?.into()
+                            self.builder
+                                .build_atomicrmw(AtomicRMWBinOp::Xor, ptr_val, val, llvm_ordering)?
+                                .into()
                         } else {
                             return Err(CompilerError::CodeGen(
-                                "AtomicXor requires a value".to_string()
+                                "AtomicXor requires a value".to_string(),
                             ));
                         }
                     }
@@ -1218,7 +1381,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                         // Current HIR has single value field - architecture limitation
                         // FUTURE: Extend HIR instruction for compare-exchange
                         return Err(CompilerError::CodeGen(
-                            "CompareExchange not yet implemented - requires HIR extension".to_string()
+                            "CompareExchange not yet implemented - requires HIR extension"
+                                .to_string(),
                         ));
                     }
                 };
@@ -1233,7 +1397,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                     crate::hir::AtomicOrdering::Acquire => LLVMAtomicOrdering::Acquire,
                     crate::hir::AtomicOrdering::Release => LLVMAtomicOrdering::Release,
                     crate::hir::AtomicOrdering::AcqRel => LLVMAtomicOrdering::AcquireRelease,
-                    crate::hir::AtomicOrdering::SeqCst => LLVMAtomicOrdering::SequentiallyConsistent,
+                    crate::hir::AtomicOrdering::SeqCst => {
+                        LLVMAtomicOrdering::SequentiallyConsistent
+                    }
                 };
 
                 // Build fence instruction
@@ -1241,7 +1407,12 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
 
             // ========== Union Type Operations ==========
-            HirInstruction::CreateUnion { result, union_ty: _, variant_index, value } => {
+            HirInstruction::CreateUnion {
+                result,
+                union_ty: _,
+                variant_index,
+                value,
+            } => {
                 // Create a tagged union value
                 // Union layout: 16 bytes (4 bytes discriminant + 12 bytes data)
                 // This matches Cranelift's implementation for backend parity
@@ -1249,40 +1420,39 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Create union type: struct { i32 discriminant, [12 x i8] data }
                 let i32_type = self.context.i32_type();
                 let data_array_type = self.context.i8_type().array_type(12);
-                let union_type = self.context.struct_type(
-                    &[i32_type.into(), data_array_type.into()],
-                    false
-                );
+                let union_type = self
+                    .context
+                    .struct_type(&[i32_type.into(), data_array_type.into()], false);
 
                 // Allocate space for the union on the stack
                 let union_alloca = self.builder.build_alloca(union_type, "union")?;
 
                 // Store the discriminant at offset 0
-                let discriminant = self.context.i32_type().const_int(*variant_index as u64, false);
+                let discriminant = self
+                    .context
+                    .i32_type()
+                    .const_int(*variant_index as u64, false);
                 let discriminant_ptr = self.builder.build_struct_gep(
                     union_type,
                     union_alloca,
                     0,
-                    "union_discriminant_ptr"
+                    "union_discriminant_ptr",
                 )?;
                 self.builder.build_store(discriminant_ptr, discriminant)?;
 
                 // Store the value at offset 4 (in the data field)
                 // We need to bitcast the data field pointer to the value's type
                 let value_val = self.get_value(*value)?;
-                let data_ptr = self.builder.build_struct_gep(
-                    union_type,
-                    union_alloca,
-                    1,
-                    "union_data_ptr"
-                )?;
+                let data_ptr =
+                    self.builder
+                        .build_struct_gep(union_type, union_alloca, 1, "union_data_ptr")?;
 
                 // Cast data pointer to the value's type pointer and store
                 let value_type = value_val.get_type();
                 let typed_data_ptr = self.builder.build_pointer_cast(
                     data_ptr,
                     value_type.ptr_type(AddressSpace::default()),
-                    "typed_data_ptr"
+                    "typed_data_ptr",
                 )?;
                 self.builder.build_store(typed_data_ptr, value_val)?;
 
@@ -1297,48 +1467,46 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Union type for GEP
                 let i32_type = self.context.i32_type();
                 let data_array_type = self.context.i8_type().array_type(12);
-                let union_type = self.context.struct_type(
-                    &[i32_type.into(), data_array_type.into()],
-                    false
-                );
+                let union_type = self
+                    .context
+                    .struct_type(&[i32_type.into(), data_array_type.into()], false);
 
                 // Get pointer to discriminant field
                 let discriminant_ptr = self.builder.build_struct_gep(
                     union_type,
                     union_ptr,
                     0,
-                    "union_discriminant_ptr"
+                    "union_discriminant_ptr",
                 )?;
 
                 // Load the discriminant value
-                let discriminant = self.builder.build_load(
-                    i32_type,
-                    discriminant_ptr,
-                    "union_discriminant"
-                )?;
+                let discriminant =
+                    self.builder
+                        .build_load(i32_type, discriminant_ptr, "union_discriminant")?;
 
                 self.value_map.insert(*result, discriminant);
             }
 
-            HirInstruction::ExtractUnionValue { result, ty, union_val, variant_index: _ } => {
+            HirInstruction::ExtractUnionValue {
+                result,
+                ty,
+                union_val,
+                variant_index: _,
+            } => {
                 // Extract value from union variant (unsafe - assumes correct variant)
                 let union_ptr = self.get_value(*union_val)?.into_pointer_value();
 
                 // Union type for GEP
                 let i32_type = self.context.i32_type();
                 let data_array_type = self.context.i8_type().array_type(12);
-                let union_type = self.context.struct_type(
-                    &[i32_type.into(), data_array_type.into()],
-                    false
-                );
+                let union_type = self
+                    .context
+                    .struct_type(&[i32_type.into(), data_array_type.into()], false);
 
                 // Get pointer to data field (offset 4, after discriminant)
-                let data_ptr = self.builder.build_struct_gep(
-                    union_type,
-                    union_ptr,
-                    1,
-                    "union_data_ptr"
-                )?;
+                let data_ptr =
+                    self.builder
+                        .build_struct_gep(union_type, union_ptr, 1, "union_data_ptr")?;
 
                 // Translate the target type
                 let llvm_ty = self.translate_type(ty)?;
@@ -1347,20 +1515,23 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let typed_data_ptr = self.builder.build_pointer_cast(
                     data_ptr,
                     llvm_ty.ptr_type(AddressSpace::default()),
-                    "typed_data_ptr"
+                    "typed_data_ptr",
                 )?;
 
-                let value = self.builder.build_load(
-                    llvm_ty,
-                    typed_data_ptr,
-                    "union_value"
-                )?;
+                let value = self
+                    .builder
+                    .build_load(llvm_ty, typed_data_ptr, "union_value")?;
 
                 self.value_map.insert(*result, value);
             }
 
             // ========== Closure Operations ==========
-            HirInstruction::CreateClosure { result, closure_ty: _, function, captures } => {
+            HirInstruction::CreateClosure {
+                result,
+                closure_ty: _,
+                function,
+                captures,
+            } => {
                 // Create a closure with function pointer and captured environment
                 // Closure layout: { fn_ptr: *(), captures... }
                 // Simplified: 8 bytes for fn_ptr + 8 bytes per capture
@@ -1380,19 +1551,20 @@ impl<'ctx> LLVMBackend<'ctx> {
                 if let Some(&llvm_func) = self.functions.get(function) {
                     // Get function pointer
                     let func_ptr = llvm_func.as_global_value().as_pointer_value();
-                    let func_ptr_as_i64 = self.builder.build_ptr_to_int(
-                        func_ptr,
-                        i64_type,
-                        "fn_ptr_int"
-                    )?;
+                    let func_ptr_as_i64 =
+                        self.builder
+                            .build_ptr_to_int(func_ptr, i64_type, "fn_ptr_int")?;
 
                     // Store at slot 0 using GEP
                     let fn_slot_ptr = unsafe {
                         self.builder.build_in_bounds_gep(
                             closure_type,
                             closure_alloca,
-                            &[self.context.i32_type().const_zero(), self.context.i32_type().const_zero()],
-                            "fn_slot"
+                            &[
+                                self.context.i32_type().const_zero(),
+                                self.context.i32_type().const_zero(),
+                            ],
+                            "fn_slot",
                         )?
                     };
                     self.builder.build_store(fn_slot_ptr, func_ptr_as_i64)?;
@@ -1403,8 +1575,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                         self.builder.build_in_bounds_gep(
                             closure_type,
                             closure_alloca,
-                            &[self.context.i32_type().const_zero(), self.context.i32_type().const_zero()],
-                            "fn_slot"
+                            &[
+                                self.context.i32_type().const_zero(),
+                                self.context.i32_type().const_zero(),
+                            ],
+                            "fn_slot",
                         )?
                     };
                     self.builder.build_store(fn_slot_ptr, null_i64)?;
@@ -1417,7 +1592,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                         let capture_as_i64 = if capture_val.is_int_value() {
                             let int_val = capture_val.into_int_value();
                             if int_val.get_type().get_bit_width() < 64 {
-                                self.builder.build_int_z_extend(int_val, i64_type, "capture_ext")?
+                                self.builder
+                                    .build_int_z_extend(int_val, i64_type, "capture_ext")?
                             } else {
                                 int_val
                             }
@@ -1425,7 +1601,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                             self.builder.build_ptr_to_int(
                                 capture_val.into_pointer_value(),
                                 i64_type,
-                                "capture_ptr_int"
+                                "capture_ptr_int",
                             )?
                         } else {
                             // For other types, store as bitcast (simplified)
@@ -1439,9 +1615,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                                 closure_alloca,
                                 &[
                                     self.context.i32_type().const_zero(),
-                                    self.context.i32_type().const_int((i + 1) as u64, false)
+                                    self.context.i32_type().const_int((i + 1) as u64, false),
                                 ],
-                                &format!("capture_slot_{}", i)
+                                &format!("capture_slot_{}", i),
                             )?
                         };
                         self.builder.build_store(capture_slot_ptr, capture_as_i64)?;
@@ -1452,7 +1628,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.value_map.insert(*result, closure_alloca.into());
             }
 
-            HirInstruction::CallClosure { result, closure, args } => {
+            HirInstruction::CallClosure {
+                result,
+                closure,
+                args,
+            } => {
                 // Call a closure through its function pointer
                 // Closure layout: { fn_ptr: *(), captures... }
 
@@ -1469,15 +1649,20 @@ impl<'ctx> LLVMBackend<'ctx> {
                     self.builder.build_in_bounds_gep(
                         closure_type,
                         closure_ptr,
-                        &[self.context.i32_type().const_zero(), self.context.i32_type().const_zero()],
-                        "fn_slot"
+                        &[
+                            self.context.i32_type().const_zero(),
+                            self.context.i32_type().const_zero(),
+                        ],
+                        "fn_slot",
                     )?
                 };
-                let fn_ptr_int = self.builder.build_load(i64_type, fn_slot_ptr, "fn_ptr_int")?;
+                let fn_ptr_int = self
+                    .builder
+                    .build_load(i64_type, fn_slot_ptr, "fn_ptr_int")?;
                 let fn_ptr = self.builder.build_int_to_ptr(
                     fn_ptr_int.into_int_value(),
                     ptr_type,
-                    "fn_ptr"
+                    "fn_ptr",
                 )?;
 
                 // Build argument list: closure pointer (for environment) + actual args
@@ -1502,7 +1687,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     fn_type,
                     fn_ptr,
                     &call_args,
-                    "closure_call"
+                    "closure_call",
                 )?;
 
                 // Store result if needed
@@ -1516,7 +1701,12 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
 
             // ========== Trait Objects ==========
-            HirInstruction::CreateTraitObject { result, trait_id, data_ptr, vtable_id } => {
+            HirInstruction::CreateTraitObject {
+                result,
+                trait_id,
+                data_ptr,
+                vtable_id,
+            } => {
                 // Create trait object as fat pointer: { *data, *vtable }
                 // This matches Cranelift's implementation for backend parity
 
@@ -1525,93 +1715,151 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                 // Create a struct type for the fat pointer (two pointers)
                 let ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-                let fat_ptr_type = self.context.struct_type(&[ptr_type.into(), ptr_type.into()], false);
+                let fat_ptr_type = self
+                    .context
+                    .struct_type(&[ptr_type.into(), ptr_type.into()], false);
 
                 // Allocate space for fat pointer on stack
                 let fat_ptr_alloca = self.builder.build_alloca(fat_ptr_type, "trait_obj")?;
 
                 // Store data pointer at field 0
-                let data_field_ptr = self.builder.build_struct_gep(fat_ptr_type, fat_ptr_alloca, 0, "data_field")?;
+                let data_field_ptr =
+                    self.builder
+                        .build_struct_gep(fat_ptr_type, fat_ptr_alloca, 0, "data_field")?;
                 self.builder.build_store(data_field_ptr, data_ptr_val)?;
 
                 // Store vtable pointer at field 1
-                let vtable_field_ptr = self.builder.build_struct_gep(fat_ptr_type, fat_ptr_alloca, 1, "vtable_field")?;
+                let vtable_field_ptr = self.builder.build_struct_gep(
+                    fat_ptr_type,
+                    fat_ptr_alloca,
+                    1,
+                    "vtable_field",
+                )?;
                 self.builder.build_store(vtable_field_ptr, vtable_ptr_val)?;
 
                 // Return the fat pointer (as pointer to struct)
                 self.value_map.insert(*result, fat_ptr_alloca.into());
             }
 
-            HirInstruction::UpcastTraitObject { result, sub_trait_object, sub_trait_id, super_trait_id, super_vtable_id } => {
+            HirInstruction::UpcastTraitObject {
+                result,
+                sub_trait_object,
+                sub_trait_id,
+                super_trait_id,
+                super_vtable_id,
+            } => {
                 // Upcast trait object: extract data pointer from sub-trait, combine with super-trait vtable
                 // Fat pointer layout: struct { *data, *vtable }
 
                 let ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-                let fat_ptr_type = self.context.struct_type(&[ptr_type.into(), ptr_type.into()], false);
+                let fat_ptr_type = self
+                    .context
+                    .struct_type(&[ptr_type.into(), ptr_type.into()], false);
 
                 // Step 1: Get sub-trait fat pointer
-                let sub_trait_fat_ptr = self.get_value(*sub_trait_object)?
-                    .into_pointer_value();
+                let sub_trait_fat_ptr = self.get_value(*sub_trait_object)?.into_pointer_value();
 
                 // Step 2: Extract data pointer from sub-trait object (field 0)
-                let data_field_ptr = self.builder.build_struct_gep(fat_ptr_type, sub_trait_fat_ptr, 0, "data_field")?;
-                let data_ptr = self.builder.build_load(ptr_type, data_field_ptr, "data_ptr")?;
+                let data_field_ptr = self.builder.build_struct_gep(
+                    fat_ptr_type,
+                    sub_trait_fat_ptr,
+                    0,
+                    "data_field",
+                )?;
+                let data_ptr = self
+                    .builder
+                    .build_load(ptr_type, data_field_ptr, "data_ptr")?;
 
                 // Step 3: Get super-trait vtable pointer
                 let super_vtable_ptr = self.get_value(*super_vtable_id)?;
 
                 // Step 4: Allocate space for new super-trait fat pointer on stack
-                let super_trait_fat_ptr_alloca = self.builder.build_alloca(fat_ptr_type, "super_trait_obj")?;
+                let super_trait_fat_ptr_alloca =
+                    self.builder.build_alloca(fat_ptr_type, "super_trait_obj")?;
 
                 // Step 5: Store data pointer at field 0 (same as sub-trait)
-                let super_data_field_ptr = self.builder.build_struct_gep(fat_ptr_type, super_trait_fat_ptr_alloca, 0, "super_data_field")?;
+                let super_data_field_ptr = self.builder.build_struct_gep(
+                    fat_ptr_type,
+                    super_trait_fat_ptr_alloca,
+                    0,
+                    "super_data_field",
+                )?;
                 self.builder.build_store(super_data_field_ptr, data_ptr)?;
 
                 // Step 6: Store super-trait vtable pointer at field 1
-                let super_vtable_field_ptr = self.builder.build_struct_gep(fat_ptr_type, super_trait_fat_ptr_alloca, 1, "super_vtable_field")?;
-                self.builder.build_store(super_vtable_field_ptr, super_vtable_ptr)?;
+                let super_vtable_field_ptr = self.builder.build_struct_gep(
+                    fat_ptr_type,
+                    super_trait_fat_ptr_alloca,
+                    1,
+                    "super_vtable_field",
+                )?;
+                self.builder
+                    .build_store(super_vtable_field_ptr, super_vtable_ptr)?;
 
                 // Return the new fat pointer
-                self.value_map.insert(*result, super_trait_fat_ptr_alloca.into());
+                self.value_map
+                    .insert(*result, super_trait_fat_ptr_alloca.into());
             }
 
-            HirInstruction::TraitMethodCall { result, trait_object, method_index, method_sig, args, return_ty } => {
+            HirInstruction::TraitMethodCall {
+                result,
+                trait_object,
+                method_index,
+                method_sig,
+                args,
+                return_ty,
+            } => {
                 // Dynamic dispatch: call method on trait object
                 // Fat pointer layout: struct { *data, *vtable }
 
                 let ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-                let fat_ptr_type = self.context.struct_type(&[ptr_type.into(), ptr_type.into()], false);
+                let fat_ptr_type = self
+                    .context
+                    .struct_type(&[ptr_type.into(), ptr_type.into()], false);
 
                 // Get fat pointer (trait object)
-                let fat_ptr = self.get_value(*trait_object)?
-                    .into_pointer_value();
+                let fat_ptr = self.get_value(*trait_object)?.into_pointer_value();
 
                 // Step 1: Load data pointer from fat_ptr.field[0]
-                let data_field_ptr = self.builder.build_struct_gep(fat_ptr_type, fat_ptr, 0, "data_field")?;
-                let data_ptr = self.builder.build_load(ptr_type, data_field_ptr, "data_ptr")?
+                let data_field_ptr =
+                    self.builder
+                        .build_struct_gep(fat_ptr_type, fat_ptr, 0, "data_field")?;
+                let data_ptr = self
+                    .builder
+                    .build_load(ptr_type, data_field_ptr, "data_ptr")?
                     .into_pointer_value();
 
                 // Step 2: Load vtable pointer from fat_ptr.field[1]
-                let vtable_field_ptr = self.builder.build_struct_gep(fat_ptr_type, fat_ptr, 1, "vtable_field")?;
-                let vtable_ptr = self.builder.build_load(ptr_type, vtable_field_ptr, "vtable_ptr")?
+                let vtable_field_ptr =
+                    self.builder
+                        .build_struct_gep(fat_ptr_type, fat_ptr, 1, "vtable_field")?;
+                let vtable_ptr = self
+                    .builder
+                    .build_load(ptr_type, vtable_field_ptr, "vtable_ptr")?
                     .into_pointer_value();
 
                 // Step 3: Load function pointer from vtable[method_index]
                 // Vtable is an array of function pointers
-                let method_index_val = self.context.i32_type().const_int(*method_index as u64, false);
+                let method_index_val = self
+                    .context
+                    .i32_type()
+                    .const_int(*method_index as u64, false);
                 let func_ptr_ptr = unsafe {
                     self.builder.build_gep(
                         ptr_type,
                         vtable_ptr,
                         &[method_index_val],
-                        "func_ptr_ptr"
+                        "func_ptr_ptr",
                     )?
                 };
-                let func_ptr = self.builder.build_load(ptr_type, func_ptr_ptr, "func_ptr")?
+                let func_ptr = self
+                    .builder
+                    .build_load(ptr_type, func_ptr_ptr, "func_ptr")?
                     .into_pointer_value();
 
                 // Step 4: Build arguments: prepend self (data_ptr) to args
-                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![data_ptr.into()];
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+                    vec![data_ptr.into()];
                 for arg_id in args {
                     let arg_val = self.get_value(*arg_id)?;
                     call_args.push(arg_val.into());
@@ -1619,7 +1867,8 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                 // Step 5: Create function type for indirect call
                 // First parameter is always self (data pointer)
-                let mut param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![ptr_type.into()]; // self
+                let mut param_types: Vec<inkwell::types::BasicMetadataTypeEnum> =
+                    vec![ptr_type.into()]; // self
 
                 // Translate actual parameter types from method signature
                 for param_ty in &method_sig.params {
@@ -1645,7 +1894,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let typed_func_ptr = self.builder.build_pointer_cast(
                     func_ptr,
                     func_type.ptr_type(AddressSpace::default()),
-                    "typed_func_ptr"
+                    "typed_func_ptr",
                 )?;
 
                 // Step 7: Perform indirect call
@@ -1653,7 +1902,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     func_type,
                     typed_func_ptr,
                     &call_args,
-                    "trait_method_call"
+                    "trait_method_call",
                 )?;
 
                 // Step 8: Get return value if non-void
@@ -1665,9 +1914,10 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
 
             _ => {
-                return Err(CompilerError::CodeGen(
-                    format!("Instruction not yet implemented: {:?}", instruction)
-                ));
+                return Err(CompilerError::CodeGen(format!(
+                    "Instruction not yet implemented: {:?}",
+                    instruction
+                )));
             }
         }
         Ok(())
@@ -1686,306 +1936,291 @@ impl<'ctx> LLVMBackend<'ctx> {
             // Integer arithmetic
             Add => {
                 if left.is_int_value() {
-                    self.builder.build_int_add(
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "add"
-                    )?.into()
+                    self.builder
+                        .build_int_add(left.into_int_value(), right.into_int_value(), "add")?
+                        .into()
                 } else {
-                    self.builder.build_float_add(
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fadd"
-                    )?.into()
+                    self.builder
+                        .build_float_add(left.into_float_value(), right.into_float_value(), "fadd")?
+                        .into()
                 }
             }
             Sub => {
                 if left.is_int_value() {
-                    self.builder.build_int_sub(
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "sub"
-                    )?.into()
+                    self.builder
+                        .build_int_sub(left.into_int_value(), right.into_int_value(), "sub")?
+                        .into()
                 } else {
-                    self.builder.build_float_sub(
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fsub"
-                    )?.into()
+                    self.builder
+                        .build_float_sub(left.into_float_value(), right.into_float_value(), "fsub")?
+                        .into()
                 }
             }
             Mul => {
                 if left.is_int_value() {
-                    self.builder.build_int_mul(
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "mul"
-                    )?.into()
+                    self.builder
+                        .build_int_mul(left.into_int_value(), right.into_int_value(), "mul")?
+                        .into()
                 } else {
-                    self.builder.build_float_mul(
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fmul"
-                    )?.into()
+                    self.builder
+                        .build_float_mul(left.into_float_value(), right.into_float_value(), "fmul")?
+                        .into()
                 }
             }
             Div => {
                 if left.is_int_value() {
-                    self.builder.build_int_signed_div(
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "div"
-                    )?.into()
+                    self.builder
+                        .build_int_signed_div(left.into_int_value(), right.into_int_value(), "div")?
+                        .into()
                 } else {
-                    self.builder.build_float_div(
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fdiv"
-                    )?.into()
+                    self.builder
+                        .build_float_div(left.into_float_value(), right.into_float_value(), "fdiv")?
+                        .into()
                 }
             }
             Rem => {
                 if left.is_int_value() {
-                    self.builder.build_int_signed_rem(
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "rem"
-                    )?.into()
+                    self.builder
+                        .build_int_signed_rem(left.into_int_value(), right.into_int_value(), "rem")?
+                        .into()
                 } else {
-                    self.builder.build_float_rem(
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "frem"
-                    )?.into()
+                    self.builder
+                        .build_float_rem(left.into_float_value(), right.into_float_value(), "frem")?
+                        .into()
                 }
             }
 
             // Bitwise operations
-            And => {
-                self.builder.build_and(
-                    left.into_int_value(),
-                    right.into_int_value(),
-                    "and"
-                )?.into()
-            }
-            Or => {
-                self.builder.build_or(
-                    left.into_int_value(),
-                    right.into_int_value(),
-                    "or"
-                )?.into()
-            }
-            Xor => {
-                self.builder.build_xor(
-                    left.into_int_value(),
-                    right.into_int_value(),
-                    "xor"
-                )?.into()
-            }
-            Shl => {
-                self.builder.build_left_shift(
-                    left.into_int_value(),
-                    right.into_int_value(),
-                    "shl"
-                )?.into()
-            }
+            And => self
+                .builder
+                .build_and(left.into_int_value(), right.into_int_value(), "and")?
+                .into(),
+            Or => self
+                .builder
+                .build_or(left.into_int_value(), right.into_int_value(), "or")?
+                .into(),
+            Xor => self
+                .builder
+                .build_xor(left.into_int_value(), right.into_int_value(), "xor")?
+                .into(),
+            Shl => self
+                .builder
+                .build_left_shift(left.into_int_value(), right.into_int_value(), "shl")?
+                .into(),
             Shr => {
-                self.builder.build_right_shift(
-                    left.into_int_value(),
-                    right.into_int_value(),
-                    true,  // arithmetic shift (sign-extend)
-                    "shr"
-                )?.into()
+                self.builder
+                    .build_right_shift(
+                        left.into_int_value(),
+                        right.into_int_value(),
+                        true, // arithmetic shift (sign-extend)
+                        "shr",
+                    )?
+                    .into()
             }
 
             // Comparison operations
             Eq => {
                 if left.is_int_value() {
-                    self.builder.build_int_compare(
-                        IntPredicate::EQ,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "eq"
-                    )?.into()
+                    self.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            left.into_int_value(),
+                            right.into_int_value(),
+                            "eq",
+                        )?
+                        .into()
                 } else {
-                    self.builder.build_float_compare(
-                        FloatPredicate::OEQ,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "feq"
-                    )?.into()
+                    self.builder
+                        .build_float_compare(
+                            FloatPredicate::OEQ,
+                            left.into_float_value(),
+                            right.into_float_value(),
+                            "feq",
+                        )?
+                        .into()
                 }
             }
             Ne => {
                 if left.is_int_value() {
-                    self.builder.build_int_compare(
-                        IntPredicate::NE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "ne"
-                    )?.into()
+                    self.builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            left.into_int_value(),
+                            right.into_int_value(),
+                            "ne",
+                        )?
+                        .into()
                 } else {
-                    self.builder.build_float_compare(
-                        FloatPredicate::ONE,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fne"
-                    )?.into()
+                    self.builder
+                        .build_float_compare(
+                            FloatPredicate::ONE,
+                            left.into_float_value(),
+                            right.into_float_value(),
+                            "fne",
+                        )?
+                        .into()
                 }
             }
             Lt => {
                 if left.is_int_value() {
-                    self.builder.build_int_compare(
-                        IntPredicate::SLT,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "lt"
-                    )?.into()
+                    self.builder
+                        .build_int_compare(
+                            IntPredicate::SLT,
+                            left.into_int_value(),
+                            right.into_int_value(),
+                            "lt",
+                        )?
+                        .into()
                 } else {
-                    self.builder.build_float_compare(
-                        FloatPredicate::OLT,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "flt"
-                    )?.into()
+                    self.builder
+                        .build_float_compare(
+                            FloatPredicate::OLT,
+                            left.into_float_value(),
+                            right.into_float_value(),
+                            "flt",
+                        )?
+                        .into()
                 }
             }
             Le => {
                 if left.is_int_value() {
-                    self.builder.build_int_compare(
-                        IntPredicate::SLE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "le"
-                    )?.into()
+                    self.builder
+                        .build_int_compare(
+                            IntPredicate::SLE,
+                            left.into_int_value(),
+                            right.into_int_value(),
+                            "le",
+                        )?
+                        .into()
                 } else {
-                    self.builder.build_float_compare(
-                        FloatPredicate::OLE,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fle"
-                    )?.into()
+                    self.builder
+                        .build_float_compare(
+                            FloatPredicate::OLE,
+                            left.into_float_value(),
+                            right.into_float_value(),
+                            "fle",
+                        )?
+                        .into()
                 }
             }
             Gt => {
                 if left.is_int_value() {
-                    self.builder.build_int_compare(
-                        IntPredicate::SGT,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "gt"
-                    )?.into()
+                    self.builder
+                        .build_int_compare(
+                            IntPredicate::SGT,
+                            left.into_int_value(),
+                            right.into_int_value(),
+                            "gt",
+                        )?
+                        .into()
                 } else {
-                    self.builder.build_float_compare(
-                        FloatPredicate::OGT,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fgt"
-                    )?.into()
+                    self.builder
+                        .build_float_compare(
+                            FloatPredicate::OGT,
+                            left.into_float_value(),
+                            right.into_float_value(),
+                            "fgt",
+                        )?
+                        .into()
                 }
             }
             Ge => {
                 if left.is_int_value() {
-                    self.builder.build_int_compare(
-                        IntPredicate::SGE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "ge"
-                    )?.into()
+                    self.builder
+                        .build_int_compare(
+                            IntPredicate::SGE,
+                            left.into_int_value(),
+                            right.into_int_value(),
+                            "ge",
+                        )?
+                        .into()
                 } else {
-                    self.builder.build_float_compare(
-                        FloatPredicate::OGE,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "fge"
-                    )?.into()
+                    self.builder
+                        .build_float_compare(
+                            FloatPredicate::OGE,
+                            left.into_float_value(),
+                            right.into_float_value(),
+                            "fge",
+                        )?
+                        .into()
                 }
             }
 
             // Explicit floating-point operations (for when type is already known)
-            FAdd => {
-                self.builder.build_float_add(
-                    left.into_float_value(),
-                    right.into_float_value(),
-                    "fadd"
-                )?.into()
-            }
-            FSub => {
-                self.builder.build_float_sub(
-                    left.into_float_value(),
-                    right.into_float_value(),
-                    "fsub"
-                )?.into()
-            }
-            FMul => {
-                self.builder.build_float_mul(
-                    left.into_float_value(),
-                    right.into_float_value(),
-                    "fmul"
-                )?.into()
-            }
-            FDiv => {
-                self.builder.build_float_div(
-                    left.into_float_value(),
-                    right.into_float_value(),
-                    "fdiv"
-                )?.into()
-            }
-            FRem => {
-                self.builder.build_float_rem(
-                    left.into_float_value(),
-                    right.into_float_value(),
-                    "frem"
-                )?.into()
-            }
-            FEq => {
-                self.builder.build_float_compare(
+            FAdd => self
+                .builder
+                .build_float_add(left.into_float_value(), right.into_float_value(), "fadd")?
+                .into(),
+            FSub => self
+                .builder
+                .build_float_sub(left.into_float_value(), right.into_float_value(), "fsub")?
+                .into(),
+            FMul => self
+                .builder
+                .build_float_mul(left.into_float_value(), right.into_float_value(), "fmul")?
+                .into(),
+            FDiv => self
+                .builder
+                .build_float_div(left.into_float_value(), right.into_float_value(), "fdiv")?
+                .into(),
+            FRem => self
+                .builder
+                .build_float_rem(left.into_float_value(), right.into_float_value(), "frem")?
+                .into(),
+            FEq => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::OEQ,
                     left.into_float_value(),
                     right.into_float_value(),
-                    "feq"
-                )?.into()
-            }
-            FNe => {
-                self.builder.build_float_compare(
+                    "feq",
+                )?
+                .into(),
+            FNe => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::ONE,
                     left.into_float_value(),
                     right.into_float_value(),
-                    "fne"
-                )?.into()
-            }
-            FLt => {
-                self.builder.build_float_compare(
+                    "fne",
+                )?
+                .into(),
+            FLt => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::OLT,
                     left.into_float_value(),
                     right.into_float_value(),
-                    "flt"
-                )?.into()
-            }
-            FLe => {
-                self.builder.build_float_compare(
+                    "flt",
+                )?
+                .into(),
+            FLe => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::OLE,
                     left.into_float_value(),
                     right.into_float_value(),
-                    "fle"
-                )?.into()
-            }
-            FGt => {
-                self.builder.build_float_compare(
+                    "fle",
+                )?
+                .into(),
+            FGt => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::OGT,
                     left.into_float_value(),
                     right.into_float_value(),
-                    "fgt"
-                )?.into()
-            }
-            FGe => {
-                self.builder.build_float_compare(
+                    "fgt",
+                )?
+                .into(),
+            FGe => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::OGE,
                     left.into_float_value(),
                     right.into_float_value(),
-                    "fge"
-                )?.into()
-            }
+                    "fge",
+                )?
+                .into(),
         };
 
         Ok(result)
@@ -2002,17 +2237,23 @@ impl<'ctx> LLVMBackend<'ctx> {
         let result = match op {
             Neg => {
                 if operand.is_int_value() {
-                    self.builder.build_int_neg(operand.into_int_value(), "neg")?.into()
+                    self.builder
+                        .build_int_neg(operand.into_int_value(), "neg")?
+                        .into()
                 } else {
-                    self.builder.build_float_neg(operand.into_float_value(), "fneg")?.into()
+                    self.builder
+                        .build_float_neg(operand.into_float_value(), "fneg")?
+                        .into()
                 }
             }
-            Not => {
-                self.builder.build_not(operand.into_int_value(), "not")?.into()
-            }
-            FNeg => {
-                self.builder.build_float_neg(operand.into_float_value(), "fneg")?.into()
-            }
+            Not => self
+                .builder
+                .build_not(operand.into_int_value(), "not")?
+                .into(),
+            FNeg => self
+                .builder
+                .build_float_neg(operand.into_float_value(), "fneg")?
+                .into(),
         };
 
         Ok(result)
@@ -2029,112 +2270,108 @@ impl<'ctx> LLVMBackend<'ctx> {
 
         let result = match op {
             // Integer truncation (i64 -> i32, etc.)
-            Trunc => {
-                self.builder.build_int_truncate(
-                    operand.into_int_value(),
-                    target_ty.into_int_type(),
-                    "trunc"
-                )?.into()
-            }
+            Trunc => self
+                .builder
+                .build_int_truncate(operand.into_int_value(), target_ty.into_int_type(), "trunc")?
+                .into(),
 
             // Zero extension (unsigned: i32 -> i64, etc.)
-            ZExt => {
-                self.builder.build_int_z_extend(
-                    operand.into_int_value(),
-                    target_ty.into_int_type(),
-                    "zext"
-                )?.into()
-            }
+            ZExt => self
+                .builder
+                .build_int_z_extend(operand.into_int_value(), target_ty.into_int_type(), "zext")?
+                .into(),
 
             // Sign extension (signed: i32 -> i64, etc.)
-            SExt => {
-                self.builder.build_int_s_extend(
-                    operand.into_int_value(),
-                    target_ty.into_int_type(),
-                    "sext"
-                )?.into()
-            }
+            SExt => self
+                .builder
+                .build_int_s_extend(operand.into_int_value(), target_ty.into_int_type(), "sext")?
+                .into(),
 
             // Float truncation (f64 -> f32)
-            FpTrunc => {
-                self.builder.build_float_trunc(
+            FpTrunc => self
+                .builder
+                .build_float_trunc(
                     operand.into_float_value(),
                     target_ty.into_float_type(),
-                    "fptrunc"
-                )?.into()
-            }
+                    "fptrunc",
+                )?
+                .into(),
 
             // Float extension (f32 -> f64)
-            FpExt => {
-                self.builder.build_float_ext(
+            FpExt => self
+                .builder
+                .build_float_ext(
                     operand.into_float_value(),
                     target_ty.into_float_type(),
-                    "fpext"
-                )?.into()
-            }
+                    "fpext",
+                )?
+                .into(),
 
             // Float to unsigned int
-            FpToUi => {
-                self.builder.build_float_to_unsigned_int(
+            FpToUi => self
+                .builder
+                .build_float_to_unsigned_int(
                     operand.into_float_value(),
                     target_ty.into_int_type(),
-                    "fptoui"
-                )?.into()
-            }
+                    "fptoui",
+                )?
+                .into(),
 
             // Float to signed int
-            FpToSi => {
-                self.builder.build_float_to_signed_int(
+            FpToSi => self
+                .builder
+                .build_float_to_signed_int(
                     operand.into_float_value(),
                     target_ty.into_int_type(),
-                    "fptosi"
-                )?.into()
-            }
+                    "fptosi",
+                )?
+                .into(),
 
             // Unsigned int to float
-            UiToFp => {
-                self.builder.build_unsigned_int_to_float(
+            UiToFp => self
+                .builder
+                .build_unsigned_int_to_float(
                     operand.into_int_value(),
                     target_ty.into_float_type(),
-                    "uitofp"
-                )?.into()
-            }
+                    "uitofp",
+                )?
+                .into(),
 
             // Signed int to float
-            SiToFp => {
-                self.builder.build_signed_int_to_float(
+            SiToFp => self
+                .builder
+                .build_signed_int_to_float(
                     operand.into_int_value(),
                     target_ty.into_float_type(),
-                    "sitofp"
-                )?.into()
-            }
+                    "sitofp",
+                )?
+                .into(),
 
             // Pointer to integer
-            PtrToInt => {
-                self.builder.build_ptr_to_int(
+            PtrToInt => self
+                .builder
+                .build_ptr_to_int(
                     operand.into_pointer_value(),
                     target_ty.into_int_type(),
-                    "ptrtoint"
-                )?.into()
-            }
+                    "ptrtoint",
+                )?
+                .into(),
 
             // Integer to pointer
-            IntToPtr => {
-                self.builder.build_int_to_ptr(
+            IntToPtr => self
+                .builder
+                .build_int_to_ptr(
                     operand.into_int_value(),
                     target_ty.into_pointer_type(),
-                    "inttoptr"
-                )?.into()
-            }
+                    "inttoptr",
+                )?
+                .into(),
 
             // Bitcast (reinterpret bits as different type)
-            Bitcast => {
-                self.builder.build_bit_cast(
-                    operand,
-                    target_ty,
-                    "bitcast"
-                )?.into()
-            }
+            Bitcast => self
+                .builder
+                .build_bit_cast(operand, target_ty, "bitcast")?
+                .into(),
         };
 
         Ok(result)
@@ -2149,18 +2386,14 @@ impl<'ctx> LLVMBackend<'ctx> {
         match callee {
             HirCallable::Function(func_id) => {
                 // Direct function call
-                let function = self.functions.get(func_id)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("Function not found: {:?}", func_id)
-                    ))?;
+                let function = self.functions.get(func_id).ok_or_else(|| {
+                    CompilerError::CodeGen(format!("Function not found: {:?}", func_id))
+                })?;
 
                 // Compile arguments
                 let arg_values: Vec<BasicMetadataValueEnum> = args
                     .iter()
-                    .map(|arg_id| {
-                        self.get_value(*arg_id)
-                            .map(|v| v.into())
-                    })
+                    .map(|arg_id| self.get_value(*arg_id).map(|v| v.into()))
                     .collect::<CompilerResult<Vec<_>>>()?;
 
                 // Build call
@@ -2170,8 +2403,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                 match call_site.try_as_basic_value() {
                     ValueKind::Basic(val) => Ok(val),
                     ValueKind::Instruction(_) => Err(CompilerError::CodeGen(
-                        "Function call returned void when value expected".to_string()
-                    ))
+                        "Function call returned void when value expected".to_string(),
+                    )),
                 }
             }
             HirCallable::Indirect(func_ptr_id) => {
@@ -2182,37 +2415,43 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let func_ptr = func_ptr_val.into_pointer_value();
 
                 // Get the HIR type for this function pointer to extract the signature
-                let hir_type = self.type_map.get(func_ptr_id)
-                    .ok_or_else(|| CompilerError::CodeGen(
-                        format!("Type not found for function pointer: {:?}", func_ptr_id)
-                    ))?;
+                let hir_type = self.type_map.get(func_ptr_id).ok_or_else(|| {
+                    CompilerError::CodeGen(format!(
+                        "Type not found for function pointer: {:?}",
+                        func_ptr_id
+                    ))
+                })?;
 
                 // Extract the function type from the HIR type
                 let func_hir_type = match hir_type {
                     HirType::Function(ft) => ft.as_ref(),
-                    _ => return Err(CompilerError::CodeGen(
-                        format!("Expected function type for indirect call, got: {:?}", hir_type)
-                    )),
+                    _ => {
+                        return Err(CompilerError::CodeGen(format!(
+                            "Expected function type for indirect call, got: {:?}",
+                            hir_type
+                        )))
+                    }
                 };
 
                 // Translate the HIR function type to LLVM function type
-                let param_types: Result<Vec<BasicMetadataTypeEnum>, _> = func_hir_type.params
+                let param_types: Result<Vec<BasicMetadataTypeEnum>, _> = func_hir_type
+                    .params
                     .iter()
-                    .map(|param_ty| {
-                        self.translate_type(param_ty)
-                            .map(|t| t.into())
-                    })
+                    .map(|param_ty| self.translate_type(param_ty).map(|t| t.into()))
                     .collect();
                 let param_types = param_types?;
 
                 // Handle return type
                 let fn_type = if func_hir_type.returns.is_empty() {
-                    self.context.void_type().fn_type(&param_types, func_hir_type.is_variadic)
+                    self.context
+                        .void_type()
+                        .fn_type(&param_types, func_hir_type.is_variadic)
                 } else if func_hir_type.returns.len() == 1 {
                     let ret_ty = self.translate_type(&func_hir_type.returns[0])?;
                     ret_ty.fn_type(&param_types, func_hir_type.is_variadic)
                 } else {
-                    let ret_types: Result<Vec<BasicTypeEnum>, _> = func_hir_type.returns
+                    let ret_types: Result<Vec<BasicTypeEnum>, _> = func_hir_type
+                        .returns
                         .iter()
                         .map(|ret_ty| self.translate_type(ret_ty))
                         .collect();
@@ -2224,10 +2463,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Compile arguments
                 let arg_values: Vec<BasicMetadataValueEnum> = args
                     .iter()
-                    .map(|arg_id| {
-                        self.get_value(*arg_id)
-                            .map(|v| v.into())
-                    })
+                    .map(|arg_id| self.get_value(*arg_id).map(|v| v.into()))
                     .collect::<CompilerResult<Vec<_>>>()?;
 
                 // Build indirect call
@@ -2235,20 +2471,18 @@ impl<'ctx> LLVMBackend<'ctx> {
                     fn_type,
                     func_ptr,
                     &arg_values,
-                    "indirect_call"
+                    "indirect_call",
                 )?;
 
                 // Return value (or void)
                 match call_site.try_as_basic_value() {
                     ValueKind::Basic(val) => Ok(val),
                     ValueKind::Instruction(_) => Err(CompilerError::CodeGen(
-                        "Function call returned void when value expected".to_string()
-                    ))
+                        "Function call returned void when value expected".to_string(),
+                    )),
                 }
             }
-            HirCallable::Intrinsic(intrinsic) => {
-                self.compile_intrinsic(*intrinsic, args)
-            }
+            HirCallable::Intrinsic(intrinsic) => self.compile_intrinsic(*intrinsic, args),
             HirCallable::Symbol(symbol_name) => {
                 // Call external runtime symbol by name (e.g., "$haxe$trace$int")
                 // Check if any parameters need auto-boxing based on symbol signature
@@ -2261,52 +2495,64 @@ impl<'ctx> LLVMBackend<'ctx> {
                     .collect::<CompilerResult<Vec<_>>>()?;
 
                 // Process arguments - box if needed
-                let final_arg_values: Vec<BasicMetadataValueEnum> = if let Some(ref sig) = sig_info {
-                    raw_arg_values.iter().enumerate().map(|(i, &arg_val)| {
-                        if sig.param_is_dynamic(i) {
-                            // This argument needs to be boxed as DynamicBox
-                            // Determine which boxing function to call based on type
-                            let func_name = if arg_val.is_int_value() {
-                                let int_ty = arg_val.into_int_value().get_type();
-                                if int_ty == self.context.i32_type() {
-                                    "zyntax_box_i32"
-                                } else if int_ty == self.context.i64_type() {
-                                    "zyntax_box_i64"
-                                } else if int_ty == self.context.i8_type() {
-                                    "zyntax_box_bool"
+                let final_arg_values: Vec<BasicMetadataValueEnum> = if let Some(ref sig) = sig_info
+                {
+                    raw_arg_values
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &arg_val)| {
+                            if sig.param_is_dynamic(i) {
+                                // This argument needs to be boxed as DynamicBox
+                                // Determine which boxing function to call based on type
+                                let func_name = if arg_val.is_int_value() {
+                                    let int_ty = arg_val.into_int_value().get_type();
+                                    if int_ty == self.context.i32_type() {
+                                        "zyntax_box_i32"
+                                    } else if int_ty == self.context.i64_type() {
+                                        "zyntax_box_i64"
+                                    } else if int_ty == self.context.i8_type() {
+                                        "zyntax_box_bool"
+                                    } else {
+                                        "zyntax_box_i64"
+                                    }
+                                } else if arg_val.is_float_value() {
+                                    let float_ty = arg_val.into_float_value().get_type();
+                                    if float_ty == self.context.f32_type() {
+                                        "zyntax_box_f32"
+                                    } else {
+                                        "zyntax_box_f64"
+                                    }
                                 } else {
-                                    "zyntax_box_i64"
-                                }
-                            } else if arg_val.is_float_value() {
-                                let float_ty = arg_val.into_float_value().get_type();
-                                if float_ty == self.context.f32_type() {
-                                    "zyntax_box_f32"
+                                    // Pointers and other types
+                                    "zyntax_box_ptr"
+                                };
+
+                                // Declare and call boxing function
+                                let box_fn_type = self
+                                    .context
+                                    .i64_type()
+                                    .fn_type(&[arg_val.get_type().into()], false);
+                                let box_fn =
+                                    self.module.get_function(func_name).unwrap_or_else(|| {
+                                        self.module.add_function(func_name, box_fn_type, None)
+                                    });
+
+                                if let Ok(call_site) =
+                                    self.builder.build_call(box_fn, &[arg_val.into()], "box")
+                                {
+                                    call_site
+                                        .try_as_basic_value()
+                                        .left()
+                                        .unwrap_or(arg_val)
+                                        .into()
                                 } else {
-                                    "zyntax_box_f64"
+                                    arg_val.into()
                                 }
-                            } else {
-                                // Pointers and other types
-                                "zyntax_box_ptr"
-                            };
-
-                            // Declare and call boxing function
-                            let box_fn_type = self.context.i64_type().fn_type(
-                                &[arg_val.get_type().into()],
-                                false
-                            );
-                            let box_fn = self.module.get_function(func_name).unwrap_or_else(|| {
-                                self.module.add_function(func_name, box_fn_type, None)
-                            });
-
-                            if let Ok(call_site) = self.builder.build_call(box_fn, &[arg_val.into()], "box") {
-                                call_site.try_as_basic_value().left().unwrap_or(arg_val).into()
                             } else {
                                 arg_val.into()
                             }
-                        } else {
-                            arg_val.into()
-                        }
-                    }).collect()
+                        })
+                        .collect()
                 } else {
                     raw_arg_values.iter().map(|&v| v.into()).collect()
                 };
@@ -2327,12 +2573,14 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                 // Declare the function (assume void return for now)
                 let fn_type = self.context.void_type().fn_type(&param_types, false);
-                let func = self.module.get_function(symbol_name).unwrap_or_else(|| {
-                    self.module.add_function(symbol_name, fn_type, None)
-                });
+                let func = self
+                    .module
+                    .get_function(symbol_name)
+                    .unwrap_or_else(|| self.module.add_function(symbol_name, fn_type, None));
 
                 // Build call
-                self.builder.build_call(func, &final_arg_values, symbol_name)?;
+                self.builder
+                    .build_call(func, &final_arg_values, symbol_name)?;
 
                 // Return a dummy value (void functions don't return anything meaningful)
                 Ok(self.context.i32_type().const_zero().into())
@@ -2784,7 +3032,8 @@ impl<'ctx> LLVMBackend<'ctx> {
         arg_type: IntType<'ctx>,
     ) -> CompilerResult<FunctionValue<'ctx>> {
         Ok(self.module.get_function(name).unwrap_or_else(|| {
-            let fn_type = arg_type.fn_type(&[arg_type.into(), self.context.bool_type().into()], false);
+            let fn_type =
+                arg_type.fn_type(&[arg_type.into(), self.context.bool_type().into()], false);
             self.module.add_function(name, fn_type, None)
         }))
     }
@@ -2803,7 +3052,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Split i128 into high and low u64 parts
                 let low = (*v as u128 & 0xFFFFFFFFFFFFFFFF) as u64;
                 let high = ((*v as u128 >> 64) & 0xFFFFFFFFFFFFFFFF) as u64;
-                self.context.i128_type().const_int_arbitrary_precision(&[low, high]).into()
+                self.context
+                    .i128_type()
+                    .const_int_arbitrary_precision(&[low, high])
+                    .into()
             }
 
             // Primitive integers (unsigned)
@@ -2815,7 +3067,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Split u128 into high and low u64 parts
                 let low = (*v & 0xFFFFFFFFFFFFFFFF) as u64;
                 let high = ((*v >> 64) & 0xFFFFFFFFFFFFFFFF) as u64;
-                self.context.i128_type().const_int_arbitrary_precision(&[low, high]).into()
+                self.context
+                    .i128_type()
+                    .const_int_arbitrary_precision(&[low, high])
+                    .into()
             }
 
             // Floating point
@@ -2831,9 +3086,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                 if let BasicTypeEnum::PointerType(ptr_ty) = llvm_ty {
                     ptr_ty.const_null().into()
                 } else {
-                    return Err(CompilerError::CodeGen(
-                        format!("Null constant must have pointer type, got: {:?}", ty)
-                    ));
+                    return Err(CompilerError::CodeGen(format!(
+                        "Null constant must have pointer type, got: {:?}",
+                        ty
+                    )));
                 }
             }
 
@@ -2845,7 +3101,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                     arr_ty.const_zero().into()
                 } else {
                     // Compile each element
-                    let compiled_elements: Vec<BasicValueEnum> = elements.iter()
+                    let compiled_elements: Vec<BasicValueEnum> = elements
+                        .iter()
                         .map(|elem| self.compile_constant(elem))
                         .collect::<CompilerResult<Vec<_>>>()?;
 
@@ -2855,38 +3112,43 @@ impl<'ctx> LLVMBackend<'ctx> {
                     // Create constant array based on element type
                     match elem_type {
                         BasicTypeEnum::IntType(int_ty) => {
-                            let int_values: Vec<_> = compiled_elements.iter()
+                            let int_values: Vec<_> = compiled_elements
+                                .iter()
                                 .map(|v| v.into_int_value())
                                 .collect();
                             int_ty.const_array(&int_values).into()
                         }
                         BasicTypeEnum::FloatType(float_ty) => {
-                            let float_values: Vec<_> = compiled_elements.iter()
+                            let float_values: Vec<_> = compiled_elements
+                                .iter()
                                 .map(|v| v.into_float_value())
                                 .collect();
                             float_ty.const_array(&float_values).into()
                         }
                         BasicTypeEnum::PointerType(ptr_ty) => {
-                            let ptr_values: Vec<_> = compiled_elements.iter()
+                            let ptr_values: Vec<_> = compiled_elements
+                                .iter()
                                 .map(|v| v.into_pointer_value())
                                 .collect();
                             ptr_ty.const_array(&ptr_values).into()
                         }
                         BasicTypeEnum::StructType(struct_ty) => {
-                            let struct_values: Vec<_> = compiled_elements.iter()
+                            let struct_values: Vec<_> = compiled_elements
+                                .iter()
                                 .map(|v| v.into_struct_value())
                                 .collect();
                             struct_ty.const_array(&struct_values).into()
                         }
                         BasicTypeEnum::ArrayType(arr_ty) => {
-                            let arr_values: Vec<_> = compiled_elements.iter()
+                            let arr_values: Vec<_> = compiled_elements
+                                .iter()
                                 .map(|v| v.into_array_value())
                                 .collect();
                             arr_ty.const_array(&arr_values).into()
                         }
                         BasicTypeEnum::VectorType(_) | BasicTypeEnum::ScalableVectorType(_) => {
                             return Err(CompilerError::CodeGen(
-                                "Vector type arrays not yet supported in constants".to_string()
+                                "Vector type arrays not yet supported in constants".to_string(),
                             ));
                         }
                     }
@@ -2901,7 +3163,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                     struct_ty.const_named_struct(&[]).into()
                 } else {
                     // Compile each field
-                    let compiled_fields: Vec<BasicValueEnum> = fields.iter()
+                    let compiled_fields: Vec<BasicValueEnum> = fields
+                        .iter()
                         .map(|field| self.compile_constant(field))
                         .collect::<CompilerResult<Vec<_>>>()?;
 
@@ -2925,7 +3188,8 @@ impl<'ctx> LLVMBackend<'ctx> {
             // VTable should not go through compile_constant - handled separately
             VTable(_) => {
                 return Err(CompilerError::CodeGen(
-                    "VTable constants should be compiled via compile_vtable, not compile_constant".to_string()
+                    "VTable constants should be compiled via compile_vtable, not compile_constant"
+                        .to_string(),
                 ));
             }
         };
@@ -2970,7 +3234,8 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
             Struct(struct_ty) => {
                 // Translate struct fields to LLVM types
-                let field_types: Result<Vec<BasicTypeEnum>, _> = struct_ty.fields
+                let field_types: Result<Vec<BasicTypeEnum>, _> = struct_ty
+                    .fields
                     .iter()
                     .map(|field_ty| self.translate_type(field_ty))
                     .collect();
@@ -2986,17 +3251,17 @@ impl<'ctx> LLVMBackend<'ctx> {
                     struct_type.into()
                 } else {
                     // Anonymous struct
-                    self.context.struct_type(&field_types, struct_ty.packed).into()
+                    self.context
+                        .struct_type(&field_types, struct_ty.packed)
+                        .into()
                 }
             }
             Function(func_ty) => {
                 // Translate function type to function pointer
-                let param_types: Result<Vec<BasicMetadataTypeEnum>, _> = func_ty.params
+                let param_types: Result<Vec<BasicMetadataTypeEnum>, _> = func_ty
+                    .params
                     .iter()
-                    .map(|param_ty| {
-                        self.translate_type(param_ty)
-                            .map(|t| t.into())
-                    })
+                    .map(|param_ty| self.translate_type(param_ty).map(|t| t.into()))
                     .collect();
 
                 let param_types = param_types?;
@@ -3004,14 +3269,17 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Handle return types
                 let fn_type = if func_ty.returns.is_empty() {
                     // Void return
-                    self.context.void_type().fn_type(&param_types, func_ty.is_variadic)
+                    self.context
+                        .void_type()
+                        .fn_type(&param_types, func_ty.is_variadic)
                 } else if func_ty.returns.len() == 1 {
                     // Single return value
                     let ret_ty = self.translate_type(&func_ty.returns[0])?;
                     ret_ty.fn_type(&param_types, func_ty.is_variadic)
                 } else {
                     // Multiple returns - wrap in struct
-                    let ret_types: Result<Vec<BasicTypeEnum>, _> = func_ty.returns
+                    let ret_types: Result<Vec<BasicTypeEnum>, _> = func_ty
+                        .returns
                         .iter()
                         .map(|ret_ty| self.translate_type(ret_ty))
                         .collect();
@@ -3024,9 +3292,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                 fn_type.ptr_type(AddressSpace::default()).into()
             }
             _ => {
-                return Err(CompilerError::CodeGen(
-                    format!("Type translation not yet implemented: {:?}", ty)
-                ));
+                return Err(CompilerError::CodeGen(format!(
+                    "Type translation not yet implemented: {:?}",
+                    ty
+                )));
             }
         };
 
@@ -3035,13 +3304,10 @@ impl<'ctx> LLVMBackend<'ctx> {
 
     /// Get a value from the value map
     fn get_value(&self, id: HirId) -> CompilerResult<BasicValueEnum<'ctx>> {
-        self.value_map.get(&id)
+        self.value_map
+            .get(&id)
             .copied()
-            .ok_or_else(|| {
-                CompilerError::CodeGen(
-                    format!("Value not found: {:?}", id)
-                )
-            })
+            .ok_or_else(|| CompilerError::CodeGen(format!("Value not found: {:?}", id)))
     }
 
     /// Create a default value for a type (used for implicit returns)
@@ -3059,9 +3325,10 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
             Bool => self.context.bool_type().const_zero().into(),
             _ => {
-                return Err(CompilerError::CodeGen(
-                    format!("Cannot create default value for type: {:?}", ty)
-                ));
+                return Err(CompilerError::CodeGen(format!(
+                    "Cannot create default value for type: {:?}",
+                    ty
+                )));
             }
         };
 
@@ -3075,8 +3342,7 @@ impl<'ctx> LLVMBackend<'ctx> {
 
     /// Verify the module (checks for LLVM IR errors)
     pub fn verify(&self) -> Result<(), String> {
-        self.module.verify()
-            .map_err(|e| e.to_string())
+        self.module.verify().map_err(|e| e.to_string())
     }
 }
 

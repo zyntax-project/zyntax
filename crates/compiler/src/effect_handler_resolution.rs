@@ -18,15 +18,15 @@
 //! - Convert to direct function calls when handler is known at compile time
 //! - Eliminate handler overhead for pure handlers
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use indexmap::IndexMap;
+use crate::effect_analysis::{HandlerScope, ModuleEffectAnalysis};
 use crate::hir::{
-    HirModule, HirFunction, HirBlock, HirId, HirInstruction, HirTerminator,
-    HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirType,
+    HirBlock, HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirFunction, HirId,
+    HirInstruction, HirModule, HirTerminator, HirType,
 };
-use crate::effect_analysis::{ModuleEffectAnalysis, HandlerScope};
-use crate::CompilerResult;
 use crate::CompilerError;
+use crate::CompilerResult;
+use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use zyntax_typed_ast::InternedString;
 
 /// Resolution of which handler handles an effect operation
@@ -252,10 +252,9 @@ impl<'a> HandlerResolver<'a> {
         for (block_id, block) in &func.blocks {
             for (inst_index, inst) in block.instructions.iter().enumerate() {
                 if let HirInstruction::PerformEffect {
-                    effect_id,
-                    op_name,
-                    ..
-                } = inst {
+                    effect_id, op_name, ..
+                } = inst
+                {
                     let site = PerformSite {
                         function_id: func.id,
                         block_id: *block_id,
@@ -294,19 +293,19 @@ impl<'a> HandlerResolver<'a> {
                     body_block,
                     continuation_block,
                     ..
-                } = inst {
+                } = inst
+                {
                     if let Some(handler) = self.module.handlers.get(handler_id) {
-                        let effect_name = self.module.effects
+                        let effect_name = self
+                            .module
+                            .effects
                             .get(&handler.effect_id)
                             .map(|e| e.name)
                             .unwrap_or_else(|| InternedString::new_global("unknown"));
 
                         // Compute scope blocks
-                        let scope_blocks = self.compute_scope_blocks(
-                            func,
-                            *body_block,
-                            *continuation_block,
-                        );
+                        let scope_blocks =
+                            self.compute_scope_blocks(func, *body_block, *continuation_block);
 
                         // Update block_to_scope mapping
                         for scope_block in &scope_blocks {
@@ -373,11 +372,7 @@ impl<'a> HandlerResolver<'a> {
         inlinable_handlers: &HashSet<HirId>,
     ) -> HandlerResolution {
         // Find the handler for this effect in the scope tree
-        let handler_scope = self.find_handler_for_effect(
-            site.block_id,
-            effect_id,
-            scope_tree,
-        );
+        let handler_scope = self.find_handler_for_effect(site.block_id, effect_id, scope_tree);
 
         match handler_scope {
             Some(scope_node) => {
@@ -386,7 +381,8 @@ impl<'a> HandlerResolver<'a> {
 
                 let resolved_handler = handler.and_then(|h| {
                     // Find the operation implementation
-                    let impl_index = h.implementations
+                    let impl_index = h
+                        .implementations
                         .iter()
                         .position(|impl_| impl_.op_name == op_name)?;
 
@@ -481,14 +477,14 @@ pub fn resolve_handlers_with_analysis(
     module: &HirModule,
     effect_analysis: &ModuleEffectAnalysis,
 ) -> CompilerResult<ModuleHandlerResolution> {
-    let resolver = HandlerResolver::new(module)
-        .with_effect_analysis(effect_analysis);
+    let resolver = HandlerResolver::new(module).with_effect_analysis(effect_analysis);
     resolver.resolve()
 }
 
 /// Check if a handler resolution allows inlining
 pub fn can_inline_handler(resolution: &HandlerResolution) -> bool {
-    resolution.resolved_handler
+    resolution
+        .resolved_handler
         .as_ref()
         .map(|h| h.can_inline)
         .unwrap_or(false)
@@ -496,7 +492,8 @@ pub fn can_inline_handler(resolution: &HandlerResolution) -> bool {
 
 /// Get optimization level for a resolution
 pub fn get_optimization_level(resolution: &HandlerResolution) -> HandlerOptimization {
-    resolution.resolved_handler
+    resolution
+        .resolved_handler
         .as_ref()
         .map(|h| h.optimization)
         .unwrap_or(HandlerOptimization::Dynamic)
@@ -539,50 +536,59 @@ mod tests {
 
         // Add a simple effect
         let effect_id = HirId::new();
-        module.effects.insert(effect_id, HirEffect {
-            id: effect_id,
-            name: InternedString::new_global("Simple"),
-            type_params: vec![],
-            operations: vec![HirEffectOp {
-                id: HirId::new(),
-                name: InternedString::new_global("op"),
+        module.effects.insert(
+            effect_id,
+            HirEffect {
+                id: effect_id,
+                name: InternedString::new_global("Simple"),
                 type_params: vec![],
-                params: vec![],
-                return_type: HirType::Void,
-            }],
-        });
+                operations: vec![HirEffectOp {
+                    id: HirId::new(),
+                    name: InternedString::new_global("op"),
+                    type_params: vec![],
+                    params: vec![],
+                    return_type: HirType::Void,
+                }],
+            },
+        );
 
         // Add a simple handler (should be inlinable)
         let handler_id = HirId::new();
         let impl_block_id = HirId::new();
         let mut impl_blocks = IndexMap::new();
-        impl_blocks.insert(impl_block_id, HirBlock {
-            id: impl_block_id,
-            label: None,
-            phis: vec![],
-            instructions: vec![],
-            terminator: HirTerminator::Return { values: vec![] },
-            dominance_frontier: HashSet::new(),
-            predecessors: vec![],
-            successors: vec![],
-        });
+        impl_blocks.insert(
+            impl_block_id,
+            HirBlock {
+                id: impl_block_id,
+                label: None,
+                phis: vec![],
+                instructions: vec![],
+                terminator: HirTerminator::Return { values: vec![] },
+                dominance_frontier: HashSet::new(),
+                predecessors: vec![],
+                successors: vec![],
+            },
+        );
 
-        module.handlers.insert(handler_id, HirEffectHandler {
-            id: handler_id,
-            name: InternedString::new_global("SimpleHandler"),
-            effect_id,
-            type_params: vec![],
-            state_fields: vec![],
-            implementations: vec![HirEffectHandlerImpl {
-                op_name: InternedString::new_global("op"),
+        module.handlers.insert(
+            handler_id,
+            HirEffectHandler {
+                id: handler_id,
+                name: InternedString::new_global("SimpleHandler"),
+                effect_id,
                 type_params: vec![],
-                params: vec![],
-                return_type: HirType::Void,
-                entry_block: impl_block_id,
-                blocks: impl_blocks,
-                is_resumable: false,
-            }],
-        });
+                state_fields: vec![],
+                implementations: vec![HirEffectHandlerImpl {
+                    op_name: InternedString::new_global("op"),
+                    type_params: vec![],
+                    params: vec![],
+                    return_type: HirType::Void,
+                    entry_block: impl_block_id,
+                    blocks: impl_blocks,
+                    is_resumable: false,
+                }],
+            },
+        );
 
         let result = resolve_handlers(&module).unwrap();
 

@@ -7,8 +7,8 @@
 use crate::arena::InternedString;
 use crate::source::Span;
 use crate::type_registry::{
-    Lifetime, Mutability, ParamInfo, PrimitiveType, Type, TypeBound, TypeKind,
-    TypeVar, TypeVarKind, Variance,
+    Lifetime, Mutability, ParamInfo, PrimitiveType, Type, TypeBound, TypeKind, TypeVar,
+    TypeVarKind, Variance,
 };
 use crate::{ConstValue, TypeVarId};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -56,7 +56,7 @@ pub enum Constraint {
     },
 
     /// Dependent type constraints
-    
+
     /// Refinement type constraint: value must satisfy predicate
     RefinementSatisfies {
         value: Type,
@@ -254,12 +254,12 @@ impl Substitution {
                 // For nullable types, substitute the inner type and maintain nullability
                 let substituted_inner = self.apply(inner_ty);
                 Type::Nullable(Box::new(substituted_inner))
-            },
+            }
             Type::NonNull(inner_ty) => {
                 // For non-null types, substitute the inner type and maintain non-nullability
                 let substituted_inner = self.apply(inner_ty);
                 Type::NonNull(Box::new(substituted_inner))
-            },
+            }
             Type::ConstVar {
                 id,
                 name,
@@ -272,7 +272,7 @@ impl Substitution {
                     name: *name,
                     const_type: Box::new(substituted_const_type),
                 }
-            },
+            }
             Type::ConstDependent {
                 base_type,
                 constraint,
@@ -283,15 +283,15 @@ impl Substitution {
                     base_type: Box::new(substituted_base),
                     constraint: constraint.clone(), // Constraints typically don't have type vars
                 }
-            },
+            }
             Type::Dynamic => {
                 // Dynamic types don't contain type variables, so return as-is
                 ty.clone()
-            },
+            }
             Type::Unknown => {
                 // Unknown types don't contain type variables, so return as-is
                 ty.clone()
-            },
+            }
             Type::Interface {
                 methods,
                 is_structural,
@@ -907,12 +907,22 @@ impl ConstraintSolver {
                                 Constraint::HasMember(target_with_args, member, member_ty, span),
                             ]))
                         }
-                        TypeKind::Abstract { underlying_type, .. } => {
+                        TypeKind::Abstract {
+                            underlying_type, ..
+                        } => {
                             // For abstract types, forward member access to underlying type
-                            let underlying_with_args =
-                                self.apply_type_args(underlying_type, &type_def.type_params, type_args);
+                            let underlying_with_args = self.apply_type_args(
+                                underlying_type,
+                                &type_def.type_params,
+                                type_args,
+                            );
                             Ok(ConstraintResult::NewConstraints(vec![
-                                Constraint::HasMember(underlying_with_args, member, member_ty, span),
+                                Constraint::HasMember(
+                                    underlying_with_args,
+                                    member,
+                                    member_ty,
+                                    span,
+                                ),
                             ]))
                         }
                         TypeKind::Atomic => todo!(),
@@ -1206,7 +1216,11 @@ impl ConstraintSolver {
                         span,
                     )]))
                 }
-                TypeKind::Abstract { underlying_type, implicit_to, .. } => {
+                TypeKind::Abstract {
+                    underlying_type,
+                    implicit_to,
+                    ..
+                } => {
                     // For abstract types, check if super_id is in implicit_to list
                     // or if underlying type is a subtype of super_id
                     for to_type in implicit_to {
@@ -2607,7 +2621,11 @@ impl ConstraintSolver {
                 format!("{}?", self.format_type(ty))
             }
             Type::Result { ok_type, err_type } => {
-                format!("Result<{}, {}>", self.format_type(ok_type), self.format_type(err_type))
+                format!(
+                    "Result<{}, {}>",
+                    self.format_type(ok_type),
+                    self.format_type(err_type)
+                )
             }
             Type::Union(types) => {
                 let type_strs: Vec<String> = types.iter().map(|t| self.format_type(t)).collect();
@@ -2643,10 +2661,10 @@ impl ConstraintSolver {
             Type::SelfType => "Self".to_string(),
             Type::Nullable(inner_ty) => {
                 format!("{}?", self.format_type(inner_ty))
-            },
+            }
             Type::NonNull(inner_ty) => {
                 format!("{}!", self.format_type(inner_ty))
-            },
+            }
             Type::ConstVar {
                 id,
                 name,
@@ -2657,13 +2675,13 @@ impl ConstraintSolver {
                 } else {
                     format!("const C{}", id.as_u32())
                 }
-            },
+            }
             Type::ConstDependent {
                 base_type,
                 constraint,
             } => {
                 format!("{{{}|constraint}}", self.format_type(base_type))
-            },
+            }
             Type::Dynamic => "dynamic".to_string(),
             Type::Unknown => "unknown".to_string(),
             Type::Interface {
@@ -2683,11 +2701,13 @@ impl ConstraintSolver {
             } => todo!(),
             Type::Extern { name, .. } => {
                 // Format extern/opaque type by name
-                name.resolve_global().unwrap_or_else(|| format!("extern_{}", name.symbol().to_usize()))
+                name.resolve_global()
+                    .unwrap_or_else(|| format!("extern_{}", name.symbol().to_usize()))
             }
             Type::Unresolved(name) => {
                 // Format unresolved type by name
-                name.resolve_global().unwrap_or_else(|| format!("unresolved_{}", name.symbol().to_usize()))
+                name.resolve_global()
+                    .unwrap_or_else(|| format!("unresolved_{}", name.symbol().to_usize()))
             }
         }
     }
@@ -2789,7 +2809,11 @@ impl ConstraintSolver {
                 predicate,
                 span: _,
             } => {
-                format!("{} satisfies refinement {:?}", self.format_type(value), predicate)
+                format!(
+                    "{} satisfies refinement {:?}",
+                    self.format_type(value),
+                    predicate
+                )
             }
 
             Constraint::DependentCall {
@@ -2812,7 +2836,8 @@ impl ConstraintSolver {
                 target_type,
                 span: _,
             } => {
-                let path_str = path.iter()
+                let path_str = path
+                    .iter()
                     .map(|p| self.format_interned_string(*p))
                     .collect::<Vec<_>>()
                     .join(".");
@@ -3451,25 +3476,26 @@ impl ConstraintSolver {
                 // For nullable types, substitute the inner type and maintain nullability
                 let substituted_inner = self.resolve_associated_types(inner_ty, receiver_type);
                 Type::Nullable(Box::new(substituted_inner))
-            },
+            }
             Type::NonNull(inner_ty) => {
                 // For non-null types, substitute the inner type and maintain non-nullability
                 let substituted_inner = self.resolve_associated_types(inner_ty, receiver_type);
                 Type::NonNull(Box::new(substituted_inner))
-            },
+            }
             Type::ConstVar {
                 id,
                 name,
                 const_type,
             } => {
                 // Const variables don't usually need substitution, but substitute the const_type
-                let substituted_const_type = self.resolve_associated_types(const_type, receiver_type);
+                let substituted_const_type =
+                    self.resolve_associated_types(const_type, receiver_type);
                 Type::ConstVar {
                     id: *id,
                     name: *name,
                     const_type: Box::new(substituted_const_type),
                 }
-            },
+            }
             Type::ConstDependent {
                 base_type,
                 constraint,
@@ -3480,15 +3506,15 @@ impl ConstraintSolver {
                     base_type: Box::new(substituted_base),
                     constraint: constraint.clone(), // Constraints typically don't have type vars
                 }
-            },
+            }
             Type::Dynamic => {
                 // Dynamic types don't contain type variables, so return as-is
                 ty.clone()
-            },
+            }
             Type::Unknown => {
                 // Unknown types don't contain type variables, so return as-is
                 ty.clone()
-            },
+            }
             Type::Interface {
                 methods,
                 is_structural,
@@ -3623,12 +3649,12 @@ impl ConstraintSolver {
                 // For nullable types, substitute the inner type and maintain nullability
                 let substituted_inner = self.substitute_self_type(inner_ty, receiver_type);
                 Type::Nullable(Box::new(substituted_inner))
-            },
+            }
             Type::NonNull(inner_ty) => {
                 // For non-null types, substitute the inner type and maintain non-nullability
                 let substituted_inner = self.substitute_self_type(inner_ty, receiver_type);
                 Type::NonNull(Box::new(substituted_inner))
-            },
+            }
             Type::ConstVar {
                 id,
                 name,
@@ -3641,7 +3667,7 @@ impl ConstraintSolver {
                     name: *name,
                     const_type: Box::new(substituted_const_type),
                 }
-            },
+            }
             Type::ConstDependent {
                 base_type,
                 constraint,
@@ -3652,15 +3678,15 @@ impl ConstraintSolver {
                     base_type: Box::new(substituted_base),
                     constraint: constraint.clone(), // Constraints typically don't have type vars
                 }
-            },
+            }
             Type::Dynamic => {
                 // Dynamic types don't contain type variables, so return as-is
                 ty.clone()
-            },
+            }
             Type::Unknown => {
                 // Unknown types don't contain type variables, so return as-is
                 ty.clone()
-            },
+            }
             Type::Interface {
                 methods,
                 is_structural,
@@ -3702,16 +3728,20 @@ impl ConstraintSolver {
                 // 1. Convert the predicate to SMT-LIB format
                 // 2. Call an external SMT solver (Z3, CVC4, etc.)
                 // 3. Return based on satisfiability result
-                
+
                 match self.check_predicate_satisfiability(&value, &predicate) {
                     Ok(true) => Ok(ConstraintResult::Solved),
                     Ok(false) => {
                         self.errors.push(SolverError::UnsolvableConstraint(
-                            Constraint::RefinementSatisfies { value, predicate, span }
+                            Constraint::RefinementSatisfies {
+                                value,
+                                predicate,
+                                span,
+                            },
                         ));
                         Err(self.errors.clone())
                     }
-                    Err(_) => Ok(ConstraintResult::Deferred) // Could not determine, defer
+                    Err(_) => Ok(ConstraintResult::Deferred), // Could not determine, defer
                 }
             }
         }
@@ -3730,7 +3760,7 @@ impl ConstraintSolver {
 
         match &func_type {
             Type::TypeVar(_) => Ok(ConstraintResult::Deferred),
-            
+
             // TODO: Handle dependent function types specifically
             // For now, treat as regular function call constraint
             _ => {
@@ -3738,7 +3768,7 @@ impl ConstraintSolver {
                 // 1. Extract the dependent function's parameter constraints
                 // 2. Substitute the argument value into the result type
                 // 3. Generate new equality constraints
-                
+
                 // Simplified: assume the call is valid
                 Ok(ConstraintResult::Solved)
             }
@@ -3758,24 +3788,36 @@ impl ConstraintSolver {
 
         match &base_type {
             Type::TypeVar(_) => Ok(ConstraintResult::Deferred),
-            
+
             Type::Named { id, .. } => {
                 // Resolve the path through the type definition
                 if let Some(resolved_type) = self.resolve_type_path(*id, &path) {
-                    Ok(ConstraintResult::NewConstraints(vec![
-                        Constraint::Equal(resolved_type, target_type, span)
-                    ]))
+                    Ok(ConstraintResult::NewConstraints(vec![Constraint::Equal(
+                        resolved_type,
+                        target_type,
+                        span,
+                    )]))
                 } else {
                     self.errors.push(SolverError::UnsolvableConstraint(
-                        Constraint::PathDependent { base_type, path, target_type, span }
+                        Constraint::PathDependent {
+                            base_type,
+                            path,
+                            target_type,
+                            span,
+                        },
                     ));
                     Err(self.errors.clone())
                 }
             }
-            
+
             _ => {
                 self.errors.push(SolverError::UnsolvableConstraint(
-                    Constraint::PathDependent { base_type, path, target_type, span }
+                    Constraint::PathDependent {
+                        base_type,
+                        path,
+                        target_type,
+                        span,
+                    },
                 ));
                 Err(self.errors.clone())
             }
@@ -3795,13 +3837,15 @@ impl ConstraintSolver {
             Type::TypeVar(_) => {
                 // Create a singleton type and unify
                 let singleton_type = self.create_singleton_type(constant.clone());
-                Ok(ConstraintResult::NewConstraints(vec![
-                    Constraint::Equal(value_type, singleton_type, span)
-                ]))
+                Ok(ConstraintResult::NewConstraints(vec![Constraint::Equal(
+                    value_type,
+                    singleton_type,
+                    span,
+                )]))
             }
-            
+
             // TODO: Check if the type is compatible with the singleton constraint
-            _ => Ok(ConstraintResult::Solved)
+            _ => Ok(ConstraintResult::Solved),
         }
     }
 
@@ -3821,7 +3865,7 @@ impl ConstraintSolver {
         // 1. A type-level computation engine
         // 2. Evaluation of type family applications F[args]
         // 3. Generating equality constraints with the result
-        
+
         // For now, defer the constraint
         Ok(ConstraintResult::Deferred)
     }
@@ -3841,7 +3885,7 @@ impl ConstraintSolver {
 
         // TODO: Evaluate the condition and choose appropriate type
         // This would require predicate evaluation capability
-        
+
         // For now, generate constraints for both branches
         Ok(ConstraintResult::NewConstraints(vec![
             // Could be either branch - this is a simplification
@@ -3862,7 +3906,7 @@ impl ConstraintSolver {
     ) -> Result<bool, String> {
         // Try to use SMT solver for satisfiability checking
         let mut smt_solver = crate::smt_solver::SmtSolver::new();
-        
+
         if smt_solver.is_available() {
             let context = std::collections::HashMap::new(); // TODO: build actual context
             match smt_solver.check_predicate_satisfiable(predicate, value_type, &context) {
@@ -3929,8 +3973,8 @@ impl ConstraintSolver {
                     nullability: crate::type_registry::NullabilityKind::default(),
                 }
             }
-            ConstValue::Struct(..) => Type::Any, // Simplified
-            ConstValue::Tuple(..) => Type::Any, // Simplified
+            ConstValue::Struct(..) => Type::Any,   // Simplified
+            ConstValue::Tuple(..) => Type::Any,    // Simplified
             ConstValue::Variable(..) => Type::Any, // Would need context to resolve
             ConstValue::FunctionCall { .. } => Type::Any, // Would need function signature
             ConstValue::BinaryOp { .. } => Type::Any, // Would need operand types
@@ -3948,48 +3992,63 @@ impl ConstraintSolver {
         span: Span,
     ) -> Vec<Constraint> {
         use crate::dependent_types::DependentType;
-        
+
         match dependent_type {
-            DependentType::Refinement { base_type, predicate, .. } => {
+            DependentType::Refinement {
+                base_type,
+                predicate,
+                ..
+            } => {
                 let mut constraints = vec![
                     // First, ensure the target type matches the base type
-                    Constraint::Equal(target_type.clone(), (**base_type).clone(), span)
+                    Constraint::Equal(target_type.clone(), (**base_type).clone(), span),
                 ];
-                
+
                 // Then add the refinement constraint
                 constraints.push(Constraint::RefinementSatisfies {
                     value: target_type,
                     predicate: predicate.clone(),
                     span,
                 });
-                
+
                 constraints
             }
 
-            DependentType::DependentFunction { param_name, param_type, return_type, .. } => {
+            DependentType::DependentFunction {
+                param_name,
+                param_type,
+                return_type,
+                ..
+            } => {
                 // For dependent functions (x: T) -> U(x), we need to handle application
                 // This is complex and would need type-level substitution
                 vec![
-                    Constraint::Equal(target_type, Type::Primitive(PrimitiveType::Unit), span) // Placeholder
+                    Constraint::Equal(target_type, Type::Primitive(PrimitiveType::Unit), span), // Placeholder
                 ]
             }
 
-            DependentType::DependentPair { first_type, second_type, .. } => {
+            DependentType::DependentPair {
+                first_type,
+                second_type,
+                ..
+            } => {
                 // For dependent pairs (x: T, U(x)), create tuple constraint
                 // Note: This is simplified - real implementation would handle the dependency
                 let tuple_type = Type::Tuple(vec![
                     (**first_type).clone(),
                     // For now, just get the base type of the dependent second type
-                    self.extract_base_type(second_type)
+                    self.extract_base_type(second_type),
                 ]);
                 vec![Constraint::Equal(target_type, tuple_type, span)]
             }
 
-            DependentType::PathDependent { path, type_name, .. } => {
+            DependentType::PathDependent {
+                path, type_name, ..
+            } => {
                 // For path-dependent types, we would need to resolve the path
                 // This is simplified - real implementation would traverse the path
                 let _ = (path, type_name); // Use parameters to avoid warnings
-                
+
                 vec![Constraint::Equal(
                     target_type,
                     Type::Primitive(PrimitiveType::Unit), // Placeholder
@@ -4005,7 +4064,11 @@ impl ConstraintSolver {
                 }]
             }
 
-            DependentType::IndexedFamily { family_name, indices, .. } => {
+            DependentType::IndexedFamily {
+                family_name,
+                indices,
+                ..
+            } => {
                 vec![Constraint::TypeFamilyApplication {
                     family: Type::Named {
                         id: crate::type_registry::TypeId::new(0), // Placeholder
@@ -4020,11 +4083,16 @@ impl ConstraintSolver {
                 }]
             }
 
-            DependentType::Conditional { condition, then_type, else_type, .. } => {
+            DependentType::Conditional {
+                condition,
+                then_type,
+                else_type,
+                ..
+            } => {
                 // For conditional types, we would need to evaluate the condition
                 // This is simplified - real implementation would handle type-level conditionals
                 let _ = (condition, then_type, else_type); // Use parameters to avoid warnings
-                
+
                 vec![Constraint::Equal(
                     target_type,
                     Type::Primitive(PrimitiveType::Unit), // Placeholder
@@ -4037,16 +4105,34 @@ impl ConstraintSolver {
                 vec![]
             }
 
-            DependentType::Existential { var_name, var_type, body, .. } => {
+            DependentType::Existential {
+                var_name,
+                var_type,
+                body,
+                ..
+            } => {
                 // Existential types ∃(x: T). U(x) need witness generation
                 // For now, just use the body type
-                vec![Constraint::Equal(target_type, self.extract_base_type(body), span)]
+                vec![Constraint::Equal(
+                    target_type,
+                    self.extract_base_type(body),
+                    span,
+                )]
             }
 
-            DependentType::Universal { var_name, var_type, body, .. } => {
+            DependentType::Universal {
+                var_name,
+                var_type,
+                body,
+                ..
+            } => {
                 // Universal types ∀(x: T). U(x) need polymorphic instantiation
                 // For now, just use the body type
-                vec![Constraint::Equal(target_type, self.extract_base_type(body), span)]
+                vec![Constraint::Equal(
+                    target_type,
+                    self.extract_base_type(body),
+                    span,
+                )]
             }
 
             DependentType::Base(base_type) => {
@@ -4066,7 +4152,7 @@ impl ConstraintSolver {
         // 1. All free variables are bound in context
         // 2. All predicates are well-typed
         // 3. All type families are properly applied
-        
+
         // For now, return empty constraint set (assumes well-formed input)
         vec![]
     }
@@ -4079,7 +4165,7 @@ impl ConstraintSolver {
         span: Span,
     ) -> Vec<Constraint> {
         use crate::dependent_types::RefinementPredicate;
-        
+
         match predicate {
             RefinementPredicate::And(left, right) => {
                 let mut constraints = self.lower_refinement_predicate(left, value_type, span);
@@ -4115,7 +4201,6 @@ impl ConstraintSolver {
             }
 
             // Note: TypeMembership variant doesn't exist in RefinementPredicate
-
             _ => {
                 // For other predicates, create a refinement satisfaction constraint
                 vec![Constraint::RefinementSatisfies {
@@ -4130,17 +4215,18 @@ impl ConstraintSolver {
     /// Extract the base type from a dependent type (helper method)
     fn extract_base_type(&self, dependent_type: &crate::dependent_types::DependentType) -> Type {
         use crate::dependent_types::DependentType;
-        
+
         match dependent_type {
             DependentType::Refinement { base_type, .. } => (**base_type).clone(),
-            DependentType::DependentFunction { return_type, .. } => self.extract_base_type(return_type),
+            DependentType::DependentFunction { return_type, .. } => {
+                self.extract_base_type(return_type)
+            }
             DependentType::DependentPair { first_type, .. } => (**first_type).clone(), // Simplified
             DependentType::Singleton { base_type, .. } => (**base_type).clone(),
             DependentType::Base(ty) => ty.clone(),
             _ => Type::Any, // Fallback for complex dependent types
         }
     }
-
 }
 
 /// Represents a resolved method with all necessary information for type checking
@@ -4167,7 +4253,6 @@ enum ConstraintResult {
     /// Constraint deferred until more information available
     Deferred,
 }
-
 
 #[cfg(test)]
 mod tests {

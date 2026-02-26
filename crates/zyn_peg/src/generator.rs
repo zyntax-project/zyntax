@@ -4,12 +4,12 @@
 //! 1. A pest parser (from the PEG patterns)
 //! 2. A TypedAST builder (from the action blocks)
 
-use proc_macro2::TokenStream;
-use quote::{quote, format_ident};
-use std::process::{Command, Stdio};
-use std::io::Write;
-use crate::{ZynGrammar, RuleDef, RuleModifier, ActionBlock};
 use crate::error::{Result, ZynPegError};
+use crate::{ActionBlock, RuleDef, RuleModifier, ZynGrammar};
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// Generate complete Rust code from a ZynGrammar
 pub fn generate_parser(grammar: &ZynGrammar) -> Result<GeneratedCode> {
@@ -50,7 +50,9 @@ impl GeneratedCode {
 
     /// Get formatted TypedAST types code using rustfmt
     pub fn typed_ast_types_formatted(&self) -> Option<String> {
-        self.typed_ast_types.as_ref().map(|ts| format_rust_code(&ts.to_string()))
+        self.typed_ast_types
+            .as_ref()
+            .map(|ts| format_rust_code(&ts.to_string()))
     }
 }
 
@@ -1105,7 +1107,9 @@ fn generate_ast_builder(grammar: &ZynGrammar) -> Result<TokenStream> {
     let type_helpers = parse_type_helpers(&grammar.type_helpers.code);
 
     // Generate build methods for each rule with an action
-    let build_methods: Vec<TokenStream> = grammar.rules.iter()
+    let build_methods: Vec<TokenStream> = grammar
+        .rules
+        .iter()
         .filter(|r| r.action.is_some())
         .map(|r| generate_build_method(r, grammar))
         .collect::<Result<Vec<_>>>()?;
@@ -1167,16 +1171,22 @@ fn generate_standalone_ast_builder(grammar: &ZynGrammar) -> Result<TokenStream> 
     let type_helpers = parse_type_helpers(&grammar.type_helpers.code);
 
     // Generate build methods for rules WITH actions
-    let action_methods: Vec<TokenStream> = grammar.rules.iter()
+    let action_methods: Vec<TokenStream> = grammar
+        .rules
+        .iter()
         .filter(|r| r.action.is_some())
         .map(|r| generate_build_method(r, grammar))
         .collect::<Result<Vec<_>>>()?;
 
     // Generate dispatch methods for rules WITHOUT actions (like declaration, type_expr, etc.)
-    let dispatch_methods: Vec<TokenStream> = grammar.rules.iter()
+    let dispatch_methods: Vec<TokenStream> = grammar
+        .rules
+        .iter()
         .filter(|r| r.action.is_none())
         .filter(|r| !r.name.starts_with("WHITESPACE") && !r.name.starts_with("COMMENT"))
-        .filter(|r| r.modifier != Some(RuleModifier::Silent) && r.modifier != Some(RuleModifier::Atomic))
+        .filter(|r| {
+            r.modifier != Some(RuleModifier::Silent) && r.modifier != Some(RuleModifier::Atomic)
+        })
         .map(|r| generate_dispatch_method(r, grammar))
         .collect();
 
@@ -1271,9 +1281,12 @@ fn generate_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> TokenStream
         .collect();
 
     // Determine return type based on first child with an action
-    let return_type_str = dispatchable.iter()
+    let return_type_str = dispatchable
+        .iter()
         .find_map(|name| {
-            grammar.rules.iter()
+            grammar
+                .rules
+                .iter()
                 .find(|r| &r.name == *name)
                 .and_then(|r| r.action.as_ref())
                 .map(|a| a.return_type.clone())
@@ -1282,7 +1295,8 @@ fn generate_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> TokenStream
 
     // Filter dispatchable to only include rules with compatible return types
     // Rules with actions must have a return type that matches the dispatch method's return type
-    let dispatchable: Vec<_> = dispatchable.into_iter()
+    let dispatchable: Vec<_> = dispatchable
+        .into_iter()
         .filter(|name| {
             if let Some(rule) = grammar.rules.iter().find(|r| &r.name == *name) {
                 if let Some(action) = &rule.action {
@@ -1291,9 +1305,12 @@ fn generate_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> TokenStream
                     let child_return = &action.return_type;
                     // Check if return types are compatible
                     // Simple types like String, bool, i64 are incompatible with TypedNode<...>
-                    let is_simple_type = child_return == "String" || child_return == "bool"
-                        || child_return == "i64" || child_return == "i32"
-                        || child_return == "f64" || child_return == "f32";
+                    let is_simple_type = child_return == "String"
+                        || child_return == "bool"
+                        || child_return == "i64"
+                        || child_return == "i32"
+                        || child_return == "f64"
+                        || child_return == "f32";
                     let expected_is_typed_node = return_type_str.contains("TypedNode")
                         || return_type_str.contains("TypedExpression")
                         || return_type_str.contains("TypedDeclaration")
@@ -1305,7 +1322,10 @@ fn generate_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> TokenStream
                         return false;
                     }
                     // Exclude if return types are explicitly different
-                    if child_return != &return_type_str && !return_type_str.contains(child_return) && !child_return.contains(&return_type_str) {
+                    if child_return != &return_type_str
+                        && !return_type_str.contains(child_return)
+                        && !child_return.contains(&return_type_str)
+                    {
                         return false;
                     }
                 }
@@ -1314,7 +1334,8 @@ fn generate_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> TokenStream
         })
         .collect();
 
-    let return_type: TokenStream = return_type_str.parse()
+    let return_type: TokenStream = return_type_str
+        .parse()
         .unwrap_or_else(|_| quote! { TypedNode<TypedExpression> });
 
     if dispatchable.is_empty() {
@@ -1363,13 +1384,16 @@ fn generate_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> TokenStream
         }
     } else {
         // Generate match arms for child rules
-        let match_arms: Vec<TokenStream> = dispatchable.iter().map(|child_name| {
-            let rule_variant = format_ident!("{}", child_name);
-            let build_method = format_ident!("build_{}", child_name);
-            quote! {
-                Rule::#rule_variant => self.#build_method(inner),
-            }
-        }).collect();
+        let match_arms: Vec<TokenStream> = dispatchable
+            .iter()
+            .map(|child_name| {
+                let rule_variant = format_ident!("{}", child_name);
+                let build_method = format_ident!("build_{}", child_name);
+                quote! {
+                    Rule::#rule_variant => self.#build_method(inner),
+                }
+            })
+            .collect();
 
         quote! {
             pub fn #method_name(&mut self, pair: pest::iterators::Pair<Rule>) -> Result<#return_type, ParseError> {
@@ -1392,12 +1416,26 @@ fn extract_child_rules(pattern: &str) -> Vec<String> {
     let mut rules = Vec::new();
 
     // Simple extraction - find lowercase identifiers that aren't keywords
-    let keywords = ["SOI", "EOI", "ANY", "ASCII", "ASCII_DIGIT", "ASCII_ALPHA", "ASCII_ALPHANUMERIC", "WHITESPACE", "COMMENT"];
+    let keywords = [
+        "SOI",
+        "EOI",
+        "ANY",
+        "ASCII",
+        "ASCII_DIGIT",
+        "ASCII_ALPHA",
+        "ASCII_ALPHANUMERIC",
+        "WHITESPACE",
+        "COMMENT",
+    ];
 
     for part in pattern.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let part = part.trim();
         if !part.is_empty()
-            && part.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
+            && part
+                .chars()
+                .next()
+                .map(|c| c.is_lowercase())
+                .unwrap_or(false)
             && !keywords.contains(&part)
         {
             if !rules.contains(&part.to_string()) {
@@ -1457,16 +1495,22 @@ fn generate_zyntax_ast_builder(grammar: &ZynGrammar) -> Result<TokenStream> {
     let type_helpers = parse_type_helpers(&grammar.type_helpers.code);
 
     // Generate build methods for rules WITH actions
-    let action_methods: Vec<TokenStream> = grammar.rules.iter()
+    let action_methods: Vec<TokenStream> = grammar
+        .rules
+        .iter()
         .filter(|r| r.action.is_some())
         .map(|r| generate_zyntax_build_method(r, grammar))
         .collect::<Result<Vec<_>>>()?;
 
     // Generate dispatch methods for rules WITHOUT actions
-    let dispatch_methods: Vec<TokenStream> = grammar.rules.iter()
+    let dispatch_methods: Vec<TokenStream> = grammar
+        .rules
+        .iter()
         .filter(|r| r.action.is_none())
         .filter(|r| !r.name.starts_with("WHITESPACE") && !r.name.starts_with("COMMENT"))
-        .filter(|r| r.modifier != Some(RuleModifier::Silent) && r.modifier != Some(RuleModifier::Atomic))
+        .filter(|r| {
+            r.modifier != Some(RuleModifier::Silent) && r.modifier != Some(RuleModifier::Atomic)
+        })
         .map(|r| generate_zyntax_dispatch_method(r, grammar))
         .collect();
 
@@ -1607,7 +1651,9 @@ fn generate_zyntax_parser_impl(_grammar: &ZynGrammar) -> Result<TokenStream> {
 
 /// Generate a build method for a rule using zyntax_typed_ast types
 fn generate_zyntax_build_method(rule: &RuleDef, _grammar: &ZynGrammar) -> Result<TokenStream> {
-    let action = rule.action.as_ref()
+    let action = rule
+        .action
+        .as_ref()
         .ok_or_else(|| ZynPegError::InvalidAction("No action for rule".into()))?;
 
     let method_name = format_ident!("build_{}", rule.name);
@@ -1682,15 +1728,25 @@ fn generate_zyntax_build_method(rule: &RuleDef, _grammar: &ZynGrammar) -> Result
 
 /// Check if a return type needs typed_node() wrapping
 fn needs_typed_node_wrapper(type_str: &str) -> bool {
-    matches!(type_str, "TypedDeclaration" | "TypedStatement" | "TypedExpression")
+    matches!(
+        type_str,
+        "TypedDeclaration" | "TypedStatement" | "TypedExpression"
+    )
 }
 
 /// Generate struct body for zyntax_typed_ast, handling typed_node wrapping
-fn generate_zyntax_struct_body(action: &ActionBlock, pattern_info: &[PatternElement], needs_wrap: bool) -> TokenStream {
+fn generate_zyntax_struct_body(
+    action: &ActionBlock,
+    pattern_info: &[PatternElement],
+    needs_wrap: bool,
+) -> TokenStream {
     // Check if this is a TypedDeclaration with "decl" field - needs special handling
     let has_decl_field = action.fields.iter().any(|f| f.name == "decl");
     let has_stmt_field = action.fields.iter().any(|f| f.name == "stmt");
-    let has_expr_field = action.fields.iter().any(|f| f.name == "expr" && action.return_type.contains("Expression"));
+    let has_expr_field = action
+        .fields
+        .iter()
+        .any(|f| f.name == "expr" && action.return_type.contains("Expression"));
 
     if needs_wrap && has_decl_field {
         // TypedDeclaration with decl field - extract the inner declaration and wrap
@@ -1734,7 +1790,9 @@ fn generate_zyntax_struct_body(action: &ActionBlock, pattern_info: &[PatternElem
         }
     } else {
         // Regular struct - build normally
-        let field_assignments: Vec<TokenStream> = action.fields.iter()
+        let field_assignments: Vec<TokenStream> = action
+            .fields
+            .iter()
             .map(|f| {
                 let name = format_ident!("{}", f.name);
                 let value = transform_zyntax_captures(&f.value, pattern_info);
@@ -1752,7 +1810,7 @@ fn generate_zyntax_struct_body(action: &ActionBlock, pattern_info: &[PatternElem
 
         if field_assignments.is_empty() {
             quote! {
-                #return_type_mapped::default()
+                <#return_type_mapped>::default()
             }
         } else {
             let result: TokenStream = quote! {
@@ -1831,23 +1889,65 @@ fn convert_statement_to_zyntax(stmt_str: &str, _pattern_info: &[PatternElement])
 /// Convert an Expression::* construct to TypedExpression::* for zyntax_typed_ast
 fn convert_expression_to_zyntax(expr_str: &str, _pattern_info: &[PatternElement]) -> TokenStream {
     let transformed = expr_str
-        .replace("Expression::IntLiteral(", "TypedExpression::Literal(TypedLiteral::Integer(")
-        .replace("Expression::FloatLiteral(", "TypedExpression::Literal(TypedLiteral::Float(")
-        .replace("Expression::BoolLiteral(", "TypedExpression::Literal(TypedLiteral::Bool(")
-        .replace("Expression::StringLiteral(", "TypedExpression::Literal(TypedLiteral::String(InternedString::new_global(")
-        .replace("Expression::NullLiteral", "TypedExpression::Literal(TypedLiteral::Null)")
-        .replace("Expression::UndefinedLiteral", "TypedExpression::Literal(TypedLiteral::Undefined)")
-        .replace("Expression::BinaryOp(", "TypedExpression::Binary(TypedBinary { op: ")
-        .replace("Expression::UnaryOp(", "TypedExpression::Unary(TypedUnary { op: ")
-        .replace("Expression::Call(", "TypedExpression::Call(TypedCall { callee: ")
-        .replace("Expression::FieldAccess(", "TypedExpression::Field(TypedFieldAccess { object: ")
-        .replace("Expression::Index(", "TypedExpression::Index(TypedIndex { array: ")
+        .replace(
+            "Expression::IntLiteral(",
+            "TypedExpression::Literal(TypedLiteral::Integer(",
+        )
+        .replace(
+            "Expression::FloatLiteral(",
+            "TypedExpression::Literal(TypedLiteral::Float(",
+        )
+        .replace(
+            "Expression::BoolLiteral(",
+            "TypedExpression::Literal(TypedLiteral::Bool(",
+        )
+        .replace(
+            "Expression::StringLiteral(",
+            "TypedExpression::Literal(TypedLiteral::String(InternedString::new_global(",
+        )
+        .replace(
+            "Expression::NullLiteral",
+            "TypedExpression::Literal(TypedLiteral::Null)",
+        )
+        .replace(
+            "Expression::UndefinedLiteral",
+            "TypedExpression::Literal(TypedLiteral::Undefined)",
+        )
+        .replace(
+            "Expression::BinaryOp(",
+            "TypedExpression::Binary(TypedBinary { op: ",
+        )
+        .replace(
+            "Expression::UnaryOp(",
+            "TypedExpression::Unary(TypedUnary { op: ",
+        )
+        .replace(
+            "Expression::Call(",
+            "TypedExpression::Call(TypedCall { callee: ",
+        )
+        .replace(
+            "Expression::FieldAccess(",
+            "TypedExpression::Field(TypedFieldAccess { object: ",
+        )
+        .replace(
+            "Expression::Index(",
+            "TypedExpression::Index(TypedIndex { array: ",
+        )
         .replace("Expression::Deref(", "TypedExpression::Dereference(")
         .replace("Expression::Array(", "TypedExpression::Array(")
-        .replace("Expression::Lambda(", "TypedExpression::Lambda(TypedLambda ")
+        .replace(
+            "Expression::Lambda(",
+            "TypedExpression::Lambda(TypedLambda ",
+        )
         .replace("Expression::Try(", "TypedExpression::Try(")
-        .replace("Expression::Switch(", "TypedExpression::Match(TypedMatchExpr ")
-        .replace("Expression::StructLiteral(", "TypedExpression::Struct(TypedStructLiteral ");
+        .replace(
+            "Expression::Switch(",
+            "TypedExpression::Match(TypedMatchExpr ",
+        )
+        .replace(
+            "Expression::StructLiteral(",
+            "TypedExpression::Struct(TypedStructLiteral ",
+        );
 
     syn::parse_str::<syn::Expr>(&transformed)
         .map(|e| quote! { #e })
@@ -1861,21 +1961,25 @@ fn generate_zyntax_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> Toke
     let method_name = format_ident!("build_{}", rule.name);
     let child_rules = extract_child_rules(&rule.pattern);
 
-    let dispatchable: Vec<_> = child_rules.iter()
+    let dispatchable: Vec<_> = child_rules
+        .iter()
         .filter(|name| {
             grammar.rules.iter().any(|r| {
-                &r.name == *name && (
-                    r.action.is_some() ||
-                    (r.modifier != Some(RuleModifier::Atomic) && r.modifier != Some(RuleModifier::Silent))
-                )
+                &r.name == *name
+                    && (r.action.is_some()
+                        || (r.modifier != Some(RuleModifier::Atomic)
+                            && r.modifier != Some(RuleModifier::Silent)))
             })
         })
         .collect();
 
     // Determine return type
-    let return_type_str = dispatchable.iter()
+    let return_type_str = dispatchable
+        .iter()
         .find_map(|name| {
-            grammar.rules.iter()
+            grammar
+                .rules
+                .iter()
                 .find(|r| &r.name == *name)
                 .and_then(|r| r.action.as_ref())
                 .map(|a| map_to_zyntax_type(&a.return_type))
@@ -1930,13 +2034,16 @@ fn generate_zyntax_dispatch_method(rule: &RuleDef, grammar: &ZynGrammar) -> Toke
             }
         }
     } else {
-        let match_arms: Vec<TokenStream> = dispatchable.iter().map(|child_name| {
-            let rule_variant = format_ident!("{}", child_name);
-            let build_method = format_ident!("build_{}", child_name);
-            quote! {
-                Rule::#rule_variant => self.#build_method(inner),
-            }
-        }).collect();
+        let match_arms: Vec<TokenStream> = dispatchable
+            .iter()
+            .map(|child_name| {
+                let rule_variant = format_ident!("{}", child_name);
+                let build_method = format_ident!("build_{}", child_name);
+                quote! {
+                    Rule::#rule_variant => self.#build_method(inner),
+                }
+            })
+            .collect();
 
         quote! {
             pub fn #method_name(&mut self, pair: pest::iterators::Pair<Rule>) -> Result<#return_type, ParseError> {
@@ -2008,8 +2115,7 @@ fn transform_zyntax_captures(value: &str, pattern: &[PatternElement]) -> String 
             // Check if preceded by a word character (letter, digit, _, or ::)
             // If so, it's likely already wrapped (e.g., PrimitiveType::Bool)
             let before = &result[..result.len() - remaining.len() + idx];
-            let is_part_of_longer_ident = before.ends_with("Primitive") ||
-                                           before.ends_with("::");
+            let is_part_of_longer_ident = before.ends_with("Primitive") || before.ends_with("::");
             if is_part_of_longer_ident {
                 // Skip this match, it's part of a longer identifier
                 new_result.push_str(&remaining[..idx + from.len()]);
@@ -2032,11 +2138,15 @@ fn transform_zyntax_captures(value: &str, pattern: &[PatternElement]) -> String 
 
 /// Generate a build method for a rule with an action
 fn generate_build_method(rule: &RuleDef, _grammar: &ZynGrammar) -> Result<TokenStream> {
-    let action = rule.action.as_ref()
+    let action = rule
+        .action
+        .as_ref()
         .ok_or_else(|| ZynPegError::InvalidAction("No action for rule".into()))?;
 
     let method_name = format_ident!("build_{}", rule.name);
-    let return_type: TokenStream = action.return_type.parse()
+    let return_type: TokenStream = action
+        .return_type
+        .parse()
         .map_err(|e| ZynPegError::CodeGenError(format!("Invalid return type: {}", e)))?;
 
     // Analyze the rule pattern to understand what children exist
@@ -2070,7 +2180,9 @@ fn generate_build_method(rule: &RuleDef, _grammar: &ZynGrammar) -> Result<TokenS
         code_tokens
     } else {
         // Structured field assignments
-        let field_assignments: Vec<TokenStream> = action.fields.iter()
+        let field_assignments: Vec<TokenStream> = action
+            .fields
+            .iter()
             .map(|f| {
                 let name = format_ident!("{}", f.name);
                 let value = transform_captures_to_vars(&f.value, &pattern_info);
@@ -2118,18 +2230,18 @@ fn generate_build_method(rule: &RuleDef, _grammar: &ZynGrammar) -> Result<TokenS
 /// Information about a pattern element
 #[derive(Debug, Clone)]
 struct PatternElement {
-    index: usize,           // 1-based index in the pattern
+    index: usize, // 1-based index in the pattern
     kind: PatternKind,
-    name: Option<String>,   // Named element (identifier, type_expr, etc.)
-    optional: bool,         // Wrapped in (...)? or includes ?
-    repeated: bool,         // Wrapped in (...)* or (...)+
+    name: Option<String>, // Named element (identifier, type_expr, etc.)
+    optional: bool,       // Wrapped in (...)? or includes ?
+    repeated: bool,       // Wrapped in (...)* or (...)+
 }
 
 #[derive(Debug, Clone)]
 enum PatternKind {
-    Literal(String),        // "const", ";", etc.
-    Rule(String),           // identifier, expr, type_expr, etc.
-    Builtin(String),        // ASCII_DIGIT, ANY, etc.
+    Literal(String), // "const", ";", etc.
+    Rule(String),    // identifier, expr, type_expr, etc.
+    Builtin(String), // ASCII_DIGIT, ANY, etc.
 }
 
 /// Split a pattern by top-level alternation `|`, respecting parentheses
@@ -2234,15 +2346,23 @@ fn analyze_pattern(pattern: &str) -> Vec<PatternElement> {
 
         // Check modifiers
         let optional = part.ends_with('?') || part.ends_with(")?");
-        let repeated = part.ends_with('*') || part.ends_with('+') || part.ends_with(")*") || part.ends_with(")+");
+        let repeated = part.ends_with('*')
+            || part.ends_with('+')
+            || part.ends_with(")*")
+            || part.ends_with(")+");
 
         // Check if this is a group
-        if part.starts_with('(') && (part.ends_with(')') || part.ends_with(")?") || part.ends_with(")*") || part.ends_with(")+")) {
+        if part.starts_with('(')
+            && (part.ends_with(')')
+                || part.ends_with(")?")
+                || part.ends_with(")*")
+                || part.ends_with(")+"))
+        {
             // For a group, find the rule inside (ignoring literals)
             let inner = if part.ends_with(")?") || part.ends_with(")*") || part.ends_with(")+") {
-                &part[1..part.len()-2]
+                &part[1..part.len() - 2]
             } else {
-                &part[1..part.len()-1]
+                &part[1..part.len() - 1]
             };
 
             // Handle alternation inside groups - take first branch
@@ -2255,7 +2375,12 @@ fn analyze_pattern(pattern: &str) -> Vec<PatternElement> {
             for inner_part in inner_parts {
                 let clean = inner_part.trim_end_matches(['?', '*', '+']);
                 if !clean.starts_with('"') && !clean.starts_with('\'') && !clean.is_empty() {
-                    if !clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    if !clean
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                    {
                         found_rule = Some(clean.to_string());
                         break;
                     }
@@ -2289,7 +2414,12 @@ fn analyze_pattern(pattern: &str) -> Vec<PatternElement> {
                 // String literal
                 let literal = clean.trim_matches(|c| c == '"' || c == '\'');
                 PatternKind::Literal(literal.to_string())
-            } else if clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            } else if clean
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            {
                 // Builtin (ASCII_DIGIT, ANY, etc.)
                 PatternKind::Builtin(clean.to_string())
             } else if !clean.is_empty() {
@@ -2320,10 +2450,25 @@ fn sanitize_rule_name(name: &str) -> String {
     let name = name.split('|').next().unwrap_or(name).trim();
     let name = name.split('~').next().unwrap_or(name).trim();
     // Remove parentheses and modifiers
-    let name = name.trim_matches(|c| c == '(' || c == ')' || c == '?' || c == '*' || c == '+' || c == '"' || c == '\'' || c == ' ');
+    let name = name.trim_matches(|c| {
+        c == '('
+            || c == ')'
+            || c == '?'
+            || c == '*'
+            || c == '+'
+            || c == '"'
+            || c == '\''
+            || c == ' '
+    });
     // Replace any remaining invalid chars with underscore
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim_matches('_')
         .to_string()
@@ -2436,7 +2581,7 @@ fn transform_captures_to_vars(value: &str, pattern: &[PatternElement]) -> String
     // Process from $9 down to $1 to avoid $1 matching $10, etc.
     for i in (1..=9).rev() {
         let pattern_str = format!("${}", i);
-        let pattern_with_space = format!("$ {}", i);  // TokenStream may insert spaces
+        let pattern_with_space = format!("$ {}", i); // TokenStream may insert spaces
 
         // First, normalize any `$ N` to `$N` for easier processing
         result = result.replace(&pattern_with_space, &pattern_str);
@@ -2452,7 +2597,10 @@ fn transform_captures_to_vars(value: &str, pattern: &[PatternElement]) -> String
             // Replace intern($N) with getting text from the child as InternedString
             let intern_pattern = format!("intern({})", pattern_str);
             if result.contains(&intern_pattern) {
-                let replacement = format!("InternedString::new_global({}.as_ref().map(|p| p.as_str()).unwrap_or(\"\"))", var_name);
+                let replacement = format!(
+                    "InternedString::new_global({}.as_ref().map(|p| p.as_str()).unwrap_or(\"\"))",
+                    var_name
+                );
                 result = result.replace(&intern_pattern, &replacement);
             }
 
@@ -2543,9 +2691,16 @@ fn transform_captures_to_vars(value: &str, pattern: &[PatternElement]) -> String
                 if field_end > 0 {
                     let field_name = &result[after_dot..after_dot + field_end];
                     // Skip if it's a method call (map, and_then, into_iter, etc.) - these are handled specially
-                    if field_name == "map" || field_name == "and_then" || field_name == "unwrap_or"
-                        || field_name == "into_iter" || field_name == "iter" || field_name == "collect"
-                        || field_name == "ok" || field_name == "unwrap_or_default" || field_name == "clone" {
+                    if field_name == "map"
+                        || field_name == "and_then"
+                        || field_name == "unwrap_or"
+                        || field_name == "into_iter"
+                        || field_name == "iter"
+                        || field_name == "collect"
+                        || field_name == "ok"
+                        || field_name == "unwrap_or_default"
+                        || field_name == "clone"
+                    {
                         break;
                     }
                     let full_match_len = dot_pattern.len() + field_end;
@@ -2553,7 +2708,12 @@ fn transform_captures_to_vars(value: &str, pattern: &[PatternElement]) -> String
                         "{}.as_ref().and_then(|p| self.build_{}(p.clone()).ok()).map(|v| v.{}).unwrap_or_default()",
                         var_name, rule_name, field_name
                     );
-                    result = format!("{}{}{}", &result[..start], replacement, &result[start + full_match_len..]);
+                    result = format!(
+                        "{}{}{}",
+                        &result[..start],
+                        replacement,
+                        &result[start + full_match_len..]
+                    );
                 } else {
                     break;
                 }
@@ -2597,7 +2757,10 @@ fn transform_captures_to_vars(value: &str, pattern: &[PatternElement]) -> String
             // This happens when the pattern has more elements than we parsed
             // (e.g., complex nested patterns or alternations)
             if result.contains(&format!("{}.unwrap_or_default()", pattern_str)) {
-                result = result.replace(&format!("{}.unwrap_or_default()", pattern_str), "Default::default()");
+                result = result.replace(
+                    &format!("{}.unwrap_or_default()", pattern_str),
+                    "Default::default()",
+                );
             } else if result.contains(&format!("{}.span", pattern_str)) {
                 // $1.span -> span (the local span variable)
                 result = result.replace(&format!("{}.span", pattern_str), "span");
@@ -2621,18 +2784,23 @@ fn parse_imports(code: &str) -> TokenStream {
         return quote! {};
     }
 
-    code.parse().unwrap_or_else(|_| quote! {
-        // Failed to parse imports
+    code.parse().unwrap_or_else(|_| {
+        quote! {
+            // Failed to parse imports
+        }
     })
 }
 
 /// Generate context field declarations
 fn generate_context_fields(context: &[crate::ContextVar]) -> TokenStream {
-    let fields: Vec<TokenStream> = context.iter().map(|v| {
-        let name = format_ident!("{}", v.name);
-        let ty: TokenStream = v.ty.parse().unwrap_or_else(|_| quote! { () });
-        quote! { pub #name: #ty }
-    }).collect();
+    let fields: Vec<TokenStream> = context
+        .iter()
+        .map(|v| {
+            let name = format_ident!("{}", v.name);
+            let ty: TokenStream = v.ty.parse().unwrap_or_else(|_| quote! { () });
+            quote! { pub #name: #ty }
+        })
+        .collect();
 
     quote! { #(#fields,)* }
 }
@@ -2643,8 +2811,10 @@ fn parse_type_helpers(code: &str) -> TokenStream {
         return quote! {};
     }
 
-    code.parse().unwrap_or_else(|_| quote! {
-        // Failed to parse type helpers
+    code.parse().unwrap_or_else(|_| {
+        quote! {
+            // Failed to parse type helpers
+        }
     })
 }
 
@@ -2682,8 +2852,20 @@ mod tests {
     #[test]
     fn test_transform_captures_to_vars() {
         let pattern = vec![
-            PatternElement { index: 1, kind: PatternKind::Rule("identifier".to_string()), name: None, optional: false, repeated: false },
-            PatternElement { index: 2, kind: PatternKind::Rule("expr".to_string()), name: None, optional: false, repeated: false },
+            PatternElement {
+                index: 1,
+                kind: PatternKind::Rule("identifier".to_string()),
+                name: None,
+                optional: false,
+                repeated: false,
+            },
+            PatternElement {
+                index: 2,
+                kind: PatternKind::Rule("expr".to_string()),
+                name: None,
+                optional: false,
+                repeated: false,
+            },
         ];
         // Basic capture reference replacement - now uses rule-name-based variables
         assert!(transform_captures_to_vars("$1", &pattern).contains("child_identifier"));
@@ -2702,21 +2884,45 @@ mod tests {
 
         // Debug: print what was parsed
         for elem in &elements {
-            println!("index={}, kind={:?}, optional={}", elem.index, elem.kind, elem.optional);
+            println!(
+                "index={}, kind={:?}, optional={}",
+                elem.index, elem.kind, elem.optional
+            );
         }
 
         // There should be 7 elements total
         assert_eq!(elements.len(), 7, "Expected 7 pattern elements");
 
         // Check each element
-        assert!(matches!(elements[0].kind, PatternKind::Literal(_)), "Element 0 should be 'fn' literal");
-        assert!(matches!(elements[1].kind, PatternKind::Rule(ref n) if n == "identifier"), "Element 1 should be identifier");
-        assert!(matches!(elements[2].kind, PatternKind::Literal(_)), "Element 2 should be '(' literal");
-        assert!(matches!(elements[3].kind, PatternKind::Rule(ref n) if n == "fn_params"), "Element 3 should be fn_params");
+        assert!(
+            matches!(elements[0].kind, PatternKind::Literal(_)),
+            "Element 0 should be 'fn' literal"
+        );
+        assert!(
+            matches!(elements[1].kind, PatternKind::Rule(ref n) if n == "identifier"),
+            "Element 1 should be identifier"
+        );
+        assert!(
+            matches!(elements[2].kind, PatternKind::Literal(_)),
+            "Element 2 should be '(' literal"
+        );
+        assert!(
+            matches!(elements[3].kind, PatternKind::Rule(ref n) if n == "fn_params"),
+            "Element 3 should be fn_params"
+        );
         assert!(elements[3].optional, "fn_params should be optional");
-        assert!(matches!(elements[4].kind, PatternKind::Literal(_)), "Element 4 should be ')' literal");
-        assert!(matches!(elements[5].kind, PatternKind::Rule(ref n) if n == "type_expr"), "Element 5 should be type_expr");
-        assert!(matches!(elements[6].kind, PatternKind::Rule(ref n) if n == "block"), "Element 6 should be block");
+        assert!(
+            matches!(elements[4].kind, PatternKind::Literal(_)),
+            "Element 4 should be ')' literal"
+        );
+        assert!(
+            matches!(elements[5].kind, PatternKind::Rule(ref n) if n == "type_expr"),
+            "Element 5 should be type_expr"
+        );
+        assert!(
+            matches!(elements[6].kind, PatternKind::Rule(ref n) if n == "block"),
+            "Element 6 should be block"
+        );
     }
 
     #[test]

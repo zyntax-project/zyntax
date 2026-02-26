@@ -3,8 +3,8 @@
 //! For generic types like `Array<T>`, `Map<K,V>`, `Optional<T>`, etc.,
 //! we need to track the type arguments alongside the value.
 
-use crate::type_system::{TypeTag, TypeCategory, TypeFlags};
-use crate::dynamic_box::{DynamicBox, DropFn};
+use crate::dynamic_box::{DropFn, DynamicBox};
+use crate::type_system::{TypeCategory, TypeFlags, TypeTag};
 
 /// Maximum type arguments for a generic type
 pub const MAX_TYPE_ARGS: usize = 8;
@@ -140,7 +140,10 @@ impl GenericBox {
 
     /// Check if this is a generic type
     pub fn is_generic(&self) -> bool {
-        self.type_args.as_ref().map(|a| a.count > 0).unwrap_or(false)
+        self.type_args
+            .as_ref()
+            .map(|a| a.count > 0)
+            .unwrap_or(false)
     }
 
     /// Get the type arguments
@@ -166,19 +169,30 @@ impl GenericBox {
     }
 
     /// Create a generic box for `Map<K, V>`
-    pub fn map(data: *mut u8, size: u32, key_type: TypeTag, value_type: TypeTag, dropper: Option<DropFn>) -> Self {
+    pub fn map(
+        data: *mut u8,
+        size: u32,
+        key_type: TypeTag,
+        value_type: TypeTag,
+        dropper: Option<DropFn>,
+    ) -> Self {
         let base = DynamicBox {
             tag: TypeTag::new(TypeCategory::Map, 0, TypeFlags::NONE),
             size,
             data,
             dropper,
-            display_fn:None
+            display_fn: None,
         };
         Self::with_type_args(base, GenericTypeArgs::map(key_type, value_type))
     }
 
     /// Create a generic box for `Optional<T>`
-    pub fn optional(data: *mut u8, size: u32, inner_type: TypeTag, dropper: Option<DropFn>) -> Self {
+    pub fn optional(
+        data: *mut u8,
+        size: u32,
+        inner_type: TypeTag,
+        dropper: Option<DropFn>,
+    ) -> Self {
         let base = DynamicBox {
             tag: TypeTag::new(TypeCategory::Optional, 0, TypeFlags::NONE),
             size,
@@ -190,7 +204,13 @@ impl GenericBox {
     }
 
     /// Create a generic box for `Result<T, E>`
-    pub fn result(data: *mut u8, size: u32, ok_type: TypeTag, err_type: TypeTag, dropper: Option<DropFn>) -> Self {
+    pub fn result(
+        data: *mut u8,
+        size: u32,
+        ok_type: TypeTag,
+        err_type: TypeTag,
+        dropper: Option<DropFn>,
+    ) -> Self {
         let base = DynamicBox {
             tag: TypeTag::new(TypeCategory::Result, 0, TypeFlags::NONE),
             size,

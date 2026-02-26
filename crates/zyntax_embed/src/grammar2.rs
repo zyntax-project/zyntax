@@ -17,11 +17,17 @@
 //! ```
 
 use std::sync::Arc;
-use zyn_peg::grammar::{parse_grammar, GrammarIR, GrammarMetadata, BuiltinMappings, TypeDeclarations};
-use zyn_peg::runtime2::{GrammarInterpreter, ParserState, ParseResult, ParsedValue};
-use zyntax_typed_ast::{TypedASTBuilder, TypedProgram, TypedDeclaration, TypedFunction, TypedParameter};
-use zyntax_typed_ast::type_registry::{TypeRegistry, Type, PrimitiveType};
-use zyntax_typed_ast::{typed_node, Span, Visibility, CallingConvention, Mutability, InternedString};
+use zyn_peg::grammar::{
+    parse_grammar, BuiltinMappings, GrammarIR, GrammarMetadata, TypeDeclarations,
+};
+use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
+use zyntax_typed_ast::type_registry::{PrimitiveType, Type, TypeRegistry};
+use zyntax_typed_ast::{
+    typed_node, CallingConvention, InternedString, Mutability, Span, Visibility,
+};
+use zyntax_typed_ast::{
+    TypedASTBuilder, TypedDeclaration, TypedFunction, TypedParameter, TypedProgram,
+};
 
 /// Errors that can occur during grammar operations
 #[derive(Debug, thiserror::Error)]
@@ -51,8 +57,8 @@ pub struct Grammar2 {
 impl Grammar2 {
     /// Create a grammar from .zyn source code
     pub fn from_source(zyn_source: &str) -> Grammar2Result<Self> {
-        let grammar = parse_grammar(zyn_source)
-            .map_err(|e| Grammar2Error::ParseError(e.to_string()))?;
+        let grammar =
+            parse_grammar(zyn_source).map_err(|e| Grammar2Error::ParseError(e.to_string()))?;
 
         Ok(Self {
             grammar: Arc::new(grammar),
@@ -100,7 +106,11 @@ impl Grammar2 {
     }
 
     /// Parse source code with a specific filename (for diagnostics)
-    pub fn parse_with_filename(&self, source: &str, filename: &str) -> Grammar2Result<TypedProgram> {
+    pub fn parse_with_filename(
+        &self,
+        source: &str,
+        filename: &str,
+    ) -> Grammar2Result<TypedProgram> {
         use zyntax_typed_ast::source::SourceFile;
 
         let interpreter = GrammarInterpreter::new(&self.grammar);
@@ -115,21 +125,22 @@ impl Grammar2 {
         match result {
             ParseResult::Success(ParsedValue::Program(mut program), _) => {
                 // Add source file for diagnostics
-                program.source_files = vec![SourceFile::new(filename.to_string(), source.to_string())];
+                program.source_files =
+                    vec![SourceFile::new(filename.to_string(), source.to_string())];
                 Ok(*program)
             }
             ParseResult::Success(other, _) => {
                 // If we get something other than a program, wrap it
-                eprintln!("[Grammar2] Warning: parse returned {:?}, expected Program",
-                    std::mem::discriminant(&other));
+                eprintln!(
+                    "[Grammar2] Warning: parse returned {:?}, expected Program",
+                    std::mem::discriminant(&other)
+                );
                 Err(Grammar2Error::UnexpectedResult)
             }
-            ParseResult::Failure(e) => {
-                Err(Grammar2Error::SourceParseError(format!(
-                    "Parse error at {}:{}: expected {:?}",
-                    e.line, e.column, e.expected
-                )))
-            }
+            ParseResult::Failure(e) => Err(Grammar2Error::SourceParseError(format!(
+                "Parse error at {}:{}: expected {:?}",
+                e.line, e.column, e.expected
+            ))),
         }
     }
 
@@ -157,7 +168,9 @@ impl Grammar2 {
     fn inject_builtin_externs(
         &self,
         program: &mut TypedProgram,
-        signatures: Option<&std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>>,
+        signatures: Option<
+            &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
+        >,
     ) -> Grammar2Result<()> {
         use zyntax_typed_ast::typed_ast::ParameterKind;
 
@@ -165,26 +178,35 @@ impl Grammar2 {
 
         // Iterate over all builtins from @builtin directive
         for (source_name, target_symbol) in &self.grammar.builtins.functions {
-            log::debug!("[Grammar2] Processing builtin: {} -> {}", source_name, target_symbol);
+            log::debug!(
+                "[Grammar2] Processing builtin: {} -> {}",
+                source_name,
+                target_symbol
+            );
 
             // Get return type from @types.function_returns if available
-            let return_type = if let Some(type_str) = self.grammar.type_decls.function_returns.get(source_name) {
-                log::debug!("[Grammar2] Found @types.function_returns for {}: {}", source_name, type_str);
-                Type::Extern {
-                    name: InternedString::new_global(type_str),
-                    layout: None,
-                }
-            } else if let Some(sigs) = signatures {
-                if let Some(sig) = sigs.get(target_symbol.as_str()) {
-                    // Use type_tag_to_type_with_symbol to infer opaque type from symbol name
-                    Self::type_tag_to_type_with_symbol(&sig.return_type, target_symbol)
+            let return_type =
+                if let Some(type_str) = self.grammar.type_decls.function_returns.get(source_name) {
+                    log::debug!(
+                        "[Grammar2] Found @types.function_returns for {}: {}",
+                        source_name,
+                        type_str
+                    );
+                    Type::Extern {
+                        name: InternedString::new_global(type_str),
+                        layout: None,
+                    }
+                } else if let Some(sigs) = signatures {
+                    if let Some(sig) = sigs.get(target_symbol.as_str()) {
+                        // Use type_tag_to_type_with_symbol to infer opaque type from symbol name
+                        Self::type_tag_to_type_with_symbol(&sig.return_type, target_symbol)
+                    } else {
+                        Type::Any
+                    }
                 } else {
+                    log::debug!("[Grammar2] No signatures provided, using Type::Any");
                     Type::Any
-                }
-            } else {
-                log::debug!("[Grammar2] No signatures provided, using Type::Any");
-                Type::Any
-            };
+                };
 
             // Get parameters from signature if available
             let params: Vec<TypedParameter> = if let Some(sigs) = signatures {
@@ -264,7 +286,7 @@ impl Grammar2 {
 
     /// Convert ZRTL TypeTag to Type
     fn type_tag_to_type(tag: &zyntax_compiler::zrtl::TypeTag) -> Type {
-        use zyntax_compiler::zrtl::{TypeCategory, PrimitiveSize};
+        use zyntax_compiler::zrtl::{PrimitiveSize, TypeCategory};
 
         match tag.category() {
             TypeCategory::Void => Type::Primitive(PrimitiveType::Unit),
@@ -342,7 +364,8 @@ mod tests {
 
     #[test]
     fn test_grammar2_creation() {
-        let grammar = Grammar2::from_source(r#"
+        let grammar = Grammar2::from_source(
+            r#"
             @language {
                 name: "Test",
                 version: "1.0",
@@ -352,7 +375,8 @@ mod tests {
               -> TypedProgram {
                   declarations: [],
               }
-        "#);
+        "#,
+        );
 
         match grammar {
             Ok(g) => {

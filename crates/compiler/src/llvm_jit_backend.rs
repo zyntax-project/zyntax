@@ -19,16 +19,16 @@
 //! MCJIT requires the module to be fully populated before the execution engine is created.
 //! We compile HIR → LLVM IR first, then create the execution engine from the populated module.
 
+use crate::hir::{HirFunction, HirId, HirModule};
+use crate::llvm_backend::LLVMBackend;
+use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
 use inkwell::{
-    OptimizationLevel,
     context::Context,
     execution_engine::ExecutionEngine,
     targets::{InitializationConfig, Target},
+    OptimizationLevel,
 };
-use crate::{CompilerError, CompilerResult};
-use crate::hir::{HirModule, HirFunction, HirId};
-use crate::llvm_backend::LLVMBackend;
 
 /// LLVM JIT backend using MCJIT
 ///
@@ -62,10 +62,14 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     }
 
     /// Create with custom optimization level
-    pub fn with_opt_level(context: &'ctx Context, opt_level: OptimizationLevel) -> CompilerResult<Self> {
+    pub fn with_opt_level(
+        context: &'ctx Context,
+        opt_level: OptimizationLevel,
+    ) -> CompilerResult<Self> {
         // Initialize LLVM targets
-        Target::initialize_native(&InitializationConfig::default())
-            .map_err(|e| CompilerError::Backend(format!("Failed to initialize LLVM target: {}", e)))?;
+        Target::initialize_native(&InitializationConfig::default()).map_err(|e| {
+            CompilerError::Backend(format!("Failed to initialize LLVM target: {}", e))
+        })?;
 
         // Link in MCJIT
         ExecutionEngine::link_in_mc_jit();
@@ -95,7 +99,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// Register multiple runtime symbols at once
     pub fn register_symbols(&mut self, symbols: &[(&str, *const u8)]) {
         for (name, ptr) in symbols {
-            self.runtime_symbols.insert((*name).to_string(), *ptr as usize);
+            self.runtime_symbols
+                .insert((*name).to_string(), *ptr as usize);
         }
     }
 
@@ -117,7 +122,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
         // Step 2: Collect external function declarations from the module BEFORE consuming it
         // We need the function values for add_global_mapping
-        let mut external_functions: Vec<(String, inkwell::values::FunctionValue<'ctx>)> = Vec::new();
+        let mut external_functions: Vec<(String, inkwell::values::FunctionValue<'ctx>)> =
+            Vec::new();
         for (_, function) in &hir_module.functions {
             if function.is_external {
                 if let Some(name) = function.name.resolve_global() {
@@ -132,13 +138,19 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let module = backend.into_module();
         let execution_engine = module
             .create_jit_execution_engine(self.opt_level)
-            .map_err(|e| CompilerError::Backend(format!("Failed to create JIT execution engine: {}", e)))?;
+            .map_err(|e| {
+                CompilerError::Backend(format!("Failed to create JIT execution engine: {}", e))
+            })?;
 
         // Step 4: Register runtime symbols with the execution engine using add_global_mapping
         for (name, llvm_func) in &external_functions {
             if let Some(addr) = self.runtime_symbols.get(name) {
                 execution_engine.add_global_mapping(llvm_func, *addr);
-                log::debug!("Registered runtime symbol '{}' at address 0x{:x}", name, addr);
+                log::debug!(
+                    "Registered runtime symbol '{}' at address 0x{:x}",
+                    name,
+                    addr
+                );
             }
         }
 
@@ -152,7 +164,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             // Must match naming logic in llvm_backend.rs:
             // - Main function uses actual name for entry point
             // - Other functions use mangled name with HirId
-            let actual_name = function.name.resolve_global()
+            let actual_name = function
+                .name
+                .resolve_global()
                 .unwrap_or_else(|| format!("{:?}", function.name));
             let fn_name = if actual_name == "main" {
                 actual_name
@@ -163,9 +177,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             // Get function address from JIT execution engine
             let fn_ptr = execution_engine
                 .get_function_address(&fn_name)
-                .map_err(|e| CompilerError::Backend(
-                    format!("Failed to get function address for '{}': {:?}", fn_name, e)
-                ))?;
+                .map_err(|e| {
+                    CompilerError::Backend(format!(
+                        "Failed to get function address for '{}': {:?}",
+                        fn_name, e
+                    ))
+                })?;
 
             // Cache the pointer (stored as usize for thread safety)
             self.function_pointers.insert(*id, fn_ptr as usize);
@@ -207,7 +224,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
     /// Get a function pointer
     pub fn get_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
-        self.function_pointers.get(&func_id).map(|&addr| addr as *const u8)
+        self.function_pointers
+            .get(&func_id)
+            .map(|&addr| addr as *const u8)
     }
 
     /// Get optimization level

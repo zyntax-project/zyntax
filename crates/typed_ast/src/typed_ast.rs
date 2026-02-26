@@ -1,8 +1,8 @@
 //! # Typed Abstract Syntax Tree (TypedAST)
-//! 
+//!
 //! The target representation that other language implementations will lower to.
 //! Includes full type information and source locations for debugging and diagnostics.
-//! 
+//!
 //! ## Design Principles
 //! - Every node carries source location (Span) information
 //! - Variable declarations include mutability information
@@ -10,8 +10,8 @@
 //! - Supports languages like Rust, Java, C#, TypeScript, and Haxe
 
 use crate::arena::InternedString;
-use crate::source::{Span, SourceFile};
-use crate::type_registry::{Type, Mutability, Visibility, CallingConvention};
+use crate::source::{SourceFile, Span};
+use crate::type_registry::{CallingConvention, Mutability, Type, Visibility};
 use serde::{Deserialize, Serialize};
 
 /// Every typed node wraps its content with type and span information
@@ -340,27 +340,27 @@ pub struct TypedFunction {
     #[serde(default)]
     pub name: InternedString,
     #[serde(default)]
-    pub annotations: Vec<TypedAnnotation>,  // @deprecated, @inline, etc.
+    pub annotations: Vec<TypedAnnotation>, // @deprecated, @inline, etc.
     #[serde(default)]
-    pub effects: Vec<InternedString>,  // Effect names from @effect(Probabilistic, IO)
+    pub effects: Vec<InternedString>, // Effect names from @effect(Probabilistic, IO)
     #[serde(default)]
-    pub type_params: Vec<TypedTypeParam>,  // Generic type parameters
+    pub type_params: Vec<TypedTypeParam>, // Generic type parameters
     #[serde(default)]
     pub params: Vec<TypedParameter>,
     #[serde(default)]
     pub return_type: Type,
-    pub body: Option<TypedBlock>,  // None for extern functions
+    pub body: Option<TypedBlock>, // None for extern functions
     #[serde(default)]
     pub visibility: Visibility,
     #[serde(default)]
     pub is_async: bool,
     #[serde(default)]
-    pub is_pure: bool,  // True for @pure functions (no effects)
+    pub is_pure: bool, // True for @pure functions (no effects)
     #[serde(default)]
-    pub is_external: bool,  // True for extern/foreign functions
+    pub is_external: bool, // True for extern/foreign functions
     #[serde(default)]
-    pub calling_convention: CallingConvention,  // Calling convention (C, Rust, System, etc.)
-    pub link_name: Option<InternedString>,  // Override symbol name for linking
+    pub calling_convention: CallingConvention, // Calling convention (C, Rust, System, etc.)
+    pub link_name: Option<InternedString>, // Override symbol name for linking
 }
 
 /// Function parameter with mutability and advanced features
@@ -562,18 +562,32 @@ pub struct TypedBinary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     // Arithmetic
-    Add, Sub, Mul, Div, Rem,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     // Comparison
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // Logical
-    And, Or,
+    And,
+    Or,
     // Bitwise
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // Assignment (with mutability check)
     Assign,
     // Zig-specific error handling
-    Orelse,  // `a orelse b` - unwrap optional or use default
-    Catch,   // `a catch b` - unwrap error union or use default
+    Orelse, // `a orelse b` - unwrap optional or use default
+    Catch,  // `a catch b` - unwrap error union or use default
 }
 
 /// Unary operation
@@ -586,7 +600,10 @@ pub struct TypedUnary {
 /// Unary operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
-    Plus, Minus, Not, BitNot,
+    Plus,
+    Minus,
+    Not,
+    BitNot,
 }
 
 /// Function call with support for both positional and named arguments
@@ -642,10 +659,15 @@ impl TypedParameter {
             span,
         }
     }
-    
+
     /// Create an optional parameter with default value
-    pub fn optional(name: InternedString, ty: Type, mutability: Mutability, 
-                   default: TypedNode<TypedExpression>, span: Span) -> Self {
+    pub fn optional(
+        name: InternedString,
+        ty: Type,
+        mutability: Mutability,
+        default: TypedNode<TypedExpression>,
+        span: Span,
+    ) -> Self {
         Self {
             name,
             ty,
@@ -656,7 +678,7 @@ impl TypedParameter {
             span,
         }
     }
-    
+
     /// Create a rest/variadic parameter
     pub fn rest(name: InternedString, ty: Type, mutability: Mutability, span: Span) -> Self {
         Self {
@@ -669,7 +691,7 @@ impl TypedParameter {
             span,
         }
     }
-    
+
     /// Create an out parameter (C#-style)
     pub fn out(name: InternedString, ty: Type, span: Span) -> Self {
         Self {
@@ -682,7 +704,7 @@ impl TypedParameter {
             span,
         }
     }
-    
+
     /// Create a ref parameter (C#-style)
     pub fn ref_param(name: InternedString, ty: Type, mutability: Mutability, span: Span) -> Self {
         Self {
@@ -695,7 +717,7 @@ impl TypedParameter {
             span,
         }
     }
-    
+
     /// Create an inout parameter (Swift-style)
     pub fn inout(name: InternedString, ty: Type, span: Span) -> Self {
         Self {
@@ -724,9 +746,14 @@ impl TypedMethodParam {
             span,
         }
     }
-    
+
     /// Create a self parameter (requires arena for string interning)
-    pub fn self_param(arena: &mut crate::arena::AstArena, ty: Type, mutability: Mutability, span: Span) -> Self {
+    pub fn self_param(
+        arena: &mut crate::arena::AstArena,
+        ty: Type,
+        mutability: Mutability,
+        span: Span,
+    ) -> Self {
         Self {
             name: arena.intern_string("self"), // Special self name
             ty,
@@ -742,7 +769,10 @@ impl TypedMethodParam {
 
 impl TypedCall {
     /// Create a call with only positional arguments
-    pub fn positional(callee: TypedNode<TypedExpression>, args: Vec<TypedNode<TypedExpression>>) -> Self {
+    pub fn positional(
+        callee: TypedNode<TypedExpression>,
+        args: Vec<TypedNode<TypedExpression>>,
+    ) -> Self {
         Self {
             callee: Box::new(callee),
             positional_args: args,
@@ -750,12 +780,14 @@ impl TypedCall {
             type_args: vec![],
         }
     }
-    
+
     /// Create a call with both positional and named arguments
-    pub fn mixed(callee: TypedNode<TypedExpression>, 
-                positional: Vec<TypedNode<TypedExpression>>,
-                named: Vec<TypedNamedArg>,
-                type_args: Vec<Type>) -> Self {
+    pub fn mixed(
+        callee: TypedNode<TypedExpression>,
+        positional: Vec<TypedNode<TypedExpression>>,
+        named: Vec<TypedNamedArg>,
+        type_args: Vec<Type>,
+    ) -> Self {
         Self {
             callee: Box::new(callee),
             positional_args: positional,
@@ -763,7 +795,7 @@ impl TypedCall {
             type_args,
         }
     }
-    
+
     /// Create a call with only named arguments (Python/Swift style)
     pub fn named_only(callee: TypedNode<TypedExpression>, args: Vec<TypedNamedArg>) -> Self {
         Self {
@@ -788,8 +820,11 @@ impl TypedNamedArg {
 
 impl TypedMethodCall {
     /// Create a method call with positional arguments
-    pub fn positional(receiver: TypedNode<TypedExpression>, method: InternedString,
-                     args: Vec<TypedNode<TypedExpression>>) -> Self {
+    pub fn positional(
+        receiver: TypedNode<TypedExpression>,
+        method: InternedString,
+        args: Vec<TypedNode<TypedExpression>>,
+    ) -> Self {
         Self {
             receiver: Box::new(receiver),
             method,
@@ -798,10 +833,13 @@ impl TypedMethodCall {
             named_args: vec![],
         }
     }
-    
+
     /// Create a method call with named arguments
-    pub fn named(receiver: TypedNode<TypedExpression>, method: InternedString,
-                named: Vec<TypedNamedArg>) -> Self {
+    pub fn named(
+        receiver: TypedNode<TypedExpression>,
+        method: InternedString,
+        named: Vec<TypedNamedArg>,
+    ) -> Self {
         Self {
             receiver: Box::new(receiver),
             method,
@@ -1003,9 +1041,7 @@ pub enum TypedLoop {
         condition: Box<TypedNode<TypedExpression>>,
     },
     /// Infinite loop: loop { ... } (Rust-style)
-    Infinite {
-        body: TypedBlock,
-    },
+    Infinite { body: TypedBlock },
 }
 
 /// Match/Switch statement
@@ -1042,124 +1078,134 @@ pub enum TypedPattern {
     /// Wildcard pattern: _
     #[default]
     Wildcard,
-    
+
     /// Variable binding: x, mut y
-    Identifier { name: InternedString, mutability: Mutability },
-    
+    Identifier {
+        name: InternedString,
+        mutability: Mutability,
+    },
+
     /// Literal patterns: 42, "hello", true
     Literal(TypedLiteralPattern),
-    
+
     /// Tuple patterns: (x, y, _)
     Tuple(Vec<TypedNode<TypedPattern>>),
-    
+
     /// Struct patterns: Point { x, y } or Point { x: px, y: py }
-    Struct { name: InternedString, fields: Vec<TypedFieldPattern> },
-    
+    Struct {
+        name: InternedString,
+        fields: Vec<TypedFieldPattern>,
+    },
+
     /// Enum variant patterns: Some(x), Ok(value), None
-    Enum { name: InternedString, variant: InternedString, fields: Vec<TypedNode<TypedPattern>> },
-    
+    Enum {
+        name: InternedString,
+        variant: InternedString,
+        fields: Vec<TypedNode<TypedPattern>>,
+    },
+
     /// Array/Vec patterns: [x, y, z]
     Array(Vec<TypedNode<TypedPattern>>),
-    
+
     /// Slice patterns: [head, tail @ ..]
     Slice {
         prefix: Vec<TypedNode<TypedPattern>>,
         middle: Option<Box<TypedNode<TypedPattern>>>, // rest pattern: ..rest
         suffix: Vec<TypedNode<TypedPattern>>,
     },
-    
+
     /// Range patterns: 1..=10, 'a'..='z'
     Range {
         start: Box<TypedNode<TypedLiteralPattern>>,
         end: Box<TypedNode<TypedLiteralPattern>>,
         inclusive: bool,
     },
-    
+
     /// Reference patterns: &x, &mut y
     Reference {
         pattern: Box<TypedNode<TypedPattern>>,
         mutability: Mutability,
     },
-    
+
     /// Box/Pointer patterns: Box(x)
     Box(Box<TypedNode<TypedPattern>>),
-    
+
     /// Or patterns: x | y | z
     Or(Vec<TypedNode<TypedPattern>>),
-    
+
     /// Guard patterns: x if x > 0
     Guard {
         pattern: Box<TypedNode<TypedPattern>>,
         condition: Box<TypedNode<TypedExpression>>,
     },
-    
+
     /// Rest patterns: ..rest (in tuples/arrays)
     Rest {
         name: Option<InternedString>,
         mutability: Mutability,
     },
-    
+
     /// At patterns: binding @ pattern (e.g., x @ Some(y))
     At {
         name: InternedString,
         mutability: Mutability,
         pattern: Box<TypedNode<TypedPattern>>,
     },
-    
+
     /// Constant patterns: CONST_VALUE
     Constant(InternedString),
-    
+
     /// Path patterns: std::Some, MyEnum::Variant
     Path {
         path: Vec<InternedString>,
         args: Option<Vec<TypedNode<TypedPattern>>>,
     },
-    
+
     /// Regex patterns (Haxe-style): ~/pattern/flags
     Regex {
         pattern: InternedString,
         flags: Option<InternedString>,
     },
-    
+
     /// Type patterns: x: T (explicit type annotation in pattern)
     Typed {
         pattern: Box<TypedNode<TypedPattern>>,
         ty: Type,
     },
-    
+
     /// Macro patterns: pattern!(...) for language-specific extensions
     Macro {
         name: InternedString,
         args: Vec<TypedNode<TypedPattern>>,
     },
-    
+
     /// Map/Object patterns: { key1: p1, key2: p2, ..rest }
     Map(TypedMapPattern),
-    
+
     /// View patterns (active patterns): view_func => pattern
     View {
         view_function: Box<TypedNode<TypedExpression>>,
         pattern: Box<TypedNode<TypedPattern>>,
     },
-    
+
     /// Lazy patterns: lazy(pattern) - for lazy evaluation
     Lazy(Box<TypedNode<TypedPattern>>),
-    
+
     /// When patterns: pattern when condition (F#/ML style)
     When {
         pattern: Box<TypedNode<TypedPattern>>,
         condition: Box<TypedNode<TypedExpression>>,
     },
-    
+
     /// Async patterns: async pattern (for async/await contexts)
     Async(Box<TypedNode<TypedPattern>>),
-    
+
     /// Constructor patterns with type args: Vec<T>(pattern)
     Constructor {
         constructor: Type,
         pattern: Box<TypedNode<TypedPattern>>,
     },
-    
+
     /// Error patterns: Error(kind, message) for exception handling
     Error {
         error_type: Option<Type>,
@@ -1238,52 +1284,58 @@ impl TypedPattern {
     pub fn wildcard() -> Self {
         TypedPattern::Wildcard
     }
-    
+
     /// Create a variable binding pattern
     pub fn var(name: InternedString, mutability: Mutability) -> Self {
         TypedPattern::Identifier { name, mutability }
     }
-    
+
     /// Create an immutable variable binding
     pub fn immutable_var(name: InternedString) -> Self {
-        TypedPattern::Identifier { name, mutability: Mutability::Immutable }
+        TypedPattern::Identifier {
+            name,
+            mutability: Mutability::Immutable,
+        }
     }
-    
+
     /// Create a mutable variable binding
     pub fn mutable_var(name: InternedString) -> Self {
-        TypedPattern::Identifier { name, mutability: Mutability::Mutable }
+        TypedPattern::Identifier {
+            name,
+            mutability: Mutability::Mutable,
+        }
     }
-    
+
     /// Create a literal pattern
     pub fn literal(lit: TypedLiteralPattern) -> Self {
         TypedPattern::Literal(lit)
     }
-    
+
     /// Create an integer literal pattern
     pub fn int(value: i128) -> Self {
         TypedPattern::Literal(TypedLiteralPattern::Integer(value))
     }
-    
+
     /// Create a string literal pattern
     pub fn string(value: InternedString) -> Self {
         TypedPattern::Literal(TypedLiteralPattern::String(value))
     }
-    
+
     /// Create a boolean literal pattern
     pub fn bool(value: bool) -> Self {
         TypedPattern::Literal(TypedLiteralPattern::Bool(value))
     }
-    
+
     /// Create a tuple pattern
     pub fn tuple(patterns: Vec<TypedNode<TypedPattern>>) -> Self {
         TypedPattern::Tuple(patterns)
     }
-    
+
     /// Create an or-pattern (alternative patterns)
     pub fn or(patterns: Vec<TypedNode<TypedPattern>>) -> Self {
         TypedPattern::Or(patterns)
     }
-    
+
     /// Create a guard pattern
     pub fn guard(pattern: TypedNode<TypedPattern>, condition: TypedNode<TypedExpression>) -> Self {
         TypedPattern::Guard {
@@ -1291,7 +1343,7 @@ impl TypedPattern {
             condition: Box::new(condition),
         }
     }
-    
+
     /// Create a range pattern
     pub fn range(start: TypedLiteralPattern, end: TypedLiteralPattern, inclusive: bool) -> Self {
         TypedPattern::Range {
@@ -1300,16 +1352,20 @@ impl TypedPattern {
             inclusive,
         }
     }
-    
+
     /// Create an at-pattern (binding @ pattern)
-    pub fn at(name: InternedString, mutability: Mutability, pattern: TypedNode<TypedPattern>) -> Self {
+    pub fn at(
+        name: InternedString,
+        mutability: Mutability,
+        pattern: TypedNode<TypedPattern>,
+    ) -> Self {
         TypedPattern::At {
             name,
             mutability,
             pattern: Box::new(pattern),
         }
     }
-    
+
     /// Create a reference pattern
     pub fn reference(pattern: TypedNode<TypedPattern>, mutability: Mutability) -> Self {
         TypedPattern::Reference {
@@ -1317,7 +1373,7 @@ impl TypedPattern {
             mutability,
         }
     }
-    
+
     /// Check if pattern binds any variables
     pub fn binds_variables(&self) -> bool {
         match self {
@@ -1330,15 +1386,20 @@ impl TypedPattern {
             TypedPattern::Reference { pattern, .. } => pattern.node.binds_variables(),
             TypedPattern::Box(pattern) => pattern.node.binds_variables(),
             TypedPattern::Guard { pattern, .. } => pattern.node.binds_variables(),
-            TypedPattern::Struct { fields, .. } => fields.iter().any(|f| f.pattern.node.binds_variables()),
+            TypedPattern::Struct { fields, .. } => {
+                fields.iter().any(|f| f.pattern.node.binds_variables())
+            }
             TypedPattern::Enum { fields, .. } => fields.iter().any(|f| f.node.binds_variables()),
             _ => true, // Conservative approach for other patterns
         }
     }
-    
+
     /// Check if pattern is exhaustive (matches all possible values)
     pub fn is_exhaustive(&self) -> bool {
-        matches!(self, TypedPattern::Wildcard | TypedPattern::Identifier { .. })
+        matches!(
+            self,
+            TypedPattern::Wildcard | TypedPattern::Identifier { .. }
+        )
     }
 }
 
@@ -1437,7 +1498,10 @@ pub struct TypedImport {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypedImportItem {
-    Named { name: InternedString, alias: Option<InternedString> },
+    Named {
+        name: InternedString,
+        alias: Option<InternedString>,
+    },
     Glob,
     Default(InternedString),
 }
@@ -1472,7 +1536,7 @@ pub enum TypedTypeBound {
     Copy,
     /// Send constraint: T: Send (Rust style)
     Send,
-    /// Sync constraint: T: Sync (Rust style) 
+    /// Sync constraint: T: Sync (Rust style)
     Sync,
     /// Static lifetime constraint: T: 'static
     Static,
@@ -1660,7 +1724,7 @@ mod tests {
         let span = Span::new(0, 10);
         let expr = TypedExpression::Literal(TypedLiteral::Integer(42));
         let node = typed_node(expr, Type::Primitive(PrimitiveType::I32), span);
-        
+
         assert_eq!(node.span, span);
         assert!(matches!(node.ty, Type::Primitive(PrimitiveType::I32)));
     }
@@ -1677,7 +1741,7 @@ mod tests {
             initializer: None,
             span,
         };
-        
+
         assert_eq!(let_stmt.mutability, Mutability::Mutable);
         assert_eq!(let_stmt.span, span);
     }

@@ -10,7 +10,7 @@
 use zyntax_typed_ast::type_registry::{TypeId, TypeRegistry};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::*;
-use zyntax_typed_ast::{NullabilityKind, AsyncKind, CallingConvention};
+use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
 
 #[cfg(test)]
 mod type_checker_tests {
@@ -175,7 +175,7 @@ mod type_checker_tests {
                     node: TypedDeclaration::Function(TypedFunction {
                         name: main,
                         params: vec![],
-                type_params: vec![],
+                        type_params: vec![],
                         body: Some(body),
                         return_type: Type::Primitive(PrimitiveType::Unit),
                         visibility: Visibility::Public,
@@ -183,6 +183,7 @@ mod type_checker_tests {
                         is_external: false,
                         calling_convention: CallingConvention::Default,
                         link_name: None,
+                        ..Default::default()
                     }),
                     ty: Type::Function {
                         params: vec![],
@@ -190,10 +191,10 @@ mod type_checker_tests {
                         is_varargs: false,
                         has_named_params: false,
                         has_default_params: false,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            },
+                        async_kind: AsyncKind::Sync,
+                        calling_convention: CallingConvention::Default,
+                        nullability: NullabilityKind::NonNull,
+                    },
                     span,
                 },
             ],
@@ -286,6 +287,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -324,10 +326,10 @@ mod type_checker_tests {
         let point_type = Type::Named {
             id: TypeId::next(), // Point type
             type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
+            const_args: Vec::new(),
+            variance: Vec::new(),
+            nullability: NullabilityKind::NonNull,
+        };
 
         // Create a variable declaration of struct type
         let point_decl = builder.let_statement(
@@ -368,6 +370,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -402,8 +405,8 @@ mod type_checker_tests {
         let array_type = Type::Array {
             element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
             size: Some(ConstValue::Int(10)),
-                nullability: NullabilityKind::NonNull,
-            };
+            nullability: NullabilityKind::NonNull,
+        };
         let array_decl = builder.let_statement(
             "numbers",
             array_type.clone(),
@@ -437,6 +440,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -510,6 +514,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -586,10 +591,10 @@ mod type_checker_tests {
             is_varargs: false,
             has_named_params: false,
             has_default_params: false,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            };
+            async_kind: AsyncKind::Sync,
+            calling_convention: CallingConvention::Default,
+            nullability: NullabilityKind::NonNull,
+        };
 
         // Create call with 3 arguments (too many!)
         let callee = builder.variable("add", function_type, span);
@@ -619,6 +624,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -663,8 +669,8 @@ mod type_checker_tests {
         let rest_param_type = Type::Array {
             element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
             size: None,
-                nullability: NullabilityKind::NonNull,
-            };
+            nullability: NullabilityKind::NonNull,
+        };
         let rest_param =
             builder.rest_parameter("numbers", rest_param_type, Mutability::Immutable, span);
 
@@ -698,8 +704,8 @@ mod type_checker_tests {
                     ty: Type::Array {
                         element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
                         size: None,
-                nullability: NullabilityKind::NonNull,
-            },
+                        nullability: NullabilityKind::NonNull,
+                    },
                     is_optional: false,
                     is_varargs: true,
                     is_keyword_only: false,
@@ -747,6 +753,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -825,10 +832,10 @@ mod type_checker_tests {
                     is_varargs: false,
                     has_named_params: false,
                     has_default_params: false,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            },
+                    async_kind: AsyncKind::Sync,
+                    calling_convention: CallingConvention::Default,
+                    nullability: NullabilityKind::NonNull,
+                },
                 span,
             );
 
@@ -856,6 +863,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],
@@ -964,10 +972,10 @@ mod type_checker_tests {
             is_varargs: false,
             has_named_params: true,
             has_default_params: true,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            };
+            async_kind: AsyncKind::Sync,
+            calling_convention: CallingConvention::Default,
+            nullability: NullabilityKind::NonNull,
+        };
 
         // Call with positional + named arguments
         let callee = builder.variable("process", function_type, span);
@@ -999,6 +1007,7 @@ mod type_checker_tests {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                ..Default::default()
             }),
             ty: Type::Function {
                 params: vec![],

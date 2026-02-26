@@ -1,10 +1,10 @@
 //! Tests for the extended TypedAST features
 
-use zyntax_typed_ast::{NullabilityKind, AsyncKind, CallingConvention};
 use zyntax_typed_ast::{
-    ast_convert::*, Type, TypeId, PrimitiveType, Mutability, Visibility, typed_ast::*, 
-    AstArena, InternedString, Span, TypeRegistry,
+    ast_convert::*, typed_ast::*, AstArena, InternedString, Mutability, PrimitiveType, Span, Type,
+    TypeId, TypeRegistry, Visibility,
 };
+use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
 
 #[test]
 fn test_class_declaration() {
@@ -36,10 +36,10 @@ fn test_class_declaration() {
                 ty: Type::Named {
                     id: TypeId::next(), // Placeholder type ID for Person class
                     type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            },
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                },
                 mutability: Mutability::Immutable,
                 is_self: true,
                 span: Span::new(50, 54),
@@ -137,10 +137,10 @@ fn test_interface_with_methods() {
                 ty: Type::Named {
                     id: TypeId::next(), // Placeholder type ID for Printable interface
                     type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            },
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                },
                 mutability: Mutability::Immutable,
                 is_self: true,
                 span: Span::new(15, 19),
@@ -289,10 +289,10 @@ fn test_comprehensive_program_structure() {
                 Type::Named {
                     id: TypeId::next(), // Placeholder type ID for Person class
                     type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            },
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                },
                 Span::new(25, 60),
             ),
             // Function declaration
@@ -311,6 +311,7 @@ fn test_comprehensive_program_structure() {
                     is_external: false,
                     calling_convention: CallingConvention::Default,
                     link_name: None,
+                    ..Default::default()
                 }),
                 Type::Function {
                     params: vec![],
@@ -318,14 +319,15 @@ fn test_comprehensive_program_structure() {
                     is_varargs: false,
                     has_named_params: false,
                     has_default_params: false,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            },
+                    async_kind: AsyncKind::Sync,
+                    calling_convention: CallingConvention::Default,
+                    nullability: NullabilityKind::NonNull,
+                },
                 Span::new(65, 95),
             ),
         ],
         span: Span::new(0, 100),
+        ..Default::default()
     };
 
     assert_eq!(program.declarations.len(), 3);

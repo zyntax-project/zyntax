@@ -30,10 +30,7 @@ pub enum AdapterError {
 
     /// Type mismatch during conversion
     #[error("Type mismatch: expected {expected}, got {got}")]
-    TypeMismatch {
-        expected: String,
-        got: String,
-    },
+    TypeMismatch { expected: String, got: String },
 
     /// Invalid Whirlwind IR structure
     #[error("Invalid Whirlwind IR: {0}")]

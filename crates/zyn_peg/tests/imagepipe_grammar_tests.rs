@@ -12,12 +12,10 @@
 //! 3. Action structure (Construct, not LegacyJson)
 //! 4. Using GrammarInterpreter to parse actual ImagePipe source files
 
-use zyn_peg::grammar::{
-    parse_grammar, PatternIR, ActionIR, RuleModifier, CharClass,
-};
-use zyn_peg::runtime2::{ParserState, ParseResult, ParsedValue, GrammarInterpreter};
-use zyntax_typed_ast::{TypedASTBuilder, TypedDeclaration};
+use zyn_peg::grammar::{parse_grammar, ActionIR, CharClass, PatternIR, RuleModifier};
+use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
 use zyntax_typed_ast::type_registry::TypeRegistry;
+use zyntax_typed_ast::{TypedASTBuilder, TypedDeclaration};
 
 const IMAGEPIPE_GRAMMAR: &str = include_str!("../../../examples/imagepipe/imagepipe.zyn");
 const VINTAGE_IMGPIPE: &str = include_str!("../../../examples/imagepipe/samples/vintage.imgpipe");
@@ -28,11 +26,14 @@ const VINTAGE_IMGPIPE: &str = include_str!("../../../examples/imagepipe/samples/
 
 #[test]
 fn test_imagepipe_grammar_parses_successfully() {
-    let grammar = parse_grammar(IMAGEPIPE_GRAMMAR)
-        .expect("ImagePipe grammar should parse successfully");
+    let grammar =
+        parse_grammar(IMAGEPIPE_GRAMMAR).expect("ImagePipe grammar should parse successfully");
 
     // Validate metadata
-    assert_eq!(grammar.metadata.name, "ImagePipe", "Language name should be ImagePipe");
+    assert_eq!(
+        grammar.metadata.name, "ImagePipe",
+        "Language name should be ImagePipe"
+    );
     assert_eq!(grammar.metadata.version, "2.0", "Version should be 2.0");
     assert_eq!(
         grammar.metadata.file_extensions,
@@ -83,7 +84,11 @@ fn test_imagepipe_builtin_mappings() {
     );
 
     // Should have 15 builtin functions
-    assert_eq!(grammar.builtins.functions.len(), 15, "Should have 15 builtin functions");
+    assert_eq!(
+        grammar.builtins.functions.len(),
+        15,
+        "Should have 15 builtin functions"
+    );
 }
 
 #[test]
@@ -98,7 +103,11 @@ fn test_imagepipe_rule_count() {
     // blur_stmt, brightness_stmt, contrast_stmt, grayscale_stmt, invert_stmt
     // string_literal, string_inner, integer, signed_integer, number, identifier
     // WHITESPACE, COMMENT
-    assert_eq!(grammar.rules.len(), 26, "ImagePipe grammar should have 26 rules");
+    assert_eq!(
+        grammar.rules.len(),
+        26,
+        "ImagePipe grammar should have 26 rules"
+    );
 }
 
 // =============================================================================
@@ -108,7 +117,10 @@ fn test_imagepipe_rule_count() {
 #[test]
 fn test_program_rule_structure() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let program = grammar.rules.get("program").expect("program rule should exist");
+    let program = grammar
+        .rules
+        .get("program")
+        .expect("program rule should exist");
 
     // Pattern: SOI ~ stmts:statements ~ EOI
     match &program.pattern {
@@ -126,7 +138,10 @@ fn test_program_rule_structure() {
     // Action: -> stmts (PassThrough)
     match &program.action {
         Some(ActionIR::PassThrough { binding }) => {
-            assert_eq!(binding, "stmts", "program should pass through stmts binding");
+            assert_eq!(
+                binding, "stmts",
+                "program should pass through stmts binding"
+            );
         }
         _ => panic!("program action should be PassThrough"),
     }
@@ -135,13 +150,21 @@ fn test_program_rule_structure() {
 #[test]
 fn test_statements_rule_structure() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let statements = grammar.rules.get("statements").expect("statements rule should exist");
+    let statements = grammar
+        .rules
+        .get("statements")
+        .expect("statements rule should exist");
 
     // Pattern: stmt:statement*
     match &statements.pattern {
-        PatternIR::Repeat { pattern, min, max, .. } => {
+        PatternIR::Repeat {
+            pattern, min, max, ..
+        } => {
             assert_eq!(*min, 0, "statements should allow zero statements");
-            assert!(max.is_none(), "statements should allow unlimited statements");
+            assert!(
+                max.is_none(),
+                "statements should allow unlimited statements"
+            );
             match pattern.as_ref() {
                 PatternIR::RuleRef { rule_name, binding } => {
                     assert_eq!(rule_name, "statement");
@@ -166,32 +189,48 @@ fn test_statements_rule_structure() {
 #[test]
 fn test_statement_rule_is_choice() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let statement = grammar.rules.get("statement").expect("statement rule should exist");
+    let statement = grammar
+        .rules
+        .get("statement")
+        .expect("statement rule should exist");
 
     match &statement.pattern {
         PatternIR::Choice(choices) => {
             assert_eq!(choices.len(), 15, "statement should have 15 alternatives");
 
             // Verify key alternatives exist
-            let choice_names: Vec<_> = choices.iter().filter_map(|c| {
-                match c {
+            let choice_names: Vec<_> = choices
+                .iter()
+                .filter_map(|c| match c {
                     PatternIR::RuleRef { rule_name, .. } => Some(rule_name.as_str()),
                     _ => None,
-                }
-            }).collect();
+                })
+                .collect();
 
             assert!(choice_names.contains(&"load_stmt"), "should have load_stmt");
             assert!(choice_names.contains(&"save_stmt"), "should have save_stmt");
-            assert!(choice_names.contains(&"print_stmt"), "should have print_stmt");
-            assert!(choice_names.contains(&"resize_stmt"), "should have resize_stmt");
+            assert!(
+                choice_names.contains(&"print_stmt"),
+                "should have print_stmt"
+            );
+            assert!(
+                choice_names.contains(&"resize_stmt"),
+                "should have resize_stmt"
+            );
             assert!(choice_names.contains(&"blur_stmt"), "should have blur_stmt");
-            assert!(choice_names.contains(&"rotate90_stmt"), "should have rotate90_stmt");
+            assert!(
+                choice_names.contains(&"rotate90_stmt"),
+                "should have rotate90_stmt"
+            );
         }
         _ => panic!("statement pattern should be Choice"),
     }
 
     // statement has no action (it's a passthrough choice)
-    assert!(statement.action.is_none(), "statement should have no explicit action");
+    assert!(
+        statement.action.is_none(),
+        "statement should have no explicit action"
+    );
 }
 
 // =============================================================================
@@ -201,7 +240,10 @@ fn test_statement_rule_is_choice() {
 #[test]
 fn test_load_stmt_rule_structure() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let load_stmt = grammar.rules.get("load_stmt").expect("load_stmt rule should exist");
+    let load_stmt = grammar
+        .rules
+        .get("load_stmt")
+        .expect("load_stmt rule should exist");
 
     // Pattern: "load" ~ path:string_literal ~ "as" ~ name:identifier
     match &load_stmt.pattern {
@@ -223,8 +265,14 @@ fn test_load_stmt_rule_structure() {
             assert_eq!(type_path, "TypedStatement::Let");
             let field_names: Vec<_> = fields.iter().map(|(n, _)| n.as_str()).collect();
             assert!(field_names.contains(&"name"), "should have name field");
-            assert!(field_names.contains(&"initializer"), "should have initializer field");
-            assert!(field_names.contains(&"is_mutable"), "should have is_mutable field");
+            assert!(
+                field_names.contains(&"initializer"),
+                "should have initializer field"
+            );
+            assert!(
+                field_names.contains(&"is_mutable"),
+                "should have is_mutable field"
+            );
         }
         _ => panic!("load_stmt action should be Construct"),
     }
@@ -233,7 +281,10 @@ fn test_load_stmt_rule_structure() {
 #[test]
 fn test_save_stmt_rule_structure() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let save_stmt = grammar.rules.get("save_stmt").expect("save_stmt rule should exist");
+    let save_stmt = grammar
+        .rules
+        .get("save_stmt")
+        .expect("save_stmt rule should exist");
 
     // Pattern: "save" ~ img:identifier ~ "as" ~ path:string_literal
     match &save_stmt.pattern {
@@ -258,7 +309,10 @@ fn test_save_stmt_rule_structure() {
 #[test]
 fn test_print_stmt_rule_structure() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let print_stmt = grammar.rules.get("print_stmt").expect("print_stmt rule should exist");
+    let print_stmt = grammar
+        .rules
+        .get("print_stmt")
+        .expect("print_stmt rule should exist");
 
     // Pattern: "print" ~ msg:string_literal
     match &print_stmt.pattern {
@@ -281,7 +335,10 @@ fn test_print_stmt_rule_structure() {
 #[test]
 fn test_resize_stmt_rule_structure() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let resize_stmt = grammar.rules.get("resize_stmt").expect("resize_stmt rule should exist");
+    let resize_stmt = grammar
+        .rules
+        .get("resize_stmt")
+        .expect("resize_stmt rule should exist");
 
     // Pattern: "resize" ~ img:identifier ~ "to" ~ w:integer ~ "x" ~ h:integer
     match &resize_stmt.pattern {
@@ -306,13 +363,18 @@ fn test_resize_stmt_rule_structure() {
 #[test]
 fn test_blur_stmt_uses_number() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let blur_stmt = grammar.rules.get("blur_stmt").expect("blur_stmt rule should exist");
+    let blur_stmt = grammar
+        .rules
+        .get("blur_stmt")
+        .expect("blur_stmt rule should exist");
 
     // Pattern should include number for sigma
     match &blur_stmt.pattern {
         PatternIR::Sequence(seq) => {
             // "blur" ~ img:identifier ~ "by" ~ sigma:number
-            let has_number = seq.iter().any(|p| matches!(p, PatternIR::RuleRef { rule_name, .. } if rule_name == "number"));
+            let has_number = seq.iter().any(
+                |p| matches!(p, PatternIR::RuleRef { rule_name, .. } if rule_name == "number"),
+            );
             assert!(has_number, "blur_stmt should use number rule for sigma");
         }
         _ => panic!("blur_stmt pattern should be Sequence"),
@@ -322,13 +384,19 @@ fn test_blur_stmt_uses_number() {
 #[test]
 fn test_brightness_stmt_uses_signed_integer() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let brightness_stmt = grammar.rules.get("brightness_stmt").expect("brightness_stmt rule should exist");
+    let brightness_stmt = grammar
+        .rules
+        .get("brightness_stmt")
+        .expect("brightness_stmt rule should exist");
 
     match &brightness_stmt.pattern {
         PatternIR::Sequence(seq) => {
             let has_signed_int = seq.iter().any(|p|
                 matches!(p, PatternIR::RuleRef { rule_name, .. } if rule_name == "signed_integer"));
-            assert!(has_signed_int, "brightness_stmt should use signed_integer for amount");
+            assert!(
+                has_signed_int,
+                "brightness_stmt should use signed_integer for amount"
+            );
         }
         _ => panic!("brightness_stmt pattern should be Sequence"),
     }
@@ -337,7 +405,10 @@ fn test_brightness_stmt_uses_signed_integer() {
 #[test]
 fn test_grayscale_stmt_unary() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let grayscale_stmt = grammar.rules.get("grayscale_stmt").expect("grayscale_stmt rule should exist");
+    let grayscale_stmt = grammar
+        .rules
+        .get("grayscale_stmt")
+        .expect("grayscale_stmt rule should exist");
 
     // Pattern: "grayscale" ~ img:identifier (just 2 elements)
     match &grayscale_stmt.pattern {
@@ -355,7 +426,10 @@ fn test_grayscale_stmt_unary() {
 #[test]
 fn test_string_literal_is_atomic() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let string_literal = grammar.rules.get("string_literal").expect("string_literal rule should exist");
+    let string_literal = grammar
+        .rules
+        .get("string_literal")
+        .expect("string_literal rule should exist");
 
     assert_eq!(
         string_literal.modifier,
@@ -375,7 +449,10 @@ fn test_string_literal_is_atomic() {
 #[test]
 fn test_integer_is_atomic() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let integer = grammar.rules.get("integer").expect("integer rule should exist");
+    let integer = grammar
+        .rules
+        .get("integer")
+        .expect("integer rule should exist");
 
     assert_eq!(
         integer.modifier,
@@ -395,7 +472,10 @@ fn test_integer_is_atomic() {
 #[test]
 fn test_number_is_atomic() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let number = grammar.rules.get("number").expect("number rule should exist");
+    let number = grammar
+        .rules
+        .get("number")
+        .expect("number rule should exist");
 
     assert_eq!(
         number.modifier,
@@ -415,7 +495,10 @@ fn test_number_is_atomic() {
 #[test]
 fn test_identifier_is_atomic() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let identifier = grammar.rules.get("identifier").expect("identifier rule should exist");
+    let identifier = grammar
+        .rules
+        .get("identifier")
+        .expect("identifier rule should exist");
 
     assert_eq!(
         identifier.modifier,
@@ -424,13 +507,19 @@ fn test_identifier_is_atomic() {
     );
 
     // identifier has no action (returns text)
-    assert!(identifier.action.is_none(), "identifier should have no action");
+    assert!(
+        identifier.action.is_none(),
+        "identifier should have no action"
+    );
 }
 
 #[test]
 fn test_whitespace_is_silent() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let whitespace = grammar.rules.get("WHITESPACE").expect("WHITESPACE rule should exist");
+    let whitespace = grammar
+        .rules
+        .get("WHITESPACE")
+        .expect("WHITESPACE rule should exist");
 
     assert_eq!(
         whitespace.modifier,
@@ -442,7 +531,10 @@ fn test_whitespace_is_silent() {
 #[test]
 fn test_comment_is_silent() {
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
-    let comment = grammar.rules.get("COMMENT").expect("COMMENT rule should exist");
+    let comment = grammar
+        .rules
+        .get("COMMENT")
+        .expect("COMMENT rule should exist");
 
     assert_eq!(
         comment.modifier,
@@ -522,11 +614,19 @@ fn test_interpreter_parse_signed_integer() {
     let mut builder = TypedASTBuilder::new();
     let mut registry = TypeRegistry::new();
     let mut state = ParserState::new("-50", &mut builder, &mut registry);
-    assert!(interp.parse_rule("signed_integer", &mut state).is_success(), "Should parse negative");
+    assert!(
+        interp.parse_rule("signed_integer", &mut state).is_success(),
+        "Should parse negative"
+    );
 
     // Test positive with sign
     let mut state2 = ParserState::new("+30", &mut builder, &mut registry);
-    assert!(interp.parse_rule("signed_integer", &mut state2).is_success(), "Should parse positive with sign");
+    assert!(
+        interp
+            .parse_rule("signed_integer", &mut state2)
+            .is_success(),
+        "Should parse positive with sign"
+    );
 }
 
 #[test]
@@ -683,7 +783,10 @@ fn test_interpreter_parse_vintage_imgpipe_statements() {
             panic!("Expected Program, got {:?}", other);
         }
         ParseResult::Failure(e) => {
-            panic!("Failed to parse vintage.imgpipe: line {} col {}: {:?}", e.line, e.column, e.expected);
+            panic!(
+                "Failed to parse vintage.imgpipe: line {} col {}: {:?}",
+                e.line, e.column, e.expected
+            );
         }
     }
 }
@@ -701,10 +804,11 @@ fn test_interpreter_parse_vintage_imgpipe_program() {
     let result = interp.parse_rule("program", &mut state);
 
     match &result {
-        ParseResult::Success(_, _) => {},
+        ParseResult::Success(_, _) => {}
         ParseResult::Failure(e) => {
             let remaining = if state.pos() < VINTAGE_IMGPIPE.len() {
-                &VINTAGE_IMGPIPE[state.pos()..std::cmp::min(state.pos() + 50, VINTAGE_IMGPIPE.len())]
+                &VINTAGE_IMGPIPE
+                    [state.pos()..std::cmp::min(state.pos() + 50, VINTAGE_IMGPIPE.len())]
             } else {
                 ""
             };
@@ -752,7 +856,9 @@ fn test_interpreter_parse_individual_vintage_statements() {
         assert!(
             result.is_success(),
             "Failed to parse '{}' with rule '{}': {:?}",
-            input, rule_name, result
+            input,
+            rule_name,
+            result
         );
     }
 }
@@ -771,12 +877,21 @@ fn test_print_typed_ast_actions() {
 
     // Print the action for each statement rule
     let stmt_rules = vec![
-        "load_stmt", "save_stmt", "print_stmt",
-        "resize_stmt", "crop_stmt",
-        "rotate90_stmt", "rotate180_stmt", "rotate270_stmt",
-        "flip_h_stmt", "flip_v_stmt",
-        "blur_stmt", "brightness_stmt", "contrast_stmt",
-        "grayscale_stmt", "invert_stmt",
+        "load_stmt",
+        "save_stmt",
+        "print_stmt",
+        "resize_stmt",
+        "crop_stmt",
+        "rotate90_stmt",
+        "rotate180_stmt",
+        "rotate270_stmt",
+        "flip_h_stmt",
+        "flip_v_stmt",
+        "blur_stmt",
+        "brightness_stmt",
+        "contrast_stmt",
+        "grayscale_stmt",
+        "invert_stmt",
     ];
 
     for rule_name in stmt_rules {
@@ -857,7 +972,8 @@ fn test_action_types_are_typed_ast() {
                 assert!(
                     type_path.starts_with("TypedStatement::"),
                     "{} should produce TypedStatement, got {}",
-                    rule_name, type_path
+                    rule_name,
+                    type_path
                 );
             }
             _ => panic!("{} should have Construct action", rule_name),
@@ -872,7 +988,8 @@ fn test_action_types_are_typed_ast() {
                 assert!(
                     type_path.starts_with("TypedExpression::"),
                     "{} should produce TypedExpression, got {}",
-                    rule_name, type_path
+                    rule_name,
+                    type_path
                 );
             }
             _ => panic!("{} should have Construct action", rule_name),
@@ -890,7 +1007,7 @@ fn test_action_types_are_typed_ast() {
 /// It parses vintage.imgpipe and prints the resulting TypedProgram structure.
 #[test]
 fn test_print_constructed_typed_ast() {
-    use zyntax_typed_ast::{TypedStatement, TypedExpression};
+    use zyntax_typed_ast::{TypedExpression, TypedStatement};
 
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
     let interp = GrammarInterpreter::new(&grammar);
@@ -905,7 +1022,10 @@ fn test_print_constructed_typed_ast() {
 
     match result {
         ParseResult::Success(ParsedValue::Program(program), _) => {
-            println!("TypedProgram created with {} declaration(s)\n", program.declarations.len());
+            println!(
+                "TypedProgram created with {} declaration(s)\n",
+                program.declarations.len()
+            );
 
             for (i, decl) in program.declarations.iter().enumerate() {
                 println!("Declaration [{}]:", i);
@@ -922,32 +1042,40 @@ fn test_print_constructed_typed_ast() {
                             match &stmt_node.node {
                                 TypedStatement::Let(let_stmt) => {
                                     let var_name = builder.arena().resolve_string(let_stmt.name);
-                                    println!("Let {} : {:?}", var_name.unwrap_or("<unknown>"), let_stmt.ty);
+                                    println!(
+                                        "Let {} : {:?}",
+                                        var_name.unwrap_or("<unknown>"),
+                                        let_stmt.ty
+                                    );
                                 }
-                                TypedStatement::Expression(expr) => {
-                                    match &expr.node {
-                                        TypedExpression::Call(call) => {
-                                            if let TypedExpression::Variable(callee_name) = &call.callee.node {
-                                                let name = builder.arena().resolve_string(*callee_name);
-                                                println!("Call {}(...) [{} args]",
-                                                    name.unwrap_or("<unknown>"),
-                                                    call.positional_args.len()
-                                                );
-                                            } else {
-                                                println!("Call <expr>(...) [{} args]", call.positional_args.len());
-                                            }
-                                        }
-                                        TypedExpression::Binary(bin) => {
-                                            println!("Binary {:?} = ...", bin.op);
-                                        }
-                                        TypedExpression::Literal(lit) => {
-                                            println!("Literal {:?}", lit);
-                                        }
-                                        other => {
-                                            println!("{:?}", other);
+                                TypedStatement::Expression(expr) => match &expr.node {
+                                    TypedExpression::Call(call) => {
+                                        if let TypedExpression::Variable(callee_name) =
+                                            &call.callee.node
+                                        {
+                                            let name = builder.arena().resolve_string(*callee_name);
+                                            println!(
+                                                "Call {}(...) [{} args]",
+                                                name.unwrap_or("<unknown>"),
+                                                call.positional_args.len()
+                                            );
+                                        } else {
+                                            println!(
+                                                "Call <expr>(...) [{} args]",
+                                                call.positional_args.len()
+                                            );
                                         }
                                     }
-                                }
+                                    TypedExpression::Binary(bin) => {
+                                        println!("Binary {:?} = ...", bin.op);
+                                    }
+                                    TypedExpression::Literal(lit) => {
+                                        println!("Literal {:?}", lit);
+                                    }
+                                    other => {
+                                        println!("{:?}", other);
+                                    }
+                                },
                                 other => {
                                     println!("{:?}", other);
                                 }
@@ -971,7 +1099,7 @@ fn test_print_constructed_typed_ast() {
 /// Test that individual statements produce the correct TypedStatement variant.
 #[test]
 fn test_statement_produces_typed_ast_nodes() {
-    use zyntax_typed_ast::{TypedStatement, TypedExpression};
+    use zyntax_typed_ast::{TypedExpression, TypedStatement};
 
     let grammar = parse_grammar(IMAGEPIPE_GRAMMAR).unwrap();
     let interp = GrammarInterpreter::new(&grammar);
@@ -980,24 +1108,18 @@ fn test_statement_produces_typed_ast_nodes() {
     {
         let mut builder = TypedASTBuilder::new();
         let mut registry = TypeRegistry::new();
-        let mut state = ParserState::new(
-            r#"load "test.jpg" as img"#,
-            &mut builder,
-            &mut registry
-        );
+        let mut state = ParserState::new(r#"load "test.jpg" as img"#, &mut builder, &mut registry);
 
         let result = interp.parse_rule("load_stmt", &mut state);
         match result {
-            ParseResult::Success(ParsedValue::Statement(stmt), _) => {
-                match &stmt.node {
-                    TypedStatement::Let(let_stmt) => {
-                        let name = builder.arena().resolve_string(let_stmt.name);
-                        assert_eq!(name, Some("img"));
-                        assert!(let_stmt.initializer.is_some());
-                    }
-                    _ => panic!("Expected Let statement"),
+            ParseResult::Success(ParsedValue::Statement(stmt), _) => match &stmt.node {
+                TypedStatement::Let(let_stmt) => {
+                    let name = builder.arena().resolve_string(let_stmt.name);
+                    assert_eq!(name, Some("img"));
+                    assert!(let_stmt.initializer.is_some());
                 }
-            }
+                _ => panic!("Expected Let statement"),
+            },
             _ => panic!("Expected Statement"),
         }
     }
@@ -1006,11 +1128,7 @@ fn test_statement_produces_typed_ast_nodes() {
     {
         let mut builder = TypedASTBuilder::new();
         let mut registry = TypeRegistry::new();
-        let mut state = ParserState::new(
-            r#"print "hello""#,
-            &mut builder,
-            &mut registry
-        );
+        let mut state = ParserState::new(r#"print "hello""#, &mut builder, &mut registry);
 
         let result = interp.parse_rule("print_stmt", &mut state);
         match result {

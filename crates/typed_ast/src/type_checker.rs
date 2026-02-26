@@ -10,7 +10,9 @@ use crate::constraint_solver::{Constraint as SolverConstraint, ConstraintSolver}
 use crate::diagnostics::{codes, DiagnosticCollector};
 use crate::source::Span;
 use crate::type_inference::{InferenceContext, InferenceError};
-use crate::type_registry::{CallingConvention, MethodSig, Mutability, ParamInfo, PrimitiveType, Type, TypeBound, Visibility};
+use crate::type_registry::{
+    CallingConvention, MethodSig, Mutability, ParamInfo, PrimitiveType, Type, TypeBound, Visibility,
+};
 use crate::{typed_ast::*, AsyncKind};
 use std::collections::HashMap;
 
@@ -706,7 +708,10 @@ impl TypeChecker {
         }
     }
 
-    fn apply_types_to_statement(&self, stmt_node: &mut crate::typed_ast::TypedNode<crate::typed_ast::TypedStatement>) {
+    fn apply_types_to_statement(
+        &self,
+        stmt_node: &mut crate::typed_ast::TypedNode<crate::typed_ast::TypedStatement>,
+    ) {
         use crate::typed_ast::TypedStatement;
 
         // Apply to the node's type
@@ -754,7 +759,10 @@ impl TypeChecker {
         }
     }
 
-    fn apply_types_to_expr_node(&self, expr_node: &mut crate::typed_ast::TypedNode<crate::typed_ast::TypedExpression>) {
+    fn apply_types_to_expr_node(
+        &self,
+        expr_node: &mut crate::typed_ast::TypedNode<crate::typed_ast::TypedExpression>,
+    ) {
         use crate::typed_ast::TypedExpression;
 
         // Apply to the node's type
@@ -879,7 +887,12 @@ impl TypeChecker {
         // Find the type definition by name
         if let Some(type_def) = registry.get_type_by_name(type_name) {
             // Check if this is an abstract type with suffixes
-            if let crate::type_registry::TypeKind::Abstract { underlying_type, suffixes, .. } = &type_def.kind {
+            if let crate::type_registry::TypeKind::Abstract {
+                underlying_type,
+                suffixes,
+                ..
+            } = &type_def.kind
+            {
                 if !suffixes.is_empty() {
                     // Check if underlying type is numeric
                     let is_numeric = matches!(
@@ -897,12 +910,17 @@ impl TypeChecker {
                     );
 
                     if !is_numeric {
-                        let type_name_str = type_name.resolve_global().unwrap_or_else(|| "Unknown".to_string());
+                        let type_name_str = type_name
+                            .resolve_global()
+                            .unwrap_or_else(|| "Unknown".to_string());
                         let underlying_type_str = match underlying_type {
                             Type::Primitive(prim) => format!("{:?}", prim),
                             Type::Named { id, .. } => {
                                 if let Some(ut_def) = registry.get_type_by_id(*id) {
-                                    ut_def.name.resolve_global().unwrap_or_else(|| "Unknown".to_string())
+                                    ut_def
+                                        .name
+                                        .resolve_global()
+                                        .unwrap_or_else(|| "Unknown".to_string())
                                 } else {
                                     "Unknown".to_string()
                                 }
@@ -929,38 +947,53 @@ impl TypeChecker {
 
     /// Type check an impl block
     fn check_impl_block(&mut self, impl_block: &TypedTraitImpl) -> Result<(), TypeError> {
-        eprintln!("[TYPE_CHECK] check_impl_block: for_type={:?}, {} methods",
-            impl_block.for_type, impl_block.methods.len());
+        eprintln!(
+            "[TYPE_CHECK] check_impl_block: for_type={:?}, {} methods",
+            impl_block.for_type,
+            impl_block.methods.len()
+        );
         // Type check each method in the impl block
         for method in &impl_block.methods {
-            eprintln!("[TYPE_CHECK] Checking method: {}", method.name.resolve_global().unwrap_or_default());
+            eprintln!(
+                "[TYPE_CHECK] Checking method: {}",
+                method.name.resolve_global().unwrap_or_default()
+            );
             // FIRST: Add constraints for self parameters so inference can propagate through body
             for param in &method.params {
-                if param.is_self && (matches!(param.ty, Type::Any) || matches!(param.ty, Type::Unresolved(_))) {
+                if param.is_self
+                    && (matches!(param.ty, Type::Any) || matches!(param.ty, Type::Unresolved(_)))
+                {
                     // Unify the parameter's Any/Unresolved type with the implementing type
                     // This allows the inference to propagate to all usages in the body
-                    self.inference.unify(param.ty.clone(), impl_block.for_type.clone())?;
+                    self.inference
+                        .unify(param.ty.clone(), impl_block.for_type.clone())?;
                 }
             }
 
             // Convert method params to function params with resolved types
-            let params: Vec<TypedParameter> = method.params.iter().map(|p| {
-                let resolved_ty = if p.is_self && (matches!(p.ty, Type::Any) || matches!(p.ty, Type::Unresolved(_))) {
-                    impl_block.for_type.clone()
-                } else {
-                    p.ty.clone()
-                };
+            let params: Vec<TypedParameter> = method
+                .params
+                .iter()
+                .map(|p| {
+                    let resolved_ty = if p.is_self
+                        && (matches!(p.ty, Type::Any) || matches!(p.ty, Type::Unresolved(_)))
+                    {
+                        impl_block.for_type.clone()
+                    } else {
+                        p.ty.clone()
+                    };
 
-                TypedParameter {
-                    name: p.name,
-                    ty: resolved_ty,
-                    mutability: p.mutability,
-                    kind: p.kind.clone(),
-                    default_value: p.default_value.clone(),
-                    attributes: p.attributes.clone(),
-                    span: p.span,
-                }
-            }).collect();
+                    TypedParameter {
+                        name: p.name,
+                        ty: resolved_ty,
+                        mutability: p.mutability,
+                        kind: p.kind.clone(),
+                        default_value: p.default_value.clone(),
+                        attributes: p.attributes.clone(),
+                        span: p.span,
+                    }
+                })
+                .collect();
 
             // Return types should be explicitly typed in source
             let resolved_return_type = method.return_type.clone();
@@ -1010,7 +1043,7 @@ impl TypeChecker {
         let body = func.body.as_ref().ok_or_else(|| {
             InferenceError::TypeMismatch {
                 expected: Type::Primitive(PrimitiveType::Unit),
-                found: Type::Never,  // Non-extern function without body is error
+                found: Type::Never, // Non-extern function without body is error
             }
         })?;
 
@@ -1337,7 +1370,9 @@ impl TypeChecker {
                     let type_name_resolved = type_def.name.resolve_global().unwrap_or_default();
                     if type_name_resolved == type_name_str {
                         // Found the type, check if it's abstract with suffixes
-                        if let crate::type_registry::TypeKind::Abstract { suffixes, .. } = &type_def.kind {
+                        if let crate::type_registry::TypeKind::Abstract { suffixes, .. } =
+                            &type_def.kind
+                        {
                             // Check if this suffix is registered for this abstract type
                             if !suffixes.contains(&suffix_part.to_string()) {
                                 return Err(TypeError::MissingSuffixFunction {
@@ -1409,7 +1444,7 @@ impl TypeChecker {
                         nullability: crate::NullabilityKind::Unknown,
                     },
                     found: callee_type,
-                })
+                });
             }
         };
 
@@ -2097,7 +2132,7 @@ impl TypeChecker {
                         .map(|arg| self.apply_type_substitution(arg, substitution))
                         .collect(),
                     const_args: vec![], // Check?
-                    variance: vec![], // Check?
+                    variance: vec![],   // Check?
                     nullability: *nullability,
                 }
             }

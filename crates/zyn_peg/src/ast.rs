@@ -1,7 +1,10 @@
 //! AST types for parsed .zyn grammar files
 
+use crate::{
+    ActionBlock, ActionField, BuiltinMappings, ContextVar, Imports, LanguageInfo, Rule, RuleDef,
+    RuleModifier, TypeDeclarations, TypeHelpers, ZynGrammar,
+};
 use pest::iterators::Pair;
-use crate::{Rule, ZynGrammar, LanguageInfo, Imports, ContextVar, TypeHelpers, BuiltinMappings, TypeDeclarations, RuleDef, RuleModifier, ActionBlock, ActionField};
 
 /// Build a ZynGrammar from parsed pest pairs
 pub fn build_grammar(pairs: pest::iterators::Pairs<Rule>) -> Result<ZynGrammar, String> {
@@ -112,7 +115,7 @@ fn extract_string_value(pair: &Pair<Rule>) -> String {
     let s = pair.as_str();
     // Remove quotes
     if s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len()-1].to_string()
+        s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
     }
@@ -184,14 +187,16 @@ fn build_builtins(pair: Pair<Rule>) -> Result<BuiltinMappings, String> {
                     if let Some(method_name) = name.strip_prefix('@') {
                         // Method mapping: @sum -> tensor_sum means x.sum() -> tensor_sum(x)
                         // Multiple definitions accumulate into a list for type-based dispatch
-                        builtins.methods
+                        builtins
+                            .methods
                             .entry(method_name.to_string())
                             .or_insert_with(Vec::new)
                             .push(symbol);
                     } else if let Some(op) = name.strip_prefix('$') {
                         // Operator mapping: $* -> vec_dot means x * y -> vec_dot(x, y)
                         // Multiple definitions accumulate into a list for type-based dispatch
-                        builtins.operators
+                        builtins
+                            .operators
                             .entry(op.to_string())
                             .or_insert_with(Vec::new)
                             .push(symbol);
@@ -373,9 +378,7 @@ fn json_value_to_string(pair: Pair<Rule>) -> Result<String, String> {
             // Already quoted
             Ok(pair.as_str().to_string())
         }
-        Rule::json_number | Rule::json_bool | Rule::json_null => {
-            Ok(pair.as_str().to_string())
-        }
+        Rule::json_number | Rule::json_bool | Rule::json_null => Ok(pair.as_str().to_string()),
         Rule::json_array => {
             let mut result = String::from("[");
             let mut first = true;
@@ -427,11 +430,13 @@ fn json_value_to_string(pair: Pair<Rule>) -> Result<String, String> {
 
 fn build_action_field(pair: Pair<Rule>) -> Result<ActionField, String> {
     let mut parts = pair.into_inner();
-    let name = parts.next()
+    let name = parts
+        .next()
         .ok_or("Missing field name")?
         .as_str()
         .to_string();
-    let value = parts.next()
+    let value = parts
+        .next()
         .ok_or("Missing field value")?
         .as_str()
         .to_string();

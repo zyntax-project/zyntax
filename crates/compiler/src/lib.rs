@@ -1,48 +1,48 @@
 //! # Zyntax Compiler Infrastructure
-//! 
+//!
 //! This crate provides the compilation pipeline from TypedAST to executable code,
 //! supporting both JIT (via Cranelift) and AOT (via LLVM) compilation targets.
 //!
 //! ## Architecture
-//! 
+//!
 //! The compiler uses a multi-tier approach:
 //! - **HIR (High-level IR)**: Platform-agnostic representation with CFG and SSA
 //! - **Cranelift Backend**: Fast JIT compilation with hot-reloading support
 //! - **LLVM Backend**: Optimized AOT compilation to native targets
 //!
 //! ## Design Principles
-//! 
+//!
 //! - Shared HIR ensures consistent semantics across backends
 //! - CFG and SSA form enable standard compiler optimizations
 //! - Type information preserved for optimization opportunities
 //! - Memory safety validated before code generation
 
-pub mod hir;
-pub mod hir_dump;  // CLIF-inspired HIR text dump for debugging
-pub mod hir_builder;  // HIR Builder API for direct HIR construction
-pub mod bytecode;  // HIR bytecode serialization/deserialization
-pub mod stdlib;  // Standard library implementation using HIR Builder
-pub mod cfg;
-pub mod typed_cfg;  // New: TypedAST-aware CFG builder
-pub mod ssa;
-pub mod lowering;
-pub mod trait_lowering;  // Trait/interface lowering to HIR
-pub mod vtable_registry;  // Vtable management and caching
-pub mod associated_type_resolver;  // Associated type resolution for trait dispatch
 pub mod analysis;
-pub mod effect_analysis;  // Effect inference and checking for algebraic effects
-pub mod effect_handler_resolution;  // Handler resolution for effect dispatch
-pub mod effect_codegen;  // Code generation support for algebraic effects
-pub mod borrow_check;  // HIR-level borrow checking pass
-pub mod optimization;
-pub mod memory_optimization;  // Memory-aware optimizations
-pub mod const_eval;
-pub mod monomorphize;
-pub mod pattern_matching;
-pub mod memory_management;
-pub mod memory_pass;
+pub mod associated_type_resolver; // Associated type resolution for trait dispatch
 pub mod async_support;
-pub mod runtime;  // Async runtime (executor, task, waker)
+pub mod borrow_check; // HIR-level borrow checking pass
+pub mod bytecode; // HIR bytecode serialization/deserialization
+pub mod cfg;
+pub mod const_eval;
+pub mod effect_analysis; // Effect inference and checking for algebraic effects
+pub mod effect_codegen; // Code generation support for algebraic effects
+pub mod effect_handler_resolution; // Handler resolution for effect dispatch
+pub mod hir;
+pub mod hir_builder; // HIR Builder API for direct HIR construction
+pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
+pub mod lowering;
+pub mod memory_management;
+pub mod memory_optimization; // Memory-aware optimizations
+pub mod memory_pass;
+pub mod monomorphize;
+pub mod optimization;
+pub mod pattern_matching;
+pub mod runtime;
+pub mod ssa;
+pub mod stdlib; // Standard library implementation using HIR Builder
+pub mod trait_lowering; // Trait/interface lowering to HIR
+pub mod typed_cfg; // New: TypedAST-aware CFG builder
+pub mod vtable_registry; // Vtable management and caching // Async runtime (executor, task, waker)
 
 pub mod cranelift_backend;
 
@@ -50,74 +50,92 @@ pub mod cranelift_backend;
 pub mod llvm_backend;
 
 #[cfg(feature = "llvm-backend")]
-pub mod llvm_jit_backend;  // LLVM MCJIT for hot-path optimization
+pub mod llvm_jit_backend; // LLVM MCJIT for hot-path optimization
 
-pub mod profiling;  // Runtime profiling for tiered compilation
-pub mod tiered_backend;  // Tiered JIT/AOT compilation system
-pub mod plugin;  // Plugin system for frontend runtime registration
-pub mod zrtl;    // ZRTL (Zyntax Runtime Library) dynamic plugin format
-pub mod zpack;   // ZPack package format for distributing modules + runtimes
+pub mod plugin; // Plugin system for frontend runtime registration
+pub mod profiling; // Runtime profiling for tiered compilation
+pub mod tiered_backend; // Tiered JIT/AOT compilation system
+pub mod zpack;
+pub mod zrtl; // ZRTL (Zyntax Runtime Library) dynamic plugin format // ZPack package format for distributing modules + runtimes
 
 // Re-export key types
-pub use hir::{HirModule, HirFunction, HirBlock, HirInstruction, HirValue, HirId};
-pub use hir_builder::HirBuilder;  // HIR Builder API
-pub use cfg::{ControlFlowGraph, BasicBlock, CfgEdge};
-use log::debug;
-pub use typed_cfg::{TypedCfgBuilder, TypedControlFlowGraph, TypedBasicBlock, TypedTerminator};
-pub use ssa::{SsaBuilder, SsaForm, PhiNode};
-pub use lowering::{
-    LoweringContext, LoweringPipeline, AstLowering, LoweringConfig,
-    // Re-export import resolver types for convenience
-    ImportResolver, ImportContext, ImportManager, ImportError,
-    ResolvedImport, ExportedSymbol, SymbolKind, ModuleArchitecture,
-    ChainedResolver, BuiltinResolver,
+pub use async_support::{
+    AsyncCapture, AsyncCaptureMode, AsyncCompiler, AsyncRuntime, AsyncRuntimeType, AsyncState,
+    AsyncStateMachine, AsyncTerminator,
 };
-pub use const_eval::{ConstEvaluator, ConstEvalContext};
-pub use monomorphize::{MonomorphizationContext, monomorphize_module};
-pub use pattern_matching::{PatternMatchCompiler, DecisionNode, check_exhaustiveness};
-pub use memory_management::{
-    MemoryStrategy, MemoryContext, ARCManager, DropManager, EscapeAnalysis,
-    RefCountInfo, EscapeInfo, AllocationInfo, StackPromotionPass,
-    // Unified cleanup types
-    UnifiedCleanupBehavior, HirLinearityKind, CleanupInfo, UnifiedCleanupManager,
-    ScopeCleanupInfo, CleanupAction, convert_linearity_kind,
-};
-pub use memory_pass::MemoryManagementPass;
-pub use memory_optimization::MemoryOptimizationPass;
 pub use borrow_check::{
-    HirBorrowChecker, BorrowCheckResult, BorrowError, BorrowWarning,
-    run_borrow_check, validate_borrow_check,
+    run_borrow_check, validate_borrow_check, BorrowCheckResult, BorrowError, BorrowWarning,
+    HirBorrowChecker,
 };
+pub use cfg::{BasicBlock, CfgEdge, ControlFlowGraph};
+pub use const_eval::{ConstEvalContext, ConstEvaluator};
 pub use effect_analysis::{
-    EffectAnalyzer, ModuleEffectAnalysis, FunctionEffectAnalysis,
-    EffectOccurrence, EffectSite, HandlerScope, EffectCallGraph,
-    EffectError, EffectErrorKind, EffectWarning, EffectWarningKind,
-    analyze_effects, analyze_effects_with_call_graph, has_effect_errors,
-    get_function_effect_summary, EffectSummary,
-};
-pub use effect_handler_resolution::{
-    HandlerResolver, ModuleHandlerResolution, FunctionHandlerResolution,
-    HandlerResolution, PerformSite, ResolvedHandler, HandlerOptimization,
-    HandlerScopeTree, HandlerScopeNode, ResolutionStats,
-    resolve_handlers, resolve_handlers_with_analysis,
-    can_inline_handler, get_optimization_level,
+    analyze_effects, analyze_effects_with_call_graph, get_function_effect_summary,
+    has_effect_errors, EffectAnalyzer, EffectCallGraph, EffectError, EffectErrorKind,
+    EffectOccurrence, EffectSite, EffectSummary, EffectWarning, EffectWarningKind,
+    FunctionEffectAnalysis, HandlerScope, ModuleEffectAnalysis,
 };
 pub use effect_codegen::{
-    EffectCodegenContext, HandlerStackEntry, StateVarInfo, HandlerStateInfo,
-    PerformEffectCodegen, PerformStrategy, HandleEffectCodegen,
-    analyze_perform_effect, analyze_handle_effect,
-    mangle_handler_op_name, mangle_handler_state_name,
-    HandlerOpInfo, get_handler_ops_info,
+    analyze_handle_effect, analyze_perform_effect, get_handler_ops_info, mangle_handler_op_name,
+    mangle_handler_state_name, EffectCodegenContext, HandleEffectCodegen, HandlerOpInfo,
+    HandlerStackEntry, HandlerStateInfo, PerformEffectCodegen, PerformStrategy, StateVarInfo,
 };
-pub use async_support::{
-    AsyncCompiler, AsyncStateMachine, AsyncState, AsyncRuntime, AsyncRuntimeType,
-    AsyncCapture, AsyncCaptureMode, AsyncTerminator
+pub use effect_handler_resolution::{
+    can_inline_handler, get_optimization_level, resolve_handlers, resolve_handlers_with_analysis,
+    FunctionHandlerResolution, HandlerOptimization, HandlerResolution, HandlerResolver,
+    HandlerScopeNode, HandlerScopeTree, ModuleHandlerResolution, PerformSite, ResolutionStats,
+    ResolvedHandler,
 };
+pub use hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue};
+pub use hir_builder::HirBuilder; // HIR Builder API
+use log::debug;
+pub use lowering::{
+    AstLowering,
+    BuiltinResolver,
+    ChainedResolver,
+    ExportedSymbol,
+    ImportContext,
+    ImportError,
+    ImportManager,
+    // Re-export import resolver types for convenience
+    ImportResolver,
+    LoweringConfig,
+    LoweringContext,
+    LoweringPipeline,
+    ModuleArchitecture,
+    ResolvedImport,
+    SymbolKind,
+};
+pub use memory_management::{
+    convert_linearity_kind,
+    ARCManager,
+    AllocationInfo,
+    CleanupAction,
+    CleanupInfo,
+    DropManager,
+    EscapeAnalysis,
+    EscapeInfo,
+    HirLinearityKind,
+    MemoryContext,
+    MemoryStrategy,
+    RefCountInfo,
+    ScopeCleanupInfo,
+    StackPromotionPass,
+    // Unified cleanup types
+    UnifiedCleanupBehavior,
+    UnifiedCleanupManager,
+};
+pub use memory_optimization::MemoryOptimizationPass;
+pub use memory_pass::MemoryManagementPass;
+pub use monomorphize::{monomorphize_module, MonomorphizationContext};
+pub use pattern_matching::{check_exhaustiveness, DecisionNode, PatternMatchCompiler};
+pub use ssa::{PhiNode, SsaBuilder, SsaForm};
+pub use typed_cfg::{TypedBasicBlock, TypedCfgBuilder, TypedControlFlowGraph, TypedTerminator};
 
+use optimization::OptimizationPass;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use zyntax_typed_ast::TypedProgram;
-use std::sync::{Arc, Mutex};
-use optimization::OptimizationPass;
 
 #[derive(Error, Debug)]
 pub enum CompilerError {
@@ -182,7 +200,10 @@ impl std::fmt::Debug for CompilationConfig {
             .field("enable_monomorphization", &self.enable_monomorphization)
             .field("memory_strategy", &self.memory_strategy)
             .field("async_runtime", &self.async_runtime)
-            .field("import_resolver", &self.import_resolver.as_ref().map(|r| r.resolver_name()))
+            .field(
+                "import_resolver",
+                &self.import_resolver.as_ref().map(|r| r.resolver_name()),
+            )
             .field("enable_borrow_check", &self.enable_borrow_check)
             .field("enable_effect_check", &self.enable_effect_check)
             .finish()
@@ -211,9 +232,11 @@ impl Default for CompilationConfig {
 /// This function orchestrates the complete compilation process:
 /// Register all impl blocks from a TypedProgram into its type registry
 /// This must be called before lowering starts
-pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Result<(), CompilerError> {
-    use zyntax_typed_ast::typed_ast::TypedDeclaration;
+pub fn register_impl_blocks(
+    program: &mut zyntax_typed_ast::TypedProgram,
+) -> Result<(), CompilerError> {
     use zyntax_typed_ast::type_registry::{ImplDef, MethodImpl, MethodSig, ParamDef};
+    use zyntax_typed_ast::typed_ast::TypedDeclaration;
     use zyntax_typed_ast::Type;
 
     // First pass: Register all traits
@@ -240,11 +263,13 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
             impl_count += 1;
 
             // Check if this is an inherent impl (empty trait name)
-            let trait_name_str = impl_block.trait_name.resolve_global().unwrap_or_else(|| String::new());
+            let trait_name_str = impl_block
+                .trait_name
+                .resolve_global()
+                .unwrap_or_else(|| String::new());
             let is_inherent = trait_name_str.is_empty();
 
             if is_inherent {
-
                 // For inherent impls, register methods directly on the type
                 // Resolve the implementing type
                 let implementing_type_id = match &impl_block.for_type {
@@ -256,8 +281,11 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
                             Some(type_def.id)
                         } else {
                             // Try with a fresh InternedString from the name string
-                            let fresh_name = zyntax_typed_ast::InternedString::new_global(&name_str);
-                            if let Some(type_def) = program.type_registry.get_type_by_name(fresh_name) {
+                            let fresh_name =
+                                zyntax_typed_ast::InternedString::new_global(&name_str);
+                            if let Some(type_def) =
+                                program.type_registry.get_type_by_name(fresh_name)
+                            {
                                 Some(type_def.id)
                             } else {
                                 None
@@ -271,8 +299,11 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
                             Some(type_def.id)
                         } else {
                             // Try with a fresh InternedString
-                            let fresh_name = zyntax_typed_ast::InternedString::new_global(&name_str);
-                            if let Some(type_def) = program.type_registry.get_type_by_name(fresh_name) {
+                            let fresh_name =
+                                zyntax_typed_ast::InternedString::new_global(&name_str);
+                            if let Some(type_def) =
+                                program.type_registry.get_type_by_name(fresh_name)
+                            {
                                 Some(type_def.id)
                             } else {
                                 None
@@ -286,25 +317,32 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
                 if let Some(type_id) = implementing_type_id {
                     // Build MethodSig list for inherent methods
                     for method in &impl_block.methods {
-                        let params: Vec<ParamDef> = method.params.iter().map(|p| {
-                            ParamDef {
+                        let params: Vec<ParamDef> = method
+                            .params
+                            .iter()
+                            .map(|p| ParamDef {
                                 name: p.name,
                                 ty: p.ty.clone(),
                                 is_self: p.is_self,
                                 is_varargs: false,
-                                is_mut: matches!(p.mutability, zyntax_typed_ast::type_registry::Mutability::Mutable),
-                            }
-                        }).collect();
+                                is_mut: matches!(
+                                    p.mutability,
+                                    zyntax_typed_ast::type_registry::Mutability::Mutable
+                                ),
+                            })
+                            .collect();
 
-                        let type_params: Vec<zyntax_typed_ast::type_registry::TypeParam> = method.type_params.iter().map(|tp| {
-                            zyntax_typed_ast::type_registry::TypeParam {
+                        let type_params: Vec<zyntax_typed_ast::type_registry::TypeParam> = method
+                            .type_params
+                            .iter()
+                            .map(|tp| zyntax_typed_ast::type_registry::TypeParam {
                                 name: tp.name,
                                 bounds: vec![],
                                 variance: zyntax_typed_ast::type_registry::Variance::Invariant,
                                 default: tp.default.clone(),
                                 span: tp.span,
-                            }
-                        }).collect();
+                            })
+                            .collect();
 
                         let method_sig = MethodSig {
                             name: method.name,
@@ -320,19 +358,30 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
                         };
 
                         // Register the inherent method on the type
-                        program.type_registry.add_method_to_type(type_id, method_sig.clone());
+                        program
+                            .type_registry
+                            .add_method_to_type(type_id, method_sig.clone());
                     }
                 }
                 continue;
             }
 
             // Find the trait by name - be lenient if trait not found
-            let trait_def = match program.type_registry.get_trait_by_name(impl_block.trait_name) {
+            let trait_def = match program
+                .type_registry
+                .get_trait_by_name(impl_block.trait_name)
+            {
                 Some(t) => t,
                 None => {
                     // Try to resolve trait name for better warning message
-                    let trait_name_str = impl_block.trait_name.resolve_global().unwrap_or_else(|| format!("{:?}", impl_block.trait_name));
-                    log::warn!("Trait '{}' not found in registry, skipping impl block", trait_name_str);
+                    let trait_name_str = impl_block
+                        .trait_name
+                        .resolve_global()
+                        .unwrap_or_else(|| format!("{:?}", impl_block.trait_name));
+                    log::warn!(
+                        "Trait '{}' not found in registry, skipping impl block",
+                        trait_name_str
+                    );
                     continue;
                 }
             };
@@ -357,45 +406,58 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
             };
 
             // Build MethodImpl list
-            let method_impls: Vec<MethodImpl> = impl_block.methods.iter().map(|method| {
-                let params: Vec<ParamDef> = method.params.iter().map(|p| {
-                    ParamDef {
-                        name: p.name,
-                        ty: p.ty.clone(),
-                        is_self: p.is_self,
-                        is_varargs: false,
-                        is_mut: matches!(p.mutability, zyntax_typed_ast::type_registry::Mutability::Mutable),
+            let method_impls: Vec<MethodImpl> = impl_block
+                .methods
+                .iter()
+                .map(|method| {
+                    let params: Vec<ParamDef> = method
+                        .params
+                        .iter()
+                        .map(|p| ParamDef {
+                            name: p.name,
+                            ty: p.ty.clone(),
+                            is_self: p.is_self,
+                            is_varargs: false,
+                            is_mut: matches!(
+                                p.mutability,
+                                zyntax_typed_ast::type_registry::Mutability::Mutable
+                            ),
+                        })
+                        .collect();
+
+                    let type_params: Vec<zyntax_typed_ast::type_registry::TypeParam> = method
+                        .type_params
+                        .iter()
+                        .map(|tp| {
+                            zyntax_typed_ast::type_registry::TypeParam {
+                                name: tp.name,
+                                bounds: vec![], // Simplified for now
+                                variance: zyntax_typed_ast::type_registry::Variance::Invariant,
+                                default: tp.default.clone(),
+                                span: tp.span,
+                            }
+                        })
+                        .collect();
+
+                    let method_sig = MethodSig {
+                        name: method.name,
+                        type_params,
+                        params,
+                        return_type: method.return_type.clone(),
+                        where_clause: vec![],
+                        is_static: false,
+                        is_async: method.is_async,
+                        visibility: zyntax_typed_ast::type_registry::Visibility::Public,
+                        span: method.span,
+                        is_extension: false,
+                    };
+
+                    MethodImpl {
+                        signature: method_sig,
+                        is_default: false,
                     }
-                }).collect();
-
-                let type_params: Vec<zyntax_typed_ast::type_registry::TypeParam> = method.type_params.iter().map(|tp| {
-                    zyntax_typed_ast::type_registry::TypeParam {
-                        name: tp.name,
-                        bounds: vec![],  // Simplified for now
-                        variance: zyntax_typed_ast::type_registry::Variance::Invariant,
-                        default: tp.default.clone(),
-                        span: tp.span,
-                    }
-                }).collect();
-
-                let method_sig = MethodSig {
-                    name: method.name,
-                    type_params,
-                    params,
-                    return_type: method.return_type.clone(),
-                    where_clause: vec![],
-                    is_static: false,
-                    is_async: method.is_async,
-                    visibility: zyntax_typed_ast::type_registry::Visibility::Public,
-                    span: method.span,
-                    is_extension: false,
-                };
-
-                MethodImpl {
-                    signature: method_sig,
-                    is_default: false,
-                }
-            }).collect();
+                })
+                .collect();
 
             // Create and register ImplDef
             let impl_def = ImplDef {
@@ -408,7 +470,9 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
                 span: impl_block.span,
             };
 
-            program.type_registry.register_implementation(impl_def.clone());
+            program
+                .type_registry
+                .register_implementation(impl_def.clone());
         }
     }
 
@@ -425,7 +489,9 @@ pub fn register_impl_blocks(program: &mut zyntax_typed_ast::TypedProgram) -> Res
 /// - Resources are properly cleaned up
 ///
 /// Returns errors if linear type constraints are violated.
-pub fn run_linear_type_check(program: &zyntax_typed_ast::TypedProgram) -> Result<(), CompilerError> {
+pub fn run_linear_type_check(
+    program: &zyntax_typed_ast::TypedProgram,
+) -> Result<(), CompilerError> {
     use zyntax_typed_ast::LinearTypeChecker;
 
     eprintln!("[LINEAR_CHECK] Running linear type checking...");
@@ -439,19 +505,30 @@ pub fn run_linear_type_check(program: &zyntax_typed_ast::TypedProgram) -> Result
         }
         Err(e) => {
             eprintln!("[LINEAR_CHECK] Linear type error: {:?}", e);
-            Err(CompilerError::Analysis(format!("Linear type error: {:?}", e)))
+            Err(CompilerError::Analysis(format!(
+                "Linear type error: {:?}",
+                e
+            )))
         }
     }
 }
 
 /// Generate automatic trait implementations for abstract types
 /// Abstract types wrapping numeric primitives automatically inherit numeric operation traits
-pub fn generate_abstract_trait_impls(program: &mut zyntax_typed_ast::TypedProgram) -> Result<(), CompilerError> {
-    use zyntax_typed_ast::type_registry::{TypeKind, PrimitiveType, ImplDef, MethodImpl, MethodSig, Variance, NullabilityKind};
-    use zyntax_typed_ast::{Type, TypedDeclaration, TypedTraitImpl, TypedMethod, TypedFunction, TypedParameter, TypedBlock, TypedStatement, TypedExpression, TypedBinary, TypedUnary, TypedNode, BinaryOp, UnaryOp, TypedImplAssociatedType};
+pub fn generate_abstract_trait_impls(
+    program: &mut zyntax_typed_ast::TypedProgram,
+) -> Result<(), CompilerError> {
+    use std::collections::HashMap;
     use zyntax_typed_ast::arena::InternedString;
     use zyntax_typed_ast::source::Span;
-    use std::collections::HashMap;
+    use zyntax_typed_ast::type_registry::{
+        ImplDef, MethodImpl, MethodSig, NullabilityKind, PrimitiveType, TypeKind, Variance,
+    };
+    use zyntax_typed_ast::{
+        BinaryOp, Type, TypedBinary, TypedBlock, TypedDeclaration, TypedExpression, TypedFunction,
+        TypedImplAssociatedType, TypedMethod, TypedNode, TypedParameter, TypedStatement,
+        TypedTraitImpl, TypedUnary, UnaryOp,
+    };
 
     // Binary operation traits that should be automatically implemented for numeric types
     let binary_traits = vec![
@@ -465,16 +542,24 @@ pub fn generate_abstract_trait_impls(program: &mut zyntax_typed_ast::TypedProgra
     // Comparison traits
     let comparison_traits = vec![
         ("Eq", vec![("eq", BinaryOp::Eq), ("ne", BinaryOp::Ne)]),
-        ("Ord", vec![("lt", BinaryOp::Lt), ("gt", BinaryOp::Gt), ("le", BinaryOp::Le), ("ge", BinaryOp::Ge)]),
+        (
+            "Ord",
+            vec![
+                ("lt", BinaryOp::Lt),
+                ("gt", BinaryOp::Gt),
+                ("le", BinaryOp::Le),
+                ("ge", BinaryOp::Ge),
+            ],
+        ),
     ];
 
     // Unary operation traits
-    let unary_traits = vec![
-        ("Neg", "neg", UnaryOp::Minus),
-    ];
+    let unary_traits = vec![("Neg", "neg", UnaryOp::Minus)];
 
     // Iterate through all registered types
-    let type_ids: Vec<_> = program.type_registry.get_all_types()
+    let type_ids: Vec<_> = program
+        .type_registry
+        .get_all_types()
         .filter_map(|type_def| {
             if matches!(&type_def.kind, TypeKind::Abstract { .. }) {
                 Some((type_def.id, type_def.name, type_def.kind.clone()))
@@ -487,12 +572,25 @@ pub fn generate_abstract_trait_impls(program: &mut zyntax_typed_ast::TypedProgra
     let mut generated_impls: Vec<TypedNode<TypedDeclaration>> = Vec::new();
 
     for (type_id, type_name, kind) in type_ids {
-        if let TypeKind::Abstract { underlying_type, .. } = &kind {
+        if let TypeKind::Abstract {
+            underlying_type, ..
+        } = &kind
+        {
             // Check if underlying type is numeric
-            let is_numeric = matches!(underlying_type,
-                Type::Primitive(PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 |
-                               PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 |
-                               PrimitiveType::F32 | PrimitiveType::F64)
+            let is_numeric = matches!(
+                underlying_type,
+                Type::Primitive(
+                    PrimitiveType::I8
+                        | PrimitiveType::I16
+                        | PrimitiveType::I32
+                        | PrimitiveType::I64
+                        | PrimitiveType::U8
+                        | PrimitiveType::U16
+                        | PrimitiveType::U32
+                        | PrimitiveType::U64
+                        | PrimitiveType::F32
+                        | PrimitiveType::F64
+                )
             );
 
             if is_numeric {
@@ -555,7 +653,6 @@ pub fn generate_abstract_trait_impls(program: &mut zyntax_typed_ast::TypedProgra
     let count = generated_impls.len();
     program.declarations.extend(generated_impls);
 
-
     Ok(())
 }
 
@@ -568,16 +665,30 @@ fn generate_binary_trait_impl(
     trait_name: &str,
     method_name: &str,
     op: zyntax_typed_ast::BinaryOp,
-) -> Result<Option<(zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>, zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>)>, CompilerError> {
-    use zyntax_typed_ast::{TypedNode, TypedDeclaration, TypedTraitImpl, TypedMethod, TypedFunction, TypedParameter, TypedBlock, TypedStatement, TypedExpression, TypedBinary, TypedImplAssociatedType, ParameterKind};
-    use zyntax_typed_ast::type_registry::Mutability;
+) -> Result<
+    Option<(
+        zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+        zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+    )>,
+    CompilerError,
+> {
     use zyntax_typed_ast::arena::InternedString;
     use zyntax_typed_ast::source::Span;
+    use zyntax_typed_ast::type_registry::Mutability;
+    use zyntax_typed_ast::{
+        ParameterKind, TypedBinary, TypedBlock, TypedDeclaration, TypedExpression, TypedFunction,
+        TypedImplAssociatedType, TypedMethod, TypedNode, TypedParameter, TypedStatement,
+        TypedTraitImpl,
+    };
 
     let trait_name_interned = InternedString::new_global(trait_name);
 
     // Check if trait exists
-    if program.type_registry.get_trait_by_name(trait_name_interned).is_none() {
+    if program
+        .type_registry
+        .get_trait_by_name(trait_name_interned)
+        .is_none()
+    {
         return Ok(None);
     }
 
@@ -590,7 +701,9 @@ fn generate_binary_trait_impl(
 
     // Get type name for struct literal
     let type_name_for_literal = if let zyntax_typed_ast::Type::Named { id, .. } = abstract_type {
-        program.type_registry.get_type_by_id(*id)
+        program
+            .type_registry
+            .get_type_by_id(*id)
             .map(|t| t.name)
             .unwrap_or_else(|| InternedString::new_global("Unknown"))
     } else {
@@ -624,58 +737,58 @@ fn generate_binary_trait_impl(
         ],
         return_type: abstract_type.clone(),
         body: Some(TypedBlock {
-            statements: vec![
-                TypedNode::new(
-                    TypedStatement::Expression(Box::new(TypedNode::new(
-                        // Create struct literal: TypeName { value: self.value {op} rhs.value }
-                        TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
-                            name: type_name_for_literal,
-                            fields: vec![
-                                zyntax_typed_ast::TypedFieldInit {
-                                    name: InternedString::new_global("value"),
-                                    value: Box::new(TypedNode::new(
-                                        TypedExpression::Binary(TypedBinary {
-                                            // Extract self.value
-                                            left: Box::new(TypedNode::new(
-                                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                                    object: Box::new(TypedNode::new(
-                                                        TypedExpression::Variable(self_param),
-                                                        abstract_type.clone(),
-                                                        Span::default(),
-                                                    )),
-                                                    field: InternedString::new_global("value"),
-                                                }),
-                                                underlying_type.clone(),
-                                                Span::default(),
-                                            )),
-                                            op,
-                                            // Extract rhs.value
-                                            right: Box::new(TypedNode::new(
-                                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                                    object: Box::new(TypedNode::new(
-                                                        TypedExpression::Variable(rhs_param),
-                                                        abstract_type.clone(),
-                                                        Span::default(),
-                                                    )),
-                                                    field: InternedString::new_global("value"),
-                                                }),
-                                                underlying_type.clone(),
-                                                Span::default(),
-                                            )),
-                                        }),
+            statements: vec![TypedNode::new(
+                TypedStatement::Expression(Box::new(TypedNode::new(
+                    // Create struct literal: TypeName { value: self.value {op} rhs.value }
+                    TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
+                        name: type_name_for_literal,
+                        fields: vec![zyntax_typed_ast::TypedFieldInit {
+                            name: InternedString::new_global("value"),
+                            value: Box::new(TypedNode::new(
+                                TypedExpression::Binary(TypedBinary {
+                                    // Extract self.value
+                                    left: Box::new(TypedNode::new(
+                                        TypedExpression::Field(
+                                            zyntax_typed_ast::TypedFieldAccess {
+                                                object: Box::new(TypedNode::new(
+                                                    TypedExpression::Variable(self_param),
+                                                    abstract_type.clone(),
+                                                    Span::default(),
+                                                )),
+                                                field: InternedString::new_global("value"),
+                                            },
+                                        ),
                                         underlying_type.clone(),
                                         Span::default(),
                                     )),
-                                },
-                            ],
-                        }),
-                        abstract_type.clone(),
-                        Span::default(),
-                    ))),
-                    zyntax_typed_ast::Type::Any,
+                                    op,
+                                    // Extract rhs.value
+                                    right: Box::new(TypedNode::new(
+                                        TypedExpression::Field(
+                                            zyntax_typed_ast::TypedFieldAccess {
+                                                object: Box::new(TypedNode::new(
+                                                    TypedExpression::Variable(rhs_param),
+                                                    abstract_type.clone(),
+                                                    Span::default(),
+                                                )),
+                                                field: InternedString::new_global("value"),
+                                            },
+                                        ),
+                                        underlying_type.clone(),
+                                        Span::default(),
+                                    )),
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                        }],
+                    }),
+                    abstract_type.clone(),
                     Span::default(),
-                ),
-            ],
+                ))),
+                zyntax_typed_ast::Type::Any,
+                Span::default(),
+            )],
             span: Span::default(),
         }),
         visibility: zyntax_typed_ast::type_registry::Visibility::Public,
@@ -691,13 +804,11 @@ fn generate_binary_trait_impl(
         trait_type_args: vec![abstract_type.clone()], // impl Add<Self> for Self
         for_type: abstract_type.clone(),
         methods: vec![method],
-        associated_types: vec![
-            TypedImplAssociatedType {
-                name: InternedString::new_global("Output"),
-                ty: abstract_type.clone(),
-                span: Span::default(),
-            }
-        ],
+        associated_types: vec![TypedImplAssociatedType {
+            name: InternedString::new_global("Output"),
+            ty: abstract_type.clone(),
+            span: Span::default(),
+        }],
         span: Span::default(),
     };
 
@@ -711,7 +822,9 @@ fn generate_binary_trait_impl(
     // Note: Operator overloading uses 2-part names (TypeName$method) not 3-part (TypeName$Trait$method)
     // This matches the naming convention in ssa.rs:try_operator_trait_dispatch()
     let type_name_str = if let zyntax_typed_ast::Type::Named { id, .. } = abstract_type {
-        program.type_registry.get_type_by_id(*id)
+        program
+            .type_registry
+            .get_type_by_id(*id)
             .map(|t| t.name.resolve_global().unwrap_or_default())
             .unwrap_or_default()
     } else {
@@ -748,58 +861,58 @@ fn generate_binary_trait_impl(
         ],
         return_type: abstract_type.clone(),
         body: Some(TypedBlock {
-            statements: vec![
-                TypedNode::new(
-                    TypedStatement::Expression(Box::new(TypedNode::new(
-                        // Create struct literal: TypeName { value: self.value {op} rhs.value }
-                        TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
-                            name: type_name_for_literal,
-                            fields: vec![
-                                zyntax_typed_ast::TypedFieldInit {
-                                    name: InternedString::new_global("value"),
-                                    value: Box::new(TypedNode::new(
-                                        TypedExpression::Binary(TypedBinary {
-                                            // Extract self.value
-                                            left: Box::new(TypedNode::new(
-                                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                                    object: Box::new(TypedNode::new(
-                                                        TypedExpression::Variable(self_param),
-                                                        abstract_type.clone(),
-                                                        Span::default(),
-                                                    )),
-                                                    field: InternedString::new_global("value"),
-                                                }),
-                                                underlying_type.clone(),
-                                                Span::default(),
-                                            )),
-                                            op,
-                                            // Extract rhs.value
-                                            right: Box::new(TypedNode::new(
-                                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                                    object: Box::new(TypedNode::new(
-                                                        TypedExpression::Variable(rhs_param),
-                                                        abstract_type.clone(),
-                                                        Span::default(),
-                                                    )),
-                                                    field: InternedString::new_global("value"),
-                                                }),
-                                                underlying_type.clone(),
-                                                Span::default(),
-                                            )),
-                                        }),
+            statements: vec![TypedNode::new(
+                TypedStatement::Expression(Box::new(TypedNode::new(
+                    // Create struct literal: TypeName { value: self.value {op} rhs.value }
+                    TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
+                        name: type_name_for_literal,
+                        fields: vec![zyntax_typed_ast::TypedFieldInit {
+                            name: InternedString::new_global("value"),
+                            value: Box::new(TypedNode::new(
+                                TypedExpression::Binary(TypedBinary {
+                                    // Extract self.value
+                                    left: Box::new(TypedNode::new(
+                                        TypedExpression::Field(
+                                            zyntax_typed_ast::TypedFieldAccess {
+                                                object: Box::new(TypedNode::new(
+                                                    TypedExpression::Variable(self_param),
+                                                    abstract_type.clone(),
+                                                    Span::default(),
+                                                )),
+                                                field: InternedString::new_global("value"),
+                                            },
+                                        ),
                                         underlying_type.clone(),
                                         Span::default(),
                                     )),
-                                },
-                            ],
-                        }),
-                        abstract_type.clone(),
-                        Span::default(),
-                    ))),
-                    zyntax_typed_ast::Type::Any,
+                                    op,
+                                    // Extract rhs.value
+                                    right: Box::new(TypedNode::new(
+                                        TypedExpression::Field(
+                                            zyntax_typed_ast::TypedFieldAccess {
+                                                object: Box::new(TypedNode::new(
+                                                    TypedExpression::Variable(rhs_param),
+                                                    abstract_type.clone(),
+                                                    Span::default(),
+                                                )),
+                                                field: InternedString::new_global("value"),
+                                            },
+                                        ),
+                                        underlying_type.clone(),
+                                        Span::default(),
+                                    )),
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                        }],
+                    }),
+                    abstract_type.clone(),
                     Span::default(),
-                ),
-            ],
+                ))),
+                zyntax_typed_ast::Type::Any,
+                Span::default(),
+            )],
             span: Span::default(),
         }),
         visibility: zyntax_typed_ast::type_registry::Visibility::Public,
@@ -816,7 +929,6 @@ fn generate_binary_trait_impl(
         Span::default(),
     );
 
-
     Ok(Some((impl_decl, func_decl)))
 }
 
@@ -828,16 +940,31 @@ fn generate_comparison_trait_impl(
     underlying_type: &zyntax_typed_ast::Type,
     trait_name: &str,
     methods: &[(&str, zyntax_typed_ast::BinaryOp)],
-) -> Result<Option<(zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>, Vec<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>>)>, CompilerError> {
-    use zyntax_typed_ast::{TypedNode, TypedDeclaration, TypedTraitImpl, TypedMethod, TypedMethodParam, TypedFunction, TypedParameter, TypedBlock, TypedStatement, TypedExpression, TypedBinary, ParameterKind};
-    use zyntax_typed_ast::type_registry::{Mutability, PrimitiveType, CallingConvention, Visibility};
+) -> Result<
+    Option<(
+        zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+        Vec<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>>,
+    )>,
+    CompilerError,
+> {
     use zyntax_typed_ast::arena::InternedString;
     use zyntax_typed_ast::source::Span;
+    use zyntax_typed_ast::type_registry::{
+        CallingConvention, Mutability, PrimitiveType, Visibility,
+    };
+    use zyntax_typed_ast::{
+        ParameterKind, TypedBinary, TypedBlock, TypedDeclaration, TypedExpression, TypedFunction,
+        TypedMethod, TypedMethodParam, TypedNode, TypedParameter, TypedStatement, TypedTraitImpl,
+    };
 
     let trait_name_interned = InternedString::new_global(trait_name);
 
     // Check if trait exists
-    if program.type_registry.get_trait_by_name(trait_name_interned).is_none() {
+    if program
+        .type_registry
+        .get_trait_by_name(trait_name_interned)
+        .is_none()
+    {
         return Ok(None);
     }
 
@@ -846,11 +973,15 @@ fn generate_comparison_trait_impl(
 
     // Get type name for mangling
     let type_name = if let zyntax_typed_ast::Type::Named { id, .. } = abstract_type {
-        program.type_registry.get_type_by_id(*id)
+        program
+            .type_registry
+            .get_type_by_id(*id)
             .ok_or_else(|| CompilerError::Analysis("Type not found in registry".to_string()))?
             .name
     } else {
-        return Err(CompilerError::Analysis("Abstract type must be Named".to_string()));
+        return Err(CompilerError::Analysis(
+            "Abstract type must be Named".to_string(),
+        ));
     };
     let type_name_str = type_name.resolve_global().unwrap_or_default();
 
@@ -889,45 +1020,43 @@ fn generate_comparison_trait_impl(
             ],
             return_type: zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
             body: Some(TypedBlock {
-                statements: vec![
-                    TypedNode::new(
-                        TypedStatement::Expression(Box::new(TypedNode::new(
-                            TypedExpression::Binary(TypedBinary {
-                                // Extract self.value
-                                left: Box::new(TypedNode::new(
-                                    TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                        object: Box::new(TypedNode::new(
-                                            TypedExpression::Variable(self_param),
-                                            abstract_type.clone(),
-                                            Span::default(),
-                                        )),
-                                        field: InternedString::new_global("value"),
-                                    }),
-                                    underlying_type.clone(),
-                                    Span::default(),
-                                )),
-                                op: *op,
-                                // Extract rhs.value
-                                right: Box::new(TypedNode::new(
-                                    TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                        object: Box::new(TypedNode::new(
-                                            TypedExpression::Variable(rhs_param),
-                                            abstract_type.clone(),
-                                            Span::default(),
-                                        )),
-                                        field: InternedString::new_global("value"),
-                                    }),
-                                    underlying_type.clone(),
-                                    Span::default(),
-                                )),
-                            }),
-                            zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
-                            Span::default(),
-                        ))),
-                        zyntax_typed_ast::Type::Any,
+                statements: vec![TypedNode::new(
+                    TypedStatement::Expression(Box::new(TypedNode::new(
+                        TypedExpression::Binary(TypedBinary {
+                            // Extract self.value
+                            left: Box::new(TypedNode::new(
+                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
+                                    object: Box::new(TypedNode::new(
+                                        TypedExpression::Variable(self_param),
+                                        abstract_type.clone(),
+                                        Span::default(),
+                                    )),
+                                    field: InternedString::new_global("value"),
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                            op: *op,
+                            // Extract rhs.value
+                            right: Box::new(TypedNode::new(
+                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
+                                    object: Box::new(TypedNode::new(
+                                        TypedExpression::Variable(rhs_param),
+                                        abstract_type.clone(),
+                                        Span::default(),
+                                    )),
+                                    field: InternedString::new_global("value"),
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                        }),
+                        zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
                         Span::default(),
-                    ),
-                ],
+                    ))),
+                    zyntax_typed_ast::Type::Any,
+                    Span::default(),
+                )],
                 span: Span::default(),
             }),
             visibility: Visibility::Public,
@@ -968,45 +1097,43 @@ fn generate_comparison_trait_impl(
             ],
             return_type: zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
             body: Some(TypedBlock {
-                statements: vec![
-                    TypedNode::new(
-                        TypedStatement::Expression(Box::new(TypedNode::new(
-                            TypedExpression::Binary(TypedBinary {
-                                // Extract self.value
-                                left: Box::new(TypedNode::new(
-                                    TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                        object: Box::new(TypedNode::new(
-                                            TypedExpression::Variable(self_param),
-                                            abstract_type.clone(),
-                                            Span::default(),
-                                        )),
-                                        field: InternedString::new_global("value"),
-                                    }),
-                                    underlying_type.clone(),
-                                    Span::default(),
-                                )),
-                                op: *op,
-                                // Extract rhs.value
-                                right: Box::new(TypedNode::new(
-                                    TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                        object: Box::new(TypedNode::new(
-                                            TypedExpression::Variable(rhs_param),
-                                            abstract_type.clone(),
-                                            Span::default(),
-                                        )),
-                                        field: InternedString::new_global("value"),
-                                    }),
-                                    underlying_type.clone(),
-                                    Span::default(),
-                                )),
-                            }),
-                            zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
-                            Span::default(),
-                        ))),
-                        zyntax_typed_ast::Type::Any,
+                statements: vec![TypedNode::new(
+                    TypedStatement::Expression(Box::new(TypedNode::new(
+                        TypedExpression::Binary(TypedBinary {
+                            // Extract self.value
+                            left: Box::new(TypedNode::new(
+                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
+                                    object: Box::new(TypedNode::new(
+                                        TypedExpression::Variable(self_param),
+                                        abstract_type.clone(),
+                                        Span::default(),
+                                    )),
+                                    field: InternedString::new_global("value"),
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                            op: *op,
+                            // Extract rhs.value
+                            right: Box::new(TypedNode::new(
+                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
+                                    object: Box::new(TypedNode::new(
+                                        TypedExpression::Variable(rhs_param),
+                                        abstract_type.clone(),
+                                        Span::default(),
+                                    )),
+                                    field: InternedString::new_global("value"),
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                        }),
+                        zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
                         Span::default(),
-                    ),
-                ],
+                    ))),
+                    zyntax_typed_ast::Type::Any,
+                    Span::default(),
+                )],
                 span: Span::default(),
             }),
             visibility: Visibility::Public,
@@ -1022,7 +1149,6 @@ fn generate_comparison_trait_impl(
             zyntax_typed_ast::Type::Any,
             Span::default(),
         ));
-
     }
 
     // Create impl block
@@ -1041,7 +1167,6 @@ fn generate_comparison_trait_impl(
         Span::default(),
     );
 
-
     Ok(Some((impl_decl, standalone_functions)))
 }
 
@@ -1054,16 +1179,30 @@ fn generate_unary_trait_impl(
     trait_name: &str,
     method_name: &str,
     op: zyntax_typed_ast::UnaryOp,
-) -> Result<Option<(zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>, zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>)>, CompilerError> {
-    use zyntax_typed_ast::{TypedNode, TypedDeclaration, TypedTraitImpl, TypedMethod, TypedMethodParam, TypedFunction, TypedParameter, TypedBlock, TypedStatement, TypedExpression, TypedUnary, TypedImplAssociatedType, ParameterKind};
-    use zyntax_typed_ast::type_registry::{Mutability, CallingConvention, Visibility};
+) -> Result<
+    Option<(
+        zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+        zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+    )>,
+    CompilerError,
+> {
     use zyntax_typed_ast::arena::InternedString;
     use zyntax_typed_ast::source::Span;
+    use zyntax_typed_ast::type_registry::{CallingConvention, Mutability, Visibility};
+    use zyntax_typed_ast::{
+        ParameterKind, TypedBlock, TypedDeclaration, TypedExpression, TypedFunction,
+        TypedImplAssociatedType, TypedMethod, TypedMethodParam, TypedNode, TypedParameter,
+        TypedStatement, TypedTraitImpl, TypedUnary,
+    };
 
     let trait_name_interned = InternedString::new_global(trait_name);
 
     // Check if trait exists
-    if program.type_registry.get_trait_by_name(trait_name_interned).is_none() {
+    if program
+        .type_registry
+        .get_trait_by_name(trait_name_interned)
+        .is_none()
+    {
         return Ok(None);
     }
 
@@ -1072,11 +1211,15 @@ fn generate_unary_trait_impl(
 
     // Get type name for mangling and struct literal construction
     let type_name = if let zyntax_typed_ast::Type::Named { id, .. } = abstract_type {
-        program.type_registry.get_type_by_id(*id)
+        program
+            .type_registry
+            .get_type_by_id(*id)
             .ok_or_else(|| CompilerError::Analysis("Type not found in registry".to_string()))?
             .name
     } else {
-        return Err(CompilerError::Analysis("Abstract type must be Named".to_string()));
+        return Err(CompilerError::Analysis(
+            "Abstract type must be Named".to_string(),
+        ));
     };
     let type_name_str = type_name.resolve_global().unwrap_or_default();
 
@@ -1084,59 +1227,55 @@ fn generate_unary_trait_impl(
     let method = TypedMethod {
         name: method_name_interned,
         type_params: vec![],
-        params: vec![
-            TypedMethodParam {
-                name: self_param,
-                ty: abstract_type.clone(),
-                mutability: Mutability::Immutable,
-                is_self: true,
-                kind: ParameterKind::Regular,
-                default_value: None,
-                attributes: vec![],
-                span: Span::default(),
-            },
-        ],
+        params: vec![TypedMethodParam {
+            name: self_param,
+            ty: abstract_type.clone(),
+            mutability: Mutability::Immutable,
+            is_self: true,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: Span::default(),
+        }],
         return_type: abstract_type.clone(),
         body: Some(TypedBlock {
-            statements: vec![
-                TypedNode::new(
-                    TypedStatement::Expression(Box::new(TypedNode::new(
-                        // Create struct literal: TypeName { value: {op}self.value }
-                        TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
-                            name: type_name,
-                            fields: vec![
-                                zyntax_typed_ast::TypedFieldInit {
-                                    name: InternedString::new_global("value"),
-                                    value: Box::new(TypedNode::new(
-                                        TypedExpression::Unary(TypedUnary {
-                                            op,
-                                            operand: Box::new(TypedNode::new(
-                                                // Extract self.value
-                                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                                    object: Box::new(TypedNode::new(
-                                                        TypedExpression::Variable(self_param),
-                                                        abstract_type.clone(),
-                                                        Span::default(),
-                                                    )),
-                                                    field: InternedString::new_global("value"),
-                                                }),
-                                                underlying_type.clone(),
-                                                Span::default(),
-                                            )),
-                                        }),
+            statements: vec![TypedNode::new(
+                TypedStatement::Expression(Box::new(TypedNode::new(
+                    // Create struct literal: TypeName { value: {op}self.value }
+                    TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
+                        name: type_name,
+                        fields: vec![zyntax_typed_ast::TypedFieldInit {
+                            name: InternedString::new_global("value"),
+                            value: Box::new(TypedNode::new(
+                                TypedExpression::Unary(TypedUnary {
+                                    op,
+                                    operand: Box::new(TypedNode::new(
+                                        // Extract self.value
+                                        TypedExpression::Field(
+                                            zyntax_typed_ast::TypedFieldAccess {
+                                                object: Box::new(TypedNode::new(
+                                                    TypedExpression::Variable(self_param),
+                                                    abstract_type.clone(),
+                                                    Span::default(),
+                                                )),
+                                                field: InternedString::new_global("value"),
+                                            },
+                                        ),
                                         underlying_type.clone(),
                                         Span::default(),
                                     )),
-                                },
-                            ],
-                        }),
-                        abstract_type.clone(),
-                        Span::default(),
-                    ))),
-                    zyntax_typed_ast::Type::Any,
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                        }],
+                    }),
+                    abstract_type.clone(),
                     Span::default(),
-                ),
-            ],
+                ))),
+                zyntax_typed_ast::Type::Any,
+                Span::default(),
+            )],
             span: Span::default(),
         }),
         visibility: Visibility::Public,
@@ -1152,13 +1291,11 @@ fn generate_unary_trait_impl(
         trait_type_args: vec![],
         for_type: abstract_type.clone(),
         methods: vec![method],
-        associated_types: vec![
-            TypedImplAssociatedType {
-                name: InternedString::new_global("Output"),
-                ty: abstract_type.clone(),
-                span: Span::default(),
-            }
-        ],
+        associated_types: vec![TypedImplAssociatedType {
+            name: InternedString::new_global("Output"),
+            ty: abstract_type.clone(),
+            span: Span::default(),
+        }],
         span: Span::default(),
     };
 
@@ -1177,58 +1314,54 @@ fn generate_unary_trait_impl(
         annotations: vec![],
         effects: vec![],
         type_params: vec![],
-        params: vec![
-            TypedParameter {
-                name: self_param,
-                ty: abstract_type.clone(),
-                mutability: Mutability::Immutable,
-                kind: ParameterKind::Regular,
-                default_value: None,
-                attributes: vec![],
-                span: Span::default(),
-            },
-        ],
+        params: vec![TypedParameter {
+            name: self_param,
+            ty: abstract_type.clone(),
+            mutability: Mutability::Immutable,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: Span::default(),
+        }],
         return_type: abstract_type.clone(),
         body: Some(TypedBlock {
-            statements: vec![
-                TypedNode::new(
-                    TypedStatement::Expression(Box::new(TypedNode::new(
-                        // Create struct literal: TypeName { value: {op}self.value }
-                        TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
-                            name: type_name,
-                            fields: vec![
-                                zyntax_typed_ast::TypedFieldInit {
-                                    name: InternedString::new_global("value"),
-                                    value: Box::new(TypedNode::new(
-                                        TypedExpression::Unary(TypedUnary {
-                                            op,
-                                            operand: Box::new(TypedNode::new(
-                                                // Extract self.value
-                                                TypedExpression::Field(zyntax_typed_ast::TypedFieldAccess {
-                                                    object: Box::new(TypedNode::new(
-                                                        TypedExpression::Variable(self_param),
-                                                        abstract_type.clone(),
-                                                        Span::default(),
-                                                    )),
-                                                    field: InternedString::new_global("value"),
-                                                }),
-                                                underlying_type.clone(),
-                                                Span::default(),
-                                            )),
-                                        }),
+            statements: vec![TypedNode::new(
+                TypedStatement::Expression(Box::new(TypedNode::new(
+                    // Create struct literal: TypeName { value: {op}self.value }
+                    TypedExpression::Struct(zyntax_typed_ast::TypedStructLiteral {
+                        name: type_name,
+                        fields: vec![zyntax_typed_ast::TypedFieldInit {
+                            name: InternedString::new_global("value"),
+                            value: Box::new(TypedNode::new(
+                                TypedExpression::Unary(TypedUnary {
+                                    op,
+                                    operand: Box::new(TypedNode::new(
+                                        // Extract self.value
+                                        TypedExpression::Field(
+                                            zyntax_typed_ast::TypedFieldAccess {
+                                                object: Box::new(TypedNode::new(
+                                                    TypedExpression::Variable(self_param),
+                                                    abstract_type.clone(),
+                                                    Span::default(),
+                                                )),
+                                                field: InternedString::new_global("value"),
+                                            },
+                                        ),
                                         underlying_type.clone(),
                                         Span::default(),
                                     )),
-                                },
-                            ],
-                        }),
-                        abstract_type.clone(),
-                        Span::default(),
-                    ))),
-                    zyntax_typed_ast::Type::Any,
+                                }),
+                                underlying_type.clone(),
+                                Span::default(),
+                            )),
+                        }],
+                    }),
+                    abstract_type.clone(),
                     Span::default(),
-                ),
-            ],
+                ))),
+                zyntax_typed_ast::Type::Any,
+                Span::default(),
+            )],
             span: Span::default(),
         }),
         visibility: Visibility::Public,
@@ -1245,8 +1378,14 @@ fn generate_unary_trait_impl(
         Span::default(),
     );
 
-    debug!("[AUTO_TRAITS] Generated {} impl for {:?}", trait_name, abstract_type);
-    debug!("[AUTO_TRAITS] Generated standalone function '{}' for {} trait", mangled_name, trait_name);
+    debug!(
+        "[AUTO_TRAITS] Generated {} impl for {:?}",
+        trait_name, abstract_type
+    );
+    debug!(
+        "[AUTO_TRAITS] Generated standalone function '{}' for {} trait",
+        mangled_name, trait_name
+    );
 
     Ok(Some((impl_decl, func_decl)))
 }
@@ -1279,13 +1418,20 @@ pub fn compile_to_hir(
     let module_name = arena.intern_string("main");
 
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut lowering_ctx = lowering::LoweringContext::new(module_name, type_registry.clone(), arena_arc, lowering_config);
+    let mut lowering_ctx = lowering::LoweringContext::new(
+        module_name,
+        type_registry.clone(),
+        arena_arc,
+        lowering_config,
+    );
     let mut hir_module = lowering_ctx.lower_program(program)?;
 
     // Step 2: Async transformation (if async runtime is configured)
     if let Some(runtime_type) = config.async_runtime {
         // Transform async functions into state machines
-        let async_func_ids: Vec<HirId> = hir_module.functions.values()
+        let async_func_ids: Vec<HirId> = hir_module
+            .functions
+            .values()
             .filter(|f| f.signature.is_async)
             .map(|f| f.id)
             .collect();
@@ -1304,7 +1450,9 @@ pub fn compile_to_hir(
 
             // Transform each async function
             for func_id in async_func_ids {
-                let original_func = hir_module.functions.get(&func_id)
+                let original_func = hir_module
+                    .functions
+                    .get(&func_id)
                     .ok_or_else(|| CompilerError::Backend("Async function not found".into()))?
                     .clone();
 
@@ -1337,7 +1485,9 @@ pub fn compile_to_hir(
 
     // Step 3: Monomorphization (if enabled and generic functions exist)
     if config.enable_monomorphization {
-        let has_generics = hir_module.functions.values()
+        let has_generics = hir_module
+            .functions
+            .values()
             .any(|f| !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty());
 
         if has_generics {
@@ -1357,14 +1507,13 @@ pub fn compile_to_hir(
 
     // Step 3c: Effect analysis and checking (if enabled)
     if config.enable_effect_check {
-        let effect_analysis = effect_analysis::analyze_effects_with_call_graph(
-            &hir_module,
-            &analysis.call_graph,
-        )?;
+        let effect_analysis =
+            effect_analysis::analyze_effects_with_call_graph(&hir_module, &analysis.call_graph)?;
 
         // Report errors if any effect constraints are violated
         if effect_analysis::has_effect_errors(&effect_analysis) {
-            let error_messages: Vec<String> = effect_analysis.errors
+            let error_messages: Vec<String> = effect_analysis
+                .errors
                 .iter()
                 .map(|e| e.message.clone())
                 .collect();
@@ -1427,7 +1576,8 @@ pub fn compile_to_jit(
     let mut backend = cranelift_backend::CraneliftBackend::new()
         .map_err(|e| CompilerError::Backend(format!("Failed to initialize Cranelift: {}", e)))?;
 
-    backend.compile_module(&hir_module)
+    backend
+        .compile_module(&hir_module)
         .map_err(|e| CompilerError::CodeGen(format!("Cranelift compilation failed: {}", e)))?;
 
     Ok(backend)

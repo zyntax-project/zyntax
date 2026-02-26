@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, HirId, HirType, HirUnionVariant};
 /// Option<T> type implementation using HIR Builder
 ///
 /// Provides a generic optional value type:
@@ -7,9 +8,7 @@
 ///     Some(T),   // Value of type T
 /// }
 /// ```
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirType, HirUnionVariant, HirId, BinaryOp};
 
 /// Builds the Option<T> type and its methods
 pub fn build_option_type(builder: &mut HirBuilder) {
@@ -42,7 +41,8 @@ fn build_unwrap(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), variants);
 
-    let func_id = builder.begin_generic_function("option_unwrap", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("option_unwrap", vec!["T"])
         .param("opt", option_ty.clone())
         .returns(t_param.clone())
         .build();
@@ -97,7 +97,8 @@ fn build_is_some(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), variants);
 
-    let func_id = builder.begin_generic_function("option_is_some", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("option_is_some", vec!["T"])
         .param("opt", option_ty.clone())
         .returns(bool_ty.clone())
         .build();
@@ -136,7 +137,8 @@ fn build_is_none(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), variants);
 
-    let func_id = builder.begin_generic_function("option_is_none", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("option_is_none", vec!["T"])
         .param("opt", option_ty.clone())
         .returns(bool_ty.clone())
         .build();
@@ -174,7 +176,8 @@ fn build_unwrap_or(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), variants);
 
-    let func_id = builder.begin_generic_function("option_unwrap_or", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("option_unwrap_or", vec!["T"])
         .param("opt", option_ty.clone())
         .param("default", t_param.clone())
         .returns(t_param.clone())
@@ -244,7 +247,9 @@ mod tests {
         assert!(module.functions.len() >= 4);
 
         // Check function names
-        let func_names: Vec<String> = module.functions.values()
+        let func_names: Vec<String> = module
+            .functions
+            .values()
             .map(|f| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
@@ -257,8 +262,11 @@ mod tests {
         for func in module.functions.values() {
             let name = arena.resolve_string(func.name).unwrap();
             if name.starts_with("option_") && !name.contains("map") && !name.contains("and_then") {
-                assert!(!func.signature.type_params.is_empty(),
-                    "Function {} should be generic", name);
+                assert!(
+                    !func.signature.type_params.is_empty(),
+                    "Function {} should be generic",
+                    name
+                );
             }
         }
     }
@@ -273,7 +281,9 @@ mod tests {
         let module = builder.finish();
 
         // Find the unwrap function
-        let unwrap_func = module.functions.values()
+        let unwrap_func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("option_unwrap"))
             .expect("unwrap function should exist");
 

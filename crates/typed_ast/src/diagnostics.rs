@@ -1,5 +1,5 @@
 //! # Diagnostic Reporting System
-//! 
+//!
 //! Rust-like compiler diagnostic reporting system with:
 //! - Source location tracking and highlighting
 //! - Error codes and structured messages
@@ -9,7 +9,7 @@
 //! - Integration with all compiler phases
 
 use crate::arena::InternedString;
-use crate::source::{Span, SourceFile, SourceMap};
+use crate::source::{SourceFile, SourceMap, Span};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -53,7 +53,7 @@ impl fmt::Display for DiagnosticCode {
 /// Common diagnostic codes
 pub mod codes {
     use super::DiagnosticCode;
-    
+
     // Type checking errors
     pub const E0001: DiagnosticCode = DiagnosticCode("E0001"); // Type mismatch
     pub const E0002: DiagnosticCode = DiagnosticCode("E0002"); // Undefined variable
@@ -63,25 +63,25 @@ pub mod codes {
     pub const E0006: DiagnosticCode = DiagnosticCode("E0006"); // Unknown parameter
     pub const E0007: DiagnosticCode = DiagnosticCode("E0007"); // Named args not allowed
     pub const E0008: DiagnosticCode = DiagnosticCode("E0008"); // Field not found
-    
-    // Trait and generic errors  
+
+    // Trait and generic errors
     pub const E0277: DiagnosticCode = DiagnosticCode("E0277"); // Trait not implemented
     pub const E0405: DiagnosticCode = DiagnosticCode("E0405"); // Cannot find trait
-    
+
     // Ownership and borrowing errors
     pub const E0100: DiagnosticCode = DiagnosticCode("E0100"); // Use after move
     pub const E0101: DiagnosticCode = DiagnosticCode("E0101"); // Conflicting borrow
     pub const E0102: DiagnosticCode = DiagnosticCode("E0102"); // Double free
-    
+
     // Lifetime errors
     pub const E0200: DiagnosticCode = DiagnosticCode("E0200"); // Lifetime constraint violation
     pub const E0201: DiagnosticCode = DiagnosticCode("E0201"); // Dangling reference
-    
+
     // Control flow errors
     pub const E0300: DiagnosticCode = DiagnosticCode("E0300"); // Unreachable code
     pub const E0301: DiagnosticCode = DiagnosticCode("E0301"); // Missing return
     pub const E0302: DiagnosticCode = DiagnosticCode("E0302"); // Invalid break/continue
-    
+
     // Lifetime errors
     pub const E0309: DiagnosticCode = DiagnosticCode("E0309"); // Lifetime cycle
 }
@@ -116,7 +116,7 @@ impl Annotation {
             message: Some(message.into()),
         }
     }
-    
+
     pub fn secondary(span: Span, message: impl Into<String>) -> Self {
         Self {
             span,
@@ -124,7 +124,7 @@ impl Annotation {
             message: Some(message.into()),
         }
     }
-    
+
     pub fn info(span: Span) -> Self {
         Self {
             span,
@@ -192,55 +192,60 @@ impl Diagnostic {
             suggestions: Vec::new(),
         }
     }
-    
+
     /// Create an error diagnostic
     pub fn error(message: impl Into<String>) -> Self {
         Self::new(DiagnosticLevel::Error, message)
     }
-    
+
     /// Create a warning diagnostic
     pub fn warning(message: impl Into<String>) -> Self {
         Self::new(DiagnosticLevel::Warning, message)
     }
-    
+
     /// Add error code
     pub fn with_code(mut self, code: DiagnosticCode) -> Self {
         self.code = Some(code);
         self
     }
-    
+
     /// Add primary annotation
     pub fn with_primary(mut self, span: Span, message: impl Into<String>) -> Self {
         self.annotations.push(Annotation::primary(span, message));
         self
     }
-    
+
     /// Add secondary annotation
     pub fn with_secondary(mut self, span: Span, message: impl Into<String>) -> Self {
         self.annotations.push(Annotation::secondary(span, message));
         self
     }
-    
+
     /// Add help message
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help.push(help.into());
         self
     }
-    
+
     /// Add note message
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
         self
     }
-    
+
     /// Add suggestion
     pub fn with_suggestion(mut self, suggestion: Suggestion) -> Self {
         self.suggestions.push(suggestion);
         self
     }
-    
+
     /// Add simple suggestion
-    pub fn suggest(mut self, span: Span, replacement: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn suggest(
+        mut self,
+        span: Span,
+        replacement: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         self.suggestions.push(Suggestion {
             span,
             replacement: replacement.into(),
@@ -254,7 +259,12 @@ impl Diagnostic {
 /// Diagnostic display formatting trait
 pub trait DiagnosticDisplay {
     /// Format the diagnostic for display
-    fn fmt_diagnostic(&self, diagnostic: &Diagnostic, source_map: &SourceMap, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    fn fmt_diagnostic(
+        &self,
+        diagnostic: &Diagnostic,
+        source_map: &SourceMap,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result;
 }
 
 /// Default console-based diagnostic formatter (similar to rustc)
@@ -289,7 +299,7 @@ impl ConsoleDiagnosticDisplay {
             format!("{}", level)
         }
     }
-    
+
     /// Format error code
     fn format_code(&self, code: DiagnosticCode) -> String {
         if self.use_colors {
@@ -298,7 +308,7 @@ impl ConsoleDiagnosticDisplay {
             format!("[{}]", code)
         }
     }
-    
+
     /// Format annotation underline
     fn format_underline(&self, style: AnnotationStyle, length: usize) -> String {
         let char = match style {
@@ -306,14 +316,14 @@ impl ConsoleDiagnosticDisplay {
             AnnotationStyle::Secondary => '-',
             AnnotationStyle::Info => '-',
         };
-        
+
         let underline = char.to_string().repeat(length.max(1));
-        
+
         if self.use_colors {
             match style {
                 AnnotationStyle::Primary => format!("\x1b[1;31m{}\x1b[0m", underline), // Red
                 AnnotationStyle::Secondary => format!("\x1b[1;34m{}\x1b[0m", underline), // Blue
-                AnnotationStyle::Info => format!("\x1b[1;37m{}\x1b[0m", underline), // White
+                AnnotationStyle::Info => format!("\x1b[1;37m{}\x1b[0m", underline),    // White
             }
         } else {
             underline
@@ -322,24 +332,36 @@ impl ConsoleDiagnosticDisplay {
 }
 
 impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
-    fn fmt_diagnostic(&self, diagnostic: &Diagnostic, source_map: &SourceMap, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt_diagnostic(
+        &self,
+        diagnostic: &Diagnostic,
+        source_map: &SourceMap,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         // Main diagnostic header
         let level_str = self.format_level(diagnostic.level);
-        let code_str = diagnostic.code.map(|c| format!("{} ", self.format_code(c))).unwrap_or_default();
-        
+        let code_str = diagnostic
+            .code
+            .map(|c| format!("{} ", self.format_code(c)))
+            .unwrap_or_default();
+
         writeln!(f, "{}{}: {}", code_str, level_str, diagnostic.message)?;
-        
+
         // Group annotations by file and sort by line
         let mut file_annotations: HashMap<String, Vec<&Annotation>> = HashMap::new();
 
         // Get the first source file name from the source map (for single-file programs)
         // TODO: For multi-file programs, track file_id in Span
-        let default_filename = source_map.get_file_by_id(0)
+        let default_filename = source_map
+            .get_file_by_id(0)
             .map(|f| f.name.clone())
             .unwrap_or_else(|| "input.zy".to_string());
 
         for annotation in &diagnostic.annotations {
-            file_annotations.entry(default_filename.clone()).or_default().push(annotation);
+            file_annotations
+                .entry(default_filename.clone())
+                .or_default()
+                .push(annotation);
         }
 
         // Display each file's annotations
@@ -358,7 +380,11 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
                     let location = file.get_location(annotation.span.start);
                     let source_line = file.get_line(location.line).unwrap_or("");
 
-                    writeln!(f, "  --> {}:{}:{}", filename, location.line, location.column)?;
+                    writeln!(
+                        f,
+                        "  --> {}:{}:{}",
+                        filename, location.line, location.column
+                    )?;
                     writeln!(f, "   |")?;
                     writeln!(f, "{:3} | {}", location.line, source_line)?;
 
@@ -366,7 +392,9 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
                     let underline_start = location.column - 1; // Convert to 0-based
                     let underline_len = annotation.span.len().max(1);
 
-                    writeln!(f, "   | {}{}",
+                    writeln!(
+                        f,
+                        "   | {}{}",
                         " ".repeat(underline_start),
                         self.format_underline(annotation.style, underline_len)
                     )?;
@@ -379,7 +407,9 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
                     writeln!(f, "  --> {}:{}:{}", filename, 1, 1)?;
                     writeln!(f, "   |")?;
                     writeln!(f, "{:3} | {}", 1, "    // source code line here")?;
-                    writeln!(f, "   | {}{}",
+                    writeln!(
+                        f,
+                        "   | {}{}",
                         " ".repeat(4),
                         self.format_underline(annotation.style, 10)
                     )?;
@@ -392,24 +422,34 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
 
             writeln!(f, "   |")?;
         }
-        
+
         // Display notes
         for note in &diagnostic.notes {
-            writeln!(f, "   = {}: {}", self.format_level(DiagnosticLevel::Note), note)?;
+            writeln!(
+                f,
+                "   = {}: {}",
+                self.format_level(DiagnosticLevel::Note),
+                note
+            )?;
         }
-        
+
         // Display help messages
         for help in &diagnostic.help {
-            writeln!(f, "   = {}: {}", self.format_level(DiagnosticLevel::Help), help)?;
+            writeln!(
+                f,
+                "   = {}: {}",
+                self.format_level(DiagnosticLevel::Help),
+                help
+            )?;
         }
-        
+
         // Display suggestions
         for suggestion in &diagnostic.suggestions {
             writeln!(f, "   = help: {}", suggestion.message)?;
             writeln!(f, "   |")?;
             writeln!(f, "   | {}", suggestion.replacement)?;
         }
-        
+
         Ok(())
     }
 }
@@ -435,13 +475,13 @@ impl DiagnosticCollector {
             fatal_on_error: false,
         }
     }
-    
+
     /// Set fatal-on-error mode
     pub fn with_fatal_on_error(mut self, fatal: bool) -> Self {
         self.fatal_on_error = fatal;
         self
     }
-    
+
     /// Add a diagnostic
     pub fn add(&mut self, diagnostic: Diagnostic) -> Result<(), ()> {
         match diagnostic.level {
@@ -462,49 +502,56 @@ impl DiagnosticCollector {
         }
         Ok(())
     }
-    
+
     /// Emit an error
     pub fn error(&mut self, message: impl Into<String>) -> DiagnosticBuilder {
         DiagnosticBuilder::new(self, Diagnostic::error(message))
     }
-    
+
     /// Emit a warning
     pub fn warning(&mut self, message: impl Into<String>) -> DiagnosticBuilder {
         DiagnosticBuilder::new(self, Diagnostic::warning(message))
     }
-    
+
     /// Check if there are any errors
     pub fn has_errors(&self) -> bool {
         self.error_count > 0
     }
-    
+
     /// Get error count
     pub fn error_count(&self) -> usize {
         self.error_count
     }
-    
+
     /// Get warning count
     pub fn warning_count(&self) -> usize {
         self.warning_count
     }
-    
+
     /// Get all diagnostics
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
-    
+
     /// Clear all diagnostics
     pub fn clear(&mut self) {
         self.diagnostics.clear();
         self.error_count = 0;
         self.warning_count = 0;
     }
-    
+
     /// Display all diagnostics
     pub fn display_all<D: DiagnosticDisplay>(&self, display: &D, source_map: &SourceMap) -> String {
         let mut output = String::new();
         for diagnostic in &self.diagnostics {
-            output.push_str(&format!("{}", DisplayWrapper { diagnostic, display, source_map }));
+            output.push_str(&format!(
+                "{}",
+                DisplayWrapper {
+                    diagnostic,
+                    display,
+                    source_map
+                }
+            ));
             output.push('\n');
         }
         output
@@ -525,41 +572,53 @@ pub struct DiagnosticBuilder<'a> {
 
 impl<'a> DiagnosticBuilder<'a> {
     fn new(collector: &'a mut DiagnosticCollector, diagnostic: Diagnostic) -> Self {
-        Self { collector, diagnostic }
+        Self {
+            collector,
+            diagnostic,
+        }
     }
-    
+
     /// Add error code
     pub fn code(mut self, code: DiagnosticCode) -> Self {
         self.diagnostic.code = Some(code);
         self
     }
-    
+
     /// Add primary span
     pub fn primary(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.diagnostic.annotations.push(Annotation::primary(span, message));
+        self.diagnostic
+            .annotations
+            .push(Annotation::primary(span, message));
         self
     }
-    
+
     /// Add secondary span
     pub fn secondary(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.diagnostic.annotations.push(Annotation::secondary(span, message));
+        self.diagnostic
+            .annotations
+            .push(Annotation::secondary(span, message));
         self
     }
-    
+
     /// Add help message
     pub fn help(mut self, help: impl Into<String>) -> Self {
         self.diagnostic.help.push(help.into());
         self
     }
-    
+
     /// Add note
     pub fn note(mut self, note: impl Into<String>) -> Self {
         self.diagnostic.notes.push(note.into());
         self
     }
-    
+
     /// Add suggestion
-    pub fn suggest(mut self, span: Span, replacement: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn suggest(
+        mut self,
+        span: Span,
+        replacement: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         self.diagnostic.suggestions.push(Suggestion {
             span,
             replacement: replacement.into(),
@@ -568,7 +627,7 @@ impl<'a> DiagnosticBuilder<'a> {
         });
         self
     }
-    
+
     /// Emit the diagnostic
     pub fn emit(self) -> Result<(), ()> {
         self.collector.add(self.diagnostic)
@@ -584,14 +643,19 @@ struct DisplayWrapper<'a, D> {
 
 impl<'a, D: DiagnosticDisplay> fmt::Display for DisplayWrapper<'a, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.display.fmt_diagnostic(self.diagnostic, self.source_map, f)
+        self.display
+            .fmt_diagnostic(self.diagnostic, self.source_map, f)
     }
 }
 
 /// Extension trait for integrating diagnostics with compiler phases
 pub trait WithDiagnostics {
     /// Run with diagnostic collection
-    fn with_diagnostics<F, R>(&mut self, collector: &mut DiagnosticCollector, f: F) -> Result<R, ()>
+    fn with_diagnostics<F, R>(
+        &mut self,
+        collector: &mut DiagnosticCollector,
+        f: F,
+    ) -> Result<R, ()>
     where
         F: FnOnce(&mut Self, &mut DiagnosticCollector) -> Result<R, ()>;
 }
@@ -606,10 +670,10 @@ mod tests {
         let diag = Diagnostic::error("Type mismatch")
             .with_code(codes::E0001)
             .with_primary(Span::new(10, 20), "expected i32")
-            .with_secondary(Span::new(5, 8), "found string")  
+            .with_secondary(Span::new(5, 8), "found string")
             .with_help("Consider casting the value to i32")
             .with_note("This error occurs when types don't match");
-        
+
         assert_eq!(diag.level, DiagnosticLevel::Error);
         assert_eq!(diag.code, Some(codes::E0001));
         assert_eq!(diag.message, "Type mismatch");
@@ -617,20 +681,24 @@ mod tests {
         assert_eq!(diag.help.len(), 1);
         assert_eq!(diag.notes.len(), 1);
     }
-    
+
     #[test]
     fn test_diagnostic_collector() {
         let mut collector = DiagnosticCollector::new();
-        
-        collector.error("First error")
+
+        collector
+            .error("First error")
             .code(codes::E0001)
             .primary(Span::new(0, 5), "here")
-            .emit().unwrap();
-            
-        collector.warning("A warning")
+            .emit()
+            .unwrap();
+
+        collector
+            .warning("A warning")
             .primary(Span::new(10, 15), "warning here")
-            .emit().unwrap();
-        
+            .emit()
+            .unwrap();
+
         assert_eq!(collector.error_count(), 1);
         assert_eq!(collector.warning_count(), 1);
         assert!(collector.has_errors());

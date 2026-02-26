@@ -3,7 +3,7 @@
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{InternedString, arena::AstArena};
+use zyntax_typed_ast::{arena::AstArena, InternedString};
 
 fn create_test_string(s: &str) -> InternedString {
     let mut arena = AstArena::new();
@@ -12,13 +12,14 @@ fn create_test_string(s: &str) -> InternedString {
 
 fn compile_and_get_ptr(func: HirFunction) -> (CraneliftBackend, Option<*const u8>) {
     let func_id = func.id;
-    let mut backend = CraneliftBackend::new()
-        .expect("Failed to create Cranelift backend");
+    let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
 
-    backend.compile_function(func_id, &func)
+    backend
+        .compile_function(func_id, &func)
         .expect("Failed to compile function");
 
-    backend.finalize_definitions()
+    backend
+        .finalize_definitions()
         .expect("Failed to finalize definitions");
 
     let func_ptr = backend.get_function_ptr(func_id);
@@ -36,7 +37,7 @@ fn test_struct_roundtrip() {
     let name = create_test_string("struct_roundtrip");
     let point_ty = HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32],  // x, y
+        fields: vec![HirType::I32, HirType::I32], // x, y
         packed: false,
     };
 
@@ -58,7 +59,7 @@ fn test_struct_roundtrip() {
     // Alloca Point
     let struct_ptr = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(point_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
         result: struct_ptr,
@@ -71,7 +72,7 @@ fn test_struct_roundtrip() {
     let val_10 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(10)));
     let ptr_1 = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(point_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert_x = HirInstruction::InsertValue {
         result: ptr_1,
@@ -85,7 +86,7 @@ fn test_struct_roundtrip() {
     let val_20 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(20)));
     let ptr_2 = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(point_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert_y = HirInstruction::InsertValue {
         result: ptr_2,
@@ -109,7 +110,9 @@ fn test_struct_roundtrip() {
     block.add_instruction(insert_x);
     block.add_instruction(insert_y);
     block.add_instruction(extract_y);
-    block.set_terminator(HirTerminator::Return { values: vec![y_result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![y_result],
+    });
 
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer");
@@ -157,7 +160,7 @@ fn test_nested_struct_execution() {
     // Alloca Outer
     let struct_ptr = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
         result: struct_ptr,
@@ -170,42 +173,42 @@ fn test_nested_struct_execution() {
     let val_5 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(5)));
     let ptr_1 = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert_a = HirInstruction::InsertValue {
         result: ptr_1,
         ty: HirType::I32,
         aggregate: struct_ptr,
         value: val_5,
-        indices: vec![0, 0],  // inner.a
+        indices: vec![0, 0], // inner.a
     };
 
     // Insert outer.inner.b = 42
     let val_42 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(42)));
     let ptr_2 = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert_b = HirInstruction::InsertValue {
         result: ptr_2,
         ty: HirType::I32,
         aggregate: ptr_1,
         value: val_42,
-        indices: vec![0, 1],  // inner.b
+        indices: vec![0, 1], // inner.b
     };
 
     // Insert outer.c = 100
     let val_100 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(100)));
     let ptr_3 = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert_c = HirInstruction::InsertValue {
         result: ptr_3,
         ty: HirType::I32,
         aggregate: ptr_2,
         value: val_100,
-        indices: vec![1],  // c
+        indices: vec![1], // c
     };
 
     // Extract outer.inner.b
@@ -223,7 +226,9 @@ fn test_nested_struct_execution() {
     block.add_instruction(insert_b);
     block.add_instruction(insert_c);
     block.add_instruction(extract_b);
-    block.set_terminator(HirTerminator::Return { values: vec![b_result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![b_result],
+    });
 
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer");
@@ -259,7 +264,7 @@ fn test_array_roundtrip() {
     // Alloca array
     let array_ptr = func.create_value(
         HirType::Ptr(Box::new(array_ty.clone())),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
         result: array_ptr,
@@ -273,11 +278,11 @@ fn test_array_roundtrip() {
     for i in 0..4 {
         let value = func.create_value(
             HirType::I32,
-            HirValueKind::Constant(HirConstant::I32((i * 10) as i32))
+            HirValueKind::Constant(HirConstant::I32((i * 10) as i32)),
         );
         let new_ptr = func.create_value(
             HirType::Ptr(Box::new(array_ty.clone())),
-            HirValueKind::Instruction
+            HirValueKind::Instruction,
         );
         let insert = HirInstruction::InsertValue {
             result: new_ptr,
@@ -303,9 +308,11 @@ fn test_array_roundtrip() {
     };
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
-    block.instructions.insert(0, alloca);  // Add alloca at beginning
+    block.instructions.insert(0, alloca); // Add alloca at beginning
     block.add_instruction(extract);
-    block.set_terminator(HirTerminator::Return { values: vec![elem_result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![elem_result],
+    });
 
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer");
@@ -342,7 +349,7 @@ fn test_2d_array_execution() {
     // Alloca 2D array
     let array_ptr = func.create_value(
         HirType::Ptr(Box::new(outer_array_ty.clone())),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
         result: array_ptr,
@@ -355,7 +362,7 @@ fn test_2d_array_execution() {
     let val_99 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(99)));
     let ptr_1 = func.create_value(
         HirType::Ptr(Box::new(outer_array_ty.clone())),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {
         result: ptr_1,
@@ -378,7 +385,9 @@ fn test_2d_array_execution() {
     block.add_instruction(alloca);
     block.add_instruction(insert);
     block.add_instruction(extract);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer");
@@ -421,7 +430,7 @@ fn test_array_of_structs_execution() {
     // Alloca array
     let array_ptr = func.create_value(
         HirType::Ptr(Box::new(array_ty.clone())),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
         result: array_ptr,
@@ -434,14 +443,14 @@ fn test_array_of_structs_execution() {
     let val_77 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(77)));
     let ptr_1 = func.create_value(
         HirType::Ptr(Box::new(array_ty.clone())),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {
         result: ptr_1,
         ty: HirType::I32,
         aggregate: array_ptr,
         value: val_77,
-        indices: vec![1, 1],  // array index 1, struct field 1
+        indices: vec![1, 1], // array index 1, struct field 1
     };
 
     // Extract points[1].y
@@ -457,7 +466,9 @@ fn test_array_of_structs_execution() {
     block.add_instruction(alloca);
     block.add_instruction(insert);
     block.add_instruction(extract);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer");
@@ -498,7 +509,7 @@ fn test_mixed_size_struct() {
     // Alloca struct
     let struct_ptr = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
         result: struct_ptr,
@@ -508,10 +519,13 @@ fn test_mixed_size_struct() {
     };
 
     // Insert field 2 (i64) = 123456789
-    let val = func.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(123456789)));
+    let val = func.create_value(
+        HirType::I64,
+        HirValueKind::Constant(HirConstant::I64(123456789)),
+    );
     let ptr_1 = func.create_value(
         HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
-        HirValueKind::Instruction
+        HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {
         result: ptr_1,
@@ -534,7 +548,9 @@ fn test_mixed_size_struct() {
     block.add_instruction(alloca);
     block.add_instruction(insert);
     block.add_instruction(extract);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer");

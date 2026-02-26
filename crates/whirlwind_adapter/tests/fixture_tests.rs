@@ -1,10 +1,9 @@
-/// Systematic fixture tests from simple to complex
-/// Tests real Whirlwind features: functions, models, enums, interfaces, generics, etc.
-
-use whirlwind_adapter::WhirlwindAdapter;
-use whirlwind_analyzer::{Module, Standpoint};
 use std::fs;
 use std::path::PathBuf;
+/// Systematic fixture tests from simple to complex
+/// Tests real Whirlwind features: functions, models, enums, interfaces, generics, etc.
+use whirlwind_adapter::WhirlwindAdapter;
+use whirlwind_analyzer::{Module, Standpoint};
 
 /// Helper to load and convert a fixture file
 fn test_fixture(fixture_name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -22,10 +21,13 @@ fn test_fixture(fixture_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Parse and analyze with Whirlwind
     let mut module = Module::from_text(&source);
     module.module_path = Some(PathBuf::from(format!("testing://{}.wrl", fixture_name)));
-    let standpoint = Standpoint::build_from_module(module, false)
-        .ok_or("Failed to build standpoint")?;
+    let standpoint =
+        Standpoint::build_from_module(module, false).ok_or("Failed to build standpoint")?;
 
-    println!("Symbols found: {}", standpoint.symbol_library.symbols().count());
+    println!(
+        "Symbols found: {}",
+        standpoint.symbol_library.symbols().count()
+    );
 
     println!("Diagnostics: {} (Note: UnknownValue errors for 'int', 'string', etc. are expected - Whirlwind core library not available)", standpoint.diagnostics.len());
 
@@ -33,7 +35,10 @@ fn test_fixture(fixture_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut adapter = WhirlwindAdapter::new();
     let typed_program = adapter.convert_standpoint(&standpoint)?;
 
-    println!("Declarations converted: {}", typed_program.declarations.len());
+    println!(
+        "Declarations converted: {}",
+        typed_program.declarations.len()
+    );
 
     // Print summary of declarations
     for decl in &typed_program.declarations {
@@ -56,8 +61,13 @@ fn test_fixture(fixture_name: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             zyntax_typed_ast::typed_ast::TypedDeclaration::Class(c) => {
                 if let Some(name) = adapter.arena().resolve_string(c.name) {
-                    println!("  ✓ Class: {} ({} fields, {} methods, {} constructors)",
-                        name, c.fields.len(), c.methods.len(), c.constructors.len());
+                    println!(
+                        "  ✓ Class: {} ({} fields, {} methods, {} constructors)",
+                        name,
+                        c.fields.len(),
+                        c.methods.len(),
+                        c.constructors.len()
+                    );
 
                     // Print fields
                     for field in &c.fields {

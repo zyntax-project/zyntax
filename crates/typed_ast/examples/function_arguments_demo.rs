@@ -4,18 +4,16 @@
 //! demonstrating how it handles various parameter passing conventions from different languages.
 
 use zyntax_typed_ast::{
-    typed_ast::*,
-    Type, TypeId, PrimitiveType, Mutability, Visibility, ParamInfo,
-    NullabilityKind, AsyncKind, CallingConvention,
-    AstArena, Span,
+    typed_ast::*, AstArena, AsyncKind, CallingConvention, Mutability, NullabilityKind, ParamInfo,
+    PrimitiveType, Span, Type, TypeId, Visibility,
 };
 
 /// Demonstrates basic positional arguments (C, Go, Java style)
 fn positional_arguments_demo() {
     let mut arena = AstArena::new();
-    
+
     println!("🔥 Basic Positional Arguments:\n");
-    
+
     // function add(x: int, y: int) -> int
     let add_function = TypedFunction {
         name: arena.intern_string("add"),
@@ -24,24 +22,25 @@ fn positional_arguments_demo() {
                 arena.intern_string("x"),
                 Type::Primitive(PrimitiveType::I32),
                 Mutability::Immutable,
-                Span::new(10, 16)
+                Span::new(10, 16),
             ),
             TypedParameter::regular(
                 arena.intern_string("y"),
                 Type::Primitive(PrimitiveType::I32),
                 Mutability::Immutable,
-                Span::new(18, 24)
+                Span::new(18, 24),
             ),
         ],
         return_type: Type::Primitive(PrimitiveType::I32),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![],
             span: Span::new(35, 50),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
-    
+
     // Function call: add(10, 20)
     let add_call = TypedCall::positional(
         typed_node(
@@ -79,22 +78,22 @@ fn positional_arguments_demo() {
                 calling_convention: CallingConvention::Default,
                 nullability: NullabilityKind::NonNull,
             },
-            Span::new(0, 3)
+            Span::new(0, 3),
         ),
         vec![
             typed_node(
                 TypedExpression::Literal(TypedLiteral::Integer(10)),
                 Type::Primitive(PrimitiveType::I32),
-                Span::new(4, 6)
+                Span::new(4, 6),
             ),
             typed_node(
                 TypedExpression::Literal(TypedLiteral::Integer(20)),
                 Type::Primitive(PrimitiveType::I32),
-                Span::new(8, 10)
+                Span::new(8, 10),
             ),
-        ]
+        ],
     );
-    
+
     println!("✅ C/Go/Java style: add(10, 20)");
     assert_eq!(add_call.positional_args.len(), 2);
     assert_eq!(add_call.named_args.len(), 0);
@@ -102,8 +101,8 @@ fn positional_arguments_demo() {
 
 fn main() {
     println!("🚀 Zyntax TypedAST Function Arguments Support Demo\n");
-    
+
     positional_arguments_demo();
-    
+
     println!("\n✨ Basic function arguments are working!");
 }

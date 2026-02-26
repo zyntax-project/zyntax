@@ -5,10 +5,10 @@
 //! - `action_gen.rs`: Generate action code from ActionIR
 //! - `pratt_gen.rs`: Generate Pratt parser for expression precedence
 
-pub mod parser_gen;
 pub mod action_gen;
+pub mod parser_gen;
 pub mod pratt_gen;
 
-pub use parser_gen::*;
 pub use action_gen::*;
+pub use parser_gen::*;
 pub use pratt_gen::*;

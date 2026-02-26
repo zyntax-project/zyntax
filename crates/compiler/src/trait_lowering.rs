@@ -29,7 +29,7 @@
 use crate::hir::{HirMethodSignature, HirType};
 use crate::CompilerResult;
 use std::collections::{HashMap, HashSet};
-use zyntax_typed_ast::{InternedString, TypeRegistry, TypeId};
+use zyntax_typed_ast::{InternedString, TypeId, TypeRegistry};
 
 /// Trait method table containing all methods defined in a trait
 #[derive(Debug, Clone)]
@@ -124,7 +124,7 @@ pub fn convert_type(
     ty: &zyntax_typed_ast::Type,
     type_registry: &TypeRegistry,
 ) -> CompilerResult<HirType> {
-    use zyntax_typed_ast::{Type as FrontendType, PrimitiveType};
+    use zyntax_typed_ast::{PrimitiveType, Type as FrontendType};
 
     match ty {
         // Primitive types
@@ -193,7 +193,11 @@ pub fn convert_type(
         }
 
         // Function types
-        FrontendType::Function { params, return_type, .. } => {
+        FrontendType::Function {
+            params,
+            return_type,
+            ..
+        } => {
             let param_types: Vec<_> = params
                 .iter()
                 .map(|p| convert_type(&p.ty, type_registry))
@@ -210,7 +214,9 @@ pub fn convert_type(
         }
 
         // Array types
-        FrontendType::Array { element_type, size, .. } => {
+        FrontendType::Array {
+            element_type, size, ..
+        } => {
             let elem_ty = convert_type(element_type, type_registry)?;
 
             if let Some(size_const) = size {
@@ -228,7 +234,12 @@ pub fn convert_type(
         }
 
         // Reference types
-        FrontendType::Reference { ty, mutability, lifetime, .. } => {
+        FrontendType::Reference {
+            ty,
+            mutability,
+            lifetime,
+            ..
+        } => {
             let pointee_ty = convert_type(ty, type_registry)?;
             let hir_lifetime = lifetime
                 .as_ref()
@@ -270,7 +281,7 @@ pub fn convert_type(
             // For now, use a named opaque type
             // TODO: Implement full tagged union support
             Err(crate::CompilerError::Analysis(
-                "Union types not yet fully supported in HIR lowering".to_string()
+                "Union types not yet fully supported in HIR lowering".to_string(),
             ))
         }
 
@@ -279,24 +290,27 @@ pub fn convert_type(
             // Option<T> should be treated as enum Option<T> { Some(T), None }
             // For now, error - this should be handled by type checker
             Err(crate::CompilerError::Analysis(
-                "Optional types should be desugared before HIR lowering".to_string()
+                "Optional types should be desugared before HIR lowering".to_string(),
             ))
         }
 
         // Trait types
-        FrontendType::Trait { id, .. } => {
-            Ok(HirType::TraitObject {
-                trait_id: *id,
-                vtable: None,
-            })
-        }
+        FrontendType::Trait { id, .. } => Ok(HirType::TraitObject {
+            trait_id: *id,
+            vtable: None,
+        }),
 
         // Interface types (structural)
-        FrontendType::Interface { methods, is_structural, .. } => {
+        FrontendType::Interface {
+            methods,
+            is_structural,
+            ..
+        } => {
             let hir_methods: Vec<_> = methods
                 .iter()
                 .map(|m| {
-                    let param_types: Vec<_> = m.params
+                    let param_types: Vec<_> = m
+                        .params
                         .iter()
                         .map(|p| convert_type(&p.ty, type_registry))
                         .collect::<CompilerResult<Vec<_>>>()?;
@@ -320,18 +334,14 @@ pub fn convert_type(
         }
 
         // Type variables (should be resolved before lowering)
-        FrontendType::TypeVar(_) => {
-            Err(crate::CompilerError::Analysis(
-                "Type variables must be resolved before HIR lowering".to_string()
-            ))
-        }
+        FrontendType::TypeVar(_) => Err(crate::CompilerError::Analysis(
+            "Type variables must be resolved before HIR lowering".to_string(),
+        )),
 
         // Self type (should be resolved)
-        FrontendType::SelfType => {
-            Err(crate::CompilerError::Analysis(
-                "Self type must be resolved before HIR lowering".to_string()
-            ))
-        }
+        FrontendType::SelfType => Err(crate::CompilerError::Analysis(
+            "Self type must be resolved before HIR lowering".to_string(),
+        )),
 
         // Error type (from failed type checking)
         FrontendType::Error => {
@@ -339,11 +349,9 @@ pub fn convert_type(
         }
 
         // Unknown/Any type
-        FrontendType::Unknown | FrontendType::Any => {
-            Err(crate::CompilerError::Analysis(
-                "Unknown/Any types should be resolved before HIR lowering".to_string()
-            ))
-        }
+        FrontendType::Unknown | FrontendType::Any => Err(crate::CompilerError::Analysis(
+            "Unknown/Any types should be resolved before HIR lowering".to_string(),
+        )),
 
         // Extern types (external runtime types like $Tensor, $Audio)
         FrontendType::Extern { name, .. } => {
@@ -354,8 +362,10 @@ pub fn convert_type(
         // Unresolved types (should be resolved before lowering, but allow as opaque)
         FrontendType::Unresolved(name) => {
             // Log a warning but allow as opaque type
-            eprintln!("[WARN] Unresolved type '{}' in HIR lowering - treating as opaque",
-                name.resolve_global().unwrap_or_default());
+            eprintln!(
+                "[WARN] Unresolved type '{}' in HIR lowering - treating as opaque",
+                name.resolve_global().unwrap_or_default()
+            );
             Ok(HirType::Opaque(*name))
         }
 
@@ -427,11 +437,8 @@ pub fn validate_trait_implementation(
     impl_def: &zyntax_typed_ast::ImplDef,
 ) -> CompilerResult<()> {
     // Collect all method names from the implementation
-    let impl_methods: HashSet<InternedString> = impl_def
-        .methods
-        .iter()
-        .map(|m| m.signature.name)
-        .collect();
+    let impl_methods: HashSet<InternedString> =
+        impl_def.methods.iter().map(|m| m.signature.name).collect();
 
     // Validate against trait table
     match trait_table.validate_implementation(&impl_methods) {
@@ -578,7 +585,7 @@ pub fn generate_vtable(
     type_id: TypeId,
     registry: &crate::vtable_registry::VtableRegistry,
 ) -> CompilerResult<crate::hir::HirVTable> {
-    use crate::hir::{HirVTable, HirVTableEntry, HirId};
+    use crate::hir::{HirId, HirVTable, HirVTableEntry};
 
     // Create vtable ID
     let vtable_id = HirId::new();
@@ -658,7 +665,7 @@ pub fn generate_vtable_name(
 ///
 /// Generates a unique string representation of a type that can be used in symbol names.
 fn mangle_type_name(ty: &zyntax_typed_ast::Type, type_registry: &TypeRegistry) -> String {
-    use zyntax_typed_ast::{Type as FrontendType, PrimitiveType};
+    use zyntax_typed_ast::{PrimitiveType, Type as FrontendType};
 
     match ty {
         FrontendType::Primitive(prim) => match prim {
@@ -710,7 +717,9 @@ fn mangle_type_name(ty: &zyntax_typed_ast::Type, type_registry: &TypeRegistry) -
             }
         }
 
-        FrontendType::Array { element_type, size, .. } => {
+        FrontendType::Array {
+            element_type, size, ..
+        } => {
             let elem = mangle_type_name(element_type, type_registry);
             if let Some(size_const) = size {
                 if let zyntax_typed_ast::ConstValue::Int(n) = size_const {
@@ -732,7 +741,11 @@ fn mangle_type_name(ty: &zyntax_typed_ast::Type, type_registry: &TypeRegistry) -
             format!("tuple_{}", elem_names)
         }
 
-        FrontendType::Function { params, return_type, .. } => {
+        FrontendType::Function {
+            params,
+            return_type,
+            ..
+        } => {
             let param_names = params
                 .iter()
                 .map(|p| mangle_type_name(&p.ty, type_registry))
@@ -750,7 +763,7 @@ fn mangle_type_name(ty: &zyntax_typed_ast::Type, type_registry: &TypeRegistry) -
             }
         }
 
-        _ => format!("unknown_type")
+        _ => format!("unknown_type"),
     }
 }
 
@@ -762,17 +775,17 @@ pub fn create_vtable_global(
     vtable: crate::hir::HirVTable,
     name: InternedString,
 ) -> crate::hir::HirGlobal {
-    use crate::hir::{HirGlobal, HirConstant, HirType, Linkage, Visibility};
+    use crate::hir::{HirConstant, HirGlobal, HirType, Linkage, Visibility};
 
     HirGlobal {
         id: vtable.id,
         name,
-        ty: HirType::Ptr(Box::new(HirType::Void)),  // Opaque vtable pointer
+        ty: HirType::Ptr(Box::new(HirType::Void)), // Opaque vtable pointer
         initializer: Some(HirConstant::VTable(vtable)),
         is_const: true,
         is_thread_local: false,
         linkage: Linkage::Internal,
-        visibility: Visibility::Hidden,  // Use Hidden instead of Private
+        visibility: Visibility::Hidden, // Use Hidden instead of Private
     }
 }
 
@@ -878,11 +891,7 @@ pub fn translate_trait_upcast(
     }
 
     // Lookup super-trait vtable from registry
-    let super_vtable_id = registry.get_super_trait_vtable(
-        from_trait_id,
-        to_trait_id,
-        type_id,
-    )?;
+    let super_vtable_id = registry.get_super_trait_vtable(from_trait_id, to_trait_id, type_id)?;
 
     // Return data pointer (unchanged) and super-trait vtable
     Ok((data_ptr_id, super_vtable_id))
@@ -900,14 +909,18 @@ mod tests {
 
     #[test]
     fn test_convert_type_primitives() {
-        use zyntax_typed_ast::{Type as FrontendType, PrimitiveType};
         use crate::hir::HirType;
+        use zyntax_typed_ast::{PrimitiveType, Type as FrontendType};
 
         let type_registry = TypeRegistry::new();
 
         // Test primitive types
         assert!(matches!(
-            convert_type(&FrontendType::Primitive(PrimitiveType::Bool), &type_registry).unwrap(),
+            convert_type(
+                &FrontendType::Primitive(PrimitiveType::Bool),
+                &type_registry
+            )
+            .unwrap(),
             HirType::Bool
         ));
 
@@ -922,20 +935,28 @@ mod tests {
         ));
 
         assert!(matches!(
-            convert_type(&FrontendType::Primitive(PrimitiveType::Unit), &type_registry).unwrap(),
+            convert_type(
+                &FrontendType::Primitive(PrimitiveType::Unit),
+                &type_registry
+            )
+            .unwrap(),
             HirType::Void
         ));
     }
 
     #[test]
     fn test_convert_type_pointer() {
-        use zyntax_typed_ast::{Type as FrontendType, PrimitiveType};
         use crate::hir::HirType;
+        use zyntax_typed_ast::{PrimitiveType, Type as FrontendType};
 
         let type_registry = TypeRegistry::new();
 
         // Test that String converts to pointer to U8
-        let result = convert_type(&FrontendType::Primitive(PrimitiveType::String), &type_registry).unwrap();
+        let result = convert_type(
+            &FrontendType::Primitive(PrimitiveType::String),
+            &type_registry,
+        )
+        .unwrap();
 
         match result {
             HirType::Ptr(inner) => {
@@ -947,14 +968,14 @@ mod tests {
 
     #[test]
     fn test_convert_type_errors_on_unresolved() {
-        use zyntax_typed_ast::{Type as FrontendType, TypeVar, TypeVarKind, TypeVarId};
+        use zyntax_typed_ast::{Type as FrontendType, TypeVar, TypeVarId, TypeVarKind};
 
         let type_registry = TypeRegistry::new();
 
         // TypeVar should error
         let type_var = FrontendType::TypeVar(TypeVar {
             id: TypeVarId::next(),
-            name: None,  // Anonymous type variable
+            name: None, // Anonymous type variable
             kind: TypeVarKind::Type,
         });
 
@@ -983,8 +1004,8 @@ mod tests {
 
     #[test]
     fn test_extract_trait_id_from_named_type() {
-        use zyntax_typed_ast::Type as FrontendType;
         use zyntax_typed_ast::NullabilityKind;
+        use zyntax_typed_ast::Type as FrontendType;
 
         // Test extracting trait ID from Named type
         let trait_id = TypeId::new(99);
@@ -1003,8 +1024,8 @@ mod tests {
 
     #[test]
     fn test_extract_trait_id_invalid_type() {
-        use zyntax_typed_ast::Type as FrontendType;
         use zyntax_typed_ast::PrimitiveType;
+        use zyntax_typed_ast::Type as FrontendType;
 
         // Test error case with non-trait type
         let primitive_type = FrontendType::Primitive(PrimitiveType::I32);

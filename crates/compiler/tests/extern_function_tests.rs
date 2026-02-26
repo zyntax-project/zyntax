@@ -5,14 +5,14 @@
 // 2. Lowering to HIR
 // 3. Backend handling (Cranelift and LLVM)
 
+use zyntax_typed_ast::typed_ast::{ParameterKind, TypedFunction, TypedParameter};
 use zyntax_typed_ast::*;
-use zyntax_typed_ast::typed_ast::{ParameterKind, TypedParameter, TypedFunction};
 
 /// Helper to create a test extern function in TypedAST
 fn create_extern_function(
     arena: &mut AstArena,
     name: &str,
-    params: Vec<(& str, Type)>,
+    params: Vec<(&str, Type)>,
     return_type: Type,
     calling_convention: CallingConvention,
 ) -> TypedFunction {
@@ -36,7 +36,7 @@ fn create_extern_function(
         params: typed_params,
         type_params: vec![],
         return_type,
-        body: None,  // Extern functions have no body
+        body: None, // Extern functions have no body
         visibility: Visibility::Public,
         is_async: false,
         is_external: true,
@@ -57,7 +57,7 @@ fn test_extern_function_declaration() {
         &mut arena,
         "malloc",
         vec![("size", Type::Primitive(PrimitiveType::U64))],
-        Type::Primitive(PrimitiveType::U64),  // Simplified - return address as u64
+        Type::Primitive(PrimitiveType::U64), // Simplified - return address as u64
         CallingConvention::Cdecl,
     );
 
@@ -75,12 +75,15 @@ fn test_extern_c_calling_convention() {
     let free_func = create_extern_function(
         &mut arena,
         "free",
-        vec![("ptr", Type::Reference {
-            ty: Box::new(Type::Primitive(PrimitiveType::U8)),
-            mutability: Mutability::Mutable,
-            lifetime: None,
-            nullability: NullabilityKind::NonNull,
-        })],
+        vec![(
+            "ptr",
+            Type::Reference {
+                ty: Box::new(Type::Primitive(PrimitiveType::U8)),
+                mutability: Mutability::Mutable,
+                lifetime: None,
+                nullability: NullabilityKind::NonNull,
+            },
+        )],
         Type::Primitive(PrimitiveType::Unit),
         CallingConvention::Cdecl,
     );
@@ -124,15 +127,15 @@ fn test_extern_function_with_multiple_parameters() {
         &mut arena,
         "printf",
         vec![
-            ("x", Type::Primitive(PrimitiveType::I32)),  // Simplified
-            // Note: variadic parameters not yet supported, so we can't fully represent printf
+            ("x", Type::Primitive(PrimitiveType::I32)), // Simplified
+                                                        // Note: variadic parameters not yet supported, so we can't fully represent printf
         ],
         Type::Primitive(PrimitiveType::I32),
         CallingConvention::Cdecl,
     );
 
     assert!(printf_func.is_external);
-    assert_eq!(printf_func.params.len(), 1);  // Just format for now
+    assert_eq!(printf_func.params.len(), 1); // Just format for now
 }
 
 #[test]
@@ -148,7 +151,7 @@ fn test_extern_function_with_pointer_types() {
             ("b", Type::Primitive(PrimitiveType::I32)),
             ("n", Type::Primitive(PrimitiveType::U64)),
         ],
-        Type::Primitive(PrimitiveType::I32),  // Simplified
+        Type::Primitive(PrimitiveType::I32), // Simplified
         CallingConvention::Cdecl,
     );
 
@@ -165,7 +168,7 @@ fn test_extern_function_void_return() {
         &mut arena,
         "exit",
         vec![("status", Type::Primitive(PrimitiveType::I32))],
-        Type::Primitive(PrimitiveType::Unit),  // void
+        Type::Primitive(PrimitiveType::Unit), // void
         CallingConvention::Cdecl,
     );
 

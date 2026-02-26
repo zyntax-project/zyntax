@@ -10,14 +10,14 @@
 //! - References do not outlive their referents
 //! - Drop order is correct for RAII resources
 
-use std::collections::{HashMap, HashSet};
+use crate::analysis::{AliasAnalysis, FunctionAnalysis, LivenessAnalysis, ModuleAnalysis};
 use crate::hir::{
-    HirModule, HirFunction, HirBlock, HirId, HirInstruction, HirValue, HirValueKind,
-    HirType, BorrowCheckContext, BorrowInfo, MoveInfo, LifetimeConstraint, HirLifetime,
+    BorrowCheckContext, BorrowInfo, HirBlock, HirFunction, HirId, HirInstruction, HirLifetime,
+    HirModule, HirType, HirValue, HirValueKind, LifetimeConstraint, MoveInfo,
 };
-use crate::analysis::{ModuleAnalysis, FunctionAnalysis, LivenessAnalysis, AliasAnalysis};
-use crate::CompilerResult;
 use crate::CompilerError;
+use crate::CompilerResult;
+use std::collections::{HashMap, HashSet};
 use zyntax_typed_ast::source::Span;
 
 /// Result of borrow checking
@@ -152,10 +152,16 @@ impl<'a> HirBorrowChecker<'a> {
         };
 
         if result.errors.is_empty() {
-            eprintln!("[BORROW_CHECK] Borrow checking passed ({} warnings)", result.warnings.len());
+            eprintln!(
+                "[BORROW_CHECK] Borrow checking passed ({} warnings)",
+                result.warnings.len()
+            );
         } else {
-            eprintln!("[BORROW_CHECK] Borrow checking found {} errors, {} warnings",
-                result.errors.len(), result.warnings.len());
+            eprintln!(
+                "[BORROW_CHECK] Borrow checking found {} errors, {} warnings",
+                result.errors.len(),
+                result.warnings.len()
+            );
         }
 
         Ok(result)
@@ -200,7 +206,11 @@ impl<'a> HirBorrowChecker<'a> {
                     crate::hir::HirTerminator::Branch { target, .. } => {
                         stack.push(*target);
                     }
-                    crate::hir::HirTerminator::CondBranch { true_target, false_target, .. } => {
+                    crate::hir::HirTerminator::CondBranch {
+                        true_target,
+                        false_target,
+                        ..
+                    } => {
                         stack.push(*false_target);
                         stack.push(*true_target);
                     }
@@ -245,42 +255,77 @@ impl<'a> HirBorrowChecker<'a> {
         context: &mut BorrowCheckContext,
     ) -> CompilerResult<()> {
         match inst {
-            HirInstruction::Call { callee: _, args, result: _, type_args: _, const_args: _, is_tail: _ } => {
+            HirInstruction::Call {
+                callee: _,
+                args,
+                result: _,
+                type_args: _,
+                const_args: _,
+                is_tail: _,
+            } => {
                 // Check all arguments
                 for arg in args {
                     self.check_value_use(func, *arg, None)?;
                 }
             }
 
-            HirInstruction::Load { result: _, ty: _, ptr, align: _, volatile: _ } => {
+            HirInstruction::Load {
+                result: _,
+                ty: _,
+                ptr,
+                align: _,
+                volatile: _,
+            } => {
                 // Loading through a pointer - check the pointer is valid
                 self.check_value_use(func, *ptr, None)?;
             }
 
-            HirInstruction::Store { ptr, value, align: _, volatile: _ } => {
+            HirInstruction::Store {
+                ptr,
+                value,
+                align: _,
+                volatile: _,
+            } => {
                 // Storing to a pointer - need mutable access
                 self.check_value_use(func, *value, None)?;
                 self.check_mutable_access(func, *ptr, None)?;
             }
 
-            HirInstruction::Move { result: _, ty: _, source } => {
+            HirInstruction::Move {
+                result: _,
+                ty: _,
+                source,
+            } => {
                 // Moving a value - record the move
                 self.check_value_use(func, *source, None)?;
                 // Mark as moved
                 self.moved_values.insert(*source);
             }
 
-            HirInstruction::Copy { result: _, ty: _, source } => {
+            HirInstruction::Copy {
+                result: _,
+                ty: _,
+                source,
+            } => {
                 // Copying a value - just check it's valid
                 self.check_value_use(func, *source, None)?;
             }
 
-            HirInstruction::CreateRef { result: borrow_id, value, lifetime: _, mutable } => {
+            HirInstruction::CreateRef {
+                result: borrow_id,
+                value,
+                lifetime: _,
+                mutable,
+            } => {
                 // Creating a reference - record the borrow
                 self.record_borrow(*borrow_id, *value, *mutable, None, context);
             }
 
-            HirInstruction::Deref { result: _, ty: _, reference } => {
+            HirInstruction::Deref {
+                result: _,
+                ty: _,
+                reference,
+            } => {
                 // Dereferencing - check the reference is valid
                 self.check_value_use(func, *reference, None)?;
             }
@@ -315,10 +360,10 @@ impl<'a> HirBorrowChecker<'a> {
             crate::hir::HirTerminator::Switch { value, .. } => {
                 self.check_value_use(func, *value, None)?;
             }
-            crate::hir::HirTerminator::Branch { .. } |
-            crate::hir::HirTerminator::Unreachable |
-            crate::hir::HirTerminator::Invoke { .. } |
-            crate::hir::HirTerminator::PatternMatch { .. } => {}
+            crate::hir::HirTerminator::Branch { .. }
+            | crate::hir::HirTerminator::Unreachable
+            | crate::hir::HirTerminator::Invoke { .. }
+            | crate::hir::HirTerminator::PatternMatch { .. } => {}
         }
 
         Ok(())
@@ -391,7 +436,13 @@ impl<'a> HirBorrowChecker<'a> {
     }
 
     /// Record a move of a value
-    fn record_move(&mut self, value_id: HirId, dest_id: HirId, location: Option<Span>, context: &mut BorrowCheckContext) {
+    fn record_move(
+        &mut self,
+        value_id: HirId,
+        dest_id: HirId,
+        location: Option<Span>,
+        context: &mut BorrowCheckContext,
+    ) {
         // Check if value is borrowed - cannot move while borrowed
         if let Some(borrows) = self.active_borrows.get(&value_id) {
             if !borrows.is_empty() {
@@ -404,11 +455,14 @@ impl<'a> HirBorrowChecker<'a> {
         }
 
         self.moved_values.insert(value_id);
-        context.add_move(value_id, MoveInfo {
-            moved_value: value_id,
-            move_location: location,
-            destination: dest_id,
-        });
+        context.add_move(
+            value_id,
+            MoveInfo {
+                moved_value: value_id,
+                move_location: location,
+                destination: dest_id,
+            },
+        );
     }
 
     /// Record a borrow of a value
@@ -463,13 +517,16 @@ impl<'a> HirBorrowChecker<'a> {
             .push(active_borrow);
 
         // Record in context
-        context.add_borrow(borrow_id, BorrowInfo {
+        context.add_borrow(
             borrow_id,
-            borrowed_value,
-            lifetime: HirLifetime::anonymous(),
-            is_mutable,
-            borrow_location: location,
-        });
+            BorrowInfo {
+                borrow_id,
+                borrowed_value,
+                lifetime: HirLifetime::anonymous(),
+                is_mutable,
+                borrow_location: location,
+            },
+        );
     }
 }
 

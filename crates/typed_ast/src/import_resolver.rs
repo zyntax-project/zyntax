@@ -13,7 +13,7 @@
 //! The `ImportResolver` trait allows each language frontend to provide
 //! its own resolution logic while sharing the common TypedAST infrastructure.
 
-use crate::{Type, Span, TypedImport};
+use crate::{Span, Type, TypedImport};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -148,26 +148,55 @@ pub enum ImportError {
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImportError::ModuleNotFound { path, suggestions, .. } => {
+            ImportError::ModuleNotFound {
+                path, suggestions, ..
+            } => {
                 write!(f, "module not found: {}", path.join("."))?;
                 if !suggestions.is_empty() {
                     write!(f, ", did you mean: {}?", suggestions.join(", "))?;
                 }
                 Ok(())
             }
-            ImportError::SymbolNotFound { symbol, module_path, .. } => {
-                write!(f, "symbol '{}' not found in module '{}'", symbol, module_path.join("."))
+            ImportError::SymbolNotFound {
+                symbol,
+                module_path,
+                ..
+            } => {
+                write!(
+                    f,
+                    "symbol '{}' not found in module '{}'",
+                    symbol,
+                    module_path.join(".")
+                )
             }
             ImportError::CircularImport { path, .. } => {
                 write!(f, "circular import detected: {}", path.join("."))
             }
-            ImportError::PrivateSymbol { symbol, module_path, .. } => {
-                write!(f, "symbol '{}' in '{}' is private", symbol, module_path.join("."))
-            }
-            ImportError::AmbiguousImport { symbol, candidates, .. } => {
-                write!(f, "ambiguous import '{}', could be: {}",
+            ImportError::PrivateSymbol {
+                symbol,
+                module_path,
+                ..
+            } => {
+                write!(
+                    f,
+                    "symbol '{}' in '{}' is private",
                     symbol,
-                    candidates.iter().map(|c| c.join(".")).collect::<Vec<_>>().join(" or "))
+                    module_path.join(".")
+                )
+            }
+            ImportError::AmbiguousImport {
+                symbol, candidates, ..
+            } => {
+                write!(
+                    f,
+                    "ambiguous import '{}', could be: {}",
+                    symbol,
+                    candidates
+                        .iter()
+                        .map(|c| c.join("."))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )
             }
             ImportError::IoError { path, message, .. } => {
                 write!(f, "I/O error reading '{}': {}", path.display(), message)
@@ -401,31 +430,34 @@ impl ModuleArchitecture {
                 vec![path.with_extension(extension)]
             }
 
-            ModuleArchitecture::RustStyle { extension, mod_file_name } => {
+            ModuleArchitecture::RustStyle {
+                extension,
+                mod_file_name,
+            } => {
                 // module::submodule -> base/module/submodule.rs OR base/module/submodule/mod.rs
                 let mut path = base_path.clone();
                 for segment in module_path {
                     path = path.join(segment);
                 }
-                vec![
-                    path.with_extension(extension),
-                    path.join(mod_file_name),
-                ]
+                vec![path.with_extension(extension), path.join(mod_file_name)]
             }
 
-            ModuleArchitecture::PythonStyle { extension, init_file_name } => {
+            ModuleArchitecture::PythonStyle {
+                extension,
+                init_file_name,
+            } => {
                 // package.module -> base/package/module.py OR base/package/module/__init__.py
                 let mut path = base_path.clone();
                 for segment in module_path {
                     path = path.join(segment);
                 }
-                vec![
-                    path.with_extension(extension),
-                    path.join(init_file_name),
-                ]
+                vec![path.with_extension(extension), path.join(init_file_name)]
             }
 
-            ModuleArchitecture::NodeStyle { extensions, index_name } => {
+            ModuleArchitecture::NodeStyle {
+                extensions,
+                index_name,
+            } => {
                 // module -> base/module.ts, base/module/index.ts, etc.
                 let mut path = base_path.clone();
                 for segment in module_path {
@@ -434,7 +466,11 @@ impl ModuleArchitecture {
                 let mut paths = Vec::new();
                 // Try direct file with each extension
                 for ext in extensions {
-                    let file_name = format!("{}{}", path.file_name().unwrap_or_default().to_string_lossy(), ext);
+                    let file_name = format!(
+                        "{}{}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        ext
+                    );
                     paths.push(path.parent().unwrap_or(&path).join(file_name));
                 }
                 // Try index file with each extension
@@ -444,7 +480,10 @@ impl ModuleArchitecture {
                 paths
             }
 
-            ModuleArchitecture::GoStyle { module_cache, extension } => {
+            ModuleArchitecture::GoStyle {
+                module_cache,
+                extension,
+            } => {
                 // github.com/user/repo/package -> cache/github.com/user/repo/package/*.go
                 // Go resolves all .go files in the directory, but we return the directory path
                 let mut path = module_cache.clone();
@@ -455,7 +494,11 @@ impl ModuleArchitecture {
                 // Return the directory and a hypothetical main file
                 vec![
                     path.clone(),
-                    path.join(format!("{}.{}", module_path.last().unwrap_or(&"main".to_string()), extension)),
+                    path.join(format!(
+                        "{}.{}",
+                        module_path.last().unwrap_or(&"main".to_string()),
+                        extension
+                    )),
                 ]
             }
 
@@ -616,7 +659,9 @@ pub struct ChainedResolver {
 
 impl ChainedResolver {
     pub fn new() -> Self {
-        Self { resolvers: Vec::new() }
+        Self {
+            resolvers: Vec::new(),
+        }
     }
 
     pub fn add_resolver(mut self, resolver: Box<dyn ImportResolver>) -> Self {
@@ -637,7 +682,8 @@ impl ImportResolver for ChainedResolver {
         import: &TypedImport,
         context: &ImportContext,
     ) -> Result<Vec<ResolvedImport>, ImportError> {
-        let path: Vec<String> = import.module_path
+        let path: Vec<String> = import
+            .module_path
             .iter()
             .map(|s| s.resolve_global().unwrap_or_default())
             .collect();
@@ -656,7 +702,9 @@ impl ImportResolver for ChainedResolver {
     }
 
     fn module_exists(&self, path: &[String], context: &ImportContext) -> bool {
-        self.resolvers.iter().any(|r| r.module_exists(path, context))
+        self.resolvers
+            .iter()
+            .any(|r| r.module_exists(path, context))
     }
 
     fn get_module_exports(
@@ -739,7 +787,8 @@ impl ImportResolver for BuiltinResolver {
         import: &TypedImport,
         _context: &ImportContext,
     ) -> Result<Vec<ResolvedImport>, ImportError> {
-        let path: Vec<String> = import.module_path
+        let path: Vec<String> = import
+            .module_path
             .iter()
             .map(|s| s.resolve_global().unwrap_or_default())
             .collect();
@@ -775,11 +824,14 @@ impl ImportResolver for BuiltinResolver {
         path: &[String],
         _context: &ImportContext,
     ) -> Result<Vec<ExportedSymbol>, ImportError> {
-        self.modules.get(path).cloned().ok_or_else(|| ImportError::ModuleNotFound {
-            path: path.to_vec(),
-            span: Span::new(0, 0),
-            suggestions: Vec::new(),
-        })
+        self.modules
+            .get(path)
+            .cloned()
+            .ok_or_else(|| ImportError::ModuleNotFound {
+                path: path.to_vec(),
+                span: Span::new(0, 0),
+                suggestions: Vec::new(),
+            })
     }
 
     fn resolve_qualified_type(
@@ -787,11 +839,14 @@ impl ImportResolver for BuiltinResolver {
         path: &[String],
         _context: &ImportContext,
     ) -> Result<Type, ImportError> {
-        self.types.get(path).cloned().ok_or_else(|| ImportError::ModuleNotFound {
-            path: path.to_vec(),
-            span: Span::new(0, 0),
-            suggestions: Vec::new(),
-        })
+        self.types
+            .get(path)
+            .cloned()
+            .ok_or_else(|| ImportError::ModuleNotFound {
+                path: path.to_vec(),
+                span: Span::new(0, 0),
+                suggestions: Vec::new(),
+            })
     }
 
     fn resolver_name(&self) -> &str {
@@ -824,7 +879,8 @@ impl ImportManager {
         import: &TypedImport,
         context: &ImportContext,
     ) -> Result<(), ImportError> {
-        let path: Vec<String> = import.module_path
+        let path: Vec<String> = import
+            .module_path
             .iter()
             .map(|s| s.resolve_global().unwrap_or_default())
             .collect();
@@ -861,7 +917,11 @@ impl ImportManager {
         for item in &import.items {
             match item {
                 TypedImportItem::Named { name, alias } => {
-                    let symbol_name = alias.as_ref().unwrap_or(name).resolve_global().unwrap_or_default();
+                    let symbol_name = alias
+                        .as_ref()
+                        .unwrap_or(name)
+                        .resolve_global()
+                        .unwrap_or_default();
                     self.symbol_table.insert(symbol_name, resolved.clone());
                 }
                 TypedImportItem::Glob => {
@@ -869,10 +929,14 @@ impl ImportManager {
                     if let ResolvedImport::Module { exports, .. } = &resolved {
                         for export in exports {
                             let export_resolved = match &export.kind {
-                                SymbolKind::Type | SymbolKind::Class |
-                                SymbolKind::Enum | SymbolKind::Interface | SymbolKind::Trait => {
+                                SymbolKind::Type
+                                | SymbolKind::Class
+                                | SymbolKind::Enum
+                                | SymbolKind::Interface
+                                | SymbolKind::Trait => {
                                     ResolvedImport::Type {
-                                        qualified_name: import.module_path
+                                        qualified_name: import
+                                            .module_path
                                             .iter()
                                             .map(|s| s.resolve_global().unwrap_or_default())
                                             .chain(std::iter::once(export.name.clone()))
@@ -881,36 +945,36 @@ impl ImportManager {
                                         is_extern: false,
                                     }
                                 }
-                                SymbolKind::Function => {
-                                    ResolvedImport::Function {
-                                        qualified_name: import.module_path
-                                            .iter()
-                                            .map(|s| s.resolve_global().unwrap_or_default())
-                                            .chain(std::iter::once(export.name.clone()))
-                                            .collect(),
-                                        params: Vec::new(),
-                                        return_type: Type::Never,
-                                        is_extern: false,
-                                    }
-                                }
-                                SymbolKind::Constant => {
-                                    ResolvedImport::Constant {
-                                        qualified_name: import.module_path
-                                            .iter()
-                                            .map(|s| s.resolve_global().unwrap_or_default())
-                                            .chain(std::iter::once(export.name.clone()))
-                                            .collect(),
-                                        ty: Type::Never,
-                                    }
-                                }
+                                SymbolKind::Function => ResolvedImport::Function {
+                                    qualified_name: import
+                                        .module_path
+                                        .iter()
+                                        .map(|s| s.resolve_global().unwrap_or_default())
+                                        .chain(std::iter::once(export.name.clone()))
+                                        .collect(),
+                                    params: Vec::new(),
+                                    return_type: Type::Never,
+                                    is_extern: false,
+                                },
+                                SymbolKind::Constant => ResolvedImport::Constant {
+                                    qualified_name: import
+                                        .module_path
+                                        .iter()
+                                        .map(|s| s.resolve_global().unwrap_or_default())
+                                        .chain(std::iter::once(export.name.clone()))
+                                        .collect(),
+                                    ty: Type::Never,
+                                },
                                 SymbolKind::Module => continue,
                             };
-                            self.symbol_table.insert(export.name.clone(), export_resolved);
+                            self.symbol_table
+                                .insert(export.name.clone(), export_resolved);
                         }
                     }
                 }
                 TypedImportItem::Default(name) => {
-                    self.symbol_table.insert(name.resolve_global().unwrap_or_default(), resolved.clone());
+                    self.symbol_table
+                        .insert(name.resolve_global().unwrap_or_default(), resolved.clone());
                 }
             }
         }
@@ -1139,28 +1203,33 @@ impl EntryPointResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typed_ast::TypedImportItem;
     use crate::arena::AstArena;
+    use crate::typed_ast::TypedImportItem;
 
     #[test]
     fn test_builtin_resolver() {
-        let resolver = BuiltinResolver::new()
-            .register_type(
-                vec!["std".to_string(), "math".to_string(), "sqrt".to_string()],
-                Type::Primitive(crate::PrimitiveType::F64),
-            );
+        let resolver = BuiltinResolver::new().register_type(
+            vec!["std".to_string(), "math".to_string(), "sqrt".to_string()],
+            Type::Primitive(crate::PrimitiveType::F64),
+        );
 
         let context = ImportContext::new();
-        assert!(resolver.module_exists(&["std".to_string(), "math".to_string(), "sqrt".to_string()], &context));
+        assert!(resolver.module_exists(
+            &["std".to_string(), "math".to_string(), "sqrt".to_string()],
+            &context
+        ));
     }
 
     #[test]
     fn test_import_manager() {
-        let resolver = BuiltinResolver::new()
-            .register_type(
-                vec!["haxe".to_string(), "ds".to_string(), "StringMap".to_string()],
-                Type::Primitive(crate::PrimitiveType::I64), // Placeholder type
-            );
+        let resolver = BuiltinResolver::new().register_type(
+            vec![
+                "haxe".to_string(),
+                "ds".to_string(),
+                "StringMap".to_string(),
+            ],
+            Type::Primitive(crate::PrimitiveType::I64), // Placeholder type
+        );
 
         let mut manager = ImportManager::new(Box::new(resolver));
         let context = ImportContext::new();

@@ -3,23 +3,22 @@
 //! Tests the complete Zyntax compilation pipeline using the HIR Builder API.
 //! These tests validate that all major language features work together.
 
+use std::mem;
 use zyntax_compiler::{
-    cranelift_backend::CraneliftBackend,
-    hir::*,
-    hir_builder::HirBuilder,
-    stdlib,
+    cranelift_backend::CraneliftBackend, hir::*, hir_builder::HirBuilder, stdlib,
 };
 use zyntax_typed_ast::arena::AstArena;
-use std::mem;
 
 /// Helper to compile and execute a module, returning result from a specific function
 fn compile_and_run_i32(module: &HirModule, func_id: HirId) -> i32 {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
 
-    backend.compile_module(module)
+    backend
+        .compile_module(module)
         .expect("Failed to compile module");
 
-    let func_ptr = backend.get_function_ptr(func_id)
+    let func_ptr = backend
+        .get_function_ptr(func_id)
         .expect("Failed to get function pointer");
 
     unsafe {
@@ -37,7 +36,8 @@ fn test_basic_arithmetic() {
     let i32_ty = builder.i32_type();
 
     // fn test() -> i32 { (10 + 20) * 2 }
-    let func_id = builder.begin_function("test")
+    let func_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -68,7 +68,8 @@ fn test_arithmetic_with_subtraction_and_division() {
     let i32_ty = builder.i32_type();
 
     // fn test() -> i32 { (100 - 40) / 2 }
-    let func_id = builder.begin_function("test")
+    let func_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -99,7 +100,8 @@ fn test_function_with_parameters() {
     let i32_ty = builder.i32_type();
 
     // fn add(a: i32, b: i32) -> i32 { a + b }
-    let func_id = builder.begin_function("add")
+    let func_id = builder
+        .begin_function("add")
         .param("a", i32_ty.clone())
         .param("b", i32_ty.clone())
         .returns(i32_ty.clone())
@@ -121,7 +123,9 @@ fn test_function_with_parameters() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
     backend.compile_module(&module).expect("Failed to compile");
 
-    let func_ptr = backend.get_function_ptr(func_id).expect("Failed to get pointer");
+    let func_ptr = backend
+        .get_function_ptr(func_id)
+        .expect("Failed to get pointer");
 
     unsafe {
         let f: fn(i32, i32) -> i32 = mem::transmute(func_ptr);
@@ -139,7 +143,8 @@ fn test_function_calls() {
     let i32_ty = builder.i32_type();
 
     // fn mul2(x: i32) -> i32 { x * 2 }
-    let mul2_id = builder.begin_function("mul2")
+    let mul2_id = builder
+        .begin_function("mul2")
         .param("x", i32_ty.clone())
         .returns(i32_ty.clone())
         .build();
@@ -154,7 +159,8 @@ fn test_function_calls() {
     builder.ret(result);
 
     // fn test() -> i32 { mul2(10) + mul2(20) }
-    let test_id = builder.begin_function("test")
+    let test_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -175,9 +181,13 @@ fn test_function_calls() {
 
     // Compile both functions
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
-    backend.compile_module(&module).expect("Failed to compile module");
+    backend
+        .compile_module(&module)
+        .expect("Failed to compile module");
 
-    let test_ptr = backend.get_function_ptr(test_id).expect("Failed to get test pointer");
+    let test_ptr = backend
+        .get_function_ptr(test_id)
+        .expect("Failed to get test pointer");
 
     unsafe {
         let f: fn() -> i32 = mem::transmute(test_ptr);
@@ -193,7 +203,8 @@ fn test_local_variables_stack_allocation() {
     let i32_ty = builder.i32_type();
 
     // fn test() -> i32 { let x = 42; let y = 100; x + y }
-    let func_id = builder.begin_function("test")
+    let func_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -234,7 +245,8 @@ fn test_comparison_operations() {
 
     // fn test() -> i32 { if 10 == 10 then 1 else 0 }
     // Tests comparison by returning 1 for true, 0 for false
-    let func_id = builder.begin_function("test")
+    let func_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -265,12 +277,20 @@ fn test_stdlib_compilation() {
     // Build the complete standard library
     let stdlib_module = stdlib::build_stdlib(&mut arena);
 
-    println!("Standard library contains {} functions", stdlib_module.functions.len());
-    assert!(stdlib_module.functions.len() > 50, "Stdlib should have 50+ functions");
+    println!(
+        "Standard library contains {} functions",
+        stdlib_module.functions.len()
+    );
+    assert!(
+        stdlib_module.functions.len() > 50,
+        "Stdlib should have 50+ functions"
+    );
 
     // Compile stdlib
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
-    backend.compile_module(&stdlib_module).expect("Failed to compile stdlib");
+    backend
+        .compile_module(&stdlib_module)
+        .expect("Failed to compile stdlib");
 
     // Count successfully compiled functions
     let mut compiled_count = 0;
@@ -280,10 +300,16 @@ fn test_stdlib_compilation() {
         }
     }
 
-    println!("✅ Successfully compiled {}/{} stdlib functions",
-             compiled_count, stdlib_module.functions.len());
+    println!(
+        "✅ Successfully compiled {}/{} stdlib functions",
+        compiled_count,
+        stdlib_module.functions.len()
+    );
 
-    assert!(compiled_count > 0, "At least some stdlib functions should compile");
+    assert!(
+        compiled_count > 0,
+        "At least some stdlib functions should compile"
+    );
 }
 
 #[test]
@@ -294,7 +320,8 @@ fn test_complex_arithmetic_expression() {
     let i32_ty = builder.i32_type();
 
     // fn test() -> i32 { ((10 + 5) * 3) - (20 / 4) }
-    let func_id = builder.begin_function("test")
+    let func_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -334,7 +361,8 @@ fn test_multiple_function_calls_chained() {
     let i32_ty = builder.i32_type();
 
     // fn double(x: i32) -> i32 { x + x }
-    let double_id = builder.begin_function("double")
+    let double_id = builder
+        .begin_function("double")
         .param("x", i32_ty.clone())
         .returns(i32_ty.clone())
         .build();
@@ -348,7 +376,8 @@ fn test_multiple_function_calls_chained() {
     builder.ret(result);
 
     // fn test() -> i32 { double(double(5)) }
-    let test_id = builder.begin_function("test")
+    let test_id = builder
+        .begin_function("test")
         .returns(i32_ty.clone())
         .build();
 
@@ -365,9 +394,13 @@ fn test_multiple_function_calls_chained() {
     let module = builder.finish();
 
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
-    backend.compile_module(&module).expect("Failed to compile module");
+    backend
+        .compile_module(&module)
+        .expect("Failed to compile module");
 
-    let test_ptr = backend.get_function_ptr(test_id).expect("Failed to get test pointer");
+    let test_ptr = backend
+        .get_function_ptr(test_id)
+        .expect("Failed to get test pointer");
 
     unsafe {
         let f: fn() -> i32 = mem::transmute(test_ptr);

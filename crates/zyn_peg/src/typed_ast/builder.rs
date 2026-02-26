@@ -4,18 +4,18 @@
 //! These functions bridge the gap between parser output and TypedAST construction.
 
 use zyntax_typed_ast::{
-    TypedASTBuilder, TypedNode, TypedProgram, TypedDeclaration, TypedExpression,
-    TypedStatement, TypedBlock, BinaryOp, UnaryOp, Span, InternedString,
-    TypedFunction, TypedVariable, TypedClass, TypedEnum, TypedField,
-    typed_ast::{TypedLet, TypedIf, TypedWhile, TypedFor, TypedBinary, TypedUnary,
-                TypedCall, TypedFieldAccess, TypedLiteral, TypedMethodCall,
-                TypedStructLiteral, TypedFieldInit, TypedLambda, TypedLambdaParam,
-                TypedLambdaBody, TypedParameter, TypedTypeParam, ParameterKind,
-                TypedPattern},
-    type_registry::{Type, TypeRegistry, PrimitiveType, Mutability, Visibility, CallingConvention},
+    type_registry::{CallingConvention, Mutability, PrimitiveType, Type, TypeRegistry, Visibility},
+    typed_ast::{
+        ParameterKind, TypedBinary, TypedCall, TypedFieldAccess, TypedFieldInit, TypedFor, TypedIf,
+        TypedLambda, TypedLambdaBody, TypedLambdaParam, TypedLet, TypedLiteral, TypedMethodCall,
+        TypedParameter, TypedPattern, TypedStructLiteral, TypedTypeParam, TypedUnary, TypedWhile,
+    },
+    BinaryOp, InternedString, Span, TypedASTBuilder, TypedBlock, TypedClass, TypedDeclaration,
+    TypedEnum, TypedExpression, TypedField, TypedFunction, TypedNode, TypedProgram, TypedStatement,
+    TypedVariable, UnaryOp,
 };
 
-use crate::runtime2::state::{ParsedValue, NodeHandle};
+use crate::runtime2::state::{NodeHandle, ParsedValue};
 
 /// Helper context for TypedAST construction
 pub struct AstContext<'a> {
@@ -25,7 +25,10 @@ pub struct AstContext<'a> {
 
 impl<'a> AstContext<'a> {
     pub fn new(builder: &'a mut TypedASTBuilder, type_registry: &'a mut TypeRegistry) -> Self {
-        AstContext { builder, type_registry }
+        AstContext {
+            builder,
+            type_registry,
+        }
     }
 
     /// Intern a string
@@ -40,12 +43,20 @@ impl<'a> AstContext<'a> {
 
     /// Wrap a node with type and span
     pub fn node<T>(&self, value: T, ty: Type, span: Span) -> TypedNode<T> {
-        TypedNode { node: value, ty, span }
+        TypedNode {
+            node: value,
+            ty,
+            span,
+        }
     }
 
     /// Create a node with unknown type
     pub fn node_unknown<T>(&self, value: T, span: Span) -> TypedNode<T> {
-        TypedNode { node: value, ty: Type::Unknown, span }
+        TypedNode {
+            node: value,
+            ty: Type::Unknown,
+            span,
+        }
     }
 }
 
@@ -128,10 +139,7 @@ pub fn method_call(
 }
 
 /// Create a field access expression
-pub fn field_access(
-    object: TypedNode<TypedExpression>,
-    field: InternedString,
-) -> TypedExpression {
+pub fn field_access(object: TypedNode<TypedExpression>, field: InternedString) -> TypedExpression {
     TypedExpression::Field(TypedFieldAccess {
         object: Box::new(object),
         field,
@@ -145,8 +153,12 @@ pub fn struct_literal(
 ) -> TypedExpression {
     TypedExpression::Struct(TypedStructLiteral {
         name,
-        fields: fields.into_iter()
-            .map(|(name, value)| TypedFieldInit { name, value: Box::new(value) })
+        fields: fields
+            .into_iter()
+            .map(|(name, value)| TypedFieldInit {
+                name,
+                value: Box::new(value),
+            })
             .collect(),
     })
 }
@@ -157,10 +169,7 @@ pub fn array_literal(elements: Vec<TypedNode<TypedExpression>>) -> TypedExpressi
 }
 
 /// Create a lambda expression
-pub fn lambda(
-    params: Vec<TypedLambdaParam>,
-    body: TypedNode<TypedExpression>,
-) -> TypedExpression {
+pub fn lambda(params: Vec<TypedLambdaParam>, body: TypedNode<TypedExpression>) -> TypedExpression {
     TypedExpression::Lambda(TypedLambda {
         params,
         body: TypedLambdaBody::Expression(Box::new(body)),
@@ -169,10 +178,7 @@ pub fn lambda(
 }
 
 /// Create a lambda with block body
-pub fn lambda_block(
-    params: Vec<TypedLambdaParam>,
-    body: TypedBlock,
-) -> TypedExpression {
+pub fn lambda_block(params: Vec<TypedLambdaParam>, body: TypedBlock) -> TypedExpression {
     TypedExpression::Lambda(TypedLambda {
         params,
         body: TypedLambdaBody::Block(body),
@@ -195,7 +201,11 @@ pub fn let_stmt(
     TypedStatement::Let(TypedLet {
         name,
         ty,
-        mutability: if mutable { Mutability::Mutable } else { Mutability::Immutable },
+        mutability: if mutable {
+            Mutability::Mutable
+        } else {
+            Mutability::Immutable
+        },
         initializer: value.map(Box::new),
         span,
     })
@@ -302,7 +312,11 @@ pub fn variable_decl(
         name,
         ty,
         initializer: value.map(Box::new),
-        mutability: if mutable { Mutability::Mutable } else { Mutability::Immutable },
+        mutability: if mutable {
+            Mutability::Mutable
+        } else {
+            Mutability::Immutable
+        },
         visibility: Visibility::Private,
     })
 }
@@ -522,7 +536,10 @@ mod tests {
 
     #[test]
     fn test_value_conversions() {
-        assert_eq!(value_to_text(&ParsedValue::Text("hello".into())), Some("hello".into()));
+        assert_eq!(
+            value_to_text(&ParsedValue::Text("hello".into())),
+            Some("hello".into())
+        );
         assert_eq!(value_to_int(&ParsedValue::Int(42)), Some(42));
         assert_eq!(value_to_bool(&ParsedValue::Bool(true)), Some(true));
     }
@@ -531,7 +548,9 @@ mod tests {
     fn test_value_is_some() {
         assert!(value_is_some(&ParsedValue::Text("x".into())));
         assert!(!value_is_some(&ParsedValue::None));
-        assert!(value_is_some(&ParsedValue::Optional(Some(Box::new(ParsedValue::Int(1))))));
+        assert!(value_is_some(&ParsedValue::Optional(Some(Box::new(
+            ParsedValue::Int(1)
+        )))));
         assert!(!value_is_some(&ParsedValue::Optional(None)));
     }
 }

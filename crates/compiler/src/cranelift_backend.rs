@@ -4,39 +4,37 @@
 //! cycles and hot-reloading support.
 
 use cranelift::prelude::*;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::entities::Value;
 use cranelift_codegen::ir::types;
-use cranelift_codegen::ir::{Signature, UserFuncName, AbiParam};
-use cranelift_codegen::ir::condcodes::{IntCC, FloatCC};
+use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_codegen::verify_function;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
-use log::{warn, error, info, debug};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::hir::{
-    HirModule, HirFunction, HirInstruction, HirTerminator,
-    HirType, HirStructType, HirId, BinaryOp, UnaryOp, HirConstant,
-    HirCallable, HirPhi, HirValueKind, Intrinsic, HirPatternKind,
-    HirGlobal, HirVTable,
-};
-use crate::{CompilerResult, CompilerError};
 use crate::effect_codegen::{
-    EffectCodegenContext, HandlerStackEntry, PerformStrategy,
-    analyze_perform_effect, analyze_handle_effect, mangle_handler_op_name,
-    get_handler_ops_info, runtime as effect_runtime,
+    analyze_handle_effect, analyze_perform_effect, get_handler_ops_info, mangle_handler_op_name,
+    runtime as effect_runtime, EffectCodegenContext, HandlerStackEntry, PerformStrategy,
 };
+use crate::hir::{
+    BinaryOp, HirCallable, HirConstant, HirFunction, HirGlobal, HirId, HirInstruction, HirModule,
+    HirPatternKind, HirPhi, HirStructType, HirTerminator, HirType, HirVTable, HirValueKind,
+    Intrinsic, UnaryOp,
+};
+use crate::{CompilerError, CompilerResult};
 
 /// Convert ZRTL TypeTag to Cranelift type
 fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
-    use crate::zrtl::{TypeCategory, PrimitiveSize};
+    use crate::zrtl::{PrimitiveSize, TypeCategory};
 
     match tag.category() {
-        TypeCategory::Void => types::I8,  // Void represented as i8
-        TypeCategory::Bool => types::I8,  // Bools as i8
+        TypeCategory::Void => types::I8, // Void represented as i8
+        TypeCategory::Bool => types::I8, // Bools as i8
         TypeCategory::Int => {
             let size = tag.type_id();
             if size == PrimitiveSize::Bits8 as u16 {
@@ -48,7 +46,7 @@ fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
             } else if size == PrimitiveSize::Bits64 as u16 {
                 types::I64
             } else {
-                types::I32  // Default
+                types::I32 // Default
             }
         }
         TypeCategory::UInt => {
@@ -58,11 +56,11 @@ fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
             } else if size == PrimitiveSize::Bits16 as u16 {
                 types::I16
             } else if size == PrimitiveSize::Bits32 as u16 {
-                types::I32  // u32 uses I32 in Cranelift
+                types::I32 // u32 uses I32 in Cranelift
             } else if size == PrimitiveSize::Bits64 as u16 {
-                types::I64  // u64 uses I64 in Cranelift
+                types::I64 // u64 uses I64 in Cranelift
             } else {
-                types::I32  // Default
+                types::I32 // Default
             }
         }
         TypeCategory::Float => {
@@ -72,7 +70,7 @@ fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
             } else if size == PrimitiveSize::Bits64 as u16 {
                 types::F64
             } else {
-                types::F32  // Default
+                types::F32 // Default
             }
         }
         // All other types (pointers, opaques, etc.) are i64
@@ -169,9 +167,11 @@ impl CraneliftBackend {
         flag_builder.set("is_pic", "false").unwrap();
         flag_builder.set("opt_level", "speed").unwrap(); // Optimize for JIT speed
         flag_builder.set("enable_verifier", "false").unwrap(); // TODO: Re-enable after fixing verifier issues with arrays
-        
+
         let isa_builder = cranelift_native::builder().unwrap();
-        let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .unwrap();
 
         // Create JIT module and register runtime functions
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -213,19 +213,31 @@ impl CraneliftBackend {
             effect_context: EffectCodegenContext::new(),
         })
     }
-    
+
     /// Register symbol signatures for auto-boxing support
     pub fn register_symbol_signatures(&mut self, symbols: &[crate::zrtl::RuntimeSymbolInfo]) {
-        log::info!("[DynamicBox] Registering {} symbol signatures", symbols.len());
+        log::info!(
+            "[DynamicBox] Registering {} symbol signatures",
+            symbols.len()
+        );
         for sym in symbols {
             if let Some(sig) = &sym.sig {
-                log::debug!("[DynamicBox] Registering signature for {}: params={}, dynamic_params={:?}",
-                    sym.name, sig.param_count,
-                    (0..sig.param_count).filter(|&i| sig.param_is_dynamic(i as usize)).collect::<Vec<_>>());
-                self.symbol_signatures.insert(sym.name.to_string(), sig.clone());
+                log::debug!(
+                    "[DynamicBox] Registering signature for {}: params={}, dynamic_params={:?}",
+                    sym.name,
+                    sig.param_count,
+                    (0..sig.param_count)
+                        .filter(|&i| sig.param_is_dynamic(i as usize))
+                        .collect::<Vec<_>>()
+                );
+                self.symbol_signatures
+                    .insert(sym.name.to_string(), sig.clone());
             }
         }
-        log::info!("[DynamicBox] Registered {} signatures total", self.symbol_signatures.len());
+        log::info!(
+            "[DynamicBox] Registered {} signatures total",
+            self.symbol_signatures.len()
+        );
     }
 
     /// Check if a symbol parameter expects DynamicBox
@@ -260,7 +272,10 @@ impl CraneliftBackend {
             if !function.is_external {
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 if let Err(e) = self.compile_function_body(*id, function, module) {
-                    eprintln!("[CRANELIFT WARN] Skipping function '{}': {:?}", function.name, e);
+                    eprintln!(
+                        "[CRANELIFT WARN] Skipping function '{}': {:?}",
+                        function.name, e
+                    );
                     // Remove from function_map to prevent later lookup failures
                     self.function_map.remove(id);
                 }
@@ -272,8 +287,14 @@ impl CraneliftBackend {
 
         // Update function pointers after finalization
         for (hir_id, compiled_func) in &self.compiled_functions {
-            let code_ptr = self.module.get_finalized_function(compiled_func.function_id);
-            self.hot_reload.function_pointers.write().unwrap().insert(*hir_id, code_ptr);
+            let code_ptr = self
+                .module
+                .get_finalized_function(compiled_func.function_id);
+            self.hot_reload
+                .function_pointers
+                .write()
+                .unwrap()
+                .insert(*hir_id, code_ptr);
         }
 
         // Note: Symbols are NOT automatically exported for cross-module linking.
@@ -289,7 +310,11 @@ impl CraneliftBackend {
         // Check for existing export conflict
         if let Some(existing_ptr) = self.exported_symbols.get(name) {
             // Find the current function pointer for this name
-            let current_ptr = self.hot_reload.function_pointers.read().unwrap()
+            let current_ptr = self
+                .hot_reload
+                .function_pointers
+                .read()
+                .unwrap()
                 .values()
                 .find(|&&p| p == *existing_ptr)
                 .copied();
@@ -342,13 +367,22 @@ impl CraneliftBackend {
     /// Export a function, allowing overwrite if the symbol already exists
     ///
     /// Returns the old pointer if it was overwritten.
-    pub fn export_function_ptr_overwrite(&mut self, name: &str, ptr: *const u8) -> Option<*const u8> {
+    pub fn export_function_ptr_overwrite(
+        &mut self,
+        name: &str,
+        ptr: *const u8,
+    ) -> Option<*const u8> {
         let old = self.exported_symbols.insert(name.to_string(), ptr);
         old
     }
 
     /// Internal export with configurable overwrite behavior
-    fn export_function_ptr_internal(&mut self, name: &str, ptr: *const u8, allow_overwrite: bool) -> CompilerResult<()> {
+    fn export_function_ptr_internal(
+        &mut self,
+        name: &str,
+        ptr: *const u8,
+        allow_overwrite: bool,
+    ) -> CompilerResult<()> {
         // Check for existing export conflict
         if !allow_overwrite && self.exported_symbols.contains_key(name) {
             return Err(CompilerError::Backend(format!(
@@ -376,44 +410,61 @@ impl CraneliftBackend {
             // External functions use Import linkage
             // Use link_name if specified (maps alias to actual symbol, e.g., "image_load" -> "$Image$load")
             // Otherwise fall back to function name
-            let link_name = function.link_name.as_ref()
+            let link_name = function
+                .link_name
+                .as_ref()
                 .map(|s| s.clone())
                 .unwrap_or_else(|| {
-                    function.name.resolve_global()
+                    function
+                        .name
+                        .resolve_global()
                         .unwrap_or_else(|| format!("{:?}", function.name))
                 });
 
-            log::debug!("[Cranelift] Declaring external function: {:?} -> '{}'", function.name, link_name);
+            log::debug!(
+                "[Cranelift] Declaring external function: {:?} -> '{}'",
+                function.name,
+                link_name
+            );
 
-            let func_id = self.module.declare_function(
-                &link_name,
-                Linkage::Import,
-                &sig,
-            ).map_err(|e| CompilerError::Backend(format!("Failed to declare extern function: {}", e)))?;
+            let func_id = self
+                .module
+                .declare_function(&link_name, Linkage::Import, &sig)
+                .map_err(|e| {
+                    CompilerError::Backend(format!("Failed to declare extern function: {}", e))
+                })?;
 
             self.function_map.insert(id, func_id);
             // Store link_name for external function boxing support
             self.external_link_names.insert(id, link_name.clone());
 
-            log::debug!("[Cranelift] External function registered: '{}' with HirId {:?} -> FuncId {:?}", link_name, id, func_id);
+            log::debug!(
+                "[Cranelift] External function registered: '{}' with HirId {:?} -> FuncId {:?}",
+                link_name,
+                id,
+                func_id
+            );
         } else {
             // Regular functions use Export linkage with unique name
             // Use resolve_global to get the actual function name
-            let base_name = function.name.resolve_global()
+            let base_name = function
+                .name
+                .resolve_global()
                 .unwrap_or_else(|| format!("{:?}", function.name));
             let unique_name = format!("{}__{:?}", base_name, id);
-            let func_id = self.module.declare_function(
-                &unique_name,
-                Linkage::Export,
-                &sig,
-            ).map_err(|e| CompilerError::Backend(format!("Failed to declare function: {}", e)))?;
+            let func_id = self
+                .module
+                .declare_function(&unique_name, Linkage::Export, &sig)
+                .map_err(|e| {
+                    CompilerError::Backend(format!("Failed to declare function: {}", e))
+                })?;
 
             self.function_map.insert(id, func_id);
         }
 
         Ok(())
     }
-    
+
     /// Compile a single function with hot-reload support (legacy, calls declare + compile_body)
     ///
     /// Note: This legacy path does not support algebraic effects. Use compile_module() for
@@ -425,7 +476,8 @@ impl CraneliftBackend {
         eprintln!("{}", self.codegen_context.func);
         if !function.is_external {
             // Create empty module for legacy path (effects won't work)
-            let empty_module = HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
+            let empty_module =
+                HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
             self.compile_function_body(id, function, &empty_module)?;
             eprintln!("[Backend] After compile_function_body, IR:");
             eprintln!("{}", self.codegen_context.func);
@@ -434,15 +486,25 @@ impl CraneliftBackend {
     }
 
     /// Compile just the body of a function (assumes signature already declared)
-    fn compile_function_body(&mut self, id: HirId, function: &HirFunction, hir_module: &HirModule) -> CompilerResult<()> {
+    fn compile_function_body(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        hir_module: &HirModule,
+    ) -> CompilerResult<()> {
         // Get the already-declared function ID
-        let func_id = *self.function_map.get(&id)
+        let func_id = *self
+            .function_map
+            .get(&id)
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not declared", id)))?;
 
         let sig = self.translate_signature(function)?;
-        
+
         // Pre-calculate parameter types before creating builder
-        let param_types: Result<Vec<_>, _> = function.signature.params.iter()
+        let param_types: Result<Vec<_>, _> = function
+            .signature
+            .params
+            .iter()
             .map(|param| self.translate_type(&param.ty))
             .collect();
         let param_types = param_types?;
@@ -454,7 +516,8 @@ impl CraneliftBackend {
         // and constant values for GEP struct field indices
         let mut type_cache: HashMap<HirType, cranelift_codegen::ir::Type> = HashMap::new();
         let mut size_cache: HashMap<HirType, usize> = HashMap::new();
-        let mut struct_layout_cache: HashMap<crate::hir::HirStructType, StructLayout> = HashMap::new();
+        let mut struct_layout_cache: HashMap<crate::hir::HirStructType, StructLayout> =
+            HashMap::new();
 
         // Build a cache of constant integer values (for struct field indices)
         let mut const_value_cache: HashMap<HirId, i64> = HashMap::new();
@@ -500,7 +563,11 @@ impl CraneliftBackend {
                         }
                         // Cache struct layouts from the aggregate type
                         if let Some(agg_value) = function.values.get(aggregate) {
-                            self.cache_struct_layouts_recursive(&agg_value.ty, &mut struct_layout_cache, &mut size_cache);
+                            self.cache_struct_layouts_recursive(
+                                &agg_value.ty,
+                                &mut struct_layout_cache,
+                                &mut size_cache,
+                            );
                         }
                     }
                     HirInstruction::InsertValue { ty, aggregate, .. } => {
@@ -509,7 +576,11 @@ impl CraneliftBackend {
                         }
                         // Cache struct layouts from the aggregate type
                         if let Some(agg_value) = function.values.get(aggregate) {
-                            self.cache_struct_layouts_recursive(&agg_value.ty, &mut struct_layout_cache, &mut size_cache);
+                            self.cache_struct_layouts_recursive(
+                                &agg_value.ty,
+                                &mut struct_layout_cache,
+                                &mut size_cache,
+                            );
                         }
                     }
                     HirInstruction::Binary { ty, .. } => {
@@ -579,7 +650,7 @@ impl CraneliftBackend {
             UserFuncName::user(0, func_id.as_u32()),
             sig.clone(),
         );
-        
+
         {
             // ================================================================
             // MULTI-BLOCK CONTROL FLOW IMPLEMENTATION
@@ -590,12 +661,20 @@ impl CraneliftBackend {
             log::debug!("[Cranelift] Compiling function: {:?}", function.name);
             log::debug!("[Cranelift] Block order: {:?} blocks", block_order.len());
             log::debug!("[Cranelift] Entry block: {:?}", function.entry_block);
-            log::debug!("[Cranelift] Total blocks in function: {:?}", function.blocks.len());
+            log::debug!(
+                "[Cranelift] Total blocks in function: {:?}",
+                function.blocks.len()
+            );
             log::debug!("[Cranelift] Values count: {:?}", function.values.len());
             for (i, block_id) in block_order.iter().enumerate() {
                 if let Some(block) = function.blocks.get(block_id) {
-                    log::debug!("[Cranelift]   [{}] {:?} - {} instructions, terminator: {:?}",
-                        i, block_id, block.instructions.len(), block.terminator);
+                    log::debug!(
+                        "[Cranelift]   [{}] {:?} - {} instructions, terminator: {:?}",
+                        i,
+                        block_id,
+                        block.instructions.len(),
+                        block.terminator
+                    );
                     for (j, inst) in block.instructions.iter().enumerate() {
                         log::debug!("[Cranelift]     inst[{}]: {:?}", j, inst);
                     }
@@ -619,21 +698,35 @@ impl CraneliftBackend {
             for block in function.blocks.values() {
                 for inst in &block.instructions {
                     match inst {
-                        HirInstruction::Call { callee: HirCallable::Symbol(symbol_name), args, .. } => {
+                        HirInstruction::Call {
+                            callee: HirCallable::Symbol(symbol_name),
+                            args,
+                            ..
+                        } => {
                             for param_index in 0..args.len() {
                                 let key = (symbol_name.clone(), param_index);
                                 if !symbol_boxing.contains_key(&key) {
-                                    symbol_boxing.insert(key, self.param_needs_boxing(symbol_name, param_index));
+                                    symbol_boxing.insert(
+                                        key,
+                                        self.param_needs_boxing(symbol_name, param_index),
+                                    );
                                 }
                             }
                         }
-                        HirInstruction::Call { callee: HirCallable::Function(func_id), args, .. } => {
+                        HirInstruction::Call {
+                            callee: HirCallable::Function(func_id),
+                            args,
+                            ..
+                        } => {
                             // Also check external functions
                             if let Some(link_name) = self.external_link_names.get(func_id) {
                                 for param_index in 0..args.len() {
                                     let key = (link_name.clone(), param_index);
                                     if !symbol_boxing.contains_key(&key) {
-                                        symbol_boxing.insert(key, self.param_needs_boxing(link_name, param_index));
+                                        symbol_boxing.insert(
+                                            key,
+                                            self.param_needs_boxing(link_name, param_index),
+                                        );
                                     }
                                 }
                             }
@@ -662,10 +755,8 @@ impl CraneliftBackend {
             let pointer_type = self.module.target_config().pointer_type();
 
             // Phase 2: Create builder and all Cranelift blocks
-            let mut builder = FunctionBuilder::new(
-                &mut self.codegen_context.func,
-                &mut self.builder_context,
-            );
+            let mut builder =
+                FunctionBuilder::new(&mut self.codegen_context.func, &mut self.builder_context);
 
             let mut block_map = HashMap::new();
 
@@ -743,7 +834,9 @@ impl CraneliftBackend {
                         }
                         HirConstant::U32(v) => builder.ins().iconst(types::I32, *v as i64),
                         HirConstant::I64(v) => builder.ins().iconst(types::I64, *v),
-                        HirConstant::Bool(v) => builder.ins().iconst(types::I8, if *v { 1 } else { 0 }),
+                        HirConstant::Bool(v) => {
+                            builder.ins().iconst(types::I8, if *v { 1 } else { 0 })
+                        }
                         HirConstant::F32(v) => builder.ins().f32const(*v),
                         HirConstant::F64(v) => builder.ins().f64const(*v),
                         _ => continue, // Complex constants not yet supported
@@ -758,7 +851,8 @@ impl CraneliftBackend {
                     // Get the Cranelift data ID for this global
                     if let Some(&data_id) = self.global_map.get(&global_id) {
                         // Declare the data in the function context
-                        let local_data = self.module.declare_data_in_func(data_id, &mut builder.func);
+                        let local_data =
+                            self.module.declare_data_in_func(data_id, &mut builder.func);
 
                         // Get the address of the global data
                         let ptr_ty = global_types[&value.id];
@@ -774,13 +868,18 @@ impl CraneliftBackend {
                 if let HirValueKind::Undef = value.kind {
                     // Check if this is an aggregate type with pre-computed size
                     if let Some(&alloc_size) = undef_aggregate_sizes.get(&value.id) {
-                        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            alloc_size,
-                        ));
+                        let slot = builder.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                alloc_size,
+                            ),
+                        );
                         let ptr = builder.ins().stack_addr(pointer_type, slot, 0);
                         self.value_map.insert(value.id, ptr);
-                        eprintln!("[CRANELIFT UNDEF] Allocated {} bytes stack for aggregate undef {:?}", alloc_size, value.id);
+                        eprintln!(
+                            "[CRANELIFT UNDEF] Allocated {} bytes stack for aggregate undef {:?}",
+                            alloc_size, value.id
+                        );
                     } else {
                         // For scalar types, use zero constant
                         let ty = type_cache.get(&value.ty).copied().unwrap_or(types::I64);
@@ -803,9 +902,13 @@ impl CraneliftBackend {
 
             // Track which blocks can be sealed and which are already sealed
             let mut seal_tracker: HashMap<HirId, usize> = HashMap::new();
-            let mut sealed_blocks: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+            let mut sealed_blocks: std::collections::HashSet<HirId> =
+                std::collections::HashSet::new();
             for hir_block_id in &block_order {
-                let pred_count = predecessor_map.get(hir_block_id).map(|v| v.len()).unwrap_or(0);
+                let pred_count = predecessor_map
+                    .get(hir_block_id)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
                 seal_tracker.insert(*hir_block_id, pred_count);
             }
 
@@ -836,9 +939,20 @@ impl CraneliftBackend {
 
                 // Map phi node results to block parameters
                 let block_params = builder.block_params(cranelift_block).to_vec();
-                log::debug!("[Cranelift] Block {:?} has {} phis and {} block_params", hir_block_id, hir_block.phis.len(), block_params.len());
+                log::debug!(
+                    "[Cranelift] Block {:?} has {} phis and {} block_params",
+                    hir_block_id,
+                    hir_block.phis.len(),
+                    block_params.len()
+                );
                 for (i, phi) in hir_block.phis.iter().enumerate() {
-                    log::debug!("[Cranelift]   phi[{}]: result={:?}, block_params[{}]={:?}", i, phi.result, i, block_params.get(i));
+                    log::debug!(
+                        "[Cranelift]   phi[{}]: result={:?}, block_params[{}]={:?}",
+                        i,
+                        phi.result,
+                        i,
+                        block_params.get(i)
+                    );
                     if let Some(&param_val) = block_params.get(i) {
                         self.value_map.insert(phi.result, param_val);
                     }
@@ -848,11 +962,19 @@ impl CraneliftBackend {
                 for inst in &hir_block.instructions {
                     // Inline instruction translation to avoid borrow checker issues
                     match inst {
-                        HirInstruction::Binary { op, result, ty, left, right } => {
-                            let lhs = self.value_map.get(left).copied()
-                                .unwrap_or_else(|| panic!("Binary op left operand {:?} not in value_map", left));
-                            let rhs = self.value_map.get(right).copied()
-                                .unwrap_or_else(|| panic!("Binary op right operand {:?} not in value_map", right));
+                        HirInstruction::Binary {
+                            op,
+                            result,
+                            ty,
+                            left,
+                            right,
+                        } => {
+                            let lhs = self.value_map.get(left).copied().unwrap_or_else(|| {
+                                panic!("Binary op left operand {:?} not in value_map", left)
+                            });
+                            let rhs = self.value_map.get(right).copied().unwrap_or_else(|| {
+                                panic!("Binary op right operand {:?} not in value_map", right)
+                            });
 
                             let value = match op {
                                 BinaryOp::Add => builder.ins().iadd(lhs, rhs),
@@ -887,18 +1009,46 @@ impl CraneliftBackend {
                                 }
                                 // Comparisons - use operand type (not result type) to determine signed/unsigned
                                 // Comparisons always return bool (i8) - never uextend
-                                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                                BinaryOp::Eq
+                                | BinaryOp::Ne
+                                | BinaryOp::Lt
+                                | BinaryOp::Le
+                                | BinaryOp::Gt
+                                | BinaryOp::Ge => {
                                     // Get operand type from left value, not result type
-                                    let operand_ty = function.values.get(left)
-                                        .map(|v| &v.ty)
-                                        .unwrap_or(ty);
+                                    let operand_ty =
+                                        function.values.get(left).map(|v| &v.ty).unwrap_or(ty);
                                     let cc = match op {
                                         BinaryOp::Eq => IntCC::Equal,
                                         BinaryOp::Ne => IntCC::NotEqual,
-                                        BinaryOp::Lt => if operand_ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan },
-                                        BinaryOp::Le => if operand_ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual },
-                                        BinaryOp::Gt => if operand_ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan },
-                                        BinaryOp::Ge => if operand_ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual },
+                                        BinaryOp::Lt => {
+                                            if operand_ty.is_signed() {
+                                                IntCC::SignedLessThan
+                                            } else {
+                                                IntCC::UnsignedLessThan
+                                            }
+                                        }
+                                        BinaryOp::Le => {
+                                            if operand_ty.is_signed() {
+                                                IntCC::SignedLessThanOrEqual
+                                            } else {
+                                                IntCC::UnsignedLessThanOrEqual
+                                            }
+                                        }
+                                        BinaryOp::Gt => {
+                                            if operand_ty.is_signed() {
+                                                IntCC::SignedGreaterThan
+                                            } else {
+                                                IntCC::UnsignedGreaterThan
+                                            }
+                                        }
+                                        BinaryOp::Ge => {
+                                            if operand_ty.is_signed() {
+                                                IntCC::SignedGreaterThanOrEqual
+                                            } else {
+                                                IntCC::UnsignedGreaterThanOrEqual
+                                            }
+                                        }
                                         _ => unreachable!(),
                                     };
                                     // icmp always returns i8 (bool) - no extension needed
@@ -913,7 +1063,12 @@ impl CraneliftBackend {
                                     builder.ins().f64const(0.0)
                                 }
                                 // Float comparisons also always return bool (i8)
-                                BinaryOp::FEq | BinaryOp::FNe | BinaryOp::FLt | BinaryOp::FLe | BinaryOp::FGt | BinaryOp::FGe => {
+                                BinaryOp::FEq
+                                | BinaryOp::FNe
+                                | BinaryOp::FLt
+                                | BinaryOp::FLe
+                                | BinaryOp::FGt
+                                | BinaryOp::FGe => {
                                     let cc = match op {
                                         BinaryOp::FEq => FloatCC::Equal,
                                         BinaryOp::FNe => FloatCC::NotEqual,
@@ -931,7 +1086,12 @@ impl CraneliftBackend {
                             self.value_map.insert(*result, value);
                         }
 
-                        HirInstruction::Unary { op, result, ty, operand } => {
+                        HirInstruction::Unary {
+                            op,
+                            result,
+                            ty,
+                            operand,
+                        } => {
                             let val = self.value_map[operand];
 
                             let value = match op {
@@ -949,7 +1109,13 @@ impl CraneliftBackend {
                             self.value_map.insert(*result, value);
                         }
 
-                        HirInstruction::Select { result, ty, condition, true_val, false_val } => {
+                        HirInstruction::Select {
+                            result,
+                            ty,
+                            condition,
+                            true_val,
+                            false_val,
+                        } => {
                             let cond = self.value_map[condition];
                             let true_v = self.value_map[true_val];
                             let false_v = self.value_map[false_val];
@@ -958,7 +1124,13 @@ impl CraneliftBackend {
                             self.value_map.insert(*result, value);
                         }
 
-                        HirInstruction::Call { result, callee, args, is_tail, .. } => {
+                        HirInstruction::Call {
+                            result,
+                            callee,
+                            args,
+                            is_tail,
+                            ..
+                        } => {
                             let arg_values: Vec<Value> = args.iter()
                                 .map(|arg_id| {
                                     match self.value_map.get(arg_id) {
@@ -993,19 +1165,36 @@ impl CraneliftBackend {
                                                 // Get or declare malloc function
                                                 let malloc_sig = {
                                                     let mut sig = self.module.make_signature();
-                                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64));
-                                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // pointer as i64
+                                                    sig.params.push(
+                                                        cranelift_codegen::ir::AbiParam::new(
+                                                            types::I64,
+                                                        ),
+                                                    );
+                                                    sig.returns.push(
+                                                        cranelift_codegen::ir::AbiParam::new(
+                                                            types::I64,
+                                                        ),
+                                                    ); // pointer as i64
                                                     sig
                                                 };
 
-                                                let malloc_func = self.module
-                                                    .declare_function("malloc", Linkage::Import, &malloc_sig)
+                                                let malloc_func = self
+                                                    .module
+                                                    .declare_function(
+                                                        "malloc",
+                                                        Linkage::Import,
+                                                        &malloc_sig,
+                                                    )
                                                     .expect("Failed to declare malloc");
 
-                                                let local_malloc = self.module
-                                                    .declare_func_in_func(malloc_func, builder.func);
+                                                let local_malloc =
+                                                    self.module.declare_func_in_func(
+                                                        malloc_func,
+                                                        builder.func,
+                                                    );
 
-                                                let call = builder.ins().call(local_malloc, &[size_arg]);
+                                                let call =
+                                                    builder.ins().call(local_malloc, &[size_arg]);
                                                 builder.inst_results(call)[0]
                                             } else {
                                                 continue;
@@ -1016,16 +1205,26 @@ impl CraneliftBackend {
                                             if let Some(&ptr_arg) = arg_values.first() {
                                                 let free_sig = {
                                                     let mut sig = self.module.make_signature();
-                                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                                                    sig.params.push(
+                                                        cranelift_codegen::ir::AbiParam::new(
+                                                            types::I64,
+                                                        ),
+                                                    );
                                                     // free returns void
                                                     sig
                                                 };
 
-                                                let free_func = self.module
-                                                    .declare_function("free", Linkage::Import, &free_sig)
+                                                let free_func = self
+                                                    .module
+                                                    .declare_function(
+                                                        "free",
+                                                        Linkage::Import,
+                                                        &free_sig,
+                                                    )
                                                     .expect("Failed to declare free");
 
-                                                let local_free = self.module
+                                                let local_free = self
+                                                    .module
                                                     .declare_func_in_func(free_func, builder.func);
 
                                                 builder.ins().call(local_free, &[ptr_arg]);
@@ -1041,9 +1240,18 @@ impl CraneliftBackend {
                                                 let mut sig = self.module.make_signature();
                                                 sig.params.push(AbiParam::new(types::F64));
                                                 sig.returns.push(AbiParam::new(types::F64));
-                                                let sin_id = self.module.declare_function("sin", Linkage::Import, &sig)
-                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare sin: {}", e)))?;
-                                                let sin_func = self.module.declare_func_in_func(sin_id, builder.func);
+                                                let sin_id = self
+                                                    .module
+                                                    .declare_function("sin", Linkage::Import, &sig)
+                                                    .map_err(|e| {
+                                                        CompilerError::Backend(format!(
+                                                            "Failed to declare sin: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+                                                let sin_func = self
+                                                    .module
+                                                    .declare_func_in_func(sin_id, builder.func);
                                                 let call = builder.ins().call(sin_func, &[arg]);
                                                 builder.inst_results(call)[0]
                                             } else {
@@ -1055,9 +1263,18 @@ impl CraneliftBackend {
                                                 let mut sig = self.module.make_signature();
                                                 sig.params.push(AbiParam::new(types::F64));
                                                 sig.returns.push(AbiParam::new(types::F64));
-                                                let cos_id = self.module.declare_function("cos", Linkage::Import, &sig)
-                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare cos: {}", e)))?;
-                                                let cos_func = self.module.declare_func_in_func(cos_id, builder.func);
+                                                let cos_id = self
+                                                    .module
+                                                    .declare_function("cos", Linkage::Import, &sig)
+                                                    .map_err(|e| {
+                                                        CompilerError::Backend(format!(
+                                                            "Failed to declare cos: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+                                                let cos_func = self
+                                                    .module
+                                                    .declare_func_in_func(cos_id, builder.func);
                                                 let call = builder.ins().call(cos_func, &[arg]);
                                                 builder.inst_results(call)[0]
                                             } else {
@@ -1069,9 +1286,18 @@ impl CraneliftBackend {
                                                 let mut sig = self.module.make_signature();
                                                 sig.params.push(AbiParam::new(types::F64));
                                                 sig.returns.push(AbiParam::new(types::F64));
-                                                let log_id = self.module.declare_function("log", Linkage::Import, &sig)
-                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare log: {}", e)))?;
-                                                let log_func = self.module.declare_func_in_func(log_id, builder.func);
+                                                let log_id = self
+                                                    .module
+                                                    .declare_function("log", Linkage::Import, &sig)
+                                                    .map_err(|e| {
+                                                        CompilerError::Backend(format!(
+                                                            "Failed to declare log: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+                                                let log_func = self
+                                                    .module
+                                                    .declare_func_in_func(log_id, builder.func);
                                                 let call = builder.ins().call(log_func, &[arg]);
                                                 builder.inst_results(call)[0]
                                             } else {
@@ -1083,9 +1309,18 @@ impl CraneliftBackend {
                                                 let mut sig = self.module.make_signature();
                                                 sig.params.push(AbiParam::new(types::F64));
                                                 sig.returns.push(AbiParam::new(types::F64));
-                                                let exp_id = self.module.declare_function("exp", Linkage::Import, &sig)
-                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare exp: {}", e)))?;
-                                                let exp_func = self.module.declare_func_in_func(exp_id, builder.func);
+                                                let exp_id = self
+                                                    .module
+                                                    .declare_function("exp", Linkage::Import, &sig)
+                                                    .map_err(|e| {
+                                                        CompilerError::Backend(format!(
+                                                            "Failed to declare exp: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+                                                let exp_func = self
+                                                    .module
+                                                    .declare_func_in_func(exp_id, builder.func);
                                                 let call = builder.ins().call(exp_func, &[arg]);
                                                 builder.inst_results(call)[0]
                                             } else {
@@ -1100,10 +1335,20 @@ impl CraneliftBackend {
                                                 sig.params.push(AbiParam::new(types::F64));
                                                 sig.params.push(AbiParam::new(types::F64));
                                                 sig.returns.push(AbiParam::new(types::F64));
-                                                let pow_id = self.module.declare_function("pow", Linkage::Import, &sig)
-                                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare pow: {}", e)))?;
-                                                let pow_func = self.module.declare_func_in_func(pow_id, builder.func);
-                                                let call = builder.ins().call(pow_func, &[base, exp]);
+                                                let pow_id = self
+                                                    .module
+                                                    .declare_function("pow", Linkage::Import, &sig)
+                                                    .map_err(|e| {
+                                                        CompilerError::Backend(format!(
+                                                            "Failed to declare pow: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+                                                let pow_func = self
+                                                    .module
+                                                    .declare_func_in_func(pow_id, builder.func);
+                                                let call =
+                                                    builder.ins().call(pow_func, &[base, exp]);
                                                 builder.inst_results(call)[0]
                                             } else {
                                                 continue;
@@ -1142,10 +1387,13 @@ impl CraneliftBackend {
                                 }
                                 HirCallable::Function(func_id) => {
                                     // Check if this is an external function with boxing requirements
-                                    if let Some(link_name) = self.external_link_names.get(func_id).cloned() {
+                                    if let Some(link_name) =
+                                        self.external_link_names.get(func_id).cloned()
+                                    {
                                         // External function - check if boxing is needed
                                         let mut boxed_args = Vec::new();
-                                        for (param_index, &arg_val) in arg_values.iter().enumerate() {
+                                        for (param_index, &arg_val) in arg_values.iter().enumerate()
+                                        {
                                             let needs_boxing = symbol_boxing
                                                 .get(&(link_name.clone(), param_index))
                                                 .copied()
@@ -1155,47 +1403,72 @@ impl CraneliftBackend {
                                                 // Apply DynamicBox wrapping - same logic as HirCallable::Symbol
                                                 let arg_hir_id = args[param_index];
                                                 // Check if this is a pointer type (opaque or string) - pass value directly
-                                                let is_pointer_type = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                let is_pointer_type = if let Some(hir_value) =
+                                                    function.values.get(&arg_hir_id)
+                                                {
                                                     match &hir_value.ty {
                                                         HirType::Opaque(_) => true,
-                                                        HirType::Ptr(inner) => matches!(inner.as_ref(), HirType::Opaque(_) | HirType::I8),
+                                                        HirType::Ptr(inner) => matches!(
+                                                            inner.as_ref(),
+                                                            HirType::Opaque(_) | HirType::I8
+                                                        ),
                                                         _ => false,
                                                     }
                                                 } else {
                                                     false
                                                 };
 
-                                                let (tag_value, size_value) = if let Some(hir_value) = function.values.get(&arg_hir_id) {
-                                                    // TypeTag format: (type_id << 8) | category
-                                                    // PrimitiveSize: Bits8=1, Bits16=2, Bits32=3, Bits64=4
-                                                    match &hir_value.ty {
-                                                        HirType::I8 => (0x0102u32, 1u32),   // Int(Bits8)
-                                                        HirType::I16 => (0x0202u32, 2u32),  // Int(Bits16)
-                                                        HirType::I32 => (0x0302u32, 4u32),  // Int(Bits32)
-                                                        HirType::I64 => (0x0402u32, 8u32),  // Int(Bits64)
-                                                        HirType::U8 => (0x0103u32, 1u32),   // UInt(Bits8)
-                                                        HirType::U16 => (0x0203u32, 2u32),  // UInt(Bits16)
-                                                        HirType::U32 => (0x0303u32, 4u32),  // UInt(Bits32)
-                                                        HirType::U64 => (0x0403u32, 8u32),  // UInt(Bits64)
-                                                        HirType::F32 => (0x0304u32, 4u32),  // Float(Bits32)
-                                                        HirType::F64 => (0x0404u32, 8u32),  // Float(Bits64)
-                                                        HirType::Bool => (0x0001u32, 1u32), // Bool
-                                                        HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::I8) => (0x0005u32, 8u32), // String
-                                                        HirType::Opaque(_) => (0x0012u32, 8u32), // Opaque
-                                                        HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_)) => (0x0012u32, 8u32),
-                                                        other => {
-                                                            (0x0012u32, 8u32)  // Opaque
-                                                        },
-                                                    }
-                                                } else {
-                                                    (0x0012u32, 8u32)  // Opaque
-                                                };
+                                                let (tag_value, size_value) =
+                                                    if let Some(hir_value) =
+                                                        function.values.get(&arg_hir_id)
+                                                    {
+                                                        // TypeTag format: (type_id << 8) | category
+                                                        // PrimitiveSize: Bits8=1, Bits16=2, Bits32=3, Bits64=4
+                                                        match &hir_value.ty {
+                                                            HirType::I8 => (0x0102u32, 1u32),   // Int(Bits8)
+                                                            HirType::I16 => (0x0202u32, 2u32), // Int(Bits16)
+                                                            HirType::I32 => (0x0302u32, 4u32), // Int(Bits32)
+                                                            HirType::I64 => (0x0402u32, 8u32), // Int(Bits64)
+                                                            HirType::U8 => (0x0103u32, 1u32), // UInt(Bits8)
+                                                            HirType::U16 => (0x0203u32, 2u32), // UInt(Bits16)
+                                                            HirType::U32 => (0x0303u32, 4u32), // UInt(Bits32)
+                                                            HirType::U64 => (0x0403u32, 8u32), // UInt(Bits64)
+                                                            HirType::F32 => (0x0304u32, 4u32), // Float(Bits32)
+                                                            HirType::F64 => (0x0404u32, 8u32), // Float(Bits64)
+                                                            HirType::Bool => (0x0001u32, 1u32), // Bool
+                                                            HirType::Ptr(inner)
+                                                                if matches!(
+                                                                    inner.as_ref(),
+                                                                    HirType::I8
+                                                                ) =>
+                                                            {
+                                                                (0x0005u32, 8u32)
+                                                            } // String
+                                                            HirType::Opaque(_) => (0x0012u32, 8u32), // Opaque
+                                                            HirType::Ptr(inner)
+                                                                if matches!(
+                                                                    inner.as_ref(),
+                                                                    HirType::Opaque(_)
+                                                                ) =>
+                                                            {
+                                                                (0x0012u32, 8u32)
+                                                            }
+                                                            other => {
+                                                                (0x0012u32, 8u32)
+                                                                // Opaque
+                                                            }
+                                                        }
+                                                    } else {
+                                                        (0x0012u32, 8u32) // Opaque
+                                                    };
 
                                                 let data_ptr_value = if is_pointer_type {
                                                     // Pointer types (opaque, string): value IS the pointer
                                                     match builder.func.dfg.value_type(arg_val) {
                                                         types::I64 => arg_val,
-                                                        _ => builder.ins().uextend(types::I64, arg_val),
+                                                        _ => builder
+                                                            .ins()
+                                                            .uextend(types::I64, arg_val),
                                                     }
                                                 } else {
                                                     // Primitives: allocate stack slot and store pointer to it
@@ -1203,16 +1476,35 @@ impl CraneliftBackend {
                                                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                                         8,
                                                     ));
-                                                    let value_addr = builder.ins().stack_addr(types::I64, value_slot, 0);
-                                                    let data_value = match builder.func.dfg.value_type(arg_val) {
-                                                        types::I8 | types::I16 | types::I32 => builder.ins().sextend(types::I64, arg_val),
+                                                    let value_addr = builder.ins().stack_addr(
+                                                        types::I64,
+                                                        value_slot,
+                                                        0,
+                                                    );
+                                                    let data_value = match builder
+                                                        .func
+                                                        .dfg
+                                                        .value_type(arg_val)
+                                                    {
+                                                        types::I8 | types::I16 | types::I32 => {
+                                                            builder
+                                                                .ins()
+                                                                .sextend(types::I64, arg_val)
+                                                        }
                                                         types::F32 => {
                                                             let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), arg_val);
-                                                            builder.ins().uextend(types::I64, as_i32)
+                                                            builder
+                                                                .ins()
+                                                                .uextend(types::I64, as_i32)
                                                         }
-                                                        _ => arg_val
+                                                        _ => arg_val,
                                                     };
-                                                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_value, value_addr, 0);
+                                                    builder.ins().store(
+                                                        cranelift_codegen::ir::MemFlags::new(),
+                                                        data_value,
+                                                        value_addr,
+                                                        0,
+                                                    );
                                                     value_addr
                                                 };
 
@@ -1221,38 +1513,85 @@ impl CraneliftBackend {
                                                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                                     32,
                                                 ));
-                                                let box_addr = builder.ins().stack_addr(types::I64, slot, 0);
-                                                let tag_val = builder.ins().iconst(types::I32, tag_value as i64);
-                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), tag_val, box_addr, 0);
-                                                let size_val = builder.ins().iconst(types::I32, size_value as i64);
-                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), size_val, box_addr, 4);
-                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_ptr_value, box_addr, 8);
-                                                let null_dropper = builder.ins().iconst(types::I64, 0);
-                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), null_dropper, box_addr, 16);
+                                                let box_addr =
+                                                    builder.ins().stack_addr(types::I64, slot, 0);
+                                                let tag_val = builder
+                                                    .ins()
+                                                    .iconst(types::I32, tag_value as i64);
+                                                builder.ins().store(
+                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    tag_val,
+                                                    box_addr,
+                                                    0,
+                                                );
+                                                let size_val = builder
+                                                    .ins()
+                                                    .iconst(types::I32, size_value as i64);
+                                                builder.ins().store(
+                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    size_val,
+                                                    box_addr,
+                                                    4,
+                                                );
+                                                builder.ins().store(
+                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    data_ptr_value,
+                                                    box_addr,
+                                                    8,
+                                                );
+                                                let null_dropper =
+                                                    builder.ins().iconst(types::I64, 0);
+                                                builder.ins().store(
+                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    null_dropper,
+                                                    box_addr,
+                                                    16,
+                                                );
 
                                                 // Check for Display trait impl
-                                                let display_fn_value = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                let display_fn_value = if let Some(hir_value) =
+                                                    function.values.get(&arg_hir_id)
+                                                {
                                                     let opaque_name = match &hir_value.ty {
-                                                        HirType::Opaque(type_name) => Some(type_name),
+                                                        HirType::Opaque(type_name) => {
+                                                            Some(type_name)
+                                                        }
                                                         HirType::Ptr(inner) => {
-                                                            if let HirType::Opaque(type_name) = inner.as_ref() {
+                                                            if let HirType::Opaque(type_name) =
+                                                                inner.as_ref()
+                                                            {
                                                                 Some(type_name)
-                                                            } else { None }
+                                                            } else {
+                                                                None
+                                                            }
                                                         }
                                                         _ => None,
                                                     };
                                                     if let Some(type_name) = opaque_name {
-                                                        let type_name_str = type_name.resolve_global().unwrap_or_default();
+                                                        let type_name_str = type_name
+                                                            .resolve_global()
+                                                            .unwrap_or_default();
                                                         // Strip leading $ if present (opaque types may have $ prefix)
-                                                        let clean_type_name = if type_name_str.starts_with('$') {
-                                                            &type_name_str[1..]
-                                                        } else {
-                                                            &type_name_str
-                                                        };
+                                                        let clean_type_name =
+                                                            if type_name_str.starts_with('$') {
+                                                                &type_name_str[1..]
+                                                            } else {
+                                                                &type_name_str
+                                                            };
                                                         if !clean_type_name.is_empty() {
-                                                            let display_symbol = format!("${}$to_string", clean_type_name);
-                                                            if let Some((_, func_ptr)) = self.runtime_symbols.iter().find(|(n, _)| n == &display_symbol) {
-                                                                builder.ins().iconst(types::I64, *func_ptr as i64)
+                                                            let display_symbol = format!(
+                                                                "${}$to_string",
+                                                                clean_type_name
+                                                            );
+                                                            if let Some((_, func_ptr)) = self
+                                                                .runtime_symbols
+                                                                .iter()
+                                                                .find(|(n, _)| n == &display_symbol)
+                                                            {
+                                                                builder.ins().iconst(
+                                                                    types::I64,
+                                                                    *func_ptr as i64,
+                                                                )
                                                             } else {
                                                                 builder.ins().iconst(types::I64, 0)
                                                             }
@@ -1265,7 +1604,12 @@ impl CraneliftBackend {
                                                 } else {
                                                     builder.ins().iconst(types::I64, 0)
                                                 };
-                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), display_fn_value, box_addr, 24);
+                                                builder.ins().store(
+                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    display_fn_value,
+                                                    box_addr,
+                                                    24,
+                                                );
                                                 boxed_args.push(box_addr);
                                             } else {
                                                 boxed_args.push(arg_val);
@@ -1273,46 +1617,81 @@ impl CraneliftBackend {
                                         }
 
                                         // Call the external function with boxed args
-                                        if let Some(&cranelift_func_id) = self.function_map.get(func_id) {
-                                            let local_callee = self.module.declare_func_in_func(cranelift_func_id, builder.func);
+                                        if let Some(&cranelift_func_id) =
+                                            self.function_map.get(func_id)
+                                        {
+                                            let local_callee = self.module.declare_func_in_func(
+                                                cranelift_func_id,
+                                                builder.func,
+                                            );
 
                                             // Coerce argument types to match declared signature
-                                            let sig_ref = builder.func.dfg.ext_funcs[local_callee].signature;
-                                            let expected_types: Vec<_> = builder.func.dfg.signatures[sig_ref]
-                                                .params.iter().map(|p| p.value_type).collect();
+                                            let sig_ref =
+                                                builder.func.dfg.ext_funcs[local_callee].signature;
+                                            let expected_types: Vec<_> =
+                                                builder.func.dfg.signatures[sig_ref]
+                                                    .params
+                                                    .iter()
+                                                    .map(|p| p.value_type)
+                                                    .collect();
                                             let mut coerced = boxed_args.clone();
-                                            for (i, &expected) in expected_types.iter().enumerate() {
+                                            for (i, &expected) in expected_types.iter().enumerate()
+                                            {
                                                 if i < coerced.len() {
-                                                    let actual = builder.func.dfg.value_type(coerced[i]);
+                                                    let actual =
+                                                        builder.func.dfg.value_type(coerced[i]);
                                                     if actual != expected {
-                                                        coerced[i] = Self::coerce_value(&mut builder, coerced[i], actual, expected);
+                                                        coerced[i] = Self::coerce_value(
+                                                            &mut builder,
+                                                            coerced[i],
+                                                            actual,
+                                                            expected,
+                                                        );
                                                     }
                                                 }
                                             }
 
                                             let call = builder.ins().call(local_callee, &coerced);
                                             if let Some(result_id) = result {
-                                                if let Some(&ret_val) = builder.inst_results(call).first() {
+                                                if let Some(&ret_val) =
+                                                    builder.inst_results(call).first()
+                                                {
                                                     self.value_map.insert(*result_id, ret_val);
                                                 }
                                             }
                                         }
                                     } else {
                                         // Regular (non-external) function call - no boxing needed
-                                        if let Some(&cranelift_func_id) = self.function_map.get(func_id) {
-                                            let local_callee = self.module
-                                                .declare_func_in_func(cranelift_func_id, builder.func);
+                                        if let Some(&cranelift_func_id) =
+                                            self.function_map.get(func_id)
+                                        {
+                                            let local_callee = self.module.declare_func_in_func(
+                                                cranelift_func_id,
+                                                builder.func,
+                                            );
 
                                             // Coerce argument types to match declared signature
-                                            let sig_ref = builder.func.dfg.ext_funcs[local_callee].signature;
-                                            let expected_types: Vec<_> = builder.func.dfg.signatures[sig_ref]
-                                                .params.iter().map(|p| p.value_type).collect();
+                                            let sig_ref =
+                                                builder.func.dfg.ext_funcs[local_callee].signature;
+                                            let expected_types: Vec<_> =
+                                                builder.func.dfg.signatures[sig_ref]
+                                                    .params
+                                                    .iter()
+                                                    .map(|p| p.value_type)
+                                                    .collect();
                                             let mut coerced = arg_values.clone();
-                                            for (i, &expected) in expected_types.iter().enumerate() {
+                                            for (i, &expected) in expected_types.iter().enumerate()
+                                            {
                                                 if i < coerced.len() {
-                                                    let actual = builder.func.dfg.value_type(coerced[i]);
+                                                    let actual =
+                                                        builder.func.dfg.value_type(coerced[i]);
                                                     if actual != expected {
-                                                        coerced[i] = Self::coerce_value(&mut builder, coerced[i], actual, expected);
+                                                        coerced[i] = Self::coerce_value(
+                                                            &mut builder,
+                                                            coerced[i],
+                                                            actual,
+                                                            expected,
+                                                        );
                                                     }
                                                 }
                                             }
@@ -1320,14 +1699,19 @@ impl CraneliftBackend {
                                             let call = builder.ins().call(local_callee, &coerced);
 
                                             if let Some(result_id) = result {
-                                                if let Some(&ret_val) = builder.inst_results(call).first() {
+                                                if let Some(&ret_val) =
+                                                    builder.inst_results(call).first()
+                                                {
                                                     self.value_map.insert(*result_id, ret_val);
                                                 }
                                             }
                                         } else {
                                             warn!(" Function {:?} not in function_map", func_id);
                                             if let Some(result_id) = result {
-                                                self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                                self.value_map.insert(
+                                                    *result_id,
+                                                    builder.ins().iconst(types::I64, 0),
+                                                );
                                             }
                                         }
                                     }
@@ -1345,13 +1729,19 @@ impl CraneliftBackend {
                                     let mut sig = self.module.make_signature();
                                     for arg_val in &arg_values {
                                         let arg_ty = builder.func.dfg.value_type(*arg_val);
-                                        sig.params.push(cranelift_codegen::ir::AbiParam::new(arg_ty));
+                                        sig.params
+                                            .push(cranelift_codegen::ir::AbiParam::new(arg_ty));
                                     }
                                     // Use i64 for return type (pointer-sized for opaque types)
-                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                                    sig.returns
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64));
 
                                     let sig_ref = builder.import_signature(sig);
-                                    let call = builder.ins().call_indirect(sig_ref, func_ptr_val, &arg_values);
+                                    let call = builder.ins().call_indirect(
+                                        sig_ref,
+                                        func_ptr_val,
+                                        &arg_values,
+                                    );
 
                                     if let Some(result_id) = result {
                                         if let Some(&ret_val) = builder.inst_results(call).first() {
@@ -1369,7 +1759,12 @@ impl CraneliftBackend {
                                             .get(&(symbol_name.clone(), param_index))
                                             .copied()
                                             .unwrap_or(false);
-                                        log::debug!("[DynamicBox] Symbol: {}, param {}: needs_boxing = {}", symbol_name, param_index, needs_boxing);
+                                        log::debug!(
+                                            "[DynamicBox] Symbol: {}, param {}: needs_boxing = {}",
+                                            symbol_name,
+                                            param_index,
+                                            needs_boxing
+                                        );
                                         if let Some(sig) = self.symbol_signatures.get(symbol_name) {
                                         } else {
                                         }
@@ -1381,43 +1776,60 @@ impl CraneliftBackend {
                                             // Allocate stack space for DynamicBox (32 bytes on 64-bit)
                                             // Determine TypeTag and size based on HIR type
                                             let arg_hir_id = args[param_index];
-                                            let (tag_value, size_value) = if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                            let (tag_value, size_value) = if let Some(hir_value) =
+                                                function.values.get(&arg_hir_id)
+                                            {
                                                 // TypeTag format: (type_id << 8) | category
                                                 // PrimitiveSize: Bits8=1, Bits16=2, Bits32=3, Bits64=4
                                                 match &hir_value.ty {
                                                     HirType::I8 => (0x0102u32, 1u32),   // Int(Bits8)
-                                                    HirType::I16 => (0x0202u32, 2u32),  // Int(Bits16)
-                                                    HirType::I32 => (0x0302u32, 4u32),  // Int(Bits32)
-                                                    HirType::I64 => (0x0402u32, 8u32),  // Int(Bits64)
-                                                    HirType::U8 => (0x0103u32, 1u32),   // UInt(Bits8)
-                                                    HirType::U16 => (0x0203u32, 2u32),  // UInt(Bits16)
-                                                    HirType::U32 => (0x0303u32, 4u32),  // UInt(Bits32)
-                                                    HirType::U64 => (0x0403u32, 8u32),  // UInt(Bits64)
-                                                    HirType::F32 => (0x0304u32, 4u32),  // Float(Bits32)
-                                                    HirType::F64 => (0x0404u32, 8u32),  // Float(Bits64)
+                                                    HirType::I16 => (0x0202u32, 2u32), // Int(Bits16)
+                                                    HirType::I32 => (0x0302u32, 4u32), // Int(Bits32)
+                                                    HirType::I64 => (0x0402u32, 8u32), // Int(Bits64)
+                                                    HirType::U8 => (0x0103u32, 1u32), // UInt(Bits8)
+                                                    HirType::U16 => (0x0203u32, 2u32), // UInt(Bits16)
+                                                    HirType::U32 => (0x0303u32, 4u32), // UInt(Bits32)
+                                                    HirType::U64 => (0x0403u32, 8u32), // UInt(Bits64)
+                                                    HirType::F32 => (0x0304u32, 4u32), // Float(Bits32)
+                                                    HirType::F64 => (0x0404u32, 8u32), // Float(Bits64)
                                                     HirType::Bool => (0x0001u32, 1u32), // Bool
-                                                    HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::I8) => {
-                                                        (0x0005u32, 8u32)  // String
+                                                    HirType::Ptr(inner)
+                                                        if matches!(
+                                                            inner.as_ref(),
+                                                            HirType::I8
+                                                        ) =>
+                                                    {
+                                                        (0x0005u32, 8u32) // String
                                                     }
-                                                    HirType::Opaque(_) => (0x0012u32, 8u32),  // Opaque
-                                                    HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_)) => {
-                                                        (0x0012u32, 8u32)  // Ptr to Opaque
+                                                    HirType::Opaque(_) => (0x0012u32, 8u32), // Opaque
+                                                    HirType::Ptr(inner)
+                                                        if matches!(
+                                                            inner.as_ref(),
+                                                            HirType::Opaque(_)
+                                                        ) =>
+                                                    {
+                                                        (0x0012u32, 8u32) // Ptr to Opaque
                                                     }
                                                     other => {
                                                         log::warn!("[Boxing] Unhandled type: {:?}, defaulting to Opaque", other);
-                                                        (0x0012u32, 8u32)  // Opaque
+                                                        (0x0012u32, 8u32) // Opaque
                                                     }
                                                 }
                                             } else {
                                                 log::warn!("[Boxing] No HirValue found for arg_hir_id {:?}", arg_hir_id);
-                                                (0x0012u32, 8u32)  // Opaque
+                                                (0x0012u32, 8u32) // Opaque
                                             };
 
                                             // Check if this is a pointer type (opaque types or strings that should be passed directly)
-                                            let is_pointer_type = if let Some(hir_value) = function.values.get(&args[param_index]) {
+                                            let is_pointer_type = if let Some(hir_value) =
+                                                function.values.get(&args[param_index])
+                                            {
                                                 match &hir_value.ty {
                                                     HirType::Opaque(_) => true,
-                                                    HirType::Ptr(inner) => matches!(inner.as_ref(), HirType::Opaque(_) | HirType::I8),
+                                                    HirType::Ptr(inner) => matches!(
+                                                        inner.as_ref(),
+                                                        HirType::Opaque(_) | HirType::I8
+                                                    ),
                                                     _ => false,
                                                 }
                                             } else {
@@ -1439,23 +1851,40 @@ impl CraneliftBackend {
                                                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                                     8,
                                                 ));
-                                                let value_addr = builder.ins().stack_addr(types::I64, value_slot, 0);
+                                                let value_addr = builder.ins().stack_addr(
+                                                    types::I64,
+                                                    value_slot,
+                                                    0,
+                                                );
 
                                                 // Store the actual value in the value slot
                                                 // Extend smaller integers to i64 for storage
-                                                let data_value = match builder.func.dfg.value_type(arg_val) {
+                                                let data_value = match builder
+                                                    .func
+                                                    .dfg
+                                                    .value_type(arg_val)
+                                                {
                                                     types::I8 | types::I16 | types::I32 => {
                                                         // Sign-extend to i64
                                                         builder.ins().sextend(types::I64, arg_val)
                                                     }
                                                     types::F32 => {
                                                         // Bitcast f32 to i32, then zero-extend to i64
-                                                        let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), arg_val);
+                                                        let as_i32 = builder.ins().bitcast(
+                                                            types::I32,
+                                                            cranelift_codegen::ir::MemFlags::new(),
+                                                            arg_val,
+                                                        );
                                                         builder.ins().uextend(types::I64, as_i32)
                                                     }
-                                                    _ => arg_val  // Already i64 or pointer
+                                                    _ => arg_val, // Already i64 or pointer
                                                 };
-                                                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_value, value_addr, 0);
+                                                builder.ins().store(
+                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    data_value,
+                                                    value_addr,
+                                                    0,
+                                                );
                                                 value_addr
                                             };
 
@@ -1464,34 +1893,63 @@ impl CraneliftBackend {
                                                 cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                                 32,
                                             ));
-                                            let box_addr = builder.ins().stack_addr(types::I64, slot, 0);
+                                            let box_addr =
+                                                builder.ins().stack_addr(types::I64, slot, 0);
 
                                             // Set tag
-                                            let tag_val = builder.ins().iconst(types::I32, tag_value as i64);
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), tag_val, box_addr, 0);
+                                            let tag_val =
+                                                builder.ins().iconst(types::I32, tag_value as i64);
+                                            builder.ins().store(
+                                                cranelift_codegen::ir::MemFlags::new(),
+                                                tag_val,
+                                                box_addr,
+                                                0,
+                                            );
 
                                             // Set size
-                                            let size_val = builder.ins().iconst(types::I32, size_value as i64);
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), size_val, box_addr, 4);
+                                            let size_val =
+                                                builder.ins().iconst(types::I32, size_value as i64);
+                                            builder.ins().store(
+                                                cranelift_codegen::ir::MemFlags::new(),
+                                                size_val,
+                                                box_addr,
+                                                4,
+                                            );
 
                                             // Set data - for opaque types this IS the pointer, for primitives it's pointer to value
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), data_ptr_value, box_addr, 8);
+                                            builder.ins().store(
+                                                cranelift_codegen::ir::MemFlags::new(),
+                                                data_ptr_value,
+                                                box_addr,
+                                                8,
+                                            );
 
                                             // Set dropper to null (0)
                                             let null_dropper = builder.ins().iconst(types::I64, 0);
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), null_dropper, box_addr, 16);
+                                            builder.ins().store(
+                                                cranelift_codegen::ir::MemFlags::new(),
+                                                null_dropper,
+                                                box_addr,
+                                                16,
+                                            );
 
                                             // Set display_fn - check if this opaque type implements Display trait
                                             // Convention: Display::to_string is at symbol ${type_name}$to_string
                                             let display_fn_value = {
                                                 // Get the HIR value to check if it's an opaque type
                                                 let arg_hir_id = args[param_index];
-                                                if let Some(hir_value) = function.values.get(&arg_hir_id) {
+                                                if let Some(hir_value) =
+                                                    function.values.get(&arg_hir_id)
+                                                {
                                                     // Extract opaque type name, handling both Opaque and Ptr(Opaque(...))
                                                     let opaque_name = match &hir_value.ty {
-                                                        HirType::Opaque(type_name) => Some(type_name),
+                                                        HirType::Opaque(type_name) => {
+                                                            Some(type_name)
+                                                        }
                                                         HirType::Ptr(inner) => {
-                                                            if let HirType::Opaque(type_name) = inner.as_ref() {
+                                                            if let HirType::Opaque(type_name) =
+                                                                inner.as_ref()
+                                                            {
                                                                 Some(type_name)
                                                             } else {
                                                                 None
@@ -1502,26 +1960,37 @@ impl CraneliftBackend {
 
                                                     if let Some(type_name) = opaque_name {
                                                         // Extract the type name string
-                                                        let type_name_str = type_name.resolve_global()
+                                                        let type_name_str = type_name
+                                                            .resolve_global()
                                                             .unwrap_or_else(|| String::new());
                                                         // Strip leading $ if present (opaque types may have $ prefix)
-                                                        let clean_type_name = if type_name_str.starts_with('$') {
-                                                            &type_name_str[1..]
-                                                        } else {
-                                                            type_name_str.as_str()
-                                                        };
+                                                        let clean_type_name =
+                                                            if type_name_str.starts_with('$') {
+                                                                &type_name_str[1..]
+                                                            } else {
+                                                                type_name_str.as_str()
+                                                            };
 
                                                         if !clean_type_name.is_empty() {
                                                             // Construct Display method symbol: ${type_name}$to_string
-                                                            let display_symbol = format!("${}$to_string", clean_type_name);
+                                                            let display_symbol = format!(
+                                                                "${}$to_string",
+                                                                clean_type_name
+                                                            );
 
                                                             // Look up in runtime symbols
-                                                            if let Some((_, func_ptr)) = self.runtime_symbols
+                                                            if let Some((_, func_ptr)) = self
+                                                                .runtime_symbols
                                                                 .iter()
-                                                                .find(|(name, _)| name == &display_symbol)
+                                                                .find(|(name, _)| {
+                                                                    name == &display_symbol
+                                                                })
                                                             {
                                                                 // Found Display implementation!
-                                                                builder.ins().iconst(types::I64, *func_ptr as i64)
+                                                                builder.ins().iconst(
+                                                                    types::I64,
+                                                                    *func_ptr as i64,
+                                                                )
                                                             } else {
                                                                 // No Display implementation
                                                                 builder.ins().iconst(types::I64, 0)
@@ -1539,7 +2008,12 @@ impl CraneliftBackend {
                                                     builder.ins().iconst(types::I64, 0)
                                                 }
                                             };
-                                            builder.ins().store(cranelift_codegen::ir::MemFlags::new(), display_fn_value, box_addr, 24);
+                                            builder.ins().store(
+                                                cranelift_codegen::ir::MemFlags::new(),
+                                                display_fn_value,
+                                                box_addr,
+                                                24,
+                                            );
 
                                             // Pass the box by value (load struct fields and pass as args)
                                             // Actually, DynamicBox is passed by value, so we need to load the struct
@@ -1555,13 +2029,17 @@ impl CraneliftBackend {
                                     let mut sig = self.module.make_signature();
 
                                     // Check if we have a ZRTL signature for this symbol
-                                    let return_cranelift_ty = if let Some(sym_sig) = self.symbol_signatures.get(symbol_name) {
+                                    let return_cranelift_ty = if let Some(sym_sig) =
+                                        self.symbol_signatures.get(symbol_name)
+                                    {
                                         // Use ZRTL signature for parameters AND return type
                                         for i in 0..sym_sig.param_count {
                                             // Convert ZRTL TypeTag to Cranelift type
                                             let type_tag = &sym_sig.params[i as usize];
                                             let cranelift_ty = type_tag_to_cranelift_type(type_tag);
-                                            sig.params.push(cranelift_codegen::ir::AbiParam::new(cranelift_ty));
+                                            sig.params.push(cranelift_codegen::ir::AbiParam::new(
+                                                cranelift_ty,
+                                            ));
                                         }
 
                                         // Use signature return type
@@ -1575,7 +2053,8 @@ impl CraneliftBackend {
                                         // No ZRTL signature - infer from boxed args
                                         for arg_val in &boxed_args {
                                             let arg_ty = builder.func.dfg.value_type(*arg_val);
-                                            sig.params.push(cranelift_codegen::ir::AbiParam::new(arg_ty));
+                                            sig.params
+                                                .push(cranelift_codegen::ir::AbiParam::new(arg_ty));
                                         }
 
                                         // Determine return type from HIR
@@ -1602,7 +2081,8 @@ impl CraneliftBackend {
                                     };
 
                                     if let Some(ret_ty) = return_cranelift_ty {
-                                        sig.returns.push(cranelift_codegen::ir::AbiParam::new(ret_ty));
+                                        sig.returns
+                                            .push(cranelift_codegen::ir::AbiParam::new(ret_ty));
                                     }
 
                                     // Coerce argument types to match the declared signature
@@ -1610,20 +2090,30 @@ impl CraneliftBackend {
                                     let mut coerced_args = boxed_args.clone();
                                     for (i, param) in sig.params.iter().enumerate() {
                                         if i < coerced_args.len() {
-                                            let actual_ty = builder.func.dfg.value_type(coerced_args[i]);
+                                            let actual_ty =
+                                                builder.func.dfg.value_type(coerced_args[i]);
                                             let expected_ty = param.value_type;
                                             if actual_ty != expected_ty {
-                                                coerced_args[i] = Self::coerce_value(&mut builder, coerced_args[i], actual_ty, expected_ty);
+                                                coerced_args[i] = Self::coerce_value(
+                                                    &mut builder,
+                                                    coerced_args[i],
+                                                    actual_ty,
+                                                    expected_ty,
+                                                );
                                             }
                                         }
                                     }
 
-                                    let func = self.module
+                                    let func = self
+                                        .module
                                         .declare_function(symbol_name, Linkage::Import, &sig)
-                                        .expect(&format!("Failed to declare symbol {}", symbol_name));
+                                        .expect(&format!(
+                                            "Failed to declare symbol {}",
+                                            symbol_name
+                                        ));
 
-                                    let local_func = self.module
-                                        .declare_func_in_func(func, builder.func);
+                                    let local_func =
+                                        self.module.declare_func_in_func(func, builder.func);
 
                                     let call = builder.ins().call(local_func, &coerced_args);
 
@@ -1632,15 +2122,24 @@ impl CraneliftBackend {
                                             self.value_map.insert(*result_id, ret_val);
                                         } else {
                                             // No return value - store dummy with correct type
-                                            let dummy_ty = return_cranelift_ty.unwrap_or(types::I32);
-                                            self.value_map.insert(*result_id, builder.ins().iconst(dummy_ty, 0));
+                                            let dummy_ty =
+                                                return_cranelift_ty.unwrap_or(types::I32);
+                                            self.value_map.insert(
+                                                *result_id,
+                                                builder.ins().iconst(dummy_ty, 0),
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
 
-                        HirInstruction::IndirectCall { result, func_ptr, args, return_ty } => {
+                        HirInstruction::IndirectCall {
+                            result,
+                            func_ptr,
+                            args,
+                            return_ty,
+                        } => {
                             // Indirect call through function pointer (for trait dispatch)
                             let func_ptr_val = match self.value_map.get(func_ptr).copied() {
                                 Some(v) => v,
@@ -1650,7 +2149,8 @@ impl CraneliftBackend {
                                 }
                             };
 
-                            let arg_values: Vec<Value> = args.iter()
+                            let arg_values: Vec<Value> = args
+                                .iter()
                                 .filter_map(|arg_id| self.value_map.get(arg_id).copied())
                                 .collect();
 
@@ -1659,7 +2159,8 @@ impl CraneliftBackend {
 
                             // Add parameters
                             for _ in &arg_values {
-                                sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                                sig.params
+                                    .push(cranelift_codegen::ir::AbiParam::new(types::I64));
                             }
 
                             // Add return type if not void
@@ -1674,11 +2175,15 @@ impl CraneliftBackend {
                             };
 
                             if let Some(ret_ty) = cranelift_return_ty {
-                                sig.returns.push(cranelift_codegen::ir::AbiParam::new(ret_ty));
+                                sig.returns
+                                    .push(cranelift_codegen::ir::AbiParam::new(ret_ty));
                             }
 
                             let sig_ref = builder.import_signature(sig);
-                            let call_inst = builder.ins().call_indirect(sig_ref, func_ptr_val, &arg_values);
+                            let call_inst =
+                                builder
+                                    .ins()
+                                    .call_indirect(sig_ref, func_ptr_val, &arg_values);
 
                             // Map result if present
                             if let Some(result_id) = result {
@@ -1689,7 +2194,12 @@ impl CraneliftBackend {
                             }
                         }
 
-                        HirInstruction::Alloca { result, ty, count, align } => {
+                        HirInstruction::Alloca {
+                            result,
+                            ty,
+                            count,
+                            align,
+                        } => {
                             // Stack allocation
                             let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
 
@@ -1700,10 +2210,12 @@ impl CraneliftBackend {
                                 // For dynamic count, we need to calculate size and use stack_alloc
                                 // For now, create a fixed-size slot and warn
                                 warn!(" Dynamic alloca not fully supported, using fixed size");
-                                builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                    64, // Fixed size for now
-                                ))
+                                builder.create_sized_stack_slot(
+                                    cranelift_codegen::ir::StackSlotData::new(
+                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                        64, // Fixed size for now
+                                    ),
+                                )
                             } else {
                                 // Static allocation (single value)
                                 // IMPORTANT: Check size_cache FIRST because arrays/structs translate
@@ -1722,10 +2234,12 @@ impl CraneliftBackend {
                                     }
                                 };
 
-                                builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                    size,
-                                ))
+                                builder.create_sized_stack_slot(
+                                    cranelift_codegen::ir::StackSlotData::new(
+                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                        size,
+                                    ),
+                                )
                             };
 
                             // Get pointer to stack slot
@@ -1733,11 +2247,21 @@ impl CraneliftBackend {
                             self.value_map.insert(*result, ptr);
                         }
 
-                        HirInstruction::Load { result, ty, ptr, align, volatile } => {
+                        HirInstruction::Load {
+                            result,
+                            ty,
+                            ptr,
+                            align,
+                            volatile,
+                        } => {
                             // Load value from memory
                             let ptr_val = match self.value_map.get(ptr) {
                                 Some(v) => *v,
-                                None => panic!("Load instruction: ptr {:?} not in value_map. Available: {:?}", ptr, self.value_map.keys().collect::<Vec<_>>()),
+                                None => panic!(
+                                    "Load instruction: ptr {:?} not in value_map. Available: {:?}",
+                                    ptr,
+                                    self.value_map.keys().collect::<Vec<_>>()
+                                ),
                             };
                             let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
 
@@ -1748,7 +2272,12 @@ impl CraneliftBackend {
                             self.value_map.insert(*result, loaded);
                         }
 
-                        HirInstruction::Store { value, ptr, align, volatile } => {
+                        HirInstruction::Store {
+                            value,
+                            ptr,
+                            align,
+                            volatile,
+                        } => {
                             // Store value to memory
                             let val = self.value_map[value];
                             let ptr_val = self.value_map[ptr];
@@ -1760,7 +2289,12 @@ impl CraneliftBackend {
                             // Store has no result value
                         }
 
-                        HirInstruction::GetElementPtr { result, ty, ptr, indices } => {
+                        HirInstruction::GetElementPtr {
+                            result,
+                            ty,
+                            ptr,
+                            indices,
+                        } => {
                             // Calculate pointer offset for struct field or array element access
                             let mut current_ptr = self.value_map[ptr];
                             let mut current_type = ty.clone();
@@ -1771,7 +2305,8 @@ impl CraneliftBackend {
                                 match &current_type {
                                     HirType::Ptr(inner) => {
                                         // Pointer dereference - calculate offset
-                                        let elem_size = size_cache.get(&**inner).copied().unwrap_or(1) as i64;
+                                        let elem_size =
+                                            size_cache.get(&**inner).copied().unwrap_or(1) as i64;
 
                                         // offset = index * elem_size
                                         let size_val = builder.ins().iconst(types::I64, elem_size);
@@ -1781,7 +2316,8 @@ impl CraneliftBackend {
                                     }
                                     HirType::Array(elem_ty, _) => {
                                         // Array indexing
-                                        let elem_size = size_cache.get(&**elem_ty).copied().unwrap_or(1) as i64;
+                                        let elem_size =
+                                            size_cache.get(&**elem_ty).copied().unwrap_or(1) as i64;
 
                                         let size_val = builder.ins().iconst(types::I64, elem_size);
                                         let offset = builder.ins().imul(index, size_val);
@@ -1791,8 +2327,12 @@ impl CraneliftBackend {
                                     HirType::Struct(struct_ty) => {
                                         // Struct field access - index must be a constant
                                         // Extract the constant field index
-                                        let field_index = if let Some(&const_val) = const_value_cache.get(index_id) {
-                                            if const_val >= 0 && (const_val as usize) < struct_ty.fields.len() {
+                                        let field_index = if let Some(&const_val) =
+                                            const_value_cache.get(index_id)
+                                        {
+                                            if const_val >= 0
+                                                && (const_val as usize) < struct_ty.fields.len()
+                                            {
                                                 const_val as usize
                                             } else {
                                                 warn!(" GEP struct field index {} out of bounds (struct has {} fields)",
@@ -1805,10 +2345,17 @@ impl CraneliftBackend {
                                         };
 
                                         if let Some(layout) = struct_layout_cache.get(struct_ty) {
-                                            if let Some(&field_offset) = layout.field_offsets.get(field_index) {
-                                                let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                current_ptr = builder.ins().iadd(current_ptr, offset_val);
-                                                if let Some(field_ty) = struct_ty.fields.get(field_index) {
+                                            if let Some(&field_offset) =
+                                                layout.field_offsets.get(field_index)
+                                            {
+                                                let offset_val = builder
+                                                    .ins()
+                                                    .iconst(types::I64, field_offset as i64);
+                                                current_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
+                                                if let Some(field_ty) =
+                                                    struct_ty.fields.get(field_index)
+                                                {
                                                     current_type = field_ty.clone();
                                                 }
                                             }
@@ -1833,7 +2380,12 @@ impl CraneliftBackend {
                             self.value_map.insert(*result, current_ptr);
                         }
 
-                        HirInstruction::CreateUnion { result, union_ty: _, variant_index, value } => {
+                        HirInstruction::CreateUnion {
+                            result,
+                            union_ty: _,
+                            variant_index,
+                            value,
+                        } => {
                             // Create a tagged union value
                             // TODO: Calculate proper union layout - for now use fixed size of 16 bytes
                             // (4 bytes discriminant + 12 bytes data, sufficient for i32/i64/ptr)
@@ -1843,18 +2395,23 @@ impl CraneliftBackend {
                             // Allocate space for the union on the stack
                             let union_slot = builder.create_sized_stack_slot(StackSlotData::new(
                                 StackSlotKind::ExplicitSlot,
-                                union_size
+                                union_size,
                             ));
                             let union_ptr = builder.ins().stack_addr(ptr_ty, union_slot, 0);
 
                             // Store the discriminant in the first field
-                            let discriminant = builder.ins().iconst(types::I32, *variant_index as i64);
-                            builder.ins().store(MemFlags::new(), discriminant, union_ptr, 0);
+                            let discriminant =
+                                builder.ins().iconst(types::I32, *variant_index as i64);
+                            builder
+                                .ins()
+                                .store(MemFlags::new(), discriminant, union_ptr, 0);
 
                             // Store the value in the data field (after discriminant)
                             let value_val = self.value_map[value];
                             let data_offset = 4; // Assuming 4-byte discriminant
-                            builder.ins().store(MemFlags::new(), value_val, union_ptr, data_offset);
+                            builder
+                                .ins()
+                                .store(MemFlags::new(), value_val, union_ptr, data_offset);
 
                             self.value_map.insert(*result, union_ptr);
                         }
@@ -1866,12 +2423,17 @@ impl CraneliftBackend {
                                 types::I32,
                                 MemFlags::new(),
                                 union_ptr,
-                                0 // Discriminant is at offset 0
+                                0, // Discriminant is at offset 0
                             );
                             self.value_map.insert(*result, discriminant);
                         }
 
-                        HirInstruction::ExtractUnionValue { result, ty, union_val, variant_index: _ } => {
+                        HirInstruction::ExtractUnionValue {
+                            result,
+                            ty,
+                            union_val,
+                            variant_index: _,
+                        } => {
                             // Extract value from union variant (unsafe - assumes correct variant)
                             let union_ptr = self.value_map[union_val];
                             // Use type_cache if available, otherwise default to i64
@@ -1882,24 +2444,32 @@ impl CraneliftBackend {
                                 cranelift_ty,
                                 MemFlags::new(),
                                 union_ptr,
-                                data_offset
+                                data_offset,
                             );
                             self.value_map.insert(*result, value);
                         }
 
-                        HirInstruction::CreateTraitObject { result, trait_id, data_ptr, vtable_id } => {
+                        HirInstruction::CreateTraitObject {
+                            result,
+                            trait_id,
+                            data_ptr,
+                            vtable_id,
+                        } => {
                             // Create trait object as fat pointer: { *data, *vtable }
                             // A trait object is represented as a struct with two pointer fields
 
                             // Get the data pointer value
-                            let data_ptr_val = self.value_map.get(data_ptr).copied()
+                            let data_ptr_val = self
+                                .value_map
+                                .get(data_ptr)
+                                .copied()
                                 .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
 
                             // Get the vtable pointer
                             // Note: Vtable globals may not be in value_map yet during compilation
                             // They will be resolved during linking/finalization
-                            let vtable_ptr_val = self.value_map.get(vtable_id).copied()
-                                .unwrap_or_else(|| {
+                            let vtable_ptr_val =
+                                self.value_map.get(vtable_id).copied().unwrap_or_else(|| {
                                     // Use placeholder - actual vtable address resolved at link time
                                     builder.ins().iconst(types::I64, 0)
                                 });
@@ -1907,20 +2477,18 @@ impl CraneliftBackend {
                             // Allocate space for fat pointer on stack (2 pointers = 16 bytes on 64-bit)
                             let ptr_type = self.module.target_config().pointer_type();
                             let fat_ptr_size = ptr_type.bytes() * 2; // 2 pointers
-                            let stack_slot = builder.create_sized_stack_slot(
-                                StackSlotData::new(StackSlotKind::ExplicitSlot, fat_ptr_size)
-                            );
+                            let stack_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                fat_ptr_size,
+                            ));
 
                             // Get pointer to stack slot
                             let fat_ptr = builder.ins().stack_addr(ptr_type, stack_slot, 0);
 
                             // Store data pointer at offset 0
-                            builder.ins().store(
-                                MemFlags::new(),
-                                data_ptr_val,
-                                fat_ptr,
-                                0
-                            );
+                            builder
+                                .ins()
+                                .store(MemFlags::new(), data_ptr_val, fat_ptr, 0);
 
                             // Store vtable pointer at offset pointer_size
                             let vtable_offset = ptr_type.bytes() as i32;
@@ -1928,14 +2496,20 @@ impl CraneliftBackend {
                                 MemFlags::new(),
                                 vtable_ptr_val,
                                 fat_ptr,
-                                vtable_offset
+                                vtable_offset,
                             );
 
                             // Return the fat pointer address
                             self.value_map.insert(*result, fat_ptr);
                         }
 
-                        HirInstruction::UpcastTraitObject { result, sub_trait_object, sub_trait_id, super_trait_id, super_vtable_id } => {
+                        HirInstruction::UpcastTraitObject {
+                            result,
+                            sub_trait_object,
+                            sub_trait_id,
+                            super_trait_id,
+                            super_vtable_id,
+                        } => {
                             // Upcast trait object: extract data pointer from sub-trait, combine with super-trait vtable
                             // Fat pointer layout: { *data (offset 0), *vtable (offset ptr_size) }
 
@@ -1943,23 +2517,30 @@ impl CraneliftBackend {
                             let ptr_size = ptr_type.bytes() as i32;
 
                             // Step 1: Get sub-trait fat pointer
-                            let sub_trait_fat_ptr = self.value_map.get(sub_trait_object).copied()
-                                .ok_or_else(|| CompilerError::CodeGen(
-                                    format!("Sub-trait object {:?} not found", sub_trait_object)
-                                ))?;
+                            let sub_trait_fat_ptr = self
+                                .value_map
+                                .get(sub_trait_object)
+                                .copied()
+                                .ok_or_else(|| {
+                                CompilerError::CodeGen(format!(
+                                    "Sub-trait object {:?} not found",
+                                    sub_trait_object
+                                ))
+                            })?;
 
                             // Step 2: Extract data pointer from sub-trait object (offset 0)
-                            let data_ptr = builder.ins().load(
-                                ptr_type,
-                                MemFlags::new(),
-                                sub_trait_fat_ptr,
-                                0
-                            );
+                            let data_ptr =
+                                builder
+                                    .ins()
+                                    .load(ptr_type, MemFlags::new(), sub_trait_fat_ptr, 0);
 
                             // Step 3: Get super-trait vtable pointer
                             // Note: Vtable globals may not be in value_map yet during compilation
                             // They will be resolved during linking/finalization
-                            let super_vtable_ptr = self.value_map.get(super_vtable_id).copied()
+                            let super_vtable_ptr = self
+                                .value_map
+                                .get(super_vtable_id)
+                                .copied()
                                 .unwrap_or_else(|| {
                                     // Use placeholder - actual vtable address resolved at link time
                                     builder.ins().iconst(ptr_type, 0)
@@ -1967,34 +2548,40 @@ impl CraneliftBackend {
 
                             // Step 4: Allocate space for new fat pointer on stack
                             let fat_ptr_size = ptr_type.bytes() * 2;
-                            let stack_slot = builder.create_sized_stack_slot(
-                                StackSlotData::new(StackSlotKind::ExplicitSlot, fat_ptr_size)
-                            );
+                            let stack_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                fat_ptr_size,
+                            ));
 
                             // Get pointer to stack slot
-                            let super_trait_fat_ptr = builder.ins().stack_addr(ptr_type, stack_slot, 0);
+                            let super_trait_fat_ptr =
+                                builder.ins().stack_addr(ptr_type, stack_slot, 0);
 
                             // Step 5: Store data pointer at offset 0 (same as sub-trait)
-                            builder.ins().store(
-                                MemFlags::new(),
-                                data_ptr,
-                                super_trait_fat_ptr,
-                                0
-                            );
+                            builder
+                                .ins()
+                                .store(MemFlags::new(), data_ptr, super_trait_fat_ptr, 0);
 
                             // Step 6: Store super-trait vtable pointer at offset ptr_size
                             builder.ins().store(
                                 MemFlags::new(),
                                 super_vtable_ptr,
                                 super_trait_fat_ptr,
-                                ptr_size
+                                ptr_size,
                             );
 
                             // Return the new fat pointer
                             self.value_map.insert(*result, super_trait_fat_ptr);
                         }
 
-                        HirInstruction::TraitMethodCall { result, trait_object, method_index, method_sig, args, return_ty } => {
+                        HirInstruction::TraitMethodCall {
+                            result,
+                            trait_object,
+                            method_index,
+                            method_sig,
+                            args,
+                            return_ty,
+                        } => {
                             // Dynamic dispatch: call method on trait object
                             // Fat pointer layout: { *data (offset 0), *vtable (offset ptr_size) }
 
@@ -2002,10 +2589,13 @@ impl CraneliftBackend {
                             let ptr_size = ptr_type.bytes() as i32;
 
                             // Get fat pointer (trait object)
-                            let fat_ptr = self.value_map.get(trait_object).copied()
-                                .ok_or_else(|| CompilerError::CodeGen(
-                                    format!("Trait object {:?} not found", trait_object)
-                                ))?;
+                            let fat_ptr =
+                                self.value_map.get(trait_object).copied().ok_or_else(|| {
+                                    CompilerError::CodeGen(format!(
+                                        "Trait object {:?} not found",
+                                        trait_object
+                                    ))
+                                })?;
 
                             // TODO: Type-safe signatures
                             // Current limitation: Using ptr_type for all parameters
@@ -2015,20 +2605,14 @@ impl CraneliftBackend {
                             let _ = method_sig; // Silence unused warning
 
                             // Step 1: Load data pointer from fat_ptr[0]
-                            let data_ptr = builder.ins().load(
-                                ptr_type,
-                                MemFlags::new(),
-                                fat_ptr,
-                                0
-                            );
+                            let data_ptr =
+                                builder.ins().load(ptr_type, MemFlags::new(), fat_ptr, 0);
 
                             // Step 2: Load vtable pointer from fat_ptr[ptr_size]
-                            let vtable_ptr = builder.ins().load(
-                                ptr_type,
-                                MemFlags::new(),
-                                fat_ptr,
-                                ptr_size
-                            );
+                            let vtable_ptr =
+                                builder
+                                    .ins()
+                                    .load(ptr_type, MemFlags::new(), fat_ptr, ptr_size);
 
                             // Step 3: Load function pointer from vtable[method_index]
                             let method_offset = (*method_index as i32) * ptr_size;
@@ -2036,16 +2620,19 @@ impl CraneliftBackend {
                                 ptr_type,
                                 MemFlags::new(),
                                 vtable_ptr,
-                                method_offset
+                                method_offset,
                             );
 
                             // Step 4: Build arguments: prepend self (data_ptr) to args
                             let mut call_args = vec![data_ptr];
                             for arg_id in args {
-                                let arg_val = self.value_map.get(arg_id).copied()
-                                    .ok_or_else(|| CompilerError::CodeGen(
-                                        format!("Argument {:?} not found", arg_id)
-                                    ))?;
+                                let arg_val =
+                                    self.value_map.get(arg_id).copied().ok_or_else(|| {
+                                        CompilerError::CodeGen(format!(
+                                            "Argument {:?} not found",
+                                            arg_id
+                                        ))
+                                    })?;
                                 call_args.push(arg_val);
                             }
 
@@ -2082,13 +2669,20 @@ impl CraneliftBackend {
                             }
                         }
 
-                        HirInstruction::CreateClosure { result, closure_ty, function, captures } => {
+                        HirInstruction::CreateClosure {
+                            result,
+                            closure_ty,
+                            function,
+                            captures,
+                        } => {
                             // Create a closure with function pointer
                             let ptr_ty = self.module.target_config().pointer_type();
 
                             // For simple single-block functions, just return the function pointer
                             if let Some(&cranelift_func_id) = self.function_map.get(function) {
-                                let local_func_ref = self.module.declare_func_in_func(cranelift_func_id, builder.func);
+                                let local_func_ref = self
+                                    .module
+                                    .declare_func_in_func(cranelift_func_id, builder.func);
                                 let func_ptr = builder.ins().func_addr(ptr_ty, local_func_ref);
                                 self.value_map.insert(*result, func_ptr);
                             } else {
@@ -2098,7 +2692,12 @@ impl CraneliftBackend {
                             }
                         }
 
-                        HirInstruction::ExtractValue { result, ty, aggregate, indices } => {
+                        HirInstruction::ExtractValue {
+                            result,
+                            ty,
+                            aggregate,
+                            indices,
+                        } => {
                             // Extract value from aggregate (struct/array)
                             // Strategy: Use GEP-like logic to calculate pointer, then Load the value
 
@@ -2106,7 +2705,8 @@ impl CraneliftBackend {
                             let mut current_ptr = self.value_map[aggregate];
 
                             // Get the type of the aggregate from our cache
-                            let mut current_type = value_type_cache.get(aggregate)
+                            let mut current_type = value_type_cache
+                                .get(aggregate)
                                 .cloned()
                                 .unwrap_or(HirType::Void);
 
@@ -2118,9 +2718,11 @@ impl CraneliftBackend {
                             if indices.is_empty() {
                                 // No indices - this shouldn't happen, but handle gracefully
                                 // Just load the value at the pointer
-                                let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
+                                let cranelift_ty =
+                                    type_cache.get(ty).copied().unwrap_or(types::I64);
                                 let flags = cranelift_codegen::ir::MemFlags::new();
-                                let loaded = builder.ins().load(cranelift_ty, flags, current_ptr, 0);
+                                let loaded =
+                                    builder.ins().load(cranelift_ty, flags, current_ptr, 0);
                                 self.value_map.insert(*result, loaded);
                             } else {
                                 // Navigate through indices using GEP-like logic
@@ -2130,22 +2732,36 @@ impl CraneliftBackend {
                                     match &current_type {
                                         HirType::Array(elem_ty, _) => {
                                             // Array indexing - index can be constant or we treat it as constant
-                                            let elem_size = size_cache.get(&**elem_ty).copied().unwrap_or(1) as i64;
+                                            let elem_size =
+                                                size_cache.get(&**elem_ty).copied().unwrap_or(1)
+                                                    as i64;
                                             let offset = (index_u32 as i64) * elem_size;
 
                                             if !is_last {
                                                 // Intermediate: just calculate new pointer
-                                                let offset_val = builder.ins().iconst(types::I64, offset);
-                                                current_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                let offset_val =
+                                                    builder.ins().iconst(types::I64, offset);
+                                                current_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
                                                 current_type = (**elem_ty).clone();
                                             } else {
                                                 // Last index: calculate pointer and load
-                                                let offset_val = builder.ins().iconst(types::I64, offset);
-                                                let elem_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                let offset_val =
+                                                    builder.ins().iconst(types::I64, offset);
+                                                let elem_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
 
-                                                let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
+                                                let cranelift_ty = type_cache
+                                                    .get(ty)
+                                                    .copied()
+                                                    .unwrap_or(types::I64);
                                                 let flags = cranelift_codegen::ir::MemFlags::new();
-                                                let loaded = builder.ins().load(cranelift_ty, flags, elem_ptr, 0);
+                                                let loaded = builder.ins().load(
+                                                    cranelift_ty,
+                                                    flags,
+                                                    elem_ptr,
+                                                    0,
+                                                );
                                                 self.value_map.insert(*result, loaded);
                                             }
                                         }
@@ -2153,23 +2769,47 @@ impl CraneliftBackend {
                                             // Struct field access - index is always constant
                                             let field_index = index_u32 as usize;
 
-                                            if let Some(layout) = struct_layout_cache.get(struct_ty) {
-                                                if let Some(&field_offset) = layout.field_offsets.get(field_index) {
+                                            if let Some(layout) = struct_layout_cache.get(struct_ty)
+                                            {
+                                                if let Some(&field_offset) =
+                                                    layout.field_offsets.get(field_index)
+                                                {
                                                     if !is_last {
                                                         // Intermediate: calculate new pointer
-                                                        let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                        current_ptr = builder.ins().iadd(current_ptr, offset_val);
-                                                        if let Some(field_ty) = struct_ty.fields.get(field_index) {
+                                                        let offset_val = builder.ins().iconst(
+                                                            types::I64,
+                                                            field_offset as i64,
+                                                        );
+                                                        current_ptr = builder
+                                                            .ins()
+                                                            .iadd(current_ptr, offset_val);
+                                                        if let Some(field_ty) =
+                                                            struct_ty.fields.get(field_index)
+                                                        {
                                                             current_type = field_ty.clone();
                                                         }
                                                     } else {
                                                         // Last index: calculate pointer and load
-                                                        let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                        let field_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                        let offset_val = builder.ins().iconst(
+                                                            types::I64,
+                                                            field_offset as i64,
+                                                        );
+                                                        let field_ptr = builder
+                                                            .ins()
+                                                            .iadd(current_ptr, offset_val);
 
-                                                        let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
-                                                        let flags = cranelift_codegen::ir::MemFlags::new();
-                                                        let loaded = builder.ins().load(cranelift_ty, flags, field_ptr, 0);
+                                                        let cranelift_ty = type_cache
+                                                            .get(ty)
+                                                            .copied()
+                                                            .unwrap_or(types::I64);
+                                                        let flags =
+                                                            cranelift_codegen::ir::MemFlags::new();
+                                                        let loaded = builder.ins().load(
+                                                            cranelift_ty,
+                                                            flags,
+                                                            field_ptr,
+                                                            0,
+                                                        );
                                                         self.value_map.insert(*result, loaded);
                                                     }
                                                 }
@@ -2193,34 +2833,57 @@ impl CraneliftBackend {
 
                                             if !is_last {
                                                 // Intermediate: calculate new pointer
-                                                let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                current_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                let offset_val = builder
+                                                    .ins()
+                                                    .iconst(types::I64, field_offset as i64);
+                                                current_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
                                                 // Update current_type based on what we're extracting
                                                 if field_index == 0 {
                                                     // Discriminant field
-                                                    current_type = union_def.discriminant_type.as_ref().clone();
+                                                    current_type = union_def
+                                                        .discriminant_type
+                                                        .as_ref()
+                                                        .clone();
                                                 } else {
                                                     // Data field - use the first variant's type as representative
                                                     // (all variants share the same memory location)
-                                                    if let Some(variant) = union_def.variants.first() {
+                                                    if let Some(variant) =
+                                                        union_def.variants.first()
+                                                    {
                                                         current_type = variant.ty.clone();
                                                     }
                                                 }
                                             } else {
                                                 // Last index: calculate pointer and load
-                                                let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                let field_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                let offset_val = builder
+                                                    .ins()
+                                                    .iconst(types::I64, field_offset as i64);
+                                                let field_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
 
-                                                let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
+                                                let cranelift_ty = type_cache
+                                                    .get(ty)
+                                                    .copied()
+                                                    .unwrap_or(types::I64);
                                                 let flags = cranelift_codegen::ir::MemFlags::new();
-                                                let loaded = builder.ins().load(cranelift_ty, flags, field_ptr, 0);
+                                                let loaded = builder.ins().load(
+                                                    cranelift_ty,
+                                                    flags,
+                                                    field_ptr,
+                                                    0,
+                                                );
                                                 self.value_map.insert(*result, loaded);
                                             }
                                         }
                                         _ => {
                                             // Unsupported type - just return a dummy value
-                                            warn!(" ExtractValue on unsupported type: {:?}", current_type);
-                                            let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
+                                            warn!(
+                                                " ExtractValue on unsupported type: {:?}",
+                                                current_type
+                                            );
+                                            let cranelift_ty =
+                                                type_cache.get(ty).copied().unwrap_or(types::I64);
                                             let dummy = builder.ins().iconst(cranelift_ty, 0);
                                             self.value_map.insert(*result, dummy);
                                             break;
@@ -2230,11 +2893,18 @@ impl CraneliftBackend {
                             }
                         }
 
-                        HirInstruction::InsertValue { result, ty: _, aggregate, value, indices } => {
+                        HirInstruction::InsertValue {
+                            result,
+                            ty: _,
+                            aggregate,
+                            value,
+                            indices,
+                        } => {
                             // Insert value into aggregate (struct/array)
 
                             // Get the type of the aggregate from our cache
-                            let mut current_type = value_type_cache.get(aggregate)
+                            let mut current_type = value_type_cache
+                                .get(aggregate)
                                 .cloned()
                                 .unwrap_or(HirType::Void);
 
@@ -2246,10 +2916,14 @@ impl CraneliftBackend {
                             // Special case: single-field struct being returned by value
                             // In this case, the struct is flattened and we just return the value
                             if let HirType::Struct(struct_ty) = &current_type {
-                                if struct_ty.fields.len() == 1 && indices.len() == 1 && indices[0] == 0 {
+                                if struct_ty.fields.len() == 1
+                                    && indices.len() == 1
+                                    && indices[0] == 0
+                                {
                                     // Check if the aggregate is Undef (building a new struct for return)
                                     if let Some(agg_value) = function.values.get(aggregate) {
-                                        if matches!(agg_value.kind, crate::hir::HirValueKind::Undef) {
+                                        if matches!(agg_value.kind, crate::hir::HirValueKind::Undef)
+                                        {
                                             // Flattened single-field struct: just return the value directly
                                             let val = self.value_map[value];
                                             self.value_map.insert(*result, val);
@@ -2277,18 +2951,24 @@ impl CraneliftBackend {
                                     match &current_type {
                                         HirType::Array(elem_ty, _) => {
                                             // Array indexing
-                                            let elem_size = size_cache.get(&**elem_ty).copied().unwrap_or(1) as i64;
+                                            let elem_size =
+                                                size_cache.get(&**elem_ty).copied().unwrap_or(1)
+                                                    as i64;
                                             let offset = (index_u32 as i64) * elem_size;
 
                                             if !is_last {
                                                 // Intermediate: calculate new pointer
-                                                let offset_val = builder.ins().iconst(types::I64, offset);
-                                                current_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                let offset_val =
+                                                    builder.ins().iconst(types::I64, offset);
+                                                current_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
                                                 current_type = (**elem_ty).clone();
                                             } else {
                                                 // Last index: calculate pointer and store
-                                                let offset_val = builder.ins().iconst(types::I64, offset);
-                                                let elem_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                let offset_val =
+                                                    builder.ins().iconst(types::I64, offset);
+                                                let elem_ptr =
+                                                    builder.ins().iadd(current_ptr, offset_val);
 
                                                 let flags = cranelift_codegen::ir::MemFlags::new();
                                                 builder.ins().store(flags, val, elem_ptr, 0);
@@ -2299,22 +2979,40 @@ impl CraneliftBackend {
                                             // Struct field access
                                             let field_index = index_u32 as usize;
 
-                                            if let Some(layout) = struct_layout_cache.get(struct_ty) {
-                                                if let Some(&field_offset) = layout.field_offsets.get(field_index) {
+                                            if let Some(layout) = struct_layout_cache.get(struct_ty)
+                                            {
+                                                if let Some(&field_offset) =
+                                                    layout.field_offsets.get(field_index)
+                                                {
                                                     if !is_last {
                                                         // Intermediate: calculate new pointer
-                                                        let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                        current_ptr = builder.ins().iadd(current_ptr, offset_val);
-                                                        if let Some(field_ty) = struct_ty.fields.get(field_index) {
+                                                        let offset_val = builder.ins().iconst(
+                                                            types::I64,
+                                                            field_offset as i64,
+                                                        );
+                                                        current_ptr = builder
+                                                            .ins()
+                                                            .iadd(current_ptr, offset_val);
+                                                        if let Some(field_ty) =
+                                                            struct_ty.fields.get(field_index)
+                                                        {
                                                             current_type = field_ty.clone();
                                                         }
                                                     } else {
                                                         // Last index: calculate pointer and store
-                                                        let offset_val = builder.ins().iconst(types::I64, field_offset as i64);
-                                                        let field_ptr = builder.ins().iadd(current_ptr, offset_val);
+                                                        let offset_val = builder.ins().iconst(
+                                                            types::I64,
+                                                            field_offset as i64,
+                                                        );
+                                                        let field_ptr = builder
+                                                            .ins()
+                                                            .iadd(current_ptr, offset_val);
 
-                                                        let flags = cranelift_codegen::ir::MemFlags::new();
-                                                        builder.ins().store(flags, val, field_ptr, 0);
+                                                        let flags =
+                                                            cranelift_codegen::ir::MemFlags::new();
+                                                        builder
+                                                            .ins()
+                                                            .store(flags, val, field_ptr, 0);
                                                         self.value_map.insert(*result, base_ptr);
                                                     }
                                                 }
@@ -2331,10 +3029,16 @@ impl CraneliftBackend {
                             }
                         }
 
-                        HirInstruction::Cast { result, ty, op, operand } => {
+                        HirInstruction::Cast {
+                            result,
+                            ty,
+                            op,
+                            operand,
+                        } => {
                             // Cast instruction: convert between types
-                            let val = self.value_map.get(operand).copied()
-                                .unwrap_or_else(|| panic!("Cast operand {:?} not in value_map", operand));
+                            let val = self.value_map.get(operand).copied().unwrap_or_else(|| {
+                                panic!("Cast operand {:?} not in value_map", operand)
+                            });
                             // Use type_cache directly - types should be pre-cached
                             let target_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
 
@@ -2343,12 +3047,22 @@ impl CraneliftBackend {
                                 crate::hir::CastOp::ZExt => builder.ins().uextend(target_ty, val),
                                 crate::hir::CastOp::SExt => builder.ins().sextend(target_ty, val),
                                 crate::hir::CastOp::Trunc => builder.ins().ireduce(target_ty, val),
-                                crate::hir::CastOp::FpToSi => builder.ins().fcvt_to_sint(target_ty, val),
-                                crate::hir::CastOp::FpToUi => builder.ins().fcvt_to_uint(target_ty, val),
-                                crate::hir::CastOp::SiToFp => builder.ins().fcvt_from_sint(target_ty, val),
-                                crate::hir::CastOp::UiToFp => builder.ins().fcvt_from_uint(target_ty, val),
+                                crate::hir::CastOp::FpToSi => {
+                                    builder.ins().fcvt_to_sint(target_ty, val)
+                                }
+                                crate::hir::CastOp::FpToUi => {
+                                    builder.ins().fcvt_to_uint(target_ty, val)
+                                }
+                                crate::hir::CastOp::SiToFp => {
+                                    builder.ins().fcvt_from_sint(target_ty, val)
+                                }
+                                crate::hir::CastOp::UiToFp => {
+                                    builder.ins().fcvt_from_uint(target_ty, val)
+                                }
                                 crate::hir::CastOp::FpExt => builder.ins().fpromote(target_ty, val),
-                                crate::hir::CastOp::FpTrunc => builder.ins().fdemote(target_ty, val),
+                                crate::hir::CastOp::FpTrunc => {
+                                    builder.ins().fdemote(target_ty, val)
+                                }
                                 _ => val, // PtrToInt, IntToPtr handled as bitcasts for now
                             };
 
@@ -2358,8 +3072,13 @@ impl CraneliftBackend {
                         // ================================================================
                         // Algebraic Effects Instructions (Tier 1: Simple Effects)
                         // ================================================================
-
-                        HirInstruction::PerformEffect { result, effect_id, op_name, args, return_ty } => {
+                        HirInstruction::PerformEffect {
+                            result,
+                            effect_id,
+                            op_name,
+                            args,
+                            return_ty,
+                        } => {
                             // Tier 1 implementation: Direct call to handler function
                             //
                             // For simple (non-resumable) effects, we can compile PerformEffect
@@ -2369,37 +3088,53 @@ impl CraneliftBackend {
                             // For now, we use a simple implementation that calls a mangled function.
 
                             // Look up the handler for this effect in the module
-                            let handler_func_name = if let Some(handler) = hir_module.handlers.values()
+                            let handler_func_name = if let Some(handler) = hir_module
+                                .handlers
+                                .values()
                                 .find(|h| h.effect_id == *effect_id)
                             {
                                 // Find the operation implementation
-                                if let Some(impl_) = handler.implementations.iter()
+                                if let Some(impl_) = handler
+                                    .implementations
+                                    .iter()
                                     .find(|i| i.op_name == *op_name)
                                 {
                                     mangle_handler_op_name(handler.name, impl_.op_name)
                                 } else {
-                                    warn!("[Effect] No implementation for operation {:?} in handler", op_name);
+                                    warn!(
+                                        "[Effect] No implementation for operation {:?} in handler",
+                                        op_name
+                                    );
                                     // Fall through to trap
                                     if let Some(result_id) = result {
-                                        self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                        self.value_map.insert(
+                                            *result_id,
+                                            builder.ins().iconst(types::I64, 0),
+                                        );
                                     }
                                     continue;
                                 }
                             } else {
                                 warn!("[Effect] No handler found for effect {:?}", effect_id);
                                 // Unhandled effect - trap at runtime
-                                builder.ins().trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                builder
+                                    .ins()
+                                    .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
                                 if let Some(result_id) = result {
-                                    self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                    self.value_map
+                                        .insert(*result_id, builder.ins().iconst(types::I64, 0));
                                 }
                                 continue;
                             };
 
                             // Try to find the handler function in the module
                             // Look up by name in hir_module.functions, then get FuncId from function_map
-                            let handler_hir_id = hir_module.functions.iter()
+                            let handler_hir_id = hir_module
+                                .functions
+                                .iter()
                                 .find(|(_, f)| {
-                                    f.name.resolve_global()
+                                    f.name
+                                        .resolve_global()
                                         .map(|n| n == handler_func_name)
                                         .unwrap_or(false)
                                 })
@@ -2408,8 +3143,10 @@ impl CraneliftBackend {
                             if let Some(hir_id) = handler_hir_id {
                                 if let Some(&func_id) = self.function_map.get(&hir_id) {
                                     // Direct call to compiled handler
-                                    let local_callee = self.module.declare_func_in_func(func_id, builder.func);
-                                    let arg_values: Vec<Value> = args.iter()
+                                    let local_callee =
+                                        self.module.declare_func_in_func(func_id, builder.func);
+                                    let arg_values: Vec<Value> = args
+                                        .iter()
                                         .filter_map(|a| self.value_map.get(a).copied())
                                         .collect();
                                     let call = builder.ins().call(local_callee, &arg_values);
@@ -2418,7 +3155,10 @@ impl CraneliftBackend {
                                             self.value_map.insert(*result_id, ret_val);
                                         } else if matches!(return_ty, HirType::Void) {
                                             // Void return - create dummy value
-                                            self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                            self.value_map.insert(
+                                                *result_id,
+                                                builder.ins().iconst(types::I64, 0),
+                                            );
                                         }
                                     }
                                     continue;
@@ -2445,33 +3185,58 @@ impl CraneliftBackend {
                                     sig.returns.push(AbiParam::new(return_cranelift_ty));
                                 }
 
-                                match self.module.declare_function(&handler_func_name, Linkage::Import, &sig) {
+                                match self.module.declare_function(
+                                    &handler_func_name,
+                                    Linkage::Import,
+                                    &sig,
+                                ) {
                                     Ok(extern_func_id) => {
-                                        let local_callee = self.module.declare_func_in_func(extern_func_id, builder.func);
-                                        let arg_values: Vec<Value> = args.iter()
+                                        let local_callee = self
+                                            .module
+                                            .declare_func_in_func(extern_func_id, builder.func);
+                                        let arg_values: Vec<Value> = args
+                                            .iter()
                                             .filter_map(|a| self.value_map.get(a).copied())
                                             .collect();
                                         let call = builder.ins().call(local_callee, &arg_values);
                                         if let Some(result_id) = result {
-                                            if let Some(&ret_val) = builder.inst_results(call).first() {
+                                            if let Some(&ret_val) =
+                                                builder.inst_results(call).first()
+                                            {
                                                 self.value_map.insert(*result_id, ret_val);
                                             } else if matches!(return_ty, HirType::Void) {
                                                 // Void return - create dummy value
-                                                self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                                self.value_map.insert(
+                                                    *result_id,
+                                                    builder.ins().iconst(types::I64, 0),
+                                                );
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("[Effect] Failed to declare handler function {}: {}", handler_func_name, e);
+                                        warn!(
+                                            "[Effect] Failed to declare handler function {}: {}",
+                                            handler_func_name, e
+                                        );
                                         if let Some(result_id) = result {
-                                            self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                            self.value_map.insert(
+                                                *result_id,
+                                                builder.ins().iconst(types::I64, 0),
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
 
-                        HirInstruction::HandleEffect { result, handler_id, handler_state, body_block, continuation_block, return_ty } => {
+                        HirInstruction::HandleEffect {
+                            result,
+                            handler_id,
+                            handler_state,
+                            body_block,
+                            continuation_block,
+                            return_ty,
+                        } => {
                             // Tier 1 implementation: Inline handler scope
                             //
                             // For simple effects, HandleEffect sets up a handler context and
@@ -2482,8 +3247,11 @@ impl CraneliftBackend {
                             // TODO: Handle stateful handlers (allocate state)
 
                             if let Some(handler) = hir_module.handlers.get(handler_id) {
-                                log::debug!("[Effect] HandleEffect: installing handler {} for effect {:?}",
-                                    handler.name.resolve_global().unwrap_or_default(), handler.effect_id);
+                                log::debug!(
+                                    "[Effect] HandleEffect: installing handler {} for effect {:?}",
+                                    handler.name.resolve_global().unwrap_or_default(),
+                                    handler.effect_id
+                                );
 
                                 // For Tier 1, we simply note the handler is installed.
                                 // The body block will be compiled as part of normal block processing.
@@ -2491,7 +3259,10 @@ impl CraneliftBackend {
 
                                 // Store handler state if needed
                                 if !handler_state.is_empty() {
-                                    log::debug!("[Effect] Handler has {} state values", handler_state.len());
+                                    log::debug!(
+                                        "[Effect] Handler has {} state values",
+                                        handler_state.len()
+                                    );
                                     // TODO: Allocate stack slot for handler state
                                 }
 
@@ -2516,14 +3287,21 @@ impl CraneliftBackend {
                                     _ => types::I64,
                                 };
                                 if matches!(return_ty, HirType::Void) {
-                                    self.value_map.insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                    self.value_map
+                                        .insert(*result_id, builder.ins().iconst(types::I64, 0));
                                 } else {
-                                    self.value_map.insert(*result_id, builder.ins().iconst(return_cranelift_ty, 0));
+                                    self.value_map.insert(
+                                        *result_id,
+                                        builder.ins().iconst(return_cranelift_ty, 0),
+                                    );
                                 }
                             }
                         }
 
-                        HirInstruction::Resume { value, continuation } => {
+                        HirInstruction::Resume {
+                            value,
+                            continuation,
+                        } => {
                             // Tier 1 implementation: No-op for non-resumable handlers
                             //
                             // For simple (non-resumable) handlers, Resume is essentially
@@ -2540,7 +3318,10 @@ impl CraneliftBackend {
                             let _ = (value, continuation); // Suppress unused warnings
                         }
 
-                        HirInstruction::AbortEffect { value, handler_scope } => {
+                        HirInstruction::AbortEffect {
+                            value,
+                            handler_scope,
+                        } => {
                             // Tier 1 implementation: Jump to handler exit
                             //
                             // AbortEffect terminates the handled computation early,
@@ -2549,8 +3330,11 @@ impl CraneliftBackend {
                             // For Tier 1, this can be implemented as a branch to the
                             // continuation block of the handler.
 
-                            log::debug!("[Effect] AbortEffect: aborting handler scope {:?} with value {:?}",
-                                handler_scope, value);
+                            log::debug!(
+                                "[Effect] AbortEffect: aborting handler scope {:?} with value {:?}",
+                                handler_scope,
+                                value
+                            );
 
                             // TODO: Branch to the handler's continuation block
                             // For now, we treat this as returning the value
@@ -2568,21 +3352,28 @@ impl CraneliftBackend {
                             //
                             // For now, we create a null/dummy continuation.
 
-                            warn!("[Effect] CaptureContinuation: Tier 3 feature not yet implemented");
+                            warn!(
+                                "[Effect] CaptureContinuation: Tier 3 feature not yet implemented"
+                            );
 
                             // Create a dummy continuation value (null pointer)
-                            self.value_map.insert(*result, builder.ins().iconst(types::I64, 0));
+                            self.value_map
+                                .insert(*result, builder.ins().iconst(types::I64, 0));
                         }
 
                         // Lifetime instructions (no codegen needed - used for analysis only)
-                        HirInstruction::BeginLifetime { .. } |
-                        HirInstruction::EndLifetime { .. } |
-                        HirInstruction::LifetimeConstraint { .. } => {
+                        HirInstruction::BeginLifetime { .. }
+                        | HirInstruction::EndLifetime { .. }
+                        | HirInstruction::LifetimeConstraint { .. } => {
                             // These are analysis-only instructions, no runtime code needed
                         }
 
                         // Copy instruction (simple value copy)
-                        HirInstruction::Copy { result, source, ty: _ } => {
+                        HirInstruction::Copy {
+                            result,
+                            source,
+                            ty: _,
+                        } => {
                             if let Some(&val) = self.value_map.get(source) {
                                 self.value_map.insert(*result, val);
                             } else {
@@ -2602,11 +3393,15 @@ impl CraneliftBackend {
                 match &hir_block.terminator {
                     HirTerminator::Return { values } => {
                         log::debug!("[Cranelift] Return terminator with values: {:?}", values);
-                        let cranelift_vals: Vec<_> = values.iter()
+                        let cranelift_vals: Vec<_> = values
+                            .iter()
                             .filter_map(|v| {
                                 let result = self.value_map.get(v).copied();
                                 if result.is_none() {
-                                    eprintln!("[Cranelift ERROR] Return value {:?} not in value_map", v);
+                                    eprintln!(
+                                        "[Cranelift ERROR] Return value {:?} not in value_map",
+                                        v
+                                    );
                                 }
                                 result
                             })
@@ -2620,22 +3415,25 @@ impl CraneliftBackend {
 
                         // Inline phi args extraction
                         // FIXED: phi.incoming format is (value, block), not (block, value)
-                        let args: Vec<Value> = if let Some(target_hir_block) = function.blocks.get(target) {
-                            let mut args_vec = Vec::new();
-                            for phi in &target_hir_block.phis {
-                                if let Some((value, _)) = phi.incoming.iter()
-                                    .find(|(_, pred_block)| *pred_block == *hir_block_id)
-                                {
-                                    if let Some(cranelift_val) = self.value_map.get(value) {
-                                        args_vec.push(*cranelift_val);
+                        let args: Vec<Value> =
+                            if let Some(target_hir_block) = function.blocks.get(target) {
+                                let mut args_vec = Vec::new();
+                                for phi in &target_hir_block.phis {
+                                    if let Some((value, _)) = phi
+                                        .incoming
+                                        .iter()
+                                        .find(|(_, pred_block)| *pred_block == *hir_block_id)
+                                    {
+                                        if let Some(cranelift_val) = self.value_map.get(value) {
+                                            args_vec.push(*cranelift_val);
+                                        }
+                                        // Note: Values should now all be in value_map after pure IDF fix
                                     }
-                                    // Note: Values should now all be in value_map after pure IDF fix
                                 }
-                            }
-                            args_vec
-                        } else {
-                            vec![]
-                        };
+                                args_vec
+                            } else {
+                                vec![]
+                            };
 
                         builder.ins().jump(target_block, &args);
 
@@ -2648,36 +3446,56 @@ impl CraneliftBackend {
                         }
                     }
 
-                    HirTerminator::CondBranch { condition, true_target, false_target } => {
+                    HirTerminator::CondBranch {
+                        condition,
+                        true_target,
+                        false_target,
+                    } => {
                         let cond = self.value_map[condition];
                         let true_block = self.block_map[true_target];
                         let false_block = self.block_map[false_target];
 
                         // Inline phi args extraction for true branch
                         // FIXED: phi.incoming format is (value, block), not (block, value)
-                        let true_args: Vec<Value> = if let Some(target_hir_block) = function.blocks.get(true_target) {
-                            target_hir_block.phis.iter().filter_map(|phi| {
-                                phi.incoming.iter()
-                                    .find(|(_, pred_block)| *pred_block == *hir_block_id)
-                                    .and_then(|(value, _)| self.value_map.get(value).copied())
-                            }).collect()
+                        let true_args: Vec<Value> = if let Some(target_hir_block) =
+                            function.blocks.get(true_target)
+                        {
+                            target_hir_block
+                                .phis
+                                .iter()
+                                .filter_map(|phi| {
+                                    phi.incoming
+                                        .iter()
+                                        .find(|(_, pred_block)| *pred_block == *hir_block_id)
+                                        .and_then(|(value, _)| self.value_map.get(value).copied())
+                                })
+                                .collect()
                         } else {
                             vec![]
                         };
 
                         // Inline phi args extraction for false branch
                         // FIXED: phi.incoming format is (value, block), not (block, value)
-                        let false_args: Vec<Value> = if let Some(target_hir_block) = function.blocks.get(false_target) {
-                            target_hir_block.phis.iter().filter_map(|phi| {
-                                phi.incoming.iter()
-                                    .find(|(_, pred_block)| *pred_block == *hir_block_id)
-                                    .and_then(|(value, _)| self.value_map.get(value).copied())
-                            }).collect()
+                        let false_args: Vec<Value> = if let Some(target_hir_block) =
+                            function.blocks.get(false_target)
+                        {
+                            target_hir_block
+                                .phis
+                                .iter()
+                                .filter_map(|phi| {
+                                    phi.incoming
+                                        .iter()
+                                        .find(|(_, pred_block)| *pred_block == *hir_block_id)
+                                        .and_then(|(value, _)| self.value_map.get(value).copied())
+                                })
+                                .collect()
                         } else {
                             vec![]
                         };
 
-                        builder.ins().brif(cond, true_block, &true_args, false_block, &false_args);
+                        builder
+                            .ins()
+                            .brif(cond, true_block, &true_args, false_block, &false_args);
 
                         for target in [true_target, false_target] {
                             let target_block = self.block_map[target];
@@ -2691,7 +3509,11 @@ impl CraneliftBackend {
                         }
                     }
 
-                    HirTerminator::Switch { value, default, cases } => {
+                    HirTerminator::Switch {
+                        value,
+                        default,
+                        cases,
+                    } => {
                         let switch_val = self.value_map[value];
                         let default_block = self.block_map[default];
 
@@ -2721,15 +3543,9 @@ impl CraneliftBackend {
                                 }
                                 HirConstant::I64(v) => builder.ins().iconst(types::I64, *v),
                                 // Unsigned integer types
-                                HirConstant::U8(v) => {
-                                    builder.ins().iconst(types::I8, *v as i64)
-                                }
-                                HirConstant::U16(v) => {
-                                    builder.ins().iconst(types::I16, *v as i64)
-                                }
-                                HirConstant::U32(v) => {
-                                    builder.ins().iconst(types::I32, *v as i64)
-                                }
+                                HirConstant::U8(v) => builder.ins().iconst(types::I8, *v as i64),
+                                HirConstant::U16(v) => builder.ins().iconst(types::I16, *v as i64),
+                                HirConstant::U32(v) => builder.ins().iconst(types::I32, *v as i64),
                                 HirConstant::U64(v) => builder.ins().iconst(types::I64, *v as i64),
                                 _ => continue, // Skip non-integer constants
                             };
@@ -2739,7 +3555,9 @@ impl CraneliftBackend {
 
                             if i == cases.len() - 1 {
                                 // Last case: branch to target or default
-                                builder.ins().brif(cmp, target_block, &[], default_block, &[]);
+                                builder
+                                    .ins()
+                                    .brif(cmp, target_block, &[], default_block, &[]);
                                 current_block_filled = true;
 
                                 // Seal both targets
@@ -2785,10 +3603,15 @@ impl CraneliftBackend {
                         }
                     }
 
-                    HirTerminator::PatternMatch { value, patterns, default } => {
+                    HirTerminator::PatternMatch {
+                        value,
+                        patterns,
+                        default,
+                    } => {
                         // For now, pattern matching on constants is lowered to Switch
                         // Extract constant patterns
-                        let cases: Vec<(HirConstant, HirId)> = patterns.iter()
+                        let cases: Vec<(HirConstant, HirId)> = patterns
+                            .iter()
                             .filter_map(|pattern| {
                                 if let HirPatternKind::Constant(ref c) = pattern.kind {
                                     Some((c.clone(), pattern.target))
@@ -2833,7 +3656,9 @@ impl CraneliftBackend {
                             let cmp = builder.ins().icmp(IntCC::Equal, switch_val, const_val);
 
                             if i == cases.len() - 1 {
-                                builder.ins().brif(cmp, target_block, &[], default_block, &[]);
+                                builder
+                                    .ins()
+                                    .brif(cmp, target_block, &[], default_block, &[]);
                                 current_block_filled = true;
 
                                 for target_id in [target, &default_target] {
@@ -2877,11 +3702,18 @@ impl CraneliftBackend {
                     HirTerminator::Unreachable => {
                         // For void-returning functions, emit a return instead of trap
                         // This handles Haxe/other languages where main() returns Void and has no explicit return
-                        if function.signature.returns.is_empty() ||
-                           function.signature.returns.iter().all(|r| matches!(r, HirType::Void)) {
+                        if function.signature.returns.is_empty()
+                            || function
+                                .signature
+                                .returns
+                                .iter()
+                                .all(|r| matches!(r, HirType::Void))
+                        {
                             builder.ins().return_(&[]);
                         } else {
-                            builder.ins().trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                            builder
+                                .ins()
+                                .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
                         }
                     }
 
@@ -2907,11 +3739,17 @@ impl CraneliftBackend {
         }
 
         // Debug: Print IR after finalize
-        log::debug!("[Cranelift] IR after finalize (inside compile_function_body):\n{}", self.codegen_context.func);
+        log::debug!(
+            "[Cranelift] IR after finalize (inside compile_function_body):\n{}",
+            self.codegen_context.func
+        );
 
         // Verify the generated IR (catches errors before they become cryptic panics)
         if let Err(errors) = verify_function(&self.codegen_context.func, self.module.isa()) {
-            error!("[Cranelift] IR verification failed for function '{}':", function.name);
+            error!(
+                "[Cranelift] IR verification failed for function '{}':",
+                function.name
+            );
             error!("  {}", errors);
             debug!("Function IR dump:\n{}", self.codegen_context.func.display());
             return Err(CompilerError::Backend(format!(
@@ -2925,17 +3763,20 @@ impl CraneliftBackend {
         // self.dump_cranelift_ir(&function.name.to_string());
 
         // Compile the function
-        log::debug!("[Cranelift] About to call define_function for {:?}", function.name);
-        let code = self.module.define_function(
-            func_id,
-            &mut self.codegen_context,
-        ).map_err(|e| {
-            error!("Function compilation failed for: {}", function.name);
-            error!("Error: {}", e);
-            debug!("Function dump:\n{}", self.codegen_context.func.display());
-            CompilerError::Backend(format!("Failed to compile function: {}", e))
-        })?;
-        
+        log::debug!(
+            "[Cranelift] About to call define_function for {:?}",
+            function.name
+        );
+        let code = self
+            .module
+            .define_function(func_id, &mut self.codegen_context)
+            .map_err(|e| {
+                error!("Function compilation failed for: {}", function.name);
+                error!("Error: {}", e);
+                debug!("Function dump:\n{}", self.codegen_context.func.display());
+                CompilerError::Backend(format!("Failed to compile function: {}", e))
+            })?;
+
         // Store compiled function info - will get actual pointer after finalization
         let compiled_func = CompiledFunction {
             function_id: func_id,
@@ -2945,12 +3786,12 @@ impl CraneliftBackend {
             signature: sig,
         };
         self.compiled_functions.insert(id, compiled_func);
-        
+
         // Clear context for next function
         self.codegen_context.clear();
         self.value_map.clear();
         self.block_map.clear();
-        
+
         Ok(())
     }
 
@@ -2964,8 +3805,14 @@ impl CraneliftBackend {
 
         // Declare the global data
         let unique_name = format!("global__{:?}", id);
-        let data_id = self.module
-            .declare_data(&unique_name, cranelift_module::Linkage::Export, false, false)
+        let data_id = self
+            .module
+            .declare_data(
+                &unique_name,
+                cranelift_module::Linkage::Export,
+                false,
+                false,
+            )
             .map_err(|e| CompilerError::CodeGen(format!("Failed to declare global: {}", e)))?;
 
         // For now, just define empty data
@@ -2987,21 +3834,30 @@ impl CraneliftBackend {
                 // Get the FuncId from function_map
                 if let Some(func_id) = self.function_map.get(&method_entry.function_id) {
                     // Declare function in data context - this gives us a FuncRef
-                    let func_ref = self.module.declare_func_in_data(*func_id, &mut self.data_desc);
+                    let func_ref = self
+                        .module
+                        .declare_func_in_data(*func_id, &mut self.data_desc);
 
                     // Write function address at appropriate offset
                     let offset = (index * ptr_size) as u32;
                     self.data_desc.write_function_addr(offset, func_ref);
                 } else {
-                    warn!(" Vtable method function {:?} not found in function_map", method_entry.function_id);
+                    warn!(
+                        " Vtable method function {:?} not found in function_map",
+                        method_entry.function_id
+                    );
                 }
             }
 
-            info!("Vtable with {} methods emitted with function pointer relocations", vtable.methods.len());
+            info!(
+                "Vtable with {} methods emitted with function pointer relocations",
+                vtable.methods.len()
+            );
         } else if let Some(HirConstant::String(s)) = &global.initializer {
             // String constants - emit as ZRTL String format: [length: i32][utf8_bytes...]
-            let string_val = s.resolve_global()
-                .ok_or_else(|| CompilerError::CodeGen(format!("Failed to resolve string constant: {:?}", s)))?;
+            let string_val = s.resolve_global().ok_or_else(|| {
+                CompilerError::CodeGen(format!("Failed to resolve string constant: {:?}", s))
+            })?;
 
             // Get UTF-8 bytes
             let bytes = string_val.as_bytes();
@@ -3039,8 +3895,14 @@ impl CraneliftBackend {
 
     /// Translate function signature
     pub fn translate_signature(&self, function: &HirFunction) -> CompilerResult<Signature> {
-        log::debug!("[Cranelift] translate_signature for function {:?}", function.name);
-        log::debug!("[Cranelift]   params: {:?}", function.signature.params.len());
+        log::debug!(
+            "[Cranelift] translate_signature for function {:?}",
+            function.name
+        );
+        log::debug!(
+            "[Cranelift]   params: {:?}",
+            function.signature.params.len()
+        );
         log::debug!("[Cranelift]   returns: {:?}", function.signature.returns);
 
         let mut cranelift_sig = self.module.make_signature();
@@ -3055,16 +3917,16 @@ impl CraneliftBackend {
                 // Use the default calling convention from make_signature()
                 // which is platform-native (AppleAarch64 on ARM Mac, SystemV on x86, etc.)
                 cranelift_sig.call_conv
-            },
+            }
             crate::hir::CallingConvention::WebKit => CallConv::Fast,
         };
-        
+
         // Add parameters
         for param in &function.signature.params {
             let ty = self.translate_type(&param.ty)?;
             cranelift_sig.params.push(AbiParam::new(ty));
         }
-        
+
         // Add return types
         for ret_ty in &function.signature.returns {
             if *ret_ty != HirType::Void {
@@ -3072,12 +3934,17 @@ impl CraneliftBackend {
                 cranelift_sig.returns.push(AbiParam::new(ty));
             }
         }
-        
+
         Ok(cranelift_sig)
     }
-    
+
     /// Coerce a Cranelift value from one type to another (e.g., i64 -> i32, f64 -> f32)
-    fn coerce_value(builder: &mut FunctionBuilder, val: Value, actual: types::Type, expected: types::Type) -> Value {
+    fn coerce_value(
+        builder: &mut FunctionBuilder,
+        val: Value,
+        actual: types::Type,
+        expected: types::Type,
+    ) -> Value {
         if actual == expected {
             return val;
         }
@@ -3094,9 +3961,13 @@ impl CraneliftBackend {
                 builder.ins().fpromote(expected, val)
             }
         } else if actual.is_int() && expected.is_float() && actual.bits() == expected.bits() {
-            builder.ins().bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+            builder
+                .ins()
+                .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
         } else if actual.is_float() && expected.is_int() && actual.bits() == expected.bits() {
-            builder.ins().bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+            builder
+                .ins()
+                .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
         } else {
             // Can't coerce, return as-is (may produce verification error)
             log::warn!("[Cranelift] Cannot coerce {:?} to {:?}", actual, expected);
@@ -3125,7 +3996,7 @@ impl CraneliftBackend {
             HirType::Ref { .. } => {
                 // References are treated as pointers in Cranelift
                 Ok(self.module.target_config().pointer_type())
-            },
+            }
             HirType::Array(_elem_ty, _) => {
                 // Arrays decay to pointers in Cranelift
                 Ok(self.module.target_config().pointer_type())
@@ -3136,9 +4007,19 @@ impl CraneliftBackend {
                     if let Some(field_ty) = struct_ty.fields.first() {
                         // Check if it's a scalar type
                         match field_ty {
-                            HirType::I8 | HirType::I16 | HirType::I32 | HirType::I64 | HirType::I128 |
-                            HirType::U8 | HirType::U16 | HirType::U32 | HirType::U64 | HirType::U128 |
-                            HirType::F32 | HirType::F64 | HirType::Bool => {
+                            HirType::I8
+                            | HirType::I16
+                            | HirType::I32
+                            | HirType::I64
+                            | HirType::I128
+                            | HirType::U8
+                            | HirType::U16
+                            | HirType::U32
+                            | HirType::U64
+                            | HirType::U128
+                            | HirType::F32
+                            | HirType::F64
+                            | HirType::Bool => {
                                 // Pass single-scalar-field structs by value
                                 return self.translate_type(field_ty);
                             }
@@ -3171,11 +4052,15 @@ impl CraneliftBackend {
             }
             HirType::ConstGeneric(_) => {
                 // Const generic parameters should be resolved before codegen
-                Err(CompilerError::Backend("Unresolved const generic parameter".into()))
+                Err(CompilerError::Backend(
+                    "Unresolved const generic parameter".into(),
+                ))
             }
             HirType::Generic { .. } => {
                 // Generic types should be monomorphized before codegen
-                Err(CompilerError::Backend("Generic types must be monomorphized before codegen".into()))
+                Err(CompilerError::Backend(
+                    "Generic types must be monomorphized before codegen".into(),
+                ))
             }
             HirType::TraitObject { .. } => {
                 // Trait objects are represented as fat pointers: { *data, *vtable }
@@ -3186,7 +4071,11 @@ impl CraneliftBackend {
                 // Interface types are also trait objects
                 Ok(self.module.target_config().pointer_type())
             }
-            HirType::AssociatedType { trait_id, self_ty, name } => {
+            HirType::AssociatedType {
+                trait_id,
+                self_ty,
+                name,
+            } => {
                 // Associated types must be resolved to concrete types before codegen
                 Err(CompilerError::Backend(format!(
                     "Unresolved associated type: <{:?} as {:?}>::{}",
@@ -3205,13 +4094,20 @@ impl CraneliftBackend {
             HirType::EffectRow { .. } => {
                 // Effect rows are compile-time only (used for effect polymorphism)
                 // Should never appear in codegen
-                Err(CompilerError::Backend("Effect rows should be resolved before codegen".into()))
+                Err(CompilerError::Backend(
+                    "Effect rows should be resolved before codegen".into(),
+                ))
             }
         }
     }
 
     /// Call libm fmod function for float remainder operation
-    fn call_libm_fmod(&mut self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> CompilerResult<Value> {
+    fn call_libm_fmod(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        lhs: Value,
+        rhs: Value,
+    ) -> CompilerResult<Value> {
         // Declare fmod signature: double fmod(double x, double y)
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
@@ -3219,11 +4115,10 @@ impl CraneliftBackend {
         sig.returns.push(AbiParam::new(types::F64));
 
         // Declare fmod as an external function
-        let fmod_id = self.module.declare_function(
-            "fmod",
-            Linkage::Import,
-            &sig,
-        ).map_err(|e| CompilerError::Backend(format!("Failed to declare fmod: {}", e)))?;
+        let fmod_id = self
+            .module
+            .declare_function("fmod", Linkage::Import, &sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare fmod: {}", e)))?;
 
         // Import the function into the current function
         let fmod_func = self.module.declare_func_in_func(fmod_id, builder.func);
@@ -3245,14 +4140,15 @@ impl CraneliftBackend {
         sig.returns.push(AbiParam::new(ptr_ty));
 
         // Declare malloc as an external function
-        let malloc_id = self.module.declare_function(
-            "malloc",
-            Linkage::Import,
-            &sig,
-        ).map_err(|e| CompilerError::Backend(format!("Failed to declare malloc: {}", e)))?;
+        let malloc_id = self
+            .module
+            .declare_function("malloc", Linkage::Import, &sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare malloc: {}", e)))?;
 
         // Import the function into the current function
-        let malloc_func = self.module.declare_func_in_func(malloc_id, &mut builder.func);
+        let malloc_func = self
+            .module
+            .declare_func_in_func(malloc_id, &mut builder.func);
 
         // Call malloc
         let call = builder.ins().call(malloc_func, &[size]);
@@ -3270,11 +4166,10 @@ impl CraneliftBackend {
         sig.params.push(AbiParam::new(ptr_ty));
 
         // Declare free as an external function
-        let free_id = self.module.declare_function(
-            "free",
-            Linkage::Import,
-            &sig,
-        ).map_err(|e| CompilerError::Backend(format!("Failed to declare free: {}", e)))?;
+        let free_id = self
+            .module
+            .declare_function("free", Linkage::Import, &sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare free: {}", e)))?;
 
         // Import the function into the current function
         let free_func = self.module.declare_func_in_func(free_id, builder.func);
@@ -3286,7 +4181,12 @@ impl CraneliftBackend {
     }
 
     /// Call realloc for heap reallocation
-    fn call_realloc(&mut self, builder: &mut FunctionBuilder, ptr: Value, new_size: Value) -> CompilerResult<Value> {
+    fn call_realloc(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ptr: Value,
+        new_size: Value,
+    ) -> CompilerResult<Value> {
         let ptr_ty = self.module.target_config().pointer_type();
 
         // Declare realloc signature: void* realloc(void* ptr, size_t size)
@@ -3296,11 +4196,10 @@ impl CraneliftBackend {
         sig.returns.push(AbiParam::new(ptr_ty));
 
         // Declare realloc as an external function
-        let realloc_id = self.module.declare_function(
-            "realloc",
-            Linkage::Import,
-            &sig,
-        ).map_err(|e| CompilerError::Backend(format!("Failed to declare realloc: {}", e)))?;
+        let realloc_id = self
+            .module
+            .declare_function("realloc", Linkage::Import, &sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare realloc: {}", e)))?;
 
         // Import the function into the current function
         let realloc_func = self.module.declare_func_in_func(realloc_id, builder.func);
@@ -3313,12 +4212,18 @@ impl CraneliftBackend {
     }
 
     /// Call libm sin function
-    fn call_libm_sin(&mut self, builder: &mut FunctionBuilder, val: Value) -> CompilerResult<Value> {
+    fn call_libm_sin(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        val: Value,
+    ) -> CompilerResult<Value> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.returns.push(AbiParam::new(types::F64));
 
-        let sin_id = self.module.declare_function("sin", Linkage::Import, &sig)
+        let sin_id = self
+            .module
+            .declare_function("sin", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare sin: {}", e)))?;
         let sin_func = self.module.declare_func_in_func(sin_id, builder.func);
 
@@ -3327,12 +4232,18 @@ impl CraneliftBackend {
     }
 
     /// Call libm cos function
-    fn call_libm_cos(&mut self, builder: &mut FunctionBuilder, val: Value) -> CompilerResult<Value> {
+    fn call_libm_cos(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        val: Value,
+    ) -> CompilerResult<Value> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.returns.push(AbiParam::new(types::F64));
 
-        let cos_id = self.module.declare_function("cos", Linkage::Import, &sig)
+        let cos_id = self
+            .module
+            .declare_function("cos", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare cos: {}", e)))?;
         let cos_func = self.module.declare_func_in_func(cos_id, builder.func);
 
@@ -3341,13 +4252,20 @@ impl CraneliftBackend {
     }
 
     /// Call libm pow function
-    fn call_libm_pow(&mut self, builder: &mut FunctionBuilder, base: Value, exp: Value) -> CompilerResult<Value> {
+    fn call_libm_pow(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        base: Value,
+        exp: Value,
+    ) -> CompilerResult<Value> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.params.push(AbiParam::new(types::F64));
         sig.returns.push(AbiParam::new(types::F64));
 
-        let pow_id = self.module.declare_function("pow", Linkage::Import, &sig)
+        let pow_id = self
+            .module
+            .declare_function("pow", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare pow: {}", e)))?;
         let pow_func = self.module.declare_func_in_func(pow_id, builder.func);
 
@@ -3356,12 +4274,18 @@ impl CraneliftBackend {
     }
 
     /// Call libm log function
-    fn call_libm_log(&mut self, builder: &mut FunctionBuilder, val: Value) -> CompilerResult<Value> {
+    fn call_libm_log(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        val: Value,
+    ) -> CompilerResult<Value> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.returns.push(AbiParam::new(types::F64));
 
-        let log_id = self.module.declare_function("log", Linkage::Import, &sig)
+        let log_id = self
+            .module
+            .declare_function("log", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare log: {}", e)))?;
         let log_func = self.module.declare_func_in_func(log_id, builder.func);
 
@@ -3370,12 +4294,18 @@ impl CraneliftBackend {
     }
 
     /// Call libm exp function
-    fn call_libm_exp(&mut self, builder: &mut FunctionBuilder, val: Value) -> CompilerResult<Value> {
+    fn call_libm_exp(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        val: Value,
+    ) -> CompilerResult<Value> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::F64));
         sig.returns.push(AbiParam::new(types::F64));
 
-        let exp_id = self.module.declare_function("exp", Linkage::Import, &sig)
+        let exp_id = self
+            .module
+            .declare_function("exp", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare exp: {}", e)))?;
         let exp_func = self.module.declare_func_in_func(exp_id, builder.func);
 
@@ -3384,15 +4314,23 @@ impl CraneliftBackend {
     }
 
     /// Call libc memcpy function
-    fn call_memcpy(&mut self, builder: &mut FunctionBuilder, dest: Value, src: Value, len: Value) -> CompilerResult<Value> {
+    fn call_memcpy(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        dest: Value,
+        src: Value,
+        len: Value,
+    ) -> CompilerResult<Value> {
         let ptr_ty = self.module.target_config().pointer_type();
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(ptr_ty));  // dest
-        sig.params.push(AbiParam::new(ptr_ty));  // src
-        sig.params.push(AbiParam::new(ptr_ty));  // len
+        sig.params.push(AbiParam::new(ptr_ty)); // dest
+        sig.params.push(AbiParam::new(ptr_ty)); // src
+        sig.params.push(AbiParam::new(ptr_ty)); // len
         sig.returns.push(AbiParam::new(ptr_ty)); // returns dest
 
-        let memcpy_id = self.module.declare_function("memcpy", Linkage::Import, &sig)
+        let memcpy_id = self
+            .module
+            .declare_function("memcpy", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare memcpy: {}", e)))?;
         let memcpy_func = self.module.declare_func_in_func(memcpy_id, builder.func);
 
@@ -3401,15 +4339,23 @@ impl CraneliftBackend {
     }
 
     /// Call libc memset function
-    fn call_memset(&mut self, builder: &mut FunctionBuilder, dest: Value, val: Value, len: Value) -> CompilerResult<Value> {
+    fn call_memset(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        dest: Value,
+        val: Value,
+        len: Value,
+    ) -> CompilerResult<Value> {
         let ptr_ty = self.module.target_config().pointer_type();
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(ptr_ty));  // dest
+        sig.params.push(AbiParam::new(ptr_ty)); // dest
         sig.params.push(AbiParam::new(types::I32)); // val (int)
-        sig.params.push(AbiParam::new(ptr_ty));  // len
+        sig.params.push(AbiParam::new(ptr_ty)); // len
         sig.returns.push(AbiParam::new(ptr_ty)); // returns dest
 
-        let memset_id = self.module.declare_function("memset", Linkage::Import, &sig)
+        let memset_id = self
+            .module
+            .declare_function("memset", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare memset: {}", e)))?;
         let memset_func = self.module.declare_func_in_func(memset_id, builder.func);
 
@@ -3418,15 +4364,23 @@ impl CraneliftBackend {
     }
 
     /// Call libc memmove function
-    fn call_memmove(&mut self, builder: &mut FunctionBuilder, dest: Value, src: Value, len: Value) -> CompilerResult<Value> {
+    fn call_memmove(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        dest: Value,
+        src: Value,
+        len: Value,
+    ) -> CompilerResult<Value> {
         let ptr_ty = self.module.target_config().pointer_type();
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(ptr_ty));  // dest
-        sig.params.push(AbiParam::new(ptr_ty));  // src
-        sig.params.push(AbiParam::new(ptr_ty));  // len
+        sig.params.push(AbiParam::new(ptr_ty)); // dest
+        sig.params.push(AbiParam::new(ptr_ty)); // src
+        sig.params.push(AbiParam::new(ptr_ty)); // len
         sig.returns.push(AbiParam::new(ptr_ty)); // returns dest
 
-        let memmove_id = self.module.declare_function("memmove", Linkage::Import, &sig)
+        let memmove_id = self
+            .module
+            .declare_function("memmove", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare memmove: {}", e)))?;
         let memmove_func = self.module.declare_func_in_func(memmove_id, builder.func);
 
@@ -3442,10 +4396,16 @@ impl CraneliftBackend {
         inst: &HirInstruction,
     ) -> CompilerResult<()> {
         match inst {
-            HirInstruction::Binary { op, result, left, right, .. } => {
+            HirInstruction::Binary {
+                op,
+                result,
+                left,
+                right,
+                ..
+            } => {
                 let lhs = self.value_map[left];
                 let rhs = self.value_map[right];
-                
+
                 let value = match op {
                     // Integer arithmetic
                     BinaryOp::Add => builder.ins().iadd(lhs, rhs),
@@ -3460,9 +4420,7 @@ impl CraneliftBackend {
                     BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
                     BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
                     // Float remainder requires libm fmod function call
-                    BinaryOp::FRem => {
-                        self.call_libm_fmod(builder, lhs, rhs)?
-                    },
+                    BinaryOp::FRem => self.call_libm_fmod(builder, lhs, rhs)?,
 
                     // Bitwise
                     BinaryOp::And => builder.ins().band(lhs, rhs),
@@ -3477,7 +4435,9 @@ impl CraneliftBackend {
                     BinaryOp::Lt => builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs),
                     BinaryOp::Le => builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs),
                     BinaryOp::Gt => builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs),
-                    BinaryOp::Ge => builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs),
+                    BinaryOp::Ge => builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs),
 
                     // Float comparisons
                     BinaryOp::FEq => builder.ins().fcmp(FloatCC::Equal, lhs, rhs),
@@ -3487,18 +4447,18 @@ impl CraneliftBackend {
                     BinaryOp::FGt => builder.ins().fcmp(FloatCC::GreaterThan, lhs, rhs),
                     BinaryOp::FGe => builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs, rhs),
                 };
-                
+
                 self.value_map.insert(*result, value);
                 Ok(())
             }
-            
+
             _ => {
                 // TODO: Implement other instruction types
                 Ok(())
             }
         }
     }
-    
+
     /// Translate a HIR terminator to Cranelift
     #[allow(dead_code)]
     fn translate_hir_terminator(
@@ -3508,18 +4468,16 @@ impl CraneliftBackend {
     ) -> CompilerResult<()> {
         match terminator {
             HirTerminator::Return { values } => {
-                let ret_vals: Vec<_> = values.iter()
-                    .map(|v| self.value_map[v])
-                    .collect();
+                let ret_vals: Vec<_> = values.iter().map(|v| self.value_map[v]).collect();
                 builder.ins().return_(&ret_vals);
                 Ok(())
             }
-            
+
             HirTerminator::Unreachable => {
                 builder.ins().return_(&[]);
                 Ok(())
             }
-            
+
             _ => {
                 // NOTE: Some terminator types not yet implemented.
                 // Main terminators (Return, Branch, CondBranch, Switch) already handled elsewhere.
@@ -3533,7 +4491,7 @@ impl CraneliftBackend {
             }
         }
     }
-    
+
     /// Translate phi node
     #[allow(dead_code)]
     fn translate_phi(&mut self, builder: &mut FunctionBuilder, phi: &HirPhi) -> CompilerResult<()> {
@@ -3542,11 +4500,11 @@ impl CraneliftBackend {
         let ty = self.translate_type(&phi.ty)?;
         let param = builder.append_block_param(block, ty);
         self.value_map.insert(phi.result, param);
-        
+
         // The incoming values will be added when we process the predecessor blocks
         Ok(())
     }
-    
+
     /// Translate instruction
     #[allow(dead_code)]
     fn translate_instruction(
@@ -3555,10 +4513,16 @@ impl CraneliftBackend {
         inst: &HirInstruction,
     ) -> CompilerResult<()> {
         match inst {
-            HirInstruction::Binary { op, result, ty, left, right } => {
+            HirInstruction::Binary {
+                op,
+                result,
+                ty,
+                left,
+                right,
+            } => {
                 let lhs = self.value_map[left];
                 let rhs = self.value_map[right];
-                
+
                 let value = match op {
                     BinaryOp::Add => builder.ins().iadd(lhs, rhs),
                     BinaryOp::Sub => builder.ins().isub(lhs, rhs),
@@ -3597,7 +4561,9 @@ impl CraneliftBackend {
                     BinaryOp::Lt => builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs),
                     BinaryOp::Le => builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs),
                     BinaryOp::Gt => builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs),
-                    BinaryOp::Ge => builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs),
+                    BinaryOp::Ge => builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs),
                     // Floating point operations
                     BinaryOp::FAdd => builder.ins().fadd(lhs, rhs),
                     BinaryOp::FSub => builder.ins().fsub(lhs, rhs),
@@ -3615,13 +4581,18 @@ impl CraneliftBackend {
                     BinaryOp::FGt => builder.ins().fcmp(FloatCC::GreaterThan, lhs, rhs),
                     BinaryOp::FGe => builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs, rhs),
                 };
-                
+
                 self.value_map.insert(*result, value);
             }
-            
-            HirInstruction::Unary { op, result, ty, operand } => {
+
+            HirInstruction::Unary {
+                op,
+                result,
+                ty,
+                operand,
+            } => {
                 let val = self.value_map[operand];
-                
+
                 let value = match op {
                     UnaryOp::Neg => {
                         if ty.is_float() {
@@ -3633,11 +4604,17 @@ impl CraneliftBackend {
                     UnaryOp::Not => builder.ins().bnot(val),
                     UnaryOp::FNeg => builder.ins().fneg(val),
                 };
-                
+
                 self.value_map.insert(*result, value);
             }
-            
-            HirInstruction::Load { result, ty, ptr, align: _, volatile } => {
+
+            HirInstruction::Load {
+                result,
+                ty,
+                ptr,
+                align: _,
+                volatile,
+            } => {
                 let ptr_val = self.value_map[ptr];
                 let cranelift_ty = self.translate_type(ty)?;
                 let flags = if *volatile {
@@ -3648,8 +4625,13 @@ impl CraneliftBackend {
                 let value = builder.ins().load(cranelift_ty, flags, ptr_val, 0);
                 self.value_map.insert(*result, value);
             }
-            
-            HirInstruction::Store { value, ptr, align: _, volatile } => {
+
+            HirInstruction::Store {
+                value,
+                ptr,
+                align: _,
+                volatile,
+            } => {
                 let val = self.value_map[value];
                 let ptr_val = self.value_map[ptr];
                 let flags = if *volatile {
@@ -3659,8 +4641,13 @@ impl CraneliftBackend {
                 };
                 builder.ins().store(flags, val, ptr_val, 0);
             }
-            
-            HirInstruction::Alloca { result, ty, count, align: _ } => {
+
+            HirInstruction::Alloca {
+                result,
+                ty,
+                count,
+                align: _,
+            } => {
                 // Cranelift doesn't have alloca - use stack slots
                 let size = self.type_size(ty)?;
                 // For alloca with count, we need to allocate count * size
@@ -3672,33 +4659,36 @@ impl CraneliftBackend {
                 };
                 let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, alloc_size as u32);
                 let slot = builder.create_sized_stack_slot(slot_data);
-                let addr = builder.ins().stack_addr(
-                    self.module.target_config().pointer_type(),
-                    slot,
-                    0,
-                );
+                let addr =
+                    builder
+                        .ins()
+                        .stack_addr(self.module.target_config().pointer_type(), slot, 0);
                 self.value_map.insert(*result, addr);
             }
-            
-            HirInstruction::Call { result, callee, args, type_args, is_tail, .. } => {
-                let arg_vals: Vec<_> = args.iter()
-                    .map(|arg| self.value_map[arg])
-                    .collect();
+
+            HirInstruction::Call {
+                result,
+                callee,
+                args,
+                type_args,
+                is_tail,
+                ..
+            } => {
+                let arg_vals: Vec<_> = args.iter().map(|arg| self.value_map[arg]).collect();
 
                 match callee {
                     HirCallable::Function(func_id) => {
                         let cranelift_func = self.function_map[func_id];
-                        let func_ref = self.module.declare_func_in_func(
-                            cranelift_func,
-                            builder.func,
-                        );
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(cranelift_func, builder.func);
 
                         let call = if *is_tail {
                             builder.ins().return_call(func_ref, &arg_vals)
                         } else {
                             builder.ins().call(func_ref, &arg_vals)
                         };
-                        
+
                         if let Some(result_id) = result {
                             let results = builder.inst_results(call);
                             if !results.is_empty() {
@@ -3711,13 +4701,15 @@ impl CraneliftBackend {
                         // For indirect calls, we need a signature reference
                         // This is a simplified version - in reality we'd need to track function signatures
                         let sig_ref = builder.import_signature(self.module.make_signature());
-                        
+
                         let call = if *is_tail {
-                            builder.ins().return_call_indirect(sig_ref, ptr_val, &arg_vals)
+                            builder
+                                .ins()
+                                .return_call_indirect(sig_ref, ptr_val, &arg_vals)
                         } else {
                             builder.ins().call_indirect(sig_ref, ptr_val, &arg_vals)
                         };
-                        
+
                         if let Some(result_id) = result {
                             let results = builder.inst_results(call);
                             if !results.is_empty() {
@@ -3734,13 +4726,20 @@ impl CraneliftBackend {
                                     let dst = arg_vals[0];
                                     let src = arg_vals[1];
                                     let size = arg_vals[2];
-                                    builder.call_memcpy(self.module.target_config(), dst, src, size);
+                                    builder.call_memcpy(
+                                        self.module.target_config(),
+                                        dst,
+                                        src,
+                                        size,
+                                    );
                                     // memcpy returns void, but HIR might expect a value
                                     if let Some(result_id) = result {
                                         self.value_map.insert(*result_id, dst); // Return destination
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("memcpy requires 3 arguments".into()));
+                                    return Err(CompilerError::Backend(
+                                        "memcpy requires 3 arguments".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Memset => {
@@ -3749,12 +4748,19 @@ impl CraneliftBackend {
                                     let dst = arg_vals[0];
                                     let val = arg_vals[1];
                                     let size = arg_vals[2];
-                                    builder.call_memset(self.module.target_config(), dst, val, size);
+                                    builder.call_memset(
+                                        self.module.target_config(),
+                                        dst,
+                                        val,
+                                        size,
+                                    );
                                     if let Some(result_id) = result {
                                         self.value_map.insert(*result_id, dst); // Return destination
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("memset requires 3 arguments".into()));
+                                    return Err(CompilerError::Backend(
+                                        "memset requires 3 arguments".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Memmove => {
@@ -3763,12 +4769,19 @@ impl CraneliftBackend {
                                     let dst = arg_vals[0];
                                     let src = arg_vals[1];
                                     let size = arg_vals[2];
-                                    builder.call_memmove(self.module.target_config(), dst, src, size);
+                                    builder.call_memmove(
+                                        self.module.target_config(),
+                                        dst,
+                                        src,
+                                        size,
+                                    );
                                     if let Some(result_id) = result {
                                         self.value_map.insert(*result_id, dst); // Return destination
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("memmove requires 3 arguments".into()));
+                                    return Err(CompilerError::Backend(
+                                        "memmove requires 3 arguments".into(),
+                                    ));
                                 }
                             }
                             // Math intrinsics
@@ -3780,7 +4793,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, sqrt_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("sqrt requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "sqrt requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Sin => {
@@ -3791,7 +4806,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, sin_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("sin requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "sin requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Cos => {
@@ -3802,7 +4819,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, cos_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("cos requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "cos requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Log => {
@@ -3813,7 +4832,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, log_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("log requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "log requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Exp => {
@@ -3824,7 +4845,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, exp_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("exp requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "exp requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Pow => {
@@ -3836,7 +4859,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, pow_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("pow requires 2 arguments".into()));
+                                    return Err(CompilerError::Backend(
+                                        "pow requires 2 arguments".into(),
+                                    ));
                                 }
                             }
                             // Bit manipulation intrinsics
@@ -3849,7 +4874,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, popcnt);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("ctpop requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "ctpop requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Ctlz => {
@@ -3861,7 +4888,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, clz);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("ctlz requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "ctlz requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Cttz => {
@@ -3873,7 +4902,9 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, ctz);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("cttz requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "cttz requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             crate::hir::Intrinsic::Bswap => {
@@ -3885,14 +4916,18 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, swapped);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("bswap requires 1 argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "bswap requires 1 argument".into(),
+                                    ));
                                 }
                             }
                             // Type query intrinsics
                             crate::hir::Intrinsic::SizeOf => {
                                 // Get the size of the type from type_args
                                 if type_args.is_empty() {
-                                    return Err(CompilerError::Backend("sizeof requires a type argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "sizeof requires a type argument".into(),
+                                    ));
                                 }
                                 let ty = &type_args[0];
                                 let size = self.type_size(ty)? as u64;
@@ -3904,7 +4939,9 @@ impl CraneliftBackend {
                             crate::hir::Intrinsic::AlignOf => {
                                 // Get the alignment of the type from type_args
                                 if type_args.is_empty() {
-                                    return Err(CompilerError::Backend("alignof requires a type argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "alignof requires a type argument".into(),
+                                    ));
                                 }
                                 let ty = &type_args[0];
                                 let align = self.type_alignment(ty)? as u64;
@@ -3914,13 +4951,13 @@ impl CraneliftBackend {
                                 }
                             }
                             // Overflow checking intrinsics
-                            crate::hir::Intrinsic::AddWithOverflow |
-                            crate::hir::Intrinsic::SubWithOverflow |
-                            crate::hir::Intrinsic::MulWithOverflow => {
+                            crate::hir::Intrinsic::AddWithOverflow
+                            | crate::hir::Intrinsic::SubWithOverflow
+                            | crate::hir::Intrinsic::MulWithOverflow => {
                                 if args.len() == 2 {
                                     let lhs = arg_vals[0];
                                     let rhs = arg_vals[1];
-                                    
+
                                     // Perform the operation
                                     let result_val = match intrinsic {
                                         crate::hir::Intrinsic::AddWithOverflow => {
@@ -3939,7 +4976,7 @@ impl CraneliftBackend {
                                         }
                                         _ => unreachable!(),
                                     };
-                                    
+
                                     // NOTE: Overflow intrinsics should return (result, bool overflow_flag).
                                     // Cranelift has overflow checking via: iadd_cout, isub_bout, etc.
                                     // Need: (1) Use overflow-checking instructions, (2) Create tuple/struct return,
@@ -3952,60 +4989,80 @@ impl CraneliftBackend {
                                         self.value_map.insert(*result_id, result_val);
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("overflow intrinsics require 2 arguments".into()));
+                                    return Err(CompilerError::Backend(
+                                        "overflow intrinsics require 2 arguments".into(),
+                                    ));
                                 }
                             }
-                            
+
                             // Memory management intrinsics
                             crate::hir::Intrinsic::Malloc => {
                                 if !args.is_empty() {
-                                    if let Some(&size) = args.get(0).and_then(|id| self.value_map.get(id)) {
+                                    if let Some(&size) =
+                                        args.get(0).and_then(|id| self.value_map.get(id))
+                                    {
                                         let ptr = self.call_malloc(builder, size)?;
                                         if let Some(result_id) = result {
                                             self.value_map.insert(*result_id, ptr);
                                         }
                                     } else {
-                                        return Err(CompilerError::Backend("malloc: size argument not found in value map".into()));
+                                        return Err(CompilerError::Backend(
+                                            "malloc: size argument not found in value map".into(),
+                                        ));
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("malloc requires size argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "malloc requires size argument".into(),
+                                    ));
                                 }
                             }
-                            
+
                             crate::hir::Intrinsic::Free => {
                                 if !args.is_empty() {
-                                    if let Some(&ptr) = args.get(0).and_then(|id| self.value_map.get(id)) {
+                                    if let Some(&ptr) =
+                                        args.get(0).and_then(|id| self.value_map.get(id))
+                                    {
                                         self.call_free(builder, ptr)?;
                                     } else {
-                                        return Err(CompilerError::Backend("free: pointer argument not found in value map".into()));
+                                        return Err(CompilerError::Backend(
+                                            "free: pointer argument not found in value map".into(),
+                                        ));
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("free requires pointer argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "free requires pointer argument".into(),
+                                    ));
                                 }
                             }
-                            
+
                             crate::hir::Intrinsic::Realloc => {
                                 if args.len() >= 2 {
                                     if let (Some(&ptr), Some(&new_size)) = (
                                         args.get(0).and_then(|id| self.value_map.get(id)),
-                                        args.get(1).and_then(|id| self.value_map.get(id))
+                                        args.get(1).and_then(|id| self.value_map.get(id)),
                                     ) {
                                         let new_ptr = self.call_realloc(builder, ptr, new_size)?;
                                         if let Some(result_id) = result {
                                             self.value_map.insert(*result_id, new_ptr);
                                         }
                                     } else {
-                                        return Err(CompilerError::Backend("realloc: arguments not found in value map".into()));
+                                        return Err(CompilerError::Backend(
+                                            "realloc: arguments not found in value map".into(),
+                                        ));
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("realloc requires pointer and size arguments".into()));
+                                    return Err(CompilerError::Backend(
+                                        "realloc requires pointer and size arguments".into(),
+                                    ));
                                 }
                             }
-                            
+
                             crate::hir::Intrinsic::Drop => {
                                 // Call destructor for type
                                 if !args.is_empty() {
-                                    if let Some(&_ptr) = args.get(0).and_then(|id| self.value_map.get(id)) {
+                                    if let Some(&_ptr) =
+                                        args.get(0).and_then(|id| self.value_map.get(id))
+                                    {
                                         // NOTE: Destructor dispatch requires type information + vtable.
                                         // Need: (1) Type ID from pointer, (2) Destructor lookup table,
                                         // (3) Indirect call to destructor function.
@@ -4014,70 +5071,72 @@ impl CraneliftBackend {
                                         // FUTURE (v2.0): Implement destructor dispatch system
                                         // Estimated effort: 10-15 hours (depends on trait system)
                                     } else {
-                                        return Err(CompilerError::Backend("drop: pointer argument not found in value map".into()));
+                                        return Err(CompilerError::Backend(
+                                            "drop: pointer argument not found in value map".into(),
+                                        ));
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("drop requires pointer argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "drop requires pointer argument".into(),
+                                    ));
                                 }
                             }
-                            
+
                             crate::hir::Intrinsic::IncRef => {
                                 // Increment reference count
                                 if !args.is_empty() {
-                                    if let Some(&ptr) = args.get(0).and_then(|id| self.value_map.get(id)) {
+                                    if let Some(&ptr) =
+                                        args.get(0).and_then(|id| self.value_map.get(id))
+                                    {
                                         // Assume refcount is first field of struct
-                                        let ref_count = builder.ins().load(
-                                            types::I32,
-                                            MemFlags::new(),
-                                            ptr,
-                                            0,
-                                        );
+                                        let ref_count =
+                                            builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
                                         let one = builder.ins().iconst(types::I32, 1);
                                         let new_count = builder.ins().iadd(ref_count, one);
-                                        builder.ins().store(
-                                            MemFlags::new(),
-                                            new_count,
-                                            ptr,
-                                            0,
-                                        );
+                                        builder.ins().store(MemFlags::new(), new_count, ptr, 0);
                                     } else {
-                                        return Err(CompilerError::Backend("incref: pointer argument not found in value map".into()));
+                                        return Err(CompilerError::Backend(
+                                            "incref: pointer argument not found in value map"
+                                                .into(),
+                                        ));
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("incref requires pointer argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "incref requires pointer argument".into(),
+                                    ));
                                 }
                             }
-                            
+
                             crate::hir::Intrinsic::DecRef => {
                                 // Decrement reference count
                                 if !args.is_empty() {
-                                    if let Some(&ptr) = args.get(0).and_then(|id| self.value_map.get(id)) {
+                                    if let Some(&ptr) =
+                                        args.get(0).and_then(|id| self.value_map.get(id))
+                                    {
                                         // Assume refcount is first field of struct
-                                        let ref_count = builder.ins().load(
-                                            types::I32,
-                                            MemFlags::new(),
-                                            ptr,
-                                            0,
-                                        );
+                                        let ref_count =
+                                            builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
                                         let one = builder.ins().iconst(types::I32, 1);
                                         let new_count = builder.ins().isub(ref_count, one);
-                                        builder.ins().store(
-                                            MemFlags::new(),
-                                            new_count,
-                                            ptr,
-                                            0,
-                                        );
-                                        
+                                        builder.ins().store(MemFlags::new(), new_count, ptr, 0);
+
                                         // Check if count is zero and free if so
                                         let zero = builder.ins().iconst(types::I32, 0);
-                                        let is_zero = builder.ins().icmp(IntCC::Equal, new_count, zero);
+                                        let is_zero =
+                                            builder.ins().icmp(IntCC::Equal, new_count, zero);
 
                                         // Create blocks for conditional free
                                         let free_block = builder.create_block();
                                         let continue_block = builder.create_block();
 
                                         // Branch based on refcount
-                                        builder.ins().brif(is_zero, free_block, &[], continue_block, &[]);
+                                        builder.ins().brif(
+                                            is_zero,
+                                            free_block,
+                                            &[],
+                                            continue_block,
+                                            &[],
+                                        );
 
                                         // Free block: call free and jump to continue
                                         builder.seal_block(free_block);
@@ -4089,18 +5148,25 @@ impl CraneliftBackend {
                                         builder.seal_block(continue_block);
                                         builder.switch_to_block(continue_block);
                                     } else {
-                                        return Err(CompilerError::Backend("decref: pointer argument not found in value map".into()));
+                                        return Err(CompilerError::Backend(
+                                            "decref: pointer argument not found in value map"
+                                                .into(),
+                                        ));
                                     }
                                 } else {
-                                    return Err(CompilerError::Backend("decref requires pointer argument".into()));
+                                    return Err(CompilerError::Backend(
+                                        "decref requires pointer argument".into(),
+                                    ));
                                 }
                             }
-                            
+
                             crate::hir::Intrinsic::Alloca => {
                                 // Stack allocation - should be handled as instruction, not intrinsic call
-                                return Err(CompilerError::Backend("Alloca should be an instruction, not intrinsic call".into()));
+                                return Err(CompilerError::Backend(
+                                    "Alloca should be an instruction, not intrinsic call".into(),
+                                ));
                             }
-                            
+
                             crate::hir::Intrinsic::GCSafepoint => {
                                 // GC safepoint - no-op for now in Cranelift
                                 // In a real implementation, this would:
@@ -4109,18 +5175,24 @@ impl CraneliftBackend {
                                 // 3. Update GC metadata
                                 // For now, we just ignore it
                             }
-                            
+
                             crate::hir::Intrinsic::Await => {
                                 // Await intrinsic - complex implementation
                                 // This would suspend the current function and register a continuation
                                 // For now, just call a runtime function
-                                return Err(CompilerError::Backend("Await intrinsic not yet implemented in Cranelift backend".into()));
+                                return Err(CompilerError::Backend(
+                                    "Await intrinsic not yet implemented in Cranelift backend"
+                                        .into(),
+                                ));
                             }
-                            
+
                             crate::hir::Intrinsic::Yield => {
                                 // Yield intrinsic for generators
                                 // This would suspend execution and yield a value
-                                return Err(CompilerError::Backend("Yield intrinsic not yet implemented in Cranelift backend".into()));
+                                return Err(CompilerError::Backend(
+                                    "Yield intrinsic not yet implemented in Cranelift backend"
+                                        .into(),
+                                ));
                             }
 
                             crate::hir::Intrinsic::Panic => {
@@ -4136,17 +5208,30 @@ impl CraneliftBackend {
                                 };
 
                                 let abort_name = "abort";
-                                let abort_func = self.module
-                                    .declare_function(abort_name, cranelift_module::Linkage::Import, &abort_sig)
-                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare abort: {}", e)))?;
-                                let abort_func_ref = self.module
+                                let abort_func = self
+                                    .module
+                                    .declare_function(
+                                        abort_name,
+                                        cranelift_module::Linkage::Import,
+                                        &abort_sig,
+                                    )
+                                    .map_err(|e| {
+                                        CompilerError::Backend(format!(
+                                            "Failed to declare abort: {}",
+                                            e
+                                        ))
+                                    })?;
+                                let abort_func_ref = self
+                                    .module
                                     .declare_func_in_func(abort_func, &mut builder.func);
 
                                 // Call abort() - doesn't return
                                 builder.ins().call(abort_func_ref, &[]);
 
                                 // Add unreachable to satisfy control flow
-                                builder.ins().trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                builder
+                                    .ins()
+                                    .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
                             }
 
                             crate::hir::Intrinsic::Abort => {
@@ -4159,14 +5244,27 @@ impl CraneliftBackend {
                                 };
 
                                 let abort_name = "abort";
-                                let abort_func = self.module
-                                    .declare_function(abort_name, cranelift_module::Linkage::Import, &abort_sig)
-                                    .map_err(|e| CompilerError::Backend(format!("Failed to declare abort: {}", e)))?;
-                                let abort_func_ref = self.module
+                                let abort_func = self
+                                    .module
+                                    .declare_function(
+                                        abort_name,
+                                        cranelift_module::Linkage::Import,
+                                        &abort_sig,
+                                    )
+                                    .map_err(|e| {
+                                        CompilerError::Backend(format!(
+                                            "Failed to declare abort: {}",
+                                            e
+                                        ))
+                                    })?;
+                                let abort_func_ref = self
+                                    .module
                                     .declare_func_in_func(abort_func, &mut builder.func);
 
                                 builder.ins().call(abort_func_ref, &[]);
-                                builder.ins().trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                builder
+                                    .ins()
+                                    .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
                             }
 
                             // ZRTL Value Conversion Intrinsics
@@ -4181,17 +5279,33 @@ impl CraneliftBackend {
 
                                     // Declare zyntax_closure_to_zrtl
                                     let mut sig = self.module.make_signature();
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // fn_ptr
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // env_ptr
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // env_size
-                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // result ptr
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64)); // fn_ptr
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64)); // env_ptr
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64)); // env_size
+                                    sig.returns
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64)); // result ptr
 
-                                    let func = self.module
-                                        .declare_function("zyntax_closure_to_zrtl", cranelift_module::Linkage::Import, &sig)
-                                        .map_err(|e| CompilerError::Backend(format!("Failed to declare zyntax_closure_to_zrtl: {}", e)))?;
-                                    let func_ref = self.module.declare_func_in_func(func, builder.func);
+                                    let func = self
+                                        .module
+                                        .declare_function(
+                                            "zyntax_closure_to_zrtl",
+                                            cranelift_module::Linkage::Import,
+                                            &sig,
+                                        )
+                                        .map_err(|e| {
+                                            CompilerError::Backend(format!(
+                                                "Failed to declare zyntax_closure_to_zrtl: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    let func_ref =
+                                        self.module.declare_func_in_func(func, builder.func);
 
-                                    let call_inst = builder.ins().call(func_ref, &[fn_ptr, env_ptr, env_size]);
+                                    let call_inst =
+                                        builder.ins().call(func_ref, &[fn_ptr, env_ptr, env_size]);
                                     let result_val = builder.inst_results(call_inst)[0];
 
                                     if let Some(result_id) = result {
@@ -4211,17 +5325,33 @@ impl CraneliftBackend {
 
                                     // Declare zyntax_primitive_to_box
                                     let mut sig = self.module.make_signature();
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // value_ptr
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I32)); // type_tag
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I32)); // size
-                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64)); // result ptr
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64)); // value_ptr
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I32)); // type_tag
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I32)); // size
+                                    sig.returns
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64)); // result ptr
 
-                                    let func = self.module
-                                        .declare_function("zyntax_primitive_to_box", cranelift_module::Linkage::Import, &sig)
-                                        .map_err(|e| CompilerError::Backend(format!("Failed to declare zyntax_primitive_to_box: {}", e)))?;
-                                    let func_ref = self.module.declare_func_in_func(func, builder.func);
+                                    let func = self
+                                        .module
+                                        .declare_function(
+                                            "zyntax_primitive_to_box",
+                                            cranelift_module::Linkage::Import,
+                                            &sig,
+                                        )
+                                        .map_err(|e| {
+                                            CompilerError::Backend(format!(
+                                                "Failed to declare zyntax_primitive_to_box: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    let func_ref =
+                                        self.module.declare_func_in_func(func, builder.func);
 
-                                    let call_inst = builder.ins().call(func_ref, &[value_ptr, type_tag, size]);
+                                    let call_inst =
+                                        builder.ins().call(func_ref, &[value_ptr, type_tag, size]);
                                     let result_val = builder.inst_results(call_inst)[0];
 
                                     if let Some(result_id) = result {
@@ -4253,13 +5383,26 @@ impl CraneliftBackend {
                                     };
 
                                     let mut sig = self.module.make_signature();
-                                    sig.params.push(cranelift_codegen::ir::AbiParam::new(value_ty));
-                                    sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                                    sig.params
+                                        .push(cranelift_codegen::ir::AbiParam::new(value_ty));
+                                    sig.returns
+                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64));
 
-                                    let func = self.module
-                                        .declare_function(func_name, cranelift_module::Linkage::Import, &sig)
-                                        .map_err(|e| CompilerError::Backend(format!("Failed to declare {}: {}", func_name, e)))?;
-                                    let func_ref = self.module.declare_func_in_func(func, builder.func);
+                                    let func = self
+                                        .module
+                                        .declare_function(
+                                            func_name,
+                                            cranelift_module::Linkage::Import,
+                                            &sig,
+                                        )
+                                        .map_err(|e| {
+                                            CompilerError::Backend(format!(
+                                                "Failed to declare {}: {}",
+                                                func_name, e
+                                            ))
+                                        })?;
+                                    let func_ref =
+                                        self.module.declare_func_in_func(func, builder.func);
 
                                     let call_inst = builder.ins().call(func_ref, &[value]);
                                     let result_val = builder.inst_results(call_inst)[0];
@@ -4287,11 +5430,13 @@ impl CraneliftBackend {
                         let mut sig = self.module.make_signature();
                         for arg_val in &arg_vals {
                             let arg_ty = builder.func.dfg.value_type(*arg_val);
-                            sig.params.push(cranelift_codegen::ir::AbiParam::new(arg_ty));
+                            sig.params
+                                .push(cranelift_codegen::ir::AbiParam::new(arg_ty));
                         }
                         // For now, assume void return unless we have result
                         if result.is_some() {
-                            sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                            sig.returns
+                                .push(cranelift_codegen::ir::AbiParam::new(types::I64));
                         }
 
                         // Use @___ prefix internally for runtime symbols
@@ -4301,9 +5446,19 @@ impl CraneliftBackend {
                             symbol_name.clone()
                         };
 
-                        let func = self.module
-                            .declare_function(&internal_name, cranelift_module::Linkage::Import, &sig)
-                            .map_err(|e| CompilerError::Backend(format!("Failed to declare symbol {}: {}", symbol_name, e)))?;
+                        let func = self
+                            .module
+                            .declare_function(
+                                &internal_name,
+                                cranelift_module::Linkage::Import,
+                                &sig,
+                            )
+                            .map_err(|e| {
+                                CompilerError::Backend(format!(
+                                    "Failed to declare symbol {}: {}",
+                                    symbol_name, e
+                                ))
+                            })?;
                         let func_ref = self.module.declare_func_in_func(func, builder.func);
 
                         let call = if *is_tail {
@@ -4321,12 +5476,17 @@ impl CraneliftBackend {
                     }
                 }
             }
-            
-            HirInstruction::GetElementPtr { result, ty: _, ptr, indices } => {
+
+            HirInstruction::GetElementPtr {
+                result,
+                ty: _,
+                ptr,
+                indices,
+            } => {
                 // Simplified GEP - just add offsets
                 let mut addr = self.value_map[ptr];
                 let ptr_ty = self.module.target_config().pointer_type();
-                
+
                 for (i, idx) in indices.iter().enumerate() {
                     let idx_val = self.value_map[idx];
                     // Calculate offset based on type
@@ -4341,13 +5501,24 @@ impl CraneliftBackend {
                     };
                     addr = builder.ins().iadd(addr, offset);
                 }
-                
+
                 self.value_map.insert(*result, addr);
             }
-            
-            HirInstruction::Cast { result, ty, op, operand } => {
-                eprintln!("[Cranelift Cast] operand={:?}, op={:?}, target_ty={:?}", operand, op, ty);
-                let val = self.value_map.get(operand).copied()
+
+            HirInstruction::Cast {
+                result,
+                ty,
+                op,
+                operand,
+            } => {
+                eprintln!(
+                    "[Cranelift Cast] operand={:?}, op={:?}, target_ty={:?}",
+                    operand, op, ty
+                );
+                let val = self
+                    .value_map
+                    .get(operand)
+                    .copied()
                     .unwrap_or_else(|| panic!("Cast operand {:?} not in value_map", operand));
                 let target_ty = self.translate_type(ty)?;
                 eprintln!("[Cranelift Cast] val={:?}, target_ty={:?}", val, target_ty);
@@ -4357,80 +5528,95 @@ impl CraneliftBackend {
                         // Bitcast - just return the value for now
                         val
                     }
-                    crate::hir::CastOp::ZExt => {
-                        builder.ins().uextend(target_ty, val)
-                    }
+                    crate::hir::CastOp::ZExt => builder.ins().uextend(target_ty, val),
                     crate::hir::CastOp::SExt => {
-                        eprintln!("[Cranelift Cast] Doing sextend from val={:?} to target_ty={:?}", val, target_ty);
+                        eprintln!(
+                            "[Cranelift Cast] Doing sextend from val={:?} to target_ty={:?}",
+                            val, target_ty
+                        );
                         let result = builder.ins().sextend(target_ty, val);
                         eprintln!("[Cranelift Cast] sextend result={:?}", result);
                         result
                     }
-                    crate::hir::CastOp::Trunc => {
-                        builder.ins().ireduce(target_ty, val)
-                    }
-                    crate::hir::CastOp::FpToSi => {
-                        builder.ins().fcvt_to_sint(target_ty, val)
-                    }
-                    crate::hir::CastOp::SiToFp => {
-                        builder.ins().fcvt_from_sint(target_ty, val)
-                    }
-                    crate::hir::CastOp::FpExt => {
-                        builder.ins().fpromote(target_ty, val)
-                    }
-                    crate::hir::CastOp::FpTrunc => {
-                        builder.ins().fdemote(target_ty, val)
-                    }
+                    crate::hir::CastOp::Trunc => builder.ins().ireduce(target_ty, val),
+                    crate::hir::CastOp::FpToSi => builder.ins().fcvt_to_sint(target_ty, val),
+                    crate::hir::CastOp::SiToFp => builder.ins().fcvt_from_sint(target_ty, val),
+                    crate::hir::CastOp::FpExt => builder.ins().fpromote(target_ty, val),
+                    crate::hir::CastOp::FpTrunc => builder.ins().fdemote(target_ty, val),
                     _ => {
                         // Other cast operations like PtrToInt, IntToPtr
                         val // Placeholder
                     }
                 };
-                
+
                 self.value_map.insert(*result, cast_val);
             }
-            
-            HirInstruction::ExtractValue { result, ty, aggregate: _, indices: _ } => {
+
+            HirInstruction::ExtractValue {
+                result,
+                ty,
+                aggregate: _,
+                indices: _,
+            } => {
                 // NOTE: Dead code - not used. See inline implementation in compile_function
                 let cranelift_ty = self.translate_type(ty)?;
                 let dummy = builder.ins().iconst(cranelift_ty, 0);
                 self.value_map.insert(*result, dummy);
             }
 
-            HirInstruction::InsertValue { result, ty: _, aggregate, value: _, indices: _ } => {
+            HirInstruction::InsertValue {
+                result,
+                ty: _,
+                aggregate,
+                value: _,
+                indices: _,
+            } => {
                 // NOTE: Dead code - not used. See inline implementation in compile_function
                 let struct_ptr = self.value_map[aggregate];
                 self.value_map.insert(*result, struct_ptr);
             }
-            
-            HirInstruction::Atomic { op, result, ty, ptr, value, ordering } => {
+
+            HirInstruction::Atomic {
+                op,
+                result,
+                ty,
+                ptr,
+                value,
+                ordering,
+            } => {
                 // Atomic operations
                 let ptr_val = self.value_map[ptr];
                 let target_ty = self.translate_type(ty)?;
-                
+
                 // Convert HIR atomic ordering to Cranelift memory ordering
                 let mem_flags = match ordering {
                     crate::hir::AtomicOrdering::Relaxed => MemFlags::new(),
                     crate::hir::AtomicOrdering::Acquire => MemFlags::new(),
-                    crate::hir::AtomicOrdering::Release => MemFlags::new(), 
+                    crate::hir::AtomicOrdering::Release => MemFlags::new(),
                     crate::hir::AtomicOrdering::AcqRel => MemFlags::new(),
                     crate::hir::AtomicOrdering::SeqCst => MemFlags::new(),
                 };
-                
+
                 let atomic_result = match op {
                     crate::hir::AtomicOp::Load => {
                         // Atomic load
-                        builder.ins().load(target_ty, mem_flags.with_notrap(), ptr_val, 0)
+                        builder
+                            .ins()
+                            .load(target_ty, mem_flags.with_notrap(), ptr_val, 0)
                     }
                     crate::hir::AtomicOp::Store => {
                         // Atomic store
                         if let Some(val_id) = value {
                             let val = self.value_map[val_id];
-                            builder.ins().store(mem_flags.with_notrap(), val, ptr_val, 0);
+                            builder
+                                .ins()
+                                .store(mem_flags.with_notrap(), val, ptr_val, 0);
                             // Store doesn't return a value, but HIR expects one for SSA
                             val // Return the stored value
                         } else {
-                            return Err(CompilerError::Backend("AtomicStore requires a value".into()));
+                            return Err(CompilerError::Backend(
+                                "AtomicStore requires a value".into(),
+                            ));
                         }
                     }
                     crate::hir::AtomicOp::Exchange => {
@@ -4438,23 +5624,33 @@ impl CraneliftBackend {
                         if let Some(val_id) = value {
                             let val = self.value_map[val_id];
                             // For now, use regular load/store (Cranelift has limited atomic support)
-                            let old_val = builder.ins().load(target_ty, mem_flags.with_notrap(), ptr_val, 0);
-                            builder.ins().store(mem_flags.with_notrap(), val, ptr_val, 0);
+                            let old_val =
+                                builder
+                                    .ins()
+                                    .load(target_ty, mem_flags.with_notrap(), ptr_val, 0);
+                            builder
+                                .ins()
+                                .store(mem_flags.with_notrap(), val, ptr_val, 0);
                             old_val
                         } else {
-                            return Err(CompilerError::Backend("AtomicExchange requires a value".into()));
+                            return Err(CompilerError::Backend(
+                                "AtomicExchange requires a value".into(),
+                            ));
                         }
                     }
-                    crate::hir::AtomicOp::Add |
-                    crate::hir::AtomicOp::Sub |
-                    crate::hir::AtomicOp::And |
-                    crate::hir::AtomicOp::Or |
-                    crate::hir::AtomicOp::Xor => {
+                    crate::hir::AtomicOp::Add
+                    | crate::hir::AtomicOp::Sub
+                    | crate::hir::AtomicOp::And
+                    | crate::hir::AtomicOp::Or
+                    | crate::hir::AtomicOp::Xor => {
                         // Atomic read-modify-write operations
                         if let Some(val_id) = value {
                             let val = self.value_map[val_id];
                             // For now, use load-op-store pattern (not truly atomic)
-                            let old_val = builder.ins().load(target_ty, mem_flags.with_notrap(), ptr_val, 0);
+                            let old_val =
+                                builder
+                                    .ins()
+                                    .load(target_ty, mem_flags.with_notrap(), ptr_val, 0);
                             let new_val = match op {
                                 crate::hir::AtomicOp::Add => builder.ins().iadd(old_val, val),
                                 crate::hir::AtomicOp::Sub => builder.ins().isub(old_val, val),
@@ -4463,10 +5659,14 @@ impl CraneliftBackend {
                                 crate::hir::AtomicOp::Xor => builder.ins().bxor(old_val, val),
                                 _ => unreachable!(),
                             };
-                            builder.ins().store(mem_flags.with_notrap(), new_val, ptr_val, 0);
+                            builder
+                                .ins()
+                                .store(mem_flags.with_notrap(), new_val, ptr_val, 0);
                             old_val // Return the old value
                         } else {
-                            return Err(CompilerError::Backend("Atomic RMW operations require a value".into()));
+                            return Err(CompilerError::Backend(
+                                "Atomic RMW operations require a value".into(),
+                            ));
                         }
                     }
                     crate::hir::AtomicOp::CompareExchange => {
@@ -4477,13 +5677,15 @@ impl CraneliftBackend {
                         // WORKAROUND: Returns error (unimplemented)
                         // FUTURE (v2.0): Extend AtomicRMW HIR instruction for compare-exchange
                         // Estimated effort: 4-5 hours (HIR change + Cranelift mapping)
-                        return Err(CompilerError::Backend("CompareExchange not yet fully implemented".into()));
+                        return Err(CompilerError::Backend(
+                            "CompareExchange not yet fully implemented".into(),
+                        ));
                     }
                 };
-                
+
                 self.value_map.insert(*result, atomic_result);
             }
-            
+
             HirInstruction::Fence { ordering: _ } => {
                 // Memory fence
                 // Cranelift doesn't have explicit fence instructions in the same way
@@ -4492,27 +5694,36 @@ impl CraneliftBackend {
                 // In a real implementation, this might emit platform-specific barrier instructions
             }
 
-            HirInstruction::CreateUnion { result, union_ty, variant_index, value } => {
+            HirInstruction::CreateUnion {
+                result,
+                union_ty,
+                variant_index,
+                value,
+            } => {
                 // Create a tagged union value
                 let union_layout = self.calculate_union_layout(union_ty)?;
                 let ptr_ty = self.module.target_config().pointer_type();
-                
+
                 // Allocate space for the union on the stack
                 let union_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot, 
-                    union_layout.total_size
+                    StackSlotKind::ExplicitSlot,
+                    union_layout.total_size,
                 ));
                 let union_ptr = builder.ins().stack_addr(ptr_ty, union_slot, 0);
-                
+
                 // Store the discriminant in the first field
                 let discriminant = builder.ins().iconst(types::I32, *variant_index as i64);
-                builder.ins().store(MemFlags::new(), discriminant, union_ptr, 0);
-                
+                builder
+                    .ins()
+                    .store(MemFlags::new(), discriminant, union_ptr, 0);
+
                 // Store the value in the data field (after discriminant)
                 let value_val = self.value_map[value];
                 let data_offset = 4; // Assuming 4-byte discriminant
-                builder.ins().store(MemFlags::new(), value_val, union_ptr, data_offset);
-                
+                builder
+                    .ins()
+                    .store(MemFlags::new(), value_val, union_ptr, data_offset);
+
                 self.value_map.insert(*result, union_ptr);
             }
 
@@ -4523,27 +5734,35 @@ impl CraneliftBackend {
                     types::I32,
                     MemFlags::new(),
                     union_ptr,
-                    0 // Discriminant is at offset 0
+                    0, // Discriminant is at offset 0
                 );
                 self.value_map.insert(*result, discriminant);
             }
 
-            HirInstruction::ExtractUnionValue { result, ty, union_val, variant_index: _ } => {
+            HirInstruction::ExtractUnionValue {
+                result,
+                ty,
+                union_val,
+                variant_index: _,
+            } => {
                 // Extract value from union variant (unsafe - assumes correct variant)
                 let union_ptr = self.value_map[union_val];
                 let cranelift_ty = self.translate_type(ty)?;
                 let data_offset = 4; // Skip discriminant
-                
-                let value = builder.ins().load(
-                    cranelift_ty,
-                    MemFlags::new(),
-                    union_ptr,
-                    data_offset
-                );
+
+                let value =
+                    builder
+                        .ins()
+                        .load(cranelift_ty, MemFlags::new(), union_ptr, data_offset);
                 self.value_map.insert(*result, value);
             }
 
-            HirInstruction::CreateClosure { result, closure_ty, function, captures } => {
+            HirInstruction::CreateClosure {
+                result,
+                closure_ty,
+                function,
+                captures,
+            } => {
                 // Create a closure with captured environment
                 let ptr_ty = self.module.target_config().pointer_type();
 
@@ -4553,29 +5772,37 @@ impl CraneliftBackend {
                 // Allocate closure on stack (simplified - should use proper allocator for escaping closures)
                 let closure_slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    closure_layout.total_size
+                    closure_layout.total_size,
                 ));
                 let closure_ptr = builder.ins().stack_addr(ptr_ty, closure_slot, 0);
 
                 // Store function pointer - get the actual function address
                 if let Some(&cranelift_func_id) = self.function_map.get(function) {
                     // Declare the function reference in the current function
-                    let local_func_ref = self.module.declare_func_in_func(cranelift_func_id, builder.func);
+                    let local_func_ref = self
+                        .module
+                        .declare_func_in_func(cranelift_func_id, builder.func);
                     // Get the function address as a pointer value
                     let func_ptr = builder.ins().func_addr(ptr_ty, local_func_ref);
-                    builder.ins().store(MemFlags::new(), func_ptr, closure_ptr, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::new(), func_ptr, closure_ptr, 0);
                 } else {
                     // Lambda function not found - store null pointer as fallback
                     warn!(" Lambda function {:?} not found in function_map", function);
                     let null_ptr = builder.ins().iconst(ptr_ty, 0);
-                    builder.ins().store(MemFlags::new(), null_ptr, closure_ptr, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::new(), null_ptr, closure_ptr, 0);
                 }
 
                 // Store captured values
                 let mut offset = 8; // After function pointer
                 for capture_id in captures {
                     if let Some(&capture_val) = self.value_map.get(capture_id) {
-                        builder.ins().store(MemFlags::new(), capture_val, closure_ptr, offset);
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), capture_val, closure_ptr, offset);
                         offset += 8; // Simplified - should calculate proper size
                     }
                 }
@@ -4583,19 +5810,18 @@ impl CraneliftBackend {
                 self.value_map.insert(*result, closure_ptr);
             }
 
-            HirInstruction::CallClosure { result, closure, args } => {
+            HirInstruction::CallClosure {
+                result,
+                closure,
+                args,
+            } => {
                 // Call a closure (simplified implementation)
                 let closure_ptr = self.value_map[closure];
                 let ptr_ty = self.module.target_config().pointer_type();
-                
+
                 // Load function pointer from closure
-                let func_ptr = builder.ins().load(
-                    ptr_ty,
-                    MemFlags::new(),
-                    closure_ptr,
-                    0
-                );
-                
+                let func_ptr = builder.ins().load(ptr_ty, MemFlags::new(), closure_ptr, 0);
+
                 // Collect arguments (including captured environment)
                 let mut call_args = vec![closure_ptr]; // Pass closure as first arg
                 for arg_id in args {
@@ -4603,7 +5829,7 @@ impl CraneliftBackend {
                         call_args.push(arg_val);
                     }
                 }
-                
+
                 // In a real implementation, we'd call through the function pointer
                 // For now, this is a placeholder that demonstrates the structure
                 if let Some(result_id) = result {
@@ -4612,22 +5838,27 @@ impl CraneliftBackend {
                     self.value_map.insert(*result_id, dummy_result);
                 }
             }
-            
+
             _ => {
                 // TODO: Implement remaining instructions
                 return Err(CompilerError::Backend("Unimplemented instruction".into()));
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Translate terminator
     #[allow(dead_code)]
 
     /// Get function pointer for JIT execution
     pub fn get_function_ptr(&self, id: HirId) -> Option<*const u8> {
-        self.hot_reload.function_pointers.read().unwrap().get(&id).copied()
+        self.hot_reload
+            .function_pointers
+            .read()
+            .unwrap()
+            .get(&id)
+            .copied()
     }
 
     /// Finalize compiled functions and update function pointers
@@ -4636,13 +5867,20 @@ impl CraneliftBackend {
         use cranelift_module::Module;
 
         // Finalize the module
-        self.module.finalize_definitions()
-            .map_err(|e| CompilerError::Backend(format!("Failed to finalize definitions: {}", e)))?;
+        self.module.finalize_definitions().map_err(|e| {
+            CompilerError::Backend(format!("Failed to finalize definitions: {}", e))
+        })?;
 
         // Update function pointers after finalization
         for (hir_id, compiled_func) in &self.compiled_functions {
-            let code_ptr = self.module.get_finalized_function(compiled_func.function_id);
-            self.hot_reload.function_pointers.write().unwrap().insert(*hir_id, code_ptr);
+            let code_ptr = self
+                .module
+                .get_finalized_function(compiled_func.function_id);
+            self.hot_reload
+                .function_pointers
+                .write()
+                .unwrap()
+                .insert(*hir_id, code_ptr);
         }
 
         Ok(())
@@ -4652,34 +5890,38 @@ impl CraneliftBackend {
     pub fn hot_reload_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         // Recompile the function
         self.compile_function(id, function)?;
-        
+
         // The function pointer is automatically updated in compile_function
-        
+
         Ok(())
     }
-    
+
     /// Rollback to previous function version
     pub fn rollback_function(&mut self, id: HirId) -> CompilerResult<()> {
         let mut prev_versions = self.hot_reload.previous_versions.write().unwrap();
-        
+
         if let Some(versions) = prev_versions.get_mut(&id) {
             if let Some(prev) = versions.pop() {
                 // Restore previous function pointer
                 let mut ptrs = self.hot_reload.function_pointers.write().unwrap();
                 ptrs.insert(id, prev.code_ptr);
-                
+
                 // Update version counter
                 let mut versions = self.hot_reload.versions.write().unwrap();
                 if let Some(version) = versions.get_mut(&id) {
                     *version = prev.version;
                 }
-                
+
                 Ok(())
             } else {
-                Err(CompilerError::Backend("No previous version to rollback to".into()))
+                Err(CompilerError::Backend(
+                    "No previous version to rollback to".into(),
+                ))
             }
         } else {
-            Err(CompilerError::Backend("Function has no previous versions".into()))
+            Err(CompilerError::Backend(
+                "Function has no previous versions".into(),
+            ))
         }
     }
 
@@ -4696,7 +5938,13 @@ impl CraneliftBackend {
         type_cache: &HashMap<HirType, types::Type>,
     ) -> CompilerResult<()> {
         match inst {
-            HirInstruction::Binary { op, result, ty, left, right } => {
+            HirInstruction::Binary {
+                op,
+                result,
+                ty,
+                left,
+                right,
+            } => {
                 let lhs = self.value_map[left];
                 let rhs = self.value_map[right];
 
@@ -4733,18 +5981,45 @@ impl CraneliftBackend {
                     }
                     // Comparison operations - use operand type to determine signed/unsigned
                     // Comparisons always return bool (i8) - never uextend
-                    BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge => {
                         // Get operand type from left value, not result type
-                        let operand_ty = function.values.get(left)
-                            .map(|v| &v.ty)
-                            .unwrap_or(ty);
+                        let operand_ty = function.values.get(left).map(|v| &v.ty).unwrap_or(ty);
                         let cc = match op {
                             BinaryOp::Eq => IntCC::Equal,
                             BinaryOp::Ne => IntCC::NotEqual,
-                            BinaryOp::Lt => if operand_ty.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan },
-                            BinaryOp::Le => if operand_ty.is_signed() { IntCC::SignedLessThanOrEqual } else { IntCC::UnsignedLessThanOrEqual },
-                            BinaryOp::Gt => if operand_ty.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan },
-                            BinaryOp::Ge => if operand_ty.is_signed() { IntCC::SignedGreaterThanOrEqual } else { IntCC::UnsignedGreaterThanOrEqual },
+                            BinaryOp::Lt => {
+                                if operand_ty.is_signed() {
+                                    IntCC::SignedLessThan
+                                } else {
+                                    IntCC::UnsignedLessThan
+                                }
+                            }
+                            BinaryOp::Le => {
+                                if operand_ty.is_signed() {
+                                    IntCC::SignedLessThanOrEqual
+                                } else {
+                                    IntCC::UnsignedLessThanOrEqual
+                                }
+                            }
+                            BinaryOp::Gt => {
+                                if operand_ty.is_signed() {
+                                    IntCC::SignedGreaterThan
+                                } else {
+                                    IntCC::UnsignedGreaterThan
+                                }
+                            }
+                            BinaryOp::Ge => {
+                                if operand_ty.is_signed() {
+                                    IntCC::SignedGreaterThanOrEqual
+                                } else {
+                                    IntCC::UnsignedGreaterThanOrEqual
+                                }
+                            }
                             _ => unreachable!(),
                         };
                         // icmp always returns i8 (bool) - no extension needed
@@ -4757,7 +6032,12 @@ impl CraneliftBackend {
                     BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
                     BinaryOp::FRem => self.call_libm_fmod(builder, lhs, rhs)?,
                     // Float comparisons - also always return bool (i8)
-                    BinaryOp::FEq | BinaryOp::FNe | BinaryOp::FLt | BinaryOp::FLe | BinaryOp::FGt | BinaryOp::FGe => {
+                    BinaryOp::FEq
+                    | BinaryOp::FNe
+                    | BinaryOp::FLt
+                    | BinaryOp::FLe
+                    | BinaryOp::FGt
+                    | BinaryOp::FGe => {
                         let cc = match op {
                             BinaryOp::FEq => FloatCC::Equal,
                             BinaryOp::FNe => FloatCC::NotEqual,
@@ -4776,7 +6056,12 @@ impl CraneliftBackend {
                 Ok(())
             }
 
-            HirInstruction::Unary { op, result, ty, operand } => {
+            HirInstruction::Unary {
+                op,
+                result,
+                ty,
+                operand,
+            } => {
                 let val = self.value_map[operand];
 
                 let value = match op {
@@ -4814,7 +6099,8 @@ impl CraneliftBackend {
     ) -> CompilerResult<()> {
         match terminator {
             HirTerminator::Return { values } => {
-                let cranelift_vals: Vec<_> = values.iter()
+                let cranelift_vals: Vec<_> = values
+                    .iter()
                     .filter_map(|v| self.value_map.get(v).copied())
                     .collect();
                 builder.ins().return_(&cranelift_vals);
@@ -4837,7 +6123,11 @@ impl CraneliftBackend {
                 Ok(())
             }
 
-            HirTerminator::CondBranch { condition, true_target, false_target } => {
+            HirTerminator::CondBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
                 let cond = self.value_map[condition];
                 let true_block = self.block_map[true_target];
                 let false_block = self.block_map[false_target];
@@ -4846,7 +6136,9 @@ impl CraneliftBackend {
                 let false_args = self.get_phi_args(*false_target, current_block, function);
 
                 // Use brif instruction
-                builder.ins().brif(cond, true_block, &true_args, false_block, &false_args);
+                builder
+                    .ins()
+                    .brif(cond, true_block, &true_args, false_block, &false_args);
 
                 // Update seal tracker for both targets
                 for target in [true_target, false_target] {
@@ -4864,7 +6156,10 @@ impl CraneliftBackend {
 
             _ => {
                 // Other terminators not yet implemented
-                Err(CompilerError::Backend(format!("Terminator {:?} not yet implemented", terminator)))
+                Err(CompilerError::Backend(format!(
+                    "Terminator {:?} not yet implemented",
+                    terminator
+                )))
             }
         }
     }
@@ -4910,7 +6205,12 @@ impl CraneliftBackend {
             post_order.push(block_id);
         }
 
-        visit(function.entry_block, function, &mut visited, &mut post_order);
+        visit(
+            function.entry_block,
+            function,
+            &mut visited,
+            &mut post_order,
+        );
 
         // Reverse to get reverse post-order
         post_order.reverse();
@@ -4942,17 +6242,22 @@ impl CraneliftBackend {
             None => return vec![],
         };
 
-        target.phis.iter().map(|phi| {
-            // Find the incoming value from from_block
-            // FIXED: phi.incoming format is (value, block), not (block, value)
-            phi.incoming.iter()
-                .find(|(_, pred_block)| *pred_block == from_block)
-                .map(|(value, _)| self.value_map[value])
-                .expect(&format!(
-                    "Phi node in block {:?} must have incoming value from predecessor {:?}",
-                    target_block, from_block
-                ))
-        }).collect()
+        target
+            .phis
+            .iter()
+            .map(|phi| {
+                // Find the incoming value from from_block
+                // FIXED: phi.incoming format is (value, block), not (block, value)
+                phi.incoming
+                    .iter()
+                    .find(|(_, pred_block)| *pred_block == from_block)
+                    .map(|(value, _)| self.value_map[value])
+                    .expect(&format!(
+                        "Phi node in block {:?} must have incoming value from predecessor {:?}",
+                        target_block, from_block
+                    ))
+            })
+            .collect()
     }
 
     /// Get the Cranelift IR as a string (for debugging)
@@ -5010,10 +6315,15 @@ impl CraneliftBackend {
     ///
     /// Returns the list of extern function names that need to be resolved.
     pub fn collect_extern_dependencies(module: &HirModule) -> Vec<String> {
-        module.functions
+        module
+            .functions
             .values()
             .filter(|f| f.is_external)
-            .map(|f| f.name.resolve_global().unwrap_or_else(|| f.name.to_string()))
+            .map(|f| {
+                f.name
+                    .resolve_global()
+                    .unwrap_or_else(|| f.name.to_string())
+            })
             .collect()
     }
 
@@ -5024,8 +6334,8 @@ impl CraneliftBackend {
         let externs = Self::collect_extern_dependencies(module);
         externs.iter().any(|name| {
             // Check if the extern is in our exported symbols but not in runtime symbols
-            self.exported_symbols.contains_key(name) &&
-            !self.runtime_symbols.iter().any(|(n, _)| n == name)
+            self.exported_symbols.contains_key(name)
+                && !self.runtime_symbols.iter().any(|(n, _)| n == name)
         })
     }
 
@@ -5036,7 +6346,8 @@ impl CraneliftBackend {
     /// Use with caution - primarily for cross-module linking setup.
     pub fn rebuild_with_accumulated_symbols(&mut self) -> CompilerResult<()> {
         // Collect all symbols (runtime + exported)
-        let mut all_symbols: Vec<(&str, *const u8)> = self.runtime_symbols
+        let mut all_symbols: Vec<(&str, *const u8)> = self
+            .runtime_symbols
             .iter()
             .map(|(n, p)| (n.as_str(), *p))
             .collect();
@@ -5055,7 +6366,9 @@ impl CraneliftBackend {
         flag_builder.set("enable_verifier", "false").unwrap();
 
         let isa_builder = cranelift_native::builder().unwrap();
-        let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .unwrap();
 
         // Create new JIT module with all symbols
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -5089,7 +6402,11 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
     match terminator {
         HirTerminator::Return { .. } => vec![],
         HirTerminator::Branch { target } => vec![*target],
-        HirTerminator::CondBranch { true_target, false_target, .. } => {
+        HirTerminator::CondBranch {
+            true_target,
+            false_target,
+            ..
+        } => {
             vec![*true_target, *false_target]
         }
         HirTerminator::Switch { default, cases, .. } => {
@@ -5097,7 +6414,9 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
             succs.extend(cases.iter().map(|(_, target)| *target));
             succs
         }
-        HirTerminator::PatternMatch { patterns, default, .. } => {
+        HirTerminator::PatternMatch {
+            patterns, default, ..
+        } => {
             let mut succs: Vec<HirId> = patterns.iter().map(|p| p.target).collect();
             if let Some(def) = default {
                 succs.push(*def);
@@ -5213,7 +6532,7 @@ impl CraneliftBackend {
             _ => Ok(self.module.target_config().pointer_bytes() as usize), // Default to pointer size
         }
     }
-    
+
     /// Get the alignment requirement of a type
     fn type_alignment(&self, ty: &HirType) -> CompilerResult<usize> {
         match ty {
@@ -5253,20 +6572,21 @@ impl CraneliftBackend {
     fn calculate_union_layout(&self, union_ty: &HirType) -> CompilerResult<StructLayout> {
         if let HirType::Union(union_def) = union_ty {
             let discriminant_size = self.type_size(union_def.discriminant_type.as_ref())? as u32;
-            let discriminant_align = self.type_alignment(union_def.discriminant_type.as_ref())? as u32;
-            
+            let discriminant_align =
+                self.type_alignment(union_def.discriminant_type.as_ref())? as u32;
+
             if union_def.is_c_union {
                 // C-style union: no discriminant, just largest variant
                 let mut max_size = 0u32;
                 let mut max_align = 1u32;
-                
+
                 for variant in &union_def.variants {
                     let variant_size = self.type_size(&variant.ty)? as u32;
                     let variant_align = self.type_alignment(&variant.ty)? as u32;
                     max_size = max_size.max(variant_size);
                     max_align = max_align.max(variant_align);
                 }
-                
+
                 Ok(StructLayout {
                     field_offsets: vec![0], // Single field at offset 0
                     total_size: max_size,
@@ -5276,19 +6596,20 @@ impl CraneliftBackend {
                 // Tagged union: discriminant + data
                 let mut max_variant_size = 0u32;
                 let mut max_variant_align = 1u32;
-                
+
                 for variant in &union_def.variants {
                     let variant_size = self.type_size(&variant.ty)? as u32;
                     let variant_align = self.type_alignment(&variant.ty)? as u32;
                     max_variant_size = max_variant_size.max(variant_size);
                     max_variant_align = max_variant_align.max(variant_align);
                 }
-                
+
                 // Layout: [discriminant][padding][data]
                 let data_align = max_variant_align.max(discriminant_align);
                 let data_offset = (discriminant_size + data_align - 1) & !(data_align - 1);
-                let total_size = (data_offset + max_variant_size + data_align - 1) & !(data_align - 1);
-                
+                let total_size =
+                    (data_offset + max_variant_size + data_align - 1) & !(data_align - 1);
+
                 Ok(StructLayout {
                     field_offsets: vec![0, data_offset], // [discriminant_offset, data_offset]
                     total_size,
@@ -5305,26 +6626,26 @@ impl CraneliftBackend {
         if let HirType::Closure(closure_def) = closure_ty {
             let ptr_size = self.module.target_config().pointer_bytes() as u32;
             let ptr_align = ptr_size; // Pointer alignment equals pointer size
-            
+
             let mut offset = ptr_size; // Start after function pointer
             let mut field_offsets = vec![0]; // Function pointer at offset 0
             let mut max_align = ptr_align;
-            
+
             for capture in &closure_def.captures {
                 let capture_size = self.type_size(&capture.ty)? as u32;
                 let capture_align = self.type_alignment(&capture.ty)? as u32;
-                
+
                 max_align = max_align.max(capture_align);
-                
+
                 // Align offset to capture alignment
                 offset = (offset + capture_align - 1) & !(capture_align - 1);
                 field_offsets.push(offset);
                 offset += capture_size;
             }
-            
+
             // Align total size to closure alignment
             let total_size = (offset + max_align - 1) & !(max_align - 1);
-            
+
             Ok(StructLayout {
                 field_offsets,
                 total_size,
@@ -5341,17 +6662,20 @@ impl HirType {
     fn is_float(&self) -> bool {
         matches!(self, HirType::F32 | HirType::F64)
     }
-    
+
     #[allow(dead_code)]
     fn is_signed(&self) -> bool {
-        matches!(self, HirType::I8 | HirType::I16 | HirType::I32 | HirType::I64 | HirType::I128)
+        matches!(
+            self,
+            HirType::I8 | HirType::I16 | HirType::I32 | HirType::I64 | HirType::I128
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_cranelift_backend_creation() {
         let backend = CraneliftBackend::new();

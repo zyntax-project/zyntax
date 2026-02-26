@@ -1,20 +1,23 @@
 //! # SSA Form Construction
-//! 
+//!
 //! Converts CFG to Static Single Assignment form for both Cranelift and LLVM.
 //! Uses the efficient algorithm from "Simple and Efficient Construction of SSA Form"
 //! by Braun et al.
 
-use std::collections::{HashSet, VecDeque};
-use indexmap::IndexMap;
-use std::sync::Arc;
-use zyntax_typed_ast::{InternedString, Type, ConstValue, typed_ast::{TypedNode, TypedExpression}};
-use petgraph::visit::EdgeRef; // For .source() method on edges
+use crate::cfg::{BasicBlock, ControlFlowGraph};
 use crate::hir::{
-    HirId, HirFunction, HirBlock, HirInstruction, HirValueKind, HirConstant,
-    HirType, HirPhi, HirTerminator, CastOp, HirParam, HirFunctionSignature
+    CastOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
+    HirParam, HirPhi, HirTerminator, HirType, HirValueKind,
 };
-use crate::cfg::{ControlFlowGraph, BasicBlock};
 use crate::CompilerResult;
+use indexmap::IndexMap;
+use petgraph::visit::EdgeRef; // For .source() method on edges
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use zyntax_typed_ast::{
+    typed_ast::{TypedExpression, TypedNode},
+    ConstValue, InternedString, Type,
+};
 
 /// SSA builder state
 pub struct SsaBuilder {
@@ -143,7 +146,9 @@ impl DominanceInfo {
                     if idom.contains_key(&pred_id) {
                         new_idom = match new_idom {
                             None => Some(pred_id),
-                            Some(current) => Some(Self::intersect(&idom, current, pred_id, &rpo, cfg)),
+                            Some(current) => {
+                                Some(Self::intersect(&idom, current, pred_id, &rpo, cfg))
+                            }
                         };
                     }
                 }
@@ -179,7 +184,10 @@ impl DominanceInfo {
         }
         visited.insert(node);
 
-        for edge in cfg.graph.edges_directed(node, petgraph::Direction::Outgoing) {
+        for edge in cfg
+            .graph
+            .edges_directed(node, petgraph::Direction::Outgoing)
+        {
             Self::postorder_dfs(cfg, edge.target(), visited, postorder);
         }
 
@@ -195,16 +203,19 @@ impl DominanceInfo {
         cfg: &crate::typed_cfg::TypedControlFlowGraph,
     ) -> HirId {
         // Get RPO indices for blocks
-        let rpo_map: IndexMap<HirId, usize> = rpo.iter()
+        let rpo_map: IndexMap<HirId, usize> = rpo
+            .iter()
             .enumerate()
             .map(|(i, &idx)| (cfg.graph[idx].id, i))
             .collect();
 
         while b1 != b2 {
-            while rpo_map.get(&b1).unwrap_or(&usize::MAX) > rpo_map.get(&b2).unwrap_or(&usize::MAX) {
+            while rpo_map.get(&b1).unwrap_or(&usize::MAX) > rpo_map.get(&b2).unwrap_or(&usize::MAX)
+            {
                 b1 = idom[&b1];
             }
-            while rpo_map.get(&b2).unwrap_or(&usize::MAX) > rpo_map.get(&b1).unwrap_or(&usize::MAX) {
+            while rpo_map.get(&b2).unwrap_or(&usize::MAX) > rpo_map.get(&b1).unwrap_or(&usize::MAX)
+            {
                 b2 = idom[&b2];
             }
         }
@@ -225,7 +236,9 @@ impl DominanceInfo {
             let block_id = block.id;
 
             // Get predecessors
-            let preds: Vec<_> = cfg.graph.edges_directed(node_idx, Direction::Incoming)
+            let preds: Vec<_> = cfg
+                .graph
+                .edges_directed(node_idx, Direction::Incoming)
                 .map(|e| cfg.graph[e.source()].id)
                 .collect();
 
@@ -235,7 +248,10 @@ impl DominanceInfo {
                     let mut runner = pred;
                     // Walk up dominator tree from pred until we reach block's idom
                     while runner != idom.get(&block_id).copied().unwrap_or(block_id) {
-                        frontiers.entry(runner).or_insert_with(HashSet::new).insert(block_id);
+                        frontiers
+                            .entry(runner)
+                            .or_insert_with(HashSet::new)
+                            .insert(block_id);
                         let next_runner = idom.get(&runner).copied();
                         if next_runner.is_none() || next_runner == Some(runner) {
                             break; // Reached entry or self-dom
@@ -310,7 +326,7 @@ impl SsaBuilder {
         self.extern_link_names = link_names;
         self
     }
-    
+
     /// Build SSA form from CFG
     pub fn build_from_cfg(mut self, cfg: &ControlFlowGraph) -> CompilerResult<SsaForm> {
         // Initialize blocks
@@ -343,7 +359,10 @@ impl SsaBuilder {
 
     /// Build SSA form from TypedControlFlowGraph
     /// This is the new approach that processes TypedAST directly
-    pub fn build_from_typed_cfg(mut self, cfg: &crate::typed_cfg::TypedControlFlowGraph) -> CompilerResult<SsaForm> {
+    pub fn build_from_typed_cfg(
+        mut self,
+        cfg: &crate::typed_cfg::TypedControlFlowGraph,
+    ) -> CompilerResult<SsaForm> {
         // Create HirBlocks for all blocks in the CFG (except entry which already exists)
         for node_idx in cfg.graph.node_indices() {
             let typed_block = &cfg.graph[node_idx];
@@ -363,7 +382,10 @@ impl SsaBuilder {
 
             // Find predecessors from incoming edges
             let mut predecessors = Vec::new();
-            for edge in cfg.graph.edges_directed(node_idx, petgraph::Direction::Incoming) {
+            for edge in cfg
+                .graph
+                .edges_directed(node_idx, petgraph::Direction::Incoming)
+            {
                 let pred_node = edge.source();
                 let pred_id = cfg.graph[pred_node].id;
                 predecessors.push(pred_id);
@@ -386,20 +408,32 @@ impl SsaBuilder {
         let entry_block = self.function.entry_block;
 
         for (param_index, param) in params.iter().enumerate() {
-            eprintln!("[PARAM DEBUG] Param '{}' has HIR type: {:?}",
-                param.name.resolve_global().unwrap_or_default(), param.ty);
+            eprintln!(
+                "[PARAM DEBUG] Param '{}' has HIR type: {:?}",
+                param.name.resolve_global().unwrap_or_default(),
+                param.ty
+            );
 
-            let param_value_id = self.create_value(param.ty.clone(), HirValueKind::Parameter(param_index as u32));
+            let param_value_id = self.create_value(
+                param.ty.clone(),
+                HirValueKind::Parameter(param_index as u32),
+            );
 
             // Store parameter type for SSA variable tracking
             self.var_types.insert(param.name, param.ty.clone());
 
-            eprintln!("[PARAM DEBUG] Inserted into var_types: var_types['{}'] = {:?}",
-                param.name.resolve_global().unwrap_or_default(), self.var_types.get(&param.name));
+            eprintln!(
+                "[PARAM DEBUG] Inserted into var_types: var_types['{}'] = {:?}",
+                param.name.resolve_global().unwrap_or_default(),
+                self.var_types.get(&param.name)
+            );
 
             // Define parameter in entry block so it's available to all code
-            eprintln!("[PARAM DEBUG] write_variable({}, entry_block={:?})",
-                param.name.resolve_global().unwrap_or_default(), entry_block);
+            eprintln!(
+                "[PARAM DEBUG] write_variable({}, entry_block={:?})",
+                param.name.resolve_global().unwrap_or_default(),
+                entry_block
+            );
             self.write_variable(param.name, entry_block, param_value_id);
         }
 
@@ -424,7 +458,9 @@ impl SsaBuilder {
         // CRITICAL: Propagate parameters to all blocks
         // Parameters don't need phis (they're never reassigned), but they need to be
         // available in all blocks. Copy them from entry block to all other blocks.
-        let param_defs: Vec<_> = self.definitions.get(&entry_block)
+        let param_defs: Vec<_> = self
+            .definitions
+            .get(&entry_block)
             .map(|defs| defs.iter().map(|(&var, &val)| (var, val)).collect())
             .unwrap_or_default();
 
@@ -451,22 +487,37 @@ impl SsaBuilder {
         let mut found_entry = false;
         for node_idx in cfg.graph.node_indices() {
             let typed_block = &cfg.graph[node_idx];
-            eprintln!("[SSA DEBUG] CFG block: typed_block.id={:?}, entry_block={:?}, match={}",
-                typed_block.id, entry_block, typed_block.id == entry_block);
+            eprintln!(
+                "[SSA DEBUG] CFG block: typed_block.id={:?}, entry_block={:?}, match={}",
+                typed_block.id,
+                entry_block,
+                typed_block.id == entry_block
+            );
             if typed_block.id == entry_block {
                 found_entry = true;
                 // Track current block - try expressions may create continuation blocks
                 let mut current_block = entry_block;
-                eprintln!("[SSA DEBUG] Processing entry block {:?} with {} statements", entry_block, typed_block.statements.len());
+                eprintln!(
+                    "[SSA DEBUG] Processing entry block {:?} with {} statements",
+                    entry_block,
+                    typed_block.statements.len()
+                );
                 for stmt in &typed_block.statements {
                     current_block = self.process_statement(current_block, stmt)?;
                 }
-                self.process_typed_terminator(current_block, &typed_block.terminator, &typed_block.pattern_check)?;
+                self.process_typed_terminator(
+                    current_block,
+                    &typed_block.terminator,
+                    &typed_block.pattern_check,
+                )?;
                 break;
             }
         }
         if !found_entry {
-            eprintln!("[SSA DEBUG] WARNING: entry_block {:?} NOT FOUND in CFG!", entry_block);
+            eprintln!(
+                "[SSA DEBUG] WARNING: entry_block {:?} NOT FOUND in CFG!",
+                entry_block
+            );
         }
 
         // Keep processing until worklist is empty
@@ -499,14 +550,20 @@ impl SsaBuilder {
                 // Check if we can process this block
                 // Process when at least one predecessor is filled for forward progress
                 let block_info = self.function.blocks.get(&block_id).unwrap();
-                let has_filled_pred = block_info.predecessors.iter().any(|pred| self.filled_blocks.contains(pred));
+                let has_filled_pred = block_info
+                    .predecessors
+                    .iter()
+                    .any(|pred| self.filled_blocks.contains(pred));
 
                 if !has_filled_pred {
                     return true; // Keep in worklist
                 }
 
                 // Seal block only if all predecessors are filled
-                let all_preds_filled = block_info.predecessors.iter().all(|pred| self.filled_blocks.contains(pred));
+                let all_preds_filled = block_info
+                    .predecessors
+                    .iter()
+                    .all(|pred| self.filled_blocks.contains(pred));
                 if all_preds_filled && !self.sealed_blocks.contains(&block_id) {
                     self.seal_block(block_id);
                 }
@@ -514,7 +571,11 @@ impl SsaBuilder {
                 // Extract pattern bindings if this is a match arm body
                 if let Some(pattern_info) = &typed_block.pattern_check {
                     if let Some(variant_index) = pattern_info.variant_index {
-                        if let Err(e) = self.extract_pattern_bindings(block_id, &pattern_info.pattern, variant_index) {
+                        if let Err(e) = self.extract_pattern_bindings(
+                            block_id,
+                            &pattern_info.pattern,
+                            variant_index,
+                        ) {
                             *first_error.borrow_mut() = Some(e);
                             return false;
                         }
@@ -535,7 +596,11 @@ impl SsaBuilder {
                 }
 
                 // Process the terminator
-                if let Err(e) = self.process_typed_terminator(current_block, &typed_block.terminator, &typed_block.pattern_check) {
+                if let Err(e) = self.process_typed_terminator(
+                    current_block,
+                    &typed_block.terminator,
+                    &typed_block.pattern_check,
+                ) {
                     *first_error.borrow_mut() = Some(e);
                     return false;
                 }
@@ -571,7 +636,11 @@ impl SsaBuilder {
                     // Extract pattern bindings if this is a match arm body
                     if let Some(pattern_info) = &typed_block.pattern_check {
                         if let Some(variant_index) = pattern_info.variant_index {
-                            self.extract_pattern_bindings(block_id, &pattern_info.pattern, variant_index)?;
+                            self.extract_pattern_bindings(
+                                block_id,
+                                &pattern_info.pattern,
+                                variant_index,
+                            )?;
                         }
                     }
 
@@ -580,7 +649,11 @@ impl SsaBuilder {
                     for stmt in &typed_block.statements {
                         current_block = self.process_statement(current_block, stmt)?;
                     }
-                    self.process_typed_terminator(current_block, &typed_block.terminator, &typed_block.pattern_check)?;
+                    self.process_typed_terminator(
+                        current_block,
+                        &typed_block.terminator,
+                        &typed_block.pattern_check,
+                    )?;
                     self.filled_blocks.insert(block_id);
                     if !self.sealed_blocks.contains(&block_id) {
                         self.seal_block(block_id);
@@ -662,10 +735,8 @@ impl SsaBuilder {
                             };
 
                             let union_hir_ty = HirType::Union(Box::new(union_ty));
-                            let result_id = self.create_value(
-                                union_hir_ty.clone(),
-                                HirValueKind::Instruction
-                            );
+                            let result_id =
+                                self.create_value(union_hir_ty.clone(), HirValueKind::Instruction);
 
                             self.add_instruction(
                                 block_id,
@@ -690,12 +761,18 @@ impl SsaBuilder {
                     // Check if the expression set a continuation block (for control flow expressions)
                     if let Some(continuation) = self.continuation_block.take() {
                         // Control flow expression - set Return on continuation block, not entry block
-                        let cont_block = self.function.blocks.get_mut(&continuation)
-                            .ok_or_else(|| crate::CompilerError::Analysis("Continuation block not found".into()))?;
+                        let cont_block =
+                            self.function.blocks.get_mut(&continuation).ok_or_else(|| {
+                                crate::CompilerError::Analysis(
+                                    "Continuation block not found".into(),
+                                )
+                            })?;
                         cont_block.terminator = if is_void_return {
                             HirTerminator::Return { values: vec![] }
                         } else {
-                            HirTerminator::Return { values: vec![value_id] }
+                            HirTerminator::Return {
+                                values: vec![value_id],
+                            }
                         };
 
                         // Entry block already has correct terminator (Branch/CondBranch), so return None
@@ -706,7 +783,9 @@ impl SsaBuilder {
                         if is_void_return {
                             HirTerminator::Return { values: vec![] }
                         } else {
-                            HirTerminator::Return { values: vec![value_id] }
+                            HirTerminator::Return {
+                                values: vec![value_id],
+                            }
                         }
                     }
                 } else {
@@ -718,7 +797,8 @@ impl SsaBuilder {
                 // Check if this is a pattern check block (has pattern_check with false_target)
                 if let Some(pattern_info) = pattern_check {
                     if let (Some(variant_index), Some(false_target)) =
-                        (pattern_info.variant_index, pattern_info.false_target) {
+                        (pattern_info.variant_index, pattern_info.false_target)
+                    {
                         // This is an enum pattern check - generate discriminant comparison
                         self.generate_pattern_discriminant_check(
                             block_id,
@@ -738,7 +818,11 @@ impl SsaBuilder {
                         {
                             let target_block = self.function.blocks.get_mut(target).unwrap();
                             // Replace block_id with continuation in predecessors
-                            if let Some(pos) = target_block.predecessors.iter().position(|&p| p == block_id) {
+                            if let Some(pos) = target_block
+                                .predecessors
+                                .iter()
+                                .position(|&p| p == block_id)
+                            {
                                 target_block.predecessors[pos] = continuation;
                             } else {
                                 target_block.predecessors.push(continuation);
@@ -758,7 +842,11 @@ impl SsaBuilder {
                 }
             }
 
-            TypedTerminator::CondBranch { condition, true_target, false_target } => {
+            TypedTerminator::CondBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
                 let cond_val = self.translate_expression(block_id, condition)?;
                 HirTerminator::CondBranch {
                     condition: cond_val,
@@ -786,7 +874,10 @@ impl SsaBuilder {
         };
 
         // Then set it (requires mutable block access)
-        let hir_block = self.function.blocks.get_mut(&block_id)
+        let hir_block = self
+            .function
+            .blocks
+            .get_mut(&block_id)
             .ok_or_else(|| crate::CompilerError::Analysis("Block not found".into()))?;
         hir_block.terminator = hir_terminator;
 
@@ -803,23 +894,29 @@ impl SsaBuilder {
         variant_index: u32,
     ) -> CompilerResult<HirTerminator> {
         // Get the discriminant from match context
-        let discriminant_val = self.match_context
+        let discriminant_val = self
+            .match_context
             .as_ref()
             .and_then(|ctx| ctx.discriminant_value)
-            .ok_or_else(|| crate::CompilerError::Analysis(
-                "Pattern check block has no match context with discriminant".into()
-            ))?;
+            .ok_or_else(|| {
+                crate::CompilerError::Analysis(
+                    "Pattern check block has no match context with discriminant".into(),
+                )
+            })?;
 
         // Create constant for the variant index we're checking
         let variant_const = crate::hir::HirConstant::U32(variant_index);
         let const_id = HirId::new();
-        self.function.values.insert(const_id, crate::hir::HirValue {
-            id: const_id,
-            ty: HirType::U32,
-            kind: crate::hir::HirValueKind::Constant(variant_const),
-            uses: HashSet::new(),
-            span: None,
-        });
+        self.function.values.insert(
+            const_id,
+            crate::hir::HirValue {
+                id: const_id,
+                ty: HirType::U32,
+                kind: crate::hir::HirValueKind::Constant(variant_const),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
 
         // Generate comparison: discriminant == variant_index
         let cmp_result = HirId::new();
@@ -834,8 +931,12 @@ impl SsaBuilder {
             },
         );
 
-        log::debug!("[SSA] Generated pattern check: discriminant({:?}) == {} -> {:?}",
-                 discriminant_val, variant_index, cmp_result);
+        log::debug!(
+            "[SSA] Generated pattern check: discriminant({:?}) == {} -> {:?}",
+            discriminant_val,
+            variant_index,
+            cmp_result
+        );
 
         // Use the false_target provided by CFG (next pattern check or unreachable block)
         Ok(HirTerminator::CondBranch {
@@ -874,11 +975,16 @@ impl SsaBuilder {
                 if fields.len() == 1 {
                     if let TypedPattern::Identifier { name, .. } = &fields[0].node {
                         // Get the type of the variant's inner value
-                        let variant = union_type.variants.iter()
+                        let variant = union_type
+                            .variants
+                            .iter()
                             .find(|v| v.discriminant == variant_index as u64)
-                            .ok_or_else(|| crate::CompilerError::Analysis(
-                                format!("Variant with index {} not found", variant_index)
-                            ))?;
+                            .ok_or_else(|| {
+                                crate::CompilerError::Analysis(format!(
+                                    "Variant with index {} not found",
+                                    variant_index
+                                ))
+                            })?;
 
                         // Generate ExtractUnionValue instruction
                         let extracted_id = HirId::new();
@@ -895,8 +1001,11 @@ impl SsaBuilder {
                         // Bind the extracted value to the variable
                         self.write_variable(*name, block_id, extracted_id);
 
-                        log::debug!("[SSA] Extracted union value for pattern variable {:?}: val={:?}",
-                                 name, extracted_id);
+                        log::debug!(
+                            "[SSA] Extracted union value for pattern variable {:?}: val={:?}",
+                            name,
+                            extracted_id
+                        );
                     }
                 }
             }
@@ -958,9 +1067,10 @@ impl SsaBuilder {
             "Some" => {
                 // Some(value): Optional<T> with discriminant 1
                 if args.len() != 1 {
-                    return Err(crate::CompilerError::Analysis(
-                        format!("Some() requires exactly 1 argument, got {}", args.len())
-                    ));
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "Some() requires exactly 1 argument, got {}",
+                        args.len()
+                    )));
                 }
 
                 let value_ty = self.convert_type(&args[0].ty);
@@ -993,10 +1103,15 @@ impl SsaBuilder {
             "Ok" => {
                 // Ok(value): Result<T,E> with discriminant 0
                 if args.len() != 1 {
-                    log::debug!("[SSA] ERROR: Ok() called with {} args, result_ty={:?}", args.len(), result_ty);
-                    return Err(crate::CompilerError::Analysis(
-                        format!("Ok() requires exactly 1 argument, got {}", args.len())
-                    ));
+                    log::debug!(
+                        "[SSA] ERROR: Ok() called with {} args, result_ty={:?}",
+                        args.len(),
+                        result_ty
+                    );
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "Ok() requires exactly 1 argument, got {}",
+                        args.len()
+                    )));
                 }
 
                 let value_ty = self.convert_type(&args[0].ty);
@@ -1036,9 +1151,10 @@ impl SsaBuilder {
             "Err" => {
                 // Err(error): Result<T,E> with discriminant 1
                 if args.len() != 1 {
-                    return Err(crate::CompilerError::Analysis(
-                        format!("Err() requires exactly 1 argument, got {}", args.len())
-                    ));
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "Err() requires exactly 1 argument, got {}",
+                        args.len()
+                    )));
                 }
 
                 let error_ty = self.convert_type(&args[0].ty);
@@ -1076,9 +1192,10 @@ impl SsaBuilder {
                 (1, error_ty, union_ty)
             }
             _ => {
-                return Err(crate::CompilerError::Analysis(
-                    format!("Unknown enum constructor: {}", constructor_name)
-                ));
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Unknown enum constructor: {}",
+                    constructor_name
+                )));
             }
         };
 
@@ -1094,10 +1211,7 @@ impl SsaBuilder {
         // Create the union value - must register in values map with Ptr type
         // Union values are represented as pointers to stack-allocated memory
         let union_hir_ty = HirType::Union(Box::new(union_type.clone()));
-        let result_id = self.create_value(
-            union_hir_ty.clone(),
-            HirValueKind::Instruction
-        );
+        let result_id = self.create_value(union_hir_ty.clone(), HirValueKind::Instruction);
 
         self.add_instruction(
             block_id,
@@ -1114,8 +1228,13 @@ impl SsaBuilder {
             self.add_use(value_id, result_id);
         }
 
-        log::debug!("[SSA] Created union for {}: result={:?}, variant_index={}, value={:?}",
-                 constructor_name, result_id, variant_index, value_id);
+        log::debug!(
+            "[SSA] Created union for {}: result={:?}, variant_index={}, value={:?}",
+            constructor_name,
+            result_id,
+            variant_index,
+            value_id
+        );
 
         Ok(result_id)
     }
@@ -1123,39 +1242,52 @@ impl SsaBuilder {
     /// Process a basic block
     fn process_block(&mut self, block_id: HirId, cfg: &ControlFlowGraph) -> CompilerResult<()> {
         // Find the CFG block
-        let cfg_node = cfg.block_map.get(&block_id)
+        let cfg_node = cfg
+            .block_map
+            .get(&block_id)
             .and_then(|&node| cfg.graph.node_weight(node))
             .ok_or_else(|| crate::CompilerError::Analysis("Block not found in CFG".into()))?;
-        
+
         // Process each statement
         // Track current block - may change if try expressions split the block
         let mut current_block = block_id;
         for (i, stmt) in cfg_node.statements.iter().enumerate() {
-            log::debug!("[SSA] process_block: stmt {} with current_block={:?}", i, current_block);
+            log::debug!(
+                "[SSA] process_block: stmt {} with current_block={:?}",
+                i,
+                current_block
+            );
             current_block = self.process_statement(current_block, stmt)?;
-            log::debug!("[SSA] process_block: after stmt {}, current_block={:?}", i, current_block);
+            log::debug!(
+                "[SSA] process_block: after stmt {}, current_block={:?}",
+                i,
+                current_block
+            );
         }
 
         // Process terminator on the final current block
         if let Some(term) = &cfg_node.terminator {
             self.process_terminator(current_block, term)?;
         }
-        
+
         self.filled_blocks.insert(block_id);
         Ok(())
     }
-    
+
     /// Process a statement
     /// Returns the current block ID (may be different if a try expression created a continuation block)
     fn process_statement(
         &mut self,
         block_id: HirId,
-        stmt: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>
+        stmt: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>,
     ) -> CompilerResult<HirId> {
         use zyntax_typed_ast::typed_ast::TypedStatement;
 
-        log::debug!("[SSA] process_statement: block={:?}, stmt_variant={:?}",
-                 block_id, std::mem::discriminant(&stmt.node));
+        log::debug!(
+            "[SSA] process_statement: block={:?}, stmt_variant={:?}",
+            block_id,
+            std::mem::discriminant(&stmt.node)
+        );
 
         // NOTE: Don't clear continuation_block here - it should persist across statements
         // and be consumed by the terminator. Only try expressions set it.
@@ -1181,41 +1313,52 @@ impl SsaBuilder {
                     } else {
                         let_stmt.ty.clone()
                     };
-                    self.var_typed_ast_types.insert(let_stmt.name, typed_ast_type);
+                    self.var_typed_ast_types
+                        .insert(let_stmt.name, typed_ast_type);
 
                     // Check if this variable has its address taken
                     if self.address_taken_vars.contains(&let_stmt.name) {
                         // Allocate stack slot and store value
                         let stack_slot = self.create_value(
                             HirType::Ptr(Box::new(hir_type.clone())),
-                            HirValueKind::Instruction
+                            HirValueKind::Instruction,
                         );
 
-                        self.add_instruction(write_block, HirInstruction::Alloca {
-                            result: stack_slot,
-                            ty: hir_type.clone(),
-                            count: None,
-                            align: 8,
-                        });
+                        self.add_instruction(
+                            write_block,
+                            HirInstruction::Alloca {
+                                result: stack_slot,
+                                ty: hir_type.clone(),
+                                count: None,
+                                align: 8,
+                            },
+                        );
 
                         // Store initial value
-                        self.add_instruction(write_block, HirInstruction::Store {
-                            value: value_id,
-                            ptr: stack_slot,
-                            align: 8,
-                            volatile: false,
-                        });
+                        self.add_instruction(
+                            write_block,
+                            HirInstruction::Store {
+                                value: value_id,
+                                ptr: stack_slot,
+                                align: 8,
+                                volatile: false,
+                            },
+                        );
 
                         // Track stack slot for this variable
                         self.stack_slots.insert(let_stmt.name, stack_slot);
-                        log::debug!("[SSA] Allocated stack slot {:?} for address-taken var {:?}", stack_slot, let_stmt.name);
+                        log::debug!(
+                            "[SSA] Allocated stack slot {:?} for address-taken var {:?}",
+                            stack_slot,
+                            let_stmt.name
+                        );
                     } else {
                         // Normal SSA: Create assignment in the continuation block if set
                         self.write_variable(let_stmt.name, write_block, value_id);
                     }
                 }
             }
-            
+
             TypedStatement::Expression(expr) => {
                 // Evaluate expression for side effects
                 self.translate_expression(block_id, expr)?;
@@ -1223,7 +1366,10 @@ impl SsaBuilder {
 
             TypedStatement::Match(match_stmt) => {
                 // Handle match statement: evaluate scrutinee
-                log::debug!("[SSA] Match scrutinee expression: {:?}", match_stmt.scrutinee.node);
+                log::debug!(
+                    "[SSA] Match scrutinee expression: {:?}",
+                    match_stmt.scrutinee.node
+                );
                 let scrutinee_val = self.translate_expression(block_id, &match_stmt.scrutinee)?;
 
                 // Check if scrutinee is a union type (Optional, Result, or custom union)
@@ -1248,8 +1394,11 @@ impl SsaBuilder {
                         union_type: Some(union_type.clone()),
                     });
 
-                    log::debug!("[SSA] Match on union type: scrutinee={:?}, discriminant={:?}",
-                             scrutinee_val, discriminant_id);
+                    log::debug!(
+                        "[SSA] Match on union type: scrutinee={:?}, discriminant={:?}",
+                        scrutinee_val,
+                        discriminant_id
+                    );
                 } else {
                     // Non-union match (e.g., literals, structs)
                     self.match_context = Some(MatchContext {
@@ -1269,7 +1418,6 @@ impl SsaBuilder {
             // This is the solution to Gap 2 - multi-block CFG construction
 
             // Note: TypedStatement doesn't have Assign variant - assignments are expressions
-
             _ => {
                 // Other statements handled by terminator processing
             }
@@ -1278,8 +1426,11 @@ impl SsaBuilder {
         // Return the continuation block if set (try expression), otherwise the original block
         let result_block = self.continuation_block.unwrap_or(block_id);
         if self.continuation_block.is_some() {
-            log::debug!("[SSA] process_statement: returning continuation_block {:?} instead of {:?}",
-                     result_block, block_id);
+            log::debug!(
+                "[SSA] process_statement: returning continuation_block {:?} instead of {:?}",
+                result_block,
+                block_id
+            );
         }
         Ok(result_block)
     }
@@ -1288,10 +1439,10 @@ impl SsaBuilder {
     fn process_terminator(
         &mut self,
         block_id: HirId,
-        term: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>
+        term: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>,
     ) -> CompilerResult<()> {
         use zyntax_typed_ast::typed_ast::TypedStatement;
-        
+
         match &term.node {
             TypedStatement::Return(expr) => {
                 let values = if let Some(expr) = expr {
@@ -1307,7 +1458,7 @@ impl SsaBuilder {
                 let block = self.function.blocks.get_mut(&target_block).unwrap();
                 block.terminator = HirTerminator::Return { values };
             }
-            
+
             TypedStatement::If(if_stmt) => {
                 let condition = &if_stmt.condition;
                 let cond_value = self.translate_expression(block_id, condition)?;
@@ -1322,7 +1473,7 @@ impl SsaBuilder {
                     };
                 }
             }
-            
+
             _ => {
                 // Default to branch to first successor
                 let block = self.function.blocks.get_mut(&block_id).unwrap();
@@ -1339,10 +1490,10 @@ impl SsaBuilder {
     fn translate_expression(
         &mut self,
         block_id: HirId,
-        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>
+        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
-        use zyntax_typed_ast::typed_ast::TypedExpression;
         use crate::hir::{BinaryOp, UnaryOp};
+        use zyntax_typed_ast::typed_ast::TypedExpression;
 
         match &expr.node {
             TypedExpression::Variable(name) => {
@@ -1350,15 +1501,23 @@ impl SsaBuilder {
                 if let Some(&stack_slot) = self.stack_slots.get(name) {
                     let var_ty = self.var_types.get(name).cloned().unwrap_or(HirType::I64);
                     let result = self.create_value(var_ty.clone(), HirValueKind::Instruction);
-                    self.add_instruction(block_id, HirInstruction::Load {
-                        result,
-                        ty: var_ty,
-                        ptr: stack_slot,
-                        align: 8,
-                        volatile: false,
-                    });
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Load {
+                            result,
+                            ty: var_ty,
+                            ptr: stack_slot,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
                     self.add_use(stack_slot, result);
-                    log::debug!("[SSA] Load address-taken var {:?} from stack slot {:?} -> {:?}", name, stack_slot, result);
+                    log::debug!(
+                        "[SSA] Load address-taken var {:?} from stack slot {:?} -> {:?}",
+                        name,
+                        stack_slot,
+                        result
+                    );
                     return Ok(result);
                 }
 
@@ -1376,10 +1535,18 @@ impl SsaBuilder {
                 let name_str = name.resolve_global().unwrap_or_else(|| {
                     // Fallback to local arena if global resolution fails
                     let arena = self.arena.lock().unwrap();
-                    arena.resolve_string(*name).map(|s| s.to_string()).unwrap_or_default()
+                    arena
+                        .resolve_string(*name)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
                 });
 
-                log::debug!("[SSA] Variable not found: {:?} resolves to '{}', type: {:?}", name, name_str, expr.ty);
+                log::debug!(
+                    "[SSA] Variable not found: {:?} resolves to '{}', type: {:?}",
+                    name,
+                    name_str,
+                    expr.ty
+                );
 
                 // Check for known enum constructors
                 match name_str.as_str() {
@@ -1391,7 +1558,11 @@ impl SsaBuilder {
                         // These constructors require args - shouldn't appear as bare variables
                         // They should be Call expressions, not Variable expressions
                         // This likely means the Zig builder is producing the wrong AST
-                        log::debug!("[SSA] ERROR: {} found as bare variable without args, type={:?}", name_str, expr.ty);
+                        log::debug!(
+                            "[SSA] ERROR: {} found as bare variable without args, type={:?}",
+                            name_str,
+                            expr.ty
+                        );
                         // Read as undefined variable (will likely fail later)
                         Ok(self.read_variable(*name, block_id))
                     }
@@ -1402,7 +1573,7 @@ impl SsaBuilder {
                     }
                 }
             }
-            
+
             TypedExpression::Literal(lit) => {
                 use zyntax_typed_ast::typed_ast::TypedLiteral;
 
@@ -1415,7 +1586,7 @@ impl SsaBuilder {
                     Ok(self.create_value(ty, HirValueKind::Constant(constant)))
                 }
             }
-            
+
             TypedExpression::Binary(binary) => {
                 use zyntax_typed_ast::typed_ast::BinaryOp as FrontendOp;
 
@@ -1437,8 +1608,8 @@ impl SsaBuilder {
                     let result_type = self.convert_type(&expr.ty);
 
                     let hir_op = match op {
-                        FrontendOp::And => crate::hir::BinaryOp::And,  // Bitwise AND for now
-                        FrontendOp::Or => crate::hir::BinaryOp::Or,    // Bitwise OR for now
+                        FrontendOp::And => crate::hir::BinaryOp::And, // Bitwise AND for now
+                        FrontendOp::Or => crate::hir::BinaryOp::Or,   // Bitwise OR for now
                         _ => unreachable!(),
                     };
 
@@ -1472,7 +1643,13 @@ impl SsaBuilder {
                 left_with_type.ty = left_actual_ty;
                 right_with_type.ty = right_actual_ty;
 
-                if let Some(trait_call) = self.try_operator_trait_dispatch(block_id, op, &left_with_type, &right_with_type, &expr.ty)? {
+                if let Some(trait_call) = self.try_operator_trait_dispatch(
+                    block_id,
+                    op,
+                    &left_with_type,
+                    &right_with_type,
+                    &expr.ty,
+                )? {
                     eprintln!("[DEBUG SSA] Using trait dispatch for binary op");
                     return Ok(trait_call);
                 }
@@ -1487,13 +1664,16 @@ impl SsaBuilder {
 
                 // For comparisons, use the operand type (not Bool result type) for the instruction
                 let inst_type = match hir_op {
-                    crate::hir::BinaryOp::Lt | crate::hir::BinaryOp::Le |
-                    crate::hir::BinaryOp::Gt | crate::hir::BinaryOp::Ge |
-                    crate::hir::BinaryOp::Eq | crate::hir::BinaryOp::Ne => {
+                    crate::hir::BinaryOp::Lt
+                    | crate::hir::BinaryOp::Le
+                    | crate::hir::BinaryOp::Gt
+                    | crate::hir::BinaryOp::Ge
+                    | crate::hir::BinaryOp::Eq
+                    | crate::hir::BinaryOp::Ne => {
                         // Use the left operand type so cranelift can determine signed/unsigned
                         self.convert_type(&left.ty)
                     }
-                    _ => result_type.clone()
+                    _ => result_type.clone(),
                 };
 
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
@@ -1512,47 +1692,54 @@ impl SsaBuilder {
 
                 Ok(result)
             }
-            
+
             TypedExpression::Unary(unary) => {
                 let op = &unary.op;
                 let operand = &unary.operand;
                 let operand_val = self.translate_expression(block_id, operand)?;
                 let result_type = self.convert_type(&expr.ty);
-                
+
                 let hir_op = self.convert_unary_op(op);
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
-                
+
                 let inst = HirInstruction::Unary {
                     op: hir_op,
                     result,
                     ty: result_type,
                     operand: operand_val,
                 };
-                
+
                 self.add_instruction(block_id, inst);
                 self.add_use(operand_val, result);
-                
+
                 Ok(result)
             }
-            
+
             TypedExpression::Call(call) => {
                 let callee = &call.callee;
                 let args = &call.positional_args;
 
                 // Check if callee is a function name (direct call) vs expression (indirect call)
                 // Path expressions should be resolved to Variable during lowering/type resolution
-                let (hir_callable, indirect_callee_val) = if let TypedExpression::Variable(func_name) = &callee.node {
+                let (hir_callable, indirect_callee_val) = if let TypedExpression::Variable(
+                    func_name,
+                ) = &callee.node
+                {
                     // Resolve the function name string using global interner
                     // (InternedString.resolve_global() returns the actual string value)
                     let name_str = func_name.resolve_global().unwrap_or_else(|| {
                         // Fallback to local arena if global resolution fails
                         let arena = self.arena.lock().unwrap();
-                        arena.resolve_string(*func_name).map(|s| s.to_string()).unwrap_or_default()
+                        arena
+                            .resolve_string(*func_name)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default()
                     });
 
                     // Check for enum constructors (Some, Ok, Err)
                     if name_str == "Some" || name_str == "Ok" || name_str == "Err" {
-                        return self.translate_enum_constructor(block_id, &name_str, args, &expr.ty);
+                        return self
+                            .translate_enum_constructor(block_id, &name_str, args, &expr.ty);
                     }
 
                     // Check if this is an external runtime symbol (e.g., "$haxe$trace$int")
@@ -1564,12 +1751,18 @@ impl SsaBuilder {
                         (crate::hir::HirCallable::Function(func_id), None)
                     } else if let Some(link_name) = self.extern_link_names.get(func_name) {
                         // External function with link_name (e.g., tensor_add -> $Tensor$add)
-                        log::debug!("[SSA] Resolved extern call '{}' -> '{}'", name_str, link_name);
+                        log::debug!(
+                            "[SSA] Resolved extern call '{}' -> '{}'",
+                            name_str,
+                            link_name
+                        );
                         (crate::hir::HirCallable::Symbol(link_name.clone()), None)
                     } else {
                         // Debug: Log what we're looking for and what's available
                         if !self.extern_link_names.is_empty() {
-                            let available: Vec<_> = self.extern_link_names.keys()
+                            let available: Vec<_> = self
+                                .extern_link_names
+                                .keys()
                                 .filter_map(|k| k.resolve_global())
                                 .collect();
                             log::debug!("[SSA] Function '{}' not in extern_link_names ({} entries). Sample: {:?}",
@@ -1577,12 +1770,18 @@ impl SsaBuilder {
                         }
                         // Variable lookup (function pointer)
                         let callee_val = self.translate_expression(block_id, callee)?;
-                        (crate::hir::HirCallable::Indirect(callee_val), Some(callee_val))
+                        (
+                            crate::hir::HirCallable::Indirect(callee_val),
+                            Some(callee_val),
+                        )
                     }
                 } else {
                     // General expression (e.g., field access, method call result)
                     let callee_val = self.translate_expression(block_id, callee)?;
-                    (crate::hir::HirCallable::Indirect(callee_val), Some(callee_val))
+                    (
+                        crate::hir::HirCallable::Indirect(callee_val),
+                        Some(callee_val),
+                    )
                 };
 
                 // Translate arguments
@@ -1593,7 +1792,9 @@ impl SsaBuilder {
                 }
 
                 // Translate type arguments for generic calls
-                let type_args: Vec<HirType> = call.type_args.iter()
+                let type_args: Vec<HirType> = call
+                    .type_args
+                    .iter()
                     .map(|ty| self.convert_type(ty))
                     .collect();
 
@@ -1609,7 +1810,7 @@ impl SsaBuilder {
                     result,
                     callee: hir_callable,
                     args: arg_vals.clone(),
-                    type_args,  // Preserve type arguments from TypedCall
+                    type_args,          // Preserve type arguments from TypedCall
                     const_args: vec![], // TODO: Preserve const args when TypedCall supports them
                     // NOTE: Tail call detection requires control flow analysis.
                     // Need to verify: (1) call is last instruction, (2) no cleanup needed, (3) compatible calling convention
@@ -1634,7 +1835,7 @@ impl SsaBuilder {
 
                 Ok(result_or_void)
             }
-            
+
             TypedExpression::Field(field_access) => {
                 let object = &field_access.object;
                 let field = &field_access.field;
@@ -1644,11 +1845,17 @@ impl SsaBuilder {
                 let object_type = if let TypedExpression::Variable(var_name) = &object.node {
                     // Variable - get actual type from var_types (which was updated during type resolution)
                     if let Some(hir_type) = self.var_types.get(var_name) {
-                        eprintln!("[FIELD ACCESS DEBUG] Variable '{}' has hir_type: {:?}",
-                            var_name.resolve_global().unwrap_or_default(), hir_type);
+                        eprintln!(
+                            "[FIELD ACCESS DEBUG] Variable '{}' has hir_type: {:?}",
+                            var_name.resolve_global().unwrap_or_default(),
+                            hir_type
+                        );
                         // Convert HIR type back to TypedAST Type for get_field_index
                         let converted = self.hir_type_to_typed_ast_type(hir_type);
-                        eprintln!("[FIELD ACCESS DEBUG] Converted to typed_ast_type: {:?}", converted);
+                        eprintln!(
+                            "[FIELD ACCESS DEBUG] Converted to typed_ast_type: {:?}",
+                            converted
+                        );
                         converted
                     } else {
                         eprintln!("[FIELD ACCESS DEBUG] Variable '{}' not in var_types, using object.ty: {:?}",
@@ -1656,7 +1863,10 @@ impl SsaBuilder {
                         object.ty.clone()
                     }
                 } else {
-                    eprintln!("[FIELD ACCESS DEBUG] Not a variable, using object.ty: {:?}", object.ty);
+                    eprintln!(
+                        "[FIELD ACCESS DEBUG] Not a variable, using object.ty: {:?}",
+                        object.ty
+                    );
                     object.ty.clone()
                 };
 
@@ -1665,10 +1875,16 @@ impl SsaBuilder {
                 // So accessing the 'value' field just returns the value itself
                 if let Type::Named { id, .. } = &object_type {
                     if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
-                        if matches!(&type_def.kind, zyntax_typed_ast::type_registry::TypeKind::Abstract { .. }) {
+                        if matches!(
+                            &type_def.kind,
+                            zyntax_typed_ast::type_registry::TypeKind::Abstract { .. }
+                        ) {
                             let field_name_str = {
                                 let arena = self.arena.lock().unwrap();
-                                arena.resolve_string(*field).map(|s| s.to_string()).unwrap_or_default()
+                                arena
+                                    .resolve_string(*field)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default()
                             };
 
                             if field_name_str == "value" {
@@ -1698,34 +1914,32 @@ impl SsaBuilder {
 
                 Ok(result)
             }
-            
+
             TypedExpression::Index(index_expr) => {
                 let object = &index_expr.object;
                 let index = &index_expr.index;
                 let object_val = self.translate_expression(block_id, object)?;
                 let index_val = self.translate_expression(block_id, index)?;
-                
+
                 // Create GEP instruction
                 let result_type = HirType::Ptr(Box::new(self.convert_type(&expr.ty)));
                 let gep_result = self.create_value(result_type.clone(), HirValueKind::Instruction);
-                
+
                 let gep_inst = HirInstruction::GetElementPtr {
                     result: gep_result,
                     ty: result_type,
                     ptr: object_val,
                     indices: vec![index_val],
                 };
-                
+
                 self.add_instruction(block_id, gep_inst);
                 self.add_use(object_val, gep_result);
                 self.add_use(index_val, gep_result);
-                
+
                 // Load the value
-                let load_result = self.create_value(
-                    self.convert_type(&expr.ty), 
-                    HirValueKind::Instruction
-                );
-                
+                let load_result =
+                    self.create_value(self.convert_type(&expr.ty), HirValueKind::Instruction);
+
                 let load_inst = HirInstruction::Load {
                     result: load_result,
                     ty: self.convert_type(&expr.ty),
@@ -1738,13 +1952,13 @@ impl SsaBuilder {
                     align: 4,
                     volatile: false,
                 };
-                
+
                 self.add_instruction(block_id, load_inst);
                 self.add_use(gep_result, load_result);
-                
+
                 Ok(load_result)
             }
-            
+
             TypedExpression::If(if_expr) => {
                 // Evaluate if expression with branches
                 let condition = &if_expr.condition;
@@ -1759,9 +1973,15 @@ impl SsaBuilder {
                 let merge_block_id = HirId::new();
 
                 // Create blocks in function
-                self.function.blocks.insert(then_block_id, HirBlock::new(then_block_id));
-                self.function.blocks.insert(else_block_id, HirBlock::new(else_block_id));
-                self.function.blocks.insert(merge_block_id, HirBlock::new(merge_block_id));
+                self.function
+                    .blocks
+                    .insert(then_block_id, HirBlock::new(then_block_id));
+                self.function
+                    .blocks
+                    .insert(else_block_id, HirBlock::new(else_block_id));
+                self.function
+                    .blocks
+                    .insert(merge_block_id, HirBlock::new(merge_block_id));
 
                 // Initialize definitions for new blocks
                 self.definitions.insert(then_block_id, IndexMap::new());
@@ -1769,38 +1989,85 @@ impl SsaBuilder {
                 self.definitions.insert(merge_block_id, IndexMap::new());
 
                 // Set conditional branch terminator for current block
-                self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::CondBranch {
-                    condition: cond_val,
-                    true_target: then_block_id,
-                    false_target: else_block_id,
-                };
+                self.function.blocks.get_mut(&block_id).unwrap().terminator =
+                    HirTerminator::CondBranch {
+                        condition: cond_val,
+                        true_target: then_block_id,
+                        false_target: else_block_id,
+                    };
 
                 // Update predecessors/successors
-                self.function.blocks.get_mut(&block_id).unwrap().successors = vec![then_block_id, else_block_id];
-                self.function.blocks.get_mut(&then_block_id).unwrap().predecessors.push(block_id);
-                self.function.blocks.get_mut(&else_block_id).unwrap().predecessors.push(block_id);
+                self.function.blocks.get_mut(&block_id).unwrap().successors =
+                    vec![then_block_id, else_block_id];
+                self.function
+                    .blocks
+                    .get_mut(&then_block_id)
+                    .unwrap()
+                    .predecessors
+                    .push(block_id);
+                self.function
+                    .blocks
+                    .get_mut(&else_block_id)
+                    .unwrap()
+                    .predecessors
+                    .push(block_id);
 
                 // Translate then branch
                 let then_val = self.translate_expression(then_block_id, then_branch)?;
-                self.function.blocks.get_mut(&then_block_id).unwrap().terminator = HirTerminator::Branch { target: merge_block_id };
-                self.function.blocks.get_mut(&then_block_id).unwrap().successors = vec![merge_block_id];
-                self.function.blocks.get_mut(&merge_block_id).unwrap().predecessors.push(then_block_id);
+                self.function
+                    .blocks
+                    .get_mut(&then_block_id)
+                    .unwrap()
+                    .terminator = HirTerminator::Branch {
+                    target: merge_block_id,
+                };
+                self.function
+                    .blocks
+                    .get_mut(&then_block_id)
+                    .unwrap()
+                    .successors = vec![merge_block_id];
+                self.function
+                    .blocks
+                    .get_mut(&merge_block_id)
+                    .unwrap()
+                    .predecessors
+                    .push(then_block_id);
 
                 // Translate else branch
                 let else_val = self.translate_expression(else_block_id, else_branch)?;
-                self.function.blocks.get_mut(&else_block_id).unwrap().terminator = HirTerminator::Branch { target: merge_block_id };
-                self.function.blocks.get_mut(&else_block_id).unwrap().successors = vec![merge_block_id];
-                self.function.blocks.get_mut(&merge_block_id).unwrap().predecessors.push(else_block_id);
+                self.function
+                    .blocks
+                    .get_mut(&else_block_id)
+                    .unwrap()
+                    .terminator = HirTerminator::Branch {
+                    target: merge_block_id,
+                };
+                self.function
+                    .blocks
+                    .get_mut(&else_block_id)
+                    .unwrap()
+                    .successors = vec![merge_block_id];
+                self.function
+                    .blocks
+                    .get_mut(&merge_block_id)
+                    .unwrap()
+                    .predecessors
+                    .push(else_block_id);
 
                 // Create phi in merge block
                 let result_type = self.convert_type(&expr.ty);
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
-                self.function.blocks.get_mut(&merge_block_id).unwrap().phis.push(HirPhi {
-                    result,
-                    ty: result_type,
-                    incoming: vec![(then_val, then_block_id), (else_val, else_block_id)],
-                });
+                self.function
+                    .blocks
+                    .get_mut(&merge_block_id)
+                    .unwrap()
+                    .phis
+                    .push(HirPhi {
+                        result,
+                        ty: result_type,
+                        incoming: vec![(then_val, then_block_id), (else_val, else_block_id)],
+                    });
 
                 // Set continuation block so subsequent code executes in merge block
                 self.continuation_block = Some(merge_block_id);
@@ -1812,14 +2079,14 @@ impl SsaBuilder {
                 // Build struct value directly using InsertValue operations
                 let struct_ty = self.convert_type(&expr.ty);
 
-                eprintln!("[SSA STRUCT LIT] Building struct literal with type {:?}, {} fields",
-                    struct_ty, struct_lit.fields.len());
+                eprintln!(
+                    "[SSA STRUCT LIT] Building struct literal with type {:?}, {} fields",
+                    struct_ty,
+                    struct_lit.fields.len()
+                );
 
                 // Start with an undefined struct value
-                let mut current_struct = self.create_value(
-                    struct_ty.clone(),
-                    HirValueKind::Undef
-                );
+                let mut current_struct = self.create_value(struct_ty.clone(), HirValueKind::Undef);
 
                 // Insert each field value into the struct
                 for (i, field) in struct_lit.fields.iter().enumerate() {
@@ -1828,18 +2095,19 @@ impl SsaBuilder {
                     eprintln!("[SSA STRUCT LIT] Inserting field {}", i);
 
                     // Create new struct value with the field inserted
-                    let next_struct = self.create_value(
-                        struct_ty.clone(),
-                        HirValueKind::Instruction
-                    );
+                    let next_struct =
+                        self.create_value(struct_ty.clone(), HirValueKind::Instruction);
 
-                    self.add_instruction(block_id, HirInstruction::InsertValue {
-                        result: next_struct,
-                        ty: struct_ty.clone(),
-                        aggregate: current_struct,
-                        value: field_val,
-                        indices: vec![i as u32],
-                    });
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::InsertValue {
+                            result: next_struct,
+                            ty: struct_ty.clone(),
+                            aggregate: current_struct,
+                            value: field_val,
+                            indices: vec![i as u32],
+                        },
+                    );
 
                     self.add_use(current_struct, next_struct);
                     self.add_use(field_val, next_struct);
@@ -1877,34 +2145,52 @@ impl SsaBuilder {
                 // Step 1: Allocate element data buffer
                 let data_buf_size = num_elements * elem_size;
                 let data_alloc_ty = HirType::Array(Box::new(elem_ty.clone()), num_elements as u64);
-                let data_ptr = self.create_value(HirType::Ptr(Box::new(elem_ty.clone())), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::Alloca {
-                    result: data_ptr,
-                    ty: data_alloc_ty,
-                    count: None,
-                    align: elem_size.min(8) as u32,
-                });
+                let data_ptr = self.create_value(
+                    HirType::Ptr(Box::new(elem_ty.clone())),
+                    HirValueKind::Instruction,
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Alloca {
+                        result: data_ptr,
+                        ty: data_alloc_ty,
+                        count: None,
+                        align: elem_size.min(8) as u32,
+                    },
+                );
 
                 // Step 2: Store each element into the data buffer
                 for (i, elem_expr) in elements.iter().enumerate() {
                     let elem_val = self.translate_expression(block_id, elem_expr)?;
 
                     let offset = i * elem_size;
-                    let offset_const = self.create_value(HirType::I64, HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)));
-                    let elem_ptr = self.create_value(HirType::Ptr(Box::new(elem_ty.clone())), HirValueKind::Instruction);
-                    self.add_instruction(block_id, HirInstruction::GetElementPtr {
-                        result: elem_ptr,
-                        ty: HirType::U8, // Base type for byte offset calculation
-                        ptr: data_ptr,
-                        indices: vec![offset_const],
-                    });
+                    let offset_const = self.create_value(
+                        HirType::I64,
+                        HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
+                    );
+                    let elem_ptr = self.create_value(
+                        HirType::Ptr(Box::new(elem_ty.clone())),
+                        HirValueKind::Instruction,
+                    );
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::GetElementPtr {
+                            result: elem_ptr,
+                            ty: HirType::U8, // Base type for byte offset calculation
+                            ptr: data_ptr,
+                            indices: vec![offset_const],
+                        },
+                    );
 
-                    self.add_instruction(block_id, HirInstruction::Store {
-                        value: elem_val,
-                        ptr: elem_ptr,
-                        align: elem_size.min(8) as u32,
-                        volatile: false,
-                    });
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Store {
+                            value: elem_val,
+                            ptr: elem_ptr,
+                            align: elem_size.min(8) as u32,
+                            volatile: false,
+                        },
+                    );
                 }
 
                 // Step 3: Build List<T> struct: { data: i64 (ptr), len: i64, capacity: i64 }
@@ -1913,62 +2199,104 @@ impl SsaBuilder {
                     fields: vec![HirType::I64, HirType::I64, HirType::I64],
                     packed: false,
                 });
-                let list_alloc = self.create_value(HirType::Ptr(Box::new(list_struct_ty.clone())), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::Alloca {
-                    result: list_alloc,
-                    ty: list_struct_ty,
-                    count: None,
-                    align: 8,
-                });
+                let list_alloc = self.create_value(
+                    HirType::Ptr(Box::new(list_struct_ty.clone())),
+                    HirValueKind::Instruction,
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Alloca {
+                        result: list_alloc,
+                        ty: list_struct_ty,
+                        count: None,
+                        align: 8,
+                    },
+                );
 
                 // Store data pointer (field 0) — cast ptr to i64 for storage
                 let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::Cast {
-                    result: data_as_i64,
-                    ty: HirType::I64,
-                    operand: data_ptr,
-                    op: crate::hir::CastOp::PtrToInt,
-                });
-                self.add_instruction(block_id, HirInstruction::Store {
-                    value: data_as_i64,
-                    ptr: list_alloc,
-                    align: 8,
-                    volatile: false,
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Cast {
+                        result: data_as_i64,
+                        ty: HirType::I64,
+                        operand: data_ptr,
+                        op: crate::hir::CastOp::PtrToInt,
+                    },
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Store {
+                        value: data_as_i64,
+                        ptr: list_alloc,
+                        align: 8,
+                        volatile: false,
+                    },
+                );
 
                 // Store len (field 1) at offset 8
-                let len_const = self.create_value(HirType::I64, HirValueKind::Constant(crate::hir::HirConstant::I64(num_elements as i64)));
-                let offset_8 = self.create_value(HirType::I64, HirValueKind::Constant(crate::hir::HirConstant::I64(8)));
-                let len_field_ptr = self.create_value(HirType::Ptr(Box::new(HirType::I64)), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::GetElementPtr {
-                    result: len_field_ptr,
-                    ty: HirType::U8, // byte offset
-                    ptr: list_alloc,
-                    indices: vec![offset_8],
-                });
-                self.add_instruction(block_id, HirInstruction::Store {
-                    value: len_const,
-                    ptr: len_field_ptr,
-                    align: 8,
-                    volatile: false,
-                });
+                let len_const = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(crate::hir::HirConstant::I64(num_elements as i64)),
+                );
+                let offset_8 = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(crate::hir::HirConstant::I64(8)),
+                );
+                let len_field_ptr = self.create_value(
+                    HirType::Ptr(Box::new(HirType::I64)),
+                    HirValueKind::Instruction,
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::GetElementPtr {
+                        result: len_field_ptr,
+                        ty: HirType::U8, // byte offset
+                        ptr: list_alloc,
+                        indices: vec![offset_8],
+                    },
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Store {
+                        value: len_const,
+                        ptr: len_field_ptr,
+                        align: 8,
+                        volatile: false,
+                    },
+                );
 
                 // Store capacity (field 2) at offset 16
-                let cap_const = self.create_value(HirType::I64, HirValueKind::Constant(crate::hir::HirConstant::I64(num_elements as i64)));
-                let offset_16 = self.create_value(HirType::I64, HirValueKind::Constant(crate::hir::HirConstant::I64(16)));
-                let cap_field_ptr = self.create_value(HirType::Ptr(Box::new(HirType::I64)), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::GetElementPtr {
-                    result: cap_field_ptr,
-                    ty: HirType::U8, // byte offset
-                    ptr: list_alloc,
-                    indices: vec![offset_16],
-                });
-                self.add_instruction(block_id, HirInstruction::Store {
-                    value: cap_const,
-                    ptr: cap_field_ptr,
-                    align: 8,
-                    volatile: false,
-                });
+                let cap_const = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(crate::hir::HirConstant::I64(num_elements as i64)),
+                );
+                let offset_16 = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(crate::hir::HirConstant::I64(16)),
+                );
+                let cap_field_ptr = self.create_value(
+                    HirType::Ptr(Box::new(HirType::I64)),
+                    HirValueKind::Instruction,
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::GetElementPtr {
+                        result: cap_field_ptr,
+                        ty: HirType::U8, // byte offset
+                        ptr: list_alloc,
+                        indices: vec![offset_16],
+                    },
+                );
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Store {
+                        value: cap_const,
+                        ptr: cap_field_ptr,
+                        align: 8,
+                        volatile: false,
+                    },
+                );
 
                 // Return pointer to the List struct
                 Ok(list_alloc)
@@ -1976,9 +2304,8 @@ impl SsaBuilder {
 
             TypedExpression::Tuple(elements) => {
                 // Convert tuple to struct
-                let field_types: Vec<_> = elements.iter()
-                    .map(|e| self.convert_type(&e.ty))
-                    .collect();
+                let field_types: Vec<_> =
+                    elements.iter().map(|e| self.convert_type(&e.ty)).collect();
 
                 let tuple_ty = HirType::Struct(crate::hir::HirStructType {
                     name: None,
@@ -1988,25 +2315,32 @@ impl SsaBuilder {
 
                 let alloc_result = self.create_value(tuple_ty.clone(), HirValueKind::Instruction);
 
-                self.add_instruction(block_id, HirInstruction::Alloca {
-                    result: alloc_result,
-                    ty: tuple_ty.clone(),
-                    count: None,
-                    align: 8,
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Alloca {
+                        result: alloc_result,
+                        ty: tuple_ty.clone(),
+                        count: None,
+                        align: 8,
+                    },
+                );
 
                 // Initialize each element
                 for (i, elem_expr) in elements.iter().enumerate() {
                     let elem_val = self.translate_expression(block_id, elem_expr)?;
 
-                    let insert_result = self.create_value(tuple_ty.clone(), HirValueKind::Instruction);
-                    self.add_instruction(block_id, HirInstruction::InsertValue {
-                        result: insert_result,
-                        ty: tuple_ty.clone(),
-                        aggregate: alloc_result,
-                        value: elem_val,
-                        indices: vec![i as u32],
-                    });
+                    let insert_result =
+                        self.create_value(tuple_ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::InsertValue {
+                            result: insert_result,
+                            ty: tuple_ty.clone(),
+                            aggregate: alloc_result,
+                            value: elem_val,
+                            indices: vec![i as u32],
+                        },
+                    );
                 }
 
                 Ok(alloc_result)
@@ -2026,12 +2360,15 @@ impl SsaBuilder {
                 // Estimated effort: 4-5 hours (needs type width/signedness utilities)
                 let cast_op = CastOp::Bitcast;
 
-                self.add_instruction(block_id, HirInstruction::Cast {
-                    op: cast_op,
-                    result,
-                    ty: target_ty,
-                    operand: operand_val,
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Cast {
+                        op: cast_op,
+                        result,
+                        ty: target_ty,
+                        operand: operand_val,
+                    },
+                );
 
                 self.add_use(operand_val, result);
                 Ok(result)
@@ -2044,7 +2381,11 @@ impl SsaBuilder {
                 // Check if the inner expression is a variable with a stack slot
                 if let TE::Variable(var_name) = &reference.expr.node {
                     if let Some(&stack_slot) = self.stack_slots.get(var_name) {
-                        log::debug!("[SSA] Reference to address-taken var {:?} -> stack slot {:?}", var_name, stack_slot);
+                        log::debug!(
+                            "[SSA] Reference to address-taken var {:?} -> stack slot {:?}",
+                            var_name,
+                            stack_slot
+                        );
                         return Ok(stack_slot);
                     }
                 }
@@ -2062,13 +2403,16 @@ impl SsaBuilder {
                 let result_ty = self.convert_type(&expr.ty);
                 let result = self.create_value(result_ty.clone(), HirValueKind::Instruction);
 
-                self.add_instruction(block_id, HirInstruction::Load {
-                    result,
-                    ty: result_ty,
-                    ptr: ptr_val,
-                    align: 8,
-                    volatile: false,
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Load {
+                        result,
+                        ty: result_ty,
+                        ptr: ptr_val,
+                        align: 8,
+                        volatile: false,
+                    },
+                );
 
                 self.add_use(ptr_val, result);
                 Ok(result)
@@ -2077,27 +2421,35 @@ impl SsaBuilder {
             TypedExpression::MethodCall(method_call) => {
                 // Resolve receiver type - if receiver is a variable, look up its actual type
                 // This works around the issue where type inference doesn't update variable references in the AST
-                let receiver_type = if let TypedExpression::Variable(var_name) = &method_call.receiver.node {
-                    eprintln!("[METHOD_CALL] Receiver is variable '{}'", var_name.resolve_global().unwrap_or_default());
-                    // Look up the variable's actual type from when it was declared
-                    if let Some(var_ty) = self.var_typed_ast_types.get(var_name) {
-                        eprintln!("[METHOD_CALL] Found variable type: {:?}", var_ty);
-                        var_ty.clone()
+                let receiver_type =
+                    if let TypedExpression::Variable(var_name) = &method_call.receiver.node {
+                        eprintln!(
+                            "[METHOD_CALL] Receiver is variable '{}'",
+                            var_name.resolve_global().unwrap_or_default()
+                        );
+                        // Look up the variable's actual type from when it was declared
+                        if let Some(var_ty) = self.var_typed_ast_types.get(var_name) {
+                            eprintln!("[METHOD_CALL] Found variable type: {:?}", var_ty);
+                            var_ty.clone()
+                        } else {
+                            eprintln!(
+                                "[METHOD_CALL] Variable type not found, using receiver type: {:?}",
+                                method_call.receiver.ty
+                            );
+                            method_call.receiver.ty.clone()
+                        }
                     } else {
-                        eprintln!("[METHOD_CALL] Variable type not found, using receiver type: {:?}", method_call.receiver.ty);
+                        // Non-variable expression - use the type directly
+                        eprintln!(
+                            "[METHOD_CALL] Receiver is expression with type: {:?}",
+                            method_call.receiver.ty
+                        );
                         method_call.receiver.ty.clone()
-                    }
-                } else {
-                    // Non-variable expression - use the type directly
-                    eprintln!("[METHOD_CALL] Receiver is expression with type: {:?}", method_call.receiver.ty);
-                    method_call.receiver.ty.clone()
-                };
+                    };
 
                 // Resolve method to mangled function name
-                let mangled_name = self.resolve_method_to_function(
-                    &receiver_type,
-                    method_call.method,
-                )?;
+                let mangled_name =
+                    self.resolve_method_to_function(&receiver_type, method_call.method)?;
 
                 // Translate receiver and arguments
                 let receiver_val = self.translate_expression(block_id, &method_call.receiver)?;
@@ -2109,7 +2461,8 @@ impl SsaBuilder {
                 }
 
                 // Look up the function by mangled name - first in function_symbols, then extern_link_names
-                let hir_callable = if let Some(&func_id) = self.function_symbols.get(&mangled_name) {
+                let hir_callable = if let Some(&func_id) = self.function_symbols.get(&mangled_name)
+                {
                     // Direct function call to known function
                     crate::hir::HirCallable::Function(func_id)
                 } else if let Some(link_name) = self.extern_link_names.get(&mangled_name) {
@@ -2117,9 +2470,10 @@ impl SsaBuilder {
                     crate::hir::HirCallable::Symbol(link_name.clone())
                 } else {
                     let name_str = mangled_name.resolve_global().unwrap_or_default();
-                    return Err(crate::CompilerError::Analysis(
-                        format!("Method function '{}' not found in symbol table", name_str)
-                    ));
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "Method function '{}' not found in symbol table",
+                        name_str
+                    )));
                 };
 
                 // Determine result type based on the mangled function name
@@ -2130,14 +2484,26 @@ impl SsaBuilder {
                     // Check common return type suffixes for Tensor methods
                     // Methods like sum_f32, mean_f32 return f32
                     // Methods like zeros, ones, arange return Tensor (opaque ptr)
-                    let hir_type = if mangled_str.ends_with("_f32") || mangled_str.contains("$sum") || mangled_str.contains("$mean")
-                        || mangled_str.contains("$max") || mangled_str.contains("$min") || mangled_str.contains("$std") || mangled_str.contains("$var") {
+                    let hir_type = if mangled_str.ends_with("_f32")
+                        || mangled_str.contains("$sum")
+                        || mangled_str.contains("$mean")
+                        || mangled_str.contains("$max")
+                        || mangled_str.contains("$min")
+                        || mangled_str.contains("$std")
+                        || mangled_str.contains("$var")
+                    {
                         // Reduction methods that return f32
-                        log::debug!("[METHOD_CALL] Inferred F32 return type for '{}'", mangled_str);
+                        log::debug!(
+                            "[METHOD_CALL] Inferred F32 return type for '{}'",
+                            mangled_str
+                        );
                         HirType::F32
                     } else if mangled_str.contains("$ndim") || mangled_str.contains("$numel") {
                         // Methods that return i64
-                        log::debug!("[METHOD_CALL] Inferred I64 return type for '{}'", mangled_str);
+                        log::debug!(
+                            "[METHOD_CALL] Inferred I64 return type for '{}'",
+                            mangled_str
+                        );
                         HirType::I64
                     } else if let Type::Named { id, .. } = &receiver_type {
                         // Fall back to looking up in trait implementations for named types
@@ -2145,11 +2511,15 @@ impl SsaBuilder {
                         let mut method_return_type = None;
                         for (_trait_id, impls) in self.type_registry.iter_implementations() {
                             for impl_def in impls {
-                                if let Type::Named { id: impl_type_id, .. } = &impl_def.for_type {
+                                if let Type::Named {
+                                    id: impl_type_id, ..
+                                } = &impl_def.for_type
+                                {
                                     if *impl_type_id == receiver_type_id {
                                         for method in &impl_def.methods {
                                             if method.signature.name == method_call.method {
-                                                method_return_type = Some(method.signature.return_type.clone());
+                                                method_return_type =
+                                                    Some(method.signature.return_type.clone());
                                                 break;
                                             }
                                         }
@@ -2163,11 +2533,15 @@ impl SsaBuilder {
                                 break;
                             }
                         }
-                        let typed_return_type = method_return_type.unwrap_or(Type::Primitive(zyntax_typed_ast::PrimitiveType::I64));
+                        let typed_return_type = method_return_type
+                            .unwrap_or(Type::Primitive(zyntax_typed_ast::PrimitiveType::I64));
                         self.convert_type(&typed_return_type)
                     } else {
                         // For extern types, assume opaque return (returns same type as receiver)
-                        log::debug!("[METHOD_CALL] Assuming opaque return type for extern method '{}'", mangled_str);
+                        log::debug!(
+                            "[METHOD_CALL] Assuming opaque return type for extern method '{}'",
+                            mangled_str
+                        );
                         self.convert_type(&receiver_type)
                     };
                     hir_type
@@ -2182,14 +2556,17 @@ impl SsaBuilder {
                     None
                 };
 
-                self.add_instruction(block_id, HirInstruction::Call {
-                    result,
-                    callee: hir_callable,
-                    args: arg_vals.clone(),
-                    type_args: vec![],
-                    const_args: vec![],
-                    is_tail: false,
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Call {
+                        result,
+                        callee: hir_callable,
+                        args: arg_vals.clone(),
+                        type_args: vec![],
+                        const_args: vec![],
+                        is_tail: false,
+                    },
+                );
 
                 // Track argument uses
                 let result_or_void = result.unwrap_or_else(|| self.create_undef(HirType::Void));
@@ -2222,7 +2599,9 @@ impl SsaBuilder {
                 let result_ty = self.convert_type(&expr.ty);
 
                 // The future type is *Promise<T> - the async call returns a Promise pointer
-                let promise_ty = HirType::Ptr(Box::new(HirType::Opaque(InternedString::new_global("Promise"))));
+                let promise_ty = HirType::Ptr(Box::new(HirType::Opaque(
+                    InternedString::new_global("Promise"),
+                )));
 
                 // Translate the expression being awaited (the future/async call)
                 // We need to ensure the Call result has Promise pointer type, not the final value type
@@ -2233,22 +2612,32 @@ impl SsaBuilder {
                     let args = &call.positional_args;
 
                     // Resolve the callable
-                    let (hir_callable, _) = if let TypedExpression::Variable(func_name) = &callee.node {
-                        let name_str = func_name.resolve_global().unwrap_or_else(|| {
-                            let arena = self.arena.lock().unwrap();
-                            arena.resolve_string(*func_name).map(|s| s.to_string()).unwrap_or_default()
-                        });
+                    let (hir_callable, _) =
+                        if let TypedExpression::Variable(func_name) = &callee.node {
+                            let name_str = func_name.resolve_global().unwrap_or_else(|| {
+                                let arena = self.arena.lock().unwrap();
+                                arena
+                                    .resolve_string(*func_name)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default()
+                            });
 
-                        if let Some(&func_id) = self.function_symbols.get(func_name) {
-                            (crate::hir::HirCallable::Function(func_id), None)
+                            if let Some(&func_id) = self.function_symbols.get(func_name) {
+                                (crate::hir::HirCallable::Function(func_id), None)
+                            } else {
+                                let callee_val = self.translate_expression(block_id, callee)?;
+                                (
+                                    crate::hir::HirCallable::Indirect(callee_val),
+                                    Some(callee_val),
+                                )
+                            }
                         } else {
                             let callee_val = self.translate_expression(block_id, callee)?;
-                            (crate::hir::HirCallable::Indirect(callee_val), Some(callee_val))
-                        }
-                    } else {
-                        let callee_val = self.translate_expression(block_id, callee)?;
-                        (crate::hir::HirCallable::Indirect(callee_val), Some(callee_val))
-                    };
+                            (
+                                crate::hir::HirCallable::Indirect(callee_val),
+                                Some(callee_val),
+                            )
+                        };
 
                     // Translate arguments
                     let mut arg_vals = Vec::new();
@@ -2258,7 +2647,8 @@ impl SsaBuilder {
                     }
 
                     // Create the Call result with Promise pointer type (not the function's return type)
-                    let future_val = self.create_value(promise_ty.clone(), HirValueKind::Instruction);
+                    let future_val =
+                        self.create_value(promise_ty.clone(), HirValueKind::Instruction);
 
                     let call_inst = HirInstruction::Call {
                         result: Some(future_val),
@@ -2270,7 +2660,10 @@ impl SsaBuilder {
                     };
 
                     self.add_instruction(block_id, call_inst);
-                    eprintln!("[DEBUG] SSA: Created async Call with Promise result type, future_val={:?}", future_val);
+                    eprintln!(
+                        "[DEBUG] SSA: Created async Call with Promise result type, future_val={:?}",
+                        future_val
+                    );
 
                     // Create result value for the await (with actual T type)
                     let result = self.create_value(result_ty.clone(), HirValueKind::Instruction);
@@ -2355,37 +2748,44 @@ impl SsaBuilder {
                 });
 
                 let alloc_result = self.create_value(range_ty.clone(), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::Alloca {
-                    result: alloc_result,
-                    ty: range_ty.clone(),
-                    count: None,
-                    align: 8,
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Alloca {
+                        result: alloc_result,
+                        ty: range_ty.clone(),
+                        count: None,
+                        align: 8,
+                    },
+                );
 
                 let insert1 = self.create_value(range_ty.clone(), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::InsertValue {
-                    result: insert1,
-                    ty: range_ty.clone(),
-                    aggregate: alloc_result,
-                    value: start_val,
-                    indices: vec![0],
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::InsertValue {
+                        result: insert1,
+                        ty: range_ty.clone(),
+                        aggregate: alloc_result,
+                        value: start_val,
+                        indices: vec![0],
+                    },
+                );
 
                 let insert2 = self.create_value(range_ty.clone(), HirValueKind::Instruction);
-                self.add_instruction(block_id, HirInstruction::InsertValue {
-                    result: insert2,
-                    ty: range_ty,
-                    aggregate: insert1,
-                    value: end_val,
-                    indices: vec![1],
-                });
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::InsertValue {
+                        result: insert2,
+                        ty: range_ty,
+                        aggregate: insert1,
+                        value: end_val,
+                        indices: vec![1],
+                    },
+                );
 
                 Ok(insert2)
             }
 
-            TypedExpression::Lambda(lambda) => {
-                self.translate_closure(block_id, lambda, &expr.ty)
-            }
+            TypedExpression::Lambda(lambda) => self.translate_closure(block_id, lambda, &expr.ty),
 
             _ => {
                 // Fallback for any remaining unhandled expressions
@@ -2393,14 +2793,11 @@ impl SsaBuilder {
             }
         }
     }
-    
+
     /// Write a variable in SSA form
     fn write_variable(&mut self, var: InternedString, block: HirId, value: HirId) {
         log::debug!("[SSA] write_variable({:?}, {:?}, {:?})", var, block, value);
-        self.definitions
-            .get_mut(&block)
-            .unwrap()
-            .insert(var, value);
+        self.definitions.get_mut(&block).unwrap().insert(var, value);
 
         // Track variable writes for loop phi placement
         self.variable_writes
@@ -2408,32 +2805,53 @@ impl SsaBuilder {
             .or_insert_with(HashSet::new)
             .insert(var);
     }
-    
+
     /// Read a variable in SSA form
     /// Try to read a variable without creating phis - returns None if not found
     fn try_read_variable(&self, var: InternedString, block: HirId) -> Option<HirId> {
-        self.definitions.get(&block).and_then(|defs| defs.get(&var)).copied()
+        self.definitions
+            .get(&block)
+            .and_then(|defs| defs.get(&var))
+            .copied()
     }
 
     fn read_variable(&mut self, var: InternedString, block: HirId) -> HirId {
         if let Some(&value) = self.definitions.get(&block).and_then(|defs| defs.get(&var)) {
-            log::debug!("[SSA] read_variable({:?}, {:?}) = {:?} (found in definitions)", var, block, value);
+            log::debug!(
+                "[SSA] read_variable({:?}, {:?}) = {:?} (found in definitions)",
+                var,
+                block,
+                value
+            );
             return value;
         }
 
-        log::debug!("[SSA] read_variable({:?}, {:?}) - not in definitions, recursing", var, block);
+        log::debug!(
+            "[SSA] read_variable({:?}, {:?}) - not in definitions, recursing",
+            var,
+            block
+        );
         // Not defined in this block - need phi or recursive lookup
         self.read_variable_recursive(var, block)
     }
-    
+
     /// Recursively read variable, inserting phis as needed (before IDF)
     /// After IDF placement, this won't create new phis - it will only traverse existing ones
     fn read_variable_recursive(&mut self, var: InternedString, block: HirId) -> HirId {
         let (predecessors, is_sealed) = {
             let block_info = self.function.blocks.get(&block).unwrap();
-            (block_info.predecessors.clone(), self.sealed_blocks.contains(&block))
+            (
+                block_info.predecessors.clone(),
+                self.sealed_blocks.contains(&block),
+            )
         };
-        log::trace!("[SSA] read_variable_recursive({:?}, {:?}): sealed={}, predecessors={:?}", var, block, is_sealed, predecessors);
+        log::trace!(
+            "[SSA] read_variable_recursive({:?}, {:?}): sealed={}, predecessors={:?}",
+            var,
+            block,
+            is_sealed,
+            predecessors
+        );
 
         if !is_sealed {
             // Block not sealed - create incomplete phi (ONLY if IDF not done yet)
@@ -2481,16 +2899,20 @@ impl SsaBuilder {
                 return undef;
             }
 
-            let ty = self.var_types.get(&var).cloned()
-                .unwrap_or(HirType::I64); // Default type
+            let ty = self.var_types.get(&var).cloned().unwrap_or(HirType::I64); // Default type
             let phi_val = self.create_value(ty.clone(), HirValueKind::Instruction);
 
             self.incomplete_phis.insert(phi_key, phi_val);
-            self.function.blocks.get_mut(&block).unwrap().phis.push(HirPhi {
-                result: phi_val,
-                ty,
-                incoming: vec![],
-            });
+            self.function
+                .blocks
+                .get_mut(&block)
+                .unwrap()
+                .phis
+                .push(HirPhi {
+                    result: phi_val,
+                    ty,
+                    incoming: vec![],
+                });
 
             phi_val
         } else if predecessors.len() == 1 {
@@ -2533,7 +2955,8 @@ impl SsaBuilder {
                 }
 
                 // If all values are the same (and not the phi itself), just return that value
-                let unique_vals: HashSet<_> = found_values.iter()
+                let unique_vals: HashSet<_> = found_values
+                    .iter()
                     .map(|(v, _)| v)
                     .filter(|&&v| v != phi_val)
                     .collect();
@@ -2550,17 +2973,21 @@ impl SsaBuilder {
                     return undef;
                 } else {
                     // Need a real phi node
-                    self.function.blocks.get_mut(&block).unwrap().phis.push(HirPhi {
-                        result: phi_val,
-                        ty,
-                        incoming: found_values,
-                    });
+                    self.function
+                        .blocks
+                        .get_mut(&block)
+                        .unwrap()
+                        .phis
+                        .push(HirPhi {
+                            result: phi_val,
+                            ty,
+                            incoming: found_values,
+                        });
                     return phi_val;
                 }
             }
 
-            let ty = self.var_types.get(&var).cloned()
-                .unwrap_or(HirType::I64);
+            let ty = self.var_types.get(&var).cloned().unwrap_or(HirType::I64);
             let phi_val = self.create_value(ty.clone(), HirValueKind::Instruction);
 
             // Temporarily write to avoid infinite recursion
@@ -2569,7 +2996,12 @@ impl SsaBuilder {
             // Collect values from predecessors
             let mut incoming = Vec::new();
 
-            log::debug!("[SSA] Filling phi for var {:?} in block {:?} with {} predecessors", var, block, predecessors.len());
+            log::debug!(
+                "[SSA] Filling phi for var {:?} in block {:?} with {} predecessors",
+                var,
+                block,
+                predecessors.len()
+            );
             for pred in predecessors {
                 let pred_val = self.read_variable(var, pred);
                 log::debug!("[SSA]   Phi incoming: ({:?}, {:?})", pred_val, pred);
@@ -2578,7 +3010,8 @@ impl SsaBuilder {
             log::debug!("[SSA] Phi filled with {} incoming values", incoming.len());
 
             // Check if phi is trivial
-            let non_phi_vals: HashSet<_> = incoming.iter()
+            let non_phi_vals: HashSet<_> = incoming
+                .iter()
                 .map(|(val, _)| val)
                 .filter(|&&v| v != phi_val)
                 .collect();
@@ -2593,16 +3026,21 @@ impl SsaBuilder {
                 self.create_undef(ty)
             } else {
                 // Non-trivial phi
-                self.function.blocks.get_mut(&block).unwrap().phis.push(HirPhi {
-                    result: phi_val,
-                    ty,
-                    incoming,
-                });
+                self.function
+                    .blocks
+                    .get_mut(&block)
+                    .unwrap()
+                    .phis
+                    .push(HirPhi {
+                        result: phi_val,
+                        ty,
+                        incoming,
+                    });
                 phi_val
             }
         }
     }
-    
+
     /// Seal a block (all predecessors known)
     fn seal_block(&mut self, block: HirId) {
         self.sealed_blocks.insert(block);
@@ -2617,7 +3055,9 @@ impl SsaBuilder {
         }
 
         // Process incomplete phis for this block (demand-driven SSA only)
-        let incomplete: Vec<_> = self.incomplete_phis.iter()
+        let incomplete: Vec<_> = self
+            .incomplete_phis
+            .iter()
             .filter(|((b, _), _)| *b == block)
             .map(|((b, v), _)| (*b, *v))
             .collect();
@@ -2626,7 +3066,7 @@ impl SsaBuilder {
             self.fill_incomplete_phi(block, var);
         }
     }
-    
+
     /// Fill an incomplete phi using pure IDF approach
     /// Uses read_variable() which may traverse phis, but won't create new ones after IDF
     fn fill_incomplete_phi(&mut self, block: HirId, var: InternedString) {
@@ -2636,8 +3076,13 @@ impl SsaBuilder {
             let preds = self.function.blocks[&block].predecessors.clone();
             let mut incoming = Vec::new();
 
-            log::debug!("[SSA] fill_incomplete_phi: var={:?}, block={:?}, phi_val={:?}, predecessors={}",
-                     var, block, phi_val, preds.len());
+            log::debug!(
+                "[SSA] fill_incomplete_phi: var={:?}, block={:?}, phi_val={:?}, predecessors={}",
+                var,
+                block,
+                phi_val,
+                preds.len()
+            );
             for pred in preds {
                 // Use read_variable to get the value - this will traverse phis if needed
                 let pred_val = self.read_variable(var, pred);
@@ -2648,14 +3093,17 @@ impl SsaBuilder {
             log::debug!("[SSA] Phi complete with {} incoming values", incoming.len());
 
             // Update the phi
-            if let Some(phi) = self.function.blocks.get_mut(&block)
+            if let Some(phi) = self
+                .function
+                .blocks
+                .get_mut(&block)
                 .and_then(|b| b.phis.iter_mut().find(|p| p.result == phi_val))
             {
                 phi.incoming = incoming;
             }
         }
     }
-    
+
     /// Fill all IDF-placed phis
     fn fill_incomplete_phis(&mut self) {
         let incomplete: Vec<_> = self.incomplete_phis.keys().cloned().collect();
@@ -2668,7 +3116,10 @@ impl SsaBuilder {
     /// Ensures all phis have incoming values from all predecessors
     fn verify_and_fix_phi_incoming(&mut self) {
         // Collect all blocks that have phis
-        let blocks_with_phis: Vec<HirId> = self.function.blocks.iter()
+        let blocks_with_phis: Vec<HirId> = self
+            .function
+            .blocks
+            .iter()
             .filter(|(_, block)| !block.phis.is_empty())
             .map(|(id, _)| *id)
             .collect();
@@ -2684,12 +3135,12 @@ impl SsaBuilder {
                 let block = &self.function.blocks[&block_id];
                 for phi in &block.phis {
                     // Check if phi has incoming from all predecessors
-                    let incoming_blocks: HashSet<_> = phi.incoming.iter()
-                        .map(|(_, block)| *block)
-                        .collect();
+                    let incoming_blocks: HashSet<_> =
+                        phi.incoming.iter().map(|(_, block)| *block).collect();
 
                     // Find missing predecessors
-                    let missing: Vec<_> = preds.iter()
+                    let missing: Vec<_> = preds
+                        .iter()
                         .filter(|pred| !incoming_blocks.contains(pred))
                         .copied()
                         .collect();
@@ -2736,7 +3187,7 @@ impl SsaBuilder {
     /// Scan CFG to collect variable types from Let statements
     /// This must be done before phi placement since phis need correct types
     fn scan_cfg_for_variable_types(&mut self, cfg: &crate::typed_cfg::TypedControlFlowGraph) {
-        use zyntax_typed_ast::typed_ast::{TypedStatement};
+        use zyntax_typed_ast::typed_ast::TypedStatement;
 
         for node_idx in cfg.graph.node_indices() {
             let typed_block = &cfg.graph[node_idx];
@@ -2757,8 +3208,11 @@ impl SsaBuilder {
 
     /// Scan CFG to find which blocks write which variables
     /// This is done by analyzing TypedCFG WITHOUT translating to HIR
-    fn scan_cfg_for_variable_writes(&self, cfg: &crate::typed_cfg::TypedControlFlowGraph) -> IndexMap<HirId, HashSet<InternedString>> {
-        use zyntax_typed_ast::typed_ast::{TypedExpression, TypedStatement, BinaryOp};
+    fn scan_cfg_for_variable_writes(
+        &self,
+        cfg: &crate::typed_cfg::TypedControlFlowGraph,
+    ) -> IndexMap<HirId, HashSet<InternedString>> {
+        use zyntax_typed_ast::typed_ast::{BinaryOp, TypedExpression, TypedStatement};
 
         let mut writes: IndexMap<HirId, HashSet<InternedString>> = IndexMap::new();
 
@@ -2817,11 +3271,17 @@ impl SsaBuilder {
             }
         }
 
-        log::debug!("[SSA] Address-taken variables: {:?}", self.address_taken_vars);
+        log::debug!(
+            "[SSA] Address-taken variables: {:?}",
+            self.address_taken_vars
+        );
     }
 
     /// Recursively collect variables that have their address taken
-    fn collect_address_taken_vars_from_expr(&mut self, expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>) {
+    fn collect_address_taken_vars_from_expr(
+        &mut self,
+        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) {
         use zyntax_typed_ast::typed_ast::TypedExpression;
 
         match &expr.node {
@@ -2870,8 +3330,7 @@ impl SsaBuilder {
                 }
             }
             // Leaf nodes - no recursion needed
-            TypedExpression::Literal(_) |
-            TypedExpression::Variable(_) => {}
+            TypedExpression::Literal(_) | TypedExpression::Variable(_) => {}
             // Handle other expression types as needed
             _ => {}
         }
@@ -2897,7 +3356,10 @@ impl SsaBuilder {
         // Use scanned writes instead of self.variable_writes
         for (block_id, vars) in &scanned_writes {
             for &var in vars {
-                defs_per_var.entry(var).or_insert_with(HashSet::new).insert(*block_id);
+                defs_per_var
+                    .entry(var)
+                    .or_insert_with(HashSet::new)
+                    .insert(*block_id);
             }
         }
 
@@ -2926,24 +3388,28 @@ impl SsaBuilder {
                 let phi_val = self.create_value(ty.clone(), HirValueKind::Instruction);
 
                 self.incomplete_phis.insert(phi_key, phi_val);
-                self.function.blocks.get_mut(&block_id).unwrap().phis.push(HirPhi {
-                    result: phi_val,
-                    ty,
-                    incoming: vec![],
-                });
+                self.function
+                    .blocks
+                    .get_mut(&block_id)
+                    .unwrap()
+                    .phis
+                    .push(HirPhi {
+                        result: phi_val,
+                        ty,
+                        incoming: vec![],
+                    });
 
                 // Define it in the block so reads find it
-                self.definitions.get_mut(&block_id).unwrap().insert(var, phi_val);
+                self.definitions
+                    .get_mut(&block_id)
+                    .unwrap()
+                    .insert(var, phi_val);
             }
         }
     }
 
     /// Compute Iterated Dominance Frontier for a set of blocks
-    fn compute_idf(
-        &self,
-        def_blocks: &HashSet<HirId>,
-        dom_info: &DominanceInfo
-    ) -> HashSet<HirId> {
+    fn compute_idf(&self, def_blocks: &HashSet<HirId>, dom_info: &DominanceInfo) -> HashSet<HirId> {
         let mut worklist: Vec<HirId> = def_blocks.iter().copied().collect();
         let mut idf = HashSet::new();
         let mut processed = HashSet::new();
@@ -2973,9 +3439,9 @@ impl SsaBuilder {
         cfg: &crate::typed_cfg::TypedControlFlowGraph,
         block_id: HirId,
         header_id: HirId,
-        vars: &mut HashSet<InternedString>
+        vars: &mut HashSet<InternedString>,
     ) {
-        use zyntax_typed_ast::typed_ast::{TypedStatement, TypedExpression};
+        use zyntax_typed_ast::typed_ast::{TypedExpression, TypedStatement};
 
         // Avoid infinite recursion
         if block_id == header_id {
@@ -3018,9 +3484,9 @@ impl SsaBuilder {
     fn collect_assigned_vars(
         &self,
         expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
-        vars: &mut HashSet<InternedString>
+        vars: &mut HashSet<InternedString>,
     ) {
-        use zyntax_typed_ast::typed_ast::{TypedExpression, BinaryOp};
+        use zyntax_typed_ast::typed_ast::{BinaryOp, TypedExpression};
 
         match &expr.node {
             TypedExpression::Binary(bin) if matches!(bin.op, BinaryOp::Assign) => {
@@ -3045,7 +3511,7 @@ impl SsaBuilder {
 
     /// Create a global string constant and return a value referencing it
     fn create_string_global(&mut self, string_name: InternedString) -> HirId {
-        use crate::hir::{HirGlobal, HirConstant, Linkage, Visibility};
+        use crate::hir::{HirConstant, HirGlobal, Linkage, Visibility};
 
         // Create a unique global ID and name
         let global_id = HirId::new();
@@ -3068,7 +3534,7 @@ impl SsaBuilder {
         // Create a value that references this global
         let value_id = self.create_value(
             HirType::Ptr(Box::new(HirType::I8)),
-            HirValueKind::Global(global_id)
+            HirValueKind::Global(global_id),
         );
 
         value_id
@@ -3076,31 +3542,39 @@ impl SsaBuilder {
 
     /// Add an instruction to a block
     fn add_instruction(&mut self, block: HirId, inst: HirInstruction) {
-        log::debug!("[SSA] add_instruction: block={:?}, inst={:?}", block, std::mem::discriminant(&inst));
+        log::debug!(
+            "[SSA] add_instruction: block={:?}, inst={:?}",
+            block,
+            std::mem::discriminant(&inst)
+        );
         if let HirInstruction::Binary { result, op, .. } = &inst {
             log::debug!("[SSA]   -> Binary op={:?}, result={:?}", op, result);
         }
-        self.function.blocks.get_mut(&block).unwrap().add_instruction(inst);
+        self.function
+            .blocks
+            .get_mut(&block)
+            .unwrap()
+            .add_instruction(inst);
     }
-    
+
     /// Add a use of a value
     fn add_use(&mut self, value: HirId, user: HirId) {
         if let Some(val) = self.function.values.get_mut(&value) {
             val.uses.insert(user);
         }
     }
-    
+
     /// Compute dominance order for processing
     fn compute_dominance_order(&self, _cfg: &ControlFlowGraph) -> Vec<HirId> {
         // Simple DFS order for now
         let mut order = Vec::new();
         let mut visited = HashSet::new();
         let mut stack = vec![self.function.entry_block];
-        
+
         while let Some(block) = stack.pop() {
             if visited.insert(block) {
                 order.push(block);
-                
+
                 if let Some(block_info) = self.function.blocks.get(&block) {
                     for &succ in &block_info.successors {
                         if !visited.contains(&succ) {
@@ -3110,25 +3584,25 @@ impl SsaBuilder {
                 }
             }
         }
-        
+
         order
     }
-    
+
     /// Build def-use and use-def chains
     fn build_def_use_chains(&self) -> (IndexMap<HirId, HashSet<HirId>>, IndexMap<HirId, HirId>) {
         let mut def_use = IndexMap::new();
         let mut use_def = IndexMap::new();
-        
+
         // Process all values
         for (value_id, value) in &self.function.values {
             def_use.insert(*value_id, value.uses.clone());
-            
+
             // For each use, record the definition
             for &use_id in &value.uses {
                 use_def.insert(use_id, *value_id);
             }
         }
-        
+
         (def_use, use_def)
     }
 
@@ -3149,10 +3623,12 @@ impl SsaBuilder {
                 // The mangled name format is: {TypeName}${method_name} (no leading $)
                 // E.g., Tensor$add for Tensor.add()
                 let arena = self.arena.lock().unwrap();
-                let type_name_str = arena.resolve_string(*name)
-                    .ok_or_else(|| crate::CompilerError::Analysis("Could not resolve extern type name".into()))?;
-                let method_name_str = arena.resolve_string(method_name)
-                    .ok_or_else(|| crate::CompilerError::Analysis("Could not resolve method name".into()))?;
+                let type_name_str = arena.resolve_string(*name).ok_or_else(|| {
+                    crate::CompilerError::Analysis("Could not resolve extern type name".into())
+                })?;
+                let method_name_str = arena.resolve_string(method_name).ok_or_else(|| {
+                    crate::CompilerError::Analysis("Could not resolve method name".into())
+                })?;
 
                 // Strip $ prefix if present (extern type names often have runtime_prefix like "$Tensor")
                 let base_type_name = type_name_str.strip_prefix('$').unwrap_or(&type_name_str);
@@ -3162,49 +3638,72 @@ impl SsaBuilder {
                 return Ok(InternedString::new_global(&mangled));
             }
             Type::Unknown | Type::Any => {
-                let method_name_str = self.arena.lock().unwrap().resolve_string(method_name)
-                    .unwrap_or_default().to_string();
+                let method_name_str = self
+                    .arena
+                    .lock()
+                    .unwrap()
+                    .resolve_string(method_name)
+                    .unwrap_or_default()
+                    .to_string();
                 return Err(crate::CompilerError::Analysis(
                     format!("Cannot resolve method '{}' on unknown type - add a type annotation to the variable", method_name_str)
-                ))
+                ));
             }
             _ => {
-                return Err(crate::CompilerError::Analysis(
-                    format!("Cannot call methods on non-nominal type: {:?}", receiver_type)
-                ))
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Cannot call methods on non-nominal type: {:?}",
+                    receiver_type
+                )))
             }
         };
 
         // First, check for inherent methods (impl Type { ... } without trait)
         // Inherent methods take priority over trait methods
-        eprintln!("[METHOD DISPATCH] Looking up type_id {:?} in type_registry", type_id);
+        eprintln!(
+            "[METHOD DISPATCH] Looking up type_id {:?} in type_registry",
+            type_id
+        );
         if let Some(type_def) = self.type_registry.get_type_by_id(type_id) {
-            eprintln!("[METHOD DISPATCH] Checking type {} ({:?}), {} inherent methods",
-                type_def.name.resolve_global().unwrap_or_default(), type_id, type_def.methods.len());
-            eprintln!("[METHOD DISPATCH] Looking for method: {} ({:?})",
-                method_name.resolve_global().unwrap_or_default(), method_name);
+            eprintln!(
+                "[METHOD DISPATCH] Checking type {} ({:?}), {} inherent methods",
+                type_def.name.resolve_global().unwrap_or_default(),
+                type_id,
+                type_def.methods.len()
+            );
+            eprintln!(
+                "[METHOD DISPATCH] Looking for method: {} ({:?})",
+                method_name.resolve_global().unwrap_or_default(),
+                method_name
+            );
             for method in &type_def.methods {
-                eprintln!("[METHOD DISPATCH]   Available method: {} ({:?}), match={}",
-                    method.name.resolve_global().unwrap_or_default(), method.name, method.name == method_name);
+                eprintln!(
+                    "[METHOD DISPATCH]   Available method: {} ({:?}), match={}",
+                    method.name.resolve_global().unwrap_or_default(),
+                    method.name,
+                    method.name == method_name
+                );
                 if method.name == method_name {
                     // Found inherent method!
                     // Format for inherent methods: {TypeName}${method_name}
                     let mangled = {
                         let arena = self.arena.lock().unwrap();
-                        let type_name_str = arena.resolve_string(type_def.name)
-                            .unwrap_or_default();
-                        let method_name_str = arena.resolve_string(method_name)
-                            .unwrap_or_default();
+                        let type_name_str = arena.resolve_string(type_def.name).unwrap_or_default();
+                        let method_name_str = arena.resolve_string(method_name).unwrap_or_default();
                         format!("{}${}", type_name_str, method_name_str)
                     };
 
-                    eprintln!("[METHOD DISPATCH] Found inherent method '{}' for type '{}'",
-                        method_name, type_def.name);
+                    eprintln!(
+                        "[METHOD DISPATCH] Found inherent method '{}' for type '{}'",
+                        method_name, type_def.name
+                    );
                     return Ok(InternedString::new_global(&mangled));
                 }
             }
         } else {
-            eprintln!("[METHOD DISPATCH] Type {:?} not found in type_registry!", type_id);
+            eprintln!(
+                "[METHOD DISPATCH] Type {:?} not found in type_registry!",
+                type_id
+            );
         }
 
         // Look up which traits this type implements
@@ -3212,36 +3711,54 @@ impl SsaBuilder {
         for (_trait_id, impls) in self.type_registry.iter_implementations() {
             for impl_def in impls {
                 // Check if this impl is for our type
-                if let Type::Named { id: impl_type_id, .. } = &impl_def.for_type {
+                if let Type::Named {
+                    id: impl_type_id, ..
+                } = &impl_def.for_type
+                {
                     if *impl_type_id == type_id {
                         // Check if this impl has the method we're looking for
                         for method in &impl_def.methods {
                             if method.signature.name == method_name {
                                 // Found it! Return mangled name
                                 // Format: {TypeName}${TraitName}${method_name}
-                                let type_def = self.type_registry.get_type_by_id(type_id)
-                                    .ok_or_else(|| crate::CompilerError::Analysis(
-                                        format!("Type {:?} not found in registry", type_id)
-                                    ))?;
+                                let type_def = self
+                                    .type_registry
+                                    .get_type_by_id(type_id)
+                                    .ok_or_else(|| {
+                                        crate::CompilerError::Analysis(format!(
+                                            "Type {:?} not found in registry",
+                                            type_id
+                                        ))
+                                    })?;
 
-                                let trait_def = self.type_registry.get_trait_by_id(impl_def.trait_id)
-                                    .ok_or_else(|| crate::CompilerError::Analysis(
-                                        format!("Trait {:?} not found in registry", impl_def.trait_id)
-                                    ))?;
+                                let trait_def = self
+                                    .type_registry
+                                    .get_trait_by_id(impl_def.trait_id)
+                                    .ok_or_else(|| {
+                                        crate::CompilerError::Analysis(format!(
+                                            "Trait {:?} not found in registry",
+                                            impl_def.trait_id
+                                        ))
+                                    })?;
 
                                 let mangled = {
                                     let arena = self.arena.lock().unwrap();
-                                    let type_name_str = arena.resolve_string(type_def.name)
-                                        .unwrap_or_default();
-                                    let trait_name_str = arena.resolve_string(trait_def.name)
-                                        .unwrap_or_default();
-                                    let method_name_str = arena.resolve_string(method_name)
-                                        .unwrap_or_default();
-                                    format!("{}${}${}", type_name_str, trait_name_str, method_name_str)
+                                    let type_name_str =
+                                        arena.resolve_string(type_def.name).unwrap_or_default();
+                                    let trait_name_str =
+                                        arena.resolve_string(trait_def.name).unwrap_or_default();
+                                    let method_name_str =
+                                        arena.resolve_string(method_name).unwrap_or_default();
+                                    format!(
+                                        "{}${}${}",
+                                        type_name_str, trait_name_str, method_name_str
+                                    )
                                 };
 
-                                eprintln!("[METHOD DISPATCH] Found trait method (trait: {:?})",
-                                    impl_def.trait_id);
+                                eprintln!(
+                                    "[METHOD DISPATCH] Found trait method (trait: {:?})",
+                                    impl_def.trait_id
+                                );
                                 return Ok(InternedString::new_global(&mangled));
                             }
                         }
@@ -3252,20 +3769,22 @@ impl SsaBuilder {
 
         // Method not found
         let arena = self.arena.lock().unwrap();
-        let method_name_str = arena.resolve_string(method_name)
+        let method_name_str = arena
+            .resolve_string(method_name)
             .unwrap_or("unknown")
             .to_string();
         drop(arena);
 
-        Err(crate::CompilerError::Analysis(
-            format!("Method '{}' not found for type '{:?}'", method_name_str, receiver_type)
-        ))
+        Err(crate::CompilerError::Analysis(format!(
+            "Method '{}' not found for type '{:?}'",
+            method_name_str, receiver_type
+        )))
     }
 
     /// Convert frontend type to HIR type
     fn convert_type(&self, ty: &Type) -> HirType {
         use zyntax_typed_ast::PrimitiveType;
-        
+
         match ty {
             Type::Primitive(prim) => match prim {
                 PrimitiveType::Bool => HirType::Bool,
@@ -3283,22 +3802,23 @@ impl SsaBuilder {
                 PrimitiveType::F64 => HirType::F64,
                 PrimitiveType::Unit => HirType::Void,
                 PrimitiveType::String => HirType::Ptr(Box::new(HirType::I8)), // String is Ptr<i8>
-                _ => HirType::I64, // Default
+                _ => HirType::I64,                                            // Default
             },
             Type::Tuple(types) if types.is_empty() => HirType::Void,
             Type::Reference { ty, .. } => HirType::Ptr(Box::new(self.convert_type(ty))),
-            Type::Array { element_type, size: Some(size_val), .. } => {
+            Type::Array {
+                element_type,
+                size: Some(size_val),
+                ..
+            } => {
                 // Extract size from ConstValue
                 let size = match size_val {
                     ConstValue::Int(i) => *i as u64,
                     ConstValue::UInt(u) => *u,
                     _ => 0, // Default size
                 };
-                HirType::Array(
-                    Box::new(self.convert_type(element_type)),
-                    size
-                )
-            },
+                HirType::Array(Box::new(self.convert_type(element_type)), size)
+            }
             Type::Optional(inner_ty) => {
                 // Convert Optional<T> to a tagged union: enum { None, Some(T) }
                 use crate::hir::{HirUnionType, HirUnionVariant};
@@ -3328,7 +3848,7 @@ impl SsaBuilder {
                     discriminant_type: Box::new(HirType::U32),
                     is_c_union: false,
                 }))
-            },
+            }
             Type::Result { ok_type, err_type } => {
                 // Convert Result<T, E> to a tagged union: enum { Ok(T), Err(E) }
                 use crate::hir::{HirUnionType, HirUnionVariant};
@@ -3359,12 +3879,13 @@ impl SsaBuilder {
                     discriminant_type: Box::new(HirType::U32),
                     is_c_union: false,
                 }))
-            },
+            }
             Type::Struct { fields, .. } => {
                 // Convert inline struct type to HirType::Struct
                 use crate::hir::HirStructType;
 
-                let hir_fields: Vec<HirType> = fields.iter()
+                let hir_fields: Vec<HirType> = fields
+                    .iter()
                     .map(|field| self.convert_type(&field.ty))
                     .collect();
 
@@ -3373,12 +3894,12 @@ impl SsaBuilder {
                     fields: hir_fields,
                     packed: false,
                 })
-            },
+            }
             Type::Extern { name, .. } => {
                 // Extern/Opaque types are pointers to opaque structs at the HIR level
                 // The name is used for trait dispatch (e.g., $Tensor -> $Tensor$add)
                 HirType::Ptr(Box::new(HirType::Opaque(*name)))
-            },
+            }
             Type::Named { id, .. } => {
                 // Look up the type definition in the registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
@@ -3389,11 +3910,15 @@ impl SsaBuilder {
                     // They must be treated as structs for field access to work
                     // The backend will optimize away the wrapper at codegen time
                     if let TypeKind::Abstract { .. } = &type_def.kind {
-                        eprintln!("[CONVERT TYPE SSA] Abstract type '{}' → struct with {} fields",
+                        eprintln!(
+                            "[CONVERT TYPE SSA] Abstract type '{}' → struct with {} fields",
                             type_def.name.resolve_global().unwrap_or_default(),
-                            type_def.fields.len());
+                            type_def.fields.len()
+                        );
 
-                        let hir_fields: Vec<HirType> = type_def.fields.iter()
+                        let hir_fields: Vec<HirType> = type_def
+                            .fields
+                            .iter()
                             .map(|field| self.convert_type(&field.ty))
                             .collect();
 
@@ -3406,7 +3931,9 @@ impl SsaBuilder {
 
                     // Regular Named types (structs, classes, enums) convert to struct types
                     // Convert the fields to HIR types
-                    let hir_fields: Vec<HirType> = type_def.fields.iter()
+                    let hir_fields: Vec<HirType> = type_def
+                        .fields
+                        .iter()
                         .map(|field| self.convert_type(&field.ty))
                         .collect();
 
@@ -3416,23 +3943,30 @@ impl SsaBuilder {
                         packed: false,
                     })
                 } else {
-                    eprintln!("[WARN] Named type {:?} not found in registry, defaulting to I64", id);
+                    eprintln!(
+                        "[WARN] Named type {:?} not found in registry, defaulting to I64",
+                        id
+                    );
                     HirType::I64
                 }
-            },
+            }
             Type::Unresolved(name) => {
                 // Look up the type in TypeRegistry by name and convert as Named type
                 if let Some(type_def) = self.type_registry.get_type_by_name(*name) {
                     use crate::hir::HirStructType;
                     use zyntax_typed_ast::type_registry::TypeKind;
 
-                    eprintln!("[CONVERT TYPE SSA] Unresolved type '{}' → resolved to {:?}",
+                    eprintln!(
+                        "[CONVERT TYPE SSA] Unresolved type '{}' → resolved to {:?}",
                         name.resolve_global().unwrap_or_default(),
-                        type_def.kind);
+                        type_def.kind
+                    );
 
                     // Abstract types are zero-cost wrappers with struct layout
                     if let TypeKind::Abstract { .. } = &type_def.kind {
-                        let hir_fields: Vec<HirType> = type_def.fields.iter()
+                        let hir_fields: Vec<HirType> = type_def
+                            .fields
+                            .iter()
                             .map(|field| self.convert_type(&field.ty))
                             .collect();
 
@@ -3444,7 +3978,9 @@ impl SsaBuilder {
                     }
 
                     // Regular types (structs, classes, enums) convert to struct types
-                    let hir_fields: Vec<HirType> = type_def.fields.iter()
+                    let hir_fields: Vec<HirType> = type_def
+                        .fields
+                        .iter()
                         .map(|field| self.convert_type(&field.ty))
                         .collect();
 
@@ -3454,17 +3990,19 @@ impl SsaBuilder {
                         packed: false,
                     })
                 } else {
-                    eprintln!("[WARN] Unresolved type '{}' not found in registry, defaulting to I64",
-                        name.resolve_global().unwrap_or_default());
+                    eprintln!(
+                        "[WARN] Unresolved type '{}' not found in registry, defaulting to I64",
+                        name.resolve_global().unwrap_or_default()
+                    );
                     HirType::I64
                 }
-            },
+            }
             Type::Any => {
                 // Type::Any means "infer from context" - we need to check the initializer's type
                 // For now, default to I64 but this should be improved
                 eprintln!("[WARN] Type::Any encountered in convert_type, defaulting to I64");
                 HirType::I64
-            },
+            }
             _ => HirType::I64, // Default for complex types
         }
     }
@@ -3472,8 +4010,8 @@ impl SsaBuilder {
     /// Convert HIR type back to TypedAST Type (reverse of convert_type)
     /// This is used when we need to look up type information that was stored in HIR format
     fn hir_type_to_typed_ast_type(&self, hir_ty: &HirType) -> Type {
-        use zyntax_typed_ast::PrimitiveType;
         use zyntax_typed_ast::type_registry::NullabilityKind;
+        use zyntax_typed_ast::PrimitiveType;
 
         match hir_ty {
             HirType::Bool => Type::Primitive(PrimitiveType::Bool),
@@ -3490,20 +4028,16 @@ impl SsaBuilder {
             HirType::F32 => Type::Primitive(PrimitiveType::F32),
             HirType::F64 => Type::Primitive(PrimitiveType::F64),
             HirType::Void => Type::Primitive(PrimitiveType::Unit),
-            HirType::Ptr(inner) => {
-                Type::Reference {
-                    ty: Box::new(self.hir_type_to_typed_ast_type(inner)),
-                    mutability: zyntax_typed_ast::type_registry::Mutability::Mutable,
-                    lifetime: None,
-                    nullability: NullabilityKind::NonNull,
-                }
+            HirType::Ptr(inner) => Type::Reference {
+                ty: Box::new(self.hir_type_to_typed_ast_type(inner)),
+                mutability: zyntax_typed_ast::type_registry::Mutability::Mutable,
+                lifetime: None,
+                nullability: NullabilityKind::NonNull,
             },
-            HirType::Array(elem_ty, size) => {
-                Type::Array {
-                    element_type: Box::new(self.hir_type_to_typed_ast_type(elem_ty)),
-                    size: Some(zyntax_typed_ast::type_registry::ConstValue::UInt(*size)),
-                    nullability: NullabilityKind::NonNull,
-                }
+            HirType::Array(elem_ty, size) => Type::Array {
+                element_type: Box::new(self.hir_type_to_typed_ast_type(elem_ty)),
+                size: Some(zyntax_typed_ast::type_registry::ConstValue::UInt(*size)),
+                nullability: NullabilityKind::NonNull,
             },
             HirType::Struct(struct_ty) => {
                 // If struct has a name, look it up in type registry to get TypeId
@@ -3524,11 +4058,11 @@ impl SsaBuilder {
                     is_anonymous: false,
                     nullability: NullabilityKind::NonNull,
                 }
-            },
+            }
             HirType::Union(_) => {
                 // Optional/Result types - return as Any for now
                 Type::Any
-            },
+            }
             HirType::Opaque(name) => {
                 // Check if this opaque type is actually a registered type (struct/abstract) in the registry
                 if let Some(type_def) = self.type_registry.get_type_by_name(*name) {
@@ -3546,16 +4080,19 @@ impl SsaBuilder {
                     name: *name,
                     layout: None,
                 }
-            },
+            }
             _ => Type::Any, // Default fallback
         }
     }
 
     /// Convert binary operator
-    fn convert_binary_op(&self, op: &zyntax_typed_ast::typed_ast::BinaryOp) -> crate::hir::BinaryOp {
-        use zyntax_typed_ast::typed_ast::BinaryOp as FrontendOp;
+    fn convert_binary_op(
+        &self,
+        op: &zyntax_typed_ast::typed_ast::BinaryOp,
+    ) -> crate::hir::BinaryOp {
         use crate::hir::BinaryOp as HirOp;
-        
+        use zyntax_typed_ast::typed_ast::BinaryOp as FrontendOp;
+
         match op {
             FrontendOp::Add => HirOp::Add,
             FrontendOp::Sub => HirOp::Sub,
@@ -3576,11 +4113,11 @@ impl SsaBuilder {
             _ => HirOp::Add, // Default
         }
     }
-    
+
     /// Convert unary operator
     fn convert_unary_op(&self, op: &zyntax_typed_ast::typed_ast::UnaryOp) -> crate::hir::UnaryOp {
-        use zyntax_typed_ast::typed_ast::UnaryOp as FrontendOp;
         use crate::hir::UnaryOp as HirOp;
+        use zyntax_typed_ast::typed_ast::UnaryOp as FrontendOp;
 
         match op {
             FrontendOp::Minus => HirOp::Neg,
@@ -3645,7 +4182,11 @@ impl SsaBuilder {
             format!("${}${}", type_name, method_name)
         };
         let method_name_interned = InternedString::new_global(&method_symbol);
-        log::debug!("[SSA] Operator trait dispatch: {} for type {}", method_symbol, type_name);
+        log::debug!(
+            "[SSA] Operator trait dispatch: {} for type {}",
+            method_symbol,
+            type_name
+        );
 
         // Try to look up the function ID for this method
         // If it's a compiled ZynML function (like Duration$add), we need HirCallable::Function
@@ -3654,7 +4195,10 @@ impl SsaBuilder {
             log::debug!("[SSA] Found function ID for {}", method_symbol);
             crate::hir::HirCallable::Function(func_id)
         } else {
-            log::debug!("[SSA] No function ID found, using external symbol for {}", method_symbol);
+            log::debug!(
+                "[SSA] No function ID found, using external symbol for {}",
+                method_symbol
+            );
             crate::hir::HirCallable::Symbol(method_symbol)
         };
 
@@ -3665,7 +4209,11 @@ impl SsaBuilder {
         // For binary operations, the result type should be the same as the operand type
         // (e.g., Tensor + Tensor = Tensor). Use left operand's type instead of expression type.
         let hir_result_type = self.convert_type(left_type);
-        log::debug!("[SSA] Operator trait dispatch result type: {:?} (from left type: {:?})", hir_result_type, left_type);
+        log::debug!(
+            "[SSA] Operator trait dispatch result type: {:?} (from left type: {:?})",
+            hir_result_type,
+            left_type
+        );
 
         // Create call instruction to the trait method
         let result = if hir_result_type != HirType::Void {
@@ -3687,13 +4235,19 @@ impl SsaBuilder {
         self.add_use(left_val, result.unwrap_or(left_val));
         self.add_use(right_val, result.unwrap_or(right_val));
 
-        Ok(Some(result.unwrap_or_else(|| self.create_undef(HirType::Void))))
+        Ok(Some(
+            result.unwrap_or_else(|| self.create_undef(HirType::Void)),
+        ))
     }
 
     /// Resolve the actual type for an expression, looking up variable types if needed.
     /// This is needed because expression nodes may have type `Any` even when the
     /// variable has a more specific type recorded in var_typed_ast_types.
-    fn resolve_actual_type(&self, expr: &zyntax_typed_ast::typed_ast::TypedExpression, fallback: &Type) -> Type {
+    fn resolve_actual_type(
+        &self,
+        expr: &zyntax_typed_ast::typed_ast::TypedExpression,
+        fallback: &Type,
+    ) -> Type {
         use zyntax_typed_ast::typed_ast::TypedExpression;
 
         match expr {
@@ -3701,8 +4255,11 @@ impl SsaBuilder {
                 // Look up the variable's actual type from our tracking
                 if let Some(var_ty) = self.var_typed_ast_types.get(name) {
                     if !matches!(var_ty, Type::Any | Type::Unknown) {
-                        log::debug!("[resolve_actual_type] Variable '{}' has type {:?}",
-                            name.resolve_global().unwrap_or_default(), var_ty);
+                        log::debug!(
+                            "[resolve_actual_type] Variable '{}' has type {:?}",
+                            name.resolve_global().unwrap_or_default(),
+                            var_ty
+                        );
                         return var_ty.clone();
                     }
                 }
@@ -3722,27 +4279,33 @@ impl SsaBuilder {
             // All other types (Extern, Named, Unknown, etc.) should try trait dispatch
             // This allows any type with an impl block to use operator overloading
             Type::Extern { name, .. } => {
-                let name_str = name.resolve_global()
-                    .unwrap_or_else(|| {
-                        let arena = self.arena.lock().unwrap();
-                        arena.resolve_string(*name)
-                            .map(|s| s.to_string())
-                            .unwrap_or_default()
-                    });
-                log::debug!("[trait_dispatch] Type::Extern name='{}' -> dispatchable", name_str);
+                let name_str = name.resolve_global().unwrap_or_else(|| {
+                    let arena = self.arena.lock().unwrap();
+                    arena
+                        .resolve_string(*name)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                });
+                log::debug!(
+                    "[trait_dispatch] Type::Extern name='{}' -> dispatchable",
+                    name_str
+                );
                 true
             }
             Type::Named { id, .. } => {
                 // Any named type can have trait impls
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
-                    let name = type_def.name.resolve_global()
-                        .unwrap_or_else(|| {
-                            let arena = self.arena.lock().unwrap();
-                            arena.resolve_string(type_def.name)
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        });
-                    log::debug!("[trait_dispatch] Type::Named name='{}' -> dispatchable", name);
+                    let name = type_def.name.resolve_global().unwrap_or_else(|| {
+                        let arena = self.arena.lock().unwrap();
+                        arena
+                            .resolve_string(type_def.name)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default()
+                    });
+                    log::debug!(
+                        "[trait_dispatch] Type::Named name='{}' -> dispatchable",
+                        name
+                    );
                     return true;
                 }
                 // Also check HIR conversion
@@ -3767,40 +4330,43 @@ impl SsaBuilder {
         match ty {
             // Extern types have the name directly
             Type::Extern { name, .. } => {
-                let name_str = name.resolve_global()
-                    .unwrap_or_else(|| {
-                        let arena = self.arena.lock().unwrap();
-                        arena.resolve_string(*name)
-                            .map(|s| s.to_string())
-                            .unwrap_or_default()
-                    });
+                let name_str = name.resolve_global().unwrap_or_else(|| {
+                    let arena = self.arena.lock().unwrap();
+                    arena
+                        .resolve_string(*name)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                });
                 log::debug!("[trait_dispatch] Type::Extern prefix: '{}'", name_str);
                 Some(name_str)
             }
             Type::Named { id, .. } => {
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
                     // Use the type name
-                    let name = type_def.name.resolve_global()
-                        .unwrap_or_else(|| {
-                            let arena = self.arena.lock().unwrap();
-                            arena.resolve_string(type_def.name)
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        });
+                    let name = type_def.name.resolve_global().unwrap_or_else(|| {
+                        let arena = self.arena.lock().unwrap();
+                        arena
+                            .resolve_string(type_def.name)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default()
+                    });
                     log::debug!("[trait_dispatch] Type::Named prefix: '{}'", name);
                     Some(name)
                 } else {
                     // If not in registry, try to get from HIR type
                     let hir_ty = self.convert_type(ty);
                     if let HirType::Opaque(name) = hir_ty {
-                        let name_str = name.resolve_global()
-                            .unwrap_or_else(|| {
-                                let arena = self.arena.lock().unwrap();
-                                arena.resolve_string(name)
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default()
-                            });
-                        log::debug!("[trait_dispatch] Type::Named (opaque) prefix: '{}'", name_str);
+                        let name_str = name.resolve_global().unwrap_or_else(|| {
+                            let arena = self.arena.lock().unwrap();
+                            arena
+                                .resolve_string(name)
+                                .map(|s| s.to_string())
+                                .unwrap_or_default()
+                        });
+                        log::debug!(
+                            "[trait_dispatch] Type::Named (opaque) prefix: '{}'",
+                            name_str
+                        );
                         Some(name_str)
                     } else {
                         log::debug!("[trait_dispatch] Type::Named (no registry) -> None");
@@ -3813,14 +4379,17 @@ impl SsaBuilder {
                 // Convert to HIR and try to extract name
                 let hir_ty = self.convert_type(ty);
                 if let HirType::Opaque(name) = hir_ty {
-                    let name_str = name.resolve_global()
-                        .unwrap_or_else(|| {
-                            let arena = self.arena.lock().unwrap();
-                            arena.resolve_string(name)
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        });
-                    log::debug!("[trait_dispatch] Type::Unknown converted to opaque prefix: '{}'", name_str);
+                    let name_str = name.resolve_global().unwrap_or_else(|| {
+                        let arena = self.arena.lock().unwrap();
+                        arena
+                            .resolve_string(name)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default()
+                    });
+                    log::debug!(
+                        "[trait_dispatch] Type::Unknown converted to opaque prefix: '{}'",
+                        name_str
+                    );
                     Some(name_str)
                 } else {
                     log::debug!("[trait_dispatch] Type::Unknown (not opaque) -> None");
@@ -3835,14 +4404,21 @@ impl SsaBuilder {
     }
 
     /// Translate literal to constant (legacy - always uses default types)
-    fn translate_literal(&self, lit: &zyntax_typed_ast::typed_ast::TypedLiteral) -> crate::hir::HirConstant {
+    fn translate_literal(
+        &self,
+        lit: &zyntax_typed_ast::typed_ast::TypedLiteral,
+    ) -> crate::hir::HirConstant {
         self.translate_literal_with_type(lit, &HirType::I32)
     }
 
     /// Translate literal to constant with target type information
-    fn translate_literal_with_type(&self, lit: &zyntax_typed_ast::typed_ast::TypedLiteral, target_ty: &HirType) -> crate::hir::HirConstant {
-        use zyntax_typed_ast::typed_ast::TypedLiteral;
+    fn translate_literal_with_type(
+        &self,
+        lit: &zyntax_typed_ast::typed_ast::TypedLiteral,
+        target_ty: &HirType,
+    ) -> crate::hir::HirConstant {
         use crate::hir::HirConstant;
+        use zyntax_typed_ast::typed_ast::TypedLiteral;
 
         match lit {
             TypedLiteral::Bool(b) => HirConstant::Bool(*b),
@@ -3861,12 +4437,10 @@ impl SsaBuilder {
                 }
             }
             // Float literals use the target type (F32 or F64)
-            TypedLiteral::Float(f) => {
-                match target_ty {
-                    HirType::F32 => HirConstant::F32(*f as f32),
-                    _ => HirConstant::F64(*f),
-                }
-            }
+            TypedLiteral::Float(f) => match target_ty {
+                HirType::F32 => HirConstant::F32(*f as f32),
+                _ => HirConstant::F64(*f),
+            },
             TypedLiteral::String(s) => HirConstant::String(*s),
             TypedLiteral::Char(c) => HirConstant::I32(*c as i32),
             TypedLiteral::Unit => HirConstant::Struct(vec![]),
@@ -3876,14 +4450,19 @@ impl SsaBuilder {
             TypedLiteral::Undefined => HirConstant::I32(0), // Undefined/uninitialized
         }
     }
-    
+
     /// Get field index in struct using TypeRegistry
-    fn get_field_index(&self, struct_type: &Type, field_name: &InternedString) -> CompilerResult<u32> {
+    fn get_field_index(
+        &self,
+        struct_type: &Type,
+        field_name: &InternedString,
+    ) -> CompilerResult<u32> {
         // Resolve the type if it's unresolved
         let resolved_type = match struct_type {
             Type::Unresolved(name) => {
                 // Look up the type in the registry by name
-                self.type_registry.get_type_by_name(*name)
+                self.type_registry
+                    .get_type_by_name(*name)
                     .map(|type_def| Type::Named {
                         id: type_def.id,
                         type_args: vec![],
@@ -3891,11 +4470,14 @@ impl SsaBuilder {
                         variance: vec![],
                         nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
                     })
-                    .ok_or_else(|| crate::CompilerError::Analysis(
-                        format!("Unresolved type {:?} not found in registry", name)
-                    ))?
+                    .ok_or_else(|| {
+                        crate::CompilerError::Analysis(format!(
+                            "Unresolved type {:?} not found in registry",
+                            name
+                        ))
+                    })?
             }
-            _ => struct_type.clone()
+            _ => struct_type.clone(),
         };
 
         // Extract the type ID from the resolved struct type
@@ -3908,26 +4490,34 @@ impl SsaBuilder {
                         return Ok(idx as u32);
                     }
                 }
-                return Err(crate::CompilerError::Analysis(
-                    format!("Field {:?} not found in inline struct type", field_name)
-                ));
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Field {:?} not found in inline struct type",
+                    field_name
+                )));
             }
             _ => {
-                return Err(crate::CompilerError::Analysis(
-                    format!("Cannot access fields on non-struct type: {:?}", resolved_type)
-                ));
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Cannot access fields on non-struct type: {:?}",
+                    resolved_type
+                )));
             }
         };
 
         // Look up the type definition in the registry
-        let type_def = self.type_registry.get_type_by_id(type_id)
-            .ok_or_else(|| crate::CompilerError::Analysis(
-                format!("Type with ID {:?} not found in registry", type_id)
-            ))?;
+        let type_def = self.type_registry.get_type_by_id(type_id).ok_or_else(|| {
+            crate::CompilerError::Analysis(format!(
+                "Type with ID {:?} not found in registry",
+                type_id
+            ))
+        })?;
 
         // Find the field index in the type definition
-        eprintln!("[DEBUG] Looking for field {:?} in type {:?} which has {} fields",
-            field_name, type_def.name, type_def.fields.len());
+        eprintln!(
+            "[DEBUG] Looking for field {:?} in type {:?} which has {} fields",
+            field_name,
+            type_def.name,
+            type_def.fields.len()
+        );
         for (idx, field) in type_def.fields.iter().enumerate() {
             eprintln!("[DEBUG]   Field {}: name={:?}", idx, field.name);
             if &field.name == field_name {
@@ -3939,8 +4529,12 @@ impl SsaBuilder {
         eprintln!("[DEBUG] Direct comparison failed, trying string resolution");
         for (idx, field) in type_def.fields.iter().enumerate() {
             if let (Some(field_name_str), Some(lookup_name_str)) =
-                (field.name.resolve_global(), field_name.resolve_global()) {
-                eprintln!("[DEBUG]   Comparing '{}' == '{}'", field_name_str, lookup_name_str);
+                (field.name.resolve_global(), field_name.resolve_global())
+            {
+                eprintln!(
+                    "[DEBUG]   Comparing '{}' == '{}'",
+                    field_name_str, lookup_name_str
+                );
                 if field_name_str == lookup_name_str {
                     eprintln!("[DEBUG] Found match by string comparison!");
                     return Ok(idx as u32);
@@ -3949,9 +4543,10 @@ impl SsaBuilder {
         }
 
         // Field not found
-        Err(crate::CompilerError::Analysis(
-            format!("Field {:?} not found in type {:?}", field_name, type_def.name)
-        ))
+        Err(crate::CompilerError::Analysis(format!(
+            "Field {:?} not found in type {:?}",
+            field_name, type_def.name
+        )))
     }
 
     /// Translate assignment expression
@@ -3961,7 +4556,7 @@ impl SsaBuilder {
         &mut self,
         block_id: HirId,
         target: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
-        value_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>
+        value_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
         use zyntax_typed_ast::typed_ast::TypedExpression;
 
@@ -3974,13 +4569,20 @@ impl SsaBuilder {
             TypedExpression::Variable(name) => {
                 // Check if this is an address-taken variable - store to stack slot
                 if let Some(&stack_slot) = self.stack_slots.get(name) {
-                    self.add_instruction(block_id, HirInstruction::Store {
-                        value,
-                        ptr: stack_slot,
-                        align: 8,
-                        volatile: false,
-                    });
-                    log::debug!("[SSA] Store to address-taken var {:?} stack slot {:?}", name, stack_slot);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Store {
+                            value,
+                            ptr: stack_slot,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
+                    log::debug!(
+                        "[SSA] Store to address-taken var {:?} stack slot {:?}",
+                        name,
+                        stack_slot
+                    );
                 } else {
                     // Use write_variable to update the SSA variable tracking
                     self.write_variable(*name, block_id, value);
@@ -4022,9 +4624,10 @@ impl SsaBuilder {
             }
 
             // Invalid assignment target
-            _ => Err(crate::CompilerError::Analysis(
-                format!("Invalid assignment target: {:?}", target.node)
-            ))
+            _ => Err(crate::CompilerError::Analysis(format!(
+                "Invalid assignment target: {:?}",
+                target.node
+            ))),
         }
     }
 
@@ -4033,7 +4636,7 @@ impl SsaBuilder {
         &mut self,
         block_id: HirId,
         target: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
-        value: HirId
+        value: HirId,
     ) -> CompilerResult<()> {
         use zyntax_typed_ast::typed_ast::TypedExpression;
 
@@ -4087,12 +4690,15 @@ impl SsaBuilder {
 
                 // Get element type and size from array type
                 let (element_type, array_size) = match &array.ty {
-                    Type::Array { element_type, size, .. } => {
-                        (self.convert_type(element_type), size.clone())
+                    Type::Array {
+                        element_type, size, ..
+                    } => (self.convert_type(element_type), size.clone()),
+                    _ => {
+                        return Err(crate::CompilerError::Analysis(format!(
+                            "Cannot index into non-array type: {:?}",
+                            array.ty
+                        )))
                     }
-                    _ => return Err(crate::CompilerError::Analysis(
-                        format!("Cannot index into non-array type: {:?}", array.ty)
-                    ))
                 };
 
                 // BOUNDS CHECKING: Emit runtime bounds check if array has known size
@@ -4112,11 +4718,12 @@ impl SsaBuilder {
                         // Create constant for array size
                         let size_hir = self.create_value(
                             HirType::I64,
-                            HirValueKind::Constant(crate::hir::HirConstant::I64(size_value as i64))
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(size_value as i64)),
                         );
 
                         // Compare: index < size
-                        let cond_result = self.create_value(HirType::Bool, HirValueKind::Instruction);
+                        let cond_result =
+                            self.create_value(HirType::Bool, HirValueKind::Instruction);
                         let cmp_inst = HirInstruction::Binary {
                             op: crate::hir::BinaryOp::Lt,
                             result: cond_result,
@@ -4183,7 +4790,7 @@ impl SsaBuilder {
 
                 Ok(())
             }
-            _ => Ok(())
+            _ => Ok(()),
         }
     }
 
@@ -4213,7 +4820,9 @@ impl SsaBuilder {
 
         // Create end block for all arms to converge
         let end_block_id = HirId::new();
-        self.function.blocks.insert(end_block_id, HirBlock::new(end_block_id));
+        self.function
+            .blocks
+            .insert(end_block_id, HirBlock::new(end_block_id));
         self.definitions.insert(end_block_id, IndexMap::new());
 
         // Result phi node will collect values from each arm
@@ -4227,22 +4836,29 @@ impl SsaBuilder {
         for (_arm_idx, arm) in match_expr.arms.iter().enumerate() {
             // Create block for testing this arm's pattern
             let test_block_id = HirId::new();
-            self.function.blocks.insert(test_block_id, HirBlock::new(test_block_id));
+            self.function
+                .blocks
+                .insert(test_block_id, HirBlock::new(test_block_id));
             self.definitions.insert(test_block_id, IndexMap::new());
 
             // Create block for executing this arm's body
             let body_block_id = HirId::new();
-            self.function.blocks.insert(body_block_id, HirBlock::new(body_block_id));
+            self.function
+                .blocks
+                .insert(body_block_id, HirBlock::new(body_block_id));
             self.definitions.insert(body_block_id, IndexMap::new());
 
             // Create block for next arm (or unreachable if last)
             let next_block_id = HirId::new();
-            self.function.blocks.insert(next_block_id, HirBlock::new(next_block_id));
+            self.function
+                .blocks
+                .insert(next_block_id, HirBlock::new(next_block_id));
             self.definitions.insert(next_block_id, IndexMap::new());
 
             // Current block jumps to test block
-            self.function.blocks.get_mut(&block_id).unwrap().terminator =
-                HirTerminator::Branch { target: test_block_id };
+            self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::Branch {
+                target: test_block_id,
+            };
 
             // In test block: check if pattern matches
             let pattern_matches = self.translate_pattern_test(
@@ -4276,18 +4892,26 @@ impl SsaBuilder {
             };
 
             // Conditional branch: if pattern matches (and guard passes), go to body, else next arm
-            self.function.blocks.get_mut(&test_block_id).unwrap().terminator =
-                HirTerminator::CondBranch {
-                    condition: final_condition,
-                    true_target: body_block_id,
-                    false_target: next_block_id,
-                };
+            self.function
+                .blocks
+                .get_mut(&test_block_id)
+                .unwrap()
+                .terminator = HirTerminator::CondBranch {
+                condition: final_condition,
+                true_target: body_block_id,
+                false_target: next_block_id,
+            };
 
             // In body block: execute arm body and jump to end
             let arm_result = self.translate_expression(body_block_id, &arm.body)?;
 
-            self.function.blocks.get_mut(&body_block_id).unwrap().terminator =
-                HirTerminator::Branch { target: end_block_id };
+            self.function
+                .blocks
+                .get_mut(&body_block_id)
+                .unwrap()
+                .terminator = HirTerminator::Branch {
+                target: end_block_id,
+            };
 
             // Record this arm's result for phi node
             phi_operands.push((arm_result, body_block_id));
@@ -4298,8 +4922,7 @@ impl SsaBuilder {
 
         // After all arms, if we reach here, no pattern matched
         // This should be unreachable if exhaustiveness checking is done by type checker
-        self.function.blocks.get_mut(&block_id).unwrap().terminator =
-            HirTerminator::Unreachable;
+        self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::Unreachable;
 
         // Create phi node in end block to collect results
         if !phi_operands.is_empty() {
@@ -4309,7 +4932,12 @@ impl SsaBuilder {
                 incoming: phi_operands,
             };
 
-            self.function.blocks.get_mut(&end_block_id).unwrap().phis.push(phi);
+            self.function
+                .blocks
+                .get_mut(&end_block_id)
+                .unwrap()
+                .phis
+                .push(phi);
         }
 
         // Set continuation block so that Return statements know to use end_block instead of entry block
@@ -4357,46 +4985,59 @@ impl SsaBuilder {
 
         // Extract discriminant: Result is a union with discriminant 0 = Ok, 1 = Err
         let discriminant_val = self.create_value(HirType::U32, HirValueKind::Instruction);
-        self.add_instruction(block_id, HirInstruction::ExtractValue {
-            result: discriminant_val,
-            ty: HirType::U32,
-            aggregate: inner_result_val,
-            indices: vec![0],
-        });
+        self.add_instruction(
+            block_id,
+            HirInstruction::ExtractValue {
+                result: discriminant_val,
+                ty: HirType::U32,
+                aggregate: inner_result_val,
+                indices: vec![0],
+            },
+        );
 
         // Check if discriminant == 0 (Ok)
         let zero_const = self.create_value(
             HirType::U32,
-            HirValueKind::Constant(crate::hir::HirConstant::U32(0))
+            HirValueKind::Constant(crate::hir::HirConstant::U32(0)),
         );
 
         let is_ok = self.create_value(HirType::Bool, HirValueKind::Instruction);
-        self.add_instruction(block_id, HirInstruction::Binary {
-            op: crate::hir::BinaryOp::Eq,
-            result: is_ok,
-            ty: HirType::U32,
-            left: discriminant_val,
-            right: zero_const,
-        });
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::Eq,
+                result: is_ok,
+                ty: HirType::U32,
+                left: discriminant_val,
+                right: zero_const,
+            },
+        );
 
         // Extract the Ok value unconditionally
         // (This is safe because if it's an error, we'll return early)
         let ok_value = self.create_value(hir_ok_ty.clone(), HirValueKind::Instruction);
-        self.add_instruction(block_id, HirInstruction::ExtractValue {
-            result: ok_value,
-            ty: hir_ok_ty.clone(),
-            aggregate: inner_result_val,
-            indices: vec![1],
-        });
+        self.add_instruction(
+            block_id,
+            HirInstruction::ExtractValue {
+                result: ok_value,
+                ty: hir_ok_ty.clone(),
+                aggregate: inner_result_val,
+                indices: vec![1],
+            },
+        );
 
         // Create error block for early return
         let err_block_id = HirId::new();
-        self.function.blocks.insert(err_block_id, HirBlock::new(err_block_id));
+        self.function
+            .blocks
+            .insert(err_block_id, HirBlock::new(err_block_id));
         self.definitions.insert(err_block_id, IndexMap::new());
 
         // Create continue block for success path
         let continue_block_id = HirId::new();
-        self.function.blocks.insert(continue_block_id, HirBlock::new(continue_block_id));
+        self.function
+            .blocks
+            .insert(continue_block_id, HirBlock::new(continue_block_id));
         self.definitions.insert(continue_block_id, IndexMap::new());
 
         // Set up predecessors/successors
@@ -4415,37 +5056,45 @@ impl SsaBuilder {
         }
 
         // Branch: if is_ok, continue; else, go to error block
-        self.function.blocks.get_mut(&block_id).unwrap().terminator =
-            HirTerminator::CondBranch {
-                condition: is_ok,
-                true_target: continue_block_id,
-                false_target: err_block_id,
-            };
+        self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::CondBranch {
+            condition: is_ok,
+            true_target: continue_block_id,
+            false_target: err_block_id,
+        };
 
         // ERR BLOCK: Extract error and return early
         let err_value = self.create_value(hir_err_ty.clone(), HirValueKind::Instruction);
-        self.add_instruction(err_block_id, HirInstruction::ExtractValue {
-            result: err_value,
-            ty: hir_err_ty.clone(), // Err value type (E)
-            aggregate: inner_result_val,
-            indices: vec![1], // Data field (contains the actual Ok/Err value)
-        });
+        self.add_instruction(
+            err_block_id,
+            HirInstruction::ExtractValue {
+                result: err_value,
+                ty: hir_err_ty.clone(), // Err value type (E)
+                aggregate: inner_result_val,
+                indices: vec![1], // Data field (contains the actual Ok/Err value)
+            },
+        );
 
         // Construct a new Err(error) to return
         // Create Result<T, E> union with variant_index = 1 (Err)
         let return_err = self.create_value(hir_result_ty.clone(), HirValueKind::Instruction);
-        self.add_instruction(err_block_id, HirInstruction::CreateUnion {
-            result: return_err,
-            union_ty: hir_result_ty.clone(),
-            variant_index: 1, // Err variant
-            value: err_value,
-        });
+        self.add_instruction(
+            err_block_id,
+            HirInstruction::CreateUnion {
+                result: return_err,
+                union_ty: hir_result_ty.clone(),
+                variant_index: 1, // Err variant
+                value: err_value,
+            },
+        );
 
         // Early return with Err(error)
-        self.function.blocks.get_mut(&err_block_id).unwrap().terminator =
-            HirTerminator::Return {
-                values: vec![return_err],
-            };
+        self.function
+            .blocks
+            .get_mut(&err_block_id)
+            .unwrap()
+            .terminator = HirTerminator::Return {
+            values: vec![return_err],
+        };
 
         // CONTINUE BLOCK: This block continues normal execution
         // Set continuation_block so that subsequent statements in the same
@@ -4487,7 +5136,7 @@ impl SsaBuilder {
                 )))
             }
             _ => Err(crate::CompilerError::Lowering(
-                "? operator requires Result<T, E> type, found non-generic type".to_string()
+                "? operator requires Result<T, E> type, found non-generic type".to_string(),
             )),
         }
     }
@@ -4501,7 +5150,7 @@ impl SsaBuilder {
         scrutinee_val: HirId,
         scrutinee_ty: &Type,
     ) -> CompilerResult<HirId> {
-        use zyntax_typed_ast::typed_ast::{TypedPattern, TypedLiteralPattern};
+        use zyntax_typed_ast::typed_ast::{TypedLiteralPattern, TypedPattern};
 
         log::debug!("[SSA] translate_pattern_test: pattern={:?}", pattern.node);
 
@@ -4510,20 +5159,23 @@ impl SsaBuilder {
             TypedPattern::Wildcard => {
                 let true_val = self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 );
                 Ok(true_val)
             }
 
             // Variable binding always matches (and binds the value)
-            TypedPattern::Identifier { name, mutability: _ } => {
+            TypedPattern::Identifier {
+                name,
+                mutability: _,
+            } => {
                 // Bind the scrutinee to this variable name
                 self.write_variable(*name, block_id, scrutinee_val);
 
                 // Pattern always matches
                 let true_val = self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 );
                 Ok(true_val)
             }
@@ -4534,26 +5186,47 @@ impl SsaBuilder {
             }
 
             // Tuple pattern: check each element
-            TypedPattern::Tuple(element_patterns) => {
-                self.translate_tuple_pattern_test(block_id, element_patterns, scrutinee_val, scrutinee_ty)
-            }
+            TypedPattern::Tuple(element_patterns) => self.translate_tuple_pattern_test(
+                block_id,
+                element_patterns,
+                scrutinee_val,
+                scrutinee_ty,
+            ),
 
             // Struct pattern: check fields
-            TypedPattern::Struct { name, fields } => {
-                self.translate_struct_pattern_test(block_id, name, fields, scrutinee_val, scrutinee_ty)
-            }
+            TypedPattern::Struct { name, fields } => self.translate_struct_pattern_test(
+                block_id,
+                name,
+                fields,
+                scrutinee_val,
+                scrutinee_ty,
+            ),
 
             // Enum variant pattern: check tag and fields
-            TypedPattern::Enum { name, variant, fields } => {
-                self.translate_enum_pattern_test(block_id, name, variant, fields, scrutinee_val, scrutinee_ty)
-            }
+            TypedPattern::Enum {
+                name,
+                variant,
+                fields,
+            } => self.translate_enum_pattern_test(
+                block_id,
+                name,
+                variant,
+                fields,
+                scrutinee_val,
+                scrutinee_ty,
+            ),
 
             // Or pattern: test each sub-pattern and OR results
             TypedPattern::Or(patterns) => {
                 let mut result = None;
 
                 for sub_pattern in patterns {
-                    let sub_result = self.translate_pattern_test(block_id, sub_pattern, scrutinee_val, scrutinee_ty)?;
+                    let sub_result = self.translate_pattern_test(
+                        block_id,
+                        sub_pattern,
+                        scrutinee_val,
+                        scrutinee_ty,
+                    )?;
 
                     result = Some(if let Some(prev_result) = result {
                         // OR: prev_result || sub_result
@@ -4576,9 +5249,11 @@ impl SsaBuilder {
                     });
                 }
 
-                result.ok_or_else(|| crate::CompilerError::Analysis(
-                    "Or pattern must have at least one sub-pattern".to_string()
-                ))
+                result.ok_or_else(|| {
+                    crate::CompilerError::Analysis(
+                        "Or pattern must have at least one sub-pattern".to_string(),
+                    )
+                })
             }
 
             // Array pattern: check each element (similar to tuple)
@@ -4588,9 +5263,12 @@ impl SsaBuilder {
                 // Extract array element type
                 let element_type = match scrutinee_ty {
                     FrontendType::Array { element_type, .. } => element_type,
-                    _ => return Err(crate::CompilerError::Analysis(
-                        format!("Expected array type for array pattern, got {:?}", scrutinee_ty)
-                    )),
+                    _ => {
+                        return Err(crate::CompilerError::Analysis(format!(
+                            "Expected array type for array pattern, got {:?}",
+                            scrutinee_ty
+                        )))
+                    }
                 };
 
                 // Test each element
@@ -4600,7 +5278,7 @@ impl SsaBuilder {
                     // Extract element from array using GetElementPtr
                     let elem_ptr = self.create_value(
                         HirType::Ptr(Box::new(self.convert_type(element_type))),
-                        HirValueKind::Instruction
+                        HirValueKind::Instruction,
                     );
 
                     let gep_inst = HirInstruction::GetElementPtr {
@@ -4608,7 +5286,7 @@ impl SsaBuilder {
                         ptr: scrutinee_val,
                         indices: vec![self.create_value(
                             HirType::I64,
-                            HirValueKind::Constant(crate::hir::HirConstant::I64(idx as i64))
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(idx as i64)),
                         )],
                         ty: self.convert_type(element_type),
                     };
@@ -4617,7 +5295,8 @@ impl SsaBuilder {
                     self.add_use(scrutinee_val, elem_ptr);
 
                     // Load element value
-                    let elem_val = self.create_value(self.convert_type(element_type), HirValueKind::Instruction);
+                    let elem_val = self
+                        .create_value(self.convert_type(element_type), HirValueKind::Instruction);
                     let load_inst = HirInstruction::Load {
                         result: elem_val,
                         ptr: elem_ptr,
@@ -4630,11 +5309,13 @@ impl SsaBuilder {
                     self.add_use(elem_ptr, elem_val);
 
                     // Test pattern against element
-                    let elem_test = self.translate_pattern_test(block_id, pattern, elem_val, element_type)?;
+                    let elem_test =
+                        self.translate_pattern_test(block_id, pattern, elem_val, element_type)?;
 
                     // AND with previous results
                     result = Some(if let Some(prev_result) = result {
-                        let and_result = self.create_value(HirType::Bool, HirValueKind::Instruction);
+                        let and_result =
+                            self.create_value(HirType::Bool, HirValueKind::Instruction);
                         let and_inst = HirInstruction::Binary {
                             op: crate::hir::BinaryOp::And,
                             result: and_result,
@@ -4653,13 +5334,19 @@ impl SsaBuilder {
                     });
                 }
 
-                result.ok_or_else(|| crate::CompilerError::Analysis(
-                    "Array pattern must have at least one element".to_string()
-                ))
+                result.ok_or_else(|| {
+                    crate::CompilerError::Analysis(
+                        "Array pattern must have at least one element".to_string(),
+                    )
+                })
             }
 
             // At pattern: binding @ pattern (e.g., x @ Some(y))
-            TypedPattern::At { name, mutability: _, pattern: inner_pattern } => {
+            TypedPattern::At {
+                name,
+                mutability: _,
+                pattern: inner_pattern,
+            } => {
                 // Bind the scrutinee to the name
                 self.write_variable(*name, block_id, scrutinee_val);
 
@@ -4668,7 +5355,11 @@ impl SsaBuilder {
             }
 
             // Range pattern: test if value is in range
-            TypedPattern::Range { start, end, inclusive } => {
+            TypedPattern::Range {
+                start,
+                end,
+                inclusive,
+            } => {
                 // Test: start <= scrutinee && scrutinee <= end (if inclusive)
                 //       start <= scrutinee && scrutinee < end (if exclusive)
 
@@ -4730,7 +5421,10 @@ impl SsaBuilder {
             }
 
             // Reference pattern: dereference and test inner pattern
-            TypedPattern::Reference { pattern: inner_pattern, mutability: _ } => {
+            TypedPattern::Reference {
+                pattern: inner_pattern,
+                mutability: _,
+            } => {
                 // Dereference the scrutinee
                 let deref_ty = self.convert_type(&inner_pattern.ty);
                 let deref_val = self.create_value(deref_ty.clone(), HirValueKind::Instruction);
@@ -4756,7 +5450,7 @@ impl SsaBuilder {
                 // TODO: Add proper error reporting
                 let true_val = self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 );
                 Ok(true_val)
             }
@@ -4771,27 +5465,22 @@ impl SsaBuilder {
         use zyntax_typed_ast::typed_ast::TypedLiteralPattern;
 
         let val = match &lit_pattern.node {
-            TypedLiteralPattern::Integer(i) => {
-                self.create_value(
-                    HirType::I64,
-                    HirValueKind::Constant(crate::hir::HirConstant::I64(*i as i64))
-                )
-            }
-            TypedLiteralPattern::Float(f) => {
-                self.create_value(
-                    HirType::F64,
-                    HirValueKind::Constant(crate::hir::HirConstant::F64(*f))
-                )
-            }
-            TypedLiteralPattern::Char(c) => {
-                self.create_value(
-                    HirType::I32,
-                    HirValueKind::Constant(crate::hir::HirConstant::I32(*c as i32))
-                )
-            }
+            TypedLiteralPattern::Integer(i) => self.create_value(
+                HirType::I64,
+                HirValueKind::Constant(crate::hir::HirConstant::I64(*i as i64)),
+            ),
+            TypedLiteralPattern::Float(f) => self.create_value(
+                HirType::F64,
+                HirValueKind::Constant(crate::hir::HirConstant::F64(*f)),
+            ),
+            TypedLiteralPattern::Char(c) => self.create_value(
+                HirType::I32,
+                HirValueKind::Constant(crate::hir::HirConstant::I32(*c as i32)),
+            ),
             _ => {
                 return Err(crate::CompilerError::Analysis(
-                    "Only integer, float, and char literals supported in range patterns".to_string()
+                    "Only integer, float, and char literals supported in range patterns"
+                        .to_string(),
                 ));
             }
         };
@@ -4810,64 +5499,56 @@ impl SsaBuilder {
 
         // Create HIR constant for the literal
         let lit_val = match lit_pattern {
-            TypedLiteralPattern::Integer(i) => {
-                self.create_value(
-                    HirType::I64,
-                    HirValueKind::Constant(crate::hir::HirConstant::I64(*i as i64))
-                )
-            }
-            TypedLiteralPattern::Float(f) => {
-                self.create_value(
-                    HirType::F64,
-                    HirValueKind::Constant(crate::hir::HirConstant::F64(*f))
-                )
-            }
-            TypedLiteralPattern::Bool(b) => {
-                self.create_value(
-                    HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(*b))
-                )
-            }
+            TypedLiteralPattern::Integer(i) => self.create_value(
+                HirType::I64,
+                HirValueKind::Constant(crate::hir::HirConstant::I64(*i as i64)),
+            ),
+            TypedLiteralPattern::Float(f) => self.create_value(
+                HirType::F64,
+                HirValueKind::Constant(crate::hir::HirConstant::F64(*f)),
+            ),
+            TypedLiteralPattern::Bool(b) => self.create_value(
+                HirType::Bool,
+                HirValueKind::Constant(crate::hir::HirConstant::Bool(*b)),
+            ),
             TypedLiteralPattern::String(_s) => {
                 // TODO: String comparison requires runtime support
                 // For now, always return true
                 return Ok(self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 ));
             }
             TypedLiteralPattern::Char(c) => {
                 self.create_value(
                     HirType::I32, // Chars are i32
-                    HirValueKind::Constant(crate::hir::HirConstant::I32(*c as i32))
+                    HirValueKind::Constant(crate::hir::HirConstant::I32(*c as i32)),
                 )
             }
-            TypedLiteralPattern::Byte(b) => {
-                self.create_value(
-                    HirType::I8,
-                    HirValueKind::Constant(crate::hir::HirConstant::I8(*b as i8))
-                )
-            }
+            TypedLiteralPattern::Byte(b) => self.create_value(
+                HirType::I8,
+                HirValueKind::Constant(crate::hir::HirConstant::I8(*b as i8)),
+            ),
             TypedLiteralPattern::ByteString(_bs) => {
                 // TODO: ByteString comparison requires runtime support
                 // For now, always return true
                 return Ok(self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 ));
             }
             TypedLiteralPattern::Unit => {
                 // Unit always matches
                 return Ok(self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 ));
             }
             TypedLiteralPattern::Null => {
                 // Null always matches null values
                 return Ok(self.create_value(
                     HirType::Bool,
-                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
                 ));
             }
         };
@@ -4893,7 +5574,9 @@ impl SsaBuilder {
     fn translate_tuple_pattern_test(
         &mut self,
         block_id: HirId,
-        element_patterns: &[zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedPattern>],
+        element_patterns: &[zyntax_typed_ast::TypedNode<
+            zyntax_typed_ast::typed_ast::TypedPattern,
+        >],
         scrutinee_val: HirId,
         scrutinee_ty: &Type,
     ) -> CompilerResult<HirId> {
@@ -4902,22 +5585,30 @@ impl SsaBuilder {
         // Extract tuple element types
         let element_types = match scrutinee_ty {
             FrontendType::Tuple(types) => types,
-            _ => return Err(crate::CompilerError::Analysis(
-                format!("Expected tuple type for tuple pattern, got {:?}", scrutinee_ty)
-            )),
+            _ => {
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Expected tuple type for tuple pattern, got {:?}",
+                    scrutinee_ty
+                )))
+            }
         };
 
         if element_patterns.len() != element_types.len() {
-            return Err(crate::CompilerError::Analysis(
-                format!("Tuple pattern has {} elements but type has {}",
-                    element_patterns.len(), element_types.len())
-            ));
+            return Err(crate::CompilerError::Analysis(format!(
+                "Tuple pattern has {} elements but type has {}",
+                element_patterns.len(),
+                element_types.len()
+            )));
         }
 
         // Test each element
         let mut result = None;
 
-        for (idx, (pattern, elem_ty)) in element_patterns.iter().zip(element_types.iter()).enumerate() {
+        for (idx, (pattern, elem_ty)) in element_patterns
+            .iter()
+            .zip(element_types.iter())
+            .enumerate()
+        {
             // Extract element from tuple
             let elem_val = self.create_value(self.convert_type(elem_ty), HirValueKind::Instruction);
             let extract_inst = HirInstruction::ExtractValue {
@@ -4954,9 +5645,11 @@ impl SsaBuilder {
             });
         }
 
-        result.ok_or_else(|| crate::CompilerError::Analysis(
-            "Tuple pattern must have at least one element".to_string()
-        ))
+        result.ok_or_else(|| {
+            crate::CompilerError::Analysis(
+                "Tuple pattern must have at least one element".to_string(),
+            )
+        })
     }
 
     /// Test struct pattern match
@@ -4977,7 +5670,7 @@ impl SsaBuilder {
         if field_patterns.is_empty() {
             let true_val = self.create_value(
                 HirType::Bool,
-                HirValueKind::Constant(crate::hir::HirConstant::Bool(true))
+                HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
             );
             return Ok(true_val);
         }
@@ -4987,9 +5680,12 @@ impl SsaBuilder {
             FrontendType::Struct { .. } | FrontendType::Named { .. } => {
                 // Valid struct types
             }
-            _ => return Err(crate::CompilerError::Analysis(
-                format!("Expected struct type for struct pattern, got {:?}", scrutinee_ty)
-            )),
+            _ => {
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Expected struct type for struct pattern, got {:?}",
+                    scrutinee_ty
+                )))
+            }
         };
 
         // Test each field pattern
@@ -5018,7 +5714,7 @@ impl SsaBuilder {
                 block_id,
                 &field_pattern.pattern,
                 field_val,
-                &field_pattern.pattern.ty
+                &field_pattern.pattern.ty,
             )?;
 
             // AND with previous results
@@ -5042,9 +5738,11 @@ impl SsaBuilder {
             });
         }
 
-        result.ok_or_else(|| crate::CompilerError::Analysis(
-            "Struct pattern must have at least one field".to_string()
-        ))
+        result.ok_or_else(|| {
+            crate::CompilerError::Analysis(
+                "Struct pattern must have at least one field".to_string(),
+            )
+        })
     }
 
     /// Test enum pattern match
@@ -5064,11 +5762,12 @@ impl SsaBuilder {
 
         // Check if the scrutinee is actually an enum/named type that supports enum patterns
         // If the scrutinee is a primitive type, enum pattern matching always fails
-        let is_enum_type = matches!(scrutinee_ty,
-            FrontendType::Named { .. } |
-            FrontendType::Union(_) |
-            FrontendType::Optional(_) |
-            FrontendType::Result { .. }
+        let is_enum_type = matches!(
+            scrutinee_ty,
+            FrontendType::Named { .. }
+                | FrontendType::Union(_)
+                | FrontendType::Optional(_)
+                | FrontendType::Result { .. }
         );
 
         if !is_enum_type {
@@ -5076,7 +5775,7 @@ impl SsaBuilder {
             // Return a constant false value
             let false_val = self.create_value(
                 HirType::Bool,
-                HirValueKind::Constant(crate::hir::HirConstant::Bool(false))
+                HirValueKind::Constant(crate::hir::HirConstant::Bool(false)),
             );
             return Ok(false_val);
         }
@@ -5103,7 +5802,7 @@ impl SsaBuilder {
 
         let expected_val = self.create_value(
             HirType::U32,
-            HirValueKind::Constant(crate::hir::HirConstant::U32(expected_discriminant))
+            HirValueKind::Constant(crate::hir::HirConstant::U32(expected_discriminant)),
         );
 
         // Step 3: Compare tag with expected discriminant
@@ -5159,12 +5858,8 @@ impl SsaBuilder {
             self.add_use(payload_val, field_val);
 
             // Test pattern against field
-            let field_test = self.translate_pattern_test(
-                block_id,
-                field_pattern,
-                field_val,
-                &field_pattern.ty
-            )?;
+            let field_test =
+                self.translate_pattern_test(block_id, field_pattern, field_val, &field_pattern.ty)?;
 
             // AND with previous field results
             field_result = Some(if let Some(prev_result) = field_result {
@@ -5236,10 +5931,13 @@ impl SsaBuilder {
 
         // Build function signature from lambda type
         let (param_types, return_type) = match closure_ty {
-            Type::Function { params, return_type, .. } => {
-                let hir_params: Vec<HirType> = params.iter()
-                    .map(|p| self.convert_type(&p.ty))
-                    .collect();
+            Type::Function {
+                params,
+                return_type,
+                ..
+            } => {
+                let hir_params: Vec<HirType> =
+                    params.iter().map(|p| self.convert_type(&p.ty)).collect();
                 let hir_return = self.convert_type(return_type);
                 (hir_params, hir_return)
             }
@@ -5254,22 +5952,32 @@ impl SsaBuilder {
         let lambda_name = {
             let mut arena = self.arena.lock().unwrap();
             // Use Debug format since HirId inner field is private
-            arena.intern_string(&format!("__lambda_{:?}", lambda_func_id).replace("-", "").chars().take(20).collect::<String>())
+            arena.intern_string(
+                &format!("__lambda_{:?}", lambda_func_id)
+                    .replace("-", "")
+                    .chars()
+                    .take(20)
+                    .collect::<String>(),
+            )
         };
 
         // Create HIR params for signature
-        let hir_params: Vec<crate::hir::HirParam> = param_types.iter().enumerate().map(|(idx, ty)| {
-            let param_name = {
-                let mut arena = self.arena.lock().unwrap();
-                arena.intern_string(&format!("arg{}", idx))
-            };
-            crate::hir::HirParam {
-                id: HirId::new(),
-                name: param_name,
-                ty: ty.clone(),
-                attributes: crate::hir::ParamAttributes::default(),
-            }
-        }).collect();
+        let hir_params: Vec<crate::hir::HirParam> = param_types
+            .iter()
+            .enumerate()
+            .map(|(idx, ty)| {
+                let param_name = {
+                    let mut arena = self.arena.lock().unwrap();
+                    arena.intern_string(&format!("arg{}", idx))
+                };
+                crate::hir::HirParam {
+                    id: HirId::new(),
+                    name: param_name,
+                    ty: ty.clone(),
+                    attributes: crate::hir::ParamAttributes::default(),
+                }
+            })
+            .collect();
 
         // Create the lambda function signature
         let signature = crate::hir::HirFunctionSignature {
@@ -5298,9 +6006,8 @@ impl SsaBuilder {
         };
 
         // Create parameter values
-        let param_values: Vec<(HirId, HirType)> = hir_params.iter()
-            .map(|p| (p.id, p.ty.clone()))
-            .collect();
+        let param_values: Vec<(HirId, HirType)> =
+            hir_params.iter().map(|p| (p.id, p.ty.clone())).collect();
 
         // Create the lambda HirFunction
         let mut lambda_func = HirFunction {
@@ -5320,37 +6027,47 @@ impl SsaBuilder {
 
         // Add parameter values to function
         for (idx, (param_id, param_ty)) in param_values.iter().enumerate() {
-            lambda_func.values.insert(*param_id, crate::hir::HirValue {
-                id: *param_id,
-                ty: param_ty.clone(),
-                kind: crate::hir::HirValueKind::Parameter(idx as u32),
-                uses: HashSet::new(),
-                span: None,
-            });
+            lambda_func.values.insert(
+                *param_id,
+                crate::hir::HirValue {
+                    id: *param_id,
+                    ty: param_ty.clone(),
+                    kind: crate::hir::HirValueKind::Parameter(idx as u32),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
         }
 
         // Collect outer scope variables for capture support
         // Get all variables defined in the current block that can be captured
-        let outer_captures: IndexMap<InternedString, HirId> = self.definitions
-            .get(&block_id)
-            .cloned()
-            .unwrap_or_default();
+        let outer_captures: IndexMap<InternedString, HirId> =
+            self.definitions.get(&block_id).cloned().unwrap_or_default();
 
         // Translate lambda body
         let result_val = match &lambda.body {
-            TypedLambdaBody::Expression(expr) => {
-                self.translate_lambda_expr(&mut lambda_func, &mut entry_block, &param_values, &lambda.params, &outer_captures, expr, &return_type)?
-            }
+            TypedLambdaBody::Expression(expr) => self.translate_lambda_expr(
+                &mut lambda_func,
+                &mut entry_block,
+                &param_values,
+                &lambda.params,
+                &outer_captures,
+                expr,
+                &return_type,
+            )?,
             TypedLambdaBody::Block(_block) => {
                 // Block body - for now, just return 0
                 let val_id = HirId::new();
-                lambda_func.values.insert(val_id, crate::hir::HirValue {
-                    id: val_id,
-                    ty: return_type.clone(),
-                    kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
-                    uses: HashSet::new(),
-                    span: None,
-                });
+                lambda_func.values.insert(
+                    val_id,
+                    crate::hir::HirValue {
+                        id: val_id,
+                        ty: return_type.clone(),
+                        kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
                 val_id
             }
         };
@@ -5412,13 +6129,16 @@ impl SsaBuilder {
             TypedExpression::Literal(lit) => {
                 let constant = self.translate_literal(lit);
                 let val_id = HirId::new();
-                func.values.insert(val_id, crate::hir::HirValue {
-                    id: val_id,
-                    ty: result_ty.clone(),
-                    kind: crate::hir::HirValueKind::Constant(constant),
-                    uses: HashSet::new(),
-                    span: None,
-                });
+                func.values.insert(
+                    val_id,
+                    crate::hir::HirValue {
+                        id: val_id,
+                        ty: result_ty.clone(),
+                        kind: crate::hir::HirValueKind::Constant(constant),
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
                 Ok(val_id)
             }
             TypedExpression::Variable(name) => {
@@ -5437,42 +6157,67 @@ impl SsaBuilder {
                     if let Some(outer_value) = self.function.values.get(&outer_val_id) {
                         // Clone the captured value into the lambda function
                         let val_id = HirId::new();
-                        func.values.insert(val_id, crate::hir::HirValue {
-                            id: val_id,
-                            ty: outer_value.ty.clone(),
-                            kind: outer_value.kind.clone(),
-                            uses: HashSet::new(),
-                            span: None,
-                        });
+                        func.values.insert(
+                            val_id,
+                            crate::hir::HirValue {
+                                id: val_id,
+                                ty: outer_value.ty.clone(),
+                                kind: outer_value.kind.clone(),
+                                uses: HashSet::new(),
+                                span: None,
+                            },
+                        );
                         return Ok(val_id);
                     }
                 }
 
                 // Not found - return undef
                 let val_id = HirId::new();
-                func.values.insert(val_id, crate::hir::HirValue {
-                    id: val_id,
-                    ty: result_ty.clone(),
-                    kind: crate::hir::HirValueKind::Undef,
-                    uses: HashSet::new(),
-                    span: None,
-                });
+                func.values.insert(
+                    val_id,
+                    crate::hir::HirValue {
+                        id: val_id,
+                        ty: result_ty.clone(),
+                        kind: crate::hir::HirValueKind::Undef,
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
                 Ok(val_id)
             }
             TypedExpression::Binary(bin) => {
                 // Translate binary expression
-                let left_id = self.translate_lambda_expr(func, block, param_values, lambda_params, outer_captures, &bin.left, result_ty)?;
-                let right_id = self.translate_lambda_expr(func, block, param_values, lambda_params, outer_captures, &bin.right, result_ty)?;
+                let left_id = self.translate_lambda_expr(
+                    func,
+                    block,
+                    param_values,
+                    lambda_params,
+                    outer_captures,
+                    &bin.left,
+                    result_ty,
+                )?;
+                let right_id = self.translate_lambda_expr(
+                    func,
+                    block,
+                    param_values,
+                    lambda_params,
+                    outer_captures,
+                    &bin.right,
+                    result_ty,
+                )?;
 
                 let hir_op = self.convert_binary_op(&bin.op);
                 let result_id = HirId::new();
-                func.values.insert(result_id, crate::hir::HirValue {
-                    id: result_id,
-                    ty: result_ty.clone(),
-                    kind: crate::hir::HirValueKind::Instruction,
-                    uses: HashSet::new(),
-                    span: None,
-                });
+                func.values.insert(
+                    result_id,
+                    crate::hir::HirValue {
+                        id: result_id,
+                        ty: result_ty.clone(),
+                        kind: crate::hir::HirValueKind::Instruction,
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
 
                 let binary_inst = HirInstruction::Binary {
                     op: hir_op,
@@ -5488,13 +6233,16 @@ impl SsaBuilder {
             _ => {
                 // Fallback - return constant 0
                 let val_id = HirId::new();
-                func.values.insert(val_id, crate::hir::HirValue {
-                    id: val_id,
-                    ty: result_ty.clone(),
-                    kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
-                    uses: HashSet::new(),
-                    span: None,
-                });
+                func.values.insert(
+                    val_id,
+                    crate::hir::HirValue {
+                        id: val_id,
+                        ty: result_ty.clone(),
+                        kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
                 Ok(val_id)
             }
         }
@@ -5535,7 +6283,7 @@ impl SsaBuilder {
         // Step 2: Allocate environment struct
         let env_ptr_result = self.create_value(
             HirType::Ptr(Box::new(env_struct_ty.clone())),
-            HirValueKind::Instruction
+            HirValueKind::Instruction,
         );
 
         let alloca_inst = HirInstruction::Alloca {
@@ -5586,36 +6334,41 @@ impl SsaForm {
     pub fn verify(&self) -> CompilerResult<()> {
         // Each value should be defined exactly once
         let mut defined_values = HashSet::new();
-        
+
         for (_, block) in &self.function.blocks {
             // Check phis
             for phi in &block.phis {
                 if !defined_values.insert(phi.result) {
-                    return Err(crate::CompilerError::Analysis(
-                        format!("Value {:?} defined multiple times", phi.result)
-                    ));
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "Value {:?} defined multiple times",
+                        phi.result
+                    )));
                 }
             }
-            
+
             // Check instructions
             for inst in &block.instructions {
                 if let Some(result) = inst.get_result() {
                     if !defined_values.insert(result) {
-                        return Err(crate::CompilerError::Analysis(
-                            format!("Value {:?} defined multiple times", result)
-                        ));
+                        return Err(crate::CompilerError::Analysis(format!(
+                            "Value {:?} defined multiple times",
+                            result
+                        )));
                     }
                 }
             }
         }
-        
+
         // Each use should have a definition (or be a constant/parameter)
         for (use_id, def_id) in &self.use_def_chains {
             if !defined_values.contains(def_id) {
                 // Check if it's a constant or parameter (self-defining values)
                 if let Some(value) = self.function.values.get(def_id) {
                     match value.kind {
-                        HirValueKind::Constant(_) | HirValueKind::Parameter(_) | HirValueKind::Undef | HirValueKind::Global(_) => {
+                        HirValueKind::Constant(_)
+                        | HirValueKind::Parameter(_)
+                        | HirValueKind::Undef
+                        | HirValueKind::Global(_) => {
                             // These are self-defining, so it's OK
                             continue;
                         }
@@ -5623,15 +6376,16 @@ impl SsaForm {
                     }
                 }
 
-                return Err(crate::CompilerError::Analysis(
-                    format!("Use {:?} has undefined definition {:?}", use_id, def_id)
-                ));
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Use {:?} has undefined definition {:?}",
+                    use_id, def_id
+                )));
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Optimize trivial phis
     ///
     /// A trivial phi has only one unique non-self incoming value, meaning all
@@ -5642,7 +6396,10 @@ impl SsaForm {
         let mut replacements: IndexMap<HirId, HirId> = IndexMap::new();
 
         // Collect all phi results to identify self-referential chains
-        let all_phi_results: HashSet<HirId> = self.function.blocks.values()
+        let all_phi_results: HashSet<HirId> = self
+            .function
+            .blocks
+            .values()
             .flat_map(|b| b.phis.iter().map(|p| p.result))
             .collect();
 
@@ -5650,7 +6407,9 @@ impl SsaForm {
             for phi in &block.phis {
                 // Check if phi is trivial: all non-self values must be the same
                 // A phi referencing itself or other phis doesn't make it trivial
-                let non_self_values: HashSet<_> = phi.incoming.iter()
+                let non_self_values: HashSet<_> = phi
+                    .incoming
+                    .iter()
                     .map(|(val, _)| *val)
                     .filter(|&v| v != phi.result)
                     .collect();
@@ -5697,7 +6456,9 @@ impl SsaForm {
 
         // Third pass: remove trivial phis
         for (_, block) in &mut self.function.blocks {
-            block.phis.retain(|phi| !replacements.contains_key(&phi.result));
+            block
+                .phis
+                .retain(|phi| !replacements.contains_key(&phi.result));
         }
     }
 }
@@ -5706,44 +6467,44 @@ impl HirInstruction {
     /// Get the result value of this instruction if any
     fn get_result(&self) -> Option<HirId> {
         match self {
-            HirInstruction::Binary { result, .. } |
-            HirInstruction::Unary { result, .. } |
-            HirInstruction::Alloca { result, .. } |
-            HirInstruction::Load { result, .. } |
-            HirInstruction::GetElementPtr { result, .. } |
-            HirInstruction::Cast { result, .. } |
-            HirInstruction::Select { result, .. } |
-            HirInstruction::ExtractValue { result, .. } |
-            HirInstruction::InsertValue { result, .. } |
-            HirInstruction::Atomic { result, .. } |
-            HirInstruction::CreateUnion { result, .. } |
-            HirInstruction::GetUnionDiscriminant { result, .. } |
-            HirInstruction::ExtractUnionValue { result, .. } |
-            HirInstruction::CreateClosure { result, .. } |
-            HirInstruction::CreateTraitObject { result, .. } |
-            HirInstruction::UpcastTraitObject { result, .. } => Some(*result),
+            HirInstruction::Binary { result, .. }
+            | HirInstruction::Unary { result, .. }
+            | HirInstruction::Alloca { result, .. }
+            | HirInstruction::Load { result, .. }
+            | HirInstruction::GetElementPtr { result, .. }
+            | HirInstruction::Cast { result, .. }
+            | HirInstruction::Select { result, .. }
+            | HirInstruction::ExtractValue { result, .. }
+            | HirInstruction::InsertValue { result, .. }
+            | HirInstruction::Atomic { result, .. }
+            | HirInstruction::CreateUnion { result, .. }
+            | HirInstruction::GetUnionDiscriminant { result, .. }
+            | HirInstruction::ExtractUnionValue { result, .. }
+            | HirInstruction::CreateClosure { result, .. }
+            | HirInstruction::CreateTraitObject { result, .. }
+            | HirInstruction::UpcastTraitObject { result, .. } => Some(*result),
 
-            HirInstruction::Call { result, .. } |
-            HirInstruction::IndirectCall { result, .. } |
-            HirInstruction::CallClosure { result, .. } |
-            HirInstruction::TraitMethodCall { result, .. } => *result,
-            
-            HirInstruction::CreateRef { result, .. } |
-            HirInstruction::Deref { result, .. } |
-            HirInstruction::Move { result, .. } |
-            HirInstruction::Copy { result, .. } => Some(*result),
-            
-            HirInstruction::Store { .. } |
-            HirInstruction::Fence { .. } |
-            HirInstruction::BeginLifetime { .. } |
-            HirInstruction::EndLifetime { .. } |
-            HirInstruction::LifetimeConstraint { .. } |
-            HirInstruction::Resume { .. } |
-            HirInstruction::AbortEffect { .. } => None,
+            HirInstruction::Call { result, .. }
+            | HirInstruction::IndirectCall { result, .. }
+            | HirInstruction::CallClosure { result, .. }
+            | HirInstruction::TraitMethodCall { result, .. } => *result,
+
+            HirInstruction::CreateRef { result, .. }
+            | HirInstruction::Deref { result, .. }
+            | HirInstruction::Move { result, .. }
+            | HirInstruction::Copy { result, .. } => Some(*result),
+
+            HirInstruction::Store { .. }
+            | HirInstruction::Fence { .. }
+            | HirInstruction::BeginLifetime { .. }
+            | HirInstruction::EndLifetime { .. }
+            | HirInstruction::LifetimeConstraint { .. }
+            | HirInstruction::Resume { .. }
+            | HirInstruction::AbortEffect { .. } => None,
 
             // Effect instructions with optional result
-            HirInstruction::PerformEffect { result, .. } |
-            HirInstruction::HandleEffect { result, .. } => *result,
+            HirInstruction::PerformEffect { result, .. }
+            | HirInstruction::HandleEffect { result, .. } => *result,
 
             // CaptureContinuation always has a result
             HirInstruction::CaptureContinuation { result, .. } => Some(*result),

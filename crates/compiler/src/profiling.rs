@@ -3,10 +3,10 @@
 //! Provides execution counters and profiling data for tiered compilation.
 //! Tracks function and block execution frequencies to identify hot code paths.
 
+use crate::hir::HirId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use crate::hir::HirId;
 
 /// Runtime profiling data collector
 #[derive(Clone)]
@@ -40,10 +40,10 @@ pub struct ProfileConfig {
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
-            warm_threshold: 100,      // Warm after 100 executions
-            hot_threshold: 1000,       // Hot after 1000 executions
+            warm_threshold: 100, // Warm after 100 executions
+            hot_threshold: 1000, // Hot after 1000 executions
             enable_block_profiling: false,
-            sample_rate: 1,            // Profile every call
+            sample_rate: 1, // Profile every call
         }
     }
 }
@@ -65,7 +65,7 @@ impl ProfileConfig {
             warm_threshold: 1000,
             hot_threshold: 10000,
             enable_block_profiling: false,
-            sample_rate: 10,  // Sample 1/10 calls for lower overhead
+            sample_rate: 10, // Sample 1/10 calls for lower overhead
         }
     }
 }
@@ -83,7 +83,8 @@ impl ProfileData {
     /// Record a function execution
     pub fn record_function_call(&self, func_id: HirId) {
         let mut counts = self.function_counts.write().unwrap();
-        let counter = counts.entry(func_id)
+        let counter = counts
+            .entry(func_id)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -95,7 +96,8 @@ impl ProfileData {
         }
 
         let mut counts = self.block_counts.write().unwrap();
-        let counter = counts.entry((func_id, block_id))
+        let counter = counts
+            .entry((func_id, block_id))
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -103,7 +105,8 @@ impl ProfileData {
     /// Get execution count for a function
     pub fn get_function_count(&self, func_id: HirId) -> u64 {
         let counts = self.function_counts.read().unwrap();
-        counts.get(&func_id)
+        counts
+            .get(&func_id)
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
@@ -111,7 +114,8 @@ impl ProfileData {
     /// Get execution count for a basic block
     pub fn get_block_count(&self, func_id: HirId, block_id: HirId) -> u64 {
         let counts = self.block_counts.read().unwrap();
-        counts.get(&(func_id, block_id))
+        counts
+            .get(&(func_id, block_id))
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
@@ -143,7 +147,8 @@ impl ProfileData {
     /// Get all hot functions (sorted by execution count, descending)
     pub fn get_hot_functions(&self) -> Vec<(HirId, u64)> {
         let counts = self.function_counts.read().unwrap();
-        let mut hot_funcs: Vec<_> = counts.iter()
+        let mut hot_funcs: Vec<_> = counts
+            .iter()
             .map(|(id, counter)| (*id, counter.load(Ordering::Relaxed)))
             .filter(|(_, count)| *count >= self.config.hot_threshold)
             .collect();
@@ -155,7 +160,8 @@ impl ProfileData {
     /// Get all warm functions
     pub fn get_warm_functions(&self) -> Vec<(HirId, u64)> {
         let counts = self.function_counts.read().unwrap();
-        let mut warm_funcs: Vec<_> = counts.iter()
+        let mut warm_funcs: Vec<_> = counts
+            .iter()
             .map(|(id, counter)| (*id, counter.load(Ordering::Relaxed)))
             .filter(|(_, count)| {
                 *count >= self.config.warm_threshold && *count < self.config.hot_threshold
@@ -178,7 +184,8 @@ impl ProfileData {
     /// Get a function's counter reference for direct instrumentation
     pub fn get_or_create_function_counter(&self, func_id: HirId) -> Arc<AtomicU64> {
         let mut counts = self.function_counts.write().unwrap();
-        counts.entry(func_id)
+        counts
+            .entry(func_id)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()
     }
@@ -188,10 +195,12 @@ impl ProfileData {
         let func_counts = self.function_counts.read().unwrap();
 
         let total_functions = func_counts.len();
-        let hot_count = func_counts.values()
+        let hot_count = func_counts
+            .values()
             .filter(|c| c.load(Ordering::Relaxed) >= self.config.hot_threshold)
             .count();
-        let warm_count = func_counts.values()
+        let warm_count = func_counts
+            .values()
             .filter(|c| {
                 let count = c.load(Ordering::Relaxed);
                 count >= self.config.warm_threshold && count < self.config.hot_threshold
@@ -199,7 +208,8 @@ impl ProfileData {
             .count();
         let cold_count = total_functions - hot_count - warm_count;
 
-        let total_executions: u64 = func_counts.values()
+        let total_executions: u64 = func_counts
+            .values()
             .map(|c| c.load(Ordering::Relaxed))
             .sum();
 
@@ -216,9 +226,9 @@ impl ProfileData {
 /// Hotness level classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HotnessLevel {
-    Cold,   // Below warm threshold
-    Warm,   // Between warm and hot thresholds
-    Hot,    // Above hot threshold
+    Cold, // Below warm threshold
+    Warm, // Between warm and hot thresholds
+    Hot,  // Above hot threshold
 }
 
 /// Profiling statistics summary
@@ -338,8 +348,8 @@ mod tests {
 
         let stats = profile.get_statistics();
         assert_eq!(stats.total_functions, 2);
-        assert_eq!(stats.cold_functions, 1);  // func1 is cold (< 100)
-        assert_eq!(stats.warm_functions, 1);  // func2 is warm (>= 100, < 1000)
+        assert_eq!(stats.cold_functions, 1); // func1 is cold (< 100)
+        assert_eq!(stats.warm_functions, 1); // func2 is warm (>= 100, < 1000)
         assert_eq!(stats.hot_functions, 0);
         assert_eq!(stats.total_executions, 550);
     }

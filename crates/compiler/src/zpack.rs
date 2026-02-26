@@ -74,14 +74,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use zip::read::ZipArchive;
 use zip::write::{FileOptions, SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
 
-use crate::zrtl::{ZrtlPlugin, ZrtlError};
 use crate::bytecode::{deserialize_module, serialize_module, Format};
+use crate::zrtl::{ZrtlError, ZrtlPlugin};
 use crate::HirModule;
 
 /// File extension for ZPack archives
@@ -221,16 +221,15 @@ impl ZPack {
     /// Load a ZPack from a file path
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ZPackError> {
         let path = path.as_ref();
-        let file = std::fs::File::open(path)
-            .map_err(|e| ZPackError::IoError(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         Self::load_from_reader(file)
     }
 
     /// Load a ZPack from any reader
     pub fn load_from_reader<R: Read + Seek>(reader: R) -> Result<Self, ZPackError> {
-        let mut archive = ZipArchive::new(reader)
-            .map_err(|e| ZPackError::InvalidArchive(e.to_string()))?;
+        let mut archive =
+            ZipArchive::new(reader).map_err(|e| ZPackError::InvalidArchive(e.to_string()))?;
 
         // Read manifest
         let manifest = Self::read_manifest(&mut archive)?;
@@ -250,16 +249,19 @@ impl ZPack {
     }
 
     /// Read manifest.json from archive
-    fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<ZPackManifest, ZPackError> {
-        let mut manifest_file = archive.by_name("manifest.json")
+    fn read_manifest<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+    ) -> Result<ZPackManifest, ZPackError> {
+        let mut manifest_file = archive
+            .by_name("manifest.json")
             .map_err(|_| ZPackError::MissingManifest)?;
 
         let mut manifest_json = String::new();
-        manifest_file.read_to_string(&mut manifest_json)
+        manifest_file
+            .read_to_string(&mut manifest_json)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        serde_json::from_str(&manifest_json)
-            .map_err(|e| ZPackError::InvalidManifest(e.to_string()))
+        serde_json::from_str(&manifest_json).map_err(|e| ZPackError::InvalidManifest(e.to_string()))
     }
 
     /// Read all bytecode modules from archive
@@ -270,7 +272,8 @@ impl ZPack {
         let extension = format!(".{}", BYTECODE_EXTENSION);
 
         for i in 0..archive.len() {
-            let mut file = archive.by_index(i)
+            let mut file = archive
+                .by_index(i)
                 .map_err(|e| ZPackError::InvalidArchive(e.to_string()))?;
 
             let name = file.name().to_string();
@@ -310,7 +313,8 @@ impl ZPack {
 
         // Try to find runtime for current platform
         let has_runtime = (0..archive.len()).any(|i| {
-            archive.by_index(i)
+            archive
+                .by_index(i)
                 .map(|f| f.name().starts_with(&format!("lib/{}/", target_triple)))
                 .unwrap_or(false)
         });
@@ -321,23 +325,20 @@ impl ZPack {
             let alt_path = format!("lib/{}/runtime.zrtl", simplified);
 
             let has_alt = (0..archive.len()).any(|i| {
-                archive.by_index(i)
+                archive
+                    .by_index(i)
                     .map(|f| f.name() == alt_path)
                     .unwrap_or(false)
             });
 
             if !has_alt {
-                log::warn!(
-                    "No runtime found for target '{}' in zpack",
-                    target_triple
-                );
+                log::warn!("No runtime found for target '{}' in zpack", target_triple);
                 return Ok((None, None));
             }
         }
 
         // Extract to temp directory
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| ZPackError::IoError(e.to_string()))?;
+        let temp_dir = tempfile::tempdir().map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         let zrtl_path = temp_dir.path().join("runtime.zrtl");
 
@@ -349,15 +350,16 @@ impl ZPack {
         };
 
         // Read and write the file
-        let mut runtime_file = archive.by_name(&actual_path)
+        let mut runtime_file = archive
+            .by_name(&actual_path)
             .map_err(|e| ZPackError::InvalidArchive(e.to_string()))?;
 
         let mut buffer = Vec::new();
-        runtime_file.read_to_end(&mut buffer)
+        runtime_file
+            .read_to_end(&mut buffer)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        std::fs::write(&zrtl_path, &buffer)
-            .map_err(|e| ZPackError::IoError(e.to_string()))?;
+        std::fs::write(&zrtl_path, &buffer).map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         // Make executable on Unix
         #[cfg(unix)]
@@ -372,8 +374,8 @@ impl ZPack {
         }
 
         // Load the plugin
-        let plugin = ZrtlPlugin::load(&zrtl_path)
-            .map_err(|e| ZPackError::RuntimeError(e.to_string()))?;
+        let plugin =
+            ZrtlPlugin::load(&zrtl_path).map_err(|e| ZPackError::RuntimeError(e.to_string()))?;
 
         log::info!(
             "Loaded runtime '{}' for target '{}'",
@@ -440,17 +442,19 @@ impl<W: Write + Seek> ZPackWriter<W> {
     pub fn add_module(&mut self, path: &str, hir_module: &HirModule) -> Result<(), ZPackError> {
         let file_path = format!("modules/{}.{}", path, BYTECODE_EXTENSION);
 
-        let options: SimpleFileOptions = FileOptions::default()
-            .compression_method(DEFAULT_COMPRESSION);
+        let options: SimpleFileOptions =
+            FileOptions::default().compression_method(DEFAULT_COMPRESSION);
 
-        self.writer.start_file(&file_path, options)
+        self.writer
+            .start_file(&file_path, options)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         // Serialize HirModule to bytecode
         let data = serialize_module(hir_module, Format::Postcard)
             .map_err(|e| ZPackError::BytecodeError(e.to_string()))?;
 
-        self.writer.write_all(&data)
+        self.writer
+            .write_all(&data)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         // Track module in manifest
@@ -465,13 +469,15 @@ impl<W: Write + Seek> ZPackWriter<W> {
     pub fn add_module_bytes(&mut self, path: &str, data: &[u8]) -> Result<(), ZPackError> {
         let file_path = format!("modules/{}.{}", path, BYTECODE_EXTENSION);
 
-        let options: SimpleFileOptions = FileOptions::default()
-            .compression_method(DEFAULT_COMPRESSION);
+        let options: SimpleFileOptions =
+            FileOptions::default().compression_method(DEFAULT_COMPRESSION);
 
-        self.writer.start_file(&file_path, options)
+        self.writer
+            .start_file(&file_path, options)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        self.writer.write_all(data)
+        self.writer
+            .write_all(data)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         // Track module in manifest
@@ -486,16 +492,17 @@ impl<W: Write + Seek> ZPackWriter<W> {
     pub fn add_runtime<P: AsRef<Path>>(&mut self, target: &str, path: P) -> Result<(), ZPackError> {
         let file_path = format!("lib/{}/runtime.zrtl", target);
 
-        let options: SimpleFileOptions = FileOptions::default()
-            .compression_method(BINARY_COMPRESSION); // Don't compress binaries
+        let options: SimpleFileOptions =
+            FileOptions::default().compression_method(BINARY_COMPRESSION); // Don't compress binaries
 
-        self.writer.start_file(&file_path, options)
+        self.writer
+            .start_file(&file_path, options)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        let data = std::fs::read(path.as_ref())
-            .map_err(|e| ZPackError::IoError(e.to_string()))?;
+        let data = std::fs::read(path.as_ref()).map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        self.writer.write_all(&data)
+        self.writer
+            .write_all(&data)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         // Track supported target
@@ -510,13 +517,15 @@ impl<W: Write + Seek> ZPackWriter<W> {
     pub fn add_runtime_bytes(&mut self, target: &str, data: &[u8]) -> Result<(), ZPackError> {
         let file_path = format!("lib/{}/runtime.zrtl", target);
 
-        let options: SimpleFileOptions = FileOptions::default()
-            .compression_method(BINARY_COMPRESSION);
+        let options: SimpleFileOptions =
+            FileOptions::default().compression_method(BINARY_COMPRESSION);
 
-        self.writer.start_file(&file_path, options)
+        self.writer
+            .start_file(&file_path, options)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        self.writer.write_all(data)
+        self.writer
+            .write_all(data)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
         if !self.manifest.targets.contains(&target.to_string()) {
@@ -541,16 +550,19 @@ impl<W: Write + Seek> ZPackWriter<W> {
         let manifest_json = serde_json::to_string_pretty(&self.manifest)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        let options: SimpleFileOptions = FileOptions::default()
-            .compression_method(DEFAULT_COMPRESSION);
+        let options: SimpleFileOptions =
+            FileOptions::default().compression_method(DEFAULT_COMPRESSION);
 
-        self.writer.start_file("manifest.json", options)
+        self.writer
+            .start_file("manifest.json", options)
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        self.writer.write_all(manifest_json.as_bytes())
+        self.writer
+            .write_all(manifest_json.as_bytes())
             .map_err(|e| ZPackError::IoError(e.to_string()))?;
 
-        self.writer.finish()
+        self.writer
+            .finish()
             .map_err(|e| ZPackError::IoError(e.to_string()))
     }
 }
@@ -602,25 +614,39 @@ impl From<ZrtlError> for ZPackError {
 pub fn get_current_target_triple() -> &'static str {
     // Use build-time target or runtime detection
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    { "x86_64-apple-darwin" }
+    {
+        "x86_64-apple-darwin"
+    }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    { "aarch64-apple-darwin" }
+    {
+        "aarch64-apple-darwin"
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
-    { "x86_64-unknown-linux-gnu" }
+    {
+        "x86_64-unknown-linux-gnu"
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "musl"))]
-    { "x86_64-unknown-linux-musl" }
+    {
+        "x86_64-unknown-linux-musl"
+    }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    { "aarch64-unknown-linux-gnu" }
+    {
+        "aarch64-unknown-linux-gnu"
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"))]
-    { "x86_64-pc-windows-msvc" }
+    {
+        "x86_64-pc-windows-msvc"
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"))]
-    { "x86_64-pc-windows-gnu" }
+    {
+        "x86_64-pc-windows-gnu"
+    }
 
     #[cfg(not(any(
         all(target_arch = "x86_64", target_os = "macos"),
@@ -631,25 +657,37 @@ pub fn get_current_target_triple() -> &'static str {
         all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
         all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"),
     )))]
-    { "unknown-unknown-unknown" }
+    {
+        "unknown-unknown-unknown"
+    }
 }
 
 /// Get a simplified target identifier for common platforms
 fn get_simplified_target() -> &'static str {
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    { "x86_64-apple-darwin" }
+    {
+        "x86_64-apple-darwin"
+    }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    { "aarch64-apple-darwin" }
+    {
+        "aarch64-apple-darwin"
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    { "x86_64-unknown-linux-gnu" }
+    {
+        "x86_64-unknown-linux-gnu"
+    }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    { "aarch64-unknown-linux-gnu" }
+    {
+        "aarch64-unknown-linux-gnu"
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    { "x86_64-pc-windows-msvc" }
+    {
+        "x86_64-pc-windows-msvc"
+    }
 
     #[cfg(not(any(
         all(target_arch = "x86_64", target_os = "macos"),
@@ -658,7 +696,9 @@ fn get_simplified_target() -> &'static str {
         all(target_arch = "aarch64", target_os = "linux"),
         all(target_arch = "x86_64", target_os = "windows"),
     )))]
-    { "unknown" }
+    {
+        "unknown"
+    }
 }
 
 /// Get the dynamic library extension for the current platform

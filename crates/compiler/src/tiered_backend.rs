@@ -31,16 +31,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::{CompilerError, CompilerResult};
-use crate::hir::{HirModule, HirFunction, HirId};
-use crate::profiling::{ProfileData, ProfileConfig};
 use crate::cranelift_backend::CraneliftBackend;
+use crate::hir::{HirFunction, HirId, HirModule};
+use crate::profiling::{ProfileConfig, ProfileData};
+use crate::{CompilerError, CompilerResult};
 
 /// Runtime symbol entry for FFI
 #[derive(Clone)]
 struct RuntimeSymbol {
     name: String,
-    ptr: usize,  // Store as usize for thread safety
+    ptr: usize, // Store as usize for thread safety
 }
 
 #[cfg(feature = "llvm-backend")]
@@ -95,17 +95,17 @@ pub struct TieredBackend {
 /// Optimization tier level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptimizationTier {
-    Baseline,   // Tier 0: Fast compilation, minimal optimization
-    Standard,   // Tier 1: Moderate optimization
-    Optimized,  // Tier 2: Aggressive optimization
+    Baseline,  // Tier 0: Fast compilation, minimal optimization
+    Standard,  // Tier 1: Moderate optimization
+    Optimized, // Tier 2: Aggressive optimization
 }
 
 impl OptimizationTier {
     /// Get Cranelift optimization level for this tier
     pub fn cranelift_opt_level(&self) -> &'static str {
         match self {
-            OptimizationTier::Baseline => "none",      // -O0
-            OptimizationTier::Standard => "speed",      // -O2
+            OptimizationTier::Baseline => "none",            // -O0
+            OptimizationTier::Standard => "speed",           // -O2
             OptimizationTier::Optimized => "speed_and_size", // -O3
         }
     }
@@ -245,8 +245,10 @@ impl TieredBackend {
     /// Compile a HIR module (initially at Tier 0 - Baseline)
     pub fn compile_module(&mut self, module: HirModule) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
-            eprintln!("[TieredBackend] Compiling {} functions at Tier 0 (Baseline)",
-                     module.functions.len());
+            eprintln!(
+                "[TieredBackend] Compiling {} functions at Tier 0 (Baseline)",
+                module.functions.len()
+            );
         }
 
         // Compile everything at baseline (Tier 0)
@@ -255,8 +257,14 @@ impl TieredBackend {
         // Store function pointers and mark all as Baseline tier
         for func_id in module.functions.keys() {
             if let Some(ptr) = self.cranelift.get_function_ptr(*func_id) {
-                self.function_pointers.write().unwrap().insert(*func_id, ptr as usize);
-                self.function_tiers.write().unwrap().insert(*func_id, OptimizationTier::Baseline);
+                self.function_pointers
+                    .write()
+                    .unwrap()
+                    .insert(*func_id, ptr as usize);
+                self.function_tiers
+                    .write()
+                    .unwrap()
+                    .insert(*func_id, OptimizationTier::Baseline);
             }
         }
 
@@ -273,7 +281,9 @@ impl TieredBackend {
 
     /// Get a function pointer
     pub fn get_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
-        self.function_pointers.read().unwrap()
+        self.function_pointers
+            .read()
+            .unwrap()
             .get(&func_id)
             .map(|addr| *addr as *const u8)
     }
@@ -291,7 +301,10 @@ impl TieredBackend {
         // Check if function should be promoted to next tier
         let should_promote = {
             let tiers = self.function_tiers.read().unwrap();
-            let current_tier = tiers.get(&func_id).copied().unwrap_or(OptimizationTier::Baseline);
+            let current_tier = tiers
+                .get(&func_id)
+                .copied()
+                .unwrap_or(OptimizationTier::Baseline);
 
             match current_tier {
                 OptimizationTier::Baseline if self.profile_data.is_warm(func_id) => {
@@ -315,25 +328,38 @@ impl TieredBackend {
         let optimizing = self.optimizing.lock().unwrap();
 
         // Don't enqueue if already optimizing or already in queue at this tier
-        if !optimizing.contains(&func_id) && !queue.iter().any(|(id, tier)| *id == func_id && *tier == target_tier) {
+        if !optimizing.contains(&func_id)
+            && !queue
+                .iter()
+                .any(|(id, tier)| *id == func_id && *tier == target_tier)
+        {
             if self.config.verbosity >= 2 {
                 let count = self.profile_data.get_function_count(func_id);
-                eprintln!("[TieredBackend] Enqueuing {:?} for {:?} (count: {})",
-                         func_id, target_tier, count);
+                eprintln!(
+                    "[TieredBackend] Enqueuing {:?} for {:?} (count: {})",
+                    func_id, target_tier, count
+                );
             }
             queue.push_back((func_id, target_tier));
         }
     }
 
     /// Manually trigger recompilation of a function at a specific tier
-    pub fn optimize_function(&mut self, func_id: HirId, target_tier: OptimizationTier) -> CompilerResult<()> {
+    pub fn optimize_function(
+        &mut self,
+        func_id: HirId,
+        target_tier: OptimizationTier,
+    ) -> CompilerResult<()> {
         // Clone the function to avoid holding the read lock
         let function = {
             let module_lock = self.module.read().unwrap();
-            let module = module_lock.as_ref()
+            let module = module_lock
+                .as_ref()
                 .ok_or_else(|| CompilerError::Backend("No module loaded".into()))?;
 
-            module.functions.get(&func_id)
+            module
+                .functions
+                .get(&func_id)
                 .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?
                 .clone()
         };
@@ -342,11 +368,18 @@ impl TieredBackend {
     }
 
     /// Internal: Recompile a single function at a specific tier
-    fn optimize_function_internal(&mut self, func_id: HirId, function: &HirFunction, target_tier: OptimizationTier) -> CompilerResult<()> {
+    fn optimize_function_internal(
+        &mut self,
+        func_id: HirId,
+        function: &HirFunction,
+        target_tier: OptimizationTier,
+    ) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             let count = self.profile_data.get_function_count(func_id);
-            eprintln!("[TieredBackend] Recompiling {:?} at {:?} (count: {})",
-                     func_id, target_tier, count);
+            eprintln!(
+                "[TieredBackend] Recompiling {:?} at {:?} (count: {})",
+                func_id, target_tier, count
+            );
         }
 
         // Choose backend based on tier and configuration
@@ -360,7 +393,7 @@ impl TieredBackend {
                     llvm.get_function_pointer(func_id)
                 } else {
                     return Err(CompilerError::Backend(
-                        "LLVM JIT backend not initialized".to_string()
+                        "LLVM JIT backend not initialized".to_string(),
                     ));
                 }
             } else {
@@ -383,8 +416,14 @@ impl TieredBackend {
 
         // Atomically swap the function pointer if compilation succeeded
         if let Some(ptr) = new_ptr {
-            self.function_pointers.write().unwrap().insert(func_id, ptr as usize);
-            self.function_tiers.write().unwrap().insert(func_id, target_tier);
+            self.function_pointers
+                .write()
+                .unwrap()
+                .insert(func_id, ptr as usize);
+            self.function_tiers
+                .write()
+                .unwrap()
+                .insert(func_id, target_tier);
 
             if self.config.verbosity >= 1 {
                 let backend_name = if target_tier == OptimizationTier::Optimized {
@@ -399,8 +438,10 @@ impl TieredBackend {
                 } else {
                     "Cranelift"
                 };
-                eprintln!("[TieredBackend] Successfully promoted {:?} to {:?} using {}",
-                         func_id, target_tier, backend_name);
+                eprintln!(
+                    "[TieredBackend] Successfully promoted {:?} to {:?} using {}",
+                    func_id, target_tier, backend_name
+                );
             }
         }
 
@@ -410,7 +451,7 @@ impl TieredBackend {
     /// Start background optimization worker thread
     fn start_background_optimization(&mut self) {
         if self.worker_handle.is_some() {
-            return;  // Already started
+            return; // Already started
         }
 
         let queue = Arc::clone(&self.optimization_queue);
@@ -513,16 +554,21 @@ impl TieredBackend {
     ) -> CompilerResult<()> {
         if config.verbosity >= 1 {
             let count = profile_data.get_function_count(func_id);
-            eprintln!("[TieredBackend] Worker optimizing {:?} at {:?} (count: {})",
-                     func_id, target_tier, count);
+            eprintln!(
+                "[TieredBackend] Worker optimizing {:?} at {:?} (count: {})",
+                func_id, target_tier, count
+            );
         }
 
         // Get module and function
         let module_lock = module.read().unwrap();
-        let hir_module = module_lock.as_ref()
+        let hir_module = module_lock
+            .as_ref()
             .ok_or_else(|| CompilerError::Backend("No module loaded".into()))?;
 
-        let function = hir_module.functions.get(&func_id)
+        let function = hir_module
+            .functions
+            .get(&func_id)
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?;
 
         // Create a new Cranelift backend configured for this tier
@@ -533,12 +579,17 @@ impl TieredBackend {
         // Get the optimized function pointer
         if let Some(new_ptr) = backend.get_function_ptr(func_id) {
             // Atomically swap
-            function_pointers.write().unwrap().insert(func_id, new_ptr as usize);
+            function_pointers
+                .write()
+                .unwrap()
+                .insert(func_id, new_ptr as usize);
             function_tiers.write().unwrap().insert(func_id, target_tier);
 
             if config.verbosity >= 1 {
-                eprintln!("[TieredBackend] Worker successfully promoted {:?} to {:?}",
-                         func_id, target_tier);
+                eprintln!(
+                    "[TieredBackend] Worker successfully promoted {:?} to {:?}",
+                    func_id, target_tier
+                );
             }
         }
 
@@ -550,9 +601,18 @@ impl TieredBackend {
         let profile_stats = self.profile_data.get_statistics();
         let tiers = self.function_tiers.read().unwrap();
 
-        let baseline_count = tiers.values().filter(|&&t| t == OptimizationTier::Baseline).count();
-        let standard_count = tiers.values().filter(|&&t| t == OptimizationTier::Standard).count();
-        let optimized_count = tiers.values().filter(|&&t| t == OptimizationTier::Optimized).count();
+        let baseline_count = tiers
+            .values()
+            .filter(|&&t| t == OptimizationTier::Baseline)
+            .count();
+        let standard_count = tiers
+            .values()
+            .filter(|&&t| t == OptimizationTier::Standard)
+            .count();
+        let optimized_count = tiers
+            .values()
+            .filter(|&&t| t == OptimizationTier::Optimized)
+            .count();
 
         TieredStatistics {
             profile_stats,
@@ -589,7 +649,9 @@ impl TieredBackend {
     ///
     /// Used when creating new Cranelift backends for background optimization.
     fn get_runtime_symbols(&self) -> Vec<(String, *const u8)> {
-        self.runtime_symbols.read().unwrap()
+        self.runtime_symbols
+            .read()
+            .unwrap()
             .iter()
             .map(|s| (s.name.clone(), s.ptr as *const u8))
             .collect()

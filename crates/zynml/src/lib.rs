@@ -48,7 +48,7 @@ use std::path::Path;
 use thiserror::Error;
 
 // Re-export zyntax_embed types for convenience
-pub use zyntax_embed::{LanguageGrammar, ZyntaxRuntime, FromZyntax};
+pub use zyntax_embed::{FromZyntax, LanguageGrammar, ZyntaxRuntime};
 // Re-export Grammar2 for direct TypedAST parsing
 pub use zyntax_embed::{Grammar2, Grammar2Error, Grammar2Result};
 
@@ -93,11 +93,7 @@ pub const REQUIRED_PLUGINS: &[&str] = &[
 ];
 
 /// Optional ZRTL plugins that enhance functionality
-pub const OPTIONAL_PLUGINS: &[&str] = &[
-    "zrtl_image",
-    "zrtl_json",
-    "zrtl_http",
-];
+pub const OPTIONAL_PLUGINS: &[&str] = &["zrtl_image", "zrtl_json", "zrtl_http"];
 
 /// ZynML runtime configuration
 #[derive(Debug, Clone)]
@@ -144,8 +140,7 @@ impl ZynML {
             .map_err(|e| ZynMLError::GrammarError(e.to_string()))?;
 
         // Create the runtime
-        let mut runtime = ZyntaxRuntime::new()
-            .context("Failed to create Zyntax runtime")?;
+        let mut runtime = ZyntaxRuntime::new().context("Failed to create Zyntax runtime")?;
 
         // Register stdlib import resolver
         // This allows `import prelude` and `import tensor` to resolve
@@ -166,12 +161,12 @@ impl ZynML {
                 if config.verbose {
                     log::info!("Loading plugin: {}", plugin_name);
                 }
-                runtime.load_plugin(&plugin_path).map_err(|e| {
-                    ZynMLError::PluginError {
+                runtime
+                    .load_plugin(&plugin_path)
+                    .map_err(|e| ZynMLError::PluginError {
                         plugin: plugin_name.to_string(),
                         reason: e.to_string(),
-                    }
-                })?;
+                    })?;
             } else if config.verbose {
                 log::warn!("Required plugin not found: {}", plugin_path.display());
             }
@@ -236,10 +231,7 @@ impl ZynML {
             Some(g2) => g2
                 .parse(source)
                 .map_err(|e| ZynMLError::ParseError(e.to_string()).into()),
-            None => Err(ZynMLError::GrammarError(
-                "Grammar2 not available".to_string(),
-            )
-            .into()),
+            None => Err(ZynMLError::GrammarError("Grammar2 not available".to_string()).into()),
         }
     }
 
@@ -253,10 +245,7 @@ impl ZynML {
             Some(g2) => g2
                 .parse_with_filename(source, filename)
                 .map_err(|e| ZynMLError::ParseError(e.to_string()).into()),
-            None => Err(ZynMLError::GrammarError(
-                "Grammar2 not available".to_string(),
-            )
-            .into()),
+            None => Err(ZynMLError::GrammarError("Grammar2 not available".to_string()).into()),
         }
     }
 
@@ -310,7 +299,8 @@ impl ZynML {
     /// Run a ZynML program from a file
     pub fn run_file(&mut self, path: &Path) -> Result<()> {
         // Load the file with proper filename tracking for diagnostics
-        let functions = self.runtime
+        let functions = self
+            .runtime
             .load_module_file(path)
             .with_context(|| format!("Failed to load file: {}", path.display()))?;
 
@@ -378,13 +368,21 @@ mod tests {
     #[test]
     fn test_grammar_compiles() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR);
-        assert!(grammar.is_ok(), "Grammar should compile: {:?}", grammar.err());
+        assert!(
+            grammar.is_ok(),
+            "Grammar should compile: {:?}",
+            grammar.err()
+        );
     }
 
     #[test]
     fn test_grammar2_compiles() {
         let grammar = Grammar2::from_source(ZYNML_GRAMMAR);
-        assert!(grammar.is_ok(), "Grammar2 should compile: {:?}", grammar.err());
+        assert!(
+            grammar.is_ok(),
+            "Grammar2 should compile: {:?}",
+            grammar.err()
+        );
     }
 
     #[test]
@@ -400,65 +398,96 @@ mod tests {
     fn test_parse_simple_let() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
         let result = grammar.parse_to_json("let x = 42");
-        assert!(result.is_ok(), "Should parse let statement: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should parse let statement: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_parse_function() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
-        let result = grammar.parse_to_json(r#"
+        let result = grammar.parse_to_json(
+            r#"
             fn main() {
                 let x = 10
                 let y = 20
             }
-        "#);
+        "#,
+        );
         assert!(result.is_ok(), "Should parse function: {:?}", result.err());
     }
 
     #[test]
     fn test_parse_pipe_operator() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
-        let result = grammar.parse_to_json(r#"
+        let result = grammar.parse_to_json(
+            r#"
             let result = x |> f(1) |> g()
-        "#);
-        assert!(result.is_ok(), "Should parse pipe operator: {:?}", result.err());
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "Should parse pipe operator: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_parse_tensor_literal() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
-        let result = grammar.parse_to_json(r#"
+        let result = grammar.parse_to_json(
+            r#"
             let t = tensor([1.0, 2.0, 3.0])
-        "#);
-        assert!(result.is_ok(), "Should parse tensor literal: {:?}", result.err());
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "Should parse tensor literal: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_parse_array_literal() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
-        let result = grammar.parse_to_json(r#"
+        let result = grammar.parse_to_json(
+            r#"
             let arr = [[1, 2], [3, 4]]
-        "#);
-        assert!(result.is_ok(), "Should parse array literal: {:?}", result.err());
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "Should parse array literal: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_parse_ml_pipeline() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
-        let result = grammar.parse_to_json(r#"
+        let result = grammar.parse_to_json(
+            r#"
             fn process_audio() {
                 let audio = audio_load("test.wav")
                 let mono = audio |> to_mono()
                 let mel = mono |> mel_spectrogram(80, 400, 160)
             }
-        "#);
-        assert!(result.is_ok(), "Should parse ML pipeline: {:?}", result.err());
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "Should parse ML pipeline: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_parse_control_flow() {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
-        let result = grammar.parse_to_json(r#"
+        let result = grammar.parse_to_json(
+            r#"
             fn test() {
                 if x > 0 {
                     let y = x * 2
@@ -470,8 +499,13 @@ mod tests {
                     i = i + 1
                 }
             }
-        "#);
-        assert!(result.is_ok(), "Should parse control flow: {:?}", result.err());
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "Should parse control flow: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -480,14 +514,17 @@ mod tests {
 
         // Find plugins directory relative to workspace root
         let plugins_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()  // crates/
+            .parent() // crates/
             .unwrap()
-            .parent()  // workspace root
+            .parent() // workspace root
             .unwrap()
             .join("plugins/target/zrtl");
 
         if !plugins_dir.exists() {
-            eprintln!("Skipping runtime test: plugins not built at {:?}", plugins_dir);
+            eprintln!(
+                "Skipping runtime test: plugins not built at {:?}",
+                plugins_dir
+            );
             return;
         }
 
@@ -499,7 +536,11 @@ mod tests {
 
         // Create runtime (this loads plugins and registers grammar)
         let runtime_result = ZynML::with_config(config);
-        assert!(runtime_result.is_ok(), "Should create runtime: {:?}", runtime_result.err());
+        assert!(
+            runtime_result.is_ok(),
+            "Should create runtime: {:?}",
+            runtime_result.err()
+        );
 
         let zynml = runtime_result.unwrap();
 
@@ -512,7 +553,10 @@ mod tests {
     #[test]
     fn test_parse_minimal_function() {
         // Enable logging for this test
-        let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Trace).try_init();
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
 
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).unwrap();
 
@@ -531,7 +575,11 @@ mod tests {
         let source = r#"fn main() { let x = 42 }"#;
 
         let result = grammar.parse_to_json(source);
-        assert!(result.is_ok(), "Should parse minimal function: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should parse minimal function: {:?}",
+            result.err()
+        );
 
         // Pretty-print the JSON AST for debugging
         let json = result.unwrap();
@@ -568,7 +616,11 @@ mod tests {
         "#;
 
         let result = grammar.parse_to_json(source);
-        assert!(result.is_ok(), "Should parse hello example: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should parse hello example: {:?}",
+            result.err()
+        );
 
         // Pretty-print the JSON AST for debugging
         let json = result.unwrap();
@@ -608,7 +660,11 @@ mod tests {
         "#;
 
         let result = grammar.parse_to_json(source);
-        assert!(result.is_ok(), "Should parse audio pipeline example: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should parse audio pipeline example: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -653,6 +709,10 @@ mod tests {
         "#;
 
         let result = grammar.parse_to_json(source);
-        assert!(result.is_ok(), "Should parse vector search example: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should parse vector search example: {:?}",
+            result.err()
+        );
     }
 }

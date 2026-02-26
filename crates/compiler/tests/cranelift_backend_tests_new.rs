@@ -3,7 +3,7 @@
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{InternedString, arena::AstArena};
+use zyntax_typed_ast::{arena::AstArena, InternedString};
 
 fn create_test_string(s: &str) -> InternedString {
     let mut arena = AstArena::new();
@@ -18,12 +18,14 @@ fn test_indirect_function_call() {
     // First compile a simple add function
     let add_func = create_simple_add_function();
     let add_func_id = add_func.id;
-    backend.compile_function(add_func_id, &add_func)
+    backend
+        .compile_function(add_func_id, &add_func)
         .expect("Failed to compile add function");
 
     // Now create a function that makes an indirect call
     let indirect_caller = create_indirect_call_function();
-    backend.compile_function(indirect_caller.id, &indirect_caller)
+    backend
+        .compile_function(indirect_caller.id, &indirect_caller)
         .expect("Failed to compile indirect call function");
 
     println!("✅ Successfully compiled indirect function call");
@@ -74,7 +76,9 @@ fn create_simple_add_function() -> HirFunction {
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(add_inst);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -139,7 +143,9 @@ fn create_indirect_call_function() -> HirFunction {
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(indirect_call);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -150,7 +156,8 @@ fn test_multi_level_extract_value() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
     let func = create_multi_level_extract_function();
 
-    backend.compile_function(func.id, &func)
+    backend
+        .compile_function(func.id, &func)
         .expect("Failed to compile multi-level ExtractValue");
 
     println!("✅ Successfully compiled multi-level ExtractValue");
@@ -172,14 +179,12 @@ fn create_multi_level_extract_function() -> HirFunction {
     });
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("s"),
-                ty: HirType::Ptr(Box::new(outer_ty.clone())),
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("s"),
+            ty: HirType::Ptr(Box::new(outer_ty.clone())),
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -205,7 +210,9 @@ fn create_multi_level_extract_function() -> HirFunction {
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(extract_inst);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -216,7 +223,8 @@ fn test_multi_level_insert_value() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
     let func = create_multi_level_insert_function();
 
-    backend.compile_function(func.id, &func)
+    backend
+        .compile_function(func.id, &func)
         .expect("Failed to compile multi-level InsertValue");
 
     println!("✅ Successfully compiled multi-level InsertValue");
@@ -265,7 +273,10 @@ fn create_multi_level_insert_function() -> HirFunction {
     let mut func = HirFunction::new(name, sig);
     let entry_block_id = func.entry_block;
 
-    let param_s = func.create_value(HirType::Ptr(Box::new(outer_ty.clone())), HirValueKind::Parameter(0));
+    let param_s = func.create_value(
+        HirType::Ptr(Box::new(outer_ty.clone())),
+        HirValueKind::Parameter(0),
+    );
     let param_val = func.create_value(HirType::I32, HirValueKind::Parameter(1));
 
     let result = func.create_value(HirType::Ptr(Box::new(outer_ty)), HirValueKind::Instruction);
@@ -279,7 +290,9 @@ fn create_multi_level_insert_function() -> HirFunction {
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(insert_inst);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -290,19 +303,23 @@ fn test_math_intrinsics() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
 
     let sin_func = create_math_intrinsic_function("test_sin", Intrinsic::Sin);
-    backend.compile_function(sin_func.id, &sin_func)
+    backend
+        .compile_function(sin_func.id, &sin_func)
         .expect("Failed to compile sin");
 
     let cos_func = create_math_intrinsic_function("test_cos", Intrinsic::Cos);
-    backend.compile_function(cos_func.id, &cos_func)
+    backend
+        .compile_function(cos_func.id, &cos_func)
         .expect("Failed to compile cos");
 
     let log_func = create_math_intrinsic_function("test_log", Intrinsic::Log);
-    backend.compile_function(log_func.id, &log_func)
+    backend
+        .compile_function(log_func.id, &log_func)
         .expect("Failed to compile log");
 
     let exp_func = create_math_intrinsic_function("test_exp", Intrinsic::Exp);
-    backend.compile_function(exp_func.id, &exp_func)
+    backend
+        .compile_function(exp_func.id, &exp_func)
         .expect("Failed to compile exp");
 
     println!("✅ Successfully compiled all math intrinsics");
@@ -312,14 +329,12 @@ fn create_math_intrinsic_function(name: &str, intrinsic: Intrinsic) -> HirFuncti
     let name = create_test_string(name);
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("x"),
-                ty: HirType::F64,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("x"),
+            ty: HirType::F64,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::F64],
         type_params: vec![],
         const_params: vec![],
@@ -347,7 +362,9 @@ fn create_math_intrinsic_function(name: &str, intrinsic: Intrinsic) -> HirFuncti
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(intrinsic_call);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -358,7 +375,8 @@ fn test_pow_intrinsic() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
     let pow_func = create_pow_intrinsic_function();
 
-    backend.compile_function(pow_func.id, &pow_func)
+    backend
+        .compile_function(pow_func.id, &pow_func)
         .expect("Failed to compile pow");
 
     println!("✅ Successfully compiled pow intrinsic");
@@ -410,7 +428,9 @@ fn create_pow_intrinsic_function() -> HirFunction {
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(pow_call);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -421,15 +441,18 @@ fn test_bit_manipulation_intrinsics() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
 
     let ctlz_func = create_bit_intrinsic_function("test_ctlz", Intrinsic::Ctlz);
-    backend.compile_function(ctlz_func.id, &ctlz_func)
+    backend
+        .compile_function(ctlz_func.id, &ctlz_func)
         .expect("Failed to compile ctlz");
 
     let cttz_func = create_bit_intrinsic_function("test_cttz", Intrinsic::Cttz);
-    backend.compile_function(cttz_func.id, &cttz_func)
+    backend
+        .compile_function(cttz_func.id, &cttz_func)
         .expect("Failed to compile cttz");
 
     let bswap_func = create_bit_intrinsic_function("test_bswap", Intrinsic::Bswap);
-    backend.compile_function(bswap_func.id, &bswap_func)
+    backend
+        .compile_function(bswap_func.id, &bswap_func)
         .expect("Failed to compile bswap");
 
     println!("✅ Successfully compiled all bit manipulation intrinsics");
@@ -439,14 +462,12 @@ fn create_bit_intrinsic_function(name: &str, intrinsic: Intrinsic) -> HirFunctio
     let name = create_test_string(name);
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("x"),
-                ty: HirType::I32,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("x"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -474,7 +495,9 @@ fn create_bit_intrinsic_function(name: &str, intrinsic: Intrinsic) -> HirFunctio
 
     let block = func.blocks.get_mut(&entry_block_id).unwrap();
     block.add_instruction(intrinsic_call);
-    block.set_terminator(HirTerminator::Return { values: vec![result] });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }

@@ -4,9 +4,9 @@
 //! any Zyntax runtime value. It serves as the intermediate representation
 //! for converting between Rust types and Zyntax's `DynamicValue`.
 
-use std::collections::HashMap;
 use crate::error::{ConversionError, ConversionResult};
-use zyntax_compiler::zrtl::{DynamicValue, TypeId, TypeCategory, TypeMeta};
+use std::collections::HashMap;
+use zyntax_compiler::zrtl::{DynamicValue, TypeCategory, TypeId, TypeMeta};
 
 /// A Rust-friendly representation of a Zyntax runtime value.
 ///
@@ -241,9 +241,9 @@ impl ZyntaxValue {
     /// Returns `None` if this is not an `Opaque` variant or if the type_meta is null.
     pub fn opaque_type_meta(&self) -> Option<&TypeMeta> {
         match self {
-            ZyntaxValue::Opaque { type_meta, .. } if !type_meta.is_null() => {
-                unsafe { Some(&**type_meta) }
-            }
+            ZyntaxValue::Opaque { type_meta, .. } if !type_meta.is_null() => unsafe {
+                Some(&**type_meta)
+            },
             _ => None,
         }
     }
@@ -279,9 +279,7 @@ impl ZyntaxValue {
     /// - The data must be valid for the lifetime of the returned reference
     pub unsafe fn opaque_as_ref<T>(&self) -> Option<&T> {
         match self {
-            ZyntaxValue::Opaque { ptr, .. } if !ptr.is_null() => {
-                Some(&*(*ptr as *const T))
-            }
+            ZyntaxValue::Opaque { ptr, .. } if !ptr.is_null() => Some(&*(*ptr as *const T)),
             _ => None,
         }
     }
@@ -295,9 +293,7 @@ impl ZyntaxValue {
     /// - No other references to this data must exist
     pub unsafe fn opaque_as_mut<T>(&mut self) -> Option<&mut T> {
         match self {
-            ZyntaxValue::Opaque { ptr, .. } if !ptr.is_null() => {
-                Some(&mut *(*ptr as *mut T))
-            }
+            ZyntaxValue::Opaque { ptr, .. } if !ptr.is_null() => Some(&mut *(*ptr as *mut T)),
             _ => None,
         }
     }
@@ -337,30 +333,22 @@ impl ZyntaxValue {
                     t if t == TypeId::I32 => {
                         value.as_ref::<i32>().map(|&v| ZyntaxValue::Int(v as i64))
                     }
-                    _ => {
-                        value.as_ref::<i64>().map(|&v| ZyntaxValue::Int(v))
-                    }
+                    _ => value.as_ref::<i64>().map(|&v| ZyntaxValue::Int(v)),
                 }
                 .ok_or(ConversionError::NullValue)
             }
 
-            TypeCategory::UInt => {
-                match type_id {
-                    t if t == TypeId::U8 => {
-                        value.as_ref::<u8>().map(|&v| ZyntaxValue::UInt(v as u64))
-                    }
-                    t if t == TypeId::U16 => {
-                        value.as_ref::<u16>().map(|&v| ZyntaxValue::UInt(v as u64))
-                    }
-                    t if t == TypeId::U32 => {
-                        value.as_ref::<u32>().map(|&v| ZyntaxValue::UInt(v as u64))
-                    }
-                    _ => {
-                        value.as_ref::<u64>().map(|&v| ZyntaxValue::UInt(v))
-                    }
+            TypeCategory::UInt => match type_id {
+                t if t == TypeId::U8 => value.as_ref::<u8>().map(|&v| ZyntaxValue::UInt(v as u64)),
+                t if t == TypeId::U16 => {
+                    value.as_ref::<u16>().map(|&v| ZyntaxValue::UInt(v as u64))
                 }
-                .ok_or(ConversionError::NullValue)
+                t if t == TypeId::U32 => {
+                    value.as_ref::<u32>().map(|&v| ZyntaxValue::UInt(v as u64))
+                }
+                _ => value.as_ref::<u64>().map(|&v| ZyntaxValue::UInt(v)),
             }
+            .ok_or(ConversionError::NullValue),
 
             TypeCategory::Float => {
                 if type_id == TypeId::F32 {
@@ -449,7 +437,7 @@ impl ZyntaxValue {
 
                 unsafe {
                     let ptr = std::alloc::alloc(
-                        std::alloc::Layout::from_size_align(total_size, 4).unwrap()
+                        std::alloc::Layout::from_size_align(total_size, 4).unwrap(),
                     );
 
                     if ptr.is_null() {
@@ -462,18 +450,16 @@ impl ZyntaxValue {
                     std::ptr::copy_nonoverlapping(
                         s.as_ptr(),
                         ptr.offset(std::mem::size_of::<i32>() as isize),
-                        s.len()
+                        s.len(),
                     );
 
                     DynamicValue::from_string(s)
                 }
             }
-            ZyntaxValue::Optional(inner) => {
-                match *inner {
-                    Some(v) => v.into_dynamic(),
-                    None => DynamicValue::null(),
-                }
-            }
+            ZyntaxValue::Optional(inner) => match *inner {
+                Some(v) => v.into_dynamic(),
+                None => DynamicValue::null(),
+            },
             // For complex types, we'd need more sophisticated handling
             _ => DynamicValue::null(),
         }
@@ -630,8 +616,14 @@ mod tests {
     #[test]
     fn test_type_category() {
         assert_eq!(ZyntaxValue::Int(42).type_category(), TypeCategory::Int);
-        assert_eq!(ZyntaxValue::String("hi".into()).type_category(), TypeCategory::String);
-        assert_eq!(ZyntaxValue::Array(vec![]).type_category(), TypeCategory::Array);
+        assert_eq!(
+            ZyntaxValue::String("hi".into()).type_category(),
+            TypeCategory::String
+        );
+        assert_eq!(
+            ZyntaxValue::Array(vec![]).type_category(),
+            TypeCategory::Array
+        );
     }
 
     #[test]

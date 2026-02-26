@@ -8,15 +8,15 @@
 //! - Effect checking: Validates effect annotations and purity constraints
 //! - Handler scope analysis: Ensures effect operations are within valid handler scopes
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use indexmap::IndexMap;
+use crate::analysis::{CallGraph, ModuleAnalysis};
 use crate::hir::{
-    HirModule, HirFunction, HirBlock, HirId, HirInstruction, HirTerminator,
-    HirEffect, HirEffectHandler,
+    HirBlock, HirEffect, HirEffectHandler, HirFunction, HirId, HirInstruction, HirModule,
+    HirTerminator,
 };
-use crate::analysis::{ModuleAnalysis, CallGraph};
-use crate::CompilerResult;
 use crate::CompilerError;
+use crate::CompilerResult;
+use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use zyntax_typed_ast::InternedString;
 
 /// Effect analysis results for a module
@@ -231,31 +231,36 @@ impl<'a> EffectAnalyzer<'a> {
     fn collect_definitions(&self, result: &mut ModuleEffectAnalysis) {
         // Collect effects
         for (effect_id, effect) in &self.module.effects {
-            let operations: Vec<InternedString> = effect.operations
-                .iter()
-                .map(|op| op.name)
-                .collect();
+            let operations: Vec<InternedString> =
+                effect.operations.iter().map(|op| op.name).collect();
 
-            result.defined_effects.insert(*effect_id, EffectInfo {
-                id: *effect_id,
-                name: effect.name,
-                operations,
-            });
+            result.defined_effects.insert(
+                *effect_id,
+                EffectInfo {
+                    id: *effect_id,
+                    name: effect.name,
+                    operations,
+                },
+            );
         }
 
         // Collect handlers
         for (handler_id, handler) in &self.module.handlers {
-            let handled_operations: Vec<InternedString> = handler.implementations
+            let handled_operations: Vec<InternedString> = handler
+                .implementations
                 .iter()
                 .map(|impl_| impl_.op_name)
                 .collect();
 
-            result.defined_handlers.insert(*handler_id, HandlerInfo {
-                id: *handler_id,
-                name: handler.name,
-                handled_effect: handler.effect_id,
-                handled_operations,
-            });
+            result.defined_handlers.insert(
+                *handler_id,
+                HandlerInfo {
+                    id: *handler_id,
+                    name: handler.name,
+                    handled_effect: handler.effect_id,
+                    handled_operations,
+                },
+            );
         }
     }
 
@@ -277,9 +282,7 @@ impl<'a> EffectAnalyzer<'a> {
             for (inst_index, inst) in block.instructions.iter().enumerate() {
                 match inst {
                     HirInstruction::PerformEffect {
-                        effect_id,
-                        op_name,
-                        ..
+                        effect_id, op_name, ..
                     } => {
                         // Look up effect name from effect_id
                         let effect_name = defined_effects
@@ -296,11 +299,8 @@ impl<'a> EffectAnalyzer<'a> {
                         direct_effects.insert(occurrence);
 
                         // Check if within handler scope
-                        let (in_scope, handler_id) = self.check_handler_scope(
-                            *block_id,
-                            &scope_map,
-                            effect_name,
-                        );
+                        let (in_scope, handler_id) =
+                            self.check_handler_scope(*block_id, &scope_map, effect_name);
 
                         effect_sites.push(EffectSite {
                             effect: effect_name,
@@ -362,7 +362,10 @@ impl<'a> EffectAnalyzer<'a> {
     }
 
     /// Build a map from blocks to their enclosing handler scopes
-    fn build_handler_scope_map(&self, func: &HirFunction) -> HashMap<HirId, Vec<(HirId, InternedString)>> {
+    fn build_handler_scope_map(
+        &self,
+        func: &HirFunction,
+    ) -> HashMap<HirId, Vec<(HirId, InternedString)>> {
         let mut scope_map: HashMap<HirId, Vec<(HirId, InternedString)>> = HashMap::new();
 
         // Find all HandleEffect instructions and their scope blocks
@@ -373,7 +376,8 @@ impl<'a> EffectAnalyzer<'a> {
                     body_block,
                     continuation_block,
                     ..
-                } = inst {
+                } = inst
+                {
                     if let Some(handler) = self.module.handlers.get(handler_id) {
                         if let Some(effect) = self.module.effects.get(&handler.effect_id) {
                             let scope_blocks = self.compute_handler_scope_blocks(
@@ -454,11 +458,16 @@ impl<'a> EffectAnalyzer<'a> {
                 .map(|e| e.effect_name)
                 .collect();
 
-            result.effect_call_graph.required_effects.insert(*func_id, direct_effect_names.clone());
+            result
+                .effect_call_graph
+                .required_effects
+                .insert(*func_id, direct_effect_names.clone());
 
             // Track which functions perform each effect
             for effect_name in direct_effect_names {
-                result.effect_call_graph.effect_performers
+                result
+                    .effect_call_graph
+                    .effect_performers
                     .entry(effect_name)
                     .or_default()
                     .insert(*func_id);
@@ -472,7 +481,8 @@ impl<'a> EffectAnalyzer<'a> {
                 changed = false;
 
                 for (caller_id, callees) in &call_graph.direct_calls {
-                    let mut caller_effects: HashSet<InternedString> = result.effect_call_graph
+                    let mut caller_effects: HashSet<InternedString> = result
+                        .effect_call_graph
                         .required_effects
                         .get(caller_id)
                         .cloned()
@@ -482,12 +492,16 @@ impl<'a> EffectAnalyzer<'a> {
 
                     // Add effects from all callees
                     for callee_id in callees {
-                        if let Some(callee_effects) = result.effect_call_graph.required_effects.get(callee_id) {
+                        if let Some(callee_effects) =
+                            result.effect_call_graph.required_effects.get(callee_id)
+                        {
                             // Only propagate effects that aren't handled by caller
                             let caller_analysis = result.functions.get(caller_id);
                             for effect in callee_effects {
                                 let is_handled = caller_analysis
-                                    .map(|a| a.handler_scopes.iter().any(|h| h.effect_name == *effect))
+                                    .map(|a| {
+                                        a.handler_scopes.iter().any(|h| h.effect_name == *effect)
+                                    })
                                     .unwrap_or(false);
 
                                 if !is_handled {
@@ -498,7 +512,10 @@ impl<'a> EffectAnalyzer<'a> {
                     }
 
                     if caller_effects.len() > original_count {
-                        result.effect_call_graph.required_effects.insert(*caller_id, caller_effects);
+                        result
+                            .effect_call_graph
+                            .required_effects
+                            .insert(*caller_id, caller_effects);
                         changed = true;
                     }
                 }
@@ -513,16 +530,15 @@ impl<'a> EffectAnalyzer<'a> {
                 .map(|e| e.effect_name)
                 .collect();
 
-            let total_effects = result.effect_call_graph
+            let total_effects = result
+                .effect_call_graph
                 .required_effects
                 .get(func_id)
                 .cloned()
                 .unwrap_or_default();
 
-            func_analysis.transitive_effects = total_effects
-                .difference(&direct_effects)
-                .cloned()
-                .collect();
+            func_analysis.transitive_effects =
+                total_effects.difference(&direct_effects).cloned().collect();
 
             func_analysis.total_effects = total_effects;
         }
@@ -535,7 +551,8 @@ impl<'a> EffectAnalyzer<'a> {
         for (func_id, func_analysis) in &result.functions {
             // Check 1: Pure functions must not perform any effects
             if func_analysis.is_pure && !func_analysis.total_effects.is_empty() {
-                let effect_names: Vec<String> = func_analysis.total_effects
+                let effect_names: Vec<String> = func_analysis
+                    .total_effects
                     .iter()
                     .filter_map(|e| e.resolve_global())
                     .collect();
@@ -603,10 +620,8 @@ impl<'a> EffectAnalyzer<'a> {
 
                 let missing: Vec<_> = required.difference(&handled).collect();
                 if !missing.is_empty() {
-                    let missing_names: Vec<String> = missing
-                        .iter()
-                        .filter_map(|n| n.resolve_global())
-                        .collect();
+                    let missing_names: Vec<String> =
+                        missing.iter().filter_map(|n| n.resolve_global()).collect();
 
                     result.errors.push(EffectError {
                         kind: EffectErrorKind::IncompleteHandler,
@@ -638,8 +653,7 @@ pub fn analyze_effects_with_call_graph(
     module: &HirModule,
     call_graph: &CallGraph,
 ) -> CompilerResult<ModuleEffectAnalysis> {
-    let analyzer = EffectAnalyzer::new(module)
-        .with_call_graph(call_graph);
+    let analyzer = EffectAnalyzer::new(module).with_call_graph(call_graph);
     analyzer.analyze()
 }
 
@@ -653,17 +667,19 @@ pub fn get_function_effect_summary(
     analysis: &ModuleEffectAnalysis,
     func_id: HirId,
 ) -> Option<EffectSummary> {
-    analysis.functions.get(&func_id).map(|func_analysis| {
-        EffectSummary {
-            direct_effects: func_analysis.direct_effects
+    analysis
+        .functions
+        .get(&func_id)
+        .map(|func_analysis| EffectSummary {
+            direct_effects: func_analysis
+                .direct_effects
                 .iter()
                 .map(|e| (e.effect_name, e.operation_name))
                 .collect(),
             total_effects: func_analysis.total_effects.clone(),
             is_pure: func_analysis.is_pure,
             has_handlers: !func_analysis.handler_scopes.is_empty(),
-        }
-    })
+        })
 }
 
 /// Summary of effects for display

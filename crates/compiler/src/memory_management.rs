@@ -1,12 +1,12 @@
 //! # Memory Management Infrastructure
-//! 
+//!
 //! Provides reference counting, automatic memory management, and ownership tracking
 //! for the HIR. This module implements both manual and automatic reference counting
 //! strategies that can be selected based on language requirements.
 
-use std::collections::{HashMap, HashSet};
 use crate::hir::*;
-use crate::{CompilerResult, CompilerError};
+use crate::{CompilerError, CompilerResult};
+use std::collections::{HashMap, HashSet};
 
 /// Memory management strategy for the compiler
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,49 +97,49 @@ impl ARCManager {
             weak_refs: HashMap::new(),
         }
     }
-    
+
     /// Insert reference counting operations for a function
     pub fn instrument_function(&mut self, func: &mut HirFunction) -> CompilerResult<()> {
         // Track all values that need reference counting
         let mut arc_values = Vec::new();
-        
+
         for (value_id, value) in &func.values {
             if self.needs_arc(&value.ty) {
                 arc_values.push(*value_id);
             }
         }
-        
+
         // Insert retain/release calls
         for block in func.blocks.values_mut() {
             self.instrument_block(block, &arc_values)?;
         }
-        
+
         // Mark function as ARC-instrumented
         self.arc_functions.insert(func.id);
-        
+
         Ok(())
     }
-    
+
     /// Check if a type needs ARC
     pub fn needs_arc(&self, ty: &HirType) -> bool {
         match ty {
             HirType::Ptr(_) | HirType::Ref { .. } => true,
             HirType::Array(elem_ty, _) => self.needs_arc(elem_ty),
-            HirType::Struct(struct_ty) => {
-                struct_ty.fields.iter().any(|f| self.needs_arc(f))
-            }
-            HirType::Union(union_ty) => {
-                union_ty.variants.iter().any(|v| self.needs_arc(&v.ty))
-            }
+            HirType::Struct(struct_ty) => struct_ty.fields.iter().any(|f| self.needs_arc(f)),
+            HirType::Union(union_ty) => union_ty.variants.iter().any(|v| self.needs_arc(&v.ty)),
             HirType::Closure(_) => true,
             _ => false,
         }
     }
-    
+
     /// Instrument a block with ARC operations
-    fn instrument_block(&mut self, block: &mut HirBlock, arc_values: &[HirId]) -> CompilerResult<()> {
+    fn instrument_block(
+        &mut self,
+        block: &mut HirBlock,
+        arc_values: &[HirId],
+    ) -> CompilerResult<()> {
         let mut new_instructions = Vec::new();
-        
+
         for inst in &block.instructions {
             // Insert retain before use
             if let Some(values) = self.get_used_values(inst) {
@@ -149,9 +149,9 @@ impl ARCManager {
                     }
                 }
             }
-            
+
             new_instructions.push(inst.clone());
-            
+
             // Insert release after last use
             if let Some(result) = self.get_result(inst) {
                 if arc_values.contains(&result) {
@@ -160,35 +160,35 @@ impl ARCManager {
                 }
             }
         }
-        
+
         block.instructions = new_instructions;
         Ok(())
     }
-    
+
     /// Create a retain (increment reference count) instruction
     fn create_retain(&self, value: HirId) -> HirInstruction {
         HirInstruction::Call {
             result: None,
             callee: HirCallable::Intrinsic(Intrinsic::IncRef),
             args: vec![value],
-                    type_args: vec![],
-                    const_args: vec![],
+            type_args: vec![],
+            const_args: vec![],
             is_tail: false,
         }
     }
-    
+
     /// Create a release (decrement reference count) instruction
     fn create_release(&self, value: HirId) -> HirInstruction {
         HirInstruction::Call {
             result: None,
             callee: HirCallable::Intrinsic(Intrinsic::DecRef),
             args: vec![value],
-                    type_args: vec![],
-                    const_args: vec![],
+            type_args: vec![],
+            const_args: vec![],
             is_tail: false,
         }
     }
-    
+
     /// Get values used by an instruction
     fn get_used_values(&self, inst: &HirInstruction) -> Option<Vec<HirId>> {
         match inst {
@@ -204,18 +204,18 @@ impl ARCManager {
             _ => None,
         }
     }
-    
+
     /// Get result of an instruction
     fn get_result(&self, inst: &HirInstruction) -> Option<HirId> {
         match inst {
-            HirInstruction::Binary { result, .. } |
-            HirInstruction::Unary { result, .. } |
-            HirInstruction::Alloca { result, .. } |
-            HirInstruction::Load { result, .. } |
-            HirInstruction::CreateRef { result, .. } |
-            HirInstruction::Deref { result, .. } |
-            HirInstruction::Move { result, .. } |
-            HirInstruction::Copy { result, .. } => Some(*result),
+            HirInstruction::Binary { result, .. }
+            | HirInstruction::Unary { result, .. }
+            | HirInstruction::Alloca { result, .. }
+            | HirInstruction::Load { result, .. }
+            | HirInstruction::CreateRef { result, .. }
+            | HirInstruction::Deref { result, .. }
+            | HirInstruction::Move { result, .. }
+            | HirInstruction::Copy { result, .. } => Some(*result),
             HirInstruction::Call { result, .. } => *result,
             _ => None,
         }
@@ -240,17 +240,17 @@ impl DropManager {
             drop_order: Vec::new(),
         }
     }
-    
+
     /// Register a type with a custom destructor
     pub fn register_destructor(&mut self, ty: HirType, destructor: HirId) {
         self.drop_types.insert(ty, destructor);
     }
-    
+
     /// Insert drop calls at appropriate points
     pub fn insert_drops(&mut self, func: &mut HirFunction) -> CompilerResult<()> {
         // Analyze which values need dropping
         self.analyze_drops(func)?;
-        
+
         // Create drop sequences before mutating blocks
         let mut drop_sequences = HashMap::new();
         for (block_id, block) in &func.blocks {
@@ -263,17 +263,17 @@ impl DropManager {
                 _ => {}
             }
         }
-        
+
         // Now insert the drop sequences
         for (block_id, drops) in drop_sequences {
             if let Some(block) = func.blocks.get_mut(&block_id) {
                 block.instructions.extend(drops);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Analyze which values need dropping
     fn analyze_drops(&mut self, func: &HirFunction) -> CompilerResult<()> {
         for (value_id, value) in &func.values {
@@ -281,35 +281,34 @@ impl DropManager {
                 self.needs_drop.insert(*value_id);
             }
         }
-        
+
         // Compute drop order based on dependencies
         self.compute_drop_order(func)?;
-        
+
         Ok(())
     }
-    
+
     /// Check if a type needs dropping
     pub fn needs_drop_type(&self, ty: &HirType) -> bool {
         // Check if type has custom destructor
         if self.drop_types.contains_key(ty) {
             return true;
         }
-        
+
         // Check if type contains values that need dropping
         match ty {
             HirType::Ptr(_) => true, // Heap allocations need freeing
             HirType::Array(elem_ty, _) => self.needs_drop_type(elem_ty),
-            HirType::Struct(struct_ty) => {
-                struct_ty.fields.iter().any(|f| self.needs_drop_type(f))
-            }
-            HirType::Union(union_ty) => {
-                union_ty.variants.iter().any(|v| self.needs_drop_type(&v.ty))
-            }
+            HirType::Struct(struct_ty) => struct_ty.fields.iter().any(|f| self.needs_drop_type(f)),
+            HirType::Union(union_ty) => union_ty
+                .variants
+                .iter()
+                .any(|v| self.needs_drop_type(&v.ty)),
             HirType::Closure(_) => true, // Closures have captured environment
             _ => false,
         }
     }
-    
+
     /// Compute the order in which values should be dropped
     fn compute_drop_order(&mut self, _func: &HirFunction) -> CompilerResult<()> {
         // Simple LIFO order for now
@@ -318,11 +317,11 @@ impl DropManager {
         self.drop_order.reverse();
         Ok(())
     }
-    
+
     /// Create drop instruction sequence
     fn create_drop_sequence(&self, func: &HirFunction) -> Vec<HirInstruction> {
         let mut drops = Vec::new();
-        
+
         for value_id in &self.drop_order {
             if let Some(value) = func.values.get(value_id) {
                 if let Some(destructor) = self.drop_types.get(&value.ty) {
@@ -331,8 +330,8 @@ impl DropManager {
                         result: None,
                         callee: HirCallable::Function(*destructor),
                         args: vec![*value_id],
-                    type_args: vec![],
-                    const_args: vec![],
+                        type_args: vec![],
+                        const_args: vec![],
                         is_tail: false,
                     });
                 } else {
@@ -341,14 +340,14 @@ impl DropManager {
                         result: None,
                         callee: HirCallable::Intrinsic(Intrinsic::Drop),
                         args: vec![*value_id],
-                    type_args: vec![],
-                    const_args: vec![],
+                        type_args: vec![],
+                        const_args: vec![],
                         is_tail: false,
                     });
                 }
             }
         }
-        
+
         drops
     }
 }
@@ -365,30 +364,33 @@ impl EscapeAnalysis {
             results: HashMap::new(),
         }
     }
-    
+
     /// Analyze escape behavior of values in a function
     pub fn analyze(&mut self, func: &HirFunction) -> CompilerResult<()> {
         // Initialize all values as non-escaping
         for value_id in func.values.keys() {
-            self.results.insert(*value_id, EscapeInfo {
-                escapes: false,
-                escape_targets: HashSet::new(),
-                is_returned: false,
-                stored_in_heap: false,
-            });
+            self.results.insert(
+                *value_id,
+                EscapeInfo {
+                    escapes: false,
+                    escape_targets: HashSet::new(),
+                    is_returned: false,
+                    stored_in_heap: false,
+                },
+            );
         }
-        
+
         // Analyze each block
         for block in func.blocks.values() {
             self.analyze_block(block)?;
         }
-        
+
         // Propagate escape information
         self.propagate_escapes()?;
-        
+
         Ok(())
     }
-    
+
     /// Analyze escape behavior in a block
     fn analyze_block(&mut self, block: &HirBlock) -> CompilerResult<()> {
         for inst in &block.instructions {
@@ -411,7 +413,7 @@ impl EscapeAnalysis {
                 _ => {}
             }
         }
-        
+
         // Check terminator
         match &block.terminator {
             HirTerminator::Return { values } => {
@@ -424,31 +426,34 @@ impl EscapeAnalysis {
             }
             _ => {}
         }
-        
+
         Ok(())
     }
-    
+
     /// Propagate escape information transitively
     fn propagate_escapes(&mut self) -> CompilerResult<()> {
         // Simple fixpoint iteration
         let mut changed = true;
         while changed {
             changed = false;
-            
+
             // If a value contains an escaping value, it also escapes
             let current_results = self.results.clone();
             for (value_id, info) in &mut self.results {
                 if !info.escapes {
                     // Check if any referenced values escape
                     // This is simplified - real implementation would track references
-                    if current_results.values().any(|other| other.escapes && other.escape_targets.contains(value_id)) {
+                    if current_results
+                        .values()
+                        .any(|other| other.escapes && other.escape_targets.contains(value_id))
+                    {
                         info.escapes = true;
                         changed = true;
                     }
                 }
             }
         }
-        
+
         Ok(())
     }
 }
@@ -463,29 +468,32 @@ impl MemoryContext {
             allocations: HashMap::new(),
         }
     }
-    
+
     /// Track a new allocation
     pub fn track_allocation(&mut self, value: HirId, info: AllocationInfo) {
         self.allocations.insert(value, info);
-        
+
         // Initialize reference count if using ARC
         if self.strategy == MemoryStrategy::ARC {
-            self.ref_counts.insert(value, RefCountInfo {
-                count: 1,
-                is_weak: false,
-                references: HashSet::new(),
-                referenced_by: HashSet::new(),
-            });
+            self.ref_counts.insert(
+                value,
+                RefCountInfo {
+                    count: 1,
+                    is_weak: false,
+                    references: HashSet::new(),
+                    referenced_by: HashSet::new(),
+                },
+            );
         }
     }
-    
+
     /// Increment reference count
     pub fn retain(&mut self, value: HirId) {
         if let Some(ref_info) = self.ref_counts.get_mut(&value) {
             ref_info.count += 1;
         }
     }
-    
+
     /// Decrement reference count
     pub fn release(&mut self, value: HirId) {
         if let Some(ref_info) = self.ref_counts.get_mut(&value) {
@@ -495,7 +503,7 @@ impl MemoryContext {
             }
         }
     }
-    
+
     /// Check if a value can be stack allocated
     pub fn can_stack_allocate(&self, value: HirId) -> bool {
         if let Some(escape_info) = self.escape_info.get(&value) {
@@ -514,9 +522,7 @@ impl MemoryContext {
                 // 1. Not already on stack
                 // 2. Doesn't escape
                 // 3. Has known size
-                !info.is_stack &&
-                self.can_stack_allocate(**id) &&
-                info.size.is_some()
+                !info.is_stack && self.can_stack_allocate(**id) && info.size.is_some()
             })
             .map(|(id, _)| *id)
             .collect()
@@ -545,7 +551,12 @@ impl StackPromotionPass {
         func: &mut HirFunction,
         escape_info: &HashMap<HirId, EscapeInfo>,
     ) -> CompilerResult<()> {
-        eprintln!("[STACK_PROMOTION] Analyzing function '{}'", func.name.resolve_global().unwrap_or_else(|| "?".to_string()));
+        eprintln!(
+            "[STACK_PROMOTION] Analyzing function '{}'",
+            func.name
+                .resolve_global()
+                .unwrap_or_else(|| "?".to_string())
+        );
 
         // Find all heap allocations (malloc calls)
         let mut allocations_to_promote = Vec::new();
@@ -557,28 +568,36 @@ impl StackPromotionPass {
                     callee: HirCallable::Intrinsic(Intrinsic::Malloc),
                     args,
                     ..
-                } = inst {
+                } = inst
+                {
                     // Check if this allocation escapes
                     if let Some(info) = escape_info.get(result) {
                         if info.escapes {
-                            self.not_promoted.push((*result, format!(
-                                "escapes: returned={}, stored_in_heap={}",
-                                info.is_returned, info.stored_in_heap
-                            )));
+                            self.not_promoted.push((
+                                *result,
+                                format!(
+                                    "escapes: returned={}, stored_in_heap={}",
+                                    info.is_returned, info.stored_in_heap
+                                ),
+                            ));
                         } else {
                             // Safe to promote to stack
                             allocations_to_promote.push((*result, args.clone()));
                         }
                     } else {
                         // No escape info - be conservative
-                        self.not_promoted.push((*result, "no escape info".to_string()));
+                        self.not_promoted
+                            .push((*result, "no escape info".to_string()));
                     }
                 }
             }
         }
 
-        eprintln!("[STACK_PROMOTION] Found {} promotable allocations, {} not promotable",
-            allocations_to_promote.len(), self.not_promoted.len());
+        eprintln!(
+            "[STACK_PROMOTION] Found {} promotable allocations, {} not promotable",
+            allocations_to_promote.len(),
+            self.not_promoted.len()
+        );
 
         // Actually promote the allocations
         for (result_id, args) in allocations_to_promote {
@@ -605,10 +624,14 @@ impl StackPromotionPass {
                     result: Some(result),
                     callee: HirCallable::Intrinsic(Intrinsic::Malloc),
                     ..
-                } = inst {
+                } = inst
+                {
                     if *result == result_id {
                         // Replace with alloca
-                        eprintln!("[STACK_PROMOTION] Promoting allocation {:?} to stack", result_id);
+                        eprintln!(
+                            "[STACK_PROMOTION] Promoting allocation {:?} to stack",
+                            result_id
+                        );
                         new_instructions.push(HirInstruction::Alloca {
                             result: result_id,
                             ty: HirType::I8, // Byte array, will be cast
@@ -631,7 +654,8 @@ impl StackPromotionPass {
                     callee: HirCallable::Intrinsic(Intrinsic::Free),
                     args,
                     ..
-                } = inst {
+                } = inst
+                {
                     // Remove free of the promoted allocation
                     !args.contains(&result_id)
                 } else {
@@ -663,17 +687,13 @@ pub enum UnifiedCleanupBehavior {
         is_fallible: bool,
     },
     /// Manual cleanup required - user must call cleanup explicitly
-    Manual {
-        cleanup_intrinsic: Intrinsic,
-    },
+    Manual { cleanup_intrinsic: Intrinsic },
     /// No cleanup needed (e.g., Copy types, primitives)
     None,
     /// Reference counted cleanup (decrement refcount, free if zero)
     RefCounted,
     /// Deferred cleanup (cleanup at end of scope or transaction)
-    Deferred {
-        scope_id: HirId,
-    },
+    Deferred { scope_id: HirId },
 }
 
 /// Linearity kind for HIR-level tracking
@@ -738,19 +758,14 @@ pub struct ScopeCleanupInfo {
 #[derive(Debug, Clone)]
 pub enum CleanupAction {
     /// Call destructor on a value
-    CallDestructor {
-        value: HirId,
-        destructor: HirId,
-    },
+    CallDestructor { value: HirId, destructor: HirId },
     /// Call an intrinsic (e.g., Free, DecRef)
     CallIntrinsic {
         intrinsic: Intrinsic,
         args: Vec<HirId>,
     },
     /// Drop a value using generic drop
-    Drop {
-        value: HirId,
-    },
+    Drop { value: HirId },
 }
 
 impl UnifiedCleanupManager {
@@ -780,16 +795,19 @@ impl UnifiedCleanupManager {
                 is_fallible: false,
             };
         } else {
-            self.type_cleanup.insert(ty.clone(), CleanupInfo {
-                ty,
-                cleanup_behavior: UnifiedCleanupBehavior::Automatic {
-                    destructor: Some(destructor),
-                    is_fallible: false,
+            self.type_cleanup.insert(
+                ty.clone(),
+                CleanupInfo {
+                    ty,
+                    cleanup_behavior: UnifiedCleanupBehavior::Automatic {
+                        destructor: Some(destructor),
+                        is_fallible: false,
+                    },
+                    linearity: HirLinearityKind::Affine,
+                    needs_cleanup: true,
+                    cleanup_priority: 0,
                 },
-                linearity: HirLinearityKind::Affine,
-                needs_cleanup: true,
-                cleanup_priority: 0,
-            });
+            );
         }
     }
 
@@ -881,9 +899,17 @@ impl UnifiedCleanupManager {
             // Defaults based on type kind
             match ty {
                 // Primitives are unrestricted (Copy)
-                HirType::I8 | HirType::I16 | HirType::I32 | HirType::I64 |
-                HirType::U8 | HirType::U16 | HirType::U32 | HirType::U64 |
-                HirType::F32 | HirType::F64 | HirType::Bool => HirLinearityKind::Unrestricted,
+                HirType::I8
+                | HirType::I16
+                | HirType::I32
+                | HirType::I64
+                | HirType::U8
+                | HirType::U16
+                | HirType::U32
+                | HirType::U64
+                | HirType::F32
+                | HirType::F64
+                | HirType::Bool => HirLinearityKind::Unrestricted,
 
                 // Pointers are affine by default
                 HirType::Ptr(_) => HirLinearityKind::Affine,
@@ -902,46 +928,45 @@ impl UnifiedCleanupManager {
 
     /// Convert cleanup actions to HIR instructions
     pub fn actions_to_instructions(&self, actions: &[CleanupAction]) -> Vec<HirInstruction> {
-        actions.iter().map(|action| {
-            match action {
-                CleanupAction::CallDestructor { value, destructor } => {
-                    HirInstruction::Call {
-                        result: None,
-                        callee: HirCallable::Function(*destructor),
-                        args: vec![*value],
-                        type_args: vec![],
-                        const_args: vec![],
-                        is_tail: false,
-                    }
-                }
-                CleanupAction::CallIntrinsic { intrinsic, args } => {
-                    HirInstruction::Call {
-                        result: None,
-                        callee: HirCallable::Intrinsic(*intrinsic),
-                        args: args.clone(),
-                        type_args: vec![],
-                        const_args: vec![],
-                        is_tail: false,
-                    }
-                }
-                CleanupAction::Drop { value } => {
-                    HirInstruction::Call {
-                        result: None,
-                        callee: HirCallable::Intrinsic(Intrinsic::Drop),
-                        args: vec![*value],
-                        type_args: vec![],
-                        const_args: vec![],
-                        is_tail: false,
-                    }
-                }
-            }
-        }).collect()
+        actions
+            .iter()
+            .map(|action| match action {
+                CleanupAction::CallDestructor { value, destructor } => HirInstruction::Call {
+                    result: None,
+                    callee: HirCallable::Function(*destructor),
+                    args: vec![*value],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+                CleanupAction::CallIntrinsic { intrinsic, args } => HirInstruction::Call {
+                    result: None,
+                    callee: HirCallable::Intrinsic(*intrinsic),
+                    args: args.clone(),
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+                CleanupAction::Drop { value } => HirInstruction::Call {
+                    result: None,
+                    callee: HirCallable::Intrinsic(Intrinsic::Drop),
+                    args: vec![*value],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+            })
+            .collect()
     }
 
     /// Insert cleanup instructions into a function
     pub fn insert_cleanup(&mut self, func: &mut HirFunction) -> CompilerResult<()> {
-        eprintln!("[CLEANUP] Inserting cleanup for function '{}'",
-                  func.name.resolve_global().unwrap_or_else(|| "?".to_string()));
+        eprintln!(
+            "[CLEANUP] Inserting cleanup for function '{}'",
+            func.name
+                .resolve_global()
+                .unwrap_or_else(|| "?".to_string())
+        );
 
         // Track all values that need cleanup
         for (value_id, value) in &func.values {
@@ -954,14 +979,18 @@ impl UnifiedCleanupManager {
         for (block_id, block) in &func.blocks {
             if matches!(block.terminator, HirTerminator::Return { .. }) {
                 // Get cleanup for pending values
-                let cleanup_actions: Vec<CleanupAction> = self.pending_cleanup
+                let cleanup_actions: Vec<CleanupAction> = self
+                    .pending_cleanup
                     .iter()
                     .rev()
                     .filter_map(|&value| {
                         if let Some(val) = func.values.get(&value) {
                             if self.needs_cleanup(&val.ty) {
                                 if let Some(destructor) = self.custom_destructors.get(&val.ty) {
-                                    Some(CleanupAction::CallDestructor { value, destructor: *destructor })
+                                    Some(CleanupAction::CallDestructor {
+                                        value,
+                                        destructor: *destructor,
+                                    })
                                 } else {
                                     Some(CleanupAction::Drop { value })
                                 }
@@ -975,7 +1004,8 @@ impl UnifiedCleanupManager {
                     .collect();
 
                 if !cleanup_actions.is_empty() {
-                    cleanup_sequences.insert(*block_id, self.actions_to_instructions(&cleanup_actions));
+                    cleanup_sequences
+                        .insert(*block_id, self.actions_to_instructions(&cleanup_actions));
                 }
             }
         }
@@ -1010,40 +1040,40 @@ pub fn convert_linearity_kind(typed_ast_linearity: &str) -> HirLinearityKind {
 mod tests {
     use super::*;
     use zyntax_typed_ast::arena::AstArena;
-    
+
     fn create_test_arena() -> AstArena {
         AstArena::new()
     }
-    
+
     fn intern_str(arena: &mut AstArena, s: &str) -> zyntax_typed_ast::InternedString {
         arena.intern_string(s)
     }
-    
+
     #[test]
     fn test_arc_manager_creation() {
         let arc_manager = ARCManager::new();
         assert!(arc_manager.arc_functions.is_empty());
         assert!(arc_manager.arc_types.is_empty());
     }
-    
+
     #[test]
     fn test_drop_manager_creation() {
         let drop_manager = DropManager::new();
         assert!(drop_manager.drop_types.is_empty());
         assert!(drop_manager.needs_drop.is_empty());
     }
-    
+
     #[test]
     fn test_escape_analysis_creation() {
         let escape_analysis = EscapeAnalysis::new();
         assert!(escape_analysis.results.is_empty());
     }
-    
+
     #[test]
     fn test_memory_context_allocation_tracking() {
         let mut ctx = MemoryContext::new(MemoryStrategy::ARC);
         let value_id = HirId::new();
-        
+
         let alloc_info = AllocationInfo {
             ty: HirType::I32,
             size: Some(4),
@@ -1051,35 +1081,38 @@ mod tests {
             is_stack: false,
             location: None,
         };
-        
+
         ctx.track_allocation(value_id, alloc_info);
-        
+
         assert!(ctx.allocations.contains_key(&value_id));
         assert!(ctx.ref_counts.contains_key(&value_id));
         assert_eq!(ctx.ref_counts[&value_id].count, 1);
     }
-    
+
     #[test]
     fn test_reference_counting() {
         let mut ctx = MemoryContext::new(MemoryStrategy::ARC);
         let value_id = HirId::new();
-        
-        ctx.track_allocation(value_id, AllocationInfo {
-            ty: HirType::I32,
-            size: Some(4),
-            align: 4,
-            is_stack: false,
-            location: None,
-        });
-        
+
+        ctx.track_allocation(
+            value_id,
+            AllocationInfo {
+                ty: HirType::I32,
+                size: Some(4),
+                align: 4,
+                is_stack: false,
+                location: None,
+            },
+        );
+
         // Test retain
         ctx.retain(value_id);
         assert_eq!(ctx.ref_counts[&value_id].count, 2);
-        
+
         // Test release
         ctx.release(value_id);
         assert_eq!(ctx.ref_counts[&value_id].count, 1);
-        
+
         // Test release to zero
         ctx.release(value_id);
         assert_eq!(ctx.ref_counts[&value_id].count, 0);

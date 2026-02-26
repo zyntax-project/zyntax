@@ -24,7 +24,11 @@ pub const STRING_HEADER_SIZE: usize = std::mem::size_of::<i32>();
 /// The pointer must be valid and point to a valid string header.
 #[inline]
 pub unsafe fn string_length(ptr: StringConstPtr) -> i32 {
-    if ptr.is_null() { 0 } else { *ptr }
+    if ptr.is_null() {
+        0
+    } else {
+        *ptr
+    }
 }
 
 /// Get pointer to UTF-8 bytes from a string pointer
@@ -79,11 +83,7 @@ pub fn string_new(s: &str) -> StringPtr {
 
         // Write string bytes
         if !s.is_empty() {
-            std::ptr::copy_nonoverlapping(
-                s.as_ptr(),
-                string_data_mut(ptr),
-                s.len(),
-            );
+            std::ptr::copy_nonoverlapping(s.as_ptr(), string_data_mut(ptr), s.len());
         }
 
         ptr
@@ -106,11 +106,7 @@ pub fn string_from_bytes(bytes: &[u8]) -> StringPtr {
         *ptr = len;
 
         if !bytes.is_empty() {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                string_data_mut(ptr),
-                bytes.len(),
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), string_data_mut(ptr), bytes.len());
         }
 
         ptr

@@ -208,7 +208,9 @@ impl TypedExpressionConverter {
                 is_async,
                 ..
             } => {
-                use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind, ParamInfo, PrimitiveType};
+                use zyntax_typed_ast::{
+                    AsyncKind, CallingConvention, NullabilityKind, ParamInfo, PrimitiveType,
+                };
 
                 // Extract function signature
                 let param_infos: Vec<ParamInfo> = params
@@ -668,7 +670,12 @@ impl TypedExpressionConverter {
                 let ty = match &symbol.kind {
                     SemanticSymbolKind::Attribute { declared_type, .. } => {
                         // Extract the field's declared type
-                        symbol_extractor.convert_intermediate_type(declared_type, symbol_library, type_registry, arena)?
+                        symbol_extractor.convert_intermediate_type(
+                            declared_type,
+                            symbol_library,
+                            type_registry,
+                            arena,
+                        )?
                     }
                     SemanticSymbolKind::Property { resolved, .. } => {
                         // Property that may or may not be resolved
@@ -678,15 +685,26 @@ impl TypedExpressionConverter {
                                 // Recursively extract the type from the resolved symbol
                                 match &resolved_symbol.kind {
                                     SemanticSymbolKind::Attribute { declared_type, .. } => {
-                                        symbol_extractor.convert_intermediate_type(declared_type, symbol_library, type_registry, arena)?
+                                        symbol_extractor.convert_intermediate_type(
+                                            declared_type,
+                                            symbol_library,
+                                            type_registry,
+                                            arena,
+                                        )?
                                     }
                                     _ => {
                                         // Fall back to inferred type
-                                        self.convert_evaluated_type(&access_expr.inferred_type, symbol_library)?
+                                        self.convert_evaluated_type(
+                                            &access_expr.inferred_type,
+                                            symbol_library,
+                                        )?
                                     }
                                 }
                             } else {
-                                self.convert_evaluated_type(&access_expr.inferred_type, symbol_library)?
+                                self.convert_evaluated_type(
+                                    &access_expr.inferred_type,
+                                    symbol_library,
+                                )?
                             }
                         } else {
                             // Property not resolved yet, need to resolve it manually
@@ -694,16 +712,27 @@ impl TypedExpressionConverter {
                             if let Type::Named { id, .. } = &object.ty {
                                 if let Some(type_def) = type_registry.get_type_by_id(*id) {
                                     // Find the field with matching name
-                                    if let Some(field) = type_def.fields.iter().find(|f| f.name == name) {
+                                    if let Some(field) =
+                                        type_def.fields.iter().find(|f| f.name == name)
+                                    {
                                         field.ty.clone()
                                     } else {
-                                        self.convert_evaluated_type(&access_expr.inferred_type, symbol_library)?
+                                        self.convert_evaluated_type(
+                                            &access_expr.inferred_type,
+                                            symbol_library,
+                                        )?
                                     }
                                 } else {
-                                    self.convert_evaluated_type(&access_expr.inferred_type, symbol_library)?
+                                    self.convert_evaluated_type(
+                                        &access_expr.inferred_type,
+                                        symbol_library,
+                                    )?
                                 }
                             } else {
-                                self.convert_evaluated_type(&access_expr.inferred_type, symbol_library)?
+                                self.convert_evaluated_type(
+                                    &access_expr.inferred_type,
+                                    symbol_library,
+                                )?
                             }
                         }
                     }
@@ -841,9 +870,12 @@ impl TypedExpressionConverter {
         // Infer result type based on operator
         let ty = match op {
             // Comparison operators always return Bool
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-                Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool)
-            }
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool),
             // Arithmetic operators return the type of operands (if both are same)
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                 // If both operands have the same type, use that type
@@ -855,11 +887,13 @@ impl TypedExpressionConverter {
                 }
             }
             // Logical operators return Bool
-            BinaryOp::And | BinaryOp::Or => {
-                Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool)
-            }
+            BinaryOp::And | BinaryOp::Or => Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool),
             // Bitwise operators return the type of operands
-            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
                 if left.ty == right.ty {
                     left.ty.clone()
                 } else {
@@ -867,13 +901,9 @@ impl TypedExpressionConverter {
                 }
             }
             // Assignment returns the type of the right side (the value being assigned)
-            BinaryOp::Assign => {
-                right.ty.clone()
-            }
+            BinaryOp::Assign => right.ty.clone(),
             // Zig error handling operators - return the type of the right side (default value)
-            BinaryOp::Orelse | BinaryOp::Catch => {
-                right.ty.clone()
-            }
+            BinaryOp::Orelse | BinaryOp::Catch => right.ty.clone(),
         };
         let span = Span::default();
 
@@ -1396,8 +1426,6 @@ impl TypedExpressionConverter {
             AssignOperator::MinusAssign => BinaryOp::Sub,
         })
     }
-
-    
 }
 
 impl Default for TypedExpressionConverter {

@@ -154,18 +154,66 @@ impl TypeTag {
     // Pre-defined type tags
     pub const VOID: Self = Self::new(TypeCategory::Void, 0, TypeFlags::NONE);
     pub const BOOL: Self = Self::new(TypeCategory::Bool, 0, TypeFlags::NONE);
-    pub const I8: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits8 as u16, TypeFlags::NONE);
-    pub const I16: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits16 as u16, TypeFlags::NONE);
-    pub const I32: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits32 as u16, TypeFlags::NONE);
-    pub const I64: Self = Self::new(TypeCategory::Int, PrimitiveSize::Bits64 as u16, TypeFlags::NONE);
-    pub const ISIZE: Self = Self::new(TypeCategory::Int, PrimitiveSize::Pointer as u16, TypeFlags::NONE);
-    pub const U8: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits8 as u16, TypeFlags::NONE);
-    pub const U16: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits16 as u16, TypeFlags::NONE);
-    pub const U32: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits32 as u16, TypeFlags::NONE);
-    pub const U64: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Bits64 as u16, TypeFlags::NONE);
-    pub const USIZE: Self = Self::new(TypeCategory::UInt, PrimitiveSize::Pointer as u16, TypeFlags::NONE);
-    pub const F32: Self = Self::new(TypeCategory::Float, PrimitiveSize::Bits32 as u16, TypeFlags::NONE);
-    pub const F64: Self = Self::new(TypeCategory::Float, PrimitiveSize::Bits64 as u16, TypeFlags::NONE);
+    pub const I8: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits8 as u16,
+        TypeFlags::NONE,
+    );
+    pub const I16: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits16 as u16,
+        TypeFlags::NONE,
+    );
+    pub const I32: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    );
+    pub const I64: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    );
+    pub const ISIZE: Self = Self::new(
+        TypeCategory::Int,
+        PrimitiveSize::Pointer as u16,
+        TypeFlags::NONE,
+    );
+    pub const U8: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits8 as u16,
+        TypeFlags::NONE,
+    );
+    pub const U16: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits16 as u16,
+        TypeFlags::NONE,
+    );
+    pub const U32: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    );
+    pub const U64: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    );
+    pub const USIZE: Self = Self::new(
+        TypeCategory::UInt,
+        PrimitiveSize::Pointer as u16,
+        TypeFlags::NONE,
+    );
+    pub const F32: Self = Self::new(
+        TypeCategory::Float,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    );
+    pub const F64: Self = Self::new(
+        TypeCategory::Float,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    );
     pub const STRING: Self = Self::new(TypeCategory::String, 0, TypeFlags::NONE);
 }
 
@@ -330,7 +378,8 @@ static META_I32: TypeMeta = TypeMeta::primitive(TypeId::I32, 4);
 static META_I64: TypeMeta = TypeMeta::primitive(TypeId::I64, 8);
 static META_F32: TypeMeta = TypeMeta::primitive(TypeId::F32, 4);
 static META_F64: TypeMeta = TypeMeta::primitive(TypeId::F64, 8);
-static META_STRING: TypeMeta = TypeMeta::primitive(TypeId::STRING, std::mem::size_of::<String>() as u32);
+static META_STRING: TypeMeta =
+    TypeMeta::primitive(TypeId::STRING, std::mem::size_of::<String>() as u32);
 
 impl DynamicValue {
     /// Create a null dynamic value
@@ -935,7 +984,11 @@ impl ZrtlPlugin {
 
         // Verify extension
         let ext = path.extension().and_then(OsStr::to_str);
-        if ext != Some(ZRTL_EXTENSION) && ext != Some("so") && ext != Some("dylib") && ext != Some("dll") {
+        if ext != Some(ZRTL_EXTENSION)
+            && ext != Some("so")
+            && ext != Some("dylib")
+            && ext != Some("dll")
+        {
             log::warn!(
                 "ZRTL plugin '{}' has unexpected extension (expected .{})",
                 path.display(),
@@ -945,11 +998,10 @@ impl ZrtlPlugin {
 
         unsafe {
             // Load the dynamic library
-            let library = libloading::Library::new(path)
-                .map_err(|e| ZrtlError::LoadFailed {
-                    path: path.to_path_buf(),
-                    reason: e.to_string(),
-                })?;
+            let library = libloading::Library::new(path).map_err(|e| ZrtlError::LoadFailed {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
 
             // Get plugin info
             let info_sym: libloading::Symbol<*const ZrtlInfo> = library
@@ -998,12 +1050,12 @@ impl ZrtlPlugin {
             let mut sym_ptr = *symbols_sym;
 
             while !(*sym_ptr).name.is_null() {
-                let sym_name = CStr::from_ptr((*sym_ptr).name)
-                    .to_str()
-                    .map_err(|_| ZrtlError::InvalidUtf8 {
+                let sym_name = CStr::from_ptr((*sym_ptr).name).to_str().map_err(|_| {
+                    ZrtlError::InvalidUtf8 {
                         path: path.to_path_buf(),
                         field: "symbol name".to_string(),
-                    })?;
+                    }
+                })?;
 
                 // Leak the string to get a 'static lifetime
                 // This is intentional - symbols live for the program's lifetime
@@ -1090,13 +1142,9 @@ pub enum ZrtlError {
         reason: String,
     },
     /// Plugin is missing the _zrtl_info symbol
-    MissingInfo {
-        path: std::path::PathBuf,
-    },
+    MissingInfo { path: std::path::PathBuf },
     /// Plugin is missing the _zrtl_symbols symbol
-    MissingSymbols {
-        path: std::path::PathBuf,
-    },
+    MissingSymbols { path: std::path::PathBuf },
     /// Plugin version doesn't match
     VersionMismatch {
         path: std::path::PathBuf,
@@ -1114,7 +1162,12 @@ impl std::fmt::Display for ZrtlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ZrtlError::LoadFailed { path, reason } => {
-                write!(f, "Failed to load ZRTL plugin '{}': {}", path.display(), reason)
+                write!(
+                    f,
+                    "Failed to load ZRTL plugin '{}': {}",
+                    path.display(),
+                    reason
+                )
             }
             ZrtlError::MissingInfo { path } => {
                 write!(
@@ -1130,7 +1183,11 @@ impl std::fmt::Display for ZrtlError {
                     path.display()
                 )
             }
-            ZrtlError::VersionMismatch { path, expected, found } => {
+            ZrtlError::VersionMismatch {
+                path,
+                expected,
+                found,
+            } => {
                 write!(
                     f,
                     "ZRTL plugin '{}' version mismatch: expected {}, found {}",
@@ -1255,8 +1312,8 @@ pub struct ZrtlClosureRepr {
 /// DynamicBox layout (must match sdk/zrtl/src/dynamic_box.rs)
 #[repr(C)]
 pub struct DynamicBoxRepr {
-    pub tag: u32,     // TypeTag
-    pub size: u32,    // Size in bytes
+    pub tag: u32,  // TypeTag
+    pub size: u32, // Size in bytes
     pub data: *mut u8,
     pub dropper: Option<extern "C" fn(*mut u8)>,
     pub display_fn: Option<extern "C" fn(*const u8) -> *const u8>,
@@ -1537,23 +1594,33 @@ extern "C" fn default_box_dropper(ptr: *mut u8) {
 
 // Typed droppers
 extern "C" fn drop_box_i32(ptr: *mut u8) {
-    unsafe { let _ = Box::from_raw(ptr as *mut i32); }
+    unsafe {
+        let _ = Box::from_raw(ptr as *mut i32);
+    }
 }
 
 extern "C" fn drop_box_i64(ptr: *mut u8) {
-    unsafe { let _ = Box::from_raw(ptr as *mut i64); }
+    unsafe {
+        let _ = Box::from_raw(ptr as *mut i64);
+    }
 }
 
 extern "C" fn drop_box_f32(ptr: *mut u8) {
-    unsafe { let _ = Box::from_raw(ptr as *mut f32); }
+    unsafe {
+        let _ = Box::from_raw(ptr as *mut f32);
+    }
 }
 
 extern "C" fn drop_box_f64(ptr: *mut u8) {
-    unsafe { let _ = Box::from_raw(ptr as *mut f64); }
+    unsafe {
+        let _ = Box::from_raw(ptr as *mut f64);
+    }
 }
 
 extern "C" fn drop_box_u8(ptr: *mut u8) {
-    unsafe { let _ = Box::from_raw(ptr); }
+    unsafe {
+        let _ = Box::from_raw(ptr);
+    }
 }
 
 /// Get the TypeTag for a HIR type

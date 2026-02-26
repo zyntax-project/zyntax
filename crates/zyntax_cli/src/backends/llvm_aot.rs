@@ -28,12 +28,12 @@ const LIBRARY_SEARCH_PATHS: &[&str] = &[
 ];
 
 #[cfg(all(feature = "llvm-backend", target_os = "windows"))]
-const LIBRARY_SEARCH_PATHS: &[&str] = &[
-    "C:\\Windows\\System32",
-    "C:\\Program Files\\Common Files",
-];
+const LIBRARY_SEARCH_PATHS: &[&str] = &["C:\\Windows\\System32", "C:\\Program Files\\Common Files"];
 
-#[cfg(all(feature = "llvm-backend", not(any(target_os = "macos", target_os = "linux", target_os = "windows"))))]
+#[cfg(all(
+    feature = "llvm-backend",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
 const LIBRARY_SEARCH_PATHS: &[&str] = &["/usr/local/lib", "/usr/lib"];
 
 /// Resolve a library path, searching standard locations if needed
@@ -58,17 +58,14 @@ fn resolve_library_path(lib: &Path, verbose: bool) -> Option<PathBuf> {
         vec![lib_name.to_string()]
     } else if lib_name.ends_with(".a") || lib_name.ends_with(".lib") {
         // Has extension but no lib prefix
-        vec![
-            lib_name.to_string(),
-            format!("lib{}", lib_name),
-        ]
+        vec![lib_name.to_string(), format!("lib{}", lib_name)]
     } else {
         // Bare name - try common conventions
         vec![
-            format!("lib{}.a", lib_name),    // Unix: libfoo.a
-            format!("{}.lib", lib_name),      // Windows: foo.lib
-            format!("{}.a", lib_name),        // Alternative: foo.a
-            lib_name.to_string(),             // Exact name
+            format!("lib{}.a", lib_name), // Unix: libfoo.a
+            format!("{}.lib", lib_name),  // Windows: foo.lib
+            format!("{}.a", lib_name),    // Alternative: foo.a
+            lib_name.to_string(),         // Exact name
         ]
     };
 
@@ -155,8 +152,8 @@ pub fn compile_llvm(
 
     // Get target triple for the host machine
     let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple)
-        .map_err(|e| format!("Failed to get target: {}", e))?;
+    let target =
+        Target::from_triple(&triple).map_err(|e| format!("Failed to get target: {}", e))?;
 
     // Map optimization level
     let llvm_opt = match opt_level {
@@ -227,12 +224,17 @@ pub fn compile_llvm(
             let lib_str = lib_path.to_string_lossy();
             if !lib_str.starts_with('-') {
                 // Pass as -l flag for the linker to search
-                let lib_name = lib_path.file_stem()
+                let lib_name = lib_path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .map(|s| s.strip_prefix("lib").unwrap_or(s))
                     .unwrap_or(&lib_str);
                 if verbose {
-                    info!("Library '{}' not found, passing -l{} to linker", lib_path.display(), lib_name);
+                    info!(
+                        "Library '{}' not found, passing -l{} to linker",
+                        lib_path.display(),
+                        lib_name
+                    );
                 }
                 linker.arg(format!("-l{}", lib_name));
             } else {
@@ -248,7 +250,11 @@ pub fn compile_llvm(
             info!("For AOT with runtime support, use: --lib <library>");
         }
     } else if verbose {
-        info!("Resolved {} of {} libraries", resolved_count, static_libs.len());
+        info!(
+            "Resolved {} of {} libraries",
+            resolved_count,
+            static_libs.len()
+        );
     }
 
     let status = linker
@@ -318,7 +324,10 @@ pub fn compile_and_run_llvm(
     }
 
     if verbose {
-        info!("Loaded {} runtime symbols from zpacks", runtime_symbols.len());
+        info!(
+            "Loaded {} runtime symbols from zpacks",
+            runtime_symbols.len()
+        );
         for (name, _) in &runtime_symbols {
             debug!("  - {}", name);
         }

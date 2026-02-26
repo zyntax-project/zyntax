@@ -3,7 +3,7 @@
 //! These tests verify that functions can be exported from one module
 //! and called from another module via extern declarations.
 
-use zyntax_embed::{ZyntaxRuntime, LanguageGrammar, RuntimeError, NativeType, NativeSignature};
+use zyntax_embed::{LanguageGrammar, NativeSignature, NativeType, RuntimeError, ZyntaxRuntime};
 
 /// The Zig grammar source (embedded at compile time)
 const ZIG_GRAMMAR_SOURCE: &str = include_str!("../../zyn_peg/grammars/zig.zyn");
@@ -28,22 +28,32 @@ fn test_single_module_function_call() {
     runtime.register_grammar("zig", grammar);
 
     // Note: The zig.zyn grammar doesn't have a `pub` modifier, just `fn`
-    let functions = runtime.load_module("zig", r#"
+    let functions = runtime
+        .load_module(
+            "zig",
+            r#"
 fn add(a: i32, b: i32) i32 {
     return a + b;
 }
-    "#).expect("Failed to load module");
+    "#,
+        )
+        .expect("Failed to load module");
 
     // Debug: print all function names
     println!("Loaded functions: {:?}", functions);
     println!("All runtime functions: {:?}", runtime.functions());
 
     // All functions are tracked (may have multiple due to compiler internals)
-    assert!(!functions.is_empty(), "Should have at least one function: got {:?}", functions);
+    assert!(
+        !functions.is_empty(),
+        "Should have at least one function: got {:?}",
+        functions
+    );
 
     // Use native calling for JIT-compiled functions with signature
     let sig = NativeSignature::new(&[NativeType::I32, NativeType::I32], NativeType::I32);
-    let result = runtime.call_function("add", &[10.into(), 32.into()], &sig)
+    let result = runtime
+        .call_function("add", &[10.into(), 32.into()], &sig)
         .expect("Failed to call add");
     assert_eq!(result.as_i32().unwrap(), 42);
 }
@@ -62,17 +72,24 @@ fn test_export_function_explicit() {
     runtime.register_grammar("zig", grammar);
 
     // Load module without exports
-    runtime.load_module("zig", r#"
+    runtime
+        .load_module(
+            "zig",
+            r#"
 fn square(x: i32) i32 {
     return x * x;
 }
-    "#).expect("Failed to load module");
+    "#,
+        )
+        .expect("Failed to load module");
 
     // Verify no exports yet
     assert!(runtime.exported_symbols().is_empty());
 
     // Explicitly export the function
-    runtime.export_function("square").expect("Failed to export function");
+    runtime
+        .export_function("square")
+        .expect("Failed to export function");
 
     // Verify it's now exported
     let exports = runtime.exported_symbols();
@@ -94,14 +111,20 @@ fn test_load_module_with_exports() {
     runtime.register_grammar("zig", grammar);
 
     // Load module with explicit exports
-    runtime.load_module_with_exports("zig", r#"
+    runtime
+        .load_module_with_exports(
+            "zig",
+            r#"
 fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 fn sub(a: i32, b: i32) i32 {
     return a - b;
 }
-    "#, &["add"]).expect("Failed to load module");
+    "#,
+            &["add"],
+        )
+        .expect("Failed to load module");
 
     // Only "add" should be exported
     let exports = runtime.exported_symbols();
@@ -110,11 +133,13 @@ fn sub(a: i32, b: i32) i32 {
 
     // But both functions should be callable using native calling
     let sig = NativeSignature::new(&[NativeType::I32, NativeType::I32], NativeType::I32);
-    let add_result = runtime.call_function("add", &[10.into(), 5.into()], &sig)
+    let add_result = runtime
+        .call_function("add", &[10.into(), 5.into()], &sig)
         .expect("Failed to call add");
     assert_eq!(add_result.as_i32().unwrap(), 15);
 
-    let sub_result = runtime.call_function("sub", &[10.into(), 5.into()], &sig)
+    let sub_result = runtime
+        .call_function("sub", &[10.into(), 5.into()], &sig)
         .expect("Failed to call sub");
     assert_eq!(sub_result.as_i32().unwrap(), 5);
 }
@@ -133,11 +158,17 @@ fn test_export_conflict_warning() {
     runtime.register_grammar("zig", grammar);
 
     // Load and export a function
-    runtime.load_module_with_exports("zig", r#"
+    runtime
+        .load_module_with_exports(
+            "zig",
+            r#"
 fn compute(x: i32) i32 {
     return x * 2;
 }
-    "#, &["compute"]).expect("Failed to load first module");
+    "#,
+            &["compute"],
+        )
+        .expect("Failed to load first module");
 
     // Check conflict detection
     assert!(runtime.check_export_conflict("compute").is_some());
@@ -157,11 +188,16 @@ fn test_export_nonexistent_function_error() {
     let mut runtime = ZyntaxRuntime::new().expect("Failed to create runtime");
     runtime.register_grammar("zig", grammar);
 
-    runtime.load_module("zig", r#"
+    runtime
+        .load_module(
+            "zig",
+            r#"
 fn real_fn(x: i32) i32 {
     return x;
 }
-    "#).expect("Failed to load module");
+    "#,
+        )
+        .expect("Failed to load module");
 
     // Try to export a function that doesn't exist
     let result = runtime.export_function("fake_fn");
@@ -188,11 +224,17 @@ fn test_cross_module_function_call() {
     runtime.register_grammar("zig", grammar);
 
     // Module A: Export the 'add' function
-    runtime.load_module_with_exports("zig", r#"
+    runtime
+        .load_module_with_exports(
+            "zig",
+            r#"
 fn add(a: i32, b: i32) i32 {
     return a + b;
 }
-    "#, &["add"]).expect("Failed to load module A");
+    "#,
+            &["add"],
+        )
+        .expect("Failed to load module A");
 
     // Verify the function is exported
     let exports = runtime.exported_symbols();
@@ -200,17 +242,23 @@ fn add(a: i32, b: i32) i32 {
     assert!(!exports.is_empty(), "Should have exported 'add'");
 
     // Module B: Declare extern and use it
-    runtime.load_module("zig", r#"
+    runtime
+        .load_module(
+            "zig",
+            r#"
 extern fn add(a: i32, b: i32) i32;
 
 fn double_add(a: i32, b: i32) i32 {
     return add(a, b) + add(a, b);
 }
-    "#).expect("Failed to load module B");
+    "#,
+        )
+        .expect("Failed to load module B");
 
     // Call the function that uses the extern
     let sig = NativeSignature::new(&[NativeType::I32, NativeType::I32], NativeType::I32);
-    let result = runtime.call_function("double_add", &[5.into(), 3.into()], &sig)
+    let result = runtime
+        .call_function("double_add", &[5.into(), 3.into()], &sig)
         .expect("Failed to call double_add");
     assert_eq!(result.as_i32().unwrap(), 16); // (5+3) + (5+3) = 16
 }

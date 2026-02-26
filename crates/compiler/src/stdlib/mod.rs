@@ -1,3 +1,8 @@
+pub mod async_runtime; // Async runtime types (Future trait, Poll enum, Context)
+pub mod hashmap; // HashMap<K,V> with hash functions
+pub mod io;
+pub mod iterator; // Iterator-style functions (vec_for_each)
+pub mod memory;
 /// Standard Library for Zyntax
 ///
 /// This module contains the standard library implementation built using the HIR Builder API.
@@ -9,22 +14,16 @@
 /// - Fast compilation
 /// - Version-controlled as Rust code
 /// - Easy to test and maintain
-
 pub mod option;
 pub mod result;
-pub mod memory;
-pub mod vec;     // Generic Vec<T> with monomorphization support
-pub mod vec_i32; // Performance-optimized concrete vec_i32
+pub mod string; // UTF-8 string type backed by vec_u8
+pub mod vec; // Generic Vec<T> with monomorphization support
 pub mod vec_f64; // Performance-optimized concrete vec_f64
-pub mod vec_u8;  // Performance-optimized concrete vec_u8 (byte buffers)
-pub mod string;  // UTF-8 string type backed by vec_u8
-pub mod iterator; // Iterator-style functions (vec_for_each)
-pub mod hashmap;  // HashMap<K,V> with hash functions
-pub mod async_runtime; // Async runtime types (Future trait, Poll enum, Context)
-pub mod io;      // I/O functions (printf, println, etc.)
+pub mod vec_i32; // Performance-optimized concrete vec_i32
+pub mod vec_u8; // Performance-optimized concrete vec_u8 (byte buffers) // I/O functions (printf, println, etc.)
 
-use crate::hir_builder::HirBuilder;
 use crate::hir::HirModule;
+use crate::hir_builder::HirBuilder;
 use zyntax_typed_ast::AstArena;
 
 /// Builds the complete standard library as a HIR module
@@ -50,9 +49,9 @@ pub fn build_stdlib(arena: &mut AstArena) -> HirModule {
     vec::build_vec_type(&mut builder);
 
     // Build concrete vec types (performance-optimized for specific types)
-    vec_i32::build_vec_i32_type(&mut builder);  // Integers
-    vec_f64::build_vec_f64_type(&mut builder);  // Floats
-    vec_u8::build_vec_u8_type(&mut builder);    // Byte buffers
+    vec_i32::build_vec_i32_type(&mut builder); // Integers
+    vec_f64::build_vec_f64_type(&mut builder); // Floats
+    vec_u8::build_vec_u8_type(&mut builder); // Byte buffers
 
     // Build String type (UTF-8 strings backed by vec_u8)
     string::build_string_type(&mut builder);
@@ -86,9 +85,6 @@ mod tests {
         assert!(!stdlib.functions.is_empty());
 
         // Module should be named "std"
-        assert_eq!(
-            arena.resolve_string(stdlib.name),
-            Some("std")
-        );
+        assert_eq!(arena.resolve_string(stdlib.name), Some("std"));
     }
 }

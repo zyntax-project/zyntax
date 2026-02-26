@@ -1,16 +1,10 @@
 //! Pattern matching tests for Phase 4 implementation
 
-use zyntax_compiler::{
-    hir::*,
-    PatternMatchCompiler, DecisionNode, check_exhaustiveness,
-    LoweringContext,
-};
-use zyntax_typed_ast::{
-    arena::AstArena,
-    typed_ast::*,
-    TypeRegistry, Type,
-};
 use std::sync::{Arc, Mutex};
+use zyntax_compiler::{
+    check_exhaustiveness, hir::*, DecisionNode, LoweringContext, PatternMatchCompiler,
+};
+use zyntax_typed_ast::{arena::AstArena, typed_ast::*, Type, TypeRegistry};
 
 fn create_test_arena() -> AstArena {
     AstArena::new()
@@ -24,33 +18,40 @@ fn intern_str(arena: &mut AstArena, s: &str) -> zyntax_typed_ast::InternedString
 fn test_simple_constant_pattern_match() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
     let target1 = HirId::new();
     let target2 = HirId::new();
-    
+
     // Pattern for constant 42
     let pattern1 = HirPattern {
         kind: HirPatternKind::Constant(HirConstant::I32(42)),
         target: target1,
         bindings: vec![],
     };
-    
+
     // Pattern for constant 24
     let pattern2 = HirPattern {
         kind: HirPatternKind::Constant(HirConstant::I32(24)),
         target: target2,
         bindings: vec![],
     };
-    
+
     let patterns = vec![pattern1, pattern2];
     let default_target = Some(HirId::new());
-    
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, default_target).unwrap();
-    
+
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, default_target)
+        .unwrap();
+
     // Verify the decision tree structure
     match decision_tree {
-        DecisionNode::ConstantTest { value, constant, success: _, failure: _ } => {
+        DecisionNode::ConstantTest {
+            value,
+            constant,
+            success: _,
+            failure: _,
+        } => {
             assert_eq!(value, scrutinee);
             assert_eq!(constant, HirConstant::I32(42));
         }
@@ -62,11 +63,11 @@ fn test_simple_constant_pattern_match() {
 fn test_union_variant_pattern_match() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
     let target1 = HirId::new();
     let target2 = HirId::new();
-    
+
     // Create a union type
     let union_ty = HirUnionType {
         name: Some(intern_str(&mut arena, "Option")),
@@ -85,7 +86,7 @@ fn test_union_variant_pattern_match() {
         discriminant_type: Box::new(HirType::U32),
         is_c_union: false,
     };
-    
+
     // Pattern for None variant
     let pattern1 = HirPattern {
         kind: HirPatternKind::UnionVariant {
@@ -96,7 +97,7 @@ fn test_union_variant_pattern_match() {
         target: target1,
         bindings: vec![],
     };
-    
+
     // Pattern for Some variant
     let pattern2 = HirPattern {
         kind: HirPatternKind::UnionVariant {
@@ -107,14 +108,21 @@ fn test_union_variant_pattern_match() {
         target: target2,
         bindings: vec![],
     };
-    
+
     let patterns = vec![pattern1, pattern2];
-    
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
-    
+
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
+
     // Verify the decision tree structure
     match decision_tree {
-        DecisionNode::UnionTest { value, variant_index, success: _, failure: _ } => {
+        DecisionNode::UnionTest {
+            value,
+            variant_index,
+            success: _,
+            failure: _,
+        } => {
             assert_eq!(value, scrutinee);
             assert_eq!(variant_index, 0); // First variant tested
         }
@@ -126,24 +134,29 @@ fn test_union_variant_pattern_match() {
 fn test_wildcard_pattern_match() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
     let target = HirId::new();
-    
+
     // Wildcard pattern that matches anything
     let pattern = HirPattern {
         kind: HirPatternKind::Wildcard,
         target,
         bindings: vec![],
     };
-    
+
     let patterns = vec![pattern];
-    
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
-    
+
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
+
     // Wildcard should create a success node
     match decision_tree {
-        DecisionNode::Success { target: success_target, bindings } => {
+        DecisionNode::Success {
+            target: success_target,
+            bindings,
+        } => {
             assert_eq!(success_target, target);
             assert!(bindings.is_empty());
         }
@@ -155,11 +168,11 @@ fn test_wildcard_pattern_match() {
 fn test_binding_pattern() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
     let target = HirId::new();
     let var_name = intern_str(&mut arena, "x");
-    
+
     // Binding pattern
     let pattern = HirPattern {
         kind: HirPatternKind::Binding(var_name),
@@ -170,14 +183,19 @@ fn test_binding_pattern() {
             ty: HirType::I32,
         }],
     };
-    
+
     let patterns = vec![pattern];
-    
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
-    
+
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
+
     // Binding should create a success node with bindings
     match decision_tree {
-        DecisionNode::Success { target: success_target, bindings } => {
+        DecisionNode::Success {
+            target: success_target,
+            bindings,
+        } => {
             assert_eq!(success_target, target);
             assert_eq!(bindings.len(), 1);
             assert_eq!(bindings[0].name, var_name);
@@ -189,31 +207,31 @@ fn test_binding_pattern() {
 #[test]
 fn test_exhaustiveness_checking_bool() {
     let mut arena = create_test_arena();
-    
+
     // Test exhaustive bool patterns (true + false)
     let true_pattern = HirPattern {
         kind: HirPatternKind::Constant(HirConstant::Bool(true)),
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let false_pattern = HirPattern {
         kind: HirPatternKind::Constant(HirConstant::Bool(false)),
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let patterns = vec![true_pattern, false_pattern];
     let is_exhaustive = check_exhaustiveness(&patterns, &HirType::Bool).unwrap();
     assert!(is_exhaustive);
-    
+
     // Test non-exhaustive bool patterns (only true)
     let true_only = vec![HirPattern {
         kind: HirPatternKind::Constant(HirConstant::Bool(true)),
         target: HirId::new(),
         bindings: vec![],
     }];
-    
+
     let is_exhaustive = check_exhaustiveness(&true_only, &HirType::Bool).unwrap();
     assert!(!is_exhaustive);
 }
@@ -221,7 +239,7 @@ fn test_exhaustiveness_checking_bool() {
 #[test]
 fn test_exhaustiveness_checking_union() {
     let mut arena = create_test_arena();
-    
+
     // Create a union type with 3 variants
     let union_ty = HirUnionType {
         name: Some(intern_str(&mut arena, "Color")),
@@ -245,9 +263,9 @@ fn test_exhaustiveness_checking_union() {
         discriminant_type: Box::new(HirType::U32),
         is_c_union: false,
     };
-    
+
     let union_type = HirType::Union(Box::new(union_ty.clone()));
-    
+
     // Test exhaustive patterns (all 3 variants)
     let red_pattern = HirPattern {
         kind: HirPatternKind::UnionVariant {
@@ -258,7 +276,7 @@ fn test_exhaustiveness_checking_union() {
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let green_pattern = HirPattern {
         kind: HirPatternKind::UnionVariant {
             union_ty: union_type.clone(),
@@ -268,7 +286,7 @@ fn test_exhaustiveness_checking_union() {
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let blue_pattern = HirPattern {
         kind: HirPatternKind::UnionVariant {
             union_ty: union_type.clone(),
@@ -278,11 +296,11 @@ fn test_exhaustiveness_checking_union() {
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let all_patterns = vec![red_pattern, green_pattern, blue_pattern];
     let is_exhaustive = check_exhaustiveness(&all_patterns, &union_type).unwrap();
     assert!(is_exhaustive);
-    
+
     // Test non-exhaustive patterns (only 2 variants)
     let partial_patterns = vec![
         HirPattern {
@@ -304,7 +322,7 @@ fn test_exhaustiveness_checking_union() {
             bindings: vec![],
         },
     ];
-    
+
     let is_exhaustive = check_exhaustiveness(&partial_patterns, &union_type).unwrap();
     assert!(!is_exhaustive);
 }
@@ -312,7 +330,7 @@ fn test_exhaustiveness_checking_union() {
 #[test]
 fn test_exhaustiveness_with_wildcard() {
     let mut arena = create_test_arena();
-    
+
     // Create a union type
     let union_ty = HirUnionType {
         name: Some(intern_str(&mut arena, "Result")),
@@ -331,9 +349,9 @@ fn test_exhaustiveness_with_wildcard() {
         discriminant_type: Box::new(HirType::U32),
         is_c_union: false,
     };
-    
+
     let union_type = HirType::Union(Box::new(union_ty));
-    
+
     // Test patterns with wildcard (should be exhaustive)
     let ok_pattern = HirPattern {
         kind: HirPatternKind::UnionVariant {
@@ -344,13 +362,13 @@ fn test_exhaustiveness_with_wildcard() {
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let wildcard_pattern = HirPattern {
         kind: HirPatternKind::Wildcard,
         target: HirId::new(),
         bindings: vec![],
     };
-    
+
     let patterns_with_wildcard = vec![ok_pattern, wildcard_pattern];
     let is_exhaustive = check_exhaustiveness(&patterns_with_wildcard, &union_type).unwrap();
     assert!(is_exhaustive);
@@ -360,18 +378,18 @@ fn test_exhaustiveness_with_wildcard() {
 fn test_guard_pattern_compilation() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
     let condition = HirId::new();
     let target = HirId::new();
-    
+
     // Create a guard pattern
     let inner_pattern = HirPattern {
         kind: HirPatternKind::Binding(intern_str(&mut arena, "x")),
         target,
         bindings: vec![],
     };
-    
+
     let guard_pattern = HirPattern {
         kind: HirPatternKind::Guard {
             pattern: Box::new(inner_pattern),
@@ -380,12 +398,14 @@ fn test_guard_pattern_compilation() {
         target,
         bindings: vec![],
     };
-    
+
     let patterns = vec![guard_pattern];
-    
+
     // Guard patterns should compile (though implementation is basic)
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
-    
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
+
     // Should create some form of decision tree
     match decision_tree {
         DecisionNode::Success { .. } => {
@@ -399,17 +419,17 @@ fn test_guard_pattern_compilation() {
 fn test_struct_pattern_basic() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
     let target = HirId::new();
-    
+
     // Create a struct type
     let struct_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Point")),
         fields: vec![HirType::I32, HirType::I32], // x, y
         packed: false,
     };
-    
+
     // Create a struct pattern (basic implementation)
     let struct_pattern = HirPattern {
         kind: HirPatternKind::Struct {
@@ -419,12 +439,14 @@ fn test_struct_pattern_basic() {
         target,
         bindings: vec![],
     };
-    
+
     let patterns = vec![struct_pattern];
-    
+
     // Should compile without errors
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
-    
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
+
     // Basic struct pattern should create a success node for now
     match decision_tree {
         DecisionNode::Success { .. } => {
@@ -434,13 +456,13 @@ fn test_struct_pattern_basic() {
     }
 }
 
-#[test] 
+#[test]
 fn test_complex_pattern_combinations() {
     let mut arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
-    
+
     let scrutinee = HirId::new();
-    
+
     // Create multiple patterns of different types
     let patterns = vec![
         // Constant pattern
@@ -449,7 +471,7 @@ fn test_complex_pattern_combinations() {
             target: HirId::new(),
             bindings: vec![],
         },
-        // Constant pattern 
+        // Constant pattern
         HirPattern {
             kind: HirPatternKind::Constant(HirConstant::I32(1)),
             target: HirId::new(),
@@ -462,8 +484,10 @@ fn test_complex_pattern_combinations() {
             bindings: vec![],
         },
     ];
-    
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
+
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
 
     // Should create a constant test for the first constant
     match decision_tree {
@@ -517,7 +541,9 @@ fn test_struct_pattern_with_field_destructuring() {
     let patterns = vec![struct_pattern];
 
     // Should compile without errors
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
 
     // Struct pattern should create a StructTest node
     match decision_tree {
@@ -573,10 +599,7 @@ fn test_struct_pattern_nested() {
                 fields: vec![HirType::I32, HirType::I32],
                 packed: false,
             }),
-            field_patterns: vec![
-                (0, start_x_pattern),
-                (1, start_y_pattern),
-            ],
+            field_patterns: vec![(0, start_x_pattern), (1, start_y_pattern)],
         },
         target,
         bindings: vec![],
@@ -603,14 +626,16 @@ fn test_struct_pattern_nested() {
     let patterns = vec![line_pattern];
 
     // Should compile without errors
-    let decision_tree = compiler.compile_pattern_match(scrutinee, &patterns, None).unwrap();
+    let decision_tree = compiler
+        .compile_pattern_match(scrutinee, &patterns, None)
+        .unwrap();
 
     // Should create a decision tree for nested structs
     // The exact structure may vary depending on optimization
     match decision_tree {
-        DecisionNode::StructTest { .. } |
-        DecisionNode::ConstantTest { .. } |
-        DecisionNode::Success { .. } => {
+        DecisionNode::StructTest { .. }
+        | DecisionNode::ConstantTest { .. }
+        | DecisionNode::Success { .. } => {
             // All are valid outcomes for this test
         }
         _ => {}
@@ -648,10 +673,7 @@ fn test_struct_pattern_with_bindings() {
     let struct_pattern = HirPattern {
         kind: HirPatternKind::Struct {
             struct_ty: HirType::Struct(struct_ty),
-            field_patterns: vec![
-                (0, x_binding),
-                (1, y_constant),
-            ],
+            field_patterns: vec![(0, x_binding), (1, y_constant)],
         },
         target,
         bindings: vec![],
@@ -661,7 +683,10 @@ fn test_struct_pattern_with_bindings() {
 
     // Should compile without errors
     let result = compiler.compile_pattern_match(scrutinee, &patterns, None);
-    assert!(result.is_ok(), "Struct pattern with bindings should compile successfully");
+    assert!(
+        result.is_ok(),
+        "Struct pattern with bindings should compile successfully"
+    );
 }
 
 #[test]
@@ -708,7 +733,10 @@ fn test_struct_pattern_partial_fields() {
 
     // Should compile without errors - missing field should be treated as wildcard
     let result = compiler.compile_pattern_match(scrutinee, &patterns, None);
-    assert!(result.is_ok(), "Struct pattern with partial fields should compile successfully");
+    assert!(
+        result.is_ok(),
+        "Struct pattern with partial fields should compile successfully"
+    );
 }
 
 #[test]

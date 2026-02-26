@@ -17,6 +17,14 @@
     entry_point: "main",
 }
 
+@imports {
+    use zyntax_typed_ast::*;
+}
+
+@context {
+    arena: AstArena,
+}
+
 // ===== Program Structure =====
 
 program = { SOI ~ decls:declarations ~ EOI }
@@ -88,6 +96,7 @@ extern_fn_decl_no_params = { "extern" ~ "fn" ~ name:identifier ~ "(" ~ ")" ~ ret
   }
 
 fn_decl = { async_fn_decl | sync_fn_decl }
+  -> TypedDeclaration { }
 
 sync_fn_decl = { fn_decl_with_params | fn_decl_no_params }
 
@@ -151,6 +160,7 @@ fn_param = { name:identifier ~ ":" ~ ty:type_expr }
 // ===== Variable Declarations =====
 
 const_decl = { const_decl_typed | const_decl_untyped }
+  -> TypedDeclaration { }
 
 const_decl_typed = { "const" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr ~ ";" }
   -> TypedDeclaration::Variable {
@@ -168,6 +178,7 @@ const_decl_untyped = { "const" ~ name:identifier ~ "=" ~ init:expr ~ ";" }
   }
 
 var_decl = { var_decl_typed | var_decl_untyped }
+  -> TypedDeclaration { }
 
 var_decl_typed = { "var" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr ~ ";" }
   -> TypedDeclaration::Variable {
@@ -376,7 +387,7 @@ index_expr = { object:atom ~ "[" ~ index:expr ~ "]" }
   }
 
 // Atom: base expressions
-atom = { try_expr | await_expr | struct_init | array_literal | bool_literal | string_literal | integer_literal | identifier_expr | paren_expr }
+atom = { try_expr | await_expr | struct_init | array_literal | bool_literal | string_literal | float_literal | integer_literal | identifier_expr | paren_expr }
 
 // Try expression
 try_expr = { "try" ~ e:primary }
@@ -427,9 +438,16 @@ identifier_expr = { name:identifier }
 
 // ===== Literals =====
 
+literal = { float_literal | integer_literal | bool_literal | string_literal }
+
 bool_literal = { "true" | "false" }
   -> TypedExpression::Literal {
       value: TypedLiteral::Bool { value: text },
+  }
+
+float_literal = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+  -> TypedExpression::Literal {
+      value: TypedLiteral::Float { value: parse_float(text) },
   }
 
 integer_literal = @{ "-"? ~ ASCII_DIGIT+ }

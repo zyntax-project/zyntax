@@ -1,13 +1,13 @@
 //! Main adapter implementation for converting Whirlwind Standpoint to TypedAST
 
 use crate::error::{AdapterError, AdapterResult};
-use crate::type_converter::TypeConverter;
 use crate::expression_converter::ExpressionConverter;
 use crate::statement_converter::StatementConverter;
-use crate::typed_expression_converter::TypedExpressionConverter;
 use crate::symbol_extractor::SymbolExtractor;
-use zyntax_typed_ast::{TypedProgram, AstArena, TypeRegistry, Type};
+use crate::type_converter::TypeConverter;
+use crate::typed_expression_converter::TypedExpressionConverter;
 use whirlwind_analyzer::Standpoint;
+use zyntax_typed_ast::{AstArena, Type, TypeRegistry, TypedProgram};
 
 /// The main adapter that converts Whirlwind's Standpoint IR to Zyntax's TypedAST
 ///
@@ -105,49 +105,75 @@ impl WhirlwindAdapter {
                 match typed_stmt {
                     TypedStmnt::FunctionDeclaration(func_decl) => {
                         // Convert function declarations
-                        if let Ok(typed_func) = self.convert_typed_function_declaration(func_decl, &standpoint.symbol_library, &standpoint.literals) {
+                        if let Ok(typed_func) = self.convert_typed_function_declaration(
+                            func_decl,
+                            &standpoint.symbol_library,
+                            &standpoint.literals,
+                        ) {
                             all_declarations.push(typed_func);
                         }
                     }
                     TypedStmnt::VariableDeclaration(var_decl) => {
                         // Convert variable declarations to top-level variables
-                        if let Ok(typed_var) = self.convert_typed_variable_declaration(var_decl, &standpoint.symbol_library, &standpoint.literals) {
+                        if let Ok(typed_var) = self.convert_typed_variable_declaration(
+                            var_decl,
+                            &standpoint.symbol_library,
+                            &standpoint.literals,
+                        ) {
                             all_declarations.push(typed_var);
                         }
                     }
                     TypedStmnt::ShorthandVariableDeclaration(short_decl) => {
                         // Convert shorthand variable declarations
-                        if let Ok(typed_var) = self.convert_typed_shorthand_variable(short_decl, &standpoint.symbol_library, &standpoint.literals) {
+                        if let Ok(typed_var) = self.convert_typed_shorthand_variable(
+                            short_decl,
+                            &standpoint.symbol_library,
+                            &standpoint.literals,
+                        ) {
                             all_declarations.push(typed_var);
                         }
                     }
                     TypedStmnt::EnumDeclaration(enum_decl) => {
                         // Convert enum declarations
-                        if let Ok(typed_enum) = self.convert_typed_enum_declaration(enum_decl, &standpoint.symbol_library) {
+                        if let Ok(typed_enum) = self
+                            .convert_typed_enum_declaration(enum_decl, &standpoint.symbol_library)
+                        {
                             all_declarations.push(typed_enum);
                         }
                     }
                     TypedStmnt::TypedTypeEquation(type_eq) => {
                         // Convert type aliases
-                        if let Ok(typed_alias) = self.convert_typed_type_equation(type_eq, &standpoint.symbol_library) {
+                        if let Ok(typed_alias) =
+                            self.convert_typed_type_equation(type_eq, &standpoint.symbol_library)
+                        {
                             all_declarations.push(typed_alias);
                         }
                     }
                     TypedStmnt::ImportDeclaration(import_decl) => {
                         // Convert import declarations
-                        if let Ok(typed_import) = self.convert_typed_import_declaration(import_decl, &standpoint.literals) {
+                        if let Ok(typed_import) =
+                            self.convert_typed_import_declaration(import_decl, &standpoint.literals)
+                        {
                             all_declarations.push(typed_import);
                         }
                     }
                     TypedStmnt::ModelDeclaration(model_decl) => {
                         // Convert class/model declarations
-                        if let Ok(typed_class) = self.convert_typed_model_declaration(model_decl, &standpoint.symbol_library, &standpoint.literals) {
+                        if let Ok(typed_class) = self.convert_typed_model_declaration(
+                            model_decl,
+                            &standpoint.symbol_library,
+                            &standpoint.literals,
+                        ) {
                             all_declarations.push(typed_class);
                         }
                     }
                     TypedStmnt::InterfaceDeclaration(interface_decl) => {
                         // Convert interface declarations
-                        if let Ok(typed_interface) = self.convert_typed_interface_declaration(interface_decl, &standpoint.symbol_library, &standpoint.literals) {
+                        if let Ok(typed_interface) = self.convert_typed_interface_declaration(
+                            interface_decl,
+                            &standpoint.symbol_library,
+                            &standpoint.literals,
+                        ) {
                             all_declarations.push(typed_interface);
                         }
                     }
@@ -164,13 +190,13 @@ impl WhirlwindAdapter {
                         // TODO: Convert record declarations
                     }
                     // Skip non-declaration statements (these would be in function bodies)
-                    TypedStmnt::ExpressionStatement(_) |
-                    TypedStmnt::FreeExpression(_) |
-                    TypedStmnt::ReturnStatement(_) |
-                    TypedStmnt::BreakStatement(_) |
-                    TypedStmnt::ForStatement(_) |
-                    TypedStmnt::WhileStatement(_) |
-                    TypedStmnt::ContinueStatement(_) => {
+                    TypedStmnt::ExpressionStatement(_)
+                    | TypedStmnt::FreeExpression(_)
+                    | TypedStmnt::ReturnStatement(_)
+                    | TypedStmnt::BreakStatement(_)
+                    | TypedStmnt::ForStatement(_)
+                    | TypedStmnt::WhileStatement(_)
+                    | TypedStmnt::ContinueStatement(_) => {
                         // These are not top-level declarations
                     }
                 }
@@ -194,24 +220,29 @@ impl WhirlwindAdapter {
 
     /// Run type inference on the converted program to fill in Unknown types
     fn run_type_inference(&mut self, program: &mut TypedProgram) {
-        use zyntax_typed_ast::type_checker::{TypeChecker, TypeCheckOptions};
+        use zyntax_typed_ast::type_checker::{TypeCheckOptions, TypeChecker};
 
         // Create a type checker with our type registry
         let registry = Box::new(self.type_registry.clone());
-        let mut type_checker = TypeChecker::with_options(registry, TypeCheckOptions {
-            strict_nulls: false,  // Be lenient since Whirlwind doesn't have strict nulls
-            strict_functions: false,
-            no_implicit_any: false,  // Allow Unknown types
-            check_unreachable: false,
-        });
+        let mut type_checker = TypeChecker::with_options(
+            registry,
+            TypeCheckOptions {
+                strict_nulls: false, // Be lenient since Whirlwind doesn't have strict nulls
+                strict_functions: false,
+                no_implicit_any: false, // Allow Unknown types
+                check_unreachable: false,
+            },
+        );
 
         // Run type checking/inference
         type_checker.check_program(program);
 
         // Log any diagnostics (optional - for debugging)
         if type_checker.has_errors() {
-            eprintln!("Type inference generated {} diagnostics",
-                type_checker.diagnostics().error_count());
+            eprintln!(
+                "Type inference generated {} diagnostics",
+                type_checker.diagnostics().error_count()
+            );
         }
     }
 
@@ -222,28 +253,42 @@ impl WhirlwindAdapter {
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
         literals: &whirlwind_analyzer::LiteralMap,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedVariable, TypedDeclaration, TypedNode, Span, Mutability, Visibility};
+        use zyntax_typed_ast::{
+            Mutability, Span, TypedDeclaration, TypedNode, TypedVariable, Visibility,
+        };
 
         // Get the first variable name from the symbol library
         if var_decl.names.is_empty() {
-            return Err(AdapterError::statement_conversion("Empty variable declaration"));
+            return Err(AdapterError::statement_conversion(
+                "Empty variable declaration",
+            ));
         }
 
         let symbol_idx = var_decl.names[0];
-        let symbol = symbol_library.get(symbol_idx)
+        let symbol = symbol_library
+            .get(symbol_idx)
             .ok_or_else(|| AdapterError::statement_conversion("Symbol not found in library"))?;
 
         let var_name = self.arena.intern_string(&symbol.name);
 
         // Extract actual type from symbol
-        let ty = self.symbol_extractor.extract_variable_type(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let ty = self.symbol_extractor.extract_variable_type(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract visibility
         let visibility = SymbolExtractor::extract_visibility(symbol);
 
         // Convert the initializer expression if present
         let initializer = if let Some(ref expr) = var_decl.value {
-            Some(Box::new(self.convert_typed_expression(expr, symbol_library, literals)?))
+            Some(Box::new(self.convert_typed_expression(
+                expr,
+                symbol_library,
+                literals,
+            )?))
         } else {
             None
         };
@@ -259,7 +304,7 @@ impl WhirlwindAdapter {
                 visibility,
             }),
             ty,
-            span
+            span,
         ))
     }
 
@@ -270,21 +315,30 @@ impl WhirlwindAdapter {
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
         literals: &whirlwind_analyzer::LiteralMap,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedVariable, TypedDeclaration, TypedNode, Span, Mutability, Visibility};
+        use zyntax_typed_ast::{
+            Mutability, Span, TypedDeclaration, TypedNode, TypedVariable, Visibility,
+        };
 
         let symbol_idx = short_decl.name;
-        let symbol = symbol_library.get(symbol_idx)
+        let symbol = symbol_library
+            .get(symbol_idx)
             .ok_or_else(|| AdapterError::statement_conversion("Symbol not found in library"))?;
 
         let var_name = self.arena.intern_string(&symbol.name);
 
         // Extract actual type from symbol
-        let ty = self.symbol_extractor.extract_variable_type(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let ty = self.symbol_extractor.extract_variable_type(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract visibility
         let visibility = SymbolExtractor::extract_visibility(symbol);
 
-        let initializer = self.convert_typed_expression(&short_decl.value, symbol_library, literals)?;
+        let initializer =
+            self.convert_typed_expression(&short_decl.value, symbol_library, literals)?;
         let span = Span::default(); // TODO: Convert actual span
 
         Ok(TypedNode::new(
@@ -296,7 +350,7 @@ impl WhirlwindAdapter {
                 visibility,
             }),
             ty,
-            span
+            span,
         ))
     }
 
@@ -312,8 +366,8 @@ impl WhirlwindAdapter {
             symbol_library,
             literals,
             &mut self.symbol_extractor,
-            &self.type_registry, 
-            &mut self.arena
+            &self.type_registry,
+            &mut self.arena,
         )
     }
 
@@ -324,15 +378,23 @@ impl WhirlwindAdapter {
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
         literals: &whirlwind_analyzer::LiteralMap,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedFunction, TypedDeclaration, TypedNode, Span, Visibility, Type};
+        use zyntax_typed_ast::{
+            Span, Type, TypedDeclaration, TypedFunction, TypedNode, Visibility,
+        };
 
-        let symbol = symbol_library.get(func_decl.name)
+        let symbol = symbol_library
+            .get(func_decl.name)
             .ok_or_else(|| AdapterError::statement_conversion("Function symbol not found"))?;
 
         let func_name = self.arena.intern_string(&symbol.name);
 
         // Extract parameters and return type from symbol
-        let (params, return_type) = self.symbol_extractor.extract_function_signature(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let (params, return_type) = self.symbol_extractor.extract_function_signature(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract visibility
         let visibility = SymbolExtractor::extract_visibility(symbol);
@@ -341,7 +403,14 @@ impl WhirlwindAdapter {
         let is_async = matches!(&symbol.kind, whirlwind_analyzer::SemanticSymbolKind::Function { is_async, .. } if *is_async);
 
         // Convert function body
-        let body = self.typed_expression_converter.convert_typed_block(&func_decl.body, symbol_library, literals, &mut self.symbol_extractor, &self.type_registry, &mut self.arena)?;
+        let body = self.typed_expression_converter.convert_typed_block(
+            &func_decl.body,
+            symbol_library,
+            literals,
+            &mut self.symbol_extractor,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         let span = Span::default();
 
@@ -362,7 +431,7 @@ impl WhirlwindAdapter {
                 is_pure: false,
             }),
             return_type,
-            span
+            span,
         ))
     }
 
@@ -372,19 +441,30 @@ impl WhirlwindAdapter {
         enum_decl: &whirlwind_analyzer::TypedEnumDeclaration,
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedDeclaration, TypedNode, Span, Visibility, Type};
         use zyntax_typed_ast::typed_ast::TypedEnum;
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedNode, Visibility};
 
-        let symbol = symbol_library.get(enum_decl.name)
+        let symbol = symbol_library
+            .get(enum_decl.name)
             .ok_or_else(|| AdapterError::statement_conversion("Enum symbol not found"))?;
 
         let enum_name = self.arena.intern_string(&symbol.name);
 
         // Extract enum variants from symbol information
-        let variants = self.symbol_extractor.extract_enum_variants(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let variants = self.symbol_extractor.extract_enum_variants(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract generic type parameters
-        let type_params = self.symbol_extractor.extract_generic_params(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let type_params = self.symbol_extractor.extract_generic_params(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract visibility
         let visibility = SymbolExtractor::extract_visibility(symbol);
@@ -400,7 +480,7 @@ impl WhirlwindAdapter {
                 span,
             }),
             Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
-            span
+            span,
         ))
     }
 
@@ -410,19 +490,30 @@ impl WhirlwindAdapter {
         type_eq: &whirlwind_analyzer::TypedTypeEquation,
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedDeclaration, TypedNode, Span, Visibility, Type};
         use zyntax_typed_ast::typed_ast::TypedTypeAlias;
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedNode, Visibility};
 
-        let symbol = symbol_library.get(type_eq.name)
+        let symbol = symbol_library
+            .get(type_eq.name)
             .ok_or_else(|| AdapterError::statement_conversion("Type alias symbol not found"))?;
 
         let alias_name = self.arena.intern_string(&symbol.name);
 
         // Extract actual type from symbol information
-        let target = self.symbol_extractor.extract_type_alias_target(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let target = self.symbol_extractor.extract_type_alias_target(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract generic type parameters
-        let type_params = self.symbol_extractor.extract_generic_params(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let type_params = self.symbol_extractor.extract_generic_params(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
 
         // Extract visibility
         let visibility = SymbolExtractor::extract_visibility(symbol);
@@ -438,7 +529,7 @@ impl WhirlwindAdapter {
                 span,
             }),
             target,
-            span
+            span,
         ))
     }
 
@@ -448,22 +539,28 @@ impl WhirlwindAdapter {
         import_decl: &whirlwind_analyzer::TypedImportDeclaration,
         literals: &whirlwind_analyzer::LiteralMap,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedDeclaration, TypedNode, Span, Type};
         use zyntax_typed_ast::typed_ast::TypedImport;
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedNode};
 
         // Get the import source string from literals
         use whirlwind_analyzer::Literal;
 
-        let literal = literals.get(import_decl.name)
+        let literal = literals
+            .get(import_decl.name)
             .ok_or_else(|| AdapterError::statement_conversion("Import source literal not found"))?;
 
         let source_str = match literal {
             Literal::StringLiteral { value, .. } => &value.value,
-            _ => return Err(AdapterError::statement_conversion("Import source must be a string literal")),
+            _ => {
+                return Err(AdapterError::statement_conversion(
+                    "Import source must be a string literal",
+                ))
+            }
         };
 
         // Parse module path from source string (e.g., "foo.bar.baz" -> ["foo", "bar", "baz"])
-        let module_path: Vec<_> = source_str.split('.')
+        let module_path: Vec<_> = source_str
+            .split('.')
             .map(|part| self.arena.intern_string(part))
             .collect();
 
@@ -477,7 +574,7 @@ impl WhirlwindAdapter {
                 span,
             }),
             Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
-            span
+            span,
         ))
     }
 
@@ -488,10 +585,11 @@ impl WhirlwindAdapter {
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
         literals: &whirlwind_analyzer::LiteralMap,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedDeclaration, TypedNode, Span, Visibility, Type};
         use zyntax_typed_ast::typed_ast::{TypedClass, TypedField, TypedMethod, TypedParameter};
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedNode, Visibility};
 
-        let symbol = symbol_library.get(model_decl.name)
+        let symbol = symbol_library
+            .get(model_decl.name)
             .ok_or_else(|| AdapterError::statement_conversion("Model symbol not found"))?;
 
         let class_name = self.arena.intern_string(&symbol.name);
@@ -501,7 +599,8 @@ impl WhirlwindAdapter {
         let mut methods = Vec::new();
 
         for property in &model_decl.body.properties {
-            let prop_symbol = symbol_library.get(property.name)
+            let prop_symbol = symbol_library
+                .get(property.name)
                 .ok_or_else(|| AdapterError::statement_conversion("Property symbol not found"))?;
 
             let prop_name = self.arena.intern_string(&prop_symbol.name);
@@ -509,7 +608,12 @@ impl WhirlwindAdapter {
             match &property._type {
                 whirlwind_analyzer::TypedModelPropertyType::TypedAttribute => {
                     // Convert to field - extract actual type from symbol
-                    let field_ty = self.symbol_extractor.extract_variable_type(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+                    let field_ty = self.symbol_extractor.extract_variable_type(
+                        prop_symbol,
+                        symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
                     let field_visibility = SymbolExtractor::extract_visibility(prop_symbol);
 
                     fields.push(TypedField {
@@ -525,11 +629,28 @@ impl WhirlwindAdapter {
                 whirlwind_analyzer::TypedModelPropertyType::TypedMethod { body } => {
                     // Convert to method - extract full signature
                     let (method_params, return_type, is_static, is_async) =
-                        self.symbol_extractor.extract_method_signature(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+                        self.symbol_extractor.extract_method_signature(
+                            prop_symbol,
+                            symbol_library,
+                            &self.type_registry,
+                            &mut self.arena,
+                        )?;
 
-                    let type_params = self.symbol_extractor.extract_generic_params(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+                    let type_params = self.symbol_extractor.extract_generic_params(
+                        prop_symbol,
+                        symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
                     let visibility = SymbolExtractor::extract_visibility(prop_symbol);
-                    let method_body = self.typed_expression_converter.convert_typed_block(body, symbol_library, literals, &mut self.symbol_extractor, &self.type_registry, &mut self.arena)?;
+                    let method_body = self.typed_expression_converter.convert_typed_block(
+                        body,
+                        symbol_library,
+                        literals,
+                        &mut self.symbol_extractor,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
 
                     methods.push(TypedMethod {
                         name: prop_name,
@@ -547,11 +668,28 @@ impl WhirlwindAdapter {
                 whirlwind_analyzer::TypedModelPropertyType::InterfaceImpl { body, .. } => {
                     // Interface implementation method - extract signature
                     let (method_params, return_type, is_static, is_async) =
-                        self.symbol_extractor.extract_method_signature(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+                        self.symbol_extractor.extract_method_signature(
+                            prop_symbol,
+                            symbol_library,
+                            &self.type_registry,
+                            &mut self.arena,
+                        )?;
 
-                    let type_params = self.symbol_extractor.extract_generic_params(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+                    let type_params = self.symbol_extractor.extract_generic_params(
+                        prop_symbol,
+                        symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
                     let visibility = SymbolExtractor::extract_visibility(prop_symbol);
-                    let method_body = self.typed_expression_converter.convert_typed_block(body, symbol_library, literals, &mut self.symbol_extractor, &self.type_registry, &mut self.arena)?;
+                    let method_body = self.typed_expression_converter.convert_typed_block(
+                        body,
+                        symbol_library,
+                        literals,
+                        &mut self.symbol_extractor,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
 
                     methods.push(TypedMethod {
                         name: prop_name,
@@ -570,15 +708,37 @@ impl WhirlwindAdapter {
         }
 
         // Extract class-level information
-        let type_params = self.symbol_extractor.extract_generic_params(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
-        let (extends, implements) = self.symbol_extractor.extract_model_inheritance(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let type_params = self.symbol_extractor.extract_generic_params(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
+        let (extends, implements) = self.symbol_extractor.extract_model_inheritance(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
         let visibility = SymbolExtractor::extract_visibility(symbol);
 
         // Convert constructor if present
         let mut constructors = Vec::new();
-        if let Some(constructor_params) = self.symbol_extractor.extract_constructor_params(symbol, symbol_library, &self.type_registry, &mut self.arena)? {
+        if let Some(constructor_params) = self.symbol_extractor.extract_constructor_params(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )? {
             if let Some(ref constructor_body) = model_decl.body.constructor {
-                let body = self.typed_expression_converter.convert_typed_block(constructor_body, symbol_library, literals, &mut self.symbol_extractor, &self.type_registry, &mut self.arena)?;
+                let body = self.typed_expression_converter.convert_typed_block(
+                    constructor_body,
+                    symbol_library,
+                    literals,
+                    &mut self.symbol_extractor,
+                    &self.type_registry,
+                    &mut self.arena,
+                )?;
 
                 constructors.push(zyntax_typed_ast::typed_ast::TypedConstructor {
                     params: constructor_params,
@@ -606,7 +766,7 @@ impl WhirlwindAdapter {
                 span,
             }),
             Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
-            span
+            span,
         ))
     }
 
@@ -617,10 +777,11 @@ impl WhirlwindAdapter {
         symbol_library: &whirlwind_analyzer::SymbolLibrary,
         literals: &whirlwind_analyzer::LiteralMap,
     ) -> AdapterResult<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>> {
-        use zyntax_typed_ast::{TypedDeclaration, TypedNode, Span, Visibility, Type};
         use zyntax_typed_ast::typed_ast::{TypedInterface, TypedMethodSignature};
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedNode, Visibility};
 
-        let symbol = symbol_library.get(interface_decl.name)
+        let symbol = symbol_library
+            .get(interface_decl.name)
             .ok_or_else(|| AdapterError::statement_conversion("Interface symbol not found"))?;
 
         let interface_name = self.arena.intern_string(&symbol.name);
@@ -629,15 +790,26 @@ impl WhirlwindAdapter {
         let mut methods = Vec::new();
 
         for property in &interface_decl.body.properties {
-            let prop_symbol = symbol_library.get(property.name)
-                .ok_or_else(|| AdapterError::statement_conversion("Interface property symbol not found"))?;
+            let prop_symbol = symbol_library.get(property.name).ok_or_else(|| {
+                AdapterError::statement_conversion("Interface property symbol not found")
+            })?;
 
             let method_name = self.arena.intern_string(&prop_symbol.name);
 
             // Extract method signature information
             let (method_params, return_type, is_static, is_async) =
-                self.symbol_extractor.extract_method_signature(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
-            let method_type_params = self.symbol_extractor.extract_generic_params(prop_symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+                self.symbol_extractor.extract_method_signature(
+                    prop_symbol,
+                    symbol_library,
+                    &self.type_registry,
+                    &mut self.arena,
+                )?;
+            let method_type_params = self.symbol_extractor.extract_generic_params(
+                prop_symbol,
+                symbol_library,
+                &self.type_registry,
+                &mut self.arena,
+            )?;
 
             match &property._type {
                 whirlwind_analyzer::TypedInterfacePropertyType::Signature => {
@@ -669,8 +841,18 @@ impl WhirlwindAdapter {
         }
 
         // Extract interface-level information
-        let type_params = self.symbol_extractor.extract_generic_params(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
-        let extends = self.symbol_extractor.extract_interface_extends(symbol, symbol_library, &self.type_registry, &mut self.arena)?;
+        let type_params = self.symbol_extractor.extract_generic_params(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
+        let extends = self.symbol_extractor.extract_interface_extends(
+            symbol,
+            symbol_library,
+            &self.type_registry,
+            &mut self.arena,
+        )?;
         let visibility = SymbolExtractor::extract_visibility(symbol);
 
         let span = Span::default();
@@ -686,7 +868,7 @@ impl WhirlwindAdapter {
                 span,
             }),
             Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
-            span
+            span,
         ))
     }
 
@@ -732,7 +914,9 @@ impl WhirlwindAdapter {
         })
         */
 
-        Err(AdapterError::unsupported("Module conversion not yet implemented"))
+        Err(AdapterError::unsupported(
+            "Module conversion not yet implemented",
+        ))
     }
 
     /// Access the type converter
@@ -795,7 +979,7 @@ impl WhirlwindAdapter {
     /// happens during HIR conversion, after all types are registered and can be resolved.
     fn register_all_types(&mut self, standpoint: &Standpoint) -> AdapterResult<()> {
         use whirlwind_analyzer::SemanticSymbolKind;
-        use zyntax_typed_ast::{TypeDefinition, TypeKind, TypeId, Span, TypeMetadata};
+        use zyntax_typed_ast::{Span, TypeDefinition, TypeId, TypeKind, TypeMetadata};
 
         // Iterate through ALL symbols in the SymbolLibrary
         for (_symbol_index, symbol) in standpoint.symbol_library.symbols() {
@@ -810,26 +994,42 @@ impl WhirlwindAdapter {
                     let type_id = TypeId::next();
 
                     // Extract generic parameters and convert to TypeParam
-                    let typed_type_params = self.symbol_extractor
-                        .extract_generic_params(symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
-                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params.iter().map(|tp| {
-                        zyntax_typed_ast::TypeParam {
-                            name: tp.name,
-                            bounds: vec![], // TODO: Extract bounds from tp.constraints
-                            variance: zyntax_typed_ast::Variance::Invariant,
-                            default: None,
-                            span: tp.span,
-                        }
-                    }).collect();
+                    let typed_type_params = self.symbol_extractor.extract_generic_params(
+                        symbol,
+                        &standpoint.symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
+                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params
+                        .iter()
+                        .map(|tp| {
+                            zyntax_typed_ast::TypeParam {
+                                name: tp.name,
+                                bounds: vec![], // TODO: Extract bounds from tp.constraints
+                                variance: zyntax_typed_ast::Variance::Invariant,
+                                default: None,
+                                span: tp.span,
+                            }
+                        })
+                        .collect();
 
                     // Extract fields from attributes
                     let mut fields = Vec::new();
                     for &attr_idx in attribute_indices {
                         if let Some(attr_symbol) = standpoint.symbol_library.get(attr_idx) {
-                            if let SemanticSymbolKind::Attribute { declared_type, is_public, .. } = &attr_symbol.kind {
+                            if let SemanticSymbolKind::Attribute {
+                                declared_type,
+                                is_public,
+                                ..
+                            } = &attr_symbol.kind
+                            {
                                 let field_name = self.arena.intern_string(&attr_symbol.name);
-                                let field_type = self.symbol_extractor
-                                    .convert_intermediate_type(declared_type, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
+                                let field_type = self.symbol_extractor.convert_intermediate_type(
+                                    declared_type,
+                                    &standpoint.symbol_library,
+                                    &self.type_registry,
+                                    &mut self.arena,
+                                )?;
                                 let visibility = if *is_public {
                                     zyntax_typed_ast::Visibility::Public
                                 } else {
@@ -857,25 +1057,34 @@ impl WhirlwindAdapter {
                     for &method_idx in method_indices {
                         if let Some(method_symbol) = standpoint.symbol_library.get(method_idx) {
                             let method_name = self.arena.intern_string(&method_symbol.name);
-                            let (typed_params, return_type, is_static, is_async) = self.symbol_extractor
-                                .extract_method_signature(method_symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
+                            let (typed_params, return_type, is_static, is_async) =
+                                self.symbol_extractor.extract_method_signature(
+                                    method_symbol,
+                                    &standpoint.symbol_library,
+                                    &self.type_registry,
+                                    &mut self.arena,
+                                )?;
 
-                            let is_public = if let SemanticSymbolKind::Method { is_public, .. } = &method_symbol.kind {
-                                *is_public
-                            } else {
-                                false
-                            };
+                            let is_public =
+                                if let SemanticSymbolKind::Method { is_public, .. } =
+                                    &method_symbol.kind
+                                {
+                                    *is_public
+                                } else {
+                                    false
+                                };
 
                             // Convert TypedMethodParam to ParamDef for TypeRegistry
-                            let params: Vec<zyntax_typed_ast::ParamDef> = typed_params.iter().map(|p| {
-                                zyntax_typed_ast::ParamDef {
+                            let params: Vec<zyntax_typed_ast::ParamDef> = typed_params
+                                .iter()
+                                .map(|p| zyntax_typed_ast::ParamDef {
                                     name: p.name,
                                     ty: p.ty.clone(),
                                     is_self: p.is_self,
                                     is_varargs: false,
                                     is_mut: p.mutability == zyntax_typed_ast::Mutability::Mutable,
-                                }
-                            }).collect();
+                                })
+                                .collect();
 
                             methods_sigs.push(zyntax_typed_ast::MethodSig {
                                 name: method_name,
@@ -885,7 +1094,11 @@ impl WhirlwindAdapter {
                                 where_clause: vec![],
                                 is_static,
                                 is_async,
-                                visibility: if is_public { zyntax_typed_ast::Visibility::Public } else { zyntax_typed_ast::Visibility::Private },
+                                visibility: if is_public {
+                                    zyntax_typed_ast::Visibility::Public
+                                } else {
+                                    zyntax_typed_ast::Visibility::Private
+                                },
                                 span: Span::default(),
                                 is_extension: false,
                             });
@@ -894,19 +1107,25 @@ impl WhirlwindAdapter {
 
                     // Extract constructor if present
                     let mut constructors = Vec::new();
-                    if let Some(constructor_params) = self.symbol_extractor
-                        .extract_constructor_params(symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?
+                    if let Some(constructor_params) =
+                        self.symbol_extractor.extract_constructor_params(
+                            symbol,
+                            &standpoint.symbol_library,
+                            &self.type_registry,
+                            &mut self.arena,
+                        )?
                     {
                         // Convert TypedMethodParam to ParamDef for ConstructorSig
-                        let params: Vec<zyntax_typed_ast::ParamDef> = constructor_params.iter().map(|p| {
-                            zyntax_typed_ast::ParamDef {
+                        let params: Vec<zyntax_typed_ast::ParamDef> = constructor_params
+                            .iter()
+                            .map(|p| zyntax_typed_ast::ParamDef {
                                 name: p.name,
                                 ty: p.ty.clone(),
                                 is_self: p.is_self,
                                 is_varargs: false,
                                 is_mut: p.mutability == zyntax_typed_ast::Mutability::Mutable,
-                            }
-                        }).collect();
+                            })
+                            .collect();
 
                         constructors.push(zyntax_typed_ast::ConstructorSig {
                             type_params: vec![],
@@ -942,24 +1161,36 @@ impl WhirlwindAdapter {
                     let type_id = TypeId::next();
 
                     // Extract generic parameters and convert to TypeParam
-                    let typed_type_params = self.symbol_extractor
-                        .extract_generic_params(symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
-                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params.iter().map(|tp| {
-                        zyntax_typed_ast::TypeParam {
-                            name: tp.name,
-                            bounds: vec![], // TODO: Extract bounds from tp.constraints
-                            variance: zyntax_typed_ast::Variance::Invariant,
-                            default: None,
-                            span: tp.span,
-                        }
-                    }).collect();
+                    let typed_type_params = self.symbol_extractor.extract_generic_params(
+                        symbol,
+                        &standpoint.symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
+                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params
+                        .iter()
+                        .map(|tp| {
+                            zyntax_typed_ast::TypeParam {
+                                name: tp.name,
+                                bounds: vec![], // TODO: Extract bounds from tp.constraints
+                                variance: zyntax_typed_ast::Variance::Invariant,
+                                default: None,
+                                span: tp.span,
+                            }
+                        })
+                        .collect();
 
                     // Extract super traits (interfaces this interface extends)
                     let super_traits = interfaces
                         .iter()
                         .filter_map(|int_type| {
                             self.symbol_extractor
-                                .convert_intermediate_type(int_type, &standpoint.symbol_library, &self.type_registry, &mut self.arena)
+                                .convert_intermediate_type(
+                                    int_type,
+                                    &standpoint.symbol_library,
+                                    &self.type_registry,
+                                    &mut self.arena,
+                                )
                                 .ok()
                         })
                         .collect();
@@ -969,25 +1200,34 @@ impl WhirlwindAdapter {
                     for &method_idx in method_indices {
                         if let Some(method_symbol) = standpoint.symbol_library.get(method_idx) {
                             let method_name = self.arena.intern_string(&method_symbol.name);
-                            let (typed_params, return_type, is_static, is_async) = self.symbol_extractor
-                                .extract_method_signature(method_symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
+                            let (typed_params, return_type, is_static, is_async) =
+                                self.symbol_extractor.extract_method_signature(
+                                    method_symbol,
+                                    &standpoint.symbol_library,
+                                    &self.type_registry,
+                                    &mut self.arena,
+                                )?;
 
-                            let is_public = if let SemanticSymbolKind::Method { is_public, .. } = &method_symbol.kind {
-                                *is_public
-                            } else {
-                                false
-                            };
+                            let is_public =
+                                if let SemanticSymbolKind::Method { is_public, .. } =
+                                    &method_symbol.kind
+                                {
+                                    *is_public
+                                } else {
+                                    false
+                                };
 
                             // Convert TypedMethodParam to ParamDef for TypeRegistry
-                            let params: Vec<zyntax_typed_ast::ParamDef> = typed_params.iter().map(|p| {
-                                zyntax_typed_ast::ParamDef {
+                            let params: Vec<zyntax_typed_ast::ParamDef> = typed_params
+                                .iter()
+                                .map(|p| zyntax_typed_ast::ParamDef {
                                     name: p.name,
                                     ty: p.ty.clone(),
                                     is_self: p.is_self,
                                     is_varargs: false,
                                     is_mut: p.mutability == zyntax_typed_ast::Mutability::Mutable,
-                                }
-                            }).collect();
+                                })
+                                .collect();
 
                             methods_sigs.push(zyntax_typed_ast::MethodSig {
                                 name: method_name,
@@ -997,7 +1237,11 @@ impl WhirlwindAdapter {
                                 where_clause: vec![],
                                 is_static,
                                 is_async,
-                                visibility: if is_public { zyntax_typed_ast::Visibility::Public } else { zyntax_typed_ast::Visibility::Private },
+                                visibility: if is_public {
+                                    zyntax_typed_ast::Visibility::Public
+                                } else {
+                                    zyntax_typed_ast::Visibility::Private
+                                },
                                 span: Span::default(),
                                 is_extension: false,
                             });
@@ -1033,57 +1277,76 @@ impl WhirlwindAdapter {
                     let type_id = TypeId::next();
 
                     // Extract generic parameters and convert to TypeParam
-                    let typed_type_params = self.symbol_extractor
-                        .extract_generic_params(symbol, &standpoint.symbol_library, &self.type_registry,&mut self.arena)?;
-                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params.iter().map(|tp| {
-                        zyntax_typed_ast::TypeParam {
-                            name: tp.name,
-                            bounds: vec![], // TODO: Extract bounds from tp.constraints
-                            variance: zyntax_typed_ast::Variance::Invariant,
-                            default: None,
-                            span: tp.span,
-                        }
-                    }).collect();
+                    let typed_type_params = self.symbol_extractor.extract_generic_params(
+                        symbol,
+                        &standpoint.symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
+                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params
+                        .iter()
+                        .map(|tp| {
+                            zyntax_typed_ast::TypeParam {
+                                name: tp.name,
+                                bounds: vec![], // TODO: Extract bounds from tp.constraints
+                                variance: zyntax_typed_ast::Variance::Invariant,
+                                default: None,
+                                span: tp.span,
+                            }
+                        })
+                        .collect();
 
                     // Extract and convert variants
-                    let typed_variants = self.symbol_extractor
-                        .extract_enum_variants(symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
+                    let typed_variants = self.symbol_extractor.extract_enum_variants(
+                        symbol,
+                        &standpoint.symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
 
-                    let variants: Vec<zyntax_typed_ast::VariantDef> = typed_variants.iter().map(|v| {
-                        let fields = match &v.fields {
-                            zyntax_typed_ast::typed_ast::TypedVariantFields::Unit => zyntax_typed_ast::VariantFields::Unit,
-                            zyntax_typed_ast::typed_ast::TypedVariantFields::Tuple(types) => zyntax_typed_ast::VariantFields::Tuple(types.clone()),
-                            zyntax_typed_ast::typed_ast::TypedVariantFields::Named(typed_fields) => {
-                                let field_defs: Vec<zyntax_typed_ast::FieldDef> = typed_fields.iter().map(|f| {
-                                    zyntax_typed_ast::FieldDef {
-                                        name: f.name,
-                                        ty: f.ty.clone(),
-                                        visibility: f.visibility,
-                                        mutability: f.mutability,
-                                        is_static: f.is_static,
-                                        is_synthetic: false,
-                                        span: f.span,
-                                        getter: None,
-                                        setter: None,
-                                    }
-                                }).collect();
-                                zyntax_typed_ast::VariantFields::Named(field_defs)
+                    let variants: Vec<zyntax_typed_ast::VariantDef> = typed_variants
+                        .iter()
+                        .map(|v| {
+                            let fields = match &v.fields {
+                                zyntax_typed_ast::typed_ast::TypedVariantFields::Unit => {
+                                    zyntax_typed_ast::VariantFields::Unit
+                                }
+                                zyntax_typed_ast::typed_ast::TypedVariantFields::Tuple(types) => {
+                                    zyntax_typed_ast::VariantFields::Tuple(types.clone())
+                                }
+                                zyntax_typed_ast::typed_ast::TypedVariantFields::Named(
+                                    typed_fields,
+                                ) => {
+                                    let field_defs: Vec<zyntax_typed_ast::FieldDef> = typed_fields
+                                        .iter()
+                                        .map(|f| zyntax_typed_ast::FieldDef {
+                                            name: f.name,
+                                            ty: f.ty.clone(),
+                                            visibility: f.visibility,
+                                            mutability: f.mutability,
+                                            is_static: f.is_static,
+                                            is_synthetic: false,
+                                            span: f.span,
+                                            getter: None,
+                                            setter: None,
+                                        })
+                                        .collect();
+                                    zyntax_typed_ast::VariantFields::Named(field_defs)
+                                }
+                            };
+                            zyntax_typed_ast::VariantDef {
+                                name: v.name,
+                                fields,
+                                discriminant: None, // TypedVariant has discriminant as expression, we'd need to evaluate it
+                                span: v.span,
                             }
-                        };
-                        zyntax_typed_ast::VariantDef {
-                            name: v.name,
-                            fields,
-                            discriminant: None, // TypedVariant has discriminant as expression, we'd need to evaluate it
-                            span: v.span,
-                        }
-                    }).collect();
+                        })
+                        .collect();
 
                     let type_def = TypeDefinition {
                         id: type_id,
                         name: type_name,
-                        kind: TypeKind::Enum {
-                            variants,
-                        },
+                        kind: TypeKind::Enum { variants },
                         type_params,
                         constraints: vec![],
                         fields: vec![],
@@ -1095,34 +1358,47 @@ impl WhirlwindAdapter {
 
                     self.type_registry.register_type(type_def);
                 }
-                SemanticSymbolKind::TypeName { value, generic_params: _generic_params, .. } => {
+                SemanticSymbolKind::TypeName {
+                    value,
+                    generic_params: _generic_params,
+                    ..
+                } => {
                     // Register type alias with full information
                     let type_name = self.arena.intern_string(&symbol.name);
                     let type_id = TypeId::next();
 
                     // Extract generic parameters and convert to TypeParam
-                    let typed_type_params = self.symbol_extractor
-                        .extract_generic_params(symbol, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
-                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params.iter().map(|tp| {
-                        zyntax_typed_ast::TypeParam {
-                            name: tp.name,
-                            bounds: vec![], // TODO: Extract bounds from tp.constraints
-                            variance: zyntax_typed_ast::Variance::Invariant,
-                            default: None,
-                            span: tp.span,
-                        }
-                    }).collect();
+                    let typed_type_params = self.symbol_extractor.extract_generic_params(
+                        symbol,
+                        &standpoint.symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
+                    let type_params: Vec<zyntax_typed_ast::TypeParam> = typed_type_params
+                        .iter()
+                        .map(|tp| {
+                            zyntax_typed_ast::TypeParam {
+                                name: tp.name,
+                                bounds: vec![], // TODO: Extract bounds from tp.constraints
+                                variance: zyntax_typed_ast::Variance::Invariant,
+                                default: None,
+                                span: tp.span,
+                            }
+                        })
+                        .collect();
 
                     // Convert the target type
-                    let target = self.symbol_extractor
-                        .convert_intermediate_type(value, &standpoint.symbol_library, &self.type_registry, &mut self.arena)?;
+                    let target = self.symbol_extractor.convert_intermediate_type(
+                        value,
+                        &standpoint.symbol_library,
+                        &self.type_registry,
+                        &mut self.arena,
+                    )?;
 
                     let type_def = TypeDefinition {
                         id: type_id,
                         name: type_name,
-                        kind: TypeKind::Alias {
-                            target,
-                        },
+                        kind: TypeKind::Alias { target },
                         type_params,
                         constraints: vec![],
                         fields: vec![],
@@ -1158,7 +1434,10 @@ mod tests {
     fn test_adapter_creation() {
         let adapter = WhirlwindAdapter::new();
         // Basic smoke test
-        assert!(adapter.type_converter().lookup_type("nonexistent").is_none());
+        assert!(adapter
+            .type_converter()
+            .lookup_type("nonexistent")
+            .is_none());
     }
 
     #[test]

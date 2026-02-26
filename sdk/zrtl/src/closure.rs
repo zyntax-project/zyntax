@@ -26,9 +26,9 @@
 //! assert_eq!(result, ClosureResult::ok(0)); // Previous value
 //! ```
 
-use std::sync::Arc;
-use crate::type_system::{TypeTag, TypeCategory, TypeFlags};
 use crate::dynamic_box::DynamicBox;
+use crate::type_system::{TypeCategory, TypeFlags, TypeTag};
+use std::sync::Arc;
 
 /// Result of calling a closure
 #[repr(C)]
@@ -68,7 +68,11 @@ impl ClosureResult {
     /// Get the value if successful
     #[inline]
     pub fn value(&self) -> Option<i64> {
-        if self.is_ok() { Some(self.value) } else { None }
+        if self.is_ok() {
+            Some(self.value)
+        } else {
+            None
+        }
     }
 }
 
@@ -397,10 +401,14 @@ impl ZrtlClosure {
 }
 
 // Null closure stubs
-extern "C" fn null_call(_: *const (), _: i64) -> i64 { 0 }
+extern "C" fn null_call(_: *const (), _: i64) -> i64 {
+    0
+}
 extern "C" fn null_call_void(_: *const (), _: i64) {}
 extern "C" fn null_drop(_: *const ()) {}
-extern "C" fn null_clone(ptr: *const ()) -> *const () { ptr }
+extern "C" fn null_clone(ptr: *const ()) -> *const () {
+    ptr
+}
 
 impl Clone for ZrtlClosure {
     fn clone(&self) -> Self {
@@ -740,9 +748,7 @@ mod tests {
         let counter = Arc::new(AtomicI64::new(0));
         let counter_clone = counter.clone();
 
-        let closure = ZrtlClosure::new(move |x| {
-            counter_clone.fetch_add(x, Ordering::SeqCst)
-        });
+        let closure = ZrtlClosure::new(move |x| counter_clone.fetch_add(x, Ordering::SeqCst));
 
         assert_eq!(closure.call(10).value(), Some(0));
         assert_eq!(closure.call(5).value(), Some(10));
@@ -754,9 +760,7 @@ mod tests {
         let counter = Arc::new(AtomicI64::new(0));
         let counter_clone = counter.clone();
 
-        let closure = ZrtlClosure::new(move |x| {
-            counter_clone.fetch_add(x, Ordering::SeqCst)
-        });
+        let closure = ZrtlClosure::new(move |x| counter_clone.fetch_add(x, Ordering::SeqCst));
 
         let cloned = closure.clone();
 
@@ -849,13 +853,9 @@ mod tests {
         let handles: Vec<_> = (0..4)
             .map(|i| {
                 let counter = counter.clone();
-                let closure = ZrtlClosure::new(move |x| {
-                    counter.fetch_add(x, Ordering::SeqCst)
-                });
+                let closure = ZrtlClosure::new(move |x| counter.fetch_add(x, Ordering::SeqCst));
 
-                std::thread::spawn(move || {
-                    closure.call(i + 1).value().unwrap()
-                })
+                std::thread::spawn(move || closure.call(i + 1).value().unwrap())
             })
             .collect();
 

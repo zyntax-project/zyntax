@@ -28,10 +28,10 @@
 //! assert_eq!(result, 42);
 //! ```
 
-pub mod task;
 pub mod executor;
+pub mod task;
 pub mod waker;
 
+pub use executor::{block_on, Executor};
 pub use task::Task;
-pub use executor::{Executor, block_on};
-pub use waker::{Waker, Context};
+pub use waker::{Context, Waker};

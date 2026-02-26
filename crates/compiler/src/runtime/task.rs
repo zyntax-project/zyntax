@@ -2,10 +2,10 @@
 //!
 //! A Task wraps a future (state machine) and tracks its execution state.
 
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 /// A spawned async task
 ///

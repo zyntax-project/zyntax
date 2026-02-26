@@ -5,9 +5,7 @@
 
 use zyntax_typed_ast::arena::AstArena;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::type_registry::{
-    Type, TypeRegistry, PrimitiveType, VariantFields, TypeKind
-};
+use zyntax_typed_ast::type_registry::{PrimitiveType, Type, TypeKind, TypeRegistry, VariantFields};
 
 #[test]
 fn test_register_result_type() {
@@ -20,7 +18,8 @@ fn test_register_result_type() {
 
     // Verify the type was registered
     let result_name = arena.intern_string("Result");
-    let type_def = registry.get_type_by_name(result_name)
+    let type_def = registry
+        .get_type_by_name(result_name)
         .expect("Result type should be registered");
     assert_eq!(type_def.id, result_type_id);
     assert_eq!(type_def.name, result_name);
@@ -68,7 +67,8 @@ fn test_register_option_type() {
 
     // Verify the type was registered
     let option_name = arena.intern_string("Option");
-    let type_def = registry.get_type_by_name(option_name)
+    let type_def = registry
+        .get_type_by_name(option_name)
         .expect("Option type should be registered");
     assert_eq!(type_def.id, option_type_id);
     assert_eq!(type_def.name, option_name);
@@ -191,10 +191,7 @@ fn test_nested_result_types() {
 
     let outer_result = Type::Named {
         id: result_type_id,
-        type_args: vec![
-            inner_result.clone(),
-            Type::Primitive(PrimitiveType::String),
-        ],
+        type_args: vec![inner_result.clone(), Type::Primitive(PrimitiveType::String)],
         const_args: vec![],
         variance: vec![],
         nullability: Default::default(),
@@ -208,7 +205,11 @@ fn test_nested_result_types() {
 
             // Check inner result
             match &type_args[0] {
-                Type::Named { id: inner_id, type_args: inner_type_args, .. } => {
+                Type::Named {
+                    id: inner_id,
+                    type_args: inner_type_args,
+                    ..
+                } => {
                     assert_eq!(*inner_id, result_type_id);
                     assert_eq!(inner_type_args.len(), 2);
                 }

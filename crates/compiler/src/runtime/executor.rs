@@ -3,11 +3,11 @@
 //! The executor schedules and polls tasks until they complete.
 
 use super::task::Task;
-use super::waker::{Waker, Context};
+use super::waker::{Context, Waker};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::future::Future;
 
 /// Simple single-threaded executor
 ///
@@ -124,7 +124,11 @@ where
     executor.run();
 
     // Extract the result
-    let output = result.lock().unwrap().take().expect("Future did not complete");
+    let output = result
+        .lock()
+        .unwrap()
+        .take()
+        .expect("Future did not complete");
     output
 }
 

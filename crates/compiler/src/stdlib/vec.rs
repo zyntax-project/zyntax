@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, CallingConvention, HirId, HirType};
 /// Vec<T>: Generic dynamic array
 ///
 /// Structure:
@@ -11,9 +12,7 @@
 ///
 /// Growth strategy: Double capacity when full (4 → 8 → 16 → 32)
 /// Initial capacity: 4 elements
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirId, HirType, CallingConvention, BinaryOp};
 
 /// Build Vec<T> type and all methods
 pub fn build_vec_type(builder: &mut HirBuilder) {
@@ -40,7 +39,8 @@ fn declare_c_realloc(builder: &mut HirBuilder) {
     let usize_ty = builder.u64_type();
 
     // extern "C" fn realloc(ptr: *u8, new_size: usize) -> *u8
-    let _realloc = builder.begin_extern_function("realloc", CallingConvention::C)
+    let _realloc = builder
+        .begin_extern_function("realloc", CallingConvention::C)
         .param("ptr", ptr_u8_ty.clone())
         .param("new_size", usize_ty)
         .returns(ptr_u8_ty)
@@ -61,7 +61,8 @@ fn build_vec_new(builder: &mut HirBuilder) {
         vec![ptr_t_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_generic_function("vec_new", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_new", vec!["T"])
         .returns(vec_t_ty.clone())
         .build();
 
@@ -88,10 +89,7 @@ fn build_vec_new(builder: &mut HirBuilder) {
 
     // Build struct: { ptr: ptr_t, len: 0, cap: 4 }
     let zero = builder.const_u64(0);
-    let vec_value = builder.create_struct(
-        vec_t_ty,
-        vec![ptr_t, zero, initial_cap],
-    );
+    let vec_value = builder.create_struct(vec_t_ty, vec![ptr_t, zero, initial_cap]);
 
     builder.ret(vec_value);
 }
@@ -108,7 +106,8 @@ fn build_vec_with_capacity(builder: &mut HirBuilder) {
         vec![ptr_t_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_generic_function("vec_with_capacity", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_with_capacity", vec!["T"])
         .param("capacity", usize_ty.clone())
         .returns(vec_t_ty.clone())
         .build();
@@ -135,10 +134,7 @@ fn build_vec_with_capacity(builder: &mut HirBuilder) {
 
     // Build struct: { ptr: ptr_t, len: 0, cap: capacity }
     let zero = builder.const_u64(0);
-    let vec_value = builder.create_struct(
-        vec_t_ty,
-        vec![ptr_t, zero, capacity],
-    );
+    let vec_value = builder.create_struct(vec_t_ty, vec![ptr_t, zero, capacity]);
 
     builder.ret(vec_value);
 }
@@ -156,7 +152,8 @@ fn build_vec_len(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_t_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_len", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_len", vec!["T"])
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -185,7 +182,8 @@ fn build_vec_capacity(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_t_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_capacity", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_capacity", vec!["T"])
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -215,7 +213,8 @@ fn build_vec_clear(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_t_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_clear", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_clear", vec!["T"])
         .param("vec", ptr_vec_ty)
         .returns(void_ty)
         .build();
@@ -231,10 +230,7 @@ fn build_vec_clear(builder: &mut HirBuilder) {
 
     // Set len to 0
     let zero = builder.const_u64(0);
-    let cleared_vec = builder.create_struct(
-        vec_t_ty,
-        vec![ptr_field, zero, cap_field],
-    );
+    let cleared_vec = builder.create_struct(vec_t_ty, vec![ptr_field, zero, cap_field]);
     builder.store(cleared_vec, vec_ptr);
 
     let unit = builder.unit_value();
@@ -254,7 +250,8 @@ fn build_vec_free(builder: &mut HirBuilder) {
         vec![ptr_t_ty.clone(), usize_ty.clone(), usize_ty],
     );
 
-    let func_id = builder.begin_generic_function("vec_free", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_free", vec!["T"])
         .param("vec", vec_t_ty.clone())
         .returns(void_ty)
         .build();
@@ -295,7 +292,8 @@ fn build_vec_push(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_t_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_push", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_push", vec!["T"])
         .param("vec", ptr_vec_ty)
         .param("value", t_param.clone())
         .returns(void_ty)
@@ -339,13 +337,12 @@ fn build_vec_push(builder: &mut HirBuilder) {
     let realloc_name = builder.intern("realloc");
     let realloc_id = builder.get_function_by_name(realloc_name);
     let realloc_ref = builder.function_ref(realloc_id);
-    let new_ptr_u8 = builder.call(realloc_ref, vec![old_ptr_u8, new_size]).unwrap();
+    let new_ptr_u8 = builder
+        .call(realloc_ref, vec![old_ptr_u8, new_size])
+        .unwrap();
     let new_ptr_t = builder.bitcast(new_ptr_u8, ptr_t_ty.clone());
 
-    let grown_vec = builder.create_struct(
-        vec_t_ty.clone(),
-        vec![new_ptr_t, len_field, new_cap],
-    );
+    let grown_vec = builder.create_struct(vec_t_ty.clone(), vec![new_ptr_t, len_field, new_cap]);
     builder.store(grown_vec, vec_ptr);
     builder.br(insert_element);
 
@@ -367,10 +364,7 @@ fn build_vec_push(builder: &mut HirBuilder) {
     let one = builder.const_u64(1);
     let new_len = builder.add(len_field2, one, usize_ty.clone());
 
-    let final_vec = builder.create_struct(
-        vec_t_ty,
-        vec![ptr_field2, new_len, cap_field2],
-    );
+    let final_vec = builder.create_struct(vec_t_ty, vec![ptr_field2, new_len, cap_field2]);
     builder.store(final_vec, vec_ptr);
 
     let unit = builder.unit_value();
@@ -406,7 +400,8 @@ fn build_vec_pop(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_generic_function("vec_pop", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_pop", vec!["T"])
         .param("vec", ptr_vec_ty)
         .returns(option_ty.clone())
         .build();
@@ -449,10 +444,7 @@ fn build_vec_pop(builder: &mut HirBuilder) {
     let elem_ptr = builder.ptr_add(ptr_field, new_len, ptr_t_ty.clone());
     let elem_val = builder.load(elem_ptr, t_param.clone());
 
-    let updated_vec = builder.create_struct(
-        vec_t_ty,
-        vec![ptr_field, new_len, cap_field],
-    );
+    let updated_vec = builder.create_struct(vec_t_ty, vec![ptr_field, new_len, cap_field]);
     builder.store(updated_vec, vec_ptr);
 
     let some_val = builder.create_union(1, elem_val, option_ty);
@@ -488,7 +480,8 @@ fn build_vec_get(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_generic_function("vec_get", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_get", vec!["T"])
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .returns(option_ty.clone())
@@ -544,7 +537,8 @@ fn build_vec_set(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_t_ty.clone());
 
-    let func_id = builder.begin_generic_function("vec_set", vec!["T"])
+    let func_id = builder
+        .begin_generic_function("vec_set", vec!["T"])
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .param("value", t_param.clone())
@@ -619,17 +613,23 @@ mod tests {
         ];
 
         for func_name in expected_functions {
-            let found = module.functions.values().any(|f| {
-                arena.resolve_string(f.name) == Some(func_name)
-            });
+            let found = module
+                .functions
+                .values()
+                .any(|f| arena.resolve_string(f.name) == Some(func_name));
             assert!(found, "Generic function {} not found", func_name);
 
             // Verify it's actually generic (has type params)
-            let func = module.functions.values().find(|f| {
-                arena.resolve_string(f.name) == Some(func_name)
-            }).unwrap();
-            assert!(!func.signature.type_params.is_empty(),
-                "Function {} should be generic", func_name);
+            let func = module
+                .functions
+                .values()
+                .find(|f| arena.resolve_string(f.name) == Some(func_name))
+                .unwrap();
+            assert!(
+                !func.signature.type_params.is_empty(),
+                "Function {} should be generic",
+                func_name
+            );
         }
     }
 }

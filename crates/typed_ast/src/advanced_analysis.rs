@@ -9,9 +9,9 @@
 
 use crate::arena::InternedString;
 use crate::source::Span;
-use crate::type_registry::{Type, Mutability, Lifetime};
+use crate::type_registry::{Lifetime, Mutability, Type};
 use crate::typed_ast::*;
-use std::collections::{HashMap, HashSet, BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 // ====== CORE ANALYSIS INFRASTRUCTURE ======
@@ -24,7 +24,7 @@ impl AnalysisNodeId {
     pub fn new(id: u32) -> Self {
         Self(id)
     }
-    
+
     pub fn as_u32(self) -> u32 {
         self.0
     }
@@ -82,39 +82,42 @@ impl AnalysisContext {
             phase: AnalysisPhase::Lowering,
         }
     }
-    
+
     fn next_node_id(&mut self) -> AnalysisNodeId {
         let id = AnalysisNodeId::new(self.next_id);
         self.next_id += 1;
         id
     }
-    
+
     /// Complete analysis pipeline for a TypedAST program
-    pub fn analyze_program(&mut self, program: &TypedProgram) -> Result<AnalysisResult, AnalysisError> {
+    pub fn analyze_program(
+        &mut self,
+        program: &TypedProgram,
+    ) -> Result<AnalysisResult, AnalysisError> {
         // Phase 1: Lower TypedAST to analysis IR
         self.phase = AnalysisPhase::Lowering;
         self.lower_program(program)?;
-        
+
         // Phase 2: Build control flow graph
         self.phase = AnalysisPhase::ControlFlow;
         self.build_control_flow()?;
-        
+
         // Phase 3: Build data flow graph
         self.phase = AnalysisPhase::DataFlow;
         self.build_data_flow()?;
-        
+
         // Phase 4: Ownership analysis
         self.phase = AnalysisPhase::Ownership;
         self.analyze_ownership()?;
-        
+
         // Phase 5: Lifetime analysis
         self.phase = AnalysisPhase::Lifetime;
         self.analyze_lifetimes()?;
-        
+
         // Phase 6: Optimizations
         self.phase = AnalysisPhase::Optimization;
         self.optimize()?;
-        
+
         Ok(AnalysisResult {
             cfg: self.cfg.clone(),
             dfg: self.dfg.clone(),
@@ -158,25 +161,47 @@ pub struct DFGNode {
 #[derive(Debug, Clone)]
 pub enum DFGNodeKind {
     /// Variable assignment
-    Assignment { target: InternedString, source: AnalysisNodeId },
+    Assignment {
+        target: InternedString,
+        source: AnalysisNodeId,
+    },
     /// Function call
-    Call { callee: AnalysisNodeId, args: Vec<AnalysisNodeId>, returns: Option<InternedString> },
+    Call {
+        callee: AnalysisNodeId,
+        args: Vec<AnalysisNodeId>,
+        returns: Option<InternedString>,
+    },
     /// Literal value
     Literal { value: DFGLiteral },
     /// Variable reference
     Variable { name: InternedString },
     /// Binary operation
-    BinaryOp { op: BinaryOp, left: AnalysisNodeId, right: AnalysisNodeId },
+    BinaryOp {
+        op: BinaryOp,
+        left: AnalysisNodeId,
+        right: AnalysisNodeId,
+    },
     /// Unary operation
-    UnaryOp { op: UnaryOp, operand: AnalysisNodeId },
+    UnaryOp {
+        op: UnaryOp,
+        operand: AnalysisNodeId,
+    },
     /// Field access
-    FieldAccess { object: AnalysisNodeId, field: InternedString },
+    FieldAccess {
+        object: AnalysisNodeId,
+        field: InternedString,
+    },
     /// Array/pointer dereference
     Dereference { target: AnalysisNodeId },
     /// Address-of operation
-    AddressOf { target: AnalysisNodeId, mutability: Mutability },
+    AddressOf {
+        target: AnalysisNodeId,
+        mutability: Mutability,
+    },
     /// Phi node for SSA form
-    Phi { inputs: Vec<(AnalysisNodeId, AnalysisNodeId)> }, // (value, block)
+    Phi {
+        inputs: Vec<(AnalysisNodeId, AnalysisNodeId)>,
+    }, // (value, block)
 }
 
 #[derive(Debug, Clone)]
@@ -219,24 +244,24 @@ impl DataFlowGraph {
             dominance_frontiers: HashMap::new(),
         }
     }
-    
+
     pub fn add_node(&mut self, node: DFGNode) {
         self.nodes.insert(node.id, node);
     }
-    
+
     pub fn add_edge(&mut self, from: AnalysisNodeId, edge: DFGEdge) {
         self.edges.entry(from).or_default().push(edge);
     }
-    
+
     /// Compute dominance frontiers for SSA construction
     pub fn compute_dominance_frontiers(&mut self) {
         // Implementation of dominance frontier algorithm
         // This is a simplified version - full implementation would use
         // Lengauer-Tarjan algorithm for efficiency
-        
+
         for &node_id in self.nodes.keys() {
             let mut frontier = HashSet::new();
-            
+
             // Find all nodes that this node dominates
             for &other_id in self.nodes.keys() {
                 if node_id != other_id && self.dominates(node_id, other_id) {
@@ -250,64 +275,76 @@ impl DataFlowGraph {
                     }
                 }
             }
-            
+
             self.dominance_frontiers.insert(node_id, frontier);
         }
     }
-    
+
     /// Check if node 'a' dominates node 'b'
     fn dominates(&self, a: AnalysisNodeId, b: AnalysisNodeId) -> bool {
         // Simplified dominance check
         // In practice, this would use pre-computed dominance trees
-        if a == b { return true; }
-        
+        if a == b {
+            return true;
+        }
+
         // For now, just check if 'a' is reachable from all entry points to 'b'
-        self.entry_points.iter().all(|&entry| {
-            self.path_exists_through(entry, b, a)
-        })
+        self.entry_points
+            .iter()
+            .all(|&entry| self.path_exists_through(entry, b, a))
     }
-    
-    fn path_exists_through(&self, start: AnalysisNodeId, end: AnalysisNodeId, through: AnalysisNodeId) -> bool {
-        if start == end { return start == through; }
-        
+
+    fn path_exists_through(
+        &self,
+        start: AnalysisNodeId,
+        end: AnalysisNodeId,
+        through: AnalysisNodeId,
+    ) -> bool {
+        if start == end {
+            return start == through;
+        }
+
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(start);
-        
+
         while let Some(current) = queue.pop_front() {
-            if !visited.insert(current) { continue; }
-            
+            if !visited.insert(current) {
+                continue;
+            }
+
             if current == end {
                 return true;
             }
-            
+
             if current != through && current != start {
                 continue; // Must go through 'through' node
             }
-            
+
             if let Some(edges) = self.edges.get(&current) {
                 for edge in edges {
                     queue.push_back(edge.target);
                 }
             }
         }
-        
+
         false
     }
-    
+
     /// Convert to SSA form
     pub fn convert_to_ssa(&mut self) {
         self.compute_dominance_frontiers();
-        
+
         // Insert phi nodes at dominance frontiers
         let mut phi_nodes = HashMap::new();
-        
+
         for (&node_id, frontier) in &self.dominance_frontiers {
             if let Some(node) = self.nodes.get(&node_id) {
                 for &var in &node.defines {
                     for &frontier_node in frontier {
                         // Insert phi node for this variable
-                        let phi_id = AnalysisNodeId::new(self.nodes.len() as u32 + phi_nodes.len() as u32);
+                        let phi_id =
+                            AnalysisNodeId::new(self.nodes.len() as u32 + phi_nodes.len() as u32);
                         let phi = DFGNode {
                             id: phi_id,
                             kind: DFGNodeKind::Phi { inputs: Vec::new() },
@@ -322,25 +359,25 @@ impl DataFlowGraph {
                 }
             }
         }
-        
+
         // Add phi nodes to the graph
         for (id, phi) in phi_nodes {
             self.nodes.insert(id, phi);
         }
     }
-    
+
     /// Perform live variable analysis
     pub fn compute_liveness(&mut self) {
         let mut changed = true;
-        
+
         while changed {
             changed = false;
-            
+
             // Process nodes in reverse postorder
             let node_ids: Vec<_> = self.nodes.keys().cloned().collect();
             for node_id in node_ids {
                 let mut new_live_vars = HashSet::new();
-                
+
                 // Live_out = union of Live_in of all successors
                 if let Some(edges) = self.edges.get(&node_id) {
                     for edge in edges {
@@ -349,7 +386,7 @@ impl DataFlowGraph {
                         }
                     }
                 }
-                
+
                 // Live_in = (Live_out - Def) union Use
                 if let Some(node) = self.nodes.get(&node_id) {
                     for var in &new_live_vars {
@@ -359,7 +396,7 @@ impl DataFlowGraph {
                     }
                     new_live_vars.extend(&node.uses);
                 }
-                
+
                 // Update if changed
                 if let Some(node) = self.nodes.get_mut(&node_id) {
                     if node.live_vars != new_live_vars {
@@ -407,18 +444,18 @@ pub enum CFGTerminator {
     /// Unconditional branch
     Branch { target: AnalysisNodeId },
     /// Conditional branch
-    ConditionalBranch { 
-        condition: AnalysisNodeId, 
-        then_block: AnalysisNodeId, 
-        else_block: AnalysisNodeId 
+    ConditionalBranch {
+        condition: AnalysisNodeId,
+        then_block: AnalysisNodeId,
+        else_block: AnalysisNodeId,
     },
     /// Function return
     Return { value: Option<AnalysisNodeId> },
     /// Switch/match statement
-    Switch { 
-        discriminant: AnalysisNodeId, 
+    Switch {
+        discriminant: AnalysisNodeId,
         cases: Vec<(AnalysisNodeId, AnalysisNodeId)>, // (value, target)
-        default: Option<AnalysisNodeId> 
+        default: Option<AnalysisNodeId>,
     },
     /// Unreachable code
     Unreachable,
@@ -480,39 +517,39 @@ impl ControlFlowGraph {
             loops: Vec::new(),
         }
     }
-    
+
     pub fn add_block(&mut self, block: CFGBlock) {
         self.blocks.insert(block.id, block);
     }
-    
+
     pub fn add_edge(&mut self, from: AnalysisNodeId, edge: CFGEdge) {
         self.edges.entry(from).or_default().push(edge);
     }
-    
+
     /// Detect natural loops in the CFG
     pub fn detect_loops(&mut self) {
         let mut loops = Vec::new();
         let mut visited = HashSet::new();
-        
+
         if let Some(entry) = self.entry {
             self.detect_loops_dfs(entry, &mut visited, &mut Vec::new(), &mut loops);
         }
-        
+
         self.loops = loops;
     }
-    
+
     fn detect_loops_dfs(
-        &self, 
-        current: AnalysisNodeId, 
+        &self,
+        current: AnalysisNodeId,
         visited: &mut HashSet<AnalysisNodeId>,
         path: &mut Vec<AnalysisNodeId>,
-        loops: &mut Vec<LoopInfo>
+        loops: &mut Vec<LoopInfo>,
     ) {
         if path.contains(&current) {
             // Found a back edge - this indicates a loop
             let loop_start_idx = path.iter().position(|&x| x == current).unwrap();
             let loop_blocks: HashSet<_> = path[loop_start_idx..].iter().copied().collect();
-            
+
             let loop_info = LoopInfo {
                 header: current,
                 blocks: loop_blocks,
@@ -520,62 +557,67 @@ impl ControlFlowGraph {
                 nested_loops: Vec::new(),
                 kind: LoopKind::While, // Would need to infer from structure
             };
-            
+
             loops.push(loop_info);
             return;
         }
-        
+
         if !visited.insert(current) {
             return;
         }
-        
+
         path.push(current);
-        
+
         if let Some(edges) = self.edges.get(&current) {
             for edge in edges {
                 self.detect_loops_dfs(edge.target, visited, path, loops);
             }
         }
-        
+
         path.pop();
     }
-    
+
     /// Compute dominance relationships
     pub fn compute_dominance(&mut self) {
         // Simplified dominance computation
         // Full implementation would use Lengauer-Tarjan algorithm
-        
+
         let block_ids: Vec<_> = self.blocks.keys().cloned().collect();
         for block_id in block_ids {
             let mut dominators = HashSet::new();
-            
+
             if Some(block_id) == self.entry {
                 dominators.insert(block_id);
             } else {
                 // A block is dominated by the intersection of dominators of all predecessors
-                let predecessors: Vec<_> = self.edges.iter()
+                let predecessors: Vec<_> = self
+                    .edges
+                    .iter()
                     .filter_map(|(from, edges)| {
                         edges.iter().find(|e| e.target == block_id).map(|_| *from)
                     })
                     .collect();
-                
+
                 if !predecessors.is_empty() {
                     // Start with dominators of first predecessor
                     if let Some(first_block) = self.blocks.get(&predecessors[0]) {
                         dominators = first_block.dominators.clone();
                     }
-                    
+
                     // Intersect with dominators of other predecessors
                     for &pred in &predecessors[1..] {
                         if let Some(pred_block) = self.blocks.get(&pred) {
-                            dominators = dominators.intersection(&pred_block.dominators).copied().collect();
+                            dominators = dominators
+                                .intersection(&pred_block.dominators)
+                                .copied()
+                                .collect();
                         }
                     }
                 }
-                
+
                 dominators.insert(block_id);
             }
-            
+
             if let Some(block) = self.blocks.get_mut(&block_id) {
                 block.dominators = dominators;
             }
@@ -677,9 +719,13 @@ impl OwnershipAnalysis {
             drops: Vec::new(),
         }
     }
-    
+
     /// Analyze ownership for a variable assignment
-    pub fn analyze_assignment(&mut self, target: InternedString, source: &DFGNode) -> Result<(), OwnershipError> {
+    pub fn analyze_assignment(
+        &mut self,
+        target: InternedString,
+        source: &DFGNode,
+    ) -> Result<(), OwnershipError> {
         match &source.kind {
             DFGNodeKind::Variable { name } => {
                 // Check if source is being moved
@@ -692,12 +738,12 @@ impl OwnershipAnalysis {
                                 destination: Some(target),
                                 span: source.span,
                             });
-                            
+
                             // Update ownership
                             let mut new_ownership = ownership.clone();
                             new_ownership.variable = target;
                             self.ownership_map.insert(target, new_ownership);
-                            
+
                             // Mark source as moved
                             if let Some(source_ownership) = self.ownership_map.get_mut(name) {
                                 source_ownership.kind = OwnershipKind::Moved;
@@ -710,27 +756,30 @@ impl OwnershipAnalysis {
                             self.ownership_map.insert(target, new_ownership);
                         }
                         OwnershipKind::Moved => {
-                            return Err(OwnershipError::UseAfterMove { 
-                                variable: *name, 
-                                span: source.span 
+                            return Err(OwnershipError::UseAfterMove {
+                                variable: *name,
+                                span: source.span,
                             });
                         }
                         _ => {}
                     }
                 }
             }
-            DFGNodeKind::AddressOf { target: addr_target, mutability } => {
+            DFGNodeKind::AddressOf {
+                target: addr_target,
+                mutability,
+            } => {
                 // Create a borrow
                 let borrow_kind = match mutability {
                     Mutability::Mutable => BorrowKind::Mutable,
                     Mutability::Immutable => BorrowKind::Shared,
                 };
-                
+
                 // Check if we can borrow
                 if let Some(target_node) = self.find_variable_node(*addr_target) {
                     if let DFGNodeKind::Variable { name: borrowed_var } = &target_node.kind {
                         self.check_borrow_validity(*borrowed_var, &borrow_kind, source.span)?;
-                        
+
                         // Record the borrow
                         let borrow = BorrowInfo {
                             borrowed: *borrowed_var,
@@ -739,46 +788,57 @@ impl OwnershipAnalysis {
                             lifetime: None, // Would be computed by lifetime analysis
                             span: source.span,
                         };
-                        
+
                         self.borrows.entry(*borrowed_var).or_default().push(borrow);
-                        
+
                         // Create ownership info for the reference
                         let ownership_kind = match borrow_kind {
                             BorrowKind::Shared => OwnershipKind::SharedRef,
                             BorrowKind::Mutable => OwnershipKind::MutableRef,
                         };
-                        
-                        self.ownership_map.insert(target, OwnershipInfo {
-                            variable: target,
-                            kind: ownership_kind,
-                            ty: source.ty.clone(),
-                            span: source.span,
-                            mutable: matches!(mutability, Mutability::Mutable),
-                        });
+
+                        self.ownership_map.insert(
+                            target,
+                            OwnershipInfo {
+                                variable: target,
+                                kind: ownership_kind,
+                                ty: source.ty.clone(),
+                                span: source.span,
+                                mutable: matches!(mutability, Mutability::Mutable),
+                            },
+                        );
                     }
                 }
             }
             _ => {
                 // For other kinds, create owned value
-                self.ownership_map.insert(target, OwnershipInfo {
-                    variable: target,
-                    kind: OwnershipKind::Owned,
-                    ty: source.ty.clone(),
-                    span: source.span,
-                    mutable: false,
-                });
+                self.ownership_map.insert(
+                    target,
+                    OwnershipInfo {
+                        variable: target,
+                        kind: OwnershipKind::Owned,
+                        ty: source.ty.clone(),
+                        span: source.span,
+                        mutable: false,
+                    },
+                );
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn find_variable_node(&self, node_id: AnalysisNodeId) -> Option<&DFGNode> {
         // This would need access to the DFG - simplified for now
         None
     }
-    
-    fn check_borrow_validity(&self, variable: InternedString, kind: &BorrowKind, span: Span) -> Result<(), OwnershipError> {
+
+    fn check_borrow_validity(
+        &self,
+        variable: InternedString,
+        kind: &BorrowKind,
+        span: Span,
+    ) -> Result<(), OwnershipError> {
         if let Some(existing_borrows) = self.borrows.get(&variable) {
             for borrow in existing_borrows {
                 match (kind, &borrow.kind) {
@@ -796,18 +856,22 @@ impl OwnershipAnalysis {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Check for use-after-move errors
-    pub fn check_use_after_move(&self, variable: InternedString, span: Span) -> Result<(), OwnershipError> {
+    pub fn check_use_after_move(
+        &self,
+        variable: InternedString,
+        span: Span,
+    ) -> Result<(), OwnershipError> {
         if let Some(ownership) = self.ownership_map.get(&variable) {
             if matches!(ownership.kind, OwnershipKind::Moved) {
                 return Err(OwnershipError::UseAfterMove { variable, span });
             }
         }
-        
+
         Ok(())
     }
 }
@@ -838,9 +902,15 @@ pub enum ConstraintKind {
     /// Lifetime 'a must outlive 'b
     Outlives { a: Lifetime, b: Lifetime },
     /// Variable has lifetime 'a
-    VarLifetime { var: InternedString, lifetime: Lifetime },
+    VarLifetime {
+        var: InternedString,
+        lifetime: Lifetime,
+    },
     /// Function parameter lifetime constraint
-    ParamConstraint { param: InternedString, lifetime: Lifetime },
+    ParamConstraint {
+        param: InternedString,
+        lifetime: Lifetime,
+    },
     /// Return value lifetime constraint
     ReturnConstraint { lifetime: Lifetime },
 }
@@ -875,17 +945,17 @@ impl LifetimeAnalysis {
             scopes: HashMap::new(),
         }
     }
-    
+
     /// Add a lifetime constraint
     pub fn add_constraint(&mut self, constraint: LifetimeConstraint) {
         self.constraints.push(constraint);
     }
-    
+
     /// Solve lifetime constraints
     pub fn solve_constraints(&mut self) -> Result<(), LifetimeError> {
         // Simplified constraint solving
         // Full implementation would use graph-based algorithms
-        
+
         let constraints = self.constraints.clone();
         for constraint in &constraints {
             match &constraint.kind {
@@ -898,23 +968,28 @@ impl LifetimeAnalysis {
                 _ => {}
             }
         }
-        
+
         Ok(())
     }
-    
-    fn check_outlives_constraint(&self, a: &Lifetime, b: &Lifetime, span: Span) -> Result<(), LifetimeError> {
+
+    fn check_outlives_constraint(
+        &self,
+        a: &Lifetime,
+        b: &Lifetime,
+        span: Span,
+    ) -> Result<(), LifetimeError> {
         // Check if lifetime 'a outlives lifetime 'b
         // This would involve checking scope relationships
         Ok(())
     }
-    
+
     fn assign_var_lifetime(&mut self, var: InternedString, lifetime: Lifetime) {
         let info = LifetimeInfo {
             lifetime: lifetime.clone(),
             variables: [var].into_iter().collect(),
             scope: AnalysisNodeId::new(0), // Would compute proper scope
         };
-        
+
         self.lifetime_vars.insert(var, info);
     }
 }
@@ -938,13 +1013,26 @@ pub enum AnalysisError {
 #[derive(Debug, Clone)]
 pub enum OwnershipError {
     /// Use after move
-    UseAfterMove { variable: InternedString, span: Span },
+    UseAfterMove {
+        variable: InternedString,
+        span: Span,
+    },
     /// Conflicting borrow
-    ConflictingBorrow { variable: InternedString, span: Span, existing_span: Span },
+    ConflictingBorrow {
+        variable: InternedString,
+        span: Span,
+        existing_span: Span,
+    },
     /// Double free
-    DoubleFree { variable: InternedString, span: Span },
+    DoubleFree {
+        variable: InternedString,
+        span: Span,
+    },
     /// Invalid move
-    InvalidMove { variable: InternedString, span: Span },
+    InvalidMove {
+        variable: InternedString,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -952,9 +1040,16 @@ pub enum LifetimeError {
     /// Lifetime constraint violation
     ConstraintViolation { constraint: String, span: Span },
     /// Dangling reference
-    DanglingReference { variable: InternedString, span: Span },
+    DanglingReference {
+        variable: InternedString,
+        span: Span,
+    },
     /// Lifetime parameter mismatch
-    ParameterMismatch { expected: Lifetime, found: Lifetime, span: Span },
+    ParameterMismatch {
+        expected: Lifetime,
+        found: Lifetime,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -970,7 +1065,10 @@ pub enum ControlFlowError {
 #[derive(Debug, Clone)]
 pub enum DataFlowError {
     /// Uninitialized variable use
-    UninitializedUse { variable: InternedString, span: Span },
+    UninitializedUse {
+        variable: InternedString,
+        span: Span,
+    },
     /// Dead code
     DeadCode { span: Span },
 }
@@ -998,27 +1096,27 @@ impl AnalysisContext {
         // Convert TypedAST to analysis IR
         Ok(())
     }
-    
+
     fn build_control_flow(&mut self) -> Result<(), AnalysisError> {
         // Build CFG from lowered IR
         Ok(())
     }
-    
+
     fn build_data_flow(&mut self) -> Result<(), AnalysisError> {
         // Build DFG from lowered IR
         Ok(())
     }
-    
+
     fn analyze_ownership(&mut self) -> Result<(), AnalysisError> {
         // Perform ownership analysis
         Ok(())
     }
-    
+
     fn analyze_lifetimes(&mut self) -> Result<(), AnalysisError> {
         // Perform lifetime analysis
         Ok(())
     }
-    
+
     fn optimize(&mut self) -> Result<(), AnalysisError> {
         // Perform optimizations
         Ok(())

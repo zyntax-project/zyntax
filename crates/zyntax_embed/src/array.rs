@@ -52,8 +52,8 @@ impl<T: Copy> ZyntaxArray<T> {
             }
 
             // Write header
-            *ptr = capacity;           // capacity
-            *ptr.add(1) = 0;          // length
+            *ptr = capacity; // capacity
+            *ptr.add(1) = 0; // length
 
             Self {
                 ptr: NonNull::new_unchecked(ptr),
@@ -247,11 +247,8 @@ impl<T: Copy> ZyntaxArray<T> {
 
         unsafe {
             let old_layout = std::alloc::Layout::from_size_align_unchecked(old_size, 4);
-            let new_ptr = std::alloc::realloc(
-                self.ptr.as_ptr() as *mut u8,
-                old_layout,
-                new_size,
-            ) as *mut i32;
+            let new_ptr =
+                std::alloc::realloc(self.ptr.as_ptr() as *mut u8, old_layout, new_size) as *mut i32;
 
             if new_ptr.is_null() {
                 panic!("Failed to grow ZyntaxArray");
@@ -321,7 +318,8 @@ impl<T: Copy> std::ops::Index<usize> for ZyntaxArray<T> {
 
 impl<T: Copy> std::ops::IndexMut<usize> for ZyntaxArray<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        self.get_mut(index).expect("ZyntaxArray index out of bounds")
+        self.get_mut(index)
+            .expect("ZyntaxArray index out of bounds")
     }
 }
 

@@ -48,12 +48,13 @@ fn golang_features_analysis() {
             },
         ],
         return_type: Type::Primitive(PrimitiveType::I32),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![],
             span: Span::new(20, 30),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
     println!("   ✅ Functions with parameters and return types");
 
@@ -145,8 +146,8 @@ fn golang_features_analysis() {
                     ty: Type::Array {
                         element_type: Box::new(Type::Primitive(PrimitiveType::U8)),
                         size: None,
-                nullability: NullabilityKind::NonNull,
-            },
+                        nullability: NullabilityKind::NonNull,
+                    },
                     mutability: Mutability::Immutable,
                     is_self: false,
                     span: Span::new(16, 17),
@@ -161,10 +162,10 @@ fn golang_features_analysis() {
                     // error
                     id: TypeId::next(), // "error",
                     type_args: vec![],
-                        const_args: Vec::new(),
-                        variance: Vec::new(),
-                        nullability: NullabilityKind::NonNull,
-                    },
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                },
             ]),
             is_static: false,
             is_async: false,
@@ -313,7 +314,7 @@ fn go_code_examples() {
             },
         ],
         return_type: Type::Primitive(PrimitiveType::I32),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![typed_node(
                 TypedStatement::Return(Some(Box::new(typed_node(
                     TypedExpression::Binary(TypedBinary {
@@ -336,9 +337,10 @@ fn go_code_examples() {
                 Span::new(18, 30),
             )],
             span: Span::new(17, 32),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
     println!("   → TypedFunction with binary addition expression ✅");
 
@@ -510,10 +512,10 @@ fn go_code_examples() {
                         is_varargs: false,
                         has_named_params: false,
                         has_default_params: false,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            },
+                        async_kind: AsyncKind::Sync,
+                        calling_convention: CallingConvention::Default,
+                        nullability: NullabilityKind::NonNull,
+                    },
                     Span::new(3, 17),
                 )),
                 named_args: vec![],
@@ -567,10 +569,10 @@ fn go_code_examples() {
                         Type::Named {
                             id: TypeId::next(), // "Channel",
                             type_args: vec![Type::Primitive(PrimitiveType::I32)],
-                        const_args: Vec::new(),
-                        variance: Vec::new(),
-                        nullability: NullabilityKind::NonNull,
-                    },
+                            const_args: Vec::new(),
+                            variance: Vec::new(),
+                            nullability: NullabilityKind::NonNull,
+                        },
                         Span::new(15, 18),
                     )),
                     pattern: None,
@@ -588,10 +590,10 @@ fn go_code_examples() {
                         Type::Named {
                             id: TypeId::next(), // "Channel",
                             type_args: vec![Type::Primitive(PrimitiveType::I32)],
-                        const_args: Vec::new(),
-                        variance: Vec::new(),
-                        nullability: NullabilityKind::NonNull,
-                    },
+                            const_args: Vec::new(),
+                            variance: Vec::new(),
+                            nullability: NullabilityKind::NonNull,
+                        },
                         Span::new(32, 35),
                     )),
                     value: Box::new(typed_node(
@@ -633,12 +635,13 @@ fn go_code_examples() {
             attributes: vec![],
         }],
         return_type: Type::Primitive(PrimitiveType::Unit),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![],
             span: Span::new(35, 40),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
 
     // Go generic type parameter with constraint
@@ -647,10 +650,10 @@ fn go_code_examples() {
         bounds: vec![TypedTypeBound::Trait(Type::Named {
             id: TypeId::next(), // "comparable",
             type_args: vec![],
-                        const_args: Vec::new(),
-                        variance: Vec::new(),
-                        nullability: NullabilityKind::NonNull,
-                    })],
+            const_args: Vec::new(),
+            variance: Vec::new(),
+            nullability: NullabilityKind::NonNull,
+        })],
         default: None,
         span: Span::new(15, 27),
     };
@@ -777,7 +780,7 @@ fn go_code_examples() {
         name: arena.intern_string("init"),
         params: vec![],
         return_type: Type::Primitive(PrimitiveType::Unit),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![typed_node(
                 TypedStatement::Expression(Box::new(typed_node(
                     TypedExpression::Call(TypedCall {
@@ -789,10 +792,10 @@ fn go_code_examples() {
                                 is_varargs: false,
                                 has_named_params: false,
                                 has_default_params: false,
-                async_kind: AsyncKind::Sync,
-                calling_convention: CallingConvention::Default,
-                nullability: NullabilityKind::NonNull,
-            },
+                                async_kind: AsyncKind::Sync,
+                                calling_convention: CallingConvention::Default,
+                                nullability: NullabilityKind::NonNull,
+                            },
                             Span::new(10, 23),
                         )),
                         positional_args: vec![],
@@ -806,9 +809,10 @@ fn go_code_examples() {
                 Span::new(10, 25),
             )],
             span: Span::new(15, 30),
-        },
+        }),
         visibility: Visibility::Private, // init functions are package-private
         is_async: false,
+        ..Default::default()
     };
     println!("   → TypedFunction with special 'init' name for package initialization ✅");
 
@@ -817,7 +821,7 @@ fn go_code_examples() {
     let _go_blank_assignment = TypedLet {
         name: arena.intern_string("_destructure"),
         ty: Type::Tuple(vec![
-            Type::Any,                        // blank identifier - type doesn't matter
+            Type::Any,                            // blank identifier - type doesn't matter
             Type::Primitive(PrimitiveType::Bool), // ok
         ]),
         mutability: Mutability::Immutable,
@@ -923,7 +927,7 @@ fn go_code_examples() {
             Type::Primitive(PrimitiveType::I32),
             Type::Primitive(PrimitiveType::I32),
         ]),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![typed_node(
                 TypedStatement::Return(Some(Box::new(typed_node(
                     TypedExpression::Tuple(vec![
@@ -948,9 +952,10 @@ fn go_code_examples() {
                 Span::new(0, 11),
             )],
             span: Span::new(25, 35),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
     println!("   → Tuple types perfectly handle Go's multiple assignment and returns ✅");
 
@@ -1213,15 +1218,15 @@ mod tests {
         let go_array = Type::Array {
             element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
             size: Some(5),
-                nullability: NullabilityKind::NonNull,
-            };
+            nullability: NullabilityKind::NonNull,
+        };
 
         // Go slice: []int
         let go_slice = Type::Array {
             element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
             size: None,
-                nullability: NullabilityKind::NonNull,
-            };
+            nullability: NullabilityKind::NonNull,
+        };
 
         if let Type::Array { size: Some(5), .. } = go_array {
             // Array has fixed size

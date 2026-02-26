@@ -1,16 +1,16 @@
 // Integration tests for trait bound constraint system
 
+use std::collections::HashMap;
 use zyntax_typed_ast::arena::AstArena;
 use zyntax_typed_ast::constraint_solver::{
     Constraint, ConstraintSolver, SolverError, Substitution,
 };
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{
-    TypeId, TypeRegistry, Mutability, TraitDef, ImplDef, MethodSig, TypeParam, Variance, Visibility
+    ImplDef, MethodSig, Mutability, TraitDef, TypeId, TypeParam, TypeRegistry, Variance, Visibility,
 };
+use zyntax_typed_ast::{AsyncKind, CallingConvention, ConstValue, NullabilityKind};
 use zyntax_typed_ast::{PrimitiveType, Type};
-use std::collections::HashMap;
-use zyntax_typed_ast::{NullabilityKind, AsyncKind, CallingConvention, ConstValue};
 
 #[test]
 fn test_basic_trait_implementation_setup() {
@@ -321,10 +321,10 @@ fn test_insufficient_trait_implementation_error() {
     let custom_type = Type::Named {
         id: TypeId::next(), // "CustomType",
         type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
 
     // Add trait bound: CustomType: Display
     solver.add_constraint(Constraint::TraitBound(
@@ -358,10 +358,10 @@ fn test_comprehensive_multi_trait_bounds_simplified() {
     let my_type = Type::Named {
         id: TypeId::next(), // "MyType",
         type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
 
     // Test that we can create constraint solver with type registry
     let mut solver = ConstraintSolver::with_type_registry(Box::new(env));
@@ -419,12 +419,15 @@ fn test_enhanced_constraint_propagation() {
 
     // Test enhanced solving with propagation
     let result = solver.solve_with_propagation();
-    
+
     // The propagation should create additional constraints
     let propagated = solver.propagate_trait_bounds();
     println!("Propagated {} additional constraints", propagated.len());
-    
-    println!("Enhanced constraint propagation result: {:?}", result.is_ok());
+
+    println!(
+        "Enhanced constraint propagation result: {:?}",
+        result.is_ok()
+    );
     assert!(result.is_ok() || result.is_err()); // Either way is valid for this test
 }
 
@@ -439,10 +442,10 @@ fn test_enhanced_error_reporting() {
     let custom_type = Type::Named {
         id: TypeId::next(),
         type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
 
     solver.add_constraint(Constraint::TraitBound(
         custom_type,
@@ -457,10 +460,13 @@ fn test_enhanced_error_reporting() {
         for error in &errors {
             let detailed_message = solver.generate_detailed_error(error);
             println!("Enhanced error message: {}", detailed_message);
-            
+
             // Check that the error message contains useful information
             // Note: Currently showing "trait_N" format since we don't have arena access in constraint solver
-            assert!(detailed_message.contains("trait_") || detailed_message.contains("NonExistentTrait"));
+            assert!(
+                detailed_message.contains("trait_")
+                    || detailed_message.contains("NonExistentTrait")
+            );
             assert!(detailed_message.contains("line"));
         }
     }
@@ -479,8 +485,8 @@ fn test_type_formatting() {
     let array = Type::Array {
         element_type: Box::new(Type::Primitive(PrimitiveType::String)),
         size: Some(ConstValue::Int(10)),
-                nullability: NullabilityKind::NonNull,
-            };
+        nullability: NullabilityKind::NonNull,
+    };
     assert_eq!(solver.format_type(&array), "[string; 10]");
 
     let optional = Type::Optional(Box::new(Type::Primitive(PrimitiveType::Bool)));
@@ -490,8 +496,8 @@ fn test_type_formatting() {
         ty: Box::new(Type::Primitive(PrimitiveType::F64)),
         mutability: Mutability::Mutable,
         lifetime: None,
-                nullability: NullabilityKind::NonNull,
-            };
+        nullability: NullabilityKind::NonNull,
+    };
     assert_eq!(solver.format_type(&reference), "&mut f64");
 
     println!("✅ Type formatting works correctly");
@@ -500,7 +506,7 @@ fn test_type_formatting() {
 #[test]
 fn test_method_resolution_with_trait_bounds() {
     use zyntax_typed_ast::constraint_solver::ResolvedMethod;
-    
+
     let mut arena = AstArena::new();
     let mut registry = TypeRegistry::new();
     let span = Span::new(0, 0);
@@ -511,35 +517,35 @@ fn test_method_resolution_with_trait_bounds() {
         name: arena.intern_string("Display"),
         type_params: vec![],
         super_traits: vec![],
-        methods: vec![
-            MethodSig {
-                name: arena.intern_string("fmt"),
-                type_params: vec![],
-                params: vec![],
-                return_type: Type::Primitive(PrimitiveType::String),
-                where_clause: vec![],
-                is_static: false,
-                is_async: false,
-                visibility: Visibility::Public,
-                span,
-                is_extension: false,
-            }
-        ],
+        methods: vec![MethodSig {
+            name: arena.intern_string("fmt"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::String),
+            where_clause: vec![],
+            is_static: false,
+            is_async: false,
+            visibility: Visibility::Public,
+            span,
+            is_extension: false,
+        }],
         associated_types: vec![],
         is_object_safe: true,
         span,
     };
-    
+
     let display_trait_id = registry.register_trait(display_trait);
-    
+
     // Create a type that implements Display
     let my_type_id = TypeId::next();
-    let my_type = Type::Named { id: my_type_id, type_args: vec![] ,
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
-    
+    let my_type = Type::Named {
+        id: my_type_id,
+        type_args: vec![],
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
+
     // Register an implementation of Display for MyType
     registry.register_implementation(ImplDef {
         trait_id: display_trait_id,
@@ -552,30 +558,29 @@ fn test_method_resolution_with_trait_bounds() {
     });
 
     let solver = ConstraintSolver::with_type_registry(Box::new(registry));
-    
+
     // Test method resolution
-    let result = solver.resolve_method_with_trait_bounds(
-        &my_type,
-        arena.intern_string("fmt"),
-        &[]
-    );
-    
+    let result = solver.resolve_method_with_trait_bounds(&my_type, arena.intern_string("fmt"), &[]);
+
     match result {
         Ok(Some(resolved_method)) => {
             println!("✅ Method resolution successful");
             assert_eq!(resolved_method.signature.name, arena.intern_string("fmt"));
-            
+
             // Verify trait bounds
             let bounds_check = solver.verify_method_trait_bounds(&resolved_method);
             assert!(bounds_check.is_ok(), "Trait bounds should be satisfied");
-            
+
             println!("✅ Trait bounds verification successful");
         }
         Ok(None) => {
             panic!("Method should be found");
         }
         Err(errors) => {
-            panic!("Method resolution should succeed, but got errors: {:?}", errors);
+            panic!(
+                "Method resolution should succeed, but got errors: {:?}",
+                errors
+            );
         }
     }
 }
@@ -590,7 +595,7 @@ fn test_method_resolution_with_type_variable_bounds() {
     // Create a type variable with a trait bound
     let type_var = solver.fresh_type_var();
     let display_trait = arena.intern_string("Display");
-    
+
     solver.add_constraint(Constraint::TraitBound(
         type_var.clone(),
         display_trait,
@@ -599,12 +604,8 @@ fn test_method_resolution_with_type_variable_bounds() {
 
     // Test method resolution from trait bounds
     if let Type::TypeVar(var) = &type_var {
-        let result = solver.resolve_method_from_trait_bounds(
-            var,
-            arena.intern_string("fmt"),
-            &[]
-        );
-        
+        let result = solver.resolve_method_from_trait_bounds(var, arena.intern_string("fmt"), &[]);
+
         match result {
             Ok(Some(resolved_method)) => {
                 println!("✅ Method resolved from trait bounds");
@@ -633,37 +634,34 @@ fn test_self_type_in_trait_methods() {
         name: arena.intern_string("Clone"),
         type_params: vec![],
         super_traits: vec![],
-        methods: vec![
-            MethodSig {
-                name: arena.intern_string("clone"),
-                type_params: vec![],
-                params: vec![],
-                return_type: Type::SelfType, // Returns Self
-                where_clause: vec![],
-                is_static: false,
-                is_async: false,
-                visibility: Visibility::Public,
-                span,
-                is_extension: false,
-            }
-        ],
+        methods: vec![MethodSig {
+            name: arena.intern_string("clone"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::SelfType, // Returns Self
+            where_clause: vec![],
+            is_static: false,
+            is_async: false,
+            visibility: Visibility::Public,
+            span,
+            is_extension: false,
+        }],
         associated_types: vec![],
         is_object_safe: true,
         span,
     };
-    
+
     let clone_trait_id = registry.register_trait(clone_trait);
-    
+
     // Create a concrete type implementing Clone
-    let my_type = Type::Named { 
-        id: TypeId::next(), 
-        type_args: vec![] 
-    ,
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
-    
+    let my_type = Type::Named {
+        id: TypeId::next(),
+        type_args: vec![],
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
+
     registry.register_implementation(ImplDef {
         trait_id: clone_trait_id,
         for_type: my_type.clone(),
@@ -675,14 +673,11 @@ fn test_self_type_in_trait_methods() {
     });
 
     let solver = ConstraintSolver::with_type_registry(Box::new(registry));
-    
+
     // Test method resolution with Self type
-    let result = solver.resolve_method_with_trait_bounds(
-        &my_type,
-        arena.intern_string("clone"),
-        &[]
-    );
-    
+    let result =
+        solver.resolve_method_with_trait_bounds(&my_type, arena.intern_string("clone"), &[]);
+
     match result {
         Ok(Some(resolved_method)) => {
             // The return type should be substituted from Self to the actual receiver type
@@ -693,7 +688,10 @@ fn test_self_type_in_trait_methods() {
             panic!("Method should be found");
         }
         Err(errors) => {
-            panic!("Method resolution should succeed, but got errors: {:?}", errors);
+            panic!(
+                "Method resolution should succeed, but got errors: {:?}",
+                errors
+            );
         }
     }
 }
@@ -710,53 +708,48 @@ fn test_associated_types_in_traits() {
         name: arena.intern_string("Iterator"),
         type_params: vec![],
         super_traits: vec![],
-        methods: vec![
-            MethodSig {
-                name: arena.intern_string("next"),
-                type_params: vec![],
-                params: vec![],
-                return_type: Type::Optional(Box::new(Type::Associated {
-                    trait_name: arena.intern_string("Iterator"),
-                    type_name: arena.intern_string("Item"),
-                })),
-                where_clause: vec![],
-                is_static: false,
-                is_async: false,
-                visibility: Visibility::Public,
-                span,
-                is_extension: false,
-            }
-        ],
-        associated_types: vec![
-            zyntax_typed_ast::type_registry::AssociatedTypeDef {
-                name: arena.intern_string("Item"),
-                bounds: vec![],
-                default: None,
-            }
-        ],
+        methods: vec![MethodSig {
+            name: arena.intern_string("next"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Optional(Box::new(Type::Associated {
+                trait_name: arena.intern_string("Iterator"),
+                type_name: arena.intern_string("Item"),
+            })),
+            where_clause: vec![],
+            is_static: false,
+            is_async: false,
+            visibility: Visibility::Public,
+            span,
+            is_extension: false,
+        }],
+        associated_types: vec![zyntax_typed_ast::type_registry::AssociatedTypeDef {
+            name: arena.intern_string("Item"),
+            bounds: vec![],
+            default: None,
+        }],
         is_object_safe: true,
         span,
     };
-    
+
     let iterator_trait_id = registry.register_trait(iterator_trait);
-    
+
     // Create a concrete type that implements Iterator with Item = i32
-    let vec_type = Type::Named { 
-        id: TypeId::next(), 
-        type_args: vec![Type::Primitive(PrimitiveType::I32)] 
-    ,
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
-    
+    let vec_type = Type::Named {
+        id: TypeId::next(),
+        type_args: vec![Type::Primitive(PrimitiveType::I32)],
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
+
     // Register the implementation with associated type binding
     let mut associated_types = HashMap::new();
     associated_types.insert(
-        arena.intern_string("Item"), 
-        Type::Primitive(PrimitiveType::I32)
+        arena.intern_string("Item"),
+        Type::Primitive(PrimitiveType::I32),
     );
-    
+
     registry.register_implementation(ImplDef {
         trait_id: iterator_trait_id,
         for_type: vec_type.clone(),
@@ -768,33 +761,38 @@ fn test_associated_types_in_traits() {
     });
 
     let solver = ConstraintSolver::with_type_registry(Box::new(registry));
-    
+
     // Test method resolution with associated type
-    let result = solver.resolve_method_with_trait_bounds(
-        &vec_type,
-        arena.intern_string("next"),
-        &[]
-    );
-    
+    let result =
+        solver.resolve_method_with_trait_bounds(&vec_type, arena.intern_string("next"), &[]);
+
     match result {
         Ok(Some(resolved_method)) => {
             // The return type should have the associated type resolved to i32
-            println!("Resolved return type: {:?}", resolved_method.signature.return_type);
-            
+            println!(
+                "Resolved return type: {:?}",
+                resolved_method.signature.return_type
+            );
+
             // We expect Optional<i32> instead of Optional<Iterator::Item>
             let expected_return = Type::Optional(Box::new(Type::Primitive(PrimitiveType::I32)));
-            
+
             // Verify that the associated type was resolved correctly
-            assert_eq!(resolved_method.signature.return_type, expected_return,
-                "Associated type should be resolved from Iterator::Item to i32");
-            
+            assert_eq!(
+                resolved_method.signature.return_type, expected_return,
+                "Associated type should be resolved from Iterator::Item to i32"
+            );
+
             println!("✅ Associated type resolution successful");
         }
         Ok(None) => {
             panic!("Method should be found");
         }
         Err(errors) => {
-            panic!("Method resolution should succeed, but got errors: {:?}", errors);
+            panic!(
+                "Method resolution should succeed, but got errors: {:?}",
+                errors
+            );
         }
     }
 }
@@ -825,18 +823,14 @@ fn test_associated_types_with_bounds() {
         type_params: vec![],
         super_traits: vec![],
         methods: vec![],
-        associated_types: vec![
-            zyntax_typed_ast::type_registry::AssociatedTypeDef {
-                name: arena.intern_string("Item"),
-                bounds: vec![
-                    zyntax_typed_ast::type_registry::TypeBound::Trait {
-                        name: arena.intern_string("Display"),
-                        args: vec![],
-                    }
-                ],
-                default: None,
-            }
-        ],
+        associated_types: vec![zyntax_typed_ast::type_registry::AssociatedTypeDef {
+            name: arena.intern_string("Item"),
+            bounds: vec![zyntax_typed_ast::type_registry::TypeBound::Trait {
+                name: arena.intern_string("Display"),
+                args: vec![],
+            }],
+            default: None,
+        }],
         is_object_safe: true,
         span,
     };
@@ -854,21 +848,20 @@ fn test_associated_types_with_bounds() {
     });
 
     // Create a type that implements Iterator with Item = i32
-    let vec_type = Type::Named { 
-        id: TypeId::next(), 
-        type_args: vec![] 
-    ,
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
-    
+    let vec_type = Type::Named {
+        id: TypeId::next(),
+        type_args: vec![],
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
+
     let mut associated_types = HashMap::new();
     associated_types.insert(
-        arena.intern_string("Item"), 
-        Type::Primitive(PrimitiveType::I32)
+        arena.intern_string("Item"),
+        Type::Primitive(PrimitiveType::I32),
     );
-    
+
     registry.register_implementation(ImplDef {
         trait_id: iterator_trait_id,
         for_type: vec_type.clone(),
@@ -924,7 +917,7 @@ fn test_where_clause_constraints() {
         default: None,
         span,
     };
-    
+
     // Create a method with where clause: where T: Display + Clone
     let process_method = MethodSig {
         name: arena.intern_string("process"),
@@ -933,25 +926,23 @@ fn test_where_clause_constraints() {
         return_type: Type::Primitive(PrimitiveType::Unit),
         where_clause: vec![
             zyntax_typed_ast::type_registry::TypeConstraint::Implementation {
-                ty: Type::Named { 
+                ty: Type::Named {
                     id: container_type_id,
-                    type_args: vec![]
-                ,
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            },
+                    type_args: vec![],
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                },
                 trait_id: display_trait_id,
             },
             zyntax_typed_ast::type_registry::TypeConstraint::Implementation {
-                ty: Type::Named { 
+                ty: Type::Named {
                     id: container_type_id,
-                    type_args: vec![]
-                ,
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            },
+                    type_args: vec![],
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                },
                 trait_id: clone_trait_id,
             },
         ],
@@ -978,33 +969,35 @@ fn test_where_clause_constraints() {
         metadata: Default::default(),
         span,
     };
-    
+
     registry.register_type(type_def);
 
     // Create a container instance with i32
     let container_i32 = Type::Named {
         id: container_type_id,
         type_args: vec![Type::Primitive(PrimitiveType::I32)],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            };
-    
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: NullabilityKind::NonNull,
+    };
+
     // Create a solver to test where clause processing
     let mut solver = ConstraintSolver::with_type_registry(Box::new(registry));
-    
+
     // Try to resolve the method - this should process where clauses internally
     let result = solver.resolve_method_with_trait_bounds(
         &container_i32,
         arena.intern_string("process"),
-        &[]
+        &[],
     );
-    
+
     match result {
         Ok(Some(resolved_method)) => {
             // The method should be resolved with where clause constraints
-            assert!(!resolved_method.signature.where_clause.is_empty(),
-                "Where clause should be present in resolved method");
+            assert!(
+                !resolved_method.signature.where_clause.is_empty(),
+                "Where clause should be present in resolved method"
+            );
             println!("✅ Where clause constraints processed successfully");
         }
         Ok(None) => {
@@ -1015,11 +1008,11 @@ fn test_where_clause_constraints() {
             println!("Method resolution failed with constraints: {:?}", errors);
         }
     }
-    
+
     println!("✅ Where clause constraints test completed");
 }
 
-#[test] 
+#[test]
 fn test_generic_method_instantiation() {
     let mut arena = AstArena::new();
     let mut registry = TypeRegistry::new();
@@ -1031,45 +1024,40 @@ fn test_generic_method_instantiation() {
         name: arena.intern_string("Clone"),
         type_params: vec![],
         super_traits: vec![],
-        methods: vec![
-            MethodSig {
-                name: arena.intern_string("clone"),
-                type_params: vec![
-                    TypeParam {
-                        name: arena.intern_string("T"),
-                        bounds: vec![],
-                        variance: Variance::Invariant,
-                        default: None,
-                        span,
-                    }
-                ],
-                params: vec![],
-                return_type: Type::Named { 
-                    id: TypeId::next(), // Self type
-                    type_args: vec![]
-                ,
+        methods: vec![MethodSig {
+            name: arena.intern_string("clone"),
+            type_params: vec![TypeParam {
+                name: arena.intern_string("T"),
+                bounds: vec![],
+                variance: Variance::Invariant,
+                default: None,
+                span,
+            }],
+            params: vec![],
+            return_type: Type::Named {
+                id: TypeId::next(), // Self type
+                type_args: vec![],
                 const_args: Vec::new(),
                 variance: Vec::new(),
                 nullability: NullabilityKind::NonNull,
             },
-                where_clause: vec![],
-                is_static: false,
-                is_async: false,
-                visibility: Visibility::Public,
-                span,
-                is_extension: false,
-            }
-        ],
+            where_clause: vec![],
+            is_static: false,
+            is_async: false,
+            visibility: Visibility::Public,
+            span,
+            is_extension: false,
+        }],
         associated_types: vec![],
         is_object_safe: true,
         span,
     };
-    
+
     let clone_trait_id = registry.register_trait(clone_trait);
-    
+
     // Create a concrete type implementing Clone
     let i32_type = Type::Primitive(PrimitiveType::I32);
-    
+
     registry.register_implementation(ImplDef {
         trait_id: clone_trait_id,
         for_type: i32_type.clone(),
@@ -1081,20 +1069,20 @@ fn test_generic_method_instantiation() {
     });
 
     let solver = ConstraintSolver::with_type_registry(Box::new(registry));
-    
+
     // Test method resolution and instantiation
     let result = solver.resolve_method_with_trait_bounds(
         &i32_type,
         arena.intern_string("clone"),
-        &[Type::Primitive(PrimitiveType::I32)] // Type arguments
+        &[Type::Primitive(PrimitiveType::I32)], // Type arguments
     );
-    
+
     match result {
         Ok(Some(resolved_method)) => {
             // Test return type instantiation
             let return_type = solver.instantiate_method_return_type(&resolved_method);
             println!("Instantiated return type: {:?}", return_type);
-            
+
             println!("✅ Generic method instantiation test completed");
         }
         Ok(None) => {

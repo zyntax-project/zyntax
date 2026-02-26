@@ -392,10 +392,10 @@ fn noop_raw_waker() -> RawWaker {
 }
 
 const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |_| noop_raw_waker(),  // clone
-    |_| {},                 // wake
-    |_| {},                 // wake_by_ref
-    |_| {},                 // drop
+    |_| noop_raw_waker(), // clone
+    |_| {},               // wake
+    |_| {},               // wake_by_ref
+    |_| {},               // drop
 );
 
 /// Create a waker context for polling

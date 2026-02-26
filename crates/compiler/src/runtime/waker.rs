@@ -2,9 +2,9 @@
 //!
 //! Wakers notify the executor when a task is ready to make progress.
 
-use std::sync::{Arc, Mutex};
-use std::task::{RawWaker, RawWakerVTable, Waker as StdWaker, Context as StdContext};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::task::{Context as StdContext, RawWaker, RawWakerVTable, Waker as StdWaker};
 
 /// A waker that can wake up tasks in the executor
 #[derive(Clone)]
@@ -41,12 +41,8 @@ impl Waker {
 }
 
 // Vtable for the waker
-const VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_waker,
-    wake_waker,
-    wake_by_ref_waker,
-    drop_waker,
-);
+const VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref_waker, drop_waker);
 
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
     let waker = Arc::from_raw(data as *const Waker);

@@ -1,8 +1,7 @@
+use crate::hir::{BinaryOp, CallingConvention};
 /// vec_u8: Performance-optimized concrete vector for u8 (byte buffers)
 /// Use this for strings, binary data, I/O buffers, etc.
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{CallingConvention, BinaryOp};
 
 pub fn build_vec_u8_type(builder: &mut HirBuilder) {
     // Declare C realloc for dynamic growth
@@ -26,7 +25,8 @@ fn declare_c_realloc(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty);
     let usize_ty = builder.u64_type();
 
-    let _realloc = builder.begin_extern_function("realloc", CallingConvention::C)
+    let _realloc = builder
+        .begin_extern_function("realloc", CallingConvention::C)
         .param("ptr", ptr_u8_ty.clone())
         .param("new_size", usize_ty)
         .returns(ptr_u8_ty)
@@ -44,7 +44,8 @@ fn build_vec_u8_new(builder: &mut HirBuilder) {
         vec![ptr_u8_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_function("vec_u8_new")
+    let func_id = builder
+        .begin_function("vec_u8_new")
         .returns(vec_u8_ty.clone())
         .build();
     builder.set_current_function(func_id);
@@ -75,7 +76,8 @@ fn build_vec_u8_push(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_u8_ty.clone());
 
-    let func_id = builder.begin_function("vec_u8_push")
+    let func_id = builder
+        .begin_function("vec_u8_push")
         .param("vec", ptr_vec_ty)
         .param("value", u8_ty.clone())
         .returns(void_ty)
@@ -115,12 +117,11 @@ fn build_vec_u8_push(builder: &mut HirBuilder) {
     let realloc_name = builder.intern("realloc");
     let realloc_id = builder.get_function_by_name(realloc_name);
     let realloc_ref = builder.function_ref(realloc_id);
-    let new_ptr_u8 = builder.call(realloc_ref, vec![ptr_field, new_size]).unwrap();
+    let new_ptr_u8 = builder
+        .call(realloc_ref, vec![ptr_field, new_size])
+        .unwrap();
 
-    let grown_vec = builder.create_struct(
-        vec_u8_ty.clone(),
-        vec![new_ptr_u8, len_field, new_cap],
-    );
+    let grown_vec = builder.create_struct(vec_u8_ty.clone(), vec![new_ptr_u8, len_field, new_cap]);
     builder.store(grown_vec, vec_ptr);
     builder.br(insert_element);
 
@@ -142,10 +143,7 @@ fn build_vec_u8_push(builder: &mut HirBuilder) {
     let one = builder.const_u64(1);
     let new_len = builder.add(len_field2, one, usize_ty.clone());
 
-    let final_vec = builder.create_struct(
-        vec_u8_ty,
-        vec![ptr_field2, new_len, cap_field2],
-    );
+    let final_vec = builder.create_struct(vec_u8_ty, vec![ptr_field2, new_len, cap_field2]);
     builder.store(final_vec, vec_ptr);
 
     let unit = builder.unit_value();
@@ -181,7 +179,8 @@ fn build_vec_u8_pop(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_function("vec_u8_pop")
+    let func_id = builder
+        .begin_function("vec_u8_pop")
         .param("vec", ptr_vec_ty)
         .returns(option_ty.clone())
         .build();
@@ -224,10 +223,7 @@ fn build_vec_u8_pop(builder: &mut HirBuilder) {
     let elem_ptr = builder.ptr_add(ptr_field, new_len, ptr_u8_ty.clone());
     let elem_val = builder.load(elem_ptr, u8_ty);
 
-    let updated_vec = builder.create_struct(
-        vec_u8_ty,
-        vec![ptr_field, new_len, cap_field],
-    );
+    let updated_vec = builder.create_struct(vec_u8_ty, vec![ptr_field, new_len, cap_field]);
     builder.store(updated_vec, vec_ptr);
 
     let some_val = builder.create_union(1, elem_val, option_ty);
@@ -263,7 +259,8 @@ fn build_vec_u8_get(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_function("vec_u8_get")
+    let func_id = builder
+        .begin_function("vec_u8_get")
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .returns(option_ty.clone())
@@ -319,7 +316,8 @@ fn build_vec_u8_set(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_u8_ty.clone());
 
-    let func_id = builder.begin_function("vec_u8_set")
+    let func_id = builder
+        .begin_function("vec_u8_set")
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .param("value", u8_ty)
@@ -373,7 +371,8 @@ fn build_vec_u8_len(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_u8_ty.clone());
 
-    let func_id = builder.begin_function("vec_u8_len")
+    let func_id = builder
+        .begin_function("vec_u8_len")
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -400,7 +399,8 @@ fn build_vec_u8_capacity(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_u8_ty.clone());
 
-    let func_id = builder.begin_function("vec_u8_capacity")
+    let func_id = builder
+        .begin_function("vec_u8_capacity")
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -428,7 +428,8 @@ fn build_vec_u8_clear(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_u8_ty.clone());
 
-    let func_id = builder.begin_function("vec_u8_clear")
+    let func_id = builder
+        .begin_function("vec_u8_clear")
         .param("vec", ptr_vec_ty)
         .returns(void_ty)
         .build();
@@ -462,7 +463,8 @@ fn build_vec_u8_free(builder: &mut HirBuilder) {
         vec![ptr_u8_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_function("vec_u8_free")
+    let func_id = builder
+        .begin_function("vec_u8_free")
         .param("vec", vec_u8_ty.clone())
         .returns(void_ty)
         .build();

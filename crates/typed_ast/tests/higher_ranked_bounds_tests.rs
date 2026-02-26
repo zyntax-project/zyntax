@@ -164,7 +164,7 @@ fn test_higher_ranked_fn_trait() {
                     ty: Type::Primitive(PrimitiveType::Unit),
                     is_self: true,
                     is_mut: false,
-                    is_varargs: false
+                    is_varargs: false,
                 },
                 ParamDef {
                     name: arena.intern_string("arg"),
@@ -173,7 +173,7 @@ fn test_higher_ranked_fn_trait() {
                     )),
                     is_self: false,
                     is_mut: false,
-                    is_varargs: false
+                    is_varargs: false,
                 },
             ],
             return_type: Type::TypeVar(zyntax_typed_ast::type_registry::TypeVar::unbound(

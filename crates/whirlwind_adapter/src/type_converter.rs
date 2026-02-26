@@ -1,11 +1,11 @@
 //! Type conversion from Whirlwind TypeExpression to TypedAST Type
 
 use crate::error::{AdapterError, AdapterResult};
-use zyntax_typed_ast::{
-    Type, PrimitiveType, TypeId, NullabilityKind, AsyncKind, CallingConvention,
-    ParamInfo, Variance, TypeConstraint, TypeBound, Mutability, Lifetime, AstArena,
-};
 use whirlwind_ast::TypeExpression;
+use zyntax_typed_ast::{
+    AstArena, AsyncKind, CallingConvention, Lifetime, Mutability, NullabilityKind, ParamInfo,
+    PrimitiveType, Type, TypeBound, TypeConstraint, TypeId, Variance,
+};
 
 /// Converts Whirlwind types to TypedAST types
 pub struct TypeConverter {
@@ -44,15 +44,17 @@ impl TypeConverter {
     pub fn convert_type(&mut self, whirlwind_type: &TypeExpression) -> AdapterResult<Type> {
         match whirlwind_type {
             TypeExpression::Discrete(discrete) => {
-                let generic_args = discrete.generic_args.as_ref()
-                    .map(|args| args.iter()
-                        .map(|name| name.to_string())
-                        .collect::<Vec<_>>())
+                let generic_args = discrete
+                    .generic_args
+                    .as_ref()
+                    .map(|args| args.iter().map(|name| name.to_string()).collect::<Vec<_>>())
                     .unwrap_or_default();
                 self.convert_discrete_type(&discrete.name.name, &generic_args)
             }
             TypeExpression::Union(union) => {
-                let converted_types = union.types.iter()
+                let converted_types = union
+                    .types
+                    .iter()
                     .map(|t| self.convert_type(t))
                     .collect::<AdapterResult<Vec<_>>>()?;
                 Ok(Type::Union(converted_types))
@@ -61,9 +63,7 @@ impl TypeConverter {
                 let inner_type = self.convert_type(&maybe.value)?;
                 Ok(Type::Optional(Box::new(inner_type)))
             }
-            TypeExpression::Functional(func) => {
-                self.convert_function_type_expr(func)
-            }
+            TypeExpression::Functional(func) => self.convert_function_type_expr(func),
             TypeExpression::Array(array) => {
                 let elem = self.convert_type(&array.element_type)?;
                 Ok(Type::Array {
@@ -72,18 +72,10 @@ impl TypeConverter {
                     nullability: NullabilityKind::NonNull,
                 })
             }
-            TypeExpression::Member(member) => {
-                self.convert_member_type(member)
-            }
-            TypeExpression::This { .. } => {
-                Ok(Type::SelfType)
-            }
-            TypeExpression::Constraint(constraint) => {
-                self.convert_constrained_type(constraint)
-            }
-            TypeExpression::Ternary(ternary) => {
-                self.convert_ternary_type(ternary)
-            }
+            TypeExpression::Member(member) => self.convert_member_type(member),
+            TypeExpression::This { .. } => Ok(Type::SelfType),
+            TypeExpression::Constraint(constraint) => self.convert_constrained_type(constraint),
+            TypeExpression::Ternary(ternary) => self.convert_ternary_type(ternary),
             TypeExpression::Invalid => {
                 Err(AdapterError::type_conversion("Invalid type expression"))
             }
@@ -91,7 +83,11 @@ impl TypeConverter {
     }
 
     /// Convert a discrete/named type (like "i32", "MyStruct<T>")
-    fn convert_discrete_type(&mut self, name: &str, _generic_args: &[String]) -> AdapterResult<Type> {
+    fn convert_discrete_type(
+        &mut self,
+        name: &str,
+        _generic_args: &[String],
+    ) -> AdapterResult<Type> {
         // Map Whirlwind primitive type names to TypedAST primitives
         let primitive = match name {
             "i8" => Some(PrimitiveType::I8),
@@ -119,7 +115,10 @@ impl TypeConverter {
 
         // For non-primitive types, look up in registry
         // TODO: Implement named type lookup with generics
-        Err(AdapterError::type_conversion(format!("Named type '{}' not yet supported", name)))
+        Err(AdapterError::type_conversion(format!(
+            "Named type '{}' not yet supported",
+            name
+        )))
     }
 
     /// Convert a Whirlwind FunctionalType to TypedAST Function type
@@ -127,7 +126,9 @@ impl TypeConverter {
         &mut self,
         func: &whirlwind_ast::FunctionalType,
     ) -> AdapterResult<Type> {
-        let params: AdapterResult<Vec<ParamInfo>> = func.params.iter()
+        let params: AdapterResult<Vec<ParamInfo>> = func
+            .params
+            .iter()
             .map(|param| {
                 let param_type = if let Some(ref ty) = param.type_label {
                     self.convert_type(ty)?
@@ -173,11 +174,16 @@ impl TypeConverter {
     fn convert_member_type(&mut self, member: &whirlwind_ast::MemberType) -> AdapterResult<Type> {
         // For now, treat as a named type (simplified)
         // TODO: Implement proper module path resolution
-        Err(AdapterError::unsupported("Member type conversion not yet fully implemented"))
+        Err(AdapterError::unsupported(
+            "Member type conversion not yet fully implemented",
+        ))
     }
 
     /// Convert a constrained type (e.g., T where T implements Default)
-    fn convert_constrained_type(&mut self, constraint: &whirlwind_ast::BoundConstraintType) -> AdapterResult<Type> {
+    fn convert_constrained_type(
+        &mut self,
+        constraint: &whirlwind_ast::BoundConstraintType,
+    ) -> AdapterResult<Type> {
         // Convert the base type
         let base_type = self.convert_discrete_type(&constraint.consequent.name.name, &[])?;
 
@@ -187,7 +193,10 @@ impl TypeConverter {
     }
 
     /// Convert a ternary/conditional type (e.g., if T implements Default String else Bool)
-    fn convert_ternary_type(&mut self, ternary: &whirlwind_ast::TernaryType) -> AdapterResult<Type> {
+    fn convert_ternary_type(
+        &mut self,
+        ternary: &whirlwind_ast::TernaryType,
+    ) -> AdapterResult<Type> {
         // TODO: Implement dependent type conversion
         // For now, return the consequent type
         self.convert_type(&ternary.consequent)

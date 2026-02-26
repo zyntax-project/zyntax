@@ -33,7 +33,11 @@ pub fn compile_jit(
     }
 
     if verbose {
-        println!("{} Loaded {} runtime symbols from zpacks", "info:".blue(), runtime_symbols.len());
+        println!(
+            "{} Loaded {} runtime symbols from zpacks",
+            "info:".blue(),
+            runtime_symbols.len()
+        );
         for (name, _) in &runtime_symbols {
             println!("  - {}", name);
         }
@@ -82,7 +86,11 @@ fn execute_entry(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if verbose {
-        println!("{} Looking for entry point candidates: {:?}", "debug:".cyan(), candidates);
+        println!(
+            "{} Looking for entry point candidates: {:?}",
+            "debug:".cyan(),
+            candidates
+        );
     }
 
     // Find entry function by name - try all candidates in order
@@ -90,23 +98,30 @@ fn execute_entry(
         .functions
         .iter()
         .find_map(|(id, func)| {
-            func.name.resolve_global()
-                .and_then(|name| {
-                    candidates.iter()
-                        .find(|c| c.as_str() == name)
-                        .map(|matched| (*id, matched.clone()))
-                })
+            func.name.resolve_global().and_then(|name| {
+                candidates
+                    .iter()
+                    .find(|c| c.as_str() == name)
+                    .map(|matched| (*id, matched.clone()))
+            })
         })
         .ok_or_else(|| {
             // List available functions in error message for debugging
-            let available: Vec<String> = module.functions.values()
+            let available: Vec<String> = module
+                .functions
+                .values()
                 .filter_map(|f| f.name.resolve_global())
                 .collect();
-            format!("No entry point found. Tried: {:?}. Available functions: {:?}", candidates, available)
+            format!(
+                "No entry point found. Tried: {:?}. Available functions: {:?}",
+                candidates, available
+            )
         })?;
 
     // Get the function for return type info
-    let entry_fn = module.functions.get(&entry_id)
+    let entry_fn = module
+        .functions
+        .get(&entry_id)
         .ok_or_else(|| format!("Entry function '{}' not found", matched_name))?;
 
     // Get function pointer
@@ -136,25 +151,45 @@ fn execute_entry(
                 zyntax_compiler::hir::HirType::I32 => {
                     let f: fn() -> i32 = std::mem::transmute(fn_ptr);
                     let ret = f();
-                    println!("{} {}() returned: {}", "result:".green().bold(), matched_name, ret);
+                    println!(
+                        "{} {}() returned: {}",
+                        "result:".green().bold(),
+                        matched_name,
+                        ret
+                    );
                     ret as i64
                 }
                 zyntax_compiler::hir::HirType::I64 => {
                     let f: fn() -> i64 = std::mem::transmute(fn_ptr);
                     let ret = f();
-                    println!("{} {}() returned: {}", "result:".green().bold(), matched_name, ret);
+                    println!(
+                        "{} {}() returned: {}",
+                        "result:".green().bold(),
+                        matched_name,
+                        ret
+                    );
                     ret
                 }
                 zyntax_compiler::hir::HirType::F32 => {
                     let f: fn() -> f32 = std::mem::transmute(fn_ptr);
                     let ret = f();
-                    println!("{} {}() returned: {}", "result:".green().bold(), matched_name, ret);
+                    println!(
+                        "{} {}() returned: {}",
+                        "result:".green().bold(),
+                        matched_name,
+                        ret
+                    );
                     0
                 }
                 zyntax_compiler::hir::HirType::F64 => {
                     let f: fn() -> f64 = std::mem::transmute(fn_ptr);
                     let ret = f();
-                    println!("{} {}() returned: {}", "result:".green().bold(), matched_name, ret);
+                    println!(
+                        "{} {}() returned: {}",
+                        "result:".green().bold(),
+                        matched_name,
+                        ret
+                    );
                     0
                 }
                 zyntax_compiler::hir::HirType::Void => {
@@ -166,8 +201,7 @@ fn execute_entry(
                 _ => {
                     return Err(format!(
                         "Unsupported {} return type: {:?}",
-                        matched_name,
-                        entry_fn.signature.returns[0]
+                        matched_name, entry_fn.signature.returns[0]
                     )
                     .into());
                 }
@@ -176,7 +210,11 @@ fn execute_entry(
     };
 
     if verbose {
-        println!("{} Execution completed with code: {}", "info:".green(), _result);
+        println!(
+            "{} Execution completed with code: {}",
+            "info:".green(),
+            _result
+        );
     }
 
     Ok(())
@@ -225,7 +263,8 @@ fn execute_main_repl(
         .functions
         .iter()
         .find(|(_, func)| {
-            func.name.resolve_global()
+            func.name
+                .resolve_global()
                 .map(|name| name == "main")
                 .unwrap_or(false)
         })
@@ -274,7 +313,8 @@ fn execute_main_repl(
                     return Err(format!(
                         "Unsupported return type: {:?}",
                         main_fn.signature.returns[0]
-                    ).into());
+                    )
+                    .into());
                 }
             }
         }

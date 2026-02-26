@@ -3,19 +3,18 @@
 //! These tests verify that user-defined types (structs, enums) are correctly
 //! resolved from the TypeRegistry and converted to appropriate HIR types.
 
+use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
-    hir::{HirModule, HirType, HirStructType, HirUnionType},
-    lowering::{LoweringContext, LoweringConfig, AstLowering},
+    hir::{HirModule, HirStructType, HirType, HirUnionType},
+    lowering::{AstLowering, LoweringConfig, LoweringContext},
     CompilerResult,
 };
 use zyntax_typed_ast::{
-    TypedProgram, TypedDeclaration, TypedFunction,
-    Type, PrimitiveType, TypeKind, Visibility, Mutability,
-    TypedNode, typed_node, Span, TypeRegistry, FieldDef, VariantDef, VariantFields,
-    TypeMetadata, TypeParam, MethodSig, ConstructorSig, TypeDefinition, TypeId, TypeConstraint,
-    arena::AstArena, typed_ast::TypedBlock, CallingConvention,
+    arena::AstArena, typed_ast::TypedBlock, typed_node, CallingConvention, ConstructorSig,
+    FieldDef, MethodSig, Mutability, PrimitiveType, Span, Type, TypeConstraint, TypeDefinition,
+    TypeId, TypeKind, TypeMetadata, TypeParam, TypeRegistry, TypedDeclaration, TypedFunction,
+    TypedNode, TypedProgram, VariantDef, VariantFields, Visibility,
 };
-use std::sync::{Arc, Mutex};
 
 fn test_span() -> Span {
     Span::new(0, 10)
@@ -107,15 +106,14 @@ fn test_struct_type_resolution() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry.clone(),
-        arena_arc,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry.clone(), arena_arc, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower program with struct type: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower program with struct type: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -127,8 +125,14 @@ fn test_struct_type_resolution() {
         HirType::Struct(struct_ty) => {
             assert_eq!(struct_ty.name, Some(point_name), "Struct name mismatch");
             assert_eq!(struct_ty.fields.len(), 2, "Expected 2 fields");
-            assert!(matches!(struct_ty.fields[0], HirType::I32), "Field 0 should be I32");
-            assert!(matches!(struct_ty.fields[1], HirType::I32), "Field 1 should be I32");
+            assert!(
+                matches!(struct_ty.fields[0], HirType::I32),
+                "Field 0 should be I32"
+            );
+            assert!(
+                matches!(struct_ty.fields[1], HirType::I32),
+                "Field 1 should be I32"
+            );
         }
         other => panic!("Expected HirType::Struct, got {:?}", other),
     }
@@ -217,15 +221,14 @@ fn test_enum_type_resolution() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry.clone(),
-        arena_arc,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry.clone(), arena_arc, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower program with enum type: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower program with enum type: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -239,13 +242,19 @@ fn test_enum_type_resolution() {
             assert_eq!(union_ty.variants.len(), 2, "Expected 2 variants");
 
             // First variant (None) should be Void
-            assert!(matches!(union_ty.variants[0].ty, HirType::Void), "None variant should be Void");
+            assert!(
+                matches!(union_ty.variants[0].ty, HirType::Void),
+                "None variant should be Void"
+            );
 
             // Second variant (Some) should be a struct with one I32 field
             match &union_ty.variants[1].ty {
                 HirType::Struct(s) => {
                     assert_eq!(s.fields.len(), 1, "Some variant should have 1 field");
-                    assert!(matches!(s.fields[0], HirType::I32), "Some field should be I32");
+                    assert!(
+                        matches!(s.fields[0], HirType::I32),
+                        "Some field should be I32"
+                    );
                 }
                 other => panic!("Expected Struct for Some variant, got {:?}", other),
             }
@@ -262,17 +271,16 @@ fn test_type_alias_resolution() {
     // Register type alias: type Int = i32
     let int_alias_name = arena.intern_string("Int");
 
-    type_registry.register_alias(
-        int_alias_name,
-        Type::Primitive(PrimitiveType::I32),
-    );
+    type_registry.register_alias(int_alias_name, Type::Primitive(PrimitiveType::I32));
 
     // Create a TypeId for the alias (so we can reference it)
     let alias_id = TypeId::next();
     let alias_type_def = TypeDefinition {
         id: alias_id,
         name: int_alias_name,
-        kind: TypeKind::Alias { target: Type::Primitive(PrimitiveType::I32) },
+        kind: TypeKind::Alias {
+            target: Type::Primitive(PrimitiveType::I32),
+        },
         type_params: vec![],
         constraints: vec![],
         fields: vec![],
@@ -326,15 +334,14 @@ fn test_type_alias_resolution() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry.clone(),
-        arena_arc,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry.clone(), arena_arc, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower program with type alias: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower program with type alias: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -342,7 +349,11 @@ fn test_type_alias_resolution() {
     let func = module.functions.values().next().expect("No function found");
     let return_ty = &func.signature.returns[0];
 
-    assert!(matches!(return_ty, HirType::I32), "Type alias should resolve to I32, got {:?}", return_ty);
+    assert!(
+        matches!(return_ty, HirType::I32),
+        "Type alias should resolve to I32, got {:?}",
+        return_ty
+    );
 }
 
 #[test]
@@ -447,15 +458,14 @@ fn test_nested_struct_resolution() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry.clone(),
-        arena_arc,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry.clone(), arena_arc, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower program with nested struct: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower program with nested struct: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -465,15 +475,26 @@ fn test_nested_struct_resolution() {
 
     match return_ty {
         HirType::Struct(outer_struct) => {
-            assert_eq!(outer_struct.name, Some(outer_name), "Outer struct name mismatch");
+            assert_eq!(
+                outer_struct.name,
+                Some(outer_name),
+                "Outer struct name mismatch"
+            );
             assert_eq!(outer_struct.fields.len(), 1, "Outer should have 1 field");
 
             // Verify inner struct was also resolved
             match &outer_struct.fields[0] {
                 HirType::Struct(inner_struct) => {
-                    assert_eq!(inner_struct.name, Some(inner_name), "Inner struct name mismatch");
+                    assert_eq!(
+                        inner_struct.name,
+                        Some(inner_name),
+                        "Inner struct name mismatch"
+                    );
                     assert_eq!(inner_struct.fields.len(), 1, "Inner should have 1 field");
-                    assert!(matches!(inner_struct.fields[0], HirType::I32), "Inner field should be I32");
+                    assert!(
+                        matches!(inner_struct.fields[0], HirType::I32),
+                        "Inner field should be I32"
+                    );
                 }
                 other => panic!("Expected nested struct, got {:?}", other),
             }
@@ -631,15 +652,14 @@ fn test_multiple_struct_types() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena_arc = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry.clone(),
-        arena_arc,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry.clone(), arena_arc, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower program with multiple struct types: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower program with multiple struct types: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
     assert_eq!(module.functions.len(), 2, "Expected 2 functions");

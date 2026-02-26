@@ -5,33 +5,33 @@
 
 use crate::*;
 // use crate::universal_type_system::*;
-use crate::{arena::InternedString, TypeId};
 use crate::source::Span;
+use crate::{arena::InternedString, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Nominal type checker for inheritance-based type systems
 pub struct NominalTypeChecker {
     /// Type registry containing all type definitions
     pub type_registry: HashMap<TypeId, TypeDefinition>,
-    
+
     /// Trait/interface registry
     pub trait_registry: HashMap<TypeId, TraitDefinition>,
-    
+
     /// Implementation registry (type -> implemented traits)
     pub impl_registry: HashMap<TypeId, Vec<ImplDefinition>>,
-    
+
     /// Inheritance hierarchy cache
     pub inheritance_cache: HashMap<TypeId, HashSet<TypeId>>,
-    
+
     /// Variance cache for generic parameters
     pub variance_cache: HashMap<TypeId, Vec<Variance>>,
-    
+
     /// Virtual method table cache
     pub vtable_cache: HashMap<TypeId, VirtualMethodTable>,
-    
+
     /// Interface dispatch table cache
     pub interface_dispatch_cache: HashMap<(TypeId, TypeId), InterfaceDispatchTable>,
-    
+
     /// Type compatibility cache for performance
     pub compatibility_cache: HashMap<(Type, Type), bool>,
 }
@@ -60,7 +60,7 @@ pub struct TypeDefinition {
 pub enum TypeKind {
     Class,
     Interface,
-    Struct,     // C# struct, Kotlin data class
+    Struct, // C# struct, Kotlin data class
     Enum,
     Record,     // C# record, Java record
     Delegate,   // C# delegate
@@ -191,93 +191,90 @@ pub struct ConstructorSig {
 pub enum NominalTypeError {
     /// Type not found in registry
     UnknownType { id: TypeId, span: Span },
-    
+
     /// Trait not found in registry
     UnknownTrait { id: TypeId, span: Span },
-    
+
     /// Circular inheritance detected
     CircularInheritance { types: Vec<TypeId>, span: Span },
-    
+
     /// Type doesn't implement required trait
-    TraitNotImplemented { 
-        ty: Type, 
-        trait_id: TypeId, 
-        span: Span 
+    TraitNotImplemented {
+        ty: Type,
+        trait_id: TypeId,
+        span: Span,
     },
-    
+
     /// Method not found in type
-    MethodNotFound { 
-        ty: Type, 
-        method_name: InternedString, 
-        span: Span 
+    MethodNotFound {
+        ty: Type,
+        method_name: InternedString,
+        span: Span,
     },
-    
+
     /// Invalid variance usage
-    VarianceViolation { 
-        param: InternedString, 
-        expected: Variance, 
-        actual: Variance, 
-        span: Span 
+    VarianceViolation {
+        param: InternedString,
+        expected: Variance,
+        actual: Variance,
+        span: Span,
     },
-    
+
     /// Sealed class inheritance violation
-    SealedInheritance { 
-        base_type: TypeId, 
-        derived_type: TypeId, 
-        span: Span 
+    SealedInheritance {
+        base_type: TypeId,
+        derived_type: TypeId,
+        span: Span,
     },
-    
+
     /// Abstract method not implemented
-    AbstractMethodNotImplemented { 
-        method: InternedString, 
-        in_type: TypeId, 
-        span: Span 
+    AbstractMethodNotImplemented {
+        method: InternedString,
+        in_type: TypeId,
+        span: Span,
     },
-    
+
     /// Interface segregation violation (too many unrelated methods)
-    InterfaceSegregationViolation { 
-        interface: TypeId,
-        span: Span 
-    },
-    
+    InterfaceSegregationViolation { interface: TypeId, span: Span },
+
     /// Virtual method override violation
-    VirtualMethodOverrideError { 
-        method: InternedString, 
-        base_type: TypeId, 
-        derived_type: TypeId, 
-        reason: String, 
-        span: Span 
+    VirtualMethodOverrideError {
+        method: InternedString,
+        base_type: TypeId,
+        derived_type: TypeId,
+        reason: String,
+        span: Span,
     },
-    
+
     /// Multiple inheritance not allowed (for languages that don't support it)
-    MultipleInheritanceNotAllowed { 
-        type_id: TypeId, 
-        parents: Vec<TypeId>, 
-        span: Span 
+    MultipleInheritanceNotAllowed {
+        type_id: TypeId,
+        parents: Vec<TypeId>,
+        span: Span,
     },
-    
+
     /// Diamond inheritance problem
-    DiamondInheritance { 
-        type_id: TypeId, 
-        conflicting_types: Vec<TypeId>, 
-        span: Span 
+    DiamondInheritance {
+        type_id: TypeId,
+        conflicting_types: Vec<TypeId>,
+        span: Span,
     },
-    
+
     /// Covariance/contravariance violation in method overrides
-    CovarianceViolation { 
-        method: InternedString, 
-        param_or_return: String, 
-        expected: Type, 
-        actual: Type, 
-        span: Span 
+    CovarianceViolation {
+        method: InternedString,
+        param_or_return: String,
+        expected: Type,
+        actual: Type,
+        span: Span,
     },
-    
+
     /// Liskov substitution principle violation
-    LiskovSubstitutionViolation { 
-        base_type: TypeId, 
-        derived_type: TypeId, 
-        reason: String, 
-        span: Span 
+    LiskovSubstitutionViolation {
+        base_type: TypeId,
+        derived_type: TypeId,
+        reason: String,
+        span: Span,
     },
 }
 
@@ -294,7 +291,7 @@ impl NominalTypeChecker {
             compatibility_cache: HashMap::new(),
         }
     }
-    
+
     /// Register a new type definition
     pub fn register_type(&mut self, type_def: TypeDefinition) -> Result<(), NominalTypeError> {
         // Check for circular inheritance before registering
@@ -308,45 +305,59 @@ impl NominalTypeChecker {
                 }
             }
         }
-        
+
         // Cache variance information
-        let variances: Vec<Variance> = type_def.type_params.iter()
+        let variances: Vec<Variance> = type_def
+            .type_params
+            .iter()
             .map(|param| param.variance)
             .collect();
         self.variance_cache.insert(type_def.id, variances);
-        
+
         self.type_registry.insert(type_def.id, type_def);
         Ok(())
     }
-    
+
     /// Register a new trait definition
     pub fn register_trait(&mut self, trait_def: TraitDefinition) {
         self.trait_registry.insert(trait_def.id, trait_def);
     }
-    
+
     /// Register an implementation
     pub fn register_impl(&mut self, impl_def: ImplDefinition) {
         let implementing_type_id = match &impl_def.implementing_type {
             Type::Named { id, .. } => *id,
             _ => return, // Only named types can implement traits in nominal system
         };
-        
+
         self.impl_registry
             .entry(implementing_type_id)
             .or_insert_with(Vec::new)
             .push(impl_def);
     }
-    
+
     /// Check if one type is a subtype of another in the nominal system
-    pub fn is_subtype(&mut self, sub_type: &Type, super_type: &Type) -> Result<bool, NominalTypeError> {
+    pub fn is_subtype(
+        &mut self,
+        sub_type: &Type,
+        super_type: &Type,
+    ) -> Result<bool, NominalTypeError> {
         match (sub_type, super_type) {
             // Same type is always a subtype
             (a, b) if a == b => Ok(true),
-            
+
             // Named type subtyping through inheritance
             (
-                Type::Named { id: sub_id, type_args: sub_args, .. },
-                Type::Named { id: super_id, type_args: super_args, .. }
+                Type::Named {
+                    id: sub_id,
+                    type_args: sub_args,
+                    ..
+                },
+                Type::Named {
+                    id: super_id,
+                    type_args: super_args,
+                    ..
+                },
             ) => {
                 if sub_id == super_id {
                     // Same nominal type - check variance of type arguments
@@ -362,27 +373,31 @@ impl NominalTypeChecker {
                         Ok(is_subtype)
                     }
                 }
-            },
-            
+            }
+
             // Interface implementation checking
             (Type::Named { id: type_id, .. }, Type::Trait { id: trait_id, .. }) => {
                 self.implements_trait(*type_id, *trait_id)
-            },
-            
+            }
+
             // Other cases delegate to structural/gradual checkers
             _ => Ok(false),
         }
     }
-    
+
     /// Check if a type implements a trait
-    pub fn implements_trait(&self, type_id: TypeId, trait_id: TypeId) -> Result<bool, NominalTypeError> {
+    pub fn implements_trait(
+        &self,
+        type_id: TypeId,
+        trait_id: TypeId,
+    ) -> Result<bool, NominalTypeError> {
         if let Some(impls) = self.impl_registry.get(&type_id) {
             Ok(impls.iter().any(|impl_def| impl_def.trait_id == trait_id))
         } else {
             Ok(false)
         }
     }
-    
+
     /// Get all traits implemented by a type
     pub fn get_implemented_traits(&self, type_id: TypeId) -> Vec<TypeId> {
         if let Some(impls) = self.impl_registry.get(&type_id) {
@@ -391,112 +406,133 @@ impl NominalTypeChecker {
             Vec::new()
         }
     }
-    
+
     /// Check if one type is in the inheritance hierarchy of another
-    fn is_in_inheritance_hierarchy(&mut self, sub_id: TypeId, super_id: TypeId) -> Result<bool, NominalTypeError> {
+    fn is_in_inheritance_hierarchy(
+        &mut self,
+        sub_id: TypeId,
+        super_id: TypeId,
+    ) -> Result<bool, NominalTypeError> {
         // Check cache first
         if let Some(cached) = self.inheritance_cache.get(&sub_id) {
             return Ok(cached.contains(&super_id));
         }
-        
+
         // Compute inheritance hierarchy
         let mut hierarchy = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(sub_id);
-        
+
         while let Some(current_id) = queue.pop_front() {
             if current_id == super_id {
                 self.inheritance_cache.insert(sub_id, hierarchy);
                 return Ok(true);
             }
-            
+
             if hierarchy.contains(&current_id) {
                 continue; // Already processed
             }
             hierarchy.insert(current_id);
-            
+
             // Get the type definition
             if let Some(type_def) = self.type_registry.get(&current_id) {
                 // Add super type to queue
                 if let Some(Type::Named { id: parent_id, .. }) = &type_def.super_type {
                     queue.push_back(*parent_id);
                 }
-                
+
                 // Add interfaces to queue
                 for interface in &type_def.interfaces {
-                    if let Type::Named { id: interface_id, .. } = interface {
+                    if let Type::Named {
+                        id: interface_id, ..
+                    } = interface
+                    {
                         queue.push_back(*interface_id);
                     }
                 }
             }
         }
-        
+
         self.inheritance_cache.insert(sub_id, hierarchy);
         Ok(false)
     }
-    
+
     /// Check variance of type arguments
     fn check_type_arg_variance(
         &self,
         type_id: TypeId,
         sub_args: &[Type],
-        super_args: &[Type]
+        super_args: &[Type],
     ) -> Result<bool, NominalTypeError> {
         if sub_args.len() != super_args.len() {
             return Ok(false);
         }
-        
-        let variances = self.variance_cache.get(&type_id).cloned().unwrap_or_default();
-        
-        for ((sub_arg, super_arg), variance) in sub_args.iter().zip(super_args.iter()).zip(variances.iter()) {
+
+        let variances = self
+            .variance_cache
+            .get(&type_id)
+            .cloned()
+            .unwrap_or_default();
+
+        for ((sub_arg, super_arg), variance) in
+            sub_args.iter().zip(super_args.iter()).zip(variances.iter())
+        {
             let compatible = match variance {
                 Variance::Covariant => {
                     // T<A> <: T<B> if A <: B
                     self.is_subtype_recursive(sub_arg, super_arg)?
-                },
+                }
                 Variance::Contravariant => {
                     // T<A> <: T<B> if B <: A (reversed)
                     self.is_subtype_recursive(super_arg, sub_arg)?
-                },
+                }
                 Variance::Invariant => {
                     // T<A> <: T<B> if A = B
                     sub_arg == super_arg
-                },
+                }
                 Variance::Bivariant => {
                     // T<A> <: T<B> always (unsafe)
                     true
-                },
+                }
             };
-            
+
             if !compatible {
                 return Ok(false);
             }
         }
-        
+
         Ok(true)
     }
-    
+
     /// Recursive subtype checking helper (to avoid borrowing issues)
-    fn is_subtype_recursive(&self, sub_type: &Type, super_type: &Type) -> Result<bool, NominalTypeError> {
+    fn is_subtype_recursive(
+        &self,
+        sub_type: &Type,
+        super_type: &Type,
+    ) -> Result<bool, NominalTypeError> {
         // Simplified recursive check - in practice would need full implementation
         Ok(sub_type == super_type)
     }
-    
+
     /// Check if adding an inheritance relationship would create a cycle
-    fn would_create_cycle(&self, derived_id: TypeId, base_id: TypeId) -> Result<bool, NominalTypeError> {
+    fn would_create_cycle(
+        &self,
+        derived_id: TypeId,
+        base_id: TypeId,
+    ) -> Result<bool, NominalTypeError> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(base_id);
-        
+
         while let Some(current_id) = queue.pop_front() {
             if current_id == derived_id {
                 return Ok(true); // Cycle detected
             }
-            
+
             if !visited.insert(current_id) {
                 continue; // Already visited
             }
-            
+
             // Get the type definition and check its super types
             if let Some(type_def) = self.type_registry.get(&current_id) {
                 if let Some(Type::Named { id: parent_id, .. }) = &type_def.super_type {
@@ -504,10 +540,10 @@ impl NominalTypeChecker {
                 }
             }
         }
-        
+
         Ok(false)
     }
-    
+
     /// Resolve method call on a nominal type
     pub fn resolve_method(
         &self,
@@ -516,7 +552,11 @@ impl NominalTypeChecker {
         type_args: &[Type],
     ) -> Result<Option<ResolvedMethod>, NominalTypeError> {
         match receiver_type {
-            Type::Named { id: type_id, type_args: receiver_args, .. } => {
+            Type::Named {
+                id: type_id,
+                type_args: receiver_args,
+                ..
+            } => {
                 // First check intrinsic methods
                 if let Some(type_def) = self.type_registry.get(type_id) {
                     for method in &type_def.methods {
@@ -529,22 +569,26 @@ impl NominalTypeChecker {
                             }));
                         }
                     }
-                    
+
                     // Then check inherited methods
                     if let Some(super_type) = &type_def.super_type {
-                        if let Ok(Some(method)) = self.resolve_method(super_type, method_name, type_args) {
+                        if let Ok(Some(method)) =
+                            self.resolve_method(super_type, method_name, type_args)
+                        {
                             return Ok(Some(method));
                         }
                     }
-                    
+
                     // Finally check interface methods
                     for interface in &type_def.interfaces {
-                        if let Ok(Some(method)) = self.resolve_method(interface, method_name, type_args) {
+                        if let Ok(Some(method)) =
+                            self.resolve_method(interface, method_name, type_args)
+                        {
                             return Ok(Some(method));
                         }
                     }
                 }
-                
+
                 // Check trait implementations
                 if let Some(impls) = self.impl_registry.get(type_id) {
                     for impl_def in impls {
@@ -560,10 +604,10 @@ impl NominalTypeChecker {
                         }
                     }
                 }
-                
+
                 Ok(None)
-            },
-            
+            }
+
             Type::Trait { id: trait_id, .. } => {
                 if let Some(trait_def) = self.trait_registry.get(trait_id) {
                     for method in &trait_def.methods {
@@ -578,32 +622,30 @@ impl NominalTypeChecker {
                     }
                 }
                 Ok(None)
-            },
-            
+            }
+
             _ => Ok(None),
         }
     }
-    
+
     /// Validate that all abstract methods are implemented
     pub fn validate_concrete_type(&self, type_id: TypeId) -> Result<(), Vec<NominalTypeError>> {
         let mut errors = Vec::new();
-        
+
         if let Some(type_def) = self.type_registry.get(&type_id) {
             if type_def.is_abstract {
                 return Ok(()); // Abstract types don't need to implement everything
             }
-            
+
             // Collect all abstract methods that need implementation
             let mut required_methods = HashSet::new();
             let abstract_methods = self.collect_abstract_methods(type_id);
             required_methods.extend(abstract_methods);
-            
+
             // Check that all required methods are implemented
-            let implemented_methods: HashSet<InternedString> = type_def.methods
-                .iter()
-                .map(|m| m.name)
-                .collect();
-            
+            let implemented_methods: HashSet<InternedString> =
+                type_def.methods.iter().map(|m| m.name).collect();
+
             for required_method in required_methods {
                 if !implemented_methods.contains(&required_method) {
                     errors.push(NominalTypeError::AbstractMethodNotImplemented {
@@ -614,14 +656,13 @@ impl NominalTypeChecker {
                 }
             }
         }
-        
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
         }
     }
-    
 }
 
 /// Resolved method information
@@ -636,26 +677,33 @@ pub struct ResolvedMethod {
 /// Source of a resolved method
 #[derive(Debug, Clone, PartialEq)]
 pub enum MethodSource {
-    Intrinsic,              // Method defined directly in the type
-    Inherited(TypeId),      // Method inherited from base class
-    TraitImpl(TypeId),     // Method from trait implementation
-    Trait(TypeId),         // Method from trait definition
-    Extension,              // Extension method
+    Intrinsic,         // Method defined directly in the type
+    Inherited(TypeId), // Method inherited from base class
+    TraitImpl(TypeId), // Method from trait implementation
+    Trait(TypeId),     // Method from trait definition
+    Extension,         // Extension method
 }
 
 impl NominalTypeChecker {
     // === Enhanced Nominal Type Checking Methods ===
 
     /// Build virtual method table for a type
-    pub fn build_virtual_method_table(&mut self, type_id: TypeId) -> Result<VirtualMethodTable, NominalTypeError> {
+    pub fn build_virtual_method_table(
+        &mut self,
+        type_id: TypeId,
+    ) -> Result<VirtualMethodTable, NominalTypeError> {
         if let Some(vtable) = self.vtable_cache.get(&type_id).cloned() {
             return Ok(vtable);
         }
 
-        let type_def = self.type_registry.get(&type_id).cloned().ok_or(NominalTypeError::UnknownType { 
-            id: type_id, 
-            span: crate::source::Span::new(0, 0) 
-        })?;
+        let type_def =
+            self.type_registry
+                .get(&type_id)
+                .cloned()
+                .ok_or(NominalTypeError::UnknownType {
+                    id: type_id,
+                    span: crate::source::Span::new(0, 0),
+                })?;
 
         let mut vtable = VirtualMethodTable {
             type_id,
@@ -691,7 +739,11 @@ impl NominalTypeChecker {
     }
 
     /// Build interface dispatch table for efficient interface method resolution
-    pub fn build_interface_dispatch_table(&mut self, type_id: TypeId, trait_id: TypeId) -> Result<InterfaceDispatchTable, NominalTypeError> {
+    pub fn build_interface_dispatch_table(
+        &mut self,
+        type_id: TypeId,
+        trait_id: TypeId,
+    ) -> Result<InterfaceDispatchTable, NominalTypeError> {
         let key = (type_id, trait_id);
         if let Some(table) = self.interface_dispatch_cache.get(&key).cloned() {
             return Ok(table);
@@ -708,10 +760,9 @@ impl NominalTypeChecker {
             for impl_def in impls {
                 if impl_def.trait_id == trait_id {
                     for method_impl in &impl_def.methods {
-                        table.method_implementations.insert(
-                            method_impl.signature.name,
-                            method_impl.signature.clone()
-                        );
+                        table
+                            .method_implementations
+                            .insert(method_impl.signature.name, method_impl.signature.clone());
                     }
                     break;
                 }
@@ -724,11 +775,12 @@ impl NominalTypeChecker {
     }
 
     /// Check virtual method override validity
-    pub fn check_virtual_method_override(&mut self, 
-        base_method: &MethodSig, 
+    pub fn check_virtual_method_override(
+        &mut self,
+        base_method: &MethodSig,
         derived_method: &MethodSig,
         base_type: TypeId,
-        derived_type: TypeId
+        derived_type: TypeId,
     ) -> Result<(), NominalTypeError> {
         // Check method signature compatibility
         if base_method.name != derived_method.name {
@@ -753,7 +805,9 @@ impl NominalTypeChecker {
         }
 
         // Check parameter types (contravariance)
-        for (base_param, derived_param) in base_method.params.iter().zip(derived_method.params.iter()) {
+        for (base_param, derived_param) in
+            base_method.params.iter().zip(derived_method.params.iter())
+        {
             if !self.is_contravariant_compatible(&derived_param.ty, &base_param.ty) {
                 return Err(NominalTypeError::CovarianceViolation {
                     method: base_method.name,
@@ -792,26 +846,43 @@ impl NominalTypeChecker {
     }
 
     /// Check Liskov Substitution Principle compliance
-    pub fn check_liskov_substitution(&mut self, base_type: TypeId, derived_type: TypeId) -> Result<(), NominalTypeError> {
-        let base_def = self.type_registry.get(&base_type).cloned().ok_or(NominalTypeError::UnknownType {
-            id: base_type,
-            span: crate::source::Span::new(0, 0),
-        })?;
+    pub fn check_liskov_substitution(
+        &mut self,
+        base_type: TypeId,
+        derived_type: TypeId,
+    ) -> Result<(), NominalTypeError> {
+        let base_def =
+            self.type_registry
+                .get(&base_type)
+                .cloned()
+                .ok_or(NominalTypeError::UnknownType {
+                    id: base_type,
+                    span: crate::source::Span::new(0, 0),
+                })?;
 
-        let derived_def = self.type_registry.get(&derived_type).cloned().ok_or(NominalTypeError::UnknownType {
-            id: derived_type,
-            span: crate::source::Span::new(0, 0),
-        })?;
+        let derived_def = self.type_registry.get(&derived_type).cloned().ok_or(
+            NominalTypeError::UnknownType {
+                id: derived_type,
+                span: crate::source::Span::new(0, 0),
+            },
+        )?;
 
         // Check that derived type can substitute base type
         // 1. All public methods of base must be available in derived
         for base_method in &base_def.methods {
             if base_method.visibility == Visibility::Public {
                 let found = derived_def.methods.iter().any(|derived_method| {
-                    derived_method.name == base_method.name &&
-                    self.check_virtual_method_override(base_method, derived_method, base_type, derived_type).is_ok()
+                    derived_method.name == base_method.name
+                        && self
+                            .check_virtual_method_override(
+                                base_method,
+                                derived_method,
+                                base_type,
+                                derived_type,
+                            )
+                            .is_ok()
                 });
-                
+
                 if !found {
                     return Err(NominalTypeError::LiskovSubstitutionViolation {
                         base_type,
@@ -831,10 +902,11 @@ impl NominalTypeChecker {
     }
 
     /// Resolve polymorphic method call
-    pub fn resolve_polymorphic_method(&self, 
-        receiver_type: &Type, 
+    pub fn resolve_polymorphic_method(
+        &self,
+        receiver_type: &Type,
         method_name: InternedString,
-        is_virtual_call: bool
+        is_virtual_call: bool,
     ) -> Result<Option<(MethodSig, MethodSource)>, NominalTypeError> {
         match receiver_type {
             Type::Named { id: type_id, .. } => {
@@ -850,21 +922,30 @@ impl NominalTypeChecker {
                     if is_virtual_call {
                         if let Some(vtable) = self.vtable_cache.get(type_id) {
                             if let Some(slot) = vtable.methods.get(&method_name) {
-                                return Ok(Some((slot.signature.clone(), MethodSource::Inherited(slot.implementation_type))));
+                                return Ok(Some((
+                                    slot.signature.clone(),
+                                    MethodSource::Inherited(slot.implementation_type),
+                                )));
                             }
                         }
                     }
 
                     // Check interface methods
                     for interface in &type_def.interfaces {
-                        if let Type::Named { id: interface_id, .. } = interface {
+                        if let Type::Named {
+                            id: interface_id, ..
+                        } = interface
+                        {
                             // Note: This assumes interface_id represents a trait
                             // In a real implementation, we'd need proper type/trait ID management
                             let trait_id = TypeId::new(interface_id.as_u32());
                             if let Some(trait_def) = self.trait_registry.get(&trait_id) {
                                 for method in &trait_def.methods {
                                     if method.name == method_name {
-                                        return Ok(Some((method.clone(), MethodSource::TraitImpl(trait_id))));
+                                        return Ok(Some((
+                                            method.clone(),
+                                            MethodSource::TraitImpl(trait_id),
+                                        )));
                                     }
                                 }
                             }
@@ -873,7 +954,7 @@ impl NominalTypeChecker {
                 }
                 Ok(None)
             }
-            _ => Ok(None)
+            _ => Ok(None),
         }
     }
 
@@ -896,11 +977,12 @@ impl NominalTypeChecker {
         Ok(())
     }
 
-    fn check_diamond_inheritance_recursive(&self, 
-        current_type: TypeId, 
-        visited: &mut HashSet<TypeId>, 
+    fn check_diamond_inheritance_recursive(
+        &self,
+        current_type: TypeId,
+        visited: &mut HashSet<TypeId>,
         path: &mut Vec<TypeId>,
-        conflicts: &mut Vec<TypeId>
+        conflicts: &mut Vec<TypeId>,
     ) -> Result<(), NominalTypeError> {
         if path.contains(&current_type) {
             conflicts.push(current_type);
@@ -924,8 +1006,16 @@ impl NominalTypeChecker {
 
             // Check interfaces (potential for diamond problems)
             for interface in &type_def.interfaces {
-                if let Type::Named { id: interface_id, .. } = interface {
-                    self.check_diamond_inheritance_recursive(*interface_id, visited, path, conflicts)?;
+                if let Type::Named {
+                    id: interface_id, ..
+                } = interface
+                {
+                    self.check_diamond_inheritance_recursive(
+                        *interface_id,
+                        visited,
+                        path,
+                        conflicts,
+                    )?;
                 }
             }
         }
@@ -935,11 +1025,17 @@ impl NominalTypeChecker {
     }
 
     /// Get polymorphism information for a type
-    pub fn get_polymorphism_info(&self, type_id: TypeId) -> Result<PolymorphismInfo, NominalTypeError> {
-        let type_def = self.type_registry.get(&type_id).ok_or(NominalTypeError::UnknownType {
-            id: type_id,
-            span: crate::source::Span::new(0, 0),
-        })?;
+    pub fn get_polymorphism_info(
+        &self,
+        type_id: TypeId,
+    ) -> Result<PolymorphismInfo, NominalTypeError> {
+        let type_def = self
+            .type_registry
+            .get(&type_id)
+            .ok_or(NominalTypeError::UnknownType {
+                id: type_id,
+                span: crate::source::Span::new(0, 0),
+            })?;
 
         let static_type = Type::Named {
             id: type_id,
@@ -950,7 +1046,9 @@ impl NominalTypeChecker {
         };
 
         // Collect virtual methods
-        let virtual_methods: Vec<InternedString> = type_def.methods.iter()
+        let virtual_methods: Vec<InternedString> = type_def
+            .methods
+            .iter()
             .filter(|m| !m.is_static)
             .map(|m| m.name)
             .collect();
@@ -962,9 +1060,8 @@ impl NominalTypeChecker {
                 // Convert TypeId to TypeId for trait lookup
                 let trait_id = TypeId::new(type_id.as_u32());
                 if let Some(trait_def) = self.trait_registry.get(&trait_id) {
-                    let methods: Vec<InternedString> = trait_def.methods.iter()
-                        .map(|m| m.name)
-                        .collect();
+                    let methods: Vec<InternedString> =
+                        trait_def.methods.iter().map(|m| m.name).collect();
                     interface_methods.insert(trait_id, methods);
                 }
             }
@@ -979,7 +1076,10 @@ impl NominalTypeChecker {
     }
 
     /// Validate type hierarchy for correctness
-    pub fn validate_type_hierarchy(&mut self, type_id: TypeId) -> Result<(), Vec<NominalTypeError>> {
+    pub fn validate_type_hierarchy(
+        &mut self,
+        type_id: TypeId,
+    ) -> Result<(), Vec<NominalTypeError>> {
         let mut errors = Vec::new();
 
         // Check diamond inheritance
@@ -1029,7 +1129,12 @@ impl NominalTypeChecker {
         abstract_methods
     }
 
-    fn collect_abstract_methods_recursive(&self, type_id: TypeId, methods: &mut Vec<InternedString>, visited: &mut HashSet<TypeId>) {
+    fn collect_abstract_methods_recursive(
+        &self,
+        type_id: TypeId,
+        methods: &mut Vec<InternedString>,
+        visited: &mut HashSet<TypeId>,
+    ) {
         if visited.contains(&type_id) {
             return;
         }
@@ -1039,7 +1144,7 @@ impl NominalTypeChecker {
             // Add abstract methods from this type
             for method in &type_def.methods {
                 // For interface methods, assume they're abstract unless they have default impls
-                let is_abstract = type_def.kind == TypeKind::Interface; 
+                let is_abstract = type_def.kind == TypeKind::Interface;
                 if is_abstract && !methods.contains(&method.name) {
                     methods.push(method.name);
                 }
@@ -1054,7 +1159,10 @@ impl NominalTypeChecker {
 
             // Check interfaces for abstract methods
             for interface in &type_def.interfaces {
-                if let Type::Named { id: interface_id, .. } = interface {
+                if let Type::Named {
+                    id: interface_id, ..
+                } = interface
+                {
                     self.collect_abstract_methods_recursive(*interface_id, methods, visited);
                 }
             }
@@ -1095,7 +1203,7 @@ mod tests {
     fn test_basic_nominal_subtyping() {
         let mut checker = NominalTypeChecker::new();
         let mut arena = AstArena::new();
-        
+
         // Create Object type
         let object_id = TypeId::next();
         let object_type = TypeDefinition {
@@ -1114,9 +1222,9 @@ mod tests {
             is_final: false,
             span: crate::source::Span::new(0, 0),
         };
-        
+
         checker.register_type(object_type).unwrap();
-        
+
         // Create String type that inherits from Object
         let string_id = TypeId::next();
         let string_type = TypeDefinition {
@@ -1141,9 +1249,9 @@ mod tests {
             is_final: false,
             span: crate::source::Span::new(0, 0),
         };
-        
+
         checker.register_type(string_type).unwrap();
-        
+
         // Test subtyping
         let string_instance = Type::Named {
             id: string_id,
@@ -1152,7 +1260,7 @@ mod tests {
             const_args: vec![],
             nullability: NullabilityKind::NonNull,
         };
-        
+
         let object_instance = Type::Named {
             id: object_id,
             type_args: vec![],
@@ -1160,8 +1268,12 @@ mod tests {
             const_args: vec![],
             nullability: NullabilityKind::NonNull,
         };
-        
-        assert!(checker.is_subtype(&string_instance, &object_instance).unwrap());
-        assert!(!checker.is_subtype(&object_instance, &string_instance).unwrap());
+
+        assert!(checker
+            .is_subtype(&string_instance, &object_instance)
+            .unwrap());
+        assert!(!checker
+            .is_subtype(&object_instance, &string_instance)
+            .unwrap());
     }
 }

@@ -4,12 +4,7 @@
 //! with the memory management system, eliminating redundant operations
 //! and improving performance.
 
-use crate::{
-    hir::*,
-    optimization::OptimizationPass,
-    analysis::ModuleAnalysis,
-    CompilerResult,
-};
+use crate::{analysis::ModuleAnalysis, hir::*, optimization::OptimizationPass, CompilerResult};
 use std::collections::{HashMap, HashSet};
 
 /// Memory optimization pass
@@ -38,10 +33,7 @@ impl MemoryOptimizationPass {
     ///
     /// Pattern: IncRef(x) followed by DecRef(x) with no intervening uses
     /// can be eliminated as they cancel out.
-    fn eliminate_redundant_refcounting(
-        &mut self,
-        func: &mut HirFunction,
-    ) -> CompilerResult<bool> {
+    fn eliminate_redundant_refcounting(&mut self, func: &mut HirFunction) -> CompilerResult<bool> {
         let mut changed = false;
 
         for block in func.blocks.values_mut() {
@@ -137,7 +129,12 @@ impl MemoryOptimizationPass {
             HirInstruction::Cast { operand, .. } => {
                 uses.push(*operand);
             }
-            HirInstruction::Select { condition, true_val, false_val, .. } => {
+            HirInstruction::Select {
+                condition,
+                true_val,
+                false_val,
+                ..
+            } => {
                 uses.push(*condition);
                 uses.push(*true_val);
                 uses.push(*false_val);
@@ -145,7 +142,9 @@ impl MemoryOptimizationPass {
             HirInstruction::ExtractValue { aggregate, .. } => {
                 uses.push(*aggregate);
             }
-            HirInstruction::InsertValue { aggregate, value, .. } => {
+            HirInstruction::InsertValue {
+                aggregate, value, ..
+            } => {
                 uses.push(*aggregate);
                 uses.push(*value);
             }
@@ -177,10 +176,7 @@ impl MemoryOptimizationPass {
     }
 
     /// Coalesce adjacent IncRef/DecRef operations on the same value
-    fn coalesce_refcounting(
-        &mut self,
-        func: &mut HirFunction,
-    ) -> CompilerResult<bool> {
+    fn coalesce_refcounting(&mut self, func: &mut HirFunction) -> CompilerResult<bool> {
         let mut changed = false;
 
         for block in func.blocks.values_mut() {
@@ -213,8 +209,7 @@ impl MemoryOptimizationPass {
                     }
 
                     // Flush on any instruction that might observe reference counts
-                    HirInstruction::Call { .. } |
-                    HirInstruction::Store { .. } => true,
+                    HirInstruction::Call { .. } | HirInstruction::Store { .. } => true,
 
                     _ => false,
                 };
@@ -229,7 +224,7 @@ impl MemoryOptimizationPass {
                                     result: None,
                                     callee: HirCallable::Intrinsic(Intrinsic::IncRef),
                                     args: vec![value_id],
-                                    type_args: vec![],  // Intrinsics don't have type args
+                                    type_args: vec![], // Intrinsics don't have type args
                                     const_args: vec![],
                                     is_tail: false,
                                 });
@@ -241,7 +236,7 @@ impl MemoryOptimizationPass {
                                     result: None,
                                     callee: HirCallable::Intrinsic(Intrinsic::DecRef),
                                     args: vec![value_id],
-                                    type_args: vec![],  // Intrinsics don't have type args
+                                    type_args: vec![], // Intrinsics don't have type args
                                     const_args: vec![],
                                     is_tail: false,
                                 });
@@ -330,7 +325,10 @@ mod tests {
         };
 
         let mut func = HirFunction::new(arena.intern_string("test"), signature);
-        let value_id = func.create_value(HirType::Ptr(Box::new(HirType::I32)), HirValueKind::Instruction);
+        let value_id = func.create_value(
+            HirType::Ptr(Box::new(HirType::I32)),
+            HirValueKind::Instruction,
+        );
 
         let block = func.blocks.get_mut(&func.entry_block).unwrap();
 
@@ -364,7 +362,11 @@ mod tests {
 
         // Check that both instructions were removed
         let entry_block = &func.blocks[&func.entry_block];
-        assert_eq!(entry_block.instructions.len(), 0, "Both IncRef and DecRef should be removed");
+        assert_eq!(
+            entry_block.instructions.len(),
+            0,
+            "Both IncRef and DecRef should be removed"
+        );
     }
 
     #[test]
@@ -385,7 +387,10 @@ mod tests {
         };
 
         let mut func = HirFunction::new(arena.intern_string("test_coalesce"), signature);
-        let value_id = func.create_value(HirType::Ptr(Box::new(HirType::I32)), HirValueKind::Instruction);
+        let value_id = func.create_value(
+            HirType::Ptr(Box::new(HirType::I32)),
+            HirValueKind::Instruction,
+        );
 
         let block = func.blocks.get_mut(&func.entry_block).unwrap();
 

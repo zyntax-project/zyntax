@@ -29,16 +29,16 @@
 //! let typed_program = adapter.convert_standpoint(standpoint)?;
 //! ```
 
+mod adapter;
 mod error;
-mod type_converter;
 mod expression_converter;
 mod statement_converter;
-mod typed_expression_converter;
 mod symbol_extractor;
-mod adapter;
+mod type_converter;
+mod typed_expression_converter;
 
-pub use error::{AdapterError, AdapterResult};
 pub use adapter::WhirlwindAdapter;
+pub use error::{AdapterError, AdapterResult};
 
 // Re-export key types for convenience
-pub use zyntax_typed_ast::{TypedProgram, Type, TypedExpression, TypedStatement};
+pub use zyntax_typed_ast::{Type, TypedExpression, TypedProgram, TypedStatement};

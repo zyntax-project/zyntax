@@ -1,7 +1,7 @@
 // Create a proper TypedAST JSON file using the TypedASTBuilder API
 
-use zyntax_typed_ast::*;
 use std::fs;
+use zyntax_typed_ast::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = TypedASTBuilder::new();
@@ -9,13 +9,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // fn main() -> i32 { return 42; }
     let forty_two = builder.int_literal(42, span);
-    let return_stmt = builder.return_stmt(Some(forty_two), span);
+    let return_stmt = builder.return_stmt(forty_two, span);
 
     let main_func = builder.function(
         "main",
         vec![],
         Type::Primitive(PrimitiveType::I32),
-        vec![return_stmt],
+        TypedBlock {
+            statements: vec![return_stmt],
+            span,
+        },
+        Visibility::Public,
+        false,
         span,
     );
 

@@ -7,14 +7,17 @@
 //!
 //! This is the solution to Gap #4 (CFG Construction) described in INTEGRATION_GAPS_ANALYSIS.md
 
+use crate::hir::HirId;
+use crate::CompilerResult;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
 use zyntax_typed_ast::{
+    typed_ast::{
+        typed_node, TypedBlock, TypedExpression, TypedMatchArm, TypedNode, TypedPattern,
+        TypedStatement,
+    },
     InternedString, Span, Type,
-    typed_ast::{TypedBlock, TypedStatement, TypedNode, TypedExpression, typed_node, TypedPattern, TypedMatchArm},
 };
-use crate::hir::HirId;
-use crate::CompilerResult;
 
 /// Builder for creating CFG from TypedAST
 pub struct TypedCfgBuilder {
@@ -101,7 +104,11 @@ impl TypedCfgBuilder {
 
     /// Build CFG from a typed block
     /// entry_block_id should be the ID of the entry block from the HirFunction
-    pub fn build_from_block(&mut self, block: &TypedBlock, entry_block_id: HirId) -> CompilerResult<TypedControlFlowGraph> {
+    pub fn build_from_block(
+        &mut self,
+        block: &TypedBlock,
+        entry_block_id: HirId,
+    ) -> CompilerResult<TypedControlFlowGraph> {
         let mut graph = DiGraph::new();
         let mut block_map = HashMap::new();
         let mut node_map = HashMap::new();
@@ -110,7 +117,8 @@ impl TypedCfgBuilder {
         let entry_id = entry_block_id;
 
         // Process block with control flow splitting (this is a function body)
-        let (blocks, entry_id_final, exit_id) = self.split_at_control_flow(block, entry_id, true)?;
+        let (blocks, entry_id_final, exit_id) =
+            self.split_at_control_flow(block, entry_id, true)?;
 
         // Add all blocks to graph and create mapping
         for typed_block in blocks {
@@ -122,14 +130,19 @@ impl TypedCfgBuilder {
 
         // Add edges based on terminators
         // Collect edges first to avoid borrow checker issues
-        let edges_to_add: Vec<(NodeIndex, NodeIndex)> = graph.node_indices()
+        let edges_to_add: Vec<(NodeIndex, NodeIndex)> = graph
+            .node_indices()
             .filter_map(|node| {
                 let block = &graph[node];
                 match &block.terminator {
-                    TypedTerminator::Jump(target) => {
-                        block_map.get(target).map(|&target_node| vec![(node, target_node)])
-                    }
-                    TypedTerminator::CondBranch { true_target, false_target, .. } => {
+                    TypedTerminator::Jump(target) => block_map
+                        .get(target)
+                        .map(|&target_node| vec![(node, target_node)]),
+                    TypedTerminator::CondBranch {
+                        true_target,
+                        false_target,
+                        ..
+                    } => {
                         let mut edges = Vec::new();
                         if let Some(&true_node) = block_map.get(true_target) {
                             edges.push((node, true_node));
@@ -137,9 +150,13 @@ impl TypedCfgBuilder {
                         if let Some(&false_node) = block_map.get(false_target) {
                             edges.push((node, false_node));
                         }
-                        if edges.is_empty() { None } else { Some(edges) }
+                        if edges.is_empty() {
+                            None
+                        } else {
+                            Some(edges)
+                        }
                     }
-                    _ => None
+                    _ => None,
                 }
             })
             .flatten()
@@ -209,15 +226,23 @@ impl TypedCfgBuilder {
         entry_id: HirId,
         is_function_body: bool,
     ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
-        log::debug!("[CFG] split_at_control_flow: entry_id={:?}, statements={}", entry_id, block.statements.len());
+        log::debug!(
+            "[CFG] split_at_control_flow: entry_id={:?}, statements={}",
+            entry_id,
+            block.statements.len()
+        );
         let mut all_blocks = Vec::new();
         let mut current_statements = Vec::new();
         let mut current_block_id = entry_id;
         let mut exit_id = entry_id;
 
         for (stmt_idx, stmt) in block.statements.iter().enumerate() {
-            log::debug!("[CFG]   stmt[{}]: {:?}, current_block={:?}", stmt_idx,
-                     std::mem::discriminant(&stmt.node), current_block_id);
+            log::debug!(
+                "[CFG]   stmt[{}]: {:?}, current_block={:?}",
+                stmt_idx,
+                std::mem::discriminant(&stmt.node),
+                current_block_id
+            );
             match &stmt.node {
                 TypedStatement::If(if_stmt) => {
                     // Create block for statements before If
@@ -243,17 +268,23 @@ impl TypedCfgBuilder {
                     });
 
                     // Process then block (not a function body)
-                    let (then_blocks, _, then_exit) = self.split_at_control_flow(&if_stmt.then_block, then_id, false)?;
+                    let (then_blocks, _, then_exit) =
+                        self.split_at_control_flow(&if_stmt.then_block, then_id, false)?;
                     all_blocks.extend(then_blocks);
 
                     // Check if then block has a definite terminator (return) BEFORE modifying
-                    let then_returns = all_blocks.iter().rev().find(|b| b.id == then_exit)
+                    let then_returns = all_blocks
+                        .iter()
+                        .rev()
+                        .find(|b| b.id == then_exit)
                         .map(|b| matches!(b.terminator, TypedTerminator::Return(_)))
                         .unwrap_or(false);
 
                     // Make then block jump to merge if it doesn't already have a definite terminator
                     if !then_returns {
-                        if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == then_exit) {
+                        if let Some(last_block) =
+                            all_blocks.iter_mut().rev().find(|b| b.id == then_exit)
+                        {
                             if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                 last_block.terminator = TypedTerminator::Jump(merge_id);
                             }
@@ -262,17 +293,23 @@ impl TypedCfgBuilder {
 
                     // Process else block or create empty else
                     let else_returns = if let Some(ref else_block) = if_stmt.else_block {
-                        let (else_blocks, _, else_exit) = self.split_at_control_flow(else_block, else_id, false)?;
+                        let (else_blocks, _, else_exit) =
+                            self.split_at_control_flow(else_block, else_id, false)?;
                         all_blocks.extend(else_blocks);
 
                         // Check if else block has a definite terminator (return) BEFORE modifying
-                        let has_definite_terminator = all_blocks.iter().rev().find(|b| b.id == else_exit)
+                        let has_definite_terminator = all_blocks
+                            .iter()
+                            .rev()
+                            .find(|b| b.id == else_exit)
                             .map(|b| matches!(b.terminator, TypedTerminator::Return(_)))
                             .unwrap_or(false);
 
                         // Make else block jump to merge if it doesn't have a definite terminator
                         if !has_definite_terminator {
-                            if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == else_exit) {
+                            if let Some(last_block) =
+                                all_blocks.iter_mut().rev().find(|b| b.id == else_exit)
+                            {
                                 if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                     last_block.terminator = TypedTerminator::Jump(merge_id);
                                 }
@@ -287,7 +324,7 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: vec![],
                             terminator: TypedTerminator::Jump(merge_id),
-                        pattern_check: None,
+                            pattern_check: None,
                         });
                         false
                     };
@@ -298,8 +335,8 @@ impl TypedCfgBuilder {
                         // Both branches have definite terminators - no merge block needed
                         // The if statement itself terminates the function/loop
                         exit_id = current_block_id; // Exit at the if block
-                        // Don't update current_block_id - we're done
-                        // Early return to avoid creating unreachable merge block
+                                                    // Don't update current_block_id - we're done
+                                                    // Early return to avoid creating unreachable merge block
                         return Ok((all_blocks, entry_id, exit_id));
                     } else {
                         // Start new block after If (merge point)
@@ -310,12 +347,21 @@ impl TypedCfgBuilder {
                 }
 
                 TypedStatement::While(while_stmt) => {
-                    log::debug!("[CFG] While: closing current_block={:?} with {} stmts", current_block_id, current_statements.len());
+                    log::debug!(
+                        "[CFG] While: closing current_block={:?} with {} stmts",
+                        current_block_id,
+                        current_statements.len()
+                    );
                     // Create blocks for while loop
                     let header_id = self.new_block_id();
                     let body_id = self.new_block_id();
                     let after_id = self.new_block_id();
-                    log::debug!("[CFG] While: created header={:?}, body={:?}, after={:?}", header_id, body_id, after_id);
+                    log::debug!(
+                        "[CFG] While: created header={:?}, body={:?}, after={:?}",
+                        header_id,
+                        body_id,
+                        after_id
+                    );
 
                     // Current block ends with jump to header
                     all_blocks.push(TypedBasicBlock {
@@ -323,7 +369,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: current_statements.clone(),
                         terminator: TypedTerminator::Jump(header_id),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     // Header block evaluates condition
@@ -344,16 +390,26 @@ impl TypedCfgBuilder {
 
                     // Process body block
                     log::debug!("[CFG] While: processing body with entry={:?}", body_id);
-                    let (body_blocks, _, body_exit) = self.split_at_control_flow(&while_stmt.body, body_id, false)?;
-                    log::debug!("[CFG] While: body returned {} blocks, body_exit={:?}", body_blocks.len(), body_exit);
+                    let (body_blocks, _, body_exit) =
+                        self.split_at_control_flow(&while_stmt.body, body_id, false)?;
+                    log::debug!(
+                        "[CFG] While: body returned {} blocks, body_exit={:?}",
+                        body_blocks.len(),
+                        body_exit
+                    );
                     all_blocks.extend(body_blocks);
 
                     // Pop loop context
                     self.loop_stack.pop();
 
                     // Make body block jump back to header
-                    if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
-                        log::debug!("[CFG] While: body_exit block has terminator: {:?}", last_block.terminator);
+                    if let Some(last_block) =
+                        all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                    {
+                        log::debug!(
+                            "[CFG] While: body_exit block has terminator: {:?}",
+                            last_block.terminator
+                        );
                         if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                             log::debug!("[CFG] While: setting body_exit to Jump(header)");
                             last_block.terminator = TypedTerminator::Jump(header_id);
@@ -364,7 +420,10 @@ impl TypedCfgBuilder {
                     current_statements = Vec::new();
                     current_block_id = after_id;
                     exit_id = after_id;
-                    log::debug!("[CFG] While: continuing with current_block={:?}", current_block_id);
+                    log::debug!(
+                        "[CFG] While: continuing with current_block={:?}",
+                        current_block_id
+                    );
                 }
 
                 TypedStatement::Loop(loop_stmt) => {
@@ -387,7 +446,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: current_statements.clone(),
                                 terminator: TypedTerminator::Jump(header_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             // Header block (no condition, always enters body)
@@ -396,21 +455,24 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: vec![],
                                 terminator: TypedTerminator::Jump(body_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             // Push loop context for Break/Continue
                             self.loop_stack.push((header_id, after_id));
 
                             // Process body block
-                            let (body_blocks, _, body_exit) = self.split_at_control_flow(body, body_id, false)?;
+                            let (body_blocks, _, body_exit) =
+                                self.split_at_control_flow(body, body_id, false)?;
                             all_blocks.extend(body_blocks);
 
                             // Pop loop context
                             self.loop_stack.pop();
 
                             // Make body block jump back to header (unless it has break/return)
-                            if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                            if let Some(last_block) =
+                                all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                            {
                                 if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                     last_block.terminator = TypedTerminator::Jump(header_id);
                                 }
@@ -421,7 +483,11 @@ impl TypedCfgBuilder {
                             current_block_id = after_id;
                             exit_id = after_id;
                         }
-                        TypedLoop::ForEach { pattern, iterator, body } => {
+                        TypedLoop::ForEach {
+                            pattern,
+                            iterator,
+                            body,
+                        } => {
                             // For-each loop: for item in collection
                             // Similar to While: entry → header → body → header → exit
                             // Header evaluates iterator.next(), body processes item
@@ -436,7 +502,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: current_statements.clone(),
                                 terminator: TypedTerminator::Jump(header_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             // Header block (iterator logic will be handled by SSA builder)
@@ -449,21 +515,24 @@ impl TypedCfgBuilder {
                                 // TODO: Create proper iterator condition expression
                                 // For now, treat as unconditional to body (will be fixed in SSA)
                                 terminator: TypedTerminator::Jump(body_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             // Push loop context
                             self.loop_stack.push((header_id, after_id));
 
                             // Process body block
-                            let (body_blocks, _, body_exit) = self.split_at_control_flow(body, body_id, false)?;
+                            let (body_blocks, _, body_exit) =
+                                self.split_at_control_flow(body, body_id, false)?;
                             all_blocks.extend(body_blocks);
 
                             // Pop loop context
                             self.loop_stack.pop();
 
                             // Body loops back to header
-                            if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                            if let Some(last_block) =
+                                all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                            {
                                 if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                     last_block.terminator = TypedTerminator::Jump(header_id);
                                 }
@@ -475,7 +544,12 @@ impl TypedCfgBuilder {
                             exit_id = after_id;
                         }
 
-                        TypedLoop::ForCStyle { init, condition, update, body } => {
+                        TypedLoop::ForCStyle {
+                            init,
+                            condition,
+                            update,
+                            body,
+                        } => {
                             // C-style for: for (init; condition; update) body
                             // Structure: entry → init → header → body → update → header → exit
                             //                              ↓
@@ -497,7 +571,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: current_statements.clone(),
                                 terminator: TypedTerminator::Jump(header_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             // Header evaluates condition
@@ -520,7 +594,7 @@ impl TypedCfgBuilder {
                                     label: None,
                                     statements: vec![],
                                     terminator: TypedTerminator::Jump(body_id),
-                                pattern_check: None,
+                                    pattern_check: None,
                                 });
                             }
 
@@ -528,14 +602,17 @@ impl TypedCfgBuilder {
                             self.loop_stack.push((update_id, after_id));
 
                             // Process body
-                            let (body_blocks, _, body_exit) = self.split_at_control_flow(body, body_id, false)?;
+                            let (body_blocks, _, body_exit) =
+                                self.split_at_control_flow(body, body_id, false)?;
                             all_blocks.extend(body_blocks);
 
                             // Pop loop context
                             self.loop_stack.pop();
 
                             // Body goes to update block
-                            if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                            if let Some(last_block) =
+                                all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                            {
                                 if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                     last_block.terminator = TypedTerminator::Jump(update_id);
                                 }
@@ -546,7 +623,9 @@ impl TypedCfgBuilder {
                             if let Some(upd) = update {
                                 // Update expression becomes a statement in the block
                                 update_statements.push(typed_node(
-                                    zyntax_typed_ast::typed_ast::TypedStatement::Expression(upd.clone()),
+                                    zyntax_typed_ast::typed_ast::TypedStatement::Expression(
+                                        upd.clone(),
+                                    ),
                                     upd.ty.clone(),
                                     upd.span,
                                 ));
@@ -557,7 +636,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: update_statements,
                                 terminator: TypedTerminator::Jump(header_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             // Continue with after block
@@ -578,7 +657,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: current_statements.clone(),
                                 terminator: TypedTerminator::Jump(header_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             all_blocks.push(TypedBasicBlock {
@@ -594,11 +673,14 @@ impl TypedCfgBuilder {
                             });
 
                             self.loop_stack.push((header_id, after_id));
-                            let (body_blocks, _, body_exit) = self.split_at_control_flow(body, body_id, false)?;
+                            let (body_blocks, _, body_exit) =
+                                self.split_at_control_flow(body, body_id, false)?;
                             all_blocks.extend(body_blocks);
                             self.loop_stack.pop();
 
-                            if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                            if let Some(last_block) =
+                                all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                            {
                                 if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                     last_block.terminator = TypedTerminator::Jump(header_id);
                                 }
@@ -623,16 +705,19 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: current_statements.clone(),
                                 terminator: TypedTerminator::Jump(body_id),
-                            pattern_check: None,
+                                pattern_check: None,
                             });
 
                             self.loop_stack.push((header_id, after_id));
-                            let (body_blocks, _, body_exit) = self.split_at_control_flow(body, body_id, false)?;
+                            let (body_blocks, _, body_exit) =
+                                self.split_at_control_flow(body, body_id, false)?;
                             all_blocks.extend(body_blocks);
                             self.loop_stack.pop();
 
                             // Body goes to header for condition check
-                            if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                            if let Some(last_block) =
+                                all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                            {
                                 if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                                     last_block.terminator = TypedTerminator::Jump(header_id);
                                 }
@@ -670,7 +755,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: current_statements.clone(),
                         terminator: TypedTerminator::Jump(header_id),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     // Header (iterator protocol handled by SSA)
@@ -679,15 +764,18 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: vec![],
                         terminator: TypedTerminator::Jump(body_id),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     self.loop_stack.push((header_id, after_id));
-                    let (body_blocks, _, body_exit) = self.split_at_control_flow(&for_stmt.body, body_id, false)?;
+                    let (body_blocks, _, body_exit) =
+                        self.split_at_control_flow(&for_stmt.body, body_id, false)?;
                     all_blocks.extend(body_blocks);
                     self.loop_stack.pop();
 
-                    if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                    if let Some(last_block) =
+                        all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                    {
                         if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                             last_block.terminator = TypedTerminator::Jump(header_id);
                         }
@@ -717,7 +805,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: current_statements.clone(),
                         terminator: TypedTerminator::Jump(header_id),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     // Header with condition
@@ -739,16 +827,19 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: vec![],
                             terminator: TypedTerminator::Jump(body_id),
-                        pattern_check: None,
+                            pattern_check: None,
                         });
                     }
 
                     self.loop_stack.push((update_id, after_id));
-                    let (body_blocks, _, body_exit) = self.split_at_control_flow(&for_c_stmt.body, body_id, false)?;
+                    let (body_blocks, _, body_exit) =
+                        self.split_at_control_flow(&for_c_stmt.body, body_id, false)?;
                     all_blocks.extend(body_blocks);
                     self.loop_stack.pop();
 
-                    if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == body_exit) {
+                    if let Some(last_block) =
+                        all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
+                    {
                         if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                             last_block.terminator = TypedTerminator::Jump(update_id);
                         }
@@ -769,7 +860,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: update_statements,
                         terminator: TypedTerminator::Jump(header_id),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     current_statements = Vec::new();
@@ -791,13 +882,16 @@ impl TypedCfgBuilder {
                     });
 
                     // Nested block - recursively process
-                    let (block_blocks, _, block_exit) = self.split_at_control_flow(block, block_entry_id, false)?;
+                    let (block_blocks, _, block_exit) =
+                        self.split_at_control_flow(block, block_entry_id, false)?;
 
                     // Add all blocks from the nested block
                     all_blocks.extend(block_blocks);
 
                     // Make the block exit jump to the continuation block
-                    if let Some(last_block) = all_blocks.iter_mut().rev().find(|b| b.id == block_exit) {
+                    if let Some(last_block) =
+                        all_blocks.iter_mut().rev().find(|b| b.id == block_exit)
+                    {
                         if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                             last_block.terminator = TypedTerminator::Jump(after_block_id);
                         }
@@ -812,9 +906,13 @@ impl TypedCfgBuilder {
                 TypedStatement::Expression(expr) => {
                     // Check if expression is a Block - if so, flatten it
                     if let TypedExpression::Block(block) = &expr.node {
-                        log::debug!("[CFG] Expression(Block): flattening block with {} statements", block.statements.len());
+                        log::debug!(
+                            "[CFG] Expression(Block): flattening block with {} statements",
+                            block.statements.len()
+                        );
                         // Recursively process the block's statements
-                        let (block_blocks, _block_entry, block_exit) = self.split_at_control_flow(block, current_block_id, false)?;
+                        let (block_blocks, _block_entry, block_exit) =
+                            self.split_at_control_flow(block, current_block_id, false)?;
                         all_blocks.extend(block_blocks);
                         current_statements = Vec::new();
                         current_block_id = block_exit;
@@ -833,7 +931,7 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: current_statements.clone(),
                             terminator: TypedTerminator::Jump(exit_id),
-                        pattern_check: None,
+                            pattern_check: None,
                         });
 
                         // Create a new unreachable block for any statements after break
@@ -849,7 +947,11 @@ impl TypedCfgBuilder {
                 }
 
                 TypedStatement::Continue => {
-                    log::debug!("[CFG] Continue: current_block={:?} with {} stmts", current_block_id, current_statements.len());
+                    log::debug!(
+                        "[CFG] Continue: current_block={:?} with {} stmts",
+                        current_block_id,
+                        current_statements.len()
+                    );
                     // Continue jumps to loop header
                     if let Some(&(header_id, _exit_id)) = self.loop_stack.last() {
                         log::debug!("[CFG] Continue: jumping to header={:?}", header_id);
@@ -858,12 +960,15 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: current_statements.clone(),
                             terminator: TypedTerminator::Jump(header_id),
-                        pattern_check: None,
+                            pattern_check: None,
                         });
 
                         // Create a new unreachable block for any statements after continue
                         let unreachable_id = self.new_block_id();
-                        log::debug!("[CFG] Continue: created unreachable block={:?}", unreachable_id);
+                        log::debug!(
+                            "[CFG] Continue: created unreachable block={:?}",
+                            unreachable_id
+                        );
                         current_statements = Vec::new();
                         current_block_id = unreachable_id;
                     } else {
@@ -902,7 +1007,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: entry_statements,
                         terminator: TypedTerminator::Jump(first_pattern_id),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     let mut prev_pattern_id = first_pattern_id;
@@ -966,7 +1071,7 @@ impl TypedCfgBuilder {
                                     label: None,
                                     statements: vec![],
                                     terminator: TypedTerminator::Jump(body_id),
-                                pattern_check: pattern_check_info,
+                                    pattern_check: pattern_check_info,
                                 });
                             }
                         }
@@ -980,9 +1085,13 @@ impl TypedCfgBuilder {
                                 // Last statement might be a return - if so, use it as terminator
                                 if let Some(last_stmt) = block.statements.last() {
                                     if matches!(last_stmt.node, TypedStatement::Return(_)) {
-                                        let stmts = block.statements[..block.statements.len()-1].to_vec();
-                                        let ret_stmt = &block.statements[block.statements.len()-1];
-                                        let term = if let TypedStatement::Return(ret_expr) = &ret_stmt.node {
+                                        let stmts =
+                                            block.statements[..block.statements.len() - 1].to_vec();
+                                        let ret_stmt =
+                                            &block.statements[block.statements.len() - 1];
+                                        let term = if let TypedStatement::Return(ret_expr) =
+                                            &ret_stmt.node
+                                        {
                                             TypedTerminator::Return(ret_expr.clone())
                                         } else {
                                             TypedTerminator::Jump(merge_id)
@@ -998,7 +1107,9 @@ impl TypedCfgBuilder {
                             _ => {
                                 // Non-block expression, wrap in Expression statement
                                 let body_stmt = typed_node(
-                                    zyntax_typed_ast::typed_ast::TypedStatement::Expression(arm.body.clone()),
+                                    zyntax_typed_ast::typed_ast::TypedStatement::Expression(
+                                        arm.body.clone(),
+                                    ),
                                     arm.body.ty.clone(),
                                     arm.body.span,
                                 );
@@ -1018,7 +1129,7 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: body_stmts,
                             terminator: body_terminator,
-                        pattern_check: body_pattern_info,
+                            pattern_check: body_pattern_info,
                         });
 
                         prev_pattern_id = next_pattern_id;
@@ -1030,7 +1141,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: vec![],
                         terminator: TypedTerminator::Unreachable,
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     // Continue with merge block
@@ -1046,7 +1157,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: current_statements.clone(),
                         terminator: TypedTerminator::Return(expr.clone()),
-                    pattern_check: None,
+                        pattern_check: None,
                     });
 
                     // No more processing after return
@@ -1063,27 +1174,38 @@ impl TypedCfgBuilder {
 
         // Always create a final block if we have a current_block_id that hasn't been added yet
         // This handles the case where control flow statements leave us with an empty continuation block
-        log::debug!("[CFG] End: current_block={:?}, current_statements={}, exit={:?}",
-                 current_block_id, current_statements.len(), exit_id);
+        log::debug!(
+            "[CFG] End: current_block={:?}, current_statements={}, exit={:?}",
+            current_block_id,
+            current_statements.len(),
+            exit_id
+        );
         if !all_blocks.iter().any(|b| b.id == current_block_id) {
-            log::debug!("[CFG] End: creating final block with {} statements", current_statements.len());
+            log::debug!(
+                "[CFG] End: creating final block with {} statements",
+                current_statements.len()
+            );
 
             // Special case: If this is a function body and has exactly one statement that's an expression,
             // treat it as an implicit return. This handles cases like:
             //   fn add(self, rhs: Tensor) -> Tensor { extern tensor_add(self, rhs) }
             // where the single expression should be returned.
             // Do NOT apply this to blocks inside control flow (if, match, etc.) - those should not implicitly return.
-            let (final_statements, terminator) = if is_function_body && current_statements.len() == 1 {
-                if let TypedStatement::Expression(expr) = &current_statements[0].node {
-                    // Single expression in function body - implicitly return it
-                    (vec![], TypedTerminator::Return(Some(Box::new((**expr).clone()))))
+            let (final_statements, terminator) =
+                if is_function_body && current_statements.len() == 1 {
+                    if let TypedStatement::Expression(expr) = &current_statements[0].node {
+                        // Single expression in function body - implicitly return it
+                        (
+                            vec![],
+                            TypedTerminator::Return(Some(Box::new((**expr).clone()))),
+                        )
+                    } else {
+                        (current_statements, TypedTerminator::Unreachable)
+                    }
                 } else {
+                    // Multiple statements, no statements, or not a function body - keep as unreachable
                     (current_statements, TypedTerminator::Unreachable)
-                }
-            } else {
-                // Multiple statements, no statements, or not a function body - keep as unreachable
-                (current_statements, TypedTerminator::Unreachable)
-            };
+                };
 
             all_blocks.push(TypedBasicBlock {
                 id: current_block_id,
@@ -1097,7 +1219,12 @@ impl TypedCfgBuilder {
             log::debug!("[CFG] End: current_block already exists, not creating");
         }
 
-        log::debug!("[CFG] Returning: {} blocks, entry={:?}, exit={:?}", all_blocks.len(), entry_id, exit_id);
+        log::debug!(
+            "[CFG] Returning: {} blocks, entry={:?}, exit={:?}",
+            all_blocks.len(),
+            entry_id,
+            exit_id
+        );
         Ok((all_blocks, entry_id, exit_id))
     }
 
@@ -1109,7 +1236,7 @@ impl TypedCfgBuilder {
         pattern: &TypedNode<TypedPattern>,
         span: Span,
     ) -> Option<TypedNode<TypedExpression>> {
-        use zyntax_typed_ast::typed_ast::{TypedBinary, BinaryOp, TypedLiteral};
+        use zyntax_typed_ast::typed_ast::{BinaryOp, TypedBinary, TypedLiteral};
 
         log::debug!("[CFG] generate_pattern_check: pattern={:?}", pattern.node);
 
@@ -1138,7 +1265,10 @@ impl TypedCfgBuilder {
                 // This requires extracting discriminant at runtime
                 // For now, return None and let SSA handle it
                 // TODO: Generate discriminant check expression
-                log::debug!("[CFG] TODO: Generate discriminant check for variant {:?}", variant);
+                log::debug!(
+                    "[CFG] TODO: Generate discriminant check for variant {:?}",
+                    variant
+                );
                 None
             }
 
@@ -1146,8 +1276,12 @@ impl TypedCfgBuilder {
             TypedPattern::Literal(lit_pattern) => {
                 use zyntax_typed_ast::typed_ast::TypedLiteralPattern;
                 let lit_expr = match lit_pattern {
-                    TypedLiteralPattern::Integer(i) => TypedExpression::Literal(TypedLiteral::Integer(*i)),
-                    TypedLiteralPattern::Bool(b) => TypedExpression::Literal(TypedLiteral::Bool(*b)),
+                    TypedLiteralPattern::Integer(i) => {
+                        TypedExpression::Literal(TypedLiteral::Integer(*i))
+                    }
+                    TypedLiteralPattern::Bool(b) => {
+                        TypedExpression::Literal(TypedLiteral::Bool(*b))
+                    }
                     _ => return None, // Other literals not yet supported
                 };
 
@@ -1156,11 +1290,7 @@ impl TypedCfgBuilder {
                     TypedExpression::Binary(TypedBinary {
                         op: BinaryOp::Eq,
                         left: Box::new(scrutinee.clone()),
-                        right: Box::new(typed_node(
-                            lit_expr,
-                            scrutinee.ty.clone(),
-                            span,
-                        )),
+                        right: Box::new(typed_node(lit_expr, scrutinee.ty.clone(), span)),
                     }),
                     Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool),
                     span,

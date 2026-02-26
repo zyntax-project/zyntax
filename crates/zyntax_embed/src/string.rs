@@ -8,8 +8,8 @@
 //! This module provides `ZyntaxString` for direct manipulation of these strings
 //! without intermediate conversion to Rust `String`.
 
-use std::ptr::NonNull;
 use crate::error::{ConversionError, ConversionResult};
+use std::ptr::NonNull;
 
 /// A string in Zyntax's native length-prefixed format.
 ///

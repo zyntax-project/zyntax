@@ -3,7 +3,7 @@
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{InternedString, arena::AstArena};
+use zyntax_typed_ast::{arena::AstArena, InternedString};
 
 fn create_test_string(s: &str) -> InternedString {
     let mut arena = AstArena::new();
@@ -50,26 +50,26 @@ fn test_while_with_continue() {
     use cranelift_module::Module;
 
     let func_id = func.id;
-    let mut backend = CraneliftBackend::new()
-        .expect("Failed to create Cranelift backend");
+    let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
 
     println!("\n=== Compiling HIR to Cranelift IR ===");
-    backend.compile_function(func_id, &func)
+    backend
+        .compile_function(func_id, &func)
         .expect("Failed to compile function");
 
     // Print the Cranelift IR
     println!("\n=== Cranelift IR (HIR test - WORKING) ===");
     println!("{}", backend.get_ir_string());
 
-    backend.finalize_definitions()
+    backend
+        .finalize_definitions()
         .expect("Failed to finalize definitions");
 
-    let func_ptr = backend.get_function_ptr(func_id)
+    let func_ptr = backend
+        .get_function_ptr(func_id)
         .expect("Failed to get function pointer");
 
-    let test_fn: extern "C" fn(i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let test_fn: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Test with n=4: should return 1 + 3 + 4 = 8 (skips 2)
     println!("\n=== Executing test_continue(4) ===");
@@ -84,14 +84,12 @@ fn create_continue_function() -> HirFunction {
     let name = create_test_string("test_continue");
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("n"),
-                ty: HirType::I32,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("n"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -109,8 +107,8 @@ fn create_continue_function() -> HirFunction {
     let loop_header = func.create_block();
     let loop_body = func.create_block();
     let if_check = func.create_block();
-    let continue_block = func.create_block();  // Block for continue path
-    let merge_block = func.create_block();     // Block for normal path (sum += i)
+    let continue_block = func.create_block(); // Block for continue path
+    let merge_block = func.create_block(); // Block for normal path (sum += i)
     let exit_block = func.create_block();
 
     let param_n = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -122,7 +120,9 @@ fn create_continue_function() -> HirFunction {
 
     // Entry: i = 0, sum = 0, jump to loop header
     let entry = func.blocks.get_mut(&entry_block).unwrap();
-    entry.set_terminator(HirTerminator::Branch { target: loop_header });
+    entry.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Loop header: phi nodes for i and sum, check i < n
     let i_phi = func.create_value(HirType::I32, HirValueKind::Instruction);
@@ -142,18 +142,18 @@ fn create_continue_function() -> HirFunction {
         result: i_phi,
         ty: HirType::I32,
         incoming: vec![
-            (zero, entry_block),              // Initial: i = 0
-            (HirId::new(), merge_block),      // Will be set to i_after_add
-            (HirId::new(), continue_block),   // Will be set to i_after_add
+            (zero, entry_block),            // Initial: i = 0
+            (HirId::new(), merge_block),    // Will be set to i_after_add
+            (HirId::new(), continue_block), // Will be set to i_after_add
         ],
     });
     header.add_phi(HirPhi {
         result: sum_phi,
         ty: HirType::I32,
         incoming: vec![
-            (zero, entry_block),              // Initial: sum = 0
-            (HirId::new(), merge_block),      // Will be set to new_sum
-            (HirId::new(), continue_block),   // Will be set to sum_phi from prev iteration
+            (zero, entry_block),            // Initial: sum = 0
+            (HirId::new(), merge_block),    // Will be set to new_sum
+            (HirId::new(), continue_block), // Will be set to sum_phi from prev iteration
         ],
     });
     header.add_instruction(cmp_inst);
@@ -197,7 +197,9 @@ fn create_continue_function() -> HirFunction {
 
     // Continue block: jump back to loop header (skip sum update)
     let cont_block = func.blocks.get_mut(&continue_block).unwrap();
-    cont_block.set_terminator(HirTerminator::Branch { target: loop_header });
+    cont_block.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Merge block: sum = sum + i, then jump back to loop header
     let new_sum = func.create_value(HirType::I32, HirValueKind::Instruction);
@@ -211,18 +213,22 @@ fn create_continue_function() -> HirFunction {
 
     let merge = func.blocks.get_mut(&merge_block).unwrap();
     merge.add_instruction(add_sum_inst);
-    merge.set_terminator(HirTerminator::Branch { target: loop_header });
+    merge.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Fix phi node incoming values
     let header = func.blocks.get_mut(&loop_header).unwrap();
     header.phis[0].incoming[1] = (i_plus_1, merge_block);
     header.phis[0].incoming[2] = (i_plus_1, continue_block);
     header.phis[1].incoming[1] = (new_sum, merge_block);
-    header.phis[1].incoming[2] = (sum_phi, continue_block);  // Continue: sum unchanged, use phi value
+    header.phis[1].incoming[2] = (sum_phi, continue_block); // Continue: sum unchanged, use phi value
 
     // Exit block: return sum
     let exit = func.blocks.get_mut(&exit_block).unwrap();
-    exit.set_terminator(HirTerminator::Return { values: vec![sum_phi] });
+    exit.set_terminator(HirTerminator::Return {
+        values: vec![sum_phi],
+    });
 
     func
 }

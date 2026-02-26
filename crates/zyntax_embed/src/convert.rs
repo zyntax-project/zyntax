@@ -5,7 +5,7 @@
 
 use crate::error::{ConversionError, ConversionResult};
 use crate::value::ZyntaxValue;
-use zyntax_compiler::zrtl::{DynamicValue, TypeId, TypeCategory};
+use zyntax_compiler::zrtl::{DynamicValue, TypeCategory, TypeId};
 
 /// Convert a Zyntax value to a Rust type.
 ///
@@ -383,12 +383,10 @@ impl<T: FromZyntax> FromZyntax for Option<T> {
     fn from_zyntax(value: ZyntaxValue) -> ConversionResult<Self> {
         match value {
             ZyntaxValue::Null => Ok(None),
-            ZyntaxValue::Optional(inner) => {
-                match *inner {
-                    Some(v) => Ok(Some(T::from_zyntax(v)?)),
-                    None => Ok(None),
-                }
-            }
+            ZyntaxValue::Optional(inner) => match *inner {
+                Some(v) => Ok(Some(T::from_zyntax(v)?)),
+                None => Ok(None),
+            },
             other => Ok(Some(T::from_zyntax(other)?)),
         }
     }
@@ -410,14 +408,11 @@ impl<T: IntoZyntax> IntoZyntax for Option<T> {
 impl<T: FromZyntax> FromZyntax for Vec<T> {
     fn from_zyntax(value: ZyntaxValue) -> ConversionResult<Self> {
         match value {
-            ZyntaxValue::Array(arr) => {
-                arr.into_iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        T::from_zyntax(v).map_err(|e| ConversionError::array_element(i, e))
-                    })
-                    .collect()
-            }
+            ZyntaxValue::Array(arr) => arr
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| T::from_zyntax(v).map_err(|e| ConversionError::array_element(i, e)))
+                .collect(),
             _ => Err(ConversionError::type_mismatch(
                 TypeCategory::Array,
                 value.type_category(),
@@ -439,12 +434,10 @@ impl<T: IntoZyntax> IntoZyntax for Vec<T> {
 impl<T: FromZyntax, E: FromZyntax> FromZyntax for Result<T, E> {
     fn from_zyntax(value: ZyntaxValue) -> ConversionResult<Self> {
         match value {
-            ZyntaxValue::Result(inner) => {
-                match *inner {
-                    Ok(v) => Ok(Ok(T::from_zyntax(v)?)),
-                    Err(e) => Ok(Err(E::from_zyntax(e)?)),
-                }
-            }
+            ZyntaxValue::Result(inner) => match *inner {
+                Ok(v) => Ok(Ok(T::from_zyntax(v)?)),
+                Err(e) => Ok(Err(E::from_zyntax(e)?)),
+            },
             _ => Err(ConversionError::type_mismatch(
                 TypeCategory::Result,
                 value.type_category(),
@@ -552,7 +545,10 @@ mod tests {
     fn test_overflow_error() {
         let big_val = ZyntaxValue::Int(i64::MAX);
         let result: ConversionResult<i32> = i32::from_zyntax(big_val);
-        assert!(matches!(result, Err(ConversionError::IntegerOverflow { .. })));
+        assert!(matches!(
+            result,
+            Err(ConversionError::IntegerOverflow { .. })
+        ));
     }
 
     #[test]

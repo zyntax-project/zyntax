@@ -1,8 +1,7 @@
+use crate::hir::{BinaryOp, CallingConvention};
 /// vec_f64: Performance-optimized concrete vector for f64
 /// Use this for numerical computing, physics simulations, graphics, etc.
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{CallingConvention, BinaryOp};
 
 pub fn build_vec_f64_type(builder: &mut HirBuilder) {
     // Declare C realloc for dynamic growth
@@ -26,7 +25,8 @@ fn declare_c_realloc(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty);
     let usize_ty = builder.u64_type();
 
-    let _realloc = builder.begin_extern_function("realloc", CallingConvention::C)
+    let _realloc = builder
+        .begin_extern_function("realloc", CallingConvention::C)
         .param("ptr", ptr_u8_ty.clone())
         .param("new_size", usize_ty)
         .returns(ptr_u8_ty)
@@ -44,7 +44,8 @@ fn build_vec_f64_new(builder: &mut HirBuilder) {
         vec![ptr_f64_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_function("vec_f64_new")
+    let func_id = builder
+        .begin_function("vec_f64_new")
         .returns(vec_f64_ty.clone())
         .build();
     builder.set_current_function(func_id);
@@ -76,7 +77,8 @@ fn build_vec_f64_push(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_f64_ty.clone());
 
-    let func_id = builder.begin_function("vec_f64_push")
+    let func_id = builder
+        .begin_function("vec_f64_push")
         .param("vec", ptr_vec_ty)
         .param("value", f64_ty.clone())
         .returns(void_ty)
@@ -120,13 +122,13 @@ fn build_vec_f64_push(builder: &mut HirBuilder) {
     let realloc_name = builder.intern("realloc");
     let realloc_id = builder.get_function_by_name(realloc_name);
     let realloc_ref = builder.function_ref(realloc_id);
-    let new_ptr_u8 = builder.call(realloc_ref, vec![old_ptr_u8, new_size]).unwrap();
+    let new_ptr_u8 = builder
+        .call(realloc_ref, vec![old_ptr_u8, new_size])
+        .unwrap();
     let new_ptr_f64 = builder.bitcast(new_ptr_u8, ptr_f64_ty.clone());
 
-    let grown_vec = builder.create_struct(
-        vec_f64_ty.clone(),
-        vec![new_ptr_f64, len_field, new_cap],
-    );
+    let grown_vec =
+        builder.create_struct(vec_f64_ty.clone(), vec![new_ptr_f64, len_field, new_cap]);
     builder.store(grown_vec, vec_ptr);
     builder.br(insert_element);
 
@@ -148,10 +150,7 @@ fn build_vec_f64_push(builder: &mut HirBuilder) {
     let one = builder.const_u64(1);
     let new_len = builder.add(len_field2, one, usize_ty.clone());
 
-    let final_vec = builder.create_struct(
-        vec_f64_ty,
-        vec![ptr_field2, new_len, cap_field2],
-    );
+    let final_vec = builder.create_struct(vec_f64_ty, vec![ptr_field2, new_len, cap_field2]);
     builder.store(final_vec, vec_ptr);
 
     let unit = builder.unit_value();
@@ -187,7 +186,8 @@ fn build_vec_f64_pop(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_function("vec_f64_pop")
+    let func_id = builder
+        .begin_function("vec_f64_pop")
         .param("vec", ptr_vec_ty)
         .returns(option_ty.clone())
         .build();
@@ -230,10 +230,7 @@ fn build_vec_f64_pop(builder: &mut HirBuilder) {
     let elem_ptr = builder.ptr_add(ptr_field, new_len, ptr_f64_ty.clone());
     let elem_val = builder.load(elem_ptr, f64_ty);
 
-    let updated_vec = builder.create_struct(
-        vec_f64_ty,
-        vec![ptr_field, new_len, cap_field],
-    );
+    let updated_vec = builder.create_struct(vec_f64_ty, vec![ptr_field, new_len, cap_field]);
     builder.store(updated_vec, vec_ptr);
 
     let some_val = builder.create_union(1, elem_val, option_ty);
@@ -269,7 +266,8 @@ fn build_vec_f64_get(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_function("vec_f64_get")
+    let func_id = builder
+        .begin_function("vec_f64_get")
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .returns(option_ty.clone())
@@ -325,7 +323,8 @@ fn build_vec_f64_set(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_f64_ty.clone());
 
-    let func_id = builder.begin_function("vec_f64_set")
+    let func_id = builder
+        .begin_function("vec_f64_set")
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .param("value", f64_ty)
@@ -379,7 +378,8 @@ fn build_vec_f64_len(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_f64_ty.clone());
 
-    let func_id = builder.begin_function("vec_f64_len")
+    let func_id = builder
+        .begin_function("vec_f64_len")
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -406,7 +406,8 @@ fn build_vec_f64_capacity(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_f64_ty.clone());
 
-    let func_id = builder.begin_function("vec_f64_capacity")
+    let func_id = builder
+        .begin_function("vec_f64_capacity")
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -434,7 +435,8 @@ fn build_vec_f64_clear(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_f64_ty.clone());
 
-    let func_id = builder.begin_function("vec_f64_clear")
+    let func_id = builder
+        .begin_function("vec_f64_clear")
         .param("vec", ptr_vec_ty)
         .returns(void_ty)
         .build();
@@ -468,7 +470,8 @@ fn build_vec_f64_free(builder: &mut HirBuilder) {
         vec![ptr_f64_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_function("vec_f64_free")
+    let func_id = builder
+        .begin_function("vec_f64_free")
         .param("vec", vec_f64_ty.clone())
         .returns(void_ty)
         .build();

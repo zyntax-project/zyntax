@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, HirId, HirType};
 /// String type implementation using HIR Builder
 ///
 /// Provides a UTF-8 string type backed by vec_u8:
@@ -6,16 +7,17 @@
 ///     bytes: Vec_u8,  // UTF-8 byte storage
 /// }
 /// ```
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirType, HirId, BinaryOp};
 
 /// Helper to get common types used across String functions
 fn get_string_types(builder: &mut HirBuilder) -> (HirType, HirType, HirType, HirType) {
     let usize_ty = builder.u64_type();
     let u8_ty = builder.u8_type();
     let ptr_u8_ty = builder.ptr_type(u8_ty.clone());
-    let vec_u8_ty = builder.struct_type(Some("Vec_u8"), vec![ptr_u8_ty.clone(), usize_ty.clone(), usize_ty.clone()]);
+    let vec_u8_ty = builder.struct_type(
+        Some("Vec_u8"),
+        vec![ptr_u8_ty.clone(), usize_ty.clone(), usize_ty.clone()],
+    );
     let string_ty = builder.struct_type(Some("String"), vec![vec_u8_ty.clone()]);
 
     (usize_ty, vec_u8_ty, string_ty, ptr_u8_ty)
@@ -39,7 +41,8 @@ pub fn build_string_type(builder: &mut HirBuilder) {
 fn build_new(builder: &mut HirBuilder) {
     let (_, _, string_ty, _) = get_string_types(builder);
 
-    let func_id = builder.begin_function("string_new")
+    let func_id = builder
+        .begin_function("string_new")
         .returns(string_ty.clone())
         .build();
 
@@ -65,7 +68,8 @@ fn build_new(builder: &mut HirBuilder) {
 fn build_with_capacity(builder: &mut HirBuilder) {
     let (usize_ty, _, string_ty, _) = get_string_types(builder);
 
-    let func_id = builder.begin_function("string_with_capacity")
+    let func_id = builder
+        .begin_function("string_with_capacity")
         .param("cap", usize_ty.clone())
         .returns(string_ty.clone())
         .build();
@@ -75,7 +79,7 @@ fn build_with_capacity(builder: &mut HirBuilder) {
     let entry = builder.create_block("entry");
     builder.set_insert_point(entry);
 
-    let _cap = builder.get_param(0);  // Unused for now
+    let _cap = builder.get_param(0); // Unused for now
 
     // Call vec_u8_new (ignoring capacity for now)
     let vec_u8_new_name = builder.intern("vec_u8_new");
@@ -94,7 +98,8 @@ fn build_len(builder: &mut HirBuilder) {
     let (usize_ty, vec_u8_ty, string_ty, _) = get_string_types(builder);
     let ptr_string_ty = builder.ptr_type(string_ty.clone());
 
-    let func_id = builder.begin_function("string_len")
+    let func_id = builder
+        .begin_function("string_len")
         .param("s", ptr_string_ty.clone())
         .returns(usize_ty.clone())
         .build();
@@ -124,7 +129,8 @@ fn build_capacity(builder: &mut HirBuilder) {
     let (usize_ty, vec_u8_ty, string_ty, _) = get_string_types(builder);
     let ptr_string_ty = builder.ptr_type(string_ty.clone());
 
-    let func_id = builder.begin_function("string_capacity")
+    let func_id = builder
+        .begin_function("string_capacity")
         .param("s", ptr_string_ty.clone())
         .returns(usize_ty.clone())
         .build();
@@ -154,7 +160,8 @@ fn build_as_ptr(builder: &mut HirBuilder) {
     let (_, vec_u8_ty, string_ty, ptr_u8_ty) = get_string_types(builder);
     let ptr_string_ty = builder.ptr_type(string_ty.clone());
 
-    let func_id = builder.begin_function("string_as_ptr")
+    let func_id = builder
+        .begin_function("string_as_ptr")
         .param("s", ptr_string_ty.clone())
         .returns(ptr_u8_ty.clone())
         .build();
@@ -187,7 +194,8 @@ fn build_push(builder: &mut HirBuilder) {
     let ptr_vec_u8_ty = builder.ptr_type(vec_u8_ty.clone());
     let void_ty = builder.void_type();
 
-    let func_id = builder.begin_function("string_push")
+    let func_id = builder
+        .begin_function("string_push")
         .param("s", ptr_string_ty.clone())
         .param("byte", u8_ty.clone())
         .returns(void_ty)
@@ -223,7 +231,8 @@ fn build_clear(builder: &mut HirBuilder) {
     let ptr_vec_u8_ty = builder.ptr_type(vec_u8_ty.clone());
     let void_ty = builder.void_type();
 
-    let func_id = builder.begin_function("string_clear")
+    let func_id = builder
+        .begin_function("string_clear")
         .param("s", ptr_string_ty.clone())
         .returns(void_ty)
         .build();
@@ -255,7 +264,8 @@ fn build_free(builder: &mut HirBuilder) {
     let (_, vec_u8_ty, string_ty, _) = get_string_types(builder);
     let void_ty = builder.void_type();
 
-    let func_id = builder.begin_function("string_free")
+    let func_id = builder
+        .begin_function("string_free")
         .param("s", string_ty.clone())
         .returns(void_ty)
         .build();

@@ -226,12 +226,14 @@ impl<'a> GrammarParser<'a> {
 
             // Check for method prefix (@) or operator prefix ($)
             if let Some(method_name) = name.strip_prefix('@') {
-                builtins.methods
+                builtins
+                    .methods
                     .entry(method_name.to_string())
                     .or_insert_with(Vec::new)
                     .push(symbol);
             } else if let Some(op) = name.strip_prefix('$') {
-                builtins.operators
+                builtins
+                    .operators
                     .entry(op.to_string())
                     .or_insert_with(Vec::new)
                     .push(symbol);
@@ -438,9 +440,7 @@ impl<'a> GrammarParser<'a> {
                 self.expect_char(')')?;
                 Ok(inner)
             }
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                self.parse_rule_ref_or_builtin()
-            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => self.parse_rule_ref_or_builtin(),
             _ => Err(self.error("Expected pattern element")),
         }
     }
@@ -487,8 +487,12 @@ impl<'a> GrammarParser<'a> {
             "WHITESPACE" => PatternIR::Whitespace,
             "ASCII_DIGIT" => PatternIR::CharClass(CharClass::Builtin("ASCII_DIGIT".to_string())),
             "ASCII_ALPHA" => PatternIR::CharClass(CharClass::Builtin("ASCII_ALPHA".to_string())),
-            "ASCII_ALPHANUMERIC" => PatternIR::CharClass(CharClass::Builtin("ASCII_ALPHANUMERIC".to_string())),
-            "ASCII_HEX_DIGIT" => PatternIR::CharClass(CharClass::Builtin("ASCII_HEX_DIGIT".to_string())),
+            "ASCII_ALPHANUMERIC" => {
+                PatternIR::CharClass(CharClass::Builtin("ASCII_ALPHANUMERIC".to_string()))
+            }
+            "ASCII_HEX_DIGIT" => {
+                PatternIR::CharClass(CharClass::Builtin("ASCII_HEX_DIGIT".to_string()))
+            }
             "NEWLINE" => PatternIR::CharClass(CharClass::Builtin("NEWLINE".to_string())),
             _ => PatternIR::RuleRef {
                 rule_name: name.to_string(),
@@ -543,7 +547,13 @@ impl<'a> GrammarParser<'a> {
             self.expect_char(')')?;
 
             // Function call action
-            return Ok((ActionIR::HelperCall { function: first_path.clone(), args }, "Any".to_string()));
+            return Ok((
+                ActionIR::HelperCall {
+                    function: first_path.clone(),
+                    args,
+                },
+                "Any".to_string(),
+            ));
         }
 
         // Check for simple pass-through: -> binding (no '{' follows)
@@ -553,7 +563,12 @@ impl<'a> GrammarParser<'a> {
             // Check if it's a simple identifier (no :: in path) - that's pass-through
             if !first_path.contains("::") {
                 // No '::' means it's just a binding name, not a type path
-                return Ok((ActionIR::PassThrough { binding: first_path.clone() }, first_path));
+                return Ok((
+                    ActionIR::PassThrough {
+                        binding: first_path.clone(),
+                    },
+                    first_path,
+                ));
             }
             // If it has ::, then there should be a { with fields
             return Err(self.error(&format!("Expected '{{' after type path '{}'", first_path)));
@@ -570,10 +585,13 @@ impl<'a> GrammarParser<'a> {
             // Legacy JSON action - capture everything until matching closing brace
             let json_content = self.parse_json_block_content()?;
             self.expect_char('}')?;
-            return Ok((ActionIR::LegacyJson {
-                return_type: return_type.clone(),
-                json_content,
-            }, return_type));
+            return Ok((
+                ActionIR::LegacyJson {
+                    return_type: return_type.clone(),
+                    json_content,
+                },
+                return_type,
+            ));
         }
 
         let mut fields = Vec::new();
@@ -596,10 +614,13 @@ impl<'a> GrammarParser<'a> {
 
         self.expect_char('}')?;
 
-        Ok((ActionIR::Construct {
-            type_path: return_type.clone(),
-            fields,
-        }, return_type))
+        Ok((
+            ActionIR::Construct {
+                type_path: return_type.clone(),
+                fields,
+            },
+            return_type,
+        ))
     }
 
     /// Parse the content of a JSON action block (legacy format)
@@ -764,28 +785,18 @@ impl<'a> GrammarParser<'a> {
                                     default: Box::new(args.into_iter().next().unwrap()),
                                 }
                             }
-                            "unwrap_or_default" => {
-                                ExprIR::UnwrapOr {
-                                    optional: Box::new(expr),
-                                    default: Box::new(ExprIR::Default("".to_string())),
-                                }
-                            }
-                            "is_some" => {
-                                ExprIR::IsSome(Box::new(expr))
-                            }
-                            "text" => {
-                                ExprIR::Text(Box::new(expr))
-                            }
-                            "span" => {
-                                ExprIR::GetSpan(Box::new(expr))
-                            }
-                            _ => {
-                                ExprIR::MethodCall {
-                                    receiver: Box::new(expr),
-                                    method: name,
-                                    args,
-                                }
-                            }
+                            "unwrap_or_default" => ExprIR::UnwrapOr {
+                                optional: Box::new(expr),
+                                default: Box::new(ExprIR::Default("".to_string())),
+                            },
+                            "is_some" => ExprIR::IsSome(Box::new(expr)),
+                            "text" => ExprIR::Text(Box::new(expr)),
+                            "span" => ExprIR::GetSpan(Box::new(expr)),
+                            _ => ExprIR::MethodCall {
+                                receiver: Box::new(expr),
+                                method: name,
+                                args,
+                            },
                         };
                     } else {
                         // Field access
@@ -828,11 +839,13 @@ impl<'a> GrammarParser<'a> {
                 match name.as_str() {
                     "true" => return Ok(ExprIR::BoolLit(true)),
                     "false" => return Ok(ExprIR::BoolLit(false)),
-                    "None" => return Ok(ExprIR::EnumVariant {
-                        type_name: "Option".to_string(),
-                        variant: "None".to_string(),
-                        value: None,
-                    }),
+                    "None" => {
+                        return Ok(ExprIR::EnumVariant {
+                            type_name: "Option".to_string(),
+                            variant: "None".to_string(),
+                            value: None,
+                        })
+                    }
                     _ => {}
                 }
 
@@ -913,7 +926,10 @@ impl<'a> GrammarParser<'a> {
                                 value: Some(Box::new(args.into_iter().next().unwrap())),
                             }
                         }
-                        _ => ExprIR::FunctionCall { function: name, args }
+                        _ => ExprIR::FunctionCall {
+                            function: name,
+                            args,
+                        },
                     });
                 }
 
@@ -1094,7 +1110,8 @@ impl<'a> GrammarParser<'a> {
             return None;
         }
 
-        let len = rest.chars()
+        let len = rest
+            .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .map(|c| c.len_utf8())
             .sum();
@@ -1164,12 +1181,30 @@ impl<'a> GrammarParser<'a> {
             } else if c == '\\' {
                 self.advance();
                 match self.peek_char() {
-                    Some('n') => { result.push('\n'); self.advance(); }
-                    Some('t') => { result.push('\t'); self.advance(); }
-                    Some('r') => { result.push('\r'); self.advance(); }
-                    Some('\\') => { result.push('\\'); self.advance(); }
-                    Some('"') => { result.push('"'); self.advance(); }
-                    Some(c) => { result.push(c); self.advance(); }
+                    Some('n') => {
+                        result.push('\n');
+                        self.advance();
+                    }
+                    Some('t') => {
+                        result.push('\t');
+                        self.advance();
+                    }
+                    Some('r') => {
+                        result.push('\r');
+                        self.advance();
+                    }
+                    Some('\\') => {
+                        result.push('\\');
+                        self.advance();
+                    }
+                    Some('"') => {
+                        result.push('"');
+                        self.advance();
+                    }
+                    Some(c) => {
+                        result.push(c);
+                        self.advance();
+                    }
                     None => return Err(self.error("Unexpected EOF in string")),
                 }
             } else {
@@ -1186,12 +1221,30 @@ impl<'a> GrammarParser<'a> {
             Some('\\') => {
                 self.advance();
                 match self.peek_char() {
-                    Some('n') => { self.advance(); Ok('\n') }
-                    Some('t') => { self.advance(); Ok('\t') }
-                    Some('r') => { self.advance(); Ok('\r') }
-                    Some('\\') => { self.advance(); Ok('\\') }
-                    Some('\'') => { self.advance(); Ok('\'') }
-                    Some(c) => { self.advance(); Ok(c) }
+                    Some('n') => {
+                        self.advance();
+                        Ok('\n')
+                    }
+                    Some('t') => {
+                        self.advance();
+                        Ok('\t')
+                    }
+                    Some('r') => {
+                        self.advance();
+                        Ok('\r')
+                    }
+                    Some('\\') => {
+                        self.advance();
+                        Ok('\\')
+                    }
+                    Some('\'') => {
+                        self.advance();
+                        Ok('\'')
+                    }
+                    Some(c) => {
+                        self.advance();
+                        Ok(c)
+                    }
                     None => Err(self.error("Unexpected EOF in character")),
                 }
             }
@@ -1215,7 +1268,8 @@ impl<'a> GrammarParser<'a> {
         }
 
         let s = &self.input[start..self.pos];
-        s.parse().map_err(|_| self.error(&format!("Invalid integer: {}", s)))
+        s.parse()
+            .map_err(|_| self.error(&format!("Invalid integer: {}", s)))
     }
 
     fn parse_string_list(&mut self) -> ParseResult<Vec<String>> {
@@ -1438,7 +1492,10 @@ mod tests {
         let rule = grammar.rules.get("number").unwrap();
 
         assert!(rule.action.is_some());
-        assert_eq!(rule.return_type, Some("TypedExpression::IntLiteral".to_string()));
+        assert_eq!(
+            rule.return_type,
+            Some("TypedExpression::IntLiteral".to_string())
+        );
     }
 
     #[test]
@@ -1615,7 +1672,10 @@ test = { "test" }
         match parse_grammar(input) {
             Ok(grammar) => {
                 println!("Successfully parsed ImagePipe grammar!");
-                println!("Language: {} v{}", grammar.metadata.name, grammar.metadata.version);
+                println!(
+                    "Language: {} v{}",
+                    grammar.metadata.name, grammar.metadata.version
+                );
                 println!("Rules: {}", grammar.rules.len());
                 for (name, _rule) in &grammar.rules {
                     println!("  - {}", name);
@@ -1645,7 +1705,10 @@ test = { "test" }
         match parse_grammar(input) {
             Ok(grammar) => {
                 println!("Successfully parsed ZynML grammar!");
-                println!("Language: {} v{}", grammar.metadata.name, grammar.metadata.version);
+                println!(
+                    "Language: {} v{}",
+                    grammar.metadata.name, grammar.metadata.version
+                );
                 println!("Rules: {}", grammar.rules.len());
 
                 // Verify key metadata

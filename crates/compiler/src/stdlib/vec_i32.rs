@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, CallingConvention, HirType};
 /// vec_i32: Performance-optimized concrete vector for i32
 ///
 /// This is a specialized implementation for i32 that bypasses generic monomorphization
@@ -16,9 +17,7 @@
 ///
 /// Growth strategy: Double capacity when full (4 → 8 → 16 → 32)
 /// Initial capacity: 4 elements
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirType, CallingConvention, BinaryOp};
 
 /// Build vec_i32 type and all methods (performance-optimized concrete version)
 pub fn build_vec_i32_type(builder: &mut HirBuilder) {
@@ -44,7 +43,8 @@ fn declare_c_realloc(builder: &mut HirBuilder) {
     let ptr_u8_ty = builder.ptr_type(u8_ty);
     let usize_ty = builder.u64_type();
 
-    let _realloc = builder.begin_extern_function("realloc", CallingConvention::C)
+    let _realloc = builder
+        .begin_extern_function("realloc", CallingConvention::C)
         .param("ptr", ptr_u8_ty.clone())
         .param("new_size", usize_ty)
         .returns(ptr_u8_ty)
@@ -63,7 +63,8 @@ fn build_vec_i32_new(builder: &mut HirBuilder) {
         vec![ptr_i32_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_function("vec_i32_new")
+    let func_id = builder
+        .begin_function("vec_i32_new")
         .returns(vec_i32_ty.clone())
         .build();
 
@@ -88,10 +89,7 @@ fn build_vec_i32_new(builder: &mut HirBuilder) {
 
     // Build struct: { ptr: ptr_i32, len: 0, cap: 4 }
     let zero = builder.const_u64(0);
-    let vec_value = builder.create_struct(
-        vec_i32_ty,
-        vec![ptr_i32, zero, initial_cap],
-    );
+    let vec_value = builder.create_struct(vec_i32_ty, vec![ptr_i32, zero, initial_cap]);
 
     builder.ret(vec_value);
 }
@@ -107,7 +105,8 @@ fn build_vec_i32_with_capacity(builder: &mut HirBuilder) {
         vec![ptr_i32_ty.clone(), usize_ty.clone(), usize_ty.clone()],
     );
 
-    let func_id = builder.begin_function("vec_i32_with_capacity")
+    let func_id = builder
+        .begin_function("vec_i32_with_capacity")
         .param("capacity", usize_ty.clone())
         .returns(vec_i32_ty.clone())
         .build();
@@ -134,10 +133,7 @@ fn build_vec_i32_with_capacity(builder: &mut HirBuilder) {
 
     // Build struct: { ptr: ptr_i32, len: 0, cap: capacity }
     let zero = builder.const_u64(0);
-    let vec_value = builder.create_struct(
-        vec_i32_ty,
-        vec![ptr_i32, zero, capacity],
-    );
+    let vec_value = builder.create_struct(vec_i32_ty, vec![ptr_i32, zero, capacity]);
 
     builder.ret(vec_value);
 }
@@ -155,7 +151,8 @@ fn build_vec_i32_push(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_i32_ty.clone());
 
-    let func_id = builder.begin_function("vec_i32_push")
+    let func_id = builder
+        .begin_function("vec_i32_push")
         .param("vec", ptr_vec_ty)
         .param("value", i32_ty.clone())
         .returns(void_ty)
@@ -203,10 +200,7 @@ fn build_vec_i32_push(builder: &mut HirBuilder) {
 
     let new_ptr = builder.bitcast(new_ptr_u8, ptr_i32_ty.clone());
 
-    let updated_vec = builder.create_struct(
-        vec_i32_ty.clone(),
-        vec![new_ptr, len_field, new_cap],
-    );
+    let updated_vec = builder.create_struct(vec_i32_ty.clone(), vec![new_ptr, len_field, new_cap]);
     builder.store(updated_vec, vec_ptr);
 
     builder.br(insert_element);
@@ -229,10 +223,7 @@ fn build_vec_i32_push(builder: &mut HirBuilder) {
     let one = builder.const_u64(1);
     let new_len = builder.add(len_field2, one, usize_ty.clone());
 
-    let final_vec = builder.create_struct(
-        vec_i32_ty,
-        vec![ptr_field2, new_len, cap_field2],
-    );
+    let final_vec = builder.create_struct(vec_i32_ty, vec![ptr_field2, new_len, cap_field2]);
     builder.store(final_vec, vec_ptr);
 
     let unit = builder.unit_value();
@@ -268,7 +259,8 @@ fn build_vec_i32_pop(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_function("vec_i32_pop")
+    let func_id = builder
+        .begin_function("vec_i32_pop")
         .param("vec", ptr_vec_ty)
         .returns(option_ty.clone())
         .build();
@@ -311,10 +303,7 @@ fn build_vec_i32_pop(builder: &mut HirBuilder) {
     let elem_ptr = builder.ptr_add(ptr_field, new_len, ptr_i32_ty.clone());
     let elem_val = builder.load(elem_ptr, i32_ty);
 
-    let updated_vec = builder.create_struct(
-        vec_i32_ty,
-        vec![ptr_field, new_len, cap_field],
-    );
+    let updated_vec = builder.create_struct(vec_i32_ty, vec![ptr_field, new_len, cap_field]);
     builder.store(updated_vec, vec_ptr);
 
     let some_val = builder.create_union(1, elem_val, option_ty);
@@ -350,7 +339,8 @@ fn build_vec_i32_get(builder: &mut HirBuilder) {
     ];
     let option_ty = builder.union_type(Some("Option"), option_variants);
 
-    let func_id = builder.begin_function("vec_i32_get")
+    let func_id = builder
+        .begin_function("vec_i32_get")
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .returns(option_ty.clone())
@@ -406,7 +396,8 @@ fn build_vec_i32_set(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_i32_ty.clone());
 
-    let func_id = builder.begin_function("vec_i32_set")
+    let func_id = builder
+        .begin_function("vec_i32_set")
         .param("vec", ptr_vec_ty)
         .param("index", usize_ty.clone())
         .param("value", i32_ty.clone())
@@ -460,7 +451,8 @@ fn build_vec_i32_len(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_i32_ty.clone());
 
-    let func_id = builder.begin_function("vec_i32_len")
+    let func_id = builder
+        .begin_function("vec_i32_len")
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -488,7 +480,8 @@ fn build_vec_i32_capacity(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_i32_ty.clone());
 
-    let func_id = builder.begin_function("vec_i32_capacity")
+    let func_id = builder
+        .begin_function("vec_i32_capacity")
         .param("vec", ptr_vec_ty)
         .returns(usize_ty.clone())
         .build();
@@ -517,7 +510,8 @@ fn build_vec_i32_clear(builder: &mut HirBuilder) {
     );
     let ptr_vec_ty = builder.ptr_type(vec_i32_ty.clone());
 
-    let func_id = builder.begin_function("vec_i32_clear")
+    let func_id = builder
+        .begin_function("vec_i32_clear")
         .param("vec", ptr_vec_ty)
         .returns(void_ty)
         .build();
@@ -533,10 +527,7 @@ fn build_vec_i32_clear(builder: &mut HirBuilder) {
 
     // Set len to 0
     let zero = builder.const_u64(0);
-    let cleared_vec = builder.create_struct(
-        vec_i32_ty,
-        vec![ptr_field, zero, cap_field],
-    );
+    let cleared_vec = builder.create_struct(vec_i32_ty, vec![ptr_field, zero, cap_field]);
     builder.store(cleared_vec, vec_ptr);
 
     let unit = builder.unit_value();
@@ -555,7 +546,8 @@ fn build_vec_i32_free(builder: &mut HirBuilder) {
         vec![ptr_i32_ty.clone(), usize_ty.clone(), usize_ty],
     );
 
-    let func_id = builder.begin_function("vec_i32_free")
+    let func_id = builder
+        .begin_function("vec_i32_free")
         .param("vec", vec_i32_ty.clone())
         .returns(void_ty)
         .build();
@@ -615,17 +607,23 @@ mod tests {
         ];
 
         for func_name in expected_functions {
-            let found = module.functions.values().any(|f| {
-                arena.resolve_string(f.name) == Some(func_name)
-            });
+            let found = module
+                .functions
+                .values()
+                .any(|f| arena.resolve_string(f.name) == Some(func_name));
             assert!(found, "Function {} not found", func_name);
 
             // Verify it's NOT generic (no type params)
-            let func = module.functions.values().find(|f| {
-                arena.resolve_string(f.name) == Some(func_name)
-            }).unwrap();
-            assert!(func.signature.type_params.is_empty(),
-                "Concrete vec_i32 function {} should not be generic", func_name);
+            let func = module
+                .functions
+                .values()
+                .find(|f| arena.resolve_string(f.name) == Some(func_name))
+                .unwrap();
+            assert!(
+                func.signature.type_params.is_empty(),
+                "Concrete vec_i32 function {} should not be generic",
+                func_name
+            );
         }
     }
 }

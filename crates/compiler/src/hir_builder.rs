@@ -48,7 +48,7 @@
 
 use crate::hir::*;
 use indexmap::IndexMap;
-use zyntax_typed_ast::{AstArena, InternedString, TypeId, Span};
+use zyntax_typed_ast::{AstArena, InternedString, Span, TypeId};
 
 /// Main builder for constructing HIR modules
 pub struct HirBuilder<'arena> {
@@ -236,7 +236,12 @@ impl<'arena> HirBuilder<'arena> {
     }
 
     /// Creates a generic type with type arguments
-    pub fn generic_type(&self, base: HirType, type_args: Vec<HirType>, const_args: Vec<HirConstant>) -> HirType {
+    pub fn generic_type(
+        &self,
+        base: HirType,
+        type_args: Vec<HirType>,
+        const_args: Vec<HirConstant>,
+    ) -> HirType {
         HirType::Generic {
             base: Box::new(base),
             type_args,
@@ -261,17 +266,23 @@ impl<'arena> HirBuilder<'arena> {
     }
 
     /// Begins building a new generic function
-    pub fn begin_generic_function(&mut self, name: &str, type_params: Vec<&str>) -> FunctionBuilder<'_, 'arena> {
+    pub fn begin_generic_function(
+        &mut self,
+        name: &str,
+        type_params: Vec<&str>,
+    ) -> FunctionBuilder<'_, 'arena> {
         let name_id = self.intern(name);
-        let type_param_names: Vec<_> = type_params.iter()
-            .map(|&n| self.intern(n))
-            .collect();
+        let type_param_names: Vec<_> = type_params.iter().map(|&n| self.intern(n)).collect();
 
         FunctionBuilder::new(self, name_id, type_param_names)
     }
 
     /// Begins building an extern function
-    pub fn begin_extern_function(&mut self, name: &str, calling_convention: CallingConvention) -> FunctionBuilder<'_, 'arena> {
+    pub fn begin_extern_function(
+        &mut self,
+        name: &str,
+        calling_convention: CallingConvention,
+    ) -> FunctionBuilder<'_, 'arena> {
         let name_id = self.intern(name);
         let mut fb = FunctionBuilder::new(self, name_id, Vec::new());
         fb.is_external = true;
@@ -349,13 +360,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Constant(HirConstant::I32(value)),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Constant(HirConstant::I32(value)),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -368,13 +382,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Constant(HirConstant::Bool(value)),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Constant(HirConstant::Bool(value)),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -387,13 +404,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Constant(HirConstant::U64(value)),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Constant(HirConstant::U64(value)),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -406,13 +426,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Constant(HirConstant::U8(value)),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Constant(HirConstant::U8(value)),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -425,20 +448,23 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Constant(HirConstant::F64(value)),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Constant(HirConstant::F64(value)),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
 
     /// Creates a global string constant and returns a pointer to it
     pub fn string_constant(&mut self, string_data: &str) -> HirId {
-        use crate::hir::{HirGlobal, HirConstant, Linkage, Visibility};
+        use crate::hir::{HirConstant, HirGlobal, Linkage, Visibility};
 
         // Create a unique name for this string global
         let global_id = HirId::new();
@@ -466,13 +492,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty: ptr_ty,
-            kind: HirValueKind::Global(global_id),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty: ptr_ty,
+                kind: HirValueKind::Global(global_id),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -532,7 +561,7 @@ impl<'arena> HirBuilder<'arena> {
             result,
             ty,
             ptr,
-            align: 0,  // 0 means use natural alignment
+            align: 0, // 0 means use natural alignment
             volatile: false,
         });
         result
@@ -543,7 +572,7 @@ impl<'arena> HirBuilder<'arena> {
         self.emit(HirInstruction::Store {
             value,
             ptr,
-            align: 0,  // 0 means use natural alignment
+            align: 0, // 0 means use natural alignment
             volatile: false,
         });
     }
@@ -628,15 +657,17 @@ impl<'arena> HirBuilder<'arena> {
     /// Extracts the discriminant from a union/enum
     pub fn extract_discriminant(&mut self, union_val: HirId) -> HirId {
         let result = HirId::new();
-        self.emit(HirInstruction::GetUnionDiscriminant {
-            result,
-            union_val,
-        });
+        self.emit(HirInstruction::GetUnionDiscriminant { result, union_val });
         result
     }
 
     /// Extracts a value from a union variant
-    pub fn extract_union_value(&mut self, union_val: HirId, variant_index: u32, ty: HirType) -> HirId {
+    pub fn extract_union_value(
+        &mut self,
+        union_val: HirId,
+        variant_index: u32,
+        ty: HirType,
+    ) -> HirId {
         let result = HirId::new();
         self.emit(HirInstruction::ExtractUnionValue {
             result,
@@ -674,7 +705,9 @@ impl<'arena> HirBuilder<'arena> {
 
     /// Returns from the function with a value
     pub fn ret(&mut self, value: HirId) {
-        self.set_terminator(HirTerminator::Return { values: vec![value] });
+        self.set_terminator(HirTerminator::Return {
+            values: vec![value],
+        });
     }
 
     /// Returns from a void function
@@ -735,7 +768,9 @@ impl<'arena> HirBuilder<'arena> {
 
     /// Gets a function by name (returns HirId for calling)
     pub fn get_function_by_name(&self, name: InternedString) -> HirId {
-        self.module.functions.iter()
+        self.module
+            .functions
+            .iter()
             .find(|(_, func)| func.name == name)
             .map(|(id, _)| *id)
             .expect("Function not found")
@@ -749,7 +784,12 @@ impl<'arena> HirBuilder<'arena> {
         // Get the function type from the referenced function BEFORE getting mutable borrow
         let referenced_func = self.module.functions.get(&func_id).unwrap();
         let func_ty = HirType::Function(Box::new(HirFunctionType {
-            params: referenced_func.signature.params.iter().map(|p| p.ty.clone()).collect(),
+            params: referenced_func
+                .signature
+                .params
+                .iter()
+                .map(|p| p.ty.clone())
+                .collect(),
             returns: referenced_func.signature.returns.clone(),
             lifetime_params: referenced_func.signature.lifetime_params.clone(),
             is_variadic: referenced_func.signature.is_variadic,
@@ -758,13 +798,16 @@ impl<'arena> HirBuilder<'arena> {
         // Now get mutable borrow for current function
         let func = self.module.functions.get_mut(&current_func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty: func_ty,
-            kind: HirValueKind::Global(func_id),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty: func_ty,
+                kind: HirValueKind::Global(func_id),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -788,13 +831,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty: ptr_ty.clone(),
-            kind: HirValueKind::Constant(HirConstant::Null(ptr_ty)),
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty: ptr_ty.clone(),
+                kind: HirValueKind::Constant(HirConstant::Null(ptr_ty)),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -806,13 +852,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty: void_ty,
-            kind: HirValueKind::Constant(HirConstant::Struct(Vec::new())), // Empty struct = unit
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty: void_ty,
+                kind: HirValueKind::Constant(HirConstant::Struct(Vec::new())), // Empty struct = unit
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -823,13 +872,16 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Undef,
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Undef,
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
@@ -901,19 +953,27 @@ impl<'arena> HirBuilder<'arena> {
         let func_id = self.current_function.unwrap();
         let func = self.module.functions.get_mut(&func_id).unwrap();
 
-        func.values.insert(value_id, HirValue {
-            id: value_id,
-            ty,
-            kind: HirValueKind::Undef,
-            uses: std::collections::HashSet::new(),
-            span: None,
-        });
+        func.values.insert(
+            value_id,
+            HirValue {
+                id: value_id,
+                ty,
+                kind: HirValueKind::Undef,
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
 
         value_id
     }
 
     /// Extracts a field from a struct value
-    pub fn extract_struct_field(&mut self, struct_val: HirId, field_index: u32, field_ty: HirType) -> HirId {
+    pub fn extract_struct_field(
+        &mut self,
+        struct_val: HirId,
+        field_index: u32,
+        field_ty: HirType,
+    ) -> HirId {
         let result = HirId::new();
         self.emit(HirInstruction::ExtractValue {
             result,
@@ -948,7 +1008,7 @@ impl<'arena> HirBuilder<'arena> {
             result,
             ty: ptr_ty,
             count: None,
-            align: 0,  // 0 means use natural alignment
+            align: 0, // 0 means use natural alignment
         });
         result
     }
@@ -1034,8 +1094,7 @@ impl<'arena> HirBuilder<'arena> {
     /// # Arguments
     /// * `name` - The interned function name
     pub fn has_function(&self, name: InternedString) -> bool {
-        self.module.functions.iter()
-            .any(|(_, f)| f.name == name)
+        self.module.functions.iter().any(|(_, f)| f.name == name)
     }
 
     /// Create a function type
@@ -1074,7 +1133,11 @@ pub struct FunctionBuilder<'b, 'arena> {
 }
 
 impl<'b, 'arena> FunctionBuilder<'b, 'arena> {
-    fn new(builder: &'b mut HirBuilder<'arena>, name: InternedString, type_params: Vec<InternedString>) -> Self {
+    fn new(
+        builder: &'b mut HirBuilder<'arena>,
+        name: InternedString,
+        type_params: Vec<InternedString>,
+    ) -> Self {
         FunctionBuilder {
             builder,
             name,
@@ -1111,7 +1174,9 @@ impl<'b, 'arena> FunctionBuilder<'b, 'arena> {
     pub fn build(self) -> HirId {
         let func_id = HirId::new();
 
-        let type_params: Vec<_> = self.type_params.into_iter()
+        let type_params: Vec<_> = self
+            .type_params
+            .into_iter()
             .map(|name| HirTypeParam {
                 name,
                 constraints: Vec::new(),
@@ -1172,7 +1237,8 @@ mod tests {
         let i32_ty = builder.i32_type();
 
         // Build a simple function: fn add(a: i32, b: i32) -> i32 { return a + b; }
-        let func_id = builder.begin_function("add")
+        let func_id = builder
+            .begin_function("add")
             .param("a", i32_ty.clone())
             .param("b", i32_ty.clone())
             .returns(i32_ty.clone())
@@ -1204,7 +1270,8 @@ mod tests {
         let ptr_u8_ty = builder.ptr_type(u8_ty);
 
         // Build extern function: extern "C" fn malloc(size: usize) -> *u8
-        let _malloc = builder.begin_extern_function("malloc", CallingConvention::C)
+        let _malloc = builder
+            .begin_extern_function("malloc", CallingConvention::C)
             .param("size", u64_ty)
             .returns(ptr_u8_ty)
             .build();
@@ -1229,7 +1296,8 @@ mod tests {
         let u64_ty = builder.u64_type();
 
         // Build function: fn test_sizes() -> usize { return sizeof<i32>() + sizeof<f64>(); }
-        let func_id = builder.begin_function("test_sizes")
+        let func_id = builder
+            .begin_function("test_sizes")
             .returns(u64_ty.clone())
             .build();
 
@@ -1252,7 +1320,10 @@ mod tests {
         for (_block_id, block) in &func.blocks {
             for inst in &block.instructions {
                 if let HirInstruction::Call { callee, .. } = inst {
-                    if matches!(callee, HirCallable::Intrinsic(crate::hir::Intrinsic::SizeOf)) {
+                    if matches!(
+                        callee,
+                        HirCallable::Intrinsic(crate::hir::Intrinsic::SizeOf)
+                    ) {
                         total_sizeof_calls += 1;
                     }
                 }
@@ -1260,18 +1331,32 @@ mod tests {
         }
 
         // Should have 2 Call instructions (size_of)
-        assert_eq!(total_sizeof_calls, 2, "Expected 2 SizeOf calls, found {}", total_sizeof_calls);
+        assert_eq!(
+            total_sizeof_calls, 2,
+            "Expected 2 SizeOf calls, found {}",
+            total_sizeof_calls
+        );
 
         // Verify we also have one Binary add instruction
         let mut binary_count = 0;
         for (_block_id, block) in &func.blocks {
             for inst in &block.instructions {
-                if matches!(inst, HirInstruction::Binary { op: BinaryOp::Add, .. }) {
+                if matches!(
+                    inst,
+                    HirInstruction::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ) {
                     binary_count += 1;
                 }
             }
         }
-        assert_eq!(binary_count, 1, "Expected 1 Add instruction, found {}", binary_count);
+        assert_eq!(
+            binary_count, 1,
+            "Expected 1 Add instruction, found {}",
+            binary_count
+        );
     }
 
     #[test]
@@ -1283,7 +1368,8 @@ mod tests {
         let void_ty = builder.void_type();
 
         // Create a function that allocates a local variable
-        let func_id = builder.begin_function("test_alloca")
+        let func_id = builder
+            .begin_function("test_alloca")
             .returns(void_ty)
             .build();
 
@@ -1327,15 +1413,15 @@ mod tests {
         let u64_ty = builder.u64_type();
 
         // Create a struct type: { i32, u64, i32 }
-        let struct_ty = builder.struct_type(Some("TestStruct"), vec![
-            i32_ty.clone(),
-            u64_ty.clone(),
-            i32_ty.clone(),
-        ]);
+        let struct_ty = builder.struct_type(
+            Some("TestStruct"),
+            vec![i32_ty.clone(), u64_ty.clone(), i32_ty.clone()],
+        );
         let ptr_struct_ty = builder.ptr_type(struct_ty.clone());
 
         // Create a function that accesses struct fields
-        let func_id = builder.begin_function("test_gep")
+        let func_id = builder
+            .begin_function("test_gep")
             .param("s", ptr_struct_ty.clone())
             .returns(i32_ty.clone())
             .build();
@@ -1382,10 +1468,7 @@ mod tests {
         let bool_ty = builder.bool_type();
 
         // Create a function type: fn(i32, i32) -> bool
-        let func_ty = builder.function_type(
-            vec![i32_ty.clone(), i32_ty.clone()],
-            bool_ty.clone(),
-        );
+        let func_ty = builder.function_type(vec![i32_ty.clone(), i32_ty.clone()], bool_ty.clone());
 
         // Verify it's a function type
         match func_ty {

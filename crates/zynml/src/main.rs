@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use zynml::{ZynML, ZynMLConfig, ZYNML_GRAMMAR, REQUIRED_PLUGINS, OPTIONAL_PLUGINS};
+use zynml::{ZynML, ZynMLConfig, OPTIONAL_PLUGINS, REQUIRED_PLUGINS, ZYNML_GRAMMAR};
 
 /// ZynML - Machine Learning DSL for Zyntax
 #[derive(Parser)]
@@ -94,26 +94,26 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { file, plugins, verbose, all_plugins } => {
-            run_program(&file, &plugins, verbose, all_plugins)
-        }
-        Commands::Parse { file, format } => {
-            parse_and_display(&file, &format)
-        }
-        Commands::Repl { plugins, verbose } => {
-            run_repl(&plugins, verbose)
-        }
-        Commands::Info => {
-            show_info()
-        }
-        Commands::Check { file } => {
-            check_program(&file)
-        }
+        Commands::Run {
+            file,
+            plugins,
+            verbose,
+            all_plugins,
+        } => run_program(&file, &plugins, verbose, all_plugins),
+        Commands::Parse { file, format } => parse_and_display(&file, &format),
+        Commands::Repl { plugins, verbose } => run_repl(&plugins, verbose),
+        Commands::Info => show_info(),
+        Commands::Check { file } => check_program(&file),
     }
 }
 
 /// Run a ZynML program
-fn run_program(file: &PathBuf, plugins_dir: &PathBuf, verbose: bool, all_plugins: bool) -> Result<()> {
+fn run_program(
+    file: &PathBuf,
+    plugins_dir: &PathBuf,
+    verbose: bool,
+    all_plugins: bool,
+) -> Result<()> {
     if verbose {
         println!("ZynML v{}", env!("CARGO_PKG_VERSION"));
         println!("Loading program: {}", file.display());
@@ -145,15 +145,16 @@ fn parse_and_display(file: &PathBuf, format: &str) -> Result<()> {
     use zynml::Grammar2;
 
     // Compile grammar using Grammar2 (direct TypedAST generation)
-    let grammar = Grammar2::from_source(ZYNML_GRAMMAR)
-        .context("Failed to compile ZynML grammar")?;
+    let grammar =
+        Grammar2::from_source(ZYNML_GRAMMAR).context("Failed to compile ZynML grammar")?;
 
     // Read source
     let source = std::fs::read_to_string(file)
         .with_context(|| format!("Failed to read file: {}", file.display()))?;
 
     // Parse to TypedProgram using Grammar2
-    let program = grammar.parse_with_filename(&source, &file.to_string_lossy())
+    let program = grammar
+        .parse_with_filename(&source, &file.to_string_lossy())
         .context("Failed to parse ZynML program")?;
 
     match format {
@@ -200,7 +201,10 @@ fn print_ast_tree(json: &str) -> Result<()> {
                     if key == "kind" || key == "name" || key == "op" {
                         continue;
                     }
-                    if matches!(val, serde_json::Value::Object(_) | serde_json::Value::Array(_)) {
+                    if matches!(
+                        val,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    ) {
                         if !matches!(val, serde_json::Value::Array(arr) if arr.is_empty()) {
                             println!("{}{}:", prefix, key);
                             print_value(val, indent + 1);
@@ -227,8 +231,8 @@ fn check_program(file: &PathBuf) -> Result<()> {
     use zynml::Grammar2;
 
     // Compile grammar using Grammar2 (direct TypedAST generation)
-    let grammar = Grammar2::from_source(ZYNML_GRAMMAR)
-        .context("Failed to compile ZynML grammar")?;
+    let grammar =
+        Grammar2::from_source(ZYNML_GRAMMAR).context("Failed to compile ZynML grammar")?;
 
     // Read source
     let source = std::fs::read_to_string(file)
@@ -237,7 +241,11 @@ fn check_program(file: &PathBuf) -> Result<()> {
     // Try to parse with Grammar2
     match grammar.parse_with_filename(&source, &file.to_string_lossy()) {
         Ok(program) => {
-            println!("OK: {} is valid ZynML ({} declarations)", file.display(), program.declarations.len());
+            println!(
+                "OK: {} is valid ZynML ({} declarations)",
+                file.display(),
+                program.declarations.len()
+            );
             Ok(())
         }
         Err(e) => {
@@ -321,12 +329,13 @@ fn run_repl(plugins_dir: &PathBuf, verbose: bool) -> Result<()> {
             }
             _ => {
                 // Try to evaluate as an expression or statement
-                let code = if line.contains('=') || line.starts_with("let ") || line.starts_with("fn ") {
-                    line.to_string()
-                } else {
-                    // Wrap in a print statement for expressions
-                    format!("println({})", line)
-                };
+                let code =
+                    if line.contains('=') || line.starts_with("let ") || line.starts_with("fn ") {
+                        line.to_string()
+                    } else {
+                        // Wrap in a print statement for expressions
+                        format!("println({})", line)
+                    };
 
                 match zynml.run(&code) {
                     Ok(_) => {}

@@ -119,9 +119,9 @@ pub enum PatternIR {
     /// Returns `Vec<T>`
     Repeat {
         pattern: Box<PatternIR>,
-        min: usize,  // 0 for *, 1 for +
-        max: Option<usize>,  // None for unlimited
-        separator: Option<Box<PatternIR>>,  // For comma-separated lists
+        min: usize,                        // 0 for *, 1 for +
+        max: Option<usize>,                // None for unlimited
+        separator: Option<Box<PatternIR>>, // For comma-separated lists
     },
 
     /// Positive lookahead: `&p`
@@ -185,18 +185,13 @@ pub enum ActionIR {
     /// ```zyn
     /// -> fold_binary_left(items)
     /// ```
-    HelperCall {
-        function: String,
-        args: Vec<ExprIR>,
-    },
+    HelperCall { function: String, args: Vec<ExprIR> },
 
     /// Pass through a binding directly (for wrapper rules)
     /// ```zyn
     /// -> inner
     /// ```
-    PassThrough {
-        binding: String,
-    },
+    PassThrough { binding: String },
 
     /// Match on the type of a binding
     /// ```zyn
@@ -249,10 +244,7 @@ pub enum ExprIR {
     Binding(String),
 
     /// Field access: `binding.field`
-    FieldAccess {
-        base: Box<ExprIR>,
-        field: String,
-    },
+    FieldAccess { base: Box<ExprIR>, field: String },
 
     /// Method call: `binding.method(args)`
     MethodCall {
@@ -262,10 +254,7 @@ pub enum ExprIR {
     },
 
     /// Function call: `func(args)`
-    FunctionCall {
-        function: String,
-        args: Vec<ExprIR>,
-    },
+    FunctionCall { function: String, args: Vec<ExprIR> },
 
     /// String literal: `"text"`
     StringLit(String),
@@ -417,7 +406,10 @@ impl Default for GrammarIR {
 impl PatternIR {
     /// Check if this pattern is optional (can match empty input)
     pub fn is_optional(&self) -> bool {
-        matches!(self, PatternIR::Optional(_) | PatternIR::Repeat { min: 0, .. })
+        matches!(
+            self,
+            PatternIR::Optional(_) | PatternIR::Repeat { min: 0, .. }
+        )
     }
 
     /// Check if this pattern has any named bindings

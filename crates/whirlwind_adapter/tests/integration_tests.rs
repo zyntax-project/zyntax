@@ -25,13 +25,12 @@
 //! - `model_interface.wrl` - Classes and interfaces
 //! - `enum_record.wrl` - Enums and records
 
-use whirlwind_adapter::{WhirlwindAdapter, AdapterError};
+use whirlwind_adapter::{AdapterError, WhirlwindAdapter};
 
 /// Test fixture helper - loads Whirlwind source files
 fn load_fixture(name: &str) -> String {
     let path = format!("tests/fixtures/{}.wrl", name);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("Failed to load fixture: {}", path))
+    std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("Failed to load fixture: {}", path))
 }
 
 #[test]
@@ -49,7 +48,11 @@ fn test_fixtures_exist() {
 
     for fixture in fixtures {
         let source = load_fixture(fixture);
-        assert!(!source.is_empty(), "Fixture {} should not be empty", fixture);
+        assert!(
+            !source.is_empty(),
+            "Fixture {} should not be empty",
+            fixture
+        );
         println!("✓ Fixture loaded: {} ({} bytes)", fixture, source.len());
     }
 }
@@ -60,7 +63,10 @@ fn test_adapter_initialization() {
     let adapter = WhirlwindAdapter::new();
 
     // Verify converter access
-    assert!(adapter.type_converter().lookup_type("nonexistent").is_none());
+    assert!(adapter
+        .type_converter()
+        .lookup_type("nonexistent")
+        .is_none());
 
     println!("✓ Adapter initialized successfully");
 }
@@ -344,10 +350,17 @@ fn test_empty_standpoint_conversion() {
     let result = adapter.convert_standpoint(&standpoint);
 
     // Should succeed, returning an empty program
-    assert!(result.is_ok(), "Should successfully convert empty Standpoint");
+    assert!(
+        result.is_ok(),
+        "Should successfully convert empty Standpoint"
+    );
 
     let typed_program = result.unwrap();
-    assert_eq!(typed_program.declarations.len(), 0, "Empty standpoint should produce no declarations");
+    assert_eq!(
+        typed_program.declarations.len(),
+        0,
+        "Empty standpoint should produce no declarations"
+    );
     println!("✓ Successfully converted empty Standpoint to TypedProgram");
 }
 
@@ -401,7 +414,11 @@ fn test_type_registry_model_registration() {
     let type_registry = adapter.type_registry();
 
     // For an empty standpoint, we should still be able to access the registry
-    assert_eq!(type_registry.get_all_types().count(), 0, "Empty standpoint should have no registered types");
+    assert_eq!(
+        type_registry.get_all_types().count(),
+        0,
+        "Empty standpoint should have no registered types"
+    );
 
     println!("✓ TypeRegistry accessible after conversion");
 }
@@ -420,7 +437,10 @@ fn test_type_registry_all_symbols_registered() {
 
     // Verify registry methods work
     let all_types: Vec<_> = type_registry.get_all_types().collect();
-    println!("✓ TypeRegistry contains {} registered types", all_types.len());
+    println!(
+        "✓ TypeRegistry contains {} registered types",
+        all_types.len()
+    );
 
     // With empty standpoint, should have 0 types
     assert_eq!(all_types.len(), 0);
@@ -452,8 +472,8 @@ mod snapshot_helpers {
     #[allow(dead_code)]
     pub fn compare_snapshot(name: &str, actual: &str) -> Result<(), String> {
         let path = format!("tests/snapshots/{}.txt", name);
-        let expected = std::fs::read_to_string(&path)
-            .map_err(|_| format!("Snapshot not found: {}", path))?;
+        let expected =
+            std::fs::read_to_string(&path).map_err(|_| format!("Snapshot not found: {}", path))?;
 
         if actual.trim() == expected.trim() {
             Ok(())

@@ -36,10 +36,10 @@
 //! assert_eq!(item_type, Type::I32);
 //! ```
 
+use crate::{CompilerError, CompilerResult};
 use std::collections::HashMap;
 use std::sync::Arc;
-use zyntax_typed_ast::{Type, TypeId, InternedString, ImplDef};
-use crate::{CompilerError, CompilerResult};
+use zyntax_typed_ast::{ImplDef, InternedString, Type, TypeId};
 
 /// Resolves associated type projections to concrete types
 ///
@@ -70,12 +70,7 @@ impl AssociatedTypeResolver {
     /// * `trait_id` - The trait being implemented
     /// * `for_type_id` - The type implementing the trait
     /// * `impl_def` - The implementation definition with associated type bindings
-    pub fn register_impl(
-        &mut self,
-        trait_id: TypeId,
-        for_type_id: TypeId,
-        impl_def: Arc<ImplDef>,
-    ) {
+    pub fn register_impl(&mut self, trait_id: TypeId, for_type_id: TypeId, impl_def: Arc<ImplDef>) {
         self.impl_registry.insert((trait_id, for_type_id), impl_def);
     }
 
@@ -122,19 +117,20 @@ impl AssociatedTypeResolver {
         let for_type_id = self.extract_type_id(self_ty)?;
 
         // Look up the implementation
-        let impl_def = self.find_impl(trait_id, for_type_id)
-            .ok_or_else(|| CompilerError::Analysis(format!(
+        let impl_def = self.find_impl(trait_id, for_type_id).ok_or_else(|| {
+            CompilerError::Analysis(format!(
                 "No implementation of trait {:?} found for type {:?}",
                 trait_id, self_ty
-            )))?;
+            ))
+        })?;
 
         // Look up the associated type binding in the impl
-        let concrete_type = impl_def.associated_types
-            .get(&assoc_name)
-            .ok_or_else(|| CompilerError::Analysis(format!(
+        let concrete_type = impl_def.associated_types.get(&assoc_name).ok_or_else(|| {
+            CompilerError::Analysis(format!(
                 "Associated type '{}' not found in implementation of trait {:?} for type {:?}",
                 assoc_name, trait_id, self_ty
-            )))?;
+            ))
+        })?;
 
         Ok(concrete_type.clone())
     }
@@ -149,11 +145,7 @@ impl AssociatedTypeResolver {
     /// # Returns
     ///
     /// The implementation definition if found, None otherwise.
-    fn find_impl(
-        &self,
-        trait_id: TypeId,
-        for_type_id: TypeId,
-    ) -> Option<&Arc<ImplDef>> {
+    fn find_impl(&self, trait_id: TypeId, for_type_id: TypeId) -> Option<&Arc<ImplDef>> {
         self.impl_registry.get(&(trait_id, for_type_id))
     }
 
@@ -180,12 +172,10 @@ impl AssociatedTypeResolver {
 
             // Primitive types don't have type IDs - they would need special handling
             // In a full implementation, we might create synthetic TypeIds for primitives
-            Type::Primitive(_) => {
-                Err(CompilerError::Analysis(format!(
-                    "Primitive types cannot have trait implementations yet: {:?}",
-                    ty
-                )))
-            }
+            Type::Primitive(_) => Err(CompilerError::Analysis(format!(
+                "Primitive types cannot have trait implementations yet: {:?}",
+                ty
+            ))),
 
             // Type variables and other abstract types cannot be resolved yet
             _ => Err(CompilerError::Analysis(format!(
@@ -199,9 +189,9 @@ impl AssociatedTypeResolver {
     ///
     /// Returns an iterator over (trait_id, for_type_id, impl_def) tuples.
     pub fn impls(&self) -> impl Iterator<Item = (TypeId, TypeId, &Arc<ImplDef>)> {
-        self.impl_registry.iter().map(|((trait_id, for_type_id), impl_def)| {
-            (*trait_id, *for_type_id, impl_def)
-        })
+        self.impl_registry
+            .iter()
+            .map(|((trait_id, for_type_id), impl_def)| (*trait_id, *for_type_id, impl_def))
     }
 
     /// Clear all registered implementations
@@ -226,8 +216,8 @@ impl Default for AssociatedTypeResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zyntax_typed_ast::{TypeBound, AssociatedTypeDef, MethodImpl, PrimitiveType};
     use zyntax_typed_ast::arena::AstArena;
+    use zyntax_typed_ast::{AssociatedTypeDef, MethodImpl, PrimitiveType, TypeBound};
 
     fn create_test_impl(
         arena: &mut AstArena,
@@ -365,11 +355,15 @@ mod tests {
                 variance: vec![],
                 nullability: zyntax_typed_ast::NullabilityKind::NonNull,
             },
-            arena.intern_string("Output"),  // Wrong name
+            arena.intern_string("Output"), // Wrong name
         );
 
         // Should error because impl only has "Item", not "Output"
-        assert!(result.is_err(), "Expected error for missing associated type, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "Expected error for missing associated type, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -382,11 +376,23 @@ mod tests {
         let vec_string = TypeId::new(3);
 
         // Register impl Iterator for Vec<i32>
-        let impl1 = create_test_impl(&mut arena, iterator_trait, vec_i32, "Item", Type::Primitive(PrimitiveType::I32));
+        let impl1 = create_test_impl(
+            &mut arena,
+            iterator_trait,
+            vec_i32,
+            "Item",
+            Type::Primitive(PrimitiveType::I32),
+        );
         resolver.register_impl(iterator_trait, vec_i32, Arc::new(impl1));
 
         // Register impl Iterator for Vec<String>
-        let impl2 = create_test_impl(&mut arena, iterator_trait, vec_string, "Item", Type::Primitive(PrimitiveType::String));
+        let impl2 = create_test_impl(
+            &mut arena,
+            iterator_trait,
+            vec_string,
+            "Item",
+            Type::Primitive(PrimitiveType::String),
+        );
         resolver.register_impl(iterator_trait, vec_string, Arc::new(impl2));
 
         // Resolve for Vec<i32>
@@ -426,7 +432,13 @@ mod tests {
         let iterator_trait = TypeId::new(1);
         let vec_type = TypeId::new(2);
 
-        let impl_def = create_test_impl(&mut arena, iterator_trait, vec_type, "Item", Type::Primitive(PrimitiveType::I32));
+        let impl_def = create_test_impl(
+            &mut arena,
+            iterator_trait,
+            vec_type,
+            "Item",
+            Type::Primitive(PrimitiveType::I32),
+        );
         resolver.register_impl(iterator_trait, vec_type, Arc::new(impl_def));
 
         assert_eq!(resolver.impl_count(), 1);

@@ -29,9 +29,9 @@
 //! }
 //! ```
 
-use crate::value::ZyntaxValue;
 use crate::array::ZyntaxArray;
 use crate::string::ZyntaxString;
+use crate::value::ZyntaxValue;
 
 /// Trait for types that can be iterated in a ZRTL-compatible way.
 ///
@@ -454,9 +454,15 @@ impl ZrtlIterator for ZrtlRangeIterator {
 
     fn remaining(&self) -> Option<usize> {
         if self.step > 0 && self.current < self.end {
-            Some(((self.end - self.current) as usize + (self.step as usize - 1)) / self.step as usize)
+            Some(
+                ((self.end - self.current) as usize + (self.step as usize - 1))
+                    / self.step as usize,
+            )
         } else if self.step < 0 && self.current > self.end {
-            Some(((self.current - self.end) as usize + (-self.step as usize - 1)) / (-self.step) as usize)
+            Some(
+                ((self.current - self.end) as usize + (-self.step as usize - 1))
+                    / (-self.step) as usize,
+            )
         } else {
             Some(0)
         }

@@ -4,25 +4,25 @@
 //! checked statically or dynamically, with smooth interoperability between
 //! typed and untyped code.
 
-use crate::{const_evaluator::Literal, *};
 use crate::arena::InternedString;
 use crate::source::Span;
+use crate::{const_evaluator::Literal, *};
 use std::collections::{HashMap, HashSet};
 
 /// Gradual type checker for dynamic/static hybrid systems
 pub struct GradualTypeChecker {
     /// Runtime type check insertion points
     pub runtime_checks: HashMap<CheckPointId, RuntimeCheck>,
-    
+
     /// Type evidence tracking for flow-sensitive typing
     pub type_evidence: HashMap<VariableId, TypeEvidence>,
-    
+
     /// Dynamic dispatch targets
     pub dynamic_targets: HashMap<CallSiteId, Vec<PossibleTarget>>,
-    
+
     /// Blame tracking for error reporting
     pub blame_map: HashMap<CheckPointId, BlameInfo>,
-    
+
     /// Type precision levels
     pub precision_levels: HashMap<TypeId, PrecisionLevel>,
 }
@@ -54,33 +54,35 @@ pub struct RuntimeCheck {
 pub enum RuntimeCheckKind {
     /// Type assertion: assert that value has specific type
     TypeAssertion,
-    
+
     /// Type guard: check type and narrow in conditional
     TypeGuard,
-    
+
     /// Cast: convert between compatible types
     Cast { is_safe: bool },
-    
+
     /// Duck type check: verify object has required methods/fields
-    DuckTypeCheck { required_members: Vec<MemberRequirement> },
-    
+    DuckTypeCheck {
+        required_members: Vec<MemberRequirement>,
+    },
+
     /// Interface check: verify object implements interface
     InterfaceCheck { interface_id: TypeId },
-    
+
     /// Null check: verify value is not null
     NullCheck,
-    
+
     /// Undefined check: verify value is defined (JavaScript style)
     UndefinedCheck,
-    
+
     /// Array bounds check: verify array access is valid
     BoundsCheck,
-    
+
     /// Property existence check: verify property exists on object
     PropertyCheck { property_name: InternedString },
-    
+
     /// Method existence check: verify method exists and is callable
-    MethodCheck { 
+    MethodCheck {
         method_name: InternedString,
         expected_signature: Option<FunctionSignature>,
     },
@@ -108,19 +110,19 @@ pub enum MemberKind {
 pub enum FallbackBehavior {
     /// Throw exception with error message
     Throw(String),
-    
+
     /// Return default value of expected type
     ReturnDefault,
-    
+
     /// Continue with dynamic typing (no check)
     ContinueDynamic,
-    
+
     /// Coerce to expected type if possible
     CoerceType,
-    
+
     /// Call custom error handler
     CallHandler(InternedString),
-    
+
     /// Gradual mode: issue warning but continue
     Warn(String),
 }
@@ -130,19 +132,19 @@ pub enum FallbackBehavior {
 pub enum OptimizationHint {
     /// Check is likely to succeed (hot path)
     LikelySuccess,
-    
+
     /// Check is likely to fail (error path)
     LikelyFailure,
-    
+
     /// Check can be cached for this object
     Cacheable,
-    
+
     /// Check can be eliminated if proven statically
     EliminateIfProven,
-    
+
     /// Check is performance critical
     PerformanceCritical,
-    
+
     /// Check can be deferred to usage site
     DeferToUsage,
 }
@@ -170,34 +172,34 @@ pub struct Evidence {
 pub enum EvidenceKind {
     /// Assignment: x = value
     Assignment(Type),
-    
+
     /// Type guard: if isinstance(x, Type)
     TypeGuard(Type),
-    
+
     /// Method call: x.method() succeeded
-    MethodCall { 
+    MethodCall {
         method_name: InternedString,
         return_type: Type,
     },
-    
+
     /// Field access: x.field succeeded
     FieldAccess {
         field_name: InternedString,
         field_type: Type,
     },
-    
+
     /// Duck typing: x behaves like Type
     DuckTyping(Type),
-    
+
     /// Runtime check: runtime assertion passed
     RuntimeAssertion(Type),
-    
+
     /// Pattern match: x matches pattern
     PatternMatch(Pattern),
-    
+
     /// Null check: x is not null
     NonNull,
-    
+
     /// Truthiness: x is truthy/falsy
     Truthiness(bool),
 }
@@ -207,7 +209,7 @@ pub enum EvidenceKind {
 pub enum Pattern {
     Type(Type),
     Literal(Literal),
-    Destructure { 
+    Destructure {
         constructor: InternedString,
         fields: Vec<Pattern>,
     },
@@ -220,22 +222,22 @@ pub enum Pattern {
 pub enum ConfidenceLevel {
     /// Type is guaranteed by static analysis
     Certain = 100,
-    
+
     /// Type is very likely based on strong evidence
     VeryHigh = 90,
-    
+
     /// Type is likely based on good evidence
     High = 75,
-    
+
     /// Type is somewhat likely
     Medium = 50,
-    
+
     /// Type is possible but uncertain
     Low = 25,
-    
+
     /// Type is just a guess
     VeryLow = 10,
-    
+
     /// No confidence, complete uncertainty
     Unknown = 0,
 }
@@ -252,10 +254,10 @@ pub struct PossibleTarget {
 /// Cost model for dynamic calls
 #[derive(Debug, Clone)]
 pub struct CallCost {
-    pub lookup_cost: u32,      // Cost of method lookup
-    pub dispatch_cost: u32,    // Cost of dispatch
-    pub conversion_cost: u32,  // Cost of type conversions
-    pub check_cost: u32,       // Cost of runtime checks
+    pub lookup_cost: u32,     // Cost of method lookup
+    pub dispatch_cost: u32,   // Cost of dispatch
+    pub conversion_cost: u32, // Cost of type conversions
+    pub check_cost: u32,      // Cost of runtime checks
 }
 
 /// Blame information for error reporting
@@ -270,11 +272,11 @@ pub struct BlameInfo {
 /// What to blame when a gradual typing error occurs
 #[derive(Debug, Clone, PartialEq)]
 pub enum BlamedComponent {
-    StaticCode(Span),      // Blame statically typed code
-    DynamicCode(Span),     // Blame dynamically typed code
-    Boundary(Span),        // Blame static/dynamic boundary
-    RuntimeSystem,         // Blame runtime type system
-    UserCode(Span),        // Blame user code in general
+    StaticCode(Span),  // Blame statically typed code
+    DynamicCode(Span), // Blame dynamically typed code
+    Boundary(Span),    // Blame static/dynamic boundary
+    RuntimeSystem,     // Blame runtime type system
+    UserCode(Span),    // Blame user code in general
 }
 
 /// Precision level for type information
@@ -282,19 +284,19 @@ pub enum BlamedComponent {
 pub enum PrecisionLevel {
     /// Exact type information
     Exact,
-    
+
     /// Upper bound (subtype relationship)
     UpperBound,
-    
+
     /// Lower bound (supertype relationship)
     LowerBound,
-    
+
     /// Shape information (structural)
     Shape,
-    
+
     /// Tag information (nominal)
     Tag,
-    
+
     /// No precision (Any)
     None,
 }
@@ -308,7 +310,7 @@ pub enum GradualTypeError {
         member_name: InternedString,
         span: Span,
     },
-    
+
     /// Static/dynamic boundary violation
     BoundaryViolation {
         expected_type: Type,
@@ -316,14 +318,14 @@ pub enum GradualTypeError {
         boundary_kind: BoundaryKind,
         span: Span,
     },
-    
+
     /// Runtime check failed
     RuntimeCheckFailed {
         check: RuntimeCheck,
         actual_value: String, // String representation
         span: Span,
     },
-    
+
     /// Insufficient type evidence
     InsufficientEvidence {
         variable: VariableId,
@@ -331,7 +333,7 @@ pub enum GradualTypeError {
         actual_confidence: ConfidenceLevel,
         span: Span,
     },
-    
+
     /// Contradictory type evidence
     ContradictoryEvidence {
         variable: VariableId,
@@ -339,7 +341,7 @@ pub enum GradualTypeError {
         evidence2: Evidence,
         span: Span,
     },
-    
+
     /// Dynamic dispatch failed
     DispatchFailed {
         call_site: CallSiteId,
@@ -347,7 +349,7 @@ pub enum GradualTypeError {
         method_name: InternedString,
         span: Span,
     },
-    
+
     /// Precision loss in type conversion
     PrecisionLoss {
         from_type: Type,
@@ -360,12 +362,12 @@ pub enum GradualTypeError {
 /// Different kinds of static/dynamic boundaries
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundaryKind {
-    StaticToDynamic,    // Passing static value to dynamic context
-    DynamicToStatic,    // Passing dynamic value to static context
-    Import,             // Importing from dynamically typed module
-    Export,             // Exporting to dynamically typed module
-    Callback,           // Dynamic callback from static code
-    Reflection,         // Reflection/metaprogramming boundary
+    StaticToDynamic, // Passing static value to dynamic context
+    DynamicToStatic, // Passing dynamic value to static context
+    Import,          // Importing from dynamically typed module
+    Export,          // Exporting to dynamically typed module
+    Callback,        // Dynamic callback from static code
+    Reflection,      // Reflection/metaprogramming boundary
 }
 
 /// Function signature for method checks
@@ -401,19 +403,19 @@ pub struct MethodInfo {
 /// Method implementation type
 #[derive(Debug, Clone)]
 pub enum MethodImpl {
-    Native(InternedString),      // Native implementation name
-    Dynamic(CallSiteId),         // Dynamic dispatch target
-    Wrapper(WrapperKind),        // Generated wrapper
-    Missing,                     // Method not found (for error reporting)
+    Native(InternedString), // Native implementation name
+    Dynamic(CallSiteId),    // Dynamic dispatch target
+    Wrapper(WrapperKind),   // Generated wrapper
+    Missing,                // Method not found (for error reporting)
 }
 
 /// Wrapper types for gradual typing
 #[derive(Debug, Clone)]
 pub enum WrapperKind {
-    TypeCheck,                   // Adds runtime type checks
-    Coercion,                    // Performs type coercions
-    Monitoring,                  // Adds performance monitoring
-    Blame,                       // Adds blame tracking
+    TypeCheck,  // Adds runtime type checks
+    Coercion,   // Performs type coercions
+    Monitoring, // Adds performance monitoring
+    Blame,      // Adds blame tracking
 }
 
 /// Runtime field information
@@ -428,9 +430,9 @@ pub struct FieldInfo {
 /// Field accessor type
 #[derive(Debug, Clone)]
 pub enum FieldAccessor {
-    Direct(u32),                 // Direct offset access
-    Getter(InternedString),      // Getter method name
-    Dynamic,                     // Dynamic property access
+    Direct(u32),            // Direct offset access
+    Getter(InternedString), // Getter method name
+    Dynamic,                // Dynamic property access
 }
 
 /// Type metadata for runtime
@@ -492,7 +494,7 @@ impl GradualTypeChecker {
             precision_levels: HashMap::new(),
         }
     }
-    
+
     /// Check compatibility between static and dynamic types
     pub fn check_gradual_compatibility(
         &mut self,
@@ -504,30 +506,26 @@ impl GradualTypeChecker {
         match (static_type, dynamic_value) {
             // Any is compatible with everything
             (_, Type::Any) | (Type::Any, _) => Ok(vec![]),
-            
+
             // Dynamic is compatible but requires runtime checks
-            (static_ty, Type::Dynamic) => {
-                self.generate_dynamic_to_static_checks(static_ty, span)
-            },
-            
+            (static_ty, Type::Dynamic) => self.generate_dynamic_to_static_checks(static_ty, span),
+
             (Type::Dynamic, _) => {
                 // Dynamic can accept anything, no checks needed
                 Ok(vec![])
-            },
-            
+            }
+
             // Unknown requires careful handling
-            (static_ty, Type::Unknown) => {
-                self.generate_unknown_checks(static_ty, span)
-            },
-            
+            (static_ty, Type::Unknown) => self.generate_unknown_checks(static_ty, span),
+
             // Exact type match
             (a, b) if a == b => Ok(vec![]),
-            
+
             // Structural compatibility with runtime verification
             _ => self.check_structural_with_runtime(static_type, dynamic_value, span),
         }
     }
-    
+
     /// Generate runtime checks for dynamic to static conversion
     fn generate_dynamic_to_static_checks(
         &mut self,
@@ -535,20 +533,21 @@ impl GradualTypeChecker {
         span: Span,
     ) -> Result<Vec<RuntimeCheck>, GradualTypeError> {
         let mut checks = Vec::new();
-        
+
         match target_type {
             Type::Primitive(prim) => {
                 checks.push(RuntimeCheck {
                     check_kind: RuntimeCheckKind::TypeAssertion,
                     expected_type: target_type.clone(),
-                    fallback_behavior: FallbackBehavior::Throw(
-                        format!("Expected {}, got dynamic value", self.format_primitive(*prim))
-                    ),
+                    fallback_behavior: FallbackBehavior::Throw(format!(
+                        "Expected {}, got dynamic value",
+                        self.format_primitive(*prim)
+                    )),
                     optimization_hint: OptimizationHint::EliminateIfProven,
                     span,
                 });
-            },
-            
+            }
+
             Type::Nullable(inner) => {
                 // Check for null first, then check inner type
                 checks.push(RuntimeCheck {
@@ -558,33 +557,38 @@ impl GradualTypeChecker {
                     optimization_hint: OptimizationHint::LikelySuccess,
                     span,
                 });
-                
+
                 checks.extend(self.generate_dynamic_to_static_checks(inner, span)?);
-            },
-            
+            }
+
             Type::Interface { methods, .. } => {
                 // Generate duck typing check
-                let requirements: Vec<MemberRequirement> = methods.iter().map(|method| {
-                    MemberRequirement {
+                let requirements: Vec<MemberRequirement> = methods
+                    .iter()
+                    .map(|method| MemberRequirement {
                         name: method.name,
                         kind: MemberKind::Method,
                         expected_type: Type::Function {
-                            params: method.params.iter().map(|p| ParamInfo {
-                                name: Some(p.name),
-                                ty: p.ty.clone(),
-                                is_optional: false,
-                                is_varargs: p.is_varargs,
-                                is_keyword_only: false,
-                                is_positional_only: false,
-                                is_out: false,
-                                is_ref: p.is_mut,
-                                is_inout: false,
-                            }).collect(),
+                            params: method
+                                .params
+                                .iter()
+                                .map(|p| ParamInfo {
+                                    name: Some(p.name),
+                                    ty: p.ty.clone(),
+                                    is_optional: false,
+                                    is_varargs: p.is_varargs,
+                                    is_keyword_only: false,
+                                    is_positional_only: false,
+                                    is_out: false,
+                                    is_ref: p.is_mut,
+                                    is_inout: false,
+                                })
+                                .collect(),
                             return_type: Box::new(method.return_type.clone()),
-                            async_kind: if method.is_async { 
-                                AsyncKind::Async 
-                            } else { 
-                                AsyncKind::Sync 
+                            async_kind: if method.is_async {
+                                AsyncKind::Async
+                            } else {
+                                AsyncKind::Sync
                             },
                             is_varargs: false,
                             calling_convention: CallingConvention::Default,
@@ -593,26 +597,32 @@ impl GradualTypeChecker {
                             has_default_params: false,
                         },
                         is_optional: false,
-                    }
-                }).collect();
-                
+                    })
+                    .collect();
+
                 checks.push(RuntimeCheck {
-                    check_kind: RuntimeCheckKind::DuckTypeCheck { required_members: requirements },
+                    check_kind: RuntimeCheckKind::DuckTypeCheck {
+                        required_members: requirements,
+                    },
                     expected_type: target_type.clone(),
                     fallback_behavior: FallbackBehavior::Throw(
-                        "Object does not implement required interface".to_string()
+                        "Object does not implement required interface".to_string(),
                     ),
                     optimization_hint: OptimizationHint::Cacheable,
                     span,
                 });
-            },
-            
-            Type::Function { params, return_type, .. } => {
+            }
+
+            Type::Function {
+                params,
+                return_type,
+                ..
+            } => {
                 // Check that value is callable with correct signature
                 checks.push(RuntimeCheck {
                     check_kind: RuntimeCheckKind::MethodCheck {
                         method_name: InternedString::from_symbol(
-                            string_interner::Symbol::try_from_usize(0).unwrap()
+                            string_interner::Symbol::try_from_usize(0).unwrap(),
                         ), // "__call__" or similar
                         expected_signature: Some(FunctionSignature {
                             type_params: vec![],
@@ -624,30 +634,28 @@ impl GradualTypeChecker {
                     },
                     expected_type: target_type.clone(),
                     fallback_behavior: FallbackBehavior::Throw(
-                        "Value is not callable with expected signature".to_string()
+                        "Value is not callable with expected signature".to_string(),
                     ),
                     optimization_hint: OptimizationHint::PerformanceCritical,
                     span,
                 });
-            },
-            
+            }
+
             _ => {
                 // Generic type assertion
                 checks.push(RuntimeCheck {
                     check_kind: RuntimeCheckKind::TypeAssertion,
                     expected_type: target_type.clone(),
-                    fallback_behavior: FallbackBehavior::Throw(
-                        "Type assertion failed".to_string()
-                    ),
+                    fallback_behavior: FallbackBehavior::Throw("Type assertion failed".to_string()),
                     optimization_hint: OptimizationHint::EliminateIfProven,
                     span,
                 });
-            },
+            }
         }
-        
+
         Ok(checks)
     }
-    
+
     /// Generate checks for unknown type values
     fn generate_unknown_checks(
         &mut self,
@@ -656,21 +664,19 @@ impl GradualTypeChecker {
     ) -> Result<Vec<RuntimeCheck>, GradualTypeError> {
         // Unknown is more restrictive than Any - we need to prove compatibility
         let mut checks = self.generate_dynamic_to_static_checks(target_type, span)?;
-        
+
         // Add additional safety checks for Unknown
         checks.push(RuntimeCheck {
             check_kind: RuntimeCheckKind::UndefinedCheck,
             expected_type: target_type.clone(),
-            fallback_behavior: FallbackBehavior::Throw(
-                "Value is undefined".to_string()
-            ),
+            fallback_behavior: FallbackBehavior::Throw("Value is undefined".to_string()),
             optimization_hint: OptimizationHint::LikelySuccess,
             span,
         });
-        
+
         Ok(checks)
     }
-    
+
     /// Check structural compatibility with runtime verification
     fn check_structural_with_runtime(
         &mut self,
@@ -680,28 +686,25 @@ impl GradualTypeChecker {
     ) -> Result<Vec<RuntimeCheck>, GradualTypeError> {
         // Use structural typing principles but add runtime checks
         // where static analysis is insufficient
-        
+
         let mut checks = Vec::new();
-        
+
         match (static_type, dynamic_type) {
-            (
-                Type::Named { id: static_id, .. },
-                Type::Named { id: dynamic_id, .. }
-            ) => {
+            (Type::Named { id: static_id, .. }, Type::Named { id: dynamic_id, .. }) => {
                 if static_id != dynamic_id {
                     // Different nominal types - need runtime type check
                     checks.push(RuntimeCheck {
                         check_kind: RuntimeCheckKind::TypeAssertion,
                         expected_type: static_type.clone(),
                         fallback_behavior: FallbackBehavior::Throw(
-                            "Nominal type mismatch".to_string()
+                            "Nominal type mismatch".to_string(),
                         ),
                         optimization_hint: OptimizationHint::EliminateIfProven,
                         span,
                     });
                 }
-            },
-            
+            }
+
             _ => {
                 // Default to type assertion
                 checks.push(RuntimeCheck {
@@ -711,73 +714,69 @@ impl GradualTypeChecker {
                     optimization_hint: OptimizationHint::LikelySuccess,
                     span,
                 });
-            },
+            }
         }
-        
+
         Ok(checks)
     }
-    
+
     /// Add type evidence for flow-sensitive typing
-    pub fn add_evidence(
-        &mut self,
-        variable: VariableId,
-        evidence: Evidence,
-    ) {
+    pub fn add_evidence(&mut self, variable: VariableId, evidence: Evidence) {
         // Get current type and evidence chain to avoid borrowing conflicts
         let (current_type, current_evidence_chain) = {
-            let type_evidence = self.type_evidence
-                .entry(variable)
-                .or_insert_with(|| TypeEvidence {
-                    variable_id: variable,
-                    evidence_chain: Vec::new(),
-                    current_type: Type::Unknown,
-                    confidence: ConfidenceLevel::Unknown,
-                });
-            (type_evidence.current_type.clone(), type_evidence.evidence_chain.clone())
+            let type_evidence =
+                self.type_evidence
+                    .entry(variable)
+                    .or_insert_with(|| TypeEvidence {
+                        variable_id: variable,
+                        evidence_chain: Vec::new(),
+                        current_type: Type::Unknown,
+                        confidence: ConfidenceLevel::Unknown,
+                    });
+            (
+                type_evidence.current_type.clone(),
+                type_evidence.evidence_chain.clone(),
+            )
         };
-        
+
         // Calculate new values
         let new_type = self.combine_type_with_evidence(&current_type, &evidence);
         let new_confidence = self.calculate_confidence(&current_evidence_chain, &evidence);
-        
+
         // Update the evidence
         let type_evidence = self.type_evidence.get_mut(&variable).unwrap();
         type_evidence.evidence_chain.push(evidence);
         type_evidence.current_type = new_type;
         type_evidence.confidence = new_confidence;
     }
-    
+
     /// Combine existing type information with new evidence
-    fn combine_type_with_evidence(
-        &self,
-        current_type: &Type,
-        evidence: &Evidence,
-    ) -> Type {
+    fn combine_type_with_evidence(&self, current_type: &Type, evidence: &Evidence) -> Type {
         match &evidence.kind {
             EvidenceKind::Assignment(ref new_type) => {
                 // Assignment evidence overrides previous type
                 new_type.clone()
-            },
-            
+            }
+
             EvidenceKind::TypeGuard(ref guarded_type) => {
                 // Type guard narrows the type
                 self.intersect_types(current_type, guarded_type)
-            },
-            
+            }
+
             EvidenceKind::NonNull => {
                 // Remove null from union type
                 self.remove_null_from_type(current_type)
-            },
-            
+            }
+
             EvidenceKind::MethodCall { return_type, .. } => {
                 // Method call evidence suggests object has that method
                 current_type.clone() // Keep current type, just add evidence
-            },
-            
+            }
+
             _ => current_type.clone(),
         }
     }
-    
+
     /// Calculate confidence level based on evidence chain
     fn calculate_confidence(
         &self,
@@ -792,18 +791,22 @@ impl GradualTypeChecker {
             EvidenceKind::DuckTyping(_) => ConfidenceLevel::Low,
             _ => ConfidenceLevel::Medium,
         };
-        
+
         // Adjust confidence based on evidence chain length and consistency
         let chain_length = evidence_chain.len();
         let consistency_bonus = if chain_length > 0 {
             let consistent = evidence_chain.iter().all(|e| {
                 self.evidence_supports_type(&e.resulting_type, &new_evidence.resulting_type)
             });
-            if consistent { 10 } else { -20 }
+            if consistent {
+                10
+            } else {
+                -20
+            }
         } else {
             0
         };
-        
+
         let final_confidence = (base_confidence as i32 + consistency_bonus).max(0).min(100);
         match final_confidence {
             90..=100 => ConfidenceLevel::Certain,
@@ -815,24 +818,25 @@ impl GradualTypeChecker {
             _ => ConfidenceLevel::Unknown,
         }
     }
-    
+
     /// Check if evidence supports a type hypothesis
     fn evidence_supports_type(&self, evidence_type: &Type, hypothesis: &Type) -> bool {
         // Simplified compatibility check
-        evidence_type == hypothesis || 
-        matches!((evidence_type, hypothesis), (Type::Any, _) | (_, Type::Any))
+        evidence_type == hypothesis
+            || matches!((evidence_type, hypothesis), (Type::Any, _) | (_, Type::Any))
     }
-    
+
     /// Intersect two types (type narrowing)
     fn intersect_types(&self, type1: &Type, type2: &Type) -> Type {
         match (type1, type2) {
             (Type::Union(types1), _) => {
                 // Filter union types
-                let filtered: Vec<Type> = types1.iter()
+                let filtered: Vec<Type> = types1
+                    .iter()
                     .filter(|t| self.is_subtype_of(t, type2))
                     .cloned()
                     .collect();
-                
+
                 if filtered.len() == 1 {
                     filtered[0].clone()
                 } else if filtered.is_empty() {
@@ -840,10 +844,10 @@ impl GradualTypeChecker {
                 } else {
                     Type::Union(filtered)
                 }
-            },
-            
+            }
+
             (_, Type::Union(_)) => self.intersect_types(type2, type1),
-            
+
             _ => {
                 if self.is_subtype_of(type2, type1) {
                     type2.clone()
@@ -855,72 +859,74 @@ impl GradualTypeChecker {
             }
         }
     }
-    
+
     /// Remove null from a type
     fn remove_null_from_type(&self, ty: &Type) -> Type {
         match ty {
             Type::Nullable(inner) => *inner.clone(),
             Type::Union(types) => {
-                let non_null_types: Vec<Type> = types.iter()
+                let non_null_types: Vec<Type> = types
+                    .iter()
                     .filter(|t| !matches!(t, Type::Primitive(PrimitiveType::Unit))) // Assuming Unit represents null
                     .cloned()
                     .collect();
-                
+
                 if non_null_types.len() == 1 {
                     non_null_types[0].clone()
                 } else {
                     Type::Union(non_null_types)
                 }
-            },
+            }
             _ => ty.clone(),
         }
     }
-    
+
     /// Simple subtype check
     fn is_subtype_of(&self, sub: &Type, sup: &Type) -> bool {
         sub == sup || matches!((sub, sup), (_, Type::Any) | (Type::Never, _))
     }
-    
+
     /// Format primitive type for error messages
     fn format_primitive(&self, prim: PrimitiveType) -> String {
         format!("{:?}", prim).to_lowercase()
     }
-    
+
     /// Get current type of variable with confidence
     pub fn get_variable_type(&self, variable: VariableId) -> Option<(Type, ConfidenceLevel)> {
-        self.type_evidence.get(&variable)
+        self.type_evidence
+            .get(&variable)
             .map(|evidence| (evidence.current_type.clone(), evidence.confidence))
     }
-    
+
     /// Generate blame information for error
-    pub fn generate_blame(
-        &mut self,
-        error: &GradualTypeError,
-    ) -> BlameInfo {
+    pub fn generate_blame(&mut self, error: &GradualTypeError) -> BlameInfo {
         match error {
-            GradualTypeError::BoundaryViolation { boundary_kind, span, .. } => {
-                match boundary_kind {
-                    BoundaryKind::StaticToDynamic => BlameInfo {
-                        blamed_component: BlamedComponent::StaticCode(*span),
-                        error_message: "Static code is too restrictive for dynamic context".to_string(),
-                        suggested_fix: Some("Consider using Any or adding runtime checks".to_string()),
-                        related_locations: vec![],
-                    },
-                    BoundaryKind::DynamicToStatic => BlameInfo {
-                        blamed_component: BlamedComponent::DynamicCode(*span),
-                        error_message: "Dynamic value doesn't meet static type requirements".to_string(),
-                        suggested_fix: Some("Add type assertions or guards".to_string()),
-                        related_locations: vec![],
-                    },
-                    _ => BlameInfo {
-                        blamed_component: BlamedComponent::Boundary(*span),
-                        error_message: "Type mismatch at static/dynamic boundary".to_string(),
-                        suggested_fix: Some("Add explicit type conversion".to_string()),
-                        related_locations: vec![],
-                    },
-                }
+            GradualTypeError::BoundaryViolation {
+                boundary_kind,
+                span,
+                ..
+            } => match boundary_kind {
+                BoundaryKind::StaticToDynamic => BlameInfo {
+                    blamed_component: BlamedComponent::StaticCode(*span),
+                    error_message: "Static code is too restrictive for dynamic context".to_string(),
+                    suggested_fix: Some("Consider using Any or adding runtime checks".to_string()),
+                    related_locations: vec![],
+                },
+                BoundaryKind::DynamicToStatic => BlameInfo {
+                    blamed_component: BlamedComponent::DynamicCode(*span),
+                    error_message: "Dynamic value doesn't meet static type requirements"
+                        .to_string(),
+                    suggested_fix: Some("Add type assertions or guards".to_string()),
+                    related_locations: vec![],
+                },
+                _ => BlameInfo {
+                    blamed_component: BlamedComponent::Boundary(*span),
+                    error_message: "Type mismatch at static/dynamic boundary".to_string(),
+                    suggested_fix: Some("Add explicit type conversion".to_string()),
+                    related_locations: vec![],
+                },
             },
-            
+
             _ => BlameInfo {
                 blamed_component: BlamedComponent::RuntimeSystem,
                 error_message: "Gradual typing error".to_string(),
@@ -929,9 +935,9 @@ impl GradualTypeChecker {
             },
         }
     }
-    
+
     // === ENHANCED GRADUAL TYPING METHODS ===
-    
+
     /// Generate runtime type information for a type
     pub fn generate_runtime_type_info(
         &mut self,
@@ -942,60 +948,75 @@ impl GradualTypeChecker {
         let mut methods = HashMap::new();
         let mut fields = HashMap::new();
         let mut interfaces = Vec::new();
-        
+
         // Extract methods and fields based on type definition
         match type_def {
             Type::Named { .. } => {
                 // Would need type registry access for full info
                 // This is a simplified version
-            },
-            Type::Struct { fields: field_defs, .. } => {
+            }
+            Type::Struct {
+                fields: field_defs, ..
+            } => {
                 for field_def in field_defs {
-                    fields.insert(field_def.name, FieldInfo {
-                        field_type: field_def.ty.clone(),
-                        accessor: FieldAccessor::Direct(0), // Would calculate offset
-                        is_mutable: field_def.mutability == Mutability::Mutable,
-                        metadata: FieldMetadata {
-                            is_lazy: false,
-                            is_cached: false,
-                            validator: None,
-                        },
-                    });
-                }
-            },
-            Type::Interface { methods: method_defs, .. } => {
-                for method_def in method_defs {
-                    methods.insert(method_def.name, MethodInfo {
-                        signature: FunctionSignature {
-                            type_params: method_def.type_params.clone(),
-                            params: method_def.params.iter().map(|p| ParamInfo {
-                                name: Some(p.name),
-                                ty: p.ty.clone(),
-                                is_optional: false,
-                                is_varargs: p.is_varargs,
-                                is_keyword_only: false,
-                                is_positional_only: false,
-                                is_out: false,
-                                is_ref: p.is_mut,
-                                is_inout: false,
-                            }).collect(),
-                            return_type: method_def.return_type.clone(),
-                            async_kind: if method_def.is_async {
-                                AsyncKind::Async
-                            } else {
-                                AsyncKind::Sync
+                    fields.insert(
+                        field_def.name,
+                        FieldInfo {
+                            field_type: field_def.ty.clone(),
+                            accessor: FieldAccessor::Direct(0), // Would calculate offset
+                            is_mutable: field_def.mutability == Mutability::Mutable,
+                            metadata: FieldMetadata {
+                                is_lazy: false,
+                                is_cached: false,
+                                validator: None,
                             },
-                            where_clause: method_def.where_clause.clone(),
                         },
-                        implementation: MethodImpl::Native(method_def.name),
-                        dispatch_cost: 1,
-                        is_cached: false,
-                    });
+                    );
                 }
-            },
-            _ => {},
+            }
+            Type::Interface {
+                methods: method_defs,
+                ..
+            } => {
+                for method_def in method_defs {
+                    methods.insert(
+                        method_def.name,
+                        MethodInfo {
+                            signature: FunctionSignature {
+                                type_params: method_def.type_params.clone(),
+                                params: method_def
+                                    .params
+                                    .iter()
+                                    .map(|p| ParamInfo {
+                                        name: Some(p.name),
+                                        ty: p.ty.clone(),
+                                        is_optional: false,
+                                        is_varargs: p.is_varargs,
+                                        is_keyword_only: false,
+                                        is_positional_only: false,
+                                        is_out: false,
+                                        is_ref: p.is_mut,
+                                        is_inout: false,
+                                    })
+                                    .collect(),
+                                return_type: method_def.return_type.clone(),
+                                async_kind: if method_def.is_async {
+                                    AsyncKind::Async
+                                } else {
+                                    AsyncKind::Sync
+                                },
+                                where_clause: method_def.where_clause.clone(),
+                            },
+                            implementation: MethodImpl::Native(method_def.name),
+                            dispatch_cost: 1,
+                            is_cached: false,
+                        },
+                    );
+                }
+            }
+            _ => {}
         }
-        
+
         RuntimeTypeInfo {
             type_id,
             type_name,
@@ -1011,7 +1032,7 @@ impl GradualTypeChecker {
             },
         }
     }
-    
+
     /// Generate optimized runtime checks based on mode
     pub fn generate_optimized_checks(
         &mut self,
@@ -1024,29 +1045,31 @@ impl GradualTypeChecker {
             GradualMode::Static => {
                 // In static mode, fail fast with detailed checks
                 self.generate_strict_checks(value_type, expected_type, span)
-            },
+            }
             GradualMode::Dynamic => {
                 // In dynamic mode, minimal checks
                 vec![]
-            },
+            }
             GradualMode::Permissive => {
                 // In permissive mode, check but warn instead of fail
-                let mut checks = self.generate_dynamic_to_static_checks(expected_type, span)
+                let mut checks = self
+                    .generate_dynamic_to_static_checks(expected_type, span)
                     .unwrap_or_default();
                 for check in &mut checks {
-                    check.fallback_behavior = FallbackBehavior::Warn(
-                        format!("Type mismatch in permissive mode: expected {:?}", expected_type)
-                    );
+                    check.fallback_behavior = FallbackBehavior::Warn(format!(
+                        "Type mismatch in permissive mode: expected {:?}",
+                        expected_type
+                    ));
                 }
                 checks
-            },
+            }
             GradualMode::Transitional => {
                 // In transitional mode, generate migration-friendly checks
                 self.generate_transitional_checks(value_type, expected_type, span)
-            },
+            }
         }
     }
-    
+
     /// Generate strict runtime checks for static mode
     fn generate_strict_checks(
         &mut self,
@@ -1055,32 +1078,35 @@ impl GradualTypeChecker {
         span: Span,
     ) -> Vec<RuntimeCheck> {
         let mut checks = Vec::new();
-        
+
         // Add type assertion
         checks.push(RuntimeCheck {
             check_kind: RuntimeCheckKind::TypeAssertion,
             expected_type: expected_type.clone(),
-            fallback_behavior: FallbackBehavior::Throw(
-                format!("Strict mode type violation: expected {:?}, got {:?}", expected_type, value_type)
-            ),
+            fallback_behavior: FallbackBehavior::Throw(format!(
+                "Strict mode type violation: expected {:?}, got {:?}",
+                expected_type, value_type
+            )),
             optimization_hint: OptimizationHint::EliminateIfProven,
             span,
         });
-        
+
         // Add null check if needed
         if !matches!(expected_type, Type::Nullable(_)) {
             checks.push(RuntimeCheck {
                 check_kind: RuntimeCheckKind::NullCheck,
                 expected_type: expected_type.clone(),
-                fallback_behavior: FallbackBehavior::Throw("Null value in non-nullable context".to_string()),
+                fallback_behavior: FallbackBehavior::Throw(
+                    "Null value in non-nullable context".to_string(),
+                ),
                 optimization_hint: OptimizationHint::LikelySuccess,
                 span,
             });
         }
-        
+
         checks
     }
-    
+
     /// Generate transitional checks for migration
     fn generate_transitional_checks(
         &mut self,
@@ -1089,7 +1115,7 @@ impl GradualTypeChecker {
         span: Span,
     ) -> Vec<RuntimeCheck> {
         let mut checks = Vec::new();
-        
+
         // Try to coerce if possible
         checks.push(RuntimeCheck {
             check_kind: RuntimeCheckKind::Cast { is_safe: false },
@@ -1098,21 +1124,22 @@ impl GradualTypeChecker {
             optimization_hint: OptimizationHint::Cacheable,
             span,
         });
-        
+
         // Add monitoring to track migrations
         checks.push(RuntimeCheck {
             check_kind: RuntimeCheckKind::TypeAssertion,
             expected_type: expected_type.clone(),
-            fallback_behavior: FallbackBehavior::Warn(
-                format!("Migration warning: converting {:?} to {:?}", value_type, expected_type)
-            ),
+            fallback_behavior: FallbackBehavior::Warn(format!(
+                "Migration warning: converting {:?} to {:?}",
+                value_type, expected_type
+            )),
             optimization_hint: OptimizationHint::DeferToUsage,
             span,
         });
-        
+
         checks
     }
-    
+
     /// Analyze dynamic dispatch targets and optimize
     pub fn analyze_dynamic_dispatch(
         &mut self,
@@ -1121,7 +1148,7 @@ impl GradualTypeChecker {
         method_name: InternedString,
     ) -> Vec<PossibleTarget> {
         let mut targets = Vec::new();
-        
+
         // Analyze receiver type to find possible implementations
         match receiver_type {
             Type::Union(types) => {
@@ -1141,7 +1168,7 @@ impl GradualTypeChecker {
                         });
                     }
                 }
-            },
+            }
             Type::Dynamic => {
                 // For dynamic types, we can't predict targets
                 // Return a generic dynamic dispatch target
@@ -1164,7 +1191,7 @@ impl GradualTypeChecker {
                         check_cost: 30,
                     },
                 });
-            },
+            }
             _ => {
                 // For concrete types, single target
                 if let Some(target) = self.find_method_in_type(receiver_type, method_name) {
@@ -1180,14 +1207,14 @@ impl GradualTypeChecker {
                         },
                     });
                 }
-            },
+            }
         }
-        
+
         // Cache the analysis
         self.dynamic_targets.insert(call_site, targets.clone());
         targets
     }
-    
+
     /// Find method in a type (simplified)
     fn find_method_in_type(
         &self,
@@ -1196,32 +1223,36 @@ impl GradualTypeChecker {
     ) -> Option<crate::structural_type_checker::MethodSignature> {
         match ty {
             Type::Interface { methods, .. } => {
-                methods.iter()
-                    .find(|m| m.name == method_name)
-                    .map(|m| crate::structural_type_checker::MethodSignature {
+                methods.iter().find(|m| m.name == method_name).map(|m| {
+                    crate::structural_type_checker::MethodSignature {
                         name: m.name,
                         type_params: m.type_params.clone(),
-                        params: m.params.iter().map(|p| ParamInfo {
-                            name: Some(p.name),
-                            ty: p.ty.clone(),
-                            is_optional: false,
-                            is_varargs: p.is_varargs,
-                            is_keyword_only: false,
-                            is_positional_only: false,
-                            is_out: false,
-                            is_ref: p.is_mut,
-                            is_inout: false,
-                        }).collect(),
+                        params: m
+                            .params
+                            .iter()
+                            .map(|p| ParamInfo {
+                                name: Some(p.name),
+                                ty: p.ty.clone(),
+                                is_optional: false,
+                                is_varargs: p.is_varargs,
+                                is_keyword_only: false,
+                                is_positional_only: false,
+                                is_out: false,
+                                is_ref: p.is_mut,
+                                is_inout: false,
+                            })
+                            .collect(),
                         return_type: m.return_type.clone(),
                         is_static: m.is_static,
                         is_async: m.is_async,
                         variance: vec![],
-                    })
-            },
+                    }
+                })
+            }
             _ => None,
         }
     }
-    
+
     /// Generate type migration plan
     pub fn generate_migration_plan(
         &mut self,
@@ -1230,14 +1261,16 @@ impl GradualTypeChecker {
         span: Span,
     ) -> TypeMigration {
         let mut migration_path = Vec::new();
-        
+
         // Analyze what needs to change
         match (from_type, to_type) {
-            (Type::Any, concrete_type) |
-            (Type::Dynamic, concrete_type) => {
+            (Type::Any, concrete_type) | (Type::Dynamic, concrete_type) => {
                 // Migrating from dynamic to static
-                migration_path.push(MigrationStep::AddTypeAnnotation(span, concrete_type.clone()));
-                
+                migration_path.push(MigrationStep::AddTypeAnnotation(
+                    span,
+                    concrete_type.clone(),
+                ));
+
                 let check_id = CheckPointId::next();
                 migration_path.push(MigrationStep::AddRuntimeCheck(
                     check_id,
@@ -1249,7 +1282,7 @@ impl GradualTypeChecker {
                         span,
                     },
                 ));
-            },
+            }
             (Type::Nullable(inner), non_nullable) if !matches!(non_nullable, Type::Nullable(_)) => {
                 // Migrating from nullable to non-nullable
                 migration_path.push(MigrationStep::RefactorCode(
@@ -1257,13 +1290,13 @@ impl GradualTypeChecker {
                     "Add null checks before use".to_string(),
                 ));
                 migration_path.push(MigrationStep::AddTypeAnnotation(span, non_nullable.clone()));
-            },
+            }
             _ => {
                 // Generic migration
                 migration_path.push(MigrationStep::AddTypeAnnotation(span, to_type.clone()));
-            },
+            }
         }
-        
+
         TypeMigration {
             from_type: from_type.clone(),
             to_type: to_type.clone(),
@@ -1271,36 +1304,30 @@ impl GradualTypeChecker {
             confidence: self.calculate_migration_confidence(from_type, to_type),
         }
     }
-    
+
     /// Calculate confidence for type migration
-    fn calculate_migration_confidence(
-        &self,
-        from_type: &Type,
-        to_type: &Type,
-    ) -> ConfidenceLevel {
+    fn calculate_migration_confidence(&self, from_type: &Type, to_type: &Type) -> ConfidenceLevel {
         match (from_type, to_type) {
             // Same type - certain
             (a, b) if a == b => ConfidenceLevel::Certain,
-            
+
             // Any to concrete - medium confidence
             (Type::Any, _) => ConfidenceLevel::Medium,
-            
+
             // Dynamic to concrete - low confidence
             (Type::Dynamic, _) => ConfidenceLevel::Low,
-            
+
             // Nullable to non-nullable - high confidence if evidence
-            (Type::Nullable(inner), outer) if inner.as_ref() == outer => {
-                ConfidenceLevel::High
-            },
-            
+            (Type::Nullable(inner), outer) if inner.as_ref() == outer => ConfidenceLevel::High,
+
             _ => ConfidenceLevel::VeryLow,
         }
     }
-    
+
     /// Get type name for a type ID (placeholder)
     fn get_type_name(&self, type_id: TypeId) -> InternedString {
         InternedString::from_symbol(
-            string_interner::Symbol::try_from_usize(type_id.as_u32() as usize).unwrap()
+            string_interner::Symbol::try_from_usize(type_id.as_u32() as usize).unwrap(),
         )
     }
 }
@@ -1337,53 +1364,63 @@ mod tests {
     #[test]
     fn test_gradual_compatibility_any() {
         let mut checker = GradualTypeChecker::new();
-        
+
         let static_type = Type::Primitive(PrimitiveType::I32);
         let dynamic_type = Type::Any;
-        
-        let checks = checker.check_gradual_compatibility(
-            &static_type,
-            &dynamic_type,
-            BoundaryKind::DynamicToStatic,
-            Span::new(0, 0),
-        ).unwrap();
-        
+
+        let checks = checker
+            .check_gradual_compatibility(
+                &static_type,
+                &dynamic_type,
+                BoundaryKind::DynamicToStatic,
+                Span::new(0, 0),
+            )
+            .unwrap();
+
         // Any should be compatible with no checks needed
         assert!(checks.is_empty());
     }
-    
+
     #[test]
     fn test_dynamic_to_static_checks() {
         let mut checker = GradualTypeChecker::new();
-        
+
         let static_type = Type::Primitive(PrimitiveType::String);
         let dynamic_type = Type::Dynamic;
-        
-        let checks = checker.check_gradual_compatibility(
-            &static_type,
-            &dynamic_type,
-            BoundaryKind::DynamicToStatic,
-            Span::new(0, 0),
-        ).unwrap();
-        
+
+        let checks = checker
+            .check_gradual_compatibility(
+                &static_type,
+                &dynamic_type,
+                BoundaryKind::DynamicToStatic,
+                Span::new(0, 0),
+            )
+            .unwrap();
+
         // Should generate runtime type check
         assert!(!checks.is_empty());
-        assert!(matches!(checks[0].check_kind, RuntimeCheckKind::TypeAssertion));
+        assert!(matches!(
+            checks[0].check_kind,
+            RuntimeCheckKind::TypeAssertion
+        ));
     }
-    
+
     #[test]
     fn test_type_evidence_flow() {
         let mut checker = GradualTypeChecker::new();
         let var_id = VariableId::next();
-        
+
         // Add assignment evidence
-        checker.add_evidence(var_id, Evidence {
-            kind: EvidenceKind::Assignment(Type::Primitive(PrimitiveType::String)),
-            resulting_type: Type::Primitive(PrimitiveType::String),
-            location: Span::new(0, 0),
-            confidence: ConfidenceLevel::High,
-        });
-        
+        checker.add_evidence(
+            var_id,
+            Evidence {
+                kind: EvidenceKind::Assignment(Type::Primitive(PrimitiveType::String)),
+                resulting_type: Type::Primitive(PrimitiveType::String),
+                location: Span::new(0, 0),
+                confidence: ConfidenceLevel::High,
+            },
+        );
+
         let (current_type, confidence) = checker.get_variable_type(var_id).unwrap();
         assert_eq!(current_type, Type::Primitive(PrimitiveType::String));
         assert!(confidence >= ConfidenceLevel::High);

@@ -2,8 +2,8 @@
 //!
 //! Types and macros for creating ZRTL plugins that can be loaded by the Zyntax runtime.
 
-use std::ffi::c_char;
 use crate::TypeTag;
+use std::ffi::c_char;
 
 /// Current ZRTL format version
 pub const ZRTL_VERSION: u32 = 1;
@@ -96,7 +96,8 @@ impl ZrtlSigFlags {
 /// Special TypeTag constant for DynamicBox parameter type
 impl TypeTag {
     /// TypeTag indicating a DynamicBox parameter
-    pub const DYNAMIC_BOX: Self = Self::new(crate::TypeCategory::Opaque, 0xFFFF, crate::TypeFlags::NONE);
+    pub const DYNAMIC_BOX: Self =
+        Self::new(crate::TypeCategory::Opaque, 0xFFFF, crate::TypeFlags::NONE);
 }
 
 /// Symbol entry in the ZRTL symbol table (C ABI compatible)
@@ -125,7 +126,11 @@ impl ZrtlSymbol {
 
     /// Create a new symbol without signature
     pub const fn new(name: *const c_char, ptr: *const u8) -> Self {
-        Self { name, ptr, sig: std::ptr::null() }
+        Self {
+            name,
+            ptr,
+            sig: std::ptr::null(),
+        }
     }
 
     /// Create a new symbol with signature

@@ -6,7 +6,7 @@
 //! - Optional parsing
 //! - Built-in character classes
 
-use super::state::{ParserState, ParseResult, ParsedValue, ParseFailure};
+use super::state::{ParseFailure, ParseResult, ParsedValue, ParserState};
 
 /// Parse a literal string
 pub fn literal<'a>(state: &mut ParserState<'a>, s: &str) -> ParseResult<()> {
@@ -64,7 +64,10 @@ pub fn newline<'a>(state: &mut ParserState<'a>) -> ParseResult<()> {
 
 /// Parse a character in a range
 pub fn char_range<'a>(state: &mut ParserState<'a>, start: char, end: char) -> ParseResult<char> {
-    state.match_char(|c| c >= start && c <= end, &format!("'{}'..'{}'", start, end))
+    state.match_char(
+        |c| c >= start && c <= end,
+        &format!("'{}'..'{}'", start, end),
+    )
 }
 
 /// Parse a specific character
@@ -268,11 +271,7 @@ where
 }
 
 /// Try first parser, if it fails try second (ordered choice)
-pub fn choice<'a, T, F1, F2>(
-    state: &mut ParserState<'a>,
-    first: F1,
-    second: F2,
-) -> ParseResult<T>
+pub fn choice<'a, T, F1, F2>(state: &mut ParserState<'a>, first: F1, second: F2) -> ParseResult<T>
 where
     F1: FnOnce(&mut ParserState<'a>) -> ParseResult<T>,
     F2: FnOnce(&mut ParserState<'a>) -> ParseResult<T>,
@@ -318,7 +317,11 @@ pub fn choice_n<'a, T>(
         }
     }
 
-    ParseResult::Failure(last_error.unwrap_or_else(|| ParseFailure::new("choice", start_pos, state.line(), state.column())))
+    ParseResult::Failure(
+        last_error.unwrap_or_else(|| {
+            ParseFailure::new("choice", start_pos, state.line(), state.column())
+        }),
+    )
 }
 
 /// Run parsers in sequence, returning all results
@@ -423,10 +426,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zyntax_typed_ast::TypedASTBuilder;
     use zyntax_typed_ast::type_registry::TypeRegistry;
+    use zyntax_typed_ast::TypedASTBuilder;
 
-    fn make_state<'a>(input: &'a str, builder: &'a mut TypedASTBuilder, registry: &'a mut TypeRegistry) -> ParserState<'a> {
+    fn make_state<'a>(
+        input: &'a str,
+        builder: &'a mut TypedASTBuilder,
+        registry: &'a mut TypeRegistry,
+    ) -> ParserState<'a> {
         ParserState::new(input, builder, registry)
     }
 
@@ -490,11 +497,7 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut state = make_state("hello", &mut builder, &mut registry);
 
-        let result = choice(
-            &mut state,
-            |s| literal(s, "world"),
-            |s| literal(s, "hello"),
-        );
+        let result = choice(&mut state, |s| literal(s, "world"), |s| literal(s, "hello"));
         assert!(result.is_success());
     }
 

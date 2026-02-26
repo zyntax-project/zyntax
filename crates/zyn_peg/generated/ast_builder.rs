@@ -89,7 +89,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::decls_declarations)
             .cloned();
-        Ok(decls::default())
+        Ok(<decls>::default())
     }
     pub fn build_declarations(
         &mut self,
@@ -144,7 +144,7 @@ impl AstBuilderContext {
             .filter(|p| p.as_rule() == Rule::f_struct_field)
             .cloned()
             .collect();
-        Ok(f::default())
+        Ok(<f>::default())
     }
     pub fn build_struct_field(
         &mut self,
@@ -205,7 +205,7 @@ impl AstBuilderContext {
             .filter(|p| p.as_rule() == Rule::v_enum_variant)
             .cloned()
             .collect();
-        Ok(v::default())
+        Ok(<v>::default())
     }
     pub fn build_enum_variant(
         &mut self,
@@ -278,6 +278,21 @@ impl AstBuilderContext {
             body: None,
             is_extern: true,
         })
+    }
+    pub fn build_fn_decl(
+        &mut self,
+        pair: pest::iterators::Pair<Rule>,
+    ) -> Result<TypedNode<TypedDeclaration>, ParseError> {
+        let span = span_from_pest(pair.as_span());
+        let pair_str = pair.as_str();
+        let mut children = pair.into_inner().peekable();
+        let all_children: Vec<_> = children.collect();
+        let mut child_iter = all_children.iter();
+        let child_async_fn_decl = all_children
+            .iter()
+            .find(|p| p.as_rule() == Rule::async_fn_decl)
+            .cloned();
+        Ok(<TypedNode<TypedDeclaration>>::default())
     }
     pub fn build_async_fn_decl_with_params(
         &mut self,
@@ -415,7 +430,7 @@ impl AstBuilderContext {
             .filter(|p| p.as_rule() == Rule::p_fn_param_item)
             .cloned()
             .collect();
-        Ok(p::default())
+        Ok(<p>::default())
     }
     pub fn build_fn_param_item(
         &mut self,
@@ -430,7 +445,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::fn_param_any)
             .cloned();
-        Ok(fn_param_any::default())
+        Ok(<fn_param_any>::default())
     }
     pub fn build_comptime_param(
         &mut self,
@@ -476,6 +491,21 @@ impl AstBuilderContext {
             name: InternedString::new_global(name),
             ty: ty,
         })
+    }
+    pub fn build_const_decl(
+        &mut self,
+        pair: pest::iterators::Pair<Rule>,
+    ) -> Result<TypedNode<TypedDeclaration>, ParseError> {
+        let span = span_from_pest(pair.as_span());
+        let pair_str = pair.as_str();
+        let mut children = pair.into_inner().peekable();
+        let all_children: Vec<_> = children.collect();
+        let mut child_iter = all_children.iter();
+        let child_const_decl_typed = all_children
+            .iter()
+            .find(|p| p.as_rule() == Rule::const_decl_typed)
+            .cloned();
+        Ok(<TypedNode<TypedDeclaration>>::default())
     }
     pub fn build_const_decl_typed(
         &mut self,
@@ -527,6 +557,21 @@ impl AstBuilderContext {
             initializer: Some(init),
             mutability: Mutability::Immutable,
         })
+    }
+    pub fn build_var_decl(
+        &mut self,
+        pair: pest::iterators::Pair<Rule>,
+    ) -> Result<TypedNode<TypedDeclaration>, ParseError> {
+        let span = span_from_pest(pair.as_span());
+        let pair_str = pair.as_str();
+        let mut children = pair.into_inner().peekable();
+        let all_children: Vec<_> = children.collect();
+        let mut child_iter = all_children.iter();
+        let child_var_decl_typed = all_children
+            .iter()
+            .find(|p| p.as_rule() == Rule::var_decl_typed)
+            .cloned();
+        Ok(<TypedNode<TypedDeclaration>>::default())
     }
     pub fn build_var_decl_typed(
         &mut self,
@@ -696,7 +741,7 @@ impl AstBuilderContext {
         let mut children = pair.into_inner().peekable();
         let all_children: Vec<_> = children.collect();
         let mut child_iter = all_children.iter();
-        Ok(TypedStatement::Continue::default())
+        Ok(<TypedStatement::Continue>::default())
     }
     pub fn build_if_only(
         &mut self,
@@ -969,7 +1014,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::e_comparison_expr)
             .cloned();
-        Ok(e::default())
+        Ok(<e>::default())
     }
     pub fn build_comparison_expr(
         &mut self,
@@ -988,7 +1033,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::op_comparison_op)
             .cloned();
-        Ok(left::default())
+        Ok(<left>::default())
     }
     pub fn build_add_expr(
         &mut self,
@@ -1007,7 +1052,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::op_add_op)
             .cloned();
-        Ok(left::default())
+        Ok(<left>::default())
     }
     pub fn build_mul_expr(
         &mut self,
@@ -1026,7 +1071,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::op_mul_op)
             .cloned();
-        Ok(left::default())
+        Ok(<left>::default())
     }
     pub fn build_unary_with_op(
         &mut self,
@@ -1086,7 +1131,7 @@ impl AstBuilderContext {
             .filter(|p| p.as_rule() == Rule::a_call_arg)
             .cloned()
             .collect();
-        Ok(a::default())
+        Ok(<a>::default())
     }
     pub fn build_call_arg(&mut self, pair: pest::iterators::Pair<Rule>) -> Result<e, ParseError> {
         let span = span_from_pest(pair.as_span());
@@ -1098,7 +1143,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::e_expr)
             .cloned();
-        Ok(e::default())
+        Ok(<e>::default())
     }
     pub fn build_field_expr(
         &mut self,
@@ -1210,7 +1255,7 @@ impl AstBuilderContext {
             .filter(|p| p.as_rule() == Rule::f_struct_init_field)
             .cloned()
             .collect();
-        Ok(f::default())
+        Ok(<f>::default())
     }
     pub fn build_struct_init_field(
         &mut self,
@@ -1263,7 +1308,7 @@ impl AstBuilderContext {
             .filter(|p| p.as_rule() == Rule::e_array_element)
             .cloned()
             .collect();
-        Ok(e::default())
+        Ok(<e>::default())
     }
     pub fn build_array_element(
         &mut self,
@@ -1278,7 +1323,7 @@ impl AstBuilderContext {
             .iter()
             .find(|p| p.as_rule() == Rule::v_expr)
             .cloned();
-        Ok(v::default())
+        Ok(<v>::default())
     }
     pub fn build_identifier_expr(
         &mut self,
@@ -1308,6 +1353,21 @@ impl AstBuilderContext {
         let mut child_iter = all_children.iter();
         Ok(TypedExpression::Literal {
             value: TypedLiteral::Bool { value: text },
+        })
+    }
+    pub fn build_float_literal(
+        &mut self,
+        pair: pest::iterators::Pair<Rule>,
+    ) -> Result<TypedExpression::Literal, ParseError> {
+        let span = span_from_pest(pair.as_span());
+        let pair_str = pair.as_str();
+        let mut children = pair.into_inner().peekable();
+        let all_children: Vec<_> = children.collect();
+        let mut child_iter = all_children.iter();
+        Ok(TypedExpression::Literal {
+            value: TypedLiteral::Float {
+                value: parse_float(text),
+            },
         })
     }
     pub fn build_integer_literal(
@@ -1393,28 +1453,6 @@ impl AstBuilderContext {
             )))
         }
     }
-    pub fn build_fn_decl(
-        &mut self,
-        pair: pest::iterators::Pair<Rule>,
-    ) -> Result<TypedNode<TypedExpression>, ParseError> {
-        let span = span_from_pest(pair.as_span());
-        if let Some(inner) = pair.into_inner().next() {
-            match inner.as_rule() {
-                Rule::async_fn_decl => self.build_async_fn_decl(inner),
-                Rule::sync_fn_decl => self.build_sync_fn_decl(inner),
-                _ => Err(ParseError(format!(
-                    "Unexpected rule in {}: {:?}",
-                    stringify!(build_fn_decl),
-                    inner.as_rule()
-                ))),
-            }
-        } else {
-            Err(ParseError(format!(
-                "Empty {} rule",
-                stringify!(build_fn_decl)
-            )))
-        }
-    }
     pub fn build_sync_fn_decl(
         &mut self,
         pair: pest::iterators::Pair<Rule>,
@@ -1478,50 +1516,6 @@ impl AstBuilderContext {
             Err(ParseError(format!(
                 "Empty {} rule",
                 stringify!(build_fn_param_any)
-            )))
-        }
-    }
-    pub fn build_const_decl(
-        &mut self,
-        pair: pest::iterators::Pair<Rule>,
-    ) -> Result<TypedDeclaration::Variable, ParseError> {
-        let span = span_from_pest(pair.as_span());
-        if let Some(inner) = pair.into_inner().next() {
-            match inner.as_rule() {
-                Rule::const_decl_typed => self.build_const_decl_typed(inner),
-                Rule::const_decl_untyped => self.build_const_decl_untyped(inner),
-                _ => Err(ParseError(format!(
-                    "Unexpected rule in {}: {:?}",
-                    stringify!(build_const_decl),
-                    inner.as_rule()
-                ))),
-            }
-        } else {
-            Err(ParseError(format!(
-                "Empty {} rule",
-                stringify!(build_const_decl)
-            )))
-        }
-    }
-    pub fn build_var_decl(
-        &mut self,
-        pair: pest::iterators::Pair<Rule>,
-    ) -> Result<TypedDeclaration::Variable, ParseError> {
-        let span = span_from_pest(pair.as_span());
-        if let Some(inner) = pair.into_inner().next() {
-            match inner.as_rule() {
-                Rule::var_decl_typed => self.build_var_decl_typed(inner),
-                Rule::var_decl_untyped => self.build_var_decl_untyped(inner),
-                _ => Err(ParseError(format!(
-                    "Unexpected rule in {}: {:?}",
-                    stringify!(build_var_decl),
-                    inner.as_rule()
-                ))),
-            }
-        } else {
-            Err(ParseError(format!(
-                "Empty {} rule",
-                stringify!(build_var_decl)
             )))
         }
     }
@@ -1767,6 +1761,7 @@ impl AstBuilderContext {
                 Rule::array_literal => self.build_array_literal(inner),
                 Rule::bool_literal => self.build_bool_literal(inner),
                 Rule::string_literal => self.build_string_literal(inner),
+                Rule::float_literal => self.build_float_literal(inner),
                 Rule::integer_literal => self.build_integer_literal(inner),
                 Rule::identifier_expr => self.build_identifier_expr(inner),
                 _ => Err(ParseError(format!(
@@ -1777,6 +1772,30 @@ impl AstBuilderContext {
             }
         } else {
             Err(ParseError(format!("Empty {} rule", stringify!(build_atom))))
+        }
+    }
+    pub fn build_literal(
+        &mut self,
+        pair: pest::iterators::Pair<Rule>,
+    ) -> Result<TypedExpression::Literal, ParseError> {
+        let span = span_from_pest(pair.as_span());
+        if let Some(inner) = pair.into_inner().next() {
+            match inner.as_rule() {
+                Rule::float_literal => self.build_float_literal(inner),
+                Rule::integer_literal => self.build_integer_literal(inner),
+                Rule::bool_literal => self.build_bool_literal(inner),
+                Rule::string_literal => self.build_string_literal(inner),
+                _ => Err(ParseError(format!(
+                    "Unexpected rule in {}: {:?}",
+                    stringify!(build_literal),
+                    inner.as_rule()
+                ))),
+            }
+        } else {
+            Err(ParseError(format!(
+                "Empty {} rule",
+                stringify!(build_literal)
+            )))
         }
     }
     pub fn build_string_inner(

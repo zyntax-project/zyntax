@@ -1,14 +1,13 @@
 //! # AST Lowering Pipeline
-//! 
+//!
 //! Orchestrates the transformation from TypedAST to HIR in SSA form,
 //! ready for both Cranelift and LLVM backends.
 
-use std::sync::{Arc, Mutex};
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use zyntax_typed_ast::{
-    TypedProgram, TypedDeclaration, TypedFunction, TypedNode,
-    InternedString, Type, Visibility, Mutability, AstArena, TypeId,
-    TypedEffect, TypedEffectHandler,
+    AstArena, InternedString, Mutability, Type, TypeId, TypedDeclaration, TypedEffect,
+    TypedEffectHandler, TypedFunction, TypedNode, TypedProgram, Visibility,
 };
 
 /// Helper to compute a hash for generating synthetic TypeIds
@@ -17,13 +16,12 @@ fn hash_string(s: &str) -> u64 {
     s.hash(&mut hasher);
     hasher.finish()
 }
+use crate::cfg::{CfgBuilder, ControlFlowGraph};
 use crate::hir::{
-    HirModule, HirFunction, HirFunctionSignature, HirParam, HirType,
-    ParamAttributes, OwnershipMode, HirId, HirLifetime,
-    HirEffect, HirEffectOp, HirEffectHandler, HirEffectHandlerImpl, HirHandlerField,
-    HirTypeParam,
+    HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirEffectOp, HirFunction,
+    HirFunctionSignature, HirHandlerField, HirId, HirLifetime, HirModule, HirParam, HirType,
+    HirTypeParam, OwnershipMode, ParamAttributes,
 };
-use crate::cfg::{ControlFlowGraph, CfgBuilder};
 use crate::ssa::{SsaBuilder, SsaForm};
 use crate::CompilerResult;
 use std::collections::HashMap;
@@ -82,7 +80,11 @@ impl TargetData {
         match ty {
             Type::Primitive(prim) => self.primitive_size(prim),
             Type::Reference { .. } => self.pointer_size,
-            Type::Array { element_type, size: Some(size_val), .. } => {
+            Type::Array {
+                element_type,
+                size: Some(size_val),
+                ..
+            } => {
                 let count = match size_val {
                     zyntax_typed_ast::ConstValue::UInt(u) => *u as usize,
                     zyntax_typed_ast::ConstValue::Int(i) => (*i).max(0) as usize,
@@ -93,9 +95,7 @@ impl TargetData {
                 // Align each element
                 Self::align_to(elem_size, elem_align) * count
             }
-            Type::Tuple(elems) => {
-                self.calculate_struct_size(elems.iter().collect())
-            }
+            Type::Tuple(elems) => self.calculate_struct_size(elems.iter().collect()),
             Type::Struct { fields, .. } => {
                 let field_types: Vec<&Type> = fields.iter().map(|f| &f.ty).collect();
                 self.calculate_struct_size(field_types)
@@ -116,18 +116,12 @@ impl TargetData {
             Type::Primitive(prim) => self.primitive_alignment(prim),
             Type::Reference { .. } => self.pointer_alignment,
             Type::Array { element_type, .. } => self.align_of(element_type),
-            Type::Tuple(elems) => {
-                elems.iter()
-                    .map(|e| self.align_of(e))
-                    .max()
-                    .unwrap_or(1)
-            }
-            Type::Struct { fields, .. } => {
-                fields.iter()
-                    .map(|f| self.align_of(&f.ty))
-                    .max()
-                    .unwrap_or(1)
-            }
+            Type::Tuple(elems) => elems.iter().map(|e| self.align_of(e)).max().unwrap_or(1),
+            Type::Struct { fields, .. } => fields
+                .iter()
+                .map(|f| self.align_of(&f.ty))
+                .max()
+                .unwrap_or(1),
             Type::Function { .. } => self.pointer_alignment,
             _ => self.pointer_alignment, // Conservative default
         }
@@ -280,9 +274,8 @@ pub struct ImportedItem {
 
 // Re-export import resolver types from typed_ast
 pub use zyntax_typed_ast::import_resolver::{
-    ImportResolver, ImportContext, ImportManager, ImportError,
-    ResolvedImport, ExportedSymbol, SymbolKind, ModuleArchitecture,
-    ChainedResolver, BuiltinResolver,
+    BuiltinResolver, ChainedResolver, ExportedSymbol, ImportContext, ImportError, ImportManager,
+    ImportResolver, ModuleArchitecture, ResolvedImport, SymbolKind,
 };
 
 /// Lowering configuration
@@ -313,7 +306,10 @@ impl std::fmt::Debug for LoweringConfig {
             .field("target_triple", &self.target_triple)
             .field("hot_reload", &self.hot_reload)
             .field("strict_mode", &self.strict_mode)
-            .field("import_resolver", &self.import_resolver.as_ref().map(|r| r.resolver_name()))
+            .field(
+                "import_resolver",
+                &self.import_resolver.as_ref().map(|r| r.resolver_name()),
+            )
             .finish()
     }
 }
@@ -362,10 +358,10 @@ pub struct LoweringPipeline {
 pub trait LoweringPass: Send + Sync {
     /// Name of this pass
     fn name(&self) -> &'static str;
-    
+
     /// Dependencies this pass requires
     fn dependencies(&self) -> &[&'static str];
-    
+
     /// Run this pass
     fn run(&mut self, context: &mut LoweringContext) -> CompilerResult<()>;
 }
@@ -380,11 +376,16 @@ impl LoweringContext {
         // Initialize symbol table with builtins from config
         let mut symbols = SymbolTable::default();
         if !config.builtins.is_empty() {
-            log::debug!("[LOWERING] Populating extern_link_names with {} builtins", config.builtins.len());
+            log::debug!(
+                "[LOWERING] Populating extern_link_names with {} builtins",
+                config.builtins.len()
+            );
         }
         for (alias, target) in &config.builtins {
             let alias_interned = InternedString::new_global(alias);
-            symbols.extern_link_names.insert(alias_interned, target.clone());
+            symbols
+                .extern_link_names
+                .insert(alias_interned, target.clone());
             log::trace!("[LOWERING] Added builtin: '{}' -> '{}'", alias, target);
         }
 
@@ -396,7 +397,8 @@ impl LoweringContext {
             diagnostics: Vec::new(),
             config,
             vtable_registry: crate::vtable_registry::VtableRegistry::new(),
-            associated_type_resolver: crate::associated_type_resolver::AssociatedTypeResolver::new(),
+            associated_type_resolver: crate::associated_type_resolver::AssociatedTypeResolver::new(
+            ),
             target_data: TargetData::host(),
             import_metadata: Vec::new(),
             import_context: ImportContext::default(),
@@ -482,7 +484,12 @@ impl LoweringContext {
     }
 
     /// Add a diagnostic
-    pub fn diagnostic(&mut self, level: DiagnosticLevel, message: String, span: Option<zyntax_typed_ast::Span>) {
+    pub fn diagnostic(
+        &mut self,
+        level: DiagnosticLevel,
+        message: String,
+        span: Option<zyntax_typed_ast::Span>,
+    ) {
         self.diagnostics.push(LoweringDiagnostic {
             level,
             message,
@@ -535,16 +542,19 @@ impl LoweringContext {
     /// Run type checking and inference on the program
     /// This is Issue 0 Phase 1: integrate type inference into lowering
     fn run_type_checking(&mut self, program: &mut TypedProgram) -> CompilerResult<()> {
-        use zyntax_typed_ast::type_checker::{TypeChecker, TypeCheckOptions};
+        use zyntax_typed_ast::type_checker::{TypeCheckOptions, TypeChecker};
 
         // Create type checker - needs Box<TypeRegistry>
         let registry = Box::new((*self.type_registry).clone());
-        let mut type_checker = TypeChecker::with_options(registry, TypeCheckOptions {
-            strict_nulls: false,  // Be lenient for now
-            strict_functions: false,
-            no_implicit_any: false,  // Allow Unknown types
-            check_unreachable: false,
-        });
+        let mut type_checker = TypeChecker::with_options(
+            registry,
+            TypeCheckOptions {
+                strict_nulls: false, // Be lenient for now
+                strict_functions: false,
+                no_implicit_any: false, // Allow Unknown types
+                check_unreachable: false,
+            },
+        );
 
         // Run type checking (validates and performs internal inference)
         type_checker.check_program(program);
@@ -565,7 +575,9 @@ impl LoweringContext {
             use zyntax_typed_ast::source::SourceMap;
 
             // Check if errors are only from stdlib
-            let has_stdlib_sources = program.source_files.iter()
+            let has_stdlib_sources = program
+                .source_files
+                .iter()
                 .any(|sf| sf.name.contains("stdlib/"));
 
             // If we have stdlib sources, suppress the diagnostic output
@@ -589,7 +601,9 @@ impl LoweringContext {
         }
 
         // Suppress error count if only stdlib errors
-        let has_stdlib_sources = program.source_files.iter()
+        let has_stdlib_sources = program
+            .source_files
+            .iter()
             .any(|sf| sf.name.contains("stdlib/"));
         let (error_count, warning_count) = if has_stdlib_sources {
             (0, 0) // Suppress stdlib type errors (known false positives)
@@ -600,8 +614,10 @@ impl LoweringContext {
         // TODO (Issue 0 Phase 2): Make type checking stricter once inference properly modifies AST
         // For now, just warn about errors rather than failing compilation
         if error_count > 0 {
-            eprintln!("WARNING: Type checking found {} error(s), {} warning(s) - continuing compilation",
-                error_count, warning_count);
+            eprintln!(
+                "WARNING: Type checking found {} error(s), {} warning(s) - continuing compilation",
+                error_count, warning_count
+            );
             eprintln!("NOTE: Issue 0 Phase 1 complete - type checking integrated but lenient");
             eprintln!("      Enable strict checking with ZYNTAX_STRICT_TYPES=1\n");
 
@@ -624,10 +640,10 @@ impl LoweringContext {
     /// Resolve method call return types by looking up trait implementations
     /// This updates MethodCall expressions with Type::Any to have the correct return type
     fn resolve_method_call_types(&mut self, program: &mut TypedProgram) -> CompilerResult<()> {
-        use zyntax_typed_ast::typed_ast::TypedDeclaration;
-        use zyntax_typed_ast::TypedExpression;
-        use zyntax_typed_ast::Type;
         use std::collections::HashMap;
+        use zyntax_typed_ast::typed_ast::TypedDeclaration;
+        use zyntax_typed_ast::Type;
+        use zyntax_typed_ast::TypedExpression;
 
         // Iterate through all declarations and resolve method calls
         for decl in &mut program.declarations {
@@ -648,7 +664,10 @@ impl LoweringContext {
     fn resolve_method_calls_in_block(
         &self,
         block: &mut zyntax_typed_ast::TypedBlock,
-        var_types: &mut std::collections::HashMap<zyntax_typed_ast::InternedString, zyntax_typed_ast::Type>,
+        var_types: &mut std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            zyntax_typed_ast::Type,
+        >,
     ) -> CompilerResult<()> {
         for stmt in &mut block.statements {
             self.resolve_method_calls_in_statement(stmt, var_types)?;
@@ -660,7 +679,10 @@ impl LoweringContext {
     fn resolve_method_calls_in_statement(
         &self,
         stmt: &mut zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>,
-        var_types: &mut std::collections::HashMap<zyntax_typed_ast::InternedString, zyntax_typed_ast::Type>,
+        var_types: &mut std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            zyntax_typed_ast::Type,
+        >,
     ) -> CompilerResult<()> {
         use zyntax_typed_ast::typed_ast::TypedStatement;
         use zyntax_typed_ast::Type;
@@ -696,9 +718,12 @@ impl LoweringContext {
     fn resolve_method_calls_in_expression(
         &self,
         expr: &mut zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>,
-        var_types: &std::collections::HashMap<zyntax_typed_ast::InternedString, zyntax_typed_ast::Type>,
+        var_types: &std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            zyntax_typed_ast::Type,
+        >,
     ) -> CompilerResult<()> {
-        use zyntax_typed_ast::{TypedExpression, Type};
+        use zyntax_typed_ast::{Type, TypedExpression};
 
         match &mut expr.node {
             TypedExpression::MethodCall(method_call) => {
@@ -711,7 +736,9 @@ impl LoweringContext {
                 // If the method call has Type::Any or Type::Unknown, resolve it
                 // First, get the actual receiver type (may need to look up from var_types)
                 if matches!(expr.ty, Type::Any | Type::Unknown) {
-                    let receiver_type = if let TypedExpression::Variable(var_name) = &method_call.receiver.node {
+                    let receiver_type = if let TypedExpression::Variable(var_name) =
+                        &method_call.receiver.node
+                    {
                         // First check if this is a type name (static method call like Tensor::arange)
                         if let Some(type_def) = self.type_registry.get_type_by_name(*var_name) {
                             // This is a static method call - look for the method in the type's methods
@@ -747,21 +774,32 @@ impl LoweringContext {
                                 type_args: vec![],
                                 const_args: vec![],
                                 variance: vec![],
-                                nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+                                nullability:
+                                    zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
                             }
                         } else {
                             // Not a type name, try looking up as variable
-                            var_types.get(var_name).cloned().unwrap_or_else(|| method_call.receiver.ty.clone())
+                            var_types
+                                .get(var_name)
+                                .cloned()
+                                .unwrap_or_else(|| method_call.receiver.ty.clone())
                         }
                     } else {
                         method_call.receiver.ty.clone()
                     };
 
-                    if let Type::Named { id: receiver_type_id, .. } = &receiver_type {
+                    if let Type::Named {
+                        id: receiver_type_id,
+                        ..
+                    } = &receiver_type
+                    {
                         // Look up the trait implementation
                         for (_trait_id, impls) in self.type_registry.iter_implementations() {
                             for impl_def in impls {
-                                if let Type::Named { id: impl_type_id, .. } = &impl_def.for_type {
+                                if let Type::Named {
+                                    id: impl_type_id, ..
+                                } = &impl_def.for_type
+                                {
                                     if *impl_type_id == *receiver_type_id {
                                         // Find the method in this impl
                                         for method in &impl_def.methods {
@@ -789,7 +827,9 @@ impl LoweringContext {
                         let method_name = method_name_interned.resolve_global().unwrap_or_default();
 
                         // Look up the type and find the method return type
-                        if let Some(type_def) = self.type_registry.get_type_by_name(type_name_interned) {
+                        if let Some(type_def) =
+                            self.type_registry.get_type_by_name(type_name_interned)
+                        {
                             // First check inherent methods on the type
                             for method in &type_def.methods {
                                 if method.name == method_name_interned {
@@ -801,11 +841,14 @@ impl LoweringContext {
 
                             // If not found in inherent methods, check impl blocks
                             if matches!(expr.ty, Type::Any | Type::Unknown) {
-                                for (_trait_id, impls) in self.type_registry.iter_implementations() {
+                                for (_trait_id, impls) in self.type_registry.iter_implementations()
+                                {
                                     for impl_def in impls {
                                         let impl_for_this_type = match &impl_def.for_type {
                                             Type::Named { id, .. } => *id == type_def.id,
-                                            Type::Extern { name, .. } => *name == type_name_interned,
+                                            Type::Extern { name, .. } => {
+                                                *name == type_name_interned
+                                            }
                                             Type::Unresolved(name) => *name == type_name_interned,
                                             _ => false,
                                         };
@@ -823,10 +866,9 @@ impl LoweringContext {
                         }
 
                         // Also try to resolve the mangled name
-                        if let Some(mangled_name) = self.resolve_associated_function_to_mangled(
-                            &type_name,
-                            &method_name
-                        ) {
+                        if let Some(mangled_name) =
+                            self.resolve_associated_function_to_mangled(&type_name, &method_name)
+                        {
                             // Replace the Path with the mangled Variable name
                             let mangled_interned = InternedString::new_global(&mangled_name);
                             call.callee.node = TypedExpression::Variable(mangled_interned);
@@ -835,11 +877,10 @@ impl LoweringContext {
                 }
                 // Also check for Variable with "::" in name (fallback for other parsing)
                 else if let TypedExpression::Variable(func_name) = &call.callee.node {
-                    let func_name_str = func_name.resolve_global()
-                        .or_else(|| {
-                            let arena = self.arena.lock().unwrap();
-                            arena.resolve_string(*func_name).map(|s| s.to_string())
-                        });
+                    let func_name_str = func_name.resolve_global().or_else(|| {
+                        let arena = self.arena.lock().unwrap();
+                        arena.resolve_string(*func_name).map(|s| s.to_string())
+                    });
 
                     if let Some(name_str) = func_name_str {
                         // Check if this looks like an associated function call (contains ::)
@@ -851,12 +892,12 @@ impl LoweringContext {
                                 let method_name = parts[1];
 
                                 // Look up the type and find the trait impl
-                                if let Some(mangled_name) = self.resolve_associated_function_to_mangled(
-                                    type_name,
-                                    method_name
-                                ) {
+                                if let Some(mangled_name) = self
+                                    .resolve_associated_function_to_mangled(type_name, method_name)
+                                {
                                     // Replace the Variable with the mangled name
-                                    let mangled_interned = InternedString::new_global(&mangled_name);
+                                    let mangled_interned =
+                                        InternedString::new_global(&mangled_name);
                                     call.callee.node = TypedExpression::Variable(mangled_interned);
                                 }
                             }
@@ -921,7 +962,10 @@ impl LoweringContext {
         }
 
         if unknown_count > 0 {
-            eprintln!("\n[ZYNTAX_DEBUG_TYPES] Found {} Unknown types in {} functions", unknown_count, func_count);
+            eprintln!(
+                "\n[ZYNTAX_DEBUG_TYPES] Found {} Unknown types in {} functions",
+                unknown_count, func_count
+            );
             eprintln!("[ZYNTAX_DEBUG_TYPES] Issue 0 Phase 1: Type checking integrated but inference doesn't modify AST yet");
             eprintln!("[ZYNTAX_DEBUG_TYPES] Next step: Implement AST transformation to apply inferred types\n");
         } else {
@@ -937,7 +981,7 @@ impl LoweringContext {
                     let func_id = crate::hir::HirId::new();
                     self.symbols.functions.insert(func.name, func_id);
                 }
-                
+
                 TypedDeclaration::Class(class_decl) => {
                     // Pre-register class methods in symbol table
                     for method in &class_decl.methods {
@@ -952,10 +996,13 @@ impl LoweringContext {
                         let ctor_id = crate::hir::HirId::new();
                         // Constructors: ClassName_constructor_N
                         // Use resolve_global() for portability across interner sources
-                        let class_name_str = class_decl.name.resolve_global()
+                        let class_name_str = class_decl
+                            .name
+                            .resolve_global()
                             .unwrap_or_else(|| "UnknownClass".to_string());
                         let mut arena = self.arena.lock().unwrap();
-                        let ctor_name = arena.intern_string(&format!("{}_constructor_{}", class_name_str, i));
+                        let ctor_name =
+                            arena.intern_string(&format!("{}_constructor_{}", class_name_str, i));
                         drop(arena);
                         self.symbols.functions.insert(ctor_name, ctor_id);
                     }
@@ -974,7 +1021,8 @@ impl LoweringContext {
                     // This must match the mangling done in lower_impl_block
 
                     // Check if implementing type is extern struct
-                    let is_extern_struct = matches!(&impl_block.for_type, zyntax_typed_ast::Type::Extern { .. });
+                    let is_extern_struct =
+                        matches!(&impl_block.for_type, zyntax_typed_ast::Type::Extern { .. });
 
                     // Get the implementing type name
                     let type_name = match &impl_block.for_type {
@@ -1000,7 +1048,9 @@ impl LoweringContext {
                                 // Try with fresh InternedString in case of arena mismatch
                                 let name_str = name.resolve_global().unwrap_or_default();
                                 let fresh_name = InternedString::new_global(&name_str);
-                                if let Some(type_def) = self.type_registry.get_type_by_name(fresh_name) {
+                                if let Some(type_def) =
+                                    self.type_registry.get_type_by_name(fresh_name)
+                                {
                                     type_def.name
                                 } else {
                                     // For extern struct, use the name directly
@@ -1020,19 +1070,30 @@ impl LoweringContext {
 
                         // Generate mangled name matching lower_impl_block
                         let mangled_name = if is_inherent {
-                            let type_name_str = type_name.resolve_global()
+                            let type_name_str = type_name
+                                .resolve_global()
                                 .unwrap_or_else(|| "UnknownType".to_string());
                             // Strip $ prefix if present (extern struct names have runtime_prefix)
-                            let base_type_name = type_name_str.strip_prefix('$').unwrap_or(&type_name_str);
-                            let method_name_str = method.name.resolve_global()
+                            let base_type_name =
+                                type_name_str.strip_prefix('$').unwrap_or(&type_name_str);
+                            let method_name_str = method
+                                .name
+                                .resolve_global()
                                 .unwrap_or_else(|| "unknown_method".to_string());
 
                             // Use consistent TypeName$method naming for all extern struct methods
                             // ZRTL symbols start with $ (e.g., $Tensor$sum_f32), so no collision
-                            InternedString::new_global(&format!("{}${}", base_type_name, method_name_str))
+                            InternedString::new_global(&format!(
+                                "{}${}",
+                                base_type_name, method_name_str
+                            ))
                         } else {
                             // Trait method: {TypeName}${TraitName}${method_name}
-                            self.mangle_trait_method_name(type_name, impl_block.trait_name, method.name)
+                            self.mangle_trait_method_name(
+                                type_name,
+                                impl_block.trait_name,
+                                method.name,
+                            )
                         };
 
                         self.symbols.functions.insert(mangled_name, method_id);
@@ -1057,7 +1118,7 @@ impl LoweringContext {
 
         Ok(())
     }
-    
+
     /// Lower a declaration
     fn lower_declaration(&mut self, decl: &TypedNode<TypedDeclaration>) -> CompilerResult<()> {
         match &decl.node {
@@ -1071,11 +1132,11 @@ impl LoweringContext {
                     self.symbols.functions.remove(&func.name);
                 }
             }
-            
+
             TypedDeclaration::Variable(var) => {
                 self.lower_global_variable(var)?;
             }
-            
+
             TypedDeclaration::Import(import) => {
                 self.lower_import(import)?;
             }
@@ -1094,14 +1155,17 @@ impl LoweringContext {
                 if let Err(e) = self.lower_impl_block(impl_block) {
                     let trait_name = impl_block.trait_name.resolve_global().unwrap_or_default();
                     let type_name = match &impl_block.for_type {
-                        zyntax_typed_ast::Type::Named { id, .. } => {
-                            self.type_registry.get_type_by_id(*id)
-                                .map(|t| t.name.resolve_global().unwrap_or_default())
-                                .unwrap_or_else(|| format!("{:?}", id))
-                        }
-                        _ => format!("{:?}", impl_block.for_type)
+                        zyntax_typed_ast::Type::Named { id, .. } => self
+                            .type_registry
+                            .get_type_by_id(*id)
+                            .map(|t| t.name.resolve_global().unwrap_or_default())
+                            .unwrap_or_else(|| format!("{:?}", id)),
+                        _ => format!("{:?}", impl_block.for_type),
                     };
-                    eprintln!("[LOWERING WARN] Skipping impl {} for {}: {:?}", trait_name, type_name, e);
+                    eprintln!(
+                        "[LOWERING WARN] Skipping impl {} for {}: {:?}",
+                        trait_name, type_name, e
+                    );
                 }
             }
 
@@ -1126,7 +1190,7 @@ impl LoweringContext {
 
         Ok(())
     }
-    
+
     /// Lower a function
     fn lower_function(&mut self, func: &TypedFunction) -> CompilerResult<()> {
         // Convert function signature
@@ -1150,12 +1214,15 @@ impl LoweringContext {
             // Set link_name if specified (maps alias to actual symbol)
             // e.g., "image_load" -> "$Image$load"
             if let Some(ref link_name) = func.link_name {
-                let link_name_str = link_name.resolve_global()
+                let link_name_str = link_name
+                    .resolve_global()
                     .unwrap_or_else(|| link_name.to_string());
                 hir_func.link_name = Some(link_name_str.clone());
 
                 // Register the alias -> link_name mapping for SSA call resolution
-                self.symbols.extern_link_names.insert(func.name, link_name_str);
+                self.symbols
+                    .extern_link_names
+                    .insert(func.name, link_name_str);
             }
 
             // Extern functions have no body - clear the default entry block
@@ -1180,15 +1247,21 @@ impl LoweringContext {
         let typed_cfg = typed_cfg_builder.build_from_block(body, hir_func.entry_block)?;
 
         // Debug: check TypedCFG
-        log::trace!("[LOWERING] TypedCFG for function {:?} (is_async={}): entry={:?}, nodes={}, edges={}",
-            func.name, func.is_async, hir_func.entry_block, typed_cfg.graph.node_count(), typed_cfg.graph.edge_count());
+        log::trace!(
+            "[LOWERING] TypedCFG for function {:?} (is_async={}): entry={:?}, nodes={}, edges={}",
+            func.name,
+            func.is_async,
+            hir_func.entry_block,
+            typed_cfg.graph.node_count(),
+            typed_cfg.graph.edge_count()
+        );
 
         // Convert to SSA form, processing TypedStatements to emit HIR instructions
         let ssa_builder = SsaBuilder::new(
             hir_func,
             self.type_registry.clone(),
             self.arena.clone(),
-            self.symbols.functions.clone()
+            self.symbols.functions.clone(),
         )
         .with_return_type(func.return_type.clone())
         .with_extern_link_names(self.symbols.extern_link_names.clone());
@@ -1196,7 +1269,11 @@ impl LoweringContext {
 
         // Debug: check SSA result
         if func.is_async {
-            log::trace!("[LOWERING] After SSA build for async function {:?}: {} blocks", func.name, ssa.function.blocks.len());
+            log::trace!(
+                "[LOWERING] After SSA build for async function {:?}: {} blocks",
+                func.name,
+                ssa.function.blocks.len()
+            );
         }
 
         // Verify SSA properties
@@ -1204,10 +1281,17 @@ impl LoweringContext {
 
         // Debug: print phi count before optimization
         let total_phis_before: usize = ssa.function.blocks.values().map(|b| b.phis.len()).sum();
-        log::debug!("[Lowering] Before optimize_trivial_phis: {} total phis", total_phis_before);
+        log::debug!(
+            "[Lowering] Before optimize_trivial_phis: {} total phis",
+            total_phis_before
+        );
         for (block_id, block) in &ssa.function.blocks {
             if !block.phis.is_empty() {
-                log::debug!("[Lowering]   Block {:?} has {} phis", block_id, block.phis.len());
+                log::debug!(
+                    "[Lowering]   Block {:?} has {} phis",
+                    block_id,
+                    block.phis.len()
+                );
             }
         }
 
@@ -1217,7 +1301,10 @@ impl LoweringContext {
 
         // Debug: print phi count after optimization
         let total_phis_after: usize = ssa.function.blocks.values().map(|b| b.phis.len()).sum();
-        log::debug!("[Lowering] After optimize_trivial_phis: {} total phis", total_phis_after);
+        log::debug!(
+            "[Lowering] After optimize_trivial_phis: {} total phis",
+            total_phis_after
+        );
 
         hir_func = ssa.function;
 
@@ -1233,8 +1320,12 @@ impl LoweringContext {
 
         // Gap 6 Phase 2: Transform async functions to state machines
         if func.is_async {
-            log::trace!("[LOWERING] Before transform_async_function: {:?} with {} values, {} blocks",
-                hir_func.name, hir_func.values.len(), hir_func.blocks.len());
+            log::trace!(
+                "[LOWERING] Before transform_async_function: {:?} with {} values, {} blocks",
+                hir_func.name,
+                hir_func.values.len(),
+                hir_func.blocks.len()
+            );
             hir_func = self.transform_async_function(hir_func)?;
         }
 
@@ -1251,7 +1342,10 @@ impl LoweringContext {
     /// - Promise contains `{state_machine: *mut u8, poll_fn: fn(*mut u8) -> i64}`
     /// - The poll function is generated internally (not exposed as `_poll`)
     /// - When you call foo(x), you get a Promise that holds the state machine and poll fn
-    fn transform_async_function(&mut self, original_func: HirFunction) -> CompilerResult<HirFunction> {
+    fn transform_async_function(
+        &mut self,
+        original_func: HirFunction,
+    ) -> CompilerResult<HirFunction> {
         // Create async compiler
         let mut async_compiler = crate::async_support::AsyncCompiler::new();
 
@@ -1263,10 +1357,8 @@ impl LoweringContext {
             let mut arena = self.arena.lock().unwrap();
 
             // 1. Generate the state machine struct type (needed for size calculation)
-            let _struct_type = async_compiler.generate_state_machine_struct(
-                &state_machine,
-                &mut *arena
-            );
+            let _struct_type =
+                async_compiler.generate_state_machine_struct(&state_machine, &mut *arena);
 
             // 2. Generate the poll() function (internal, prefixed with __)
             let poll_wrapper = async_compiler.generate_poll_function(
@@ -1281,7 +1373,7 @@ impl LoweringContext {
                 &state_machine,
                 &poll_wrapper,
                 &original_func,
-                &mut *arena
+                &mut *arena,
             )?;
 
             (poll_wrapper, async_entry_func)
@@ -1297,7 +1389,10 @@ impl LoweringContext {
     }
 
     /// Convert function signature
-    fn convert_function_signature(&self, func: &TypedFunction) -> CompilerResult<HirFunctionSignature> {
+    fn convert_function_signature(
+        &self,
+        func: &TypedFunction,
+    ) -> CompilerResult<HirFunctionSignature> {
         let mut params = Vec::new();
 
         for param in &func.params {
@@ -1321,14 +1416,18 @@ impl LoweringContext {
         } else {
             vec![hir_return_type]
         };
-        
+
         // Convert type params from TypedFunction to HirTypeParam
-        let hir_type_params: Vec<crate::hir::HirTypeParam> = func.type_params.iter().map(|tp| {
-            crate::hir::HirTypeParam {
-                name: tp.name,
-                constraints: vec![], // TODO: Convert bounds to constraints
-            }
-        }).collect();
+        let hir_type_params: Vec<crate::hir::HirTypeParam> = func
+            .type_params
+            .iter()
+            .map(|tp| {
+                crate::hir::HirTypeParam {
+                    name: tp.name,
+                    constraints: vec![], // TODO: Convert bounds to constraints
+                }
+            })
+            .collect();
 
         Ok(HirFunctionSignature {
             params,
@@ -1342,7 +1441,7 @@ impl LoweringContext {
             is_pure: func.is_pure,
         })
     }
-    
+
     /// Set function attributes
     fn set_function_attributes(&self, hir_func: &mut HirFunction, func: &TypedFunction) {
         // Set visibility-based attributes
@@ -1355,7 +1454,7 @@ impl LoweringContext {
             }
             _ => {}
         }
-        
+
         // Set calling convention (before async transformation)
         hir_func.calling_convention = if func.visibility == Visibility::Public {
             crate::hir::CallingConvention::C
@@ -1363,30 +1462,30 @@ impl LoweringContext {
             crate::hir::CallingConvention::Fast
         };
     }
-    
+
     /// Compute parameter attributes
     fn compute_param_attributes(&self, ty: &Type, mutability: Mutability) -> ParamAttributes {
         let mut attrs = ParamAttributes::default();
-        
+
         // Large structs passed by reference
         if self.is_large_type(ty) {
             attrs.by_ref = true;
         }
-        
+
         // Immutable references are readonly
         if matches!(ty, Type::Reference { .. }) && mutability == Mutability::Immutable {
             attrs.readonly = true;
             attrs.noalias = true;
         }
-        
+
         // Non-null pointers
         if matches!(ty, Type::Reference { .. }) {
             attrs.nonnull = true;
         }
-        
+
         attrs
     }
-    
+
     /// Check if a type is considered "large" for ABI decisions
     fn is_large_type(&self, ty: &Type) -> bool {
         // Use precise TargetData size calculation
@@ -1404,19 +1503,19 @@ impl LoweringContext {
         crate::hir::HirLifetime {
             id: crate::hir::LifetimeId::new(),
             name: Some(lifetime.name),
-            bounds: lifetime.bounds.iter().map(|bound| {
-                match bound {
+            bounds: lifetime
+                .bounds
+                .iter()
+                .map(|bound| match bound {
                     zyntax_typed_ast::LifetimeBound::Outlives(other) => {
                         crate::hir::LifetimeBound::Outlives(crate::hir::LifetimeId::new())
                     }
-                    zyntax_typed_ast::LifetimeBound::Static => {
-                        crate::hir::LifetimeBound::Static
-                    }
-                }
-            }).collect(),
+                    zyntax_typed_ast::LifetimeBound::Static => crate::hir::LifetimeBound::Static,
+                })
+                .collect(),
         }
     }
-    
+
     /// Convert frontend type to HIR type
     /// Convert a type to its ABI representation (for function signatures)
     /// Abstract types are converted to their underlying types for zero-cost abstraction
@@ -1424,9 +1523,14 @@ impl LoweringContext {
         // For abstract types, use the underlying type for ABI
         if let Type::Named { id, .. } = ty {
             if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
-                if let zyntax_typed_ast::TypeKind::Abstract { underlying_type, .. } = &type_def.kind {
-                    eprintln!("[CONVERT_ABI] Abstract type '{}' → underlying ABI type",
-                        type_def.name.resolve_global().unwrap_or_default());
+                if let zyntax_typed_ast::TypeKind::Abstract {
+                    underlying_type, ..
+                } = &type_def.kind
+                {
+                    eprintln!(
+                        "[CONVERT_ABI] Abstract type '{}' → underlying ABI type",
+                        type_def.name.resolve_global().unwrap_or_default()
+                    );
                     return self.convert_type(underlying_type);
                 }
             }
@@ -1456,17 +1560,22 @@ impl LoweringContext {
                 PrimitiveType::Unit => HirType::Void,
                 PrimitiveType::Char => HirType::U32, // Unicode scalar
                 PrimitiveType::String => HirType::Ptr(Box::new(HirType::U8)), // String as u8 pointer
-                _ => HirType::I64, // Default
+                _ => HirType::I64,                                            // Default
             },
-            
+
             Type::Tuple(types) if types.is_empty() => HirType::Void,
             Type::Tuple(types) => HirType::Struct(crate::hir::HirStructType {
                 name: None,
                 fields: types.iter().map(|t| self.convert_type(t)).collect(),
                 packed: false,
             }),
-            
-            Type::Reference { ty, mutability, lifetime, .. } => {
+
+            Type::Reference {
+                ty,
+                mutability,
+                lifetime,
+                ..
+            } => {
                 // Convert lifetime if present
                 let hir_lifetime = if let Some(lt) = lifetime {
                     self.convert_lifetime(lt)
@@ -1485,8 +1594,12 @@ impl LoweringContext {
                     mutable: *mutability == Mutability::Mutable,
                 }
             }
-            
-            Type::Array { element_type, size: Some(size_val), .. } => {
+
+            Type::Array {
+                element_type,
+                size: Some(size_val),
+                ..
+            } => {
                 let size = match size_val {
                     zyntax_typed_ast::ConstValue::UInt(u) => *u,
                     zyntax_typed_ast::ConstValue::Int(i) => *i as u64,
@@ -1494,8 +1607,13 @@ impl LoweringContext {
                 };
                 HirType::Array(Box::new(self.convert_type(element_type)), size)
             }
-            
-            Type::Function { params, return_type, is_varargs, .. } => {
+
+            Type::Function {
+                params,
+                return_type,
+                is_varargs,
+                ..
+            } => {
                 // Note: Lifetime parameters are embedded in the parameter types themselves
                 // (e.g., Type::Reference contains lifetime information). They are preserved
                 // during convert_type() and don't need separate tracking here.
@@ -1506,7 +1624,7 @@ impl LoweringContext {
                     is_variadic: *is_varargs,
                 }))
             }
-            
+
             Type::Projection { base, item } => {
                 // Handle projections like T::AssocType
                 // For now, we don't have full associated type information in TypedAST
@@ -1515,7 +1633,10 @@ impl LoweringContext {
                 HirType::Opaque(*item)
             }
 
-            Type::Associated { trait_name, type_name } => {
+            Type::Associated {
+                trait_name,
+                type_name,
+            } => {
                 // Associated types in traits (not yet fully integrated)
                 // TODO: Resolve using trait_name and type_name when trait registry is enhanced
                 HirType::Opaque(*type_name)
@@ -1543,7 +1664,10 @@ impl LoweringContext {
                     };
                     self.convert_type(&named_type)
                 } else {
-                    log::warn!("Could not resolve type '{}', defaulting to I64", name.resolve_global().unwrap_or_default());
+                    log::warn!(
+                        "Could not resolve type '{}', defaulting to I64",
+                        name.resolve_global().unwrap_or_default()
+                    );
                     HirType::I64 // Fallback
                 }
             }
@@ -1554,7 +1678,8 @@ impl LoweringContext {
                     match &type_def.kind {
                         zyntax_typed_ast::TypeKind::Struct { fields, .. } => {
                             // Convert struct fields
-                            let field_types: Vec<_> = fields.iter()
+                            let field_types: Vec<_> = fields
+                                .iter()
                                 .map(|field| self.convert_type(&field.ty))
                                 .collect();
 
@@ -1567,12 +1692,14 @@ impl LoweringContext {
 
                         zyntax_typed_ast::TypeKind::Enum { variants } => {
                             // Convert enum to discriminated union
-                            let hir_variants: Vec<_> = variants.iter()
+                            let hir_variants: Vec<_> = variants
+                                .iter()
                                 .map(|variant| {
                                     let variant_ty = match &variant.fields {
                                         zyntax_typed_ast::VariantFields::Unit => HirType::Void,
                                         zyntax_typed_ast::VariantFields::Tuple(types) => {
-                                            let fields: Vec<_> = types.iter()
+                                            let fields: Vec<_> = types
+                                                .iter()
                                                 .map(|ty| self.convert_type(ty))
                                                 .collect();
                                             HirType::Struct(crate::hir::HirStructType {
@@ -1582,7 +1709,8 @@ impl LoweringContext {
                                             })
                                         }
                                         zyntax_typed_ast::VariantFields::Named(fields) => {
-                                            let field_types: Vec<_> = fields.iter()
+                                            let field_types: Vec<_> = fields
+                                                .iter()
                                                 .map(|field| self.convert_type(&field.ty))
                                                 .collect();
                                             HirType::Struct(crate::hir::HirStructType {
@@ -1613,13 +1741,17 @@ impl LoweringContext {
                             // Abstract types are zero-cost wrappers with struct layout
                             // Convert them as structs so field access works
                             // Fields are stored in type_def.fields, not in the TypeKind::Abstract itself
-                            let field_types: Vec<_> = type_def.fields.iter()
+                            let field_types: Vec<_> = type_def
+                                .fields
+                                .iter()
                                 .map(|field| self.convert_type(&field.ty))
                                 .collect();
 
-                            eprintln!("[CONVERT TYPE] Abstract type '{}' → struct with {} fields",
+                            eprintln!(
+                                "[CONVERT TYPE] Abstract type '{}' → struct with {} fields",
                                 type_def.name.resolve_global().unwrap_or_default(),
-                                field_types.len());
+                                field_types.len()
+                            );
 
                             HirType::Struct(crate::hir::HirStructType {
                                 name: Some(type_def.name),
@@ -1647,13 +1779,16 @@ impl LoweringContext {
                     HirType::I64 // Fallback
                 }
             }
-            
+
             _ => HirType::I64, // Default for unsupported types
         }
     }
-    
+
     /// Lower a global variable
-    fn lower_global_variable(&mut self, var: &zyntax_typed_ast::TypedVariable) -> CompilerResult<()> {
+    fn lower_global_variable(
+        &mut self,
+        var: &zyntax_typed_ast::TypedVariable,
+    ) -> CompilerResult<()> {
         let hir_type = self.convert_type(&var.ty);
 
         // Evaluate initializer expression if present
@@ -1663,7 +1798,10 @@ impl LoweringContext {
                 Err(e) => {
                     self.diagnostic(
                         DiagnosticLevel::Error,
-                        format!("Global variable '{}' has non-constant initializer: {}", var.name, e),
+                        format!(
+                            "Global variable '{}' has non-constant initializer: {}",
+                            var.name, e
+                        ),
                         Some(init_expr.span),
                     );
                     None
@@ -1691,9 +1829,12 @@ impl LoweringContext {
     }
 
     /// Lower an enum declaration to HIR Union type
-    fn lower_enum(&mut self, enum_decl: &zyntax_typed_ast::typed_ast::TypedEnum) -> CompilerResult<()> {
+    fn lower_enum(
+        &mut self,
+        enum_decl: &zyntax_typed_ast::typed_ast::TypedEnum,
+    ) -> CompilerResult<()> {
+        use crate::hir::{HirType, HirUnionType, HirUnionVariant};
         use zyntax_typed_ast::typed_ast::TypedVariantFields;
-        use crate::hir::{HirUnionType, HirUnionVariant, HirType};
 
         // Determine discriminant type based on number of variants
         let discriminant_type = if enum_decl.variants.len() <= 256 {
@@ -1744,10 +1885,8 @@ impl LoweringContext {
                         self.convert_type(&field_types[0])
                     } else {
                         // Multiple fields - create tuple struct
-                        let fields: Vec<HirType> = field_types
-                            .iter()
-                            .map(|ty| self.convert_type(ty))
-                            .collect();
+                        let fields: Vec<HirType> =
+                            field_types.iter().map(|ty| self.convert_type(ty)).collect();
                         HirType::Struct(crate::hir::HirStructType {
                             name: None, // Anonymous tuple struct
                             fields,
@@ -1786,8 +1925,14 @@ impl LoweringContext {
 
         // Register the enum type in the module
         // Look up the type ID from the type registry (should already be registered by type checker)
-        if let Some(type_id) = self.type_registry.get_type_by_name(enum_decl.name).map(|def| def.id) {
-            self.module.types.insert(type_id, HirType::Union(Box::new(union_type)));
+        if let Some(type_id) = self
+            .type_registry
+            .get_type_by_name(enum_decl.name)
+            .map(|def| def.id)
+        {
+            self.module
+                .types
+                .insert(type_id, HirType::Union(Box::new(union_type)));
         } else {
             // Type not found in registry - this shouldn't happen for well-typed programs
             self.diagnostic(
@@ -1811,41 +1956,51 @@ impl LoweringContext {
         })?;
 
         // Convert type parameters
-        let type_params: Vec<HirTypeParam> = effect.type_params.iter().map(|tp| {
-            HirTypeParam {
+        let type_params: Vec<HirTypeParam> = effect
+            .type_params
+            .iter()
+            .map(|tp| HirTypeParam {
                 name: tp.name,
                 constraints: vec![],
-            }
-        }).collect();
+            })
+            .collect();
 
         // Convert effect operations
-        let operations: Vec<HirEffectOp> = effect.operations.iter().map(|op| {
-            // Convert operation type parameters
-            let op_type_params: Vec<HirTypeParam> = op.type_params.iter().map(|tp| {
-                HirTypeParam {
-                    name: tp.name,
-                    constraints: vec![],
-                }
-            }).collect();
+        let operations: Vec<HirEffectOp> = effect
+            .operations
+            .iter()
+            .map(|op| {
+                // Convert operation type parameters
+                let op_type_params: Vec<HirTypeParam> = op
+                    .type_params
+                    .iter()
+                    .map(|tp| HirTypeParam {
+                        name: tp.name,
+                        constraints: vec![],
+                    })
+                    .collect();
 
-            // Convert operation parameters
-            let params: Vec<HirParam> = op.params.iter().map(|p| {
-                HirParam {
+                // Convert operation parameters
+                let params: Vec<HirParam> = op
+                    .params
+                    .iter()
+                    .map(|p| HirParam {
+                        id: HirId::new(),
+                        name: p.name,
+                        ty: self.convert_type(&p.ty),
+                        attributes: ParamAttributes::default(),
+                    })
+                    .collect();
+
+                HirEffectOp {
                     id: HirId::new(),
-                    name: p.name,
-                    ty: self.convert_type(&p.ty),
-                    attributes: ParamAttributes::default(),
+                    name: op.name,
+                    type_params: op_type_params,
+                    params,
+                    return_type: self.convert_type(&op.return_type),
                 }
-            }).collect();
-
-            HirEffectOp {
-                id: HirId::new(),
-                name: op.name,
-                type_params: op_type_params,
-                params,
-                return_type: self.convert_type(&op.return_type),
-            }
-        }).collect();
+            })
+            .collect();
 
         // Create HIR effect
         let hir_effect = HirEffect {
@@ -1872,70 +2027,86 @@ impl LoweringContext {
         })?;
 
         // Find the effect being handled
-        let effect_id = *self.symbols.effects.get(&handler.effect_name).ok_or_else(|| {
-            crate::CompilerError::Lowering(format!(
-                "Effect '{}' not found for handler '{}'",
-                handler.effect_name, handler.name
-            ))
-        })?;
+        let effect_id = *self
+            .symbols
+            .effects
+            .get(&handler.effect_name)
+            .ok_or_else(|| {
+                crate::CompilerError::Lowering(format!(
+                    "Effect '{}' not found for handler '{}'",
+                    handler.effect_name, handler.name
+                ))
+            })?;
 
         // Convert type parameters
-        let type_params: Vec<HirTypeParam> = handler.type_params.iter().map(|tp| {
-            HirTypeParam {
+        let type_params: Vec<HirTypeParam> = handler
+            .type_params
+            .iter()
+            .map(|tp| HirTypeParam {
                 name: tp.name,
                 constraints: vec![],
-            }
-        }).collect();
+            })
+            .collect();
 
         // Convert handler state fields
-        let state_fields: Vec<HirHandlerField> = handler.fields.iter().map(|f| {
-            HirHandlerField {
+        let state_fields: Vec<HirHandlerField> = handler
+            .fields
+            .iter()
+            .map(|f| HirHandlerField {
                 name: f.name,
                 ty: self.convert_type(&f.ty),
-            }
-        }).collect();
+            })
+            .collect();
 
         // Convert handler implementations
         // For now, we only store the metadata - actual implementation lowering
         // happens when we compile the handler's functions
-        let implementations: Vec<HirEffectHandlerImpl> = handler.handlers.iter().map(|impl_| {
-            // Convert type parameters for this implementation
-            let impl_type_params: Vec<HirTypeParam> = impl_.type_params.iter().map(|tp| {
-                HirTypeParam {
-                    name: tp.name,
-                    constraints: vec![],
+        let implementations: Vec<HirEffectHandlerImpl> = handler
+            .handlers
+            .iter()
+            .map(|impl_| {
+                // Convert type parameters for this implementation
+                let impl_type_params: Vec<HirTypeParam> = impl_
+                    .type_params
+                    .iter()
+                    .map(|tp| HirTypeParam {
+                        name: tp.name,
+                        constraints: vec![],
+                    })
+                    .collect();
+
+                // Convert parameters (including the resume continuation if present)
+                let params: Vec<HirParam> = impl_
+                    .params
+                    .iter()
+                    .map(|p| HirParam {
+                        id: HirId::new(),
+                        name: p.name,
+                        ty: self.convert_type(&p.ty),
+                        attributes: ParamAttributes::default(),
+                    })
+                    .collect();
+
+                // Check if this handler is resumable (has a Resume parameter)
+                let is_resumable = impl_.params.iter().any(|p| {
+                    matches!(&p.ty, Type::Named { id, .. } if {
+                        self.type_registry.get_type_by_id(*id)
+                            .map(|def| def.name.resolve_global().as_deref() == Some("Resume"))
+                            .unwrap_or(false)
+                    })
+                });
+
+                HirEffectHandlerImpl {
+                    op_name: impl_.op_name,
+                    type_params: impl_type_params,
+                    params,
+                    return_type: self.convert_type(&impl_.return_type),
+                    entry_block: HirId::new(),
+                    blocks: indexmap::IndexMap::new(), // Will be filled in when we compile the body
+                    is_resumable,
                 }
-            }).collect();
-
-            // Convert parameters (including the resume continuation if present)
-            let params: Vec<HirParam> = impl_.params.iter().map(|p| {
-                HirParam {
-                    id: HirId::new(),
-                    name: p.name,
-                    ty: self.convert_type(&p.ty),
-                    attributes: ParamAttributes::default(),
-                }
-            }).collect();
-
-            // Check if this handler is resumable (has a Resume parameter)
-            let is_resumable = impl_.params.iter().any(|p| {
-                matches!(&p.ty, Type::Named { id, .. } if {
-                    self.type_registry.get_type_by_id(*id)
-                        .map(|def| def.name.resolve_global().as_deref() == Some("Resume"))
-                        .unwrap_or(false)
-                })
-            });
-
-            HirEffectHandlerImpl {
-                op_name: impl_.op_name,
-                type_params: impl_type_params,
-                params,
-                return_type: self.convert_type(&impl_.return_type),
-                entry_block: HirId::new(),
-                blocks: indexmap::IndexMap::new(), // Will be filled in when we compile the body
-                is_resumable,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Create HIR effect handler
         let hir_handler = HirEffectHandler {
@@ -1961,11 +2132,19 @@ impl LoweringContext {
     ) -> zyntax_typed_ast::TypedBlock {
         use zyntax_typed_ast::TypedBlock;
 
-        eprintln!("[RETYPE_BLOCK] Processing {} statements", block.statements.len());
-        let retyped_statements = block.statements.iter().enumerate().map(|(idx, stmt_node)| {
-            eprintln!("[RETYPE_BLOCK] Processing statement {}", idx);
-            self.retype_statement_with_self(stmt_node, self_params)
-        }).collect();
+        eprintln!(
+            "[RETYPE_BLOCK] Processing {} statements",
+            block.statements.len()
+        );
+        let retyped_statements = block
+            .statements
+            .iter()
+            .enumerate()
+            .map(|(idx, stmt_node)| {
+                eprintln!("[RETYPE_BLOCK] Processing statement {}", idx);
+                self.retype_statement_with_self(stmt_node, self_params)
+            })
+            .collect();
 
         TypedBlock {
             statements: retyped_statements,
@@ -1979,7 +2158,7 @@ impl LoweringContext {
         stmt_node: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedStatement>,
         self_params: &[(zyntax_typed_ast::InternedString, zyntax_typed_ast::Type)],
     ) -> zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedStatement> {
-        use zyntax_typed_ast::{TypedStatement, TypedNode, TypedLet};
+        use zyntax_typed_ast::{TypedLet, TypedNode, TypedStatement};
 
         let retyped_stmt = match &stmt_node.node {
             TypedStatement::Expression(expr) => {
@@ -1988,38 +2167,42 @@ impl LoweringContext {
                 eprintln!("[RETYPE_STMT] Expression retyping done");
                 TypedStatement::Expression(Box::new(retyped))
             }
-            TypedStatement::Let(let_stmt) => {
-                TypedStatement::Let(TypedLet {
-                    name: let_stmt.name,
-                    ty: let_stmt.ty.clone(),
-                    mutability: let_stmt.mutability,
-                    initializer: let_stmt.initializer.as_ref().map(|init| {
-                        Box::new(self.retype_expression_node_with_self(init, self_params))
-                    }),
-                    span: let_stmt.span,
-                })
-            }
-            TypedStatement::Return(opt_expr) => {
-                TypedStatement::Return(opt_expr.as_ref().map(|expr| {
-                    Box::new(self.retype_expression_node_with_self(expr, self_params))
-                }))
-            }
+            TypedStatement::Let(let_stmt) => TypedStatement::Let(TypedLet {
+                name: let_stmt.name,
+                ty: let_stmt.ty.clone(),
+                mutability: let_stmt.mutability,
+                initializer: let_stmt
+                    .initializer
+                    .as_ref()
+                    .map(|init| Box::new(self.retype_expression_node_with_self(init, self_params))),
+                span: let_stmt.span,
+            }),
+            TypedStatement::Return(opt_expr) => TypedStatement::Return(
+                opt_expr
+                    .as_ref()
+                    .map(|expr| Box::new(self.retype_expression_node_with_self(expr, self_params))),
+            ),
             TypedStatement::Break(_) | TypedStatement::Continue => stmt_node.node.clone(),
             TypedStatement::If(if_stmt) => {
                 use zyntax_typed_ast::TypedIf;
                 TypedStatement::If(TypedIf {
-                    condition: Box::new(self.retype_expression_node_with_self(&if_stmt.condition, self_params)),
+                    condition: Box::new(
+                        self.retype_expression_node_with_self(&if_stmt.condition, self_params),
+                    ),
                     then_block: self.retype_block_with_self(&if_stmt.then_block, self_params),
-                    else_block: if_stmt.else_block.as_ref().map(|block| {
-                        self.retype_block_with_self(block, self_params)
-                    }),
+                    else_block: if_stmt
+                        .else_block
+                        .as_ref()
+                        .map(|block| self.retype_block_with_self(block, self_params)),
                     span: if_stmt.span,
                 })
             }
             TypedStatement::While(while_stmt) => {
                 use zyntax_typed_ast::TypedWhile;
                 TypedStatement::While(TypedWhile {
-                    condition: Box::new(self.retype_expression_node_with_self(&while_stmt.condition, self_params)),
+                    condition: Box::new(
+                        self.retype_expression_node_with_self(&while_stmt.condition, self_params),
+                    ),
                     body: self.retype_block_with_self(&while_stmt.body, self_params),
                     span: while_stmt.span,
                 })
@@ -2028,7 +2211,9 @@ impl LoweringContext {
                 use zyntax_typed_ast::TypedFor;
                 TypedStatement::For(TypedFor {
                     pattern: for_stmt.pattern.clone(),
-                    iterator: Box::new(self.retype_expression_node_with_self(&for_stmt.iterator, self_params)),
+                    iterator: Box::new(
+                        self.retype_expression_node_with_self(&for_stmt.iterator, self_params),
+                    ),
                     body: self.retype_block_with_self(&for_stmt.body, self_params),
                 })
             }
@@ -2045,19 +2230,26 @@ impl LoweringContext {
         expr_node: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>,
         self_params: &[(zyntax_typed_ast::InternedString, zyntax_typed_ast::Type)],
     ) -> zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression> {
-        use zyntax_typed_ast::{TypedExpression, Type, TypedNode, TypedBinary, TypedUnary, TypedFieldAccess, TypedCall};
+        use zyntax_typed_ast::{
+            Type, TypedBinary, TypedCall, TypedExpression, TypedFieldAccess, TypedNode, TypedUnary,
+        };
 
         let (retyped_expr, new_ty) = match &expr_node.node {
             // Variable reference - check if it's a self parameter and retype if needed
             TypedExpression::Variable(name) => {
                 // Check if this variable is a self parameter
-                if let Some((_, resolved_ty)) = self_params.iter().find(|(param_name, _)| param_name == name) {
+                if let Some((_, resolved_ty)) = self_params
+                    .iter()
+                    .find(|(param_name, _)| param_name == name)
+                {
                     // Only retype if current type is Any or Unresolved
-                    if matches!(expr_node.ty, Type::Any) || matches!(expr_node.ty, Type::Unresolved(_)) {
+                    if matches!(expr_node.ty, Type::Any)
+                        || matches!(expr_node.ty, Type::Unresolved(_))
+                    {
                         return TypedNode::new(
                             TypedExpression::Variable(*name),
                             resolved_ty.clone(),
-                            expr_node.span
+                            expr_node.span,
                         );
                     }
                 }
@@ -2066,9 +2258,12 @@ impl LoweringContext {
 
             // Field access - retype the object expression and possibly update field type
             TypedExpression::Field(field_access) => {
-                eprintln!("[RETYPE] Field access starting: object.ty={:?}, field={:?}",
-                    field_access.object.ty, field_access.field);
-                let retyped_object = self.retype_expression_node_with_self(&field_access.object, self_params);
+                eprintln!(
+                    "[RETYPE] Field access starting: object.ty={:?}, field={:?}",
+                    field_access.object.ty, field_access.field
+                );
+                let retyped_object =
+                    self.retype_expression_node_with_self(&field_access.object, self_params);
                 eprintln!("[RETYPE] Field access: object before={:?}, after={:?}, field={:?}, expr_ty={:?}",
                     field_access.object.ty, retyped_object.ty, field_access.field, expr_node.ty);
                 let retyped_field_access = TypedFieldAccess {
@@ -2077,24 +2272,36 @@ impl LoweringContext {
                 };
                 eprintln!("[RETYPE] Field access done, returning");
                 // Keep the original field result type - it should have been correctly typed by the parser
-                (TypedExpression::Field(retyped_field_access), expr_node.ty.clone())
+                (
+                    TypedExpression::Field(retyped_field_access),
+                    expr_node.ty.clone(),
+                )
             }
 
             // Binary operation - retype both operands
             TypedExpression::Binary(binary) => {
                 let retyped_binary = TypedBinary {
                     op: binary.op,
-                    left: Box::new(self.retype_expression_node_with_self(&binary.left, self_params)),
-                    right: Box::new(self.retype_expression_node_with_self(&binary.right, self_params)),
+                    left: Box::new(
+                        self.retype_expression_node_with_self(&binary.left, self_params),
+                    ),
+                    right: Box::new(
+                        self.retype_expression_node_with_self(&binary.right, self_params),
+                    ),
                 };
-                (TypedExpression::Binary(retyped_binary), expr_node.ty.clone())
+                (
+                    TypedExpression::Binary(retyped_binary),
+                    expr_node.ty.clone(),
+                )
             }
 
             // Unary operation - retype the operand
             TypedExpression::Unary(unary) => {
                 let retyped_unary = TypedUnary {
                     op: unary.op,
-                    operand: Box::new(self.retype_expression_node_with_self(&unary.operand, self_params)),
+                    operand: Box::new(
+                        self.retype_expression_node_with_self(&unary.operand, self_params),
+                    ),
                 };
                 (TypedExpression::Unary(retyped_unary), expr_node.ty.clone())
             }
@@ -2102,10 +2309,14 @@ impl LoweringContext {
             // Function call - retype callee and arguments
             TypedExpression::Call(call) => {
                 let retyped_call = TypedCall {
-                    callee: Box::new(self.retype_expression_node_with_self(&call.callee, self_params)),
-                    positional_args: call.positional_args.iter().map(|arg| {
-                        self.retype_expression_node_with_self(arg, self_params)
-                    }).collect(),
+                    callee: Box::new(
+                        self.retype_expression_node_with_self(&call.callee, self_params),
+                    ),
+                    positional_args: call
+                        .positional_args
+                        .iter()
+                        .map(|arg| self.retype_expression_node_with_self(arg, self_params))
+                        .collect(),
                     named_args: call.named_args.clone(), // Named args don't need retyping of names
                     type_args: call.type_args.clone(),
                 };
@@ -2117,24 +2328,37 @@ impl LoweringContext {
                 use zyntax_typed_ast::TypedStructLiteral;
                 let retyped_struct = TypedStructLiteral {
                     name: struct_lit.name,
-                    fields: struct_lit.fields.iter().map(|field_init| {
-                        use zyntax_typed_ast::TypedFieldInit;
-                        TypedFieldInit {
-                            name: field_init.name,
-                            value: Box::new(self.retype_expression_node_with_self(&field_init.value, self_params)),
-                        }
-                    }).collect(),
+                    fields: struct_lit
+                        .fields
+                        .iter()
+                        .map(|field_init| {
+                            use zyntax_typed_ast::TypedFieldInit;
+                            TypedFieldInit {
+                                name: field_init.name,
+                                value: Box::new(self.retype_expression_node_with_self(
+                                    &field_init.value,
+                                    self_params,
+                                )),
+                            }
+                        })
+                        .collect(),
                 };
-                (TypedExpression::Struct(retyped_struct), expr_node.ty.clone())
+                (
+                    TypedExpression::Struct(retyped_struct),
+                    expr_node.ty.clone(),
+                )
             }
 
             // Method call - retype the receiver and arguments
             TypedExpression::MethodCall(method_call) => {
                 use zyntax_typed_ast::TypedMethodCall;
-                let retyped_receiver = self.retype_expression_node_with_self(&method_call.receiver, self_params);
-                let retyped_positional_args = method_call.positional_args.iter().map(|arg| {
-                    self.retype_expression_node_with_self(arg, self_params)
-                }).collect();
+                let retyped_receiver =
+                    self.retype_expression_node_with_self(&method_call.receiver, self_params);
+                let retyped_positional_args = method_call
+                    .positional_args
+                    .iter()
+                    .map(|arg| self.retype_expression_node_with_self(arg, self_params))
+                    .collect();
                 let retyped_method_call = TypedMethodCall {
                     receiver: Box::new(retyped_receiver),
                     method: method_call.method,
@@ -2142,7 +2366,10 @@ impl LoweringContext {
                     positional_args: retyped_positional_args,
                     named_args: method_call.named_args.clone(),
                 };
-                (TypedExpression::MethodCall(retyped_method_call), expr_node.ty.clone())
+                (
+                    TypedExpression::MethodCall(retyped_method_call),
+                    expr_node.ty.clone(),
+                )
             }
 
             // All other expression types - just clone
@@ -2153,11 +2380,18 @@ impl LoweringContext {
     }
 
     /// Lower an impl block by extracting and lowering its methods
-    fn lower_impl_block(&mut self, impl_block: &zyntax_typed_ast::typed_ast::TypedTraitImpl) -> CompilerResult<()> {
-        use zyntax_typed_ast::{TypedFunction, Type, TypeId};
+    fn lower_impl_block(
+        &mut self,
+        impl_block: &zyntax_typed_ast::typed_ast::TypedTraitImpl,
+    ) -> CompilerResult<()> {
+        use zyntax_typed_ast::{Type, TypeId, TypedFunction};
 
-        eprintln!("[LOWERING IMPL] Starting lower_impl_block for_type={:?}, trait_name={:?}, {} methods",
-            impl_block.for_type, impl_block.trait_name, impl_block.methods.len());
+        eprintln!(
+            "[LOWERING IMPL] Starting lower_impl_block for_type={:?}, trait_name={:?}, {} methods",
+            impl_block.for_type,
+            impl_block.trait_name,
+            impl_block.methods.len()
+        );
 
         // Resolve the implementing type if it's still unresolved
         // The parser uses Unresolved types, we need to look them up in the registry
@@ -2178,27 +2412,41 @@ impl LoweringContext {
                         nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
                     }
                 } else {
-                    let type_name_str = self.arena.lock().unwrap().resolve_string(*name)
+                    let type_name_str = self
+                        .arena
+                        .lock()
+                        .unwrap()
+                        .resolve_string(*name)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "<unknown>".to_string());
-                    eprintln!("[LOWERING] WARNING: Type '{}' not found in registry", type_name_str);
+                    eprintln!(
+                        "[LOWERING] WARNING: Type '{}' not found in registry",
+                        type_name_str
+                    );
                     impl_block.for_type.clone()
                 }
             }
             _ => impl_block.for_type.clone(),
         };
-        eprintln!("[LOWERING] Impl block implementing_type after resolution: {:?}", implementing_type);
+        eprintln!(
+            "[LOWERING] Impl block implementing_type after resolution: {:?}",
+            implementing_type
+        );
 
         // Check if this is an inherent impl (empty trait name) or a trait impl
         let trait_name_str = {
             let arena = self.arena.lock().unwrap();
-            arena.resolve_string(impl_block.trait_name)
+            arena
+                .resolve_string(impl_block.trait_name)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| String::new())
         };
 
         let is_inherent = trait_name_str.is_empty();
-        eprintln!("[LOWERING] Impl block is_inherent: {}, trait_name: '{}'", is_inherent, trait_name_str);
+        eprintln!(
+            "[LOWERING] Impl block is_inherent: {}, trait_name: '{}'",
+            is_inherent, trait_name_str
+        );
 
         // Check if the implementing type is an extern struct
         // For extern structs, methods should automatically map to ZRTL symbols
@@ -2212,13 +2460,21 @@ impl LoweringContext {
         } else {
             None
         };
-        eprintln!("[LOWERING] is_extern_struct: {}, extern_type_name: {:?}", is_extern_struct, extern_type_name);
+        eprintln!(
+            "[LOWERING] is_extern_struct: {}, extern_type_name: {:?}",
+            is_extern_struct, extern_type_name
+        );
 
         // For trait impls, register the implementation in the type registry
         let trait_id = if !is_inherent {
-            let trait_def = self.type_registry.get_trait_by_name(impl_block.trait_name)
+            let trait_def = self
+                .type_registry
+                .get_trait_by_name(impl_block.trait_name)
                 .ok_or_else(|| {
-                    crate::CompilerError::Analysis(format!("Trait '{}' not found in registry", trait_name_str))
+                    crate::CompilerError::Analysis(format!(
+                        "Trait '{}' not found in registry",
+                        trait_name_str
+                    ))
                 })?;
             Some(trait_def.id)
         } else {
@@ -2226,26 +2482,42 @@ impl LoweringContext {
         };
 
         // Build MethodImpl list from the impl block methods
-        let method_impls: Vec<zyntax_typed_ast::type_registry::MethodImpl> = impl_block.methods.iter().map(|method| {
-            // Build parameter definitions
-            let params: Vec<zyntax_typed_ast::type_registry::ParamDef> = method.params.iter().map(|p| {
-                zyntax_typed_ast::type_registry::ParamDef {
-                    name: p.name,
-                    ty: p.ty.clone(),
-                    is_self: p.is_self,
-                    is_varargs: false,
-                    is_mut: matches!(p.mutability, zyntax_typed_ast::type_registry::Mutability::Mutable),
-                }
-            }).collect();
+        let method_impls: Vec<zyntax_typed_ast::type_registry::MethodImpl> = impl_block
+            .methods
+            .iter()
+            .map(|method| {
+                // Build parameter definitions
+                let params: Vec<zyntax_typed_ast::type_registry::ParamDef> = method
+                    .params
+                    .iter()
+                    .map(|p| zyntax_typed_ast::type_registry::ParamDef {
+                        name: p.name,
+                        ty: p.ty.clone(),
+                        is_self: p.is_self,
+                        is_varargs: false,
+                        is_mut: matches!(
+                            p.mutability,
+                            zyntax_typed_ast::type_registry::Mutability::Mutable
+                        ),
+                    })
+                    .collect();
 
-            // Convert TypedTypeParam to TypeParam
-            let type_params: Vec<zyntax_typed_ast::type_registry::TypeParam> = method.type_params.iter().map(|tp| {
-                // Convert TypedTypeBound to TypeBound
-                let bounds: Vec<zyntax_typed_ast::type_registry::TypeBound> = tp.bounds.iter().filter_map(|bound| {
-                    match bound {
-                        zyntax_typed_ast::typed_ast::TypedTypeBound::Trait(trait_type) => {
-                            // Extract name and args from the trait type
-                            match trait_type {
+                // Convert TypedTypeParam to TypeParam
+                let type_params: Vec<zyntax_typed_ast::type_registry::TypeParam> = method
+                    .type_params
+                    .iter()
+                    .map(|tp| {
+                        // Convert TypedTypeBound to TypeBound
+                        let bounds: Vec<zyntax_typed_ast::type_registry::TypeBound> =
+                            tp.bounds
+                                .iter()
+                                .filter_map(|bound| {
+                                    match bound {
+                                        zyntax_typed_ast::typed_ast::TypedTypeBound::Trait(
+                                            trait_type,
+                                        ) => {
+                                            // Extract name and args from the trait type
+                                            match trait_type {
                                 Type::Named { id: _, type_args, .. } => {
                                     // Get the trait name from the type
                                     // For now, just use a placeholder since we don't have easy access to the name
@@ -2262,38 +2534,41 @@ impl LoweringContext {
                                 }
                                 _ => None,
                             }
+                                        }
+                                        _ => None, // Skip other bounds for now
+                                    }
+                                })
+                                .collect();
+
+                        zyntax_typed_ast::type_registry::TypeParam {
+                            name: tp.name,
+                            bounds,
+                            variance: zyntax_typed_ast::type_registry::Variance::Invariant,
+                            default: tp.default.clone(),
+                            span: tp.span,
                         }
-                        _ => None, // Skip other bounds for now
-                    }
-                }).collect();
+                    })
+                    .collect();
 
-                zyntax_typed_ast::type_registry::TypeParam {
-                    name: tp.name,
-                    bounds,
-                    variance: zyntax_typed_ast::type_registry::Variance::Invariant,
-                    default: tp.default.clone(),
-                    span: tp.span,
+                let method_sig = zyntax_typed_ast::type_registry::MethodSig {
+                    name: method.name,
+                    type_params,
+                    params,
+                    return_type: method.return_type.clone(),
+                    where_clause: vec![],
+                    is_static: false,
+                    is_async: method.is_async,
+                    visibility: zyntax_typed_ast::type_registry::Visibility::Public,
+                    span: method.span,
+                    is_extension: false,
+                };
+
+                zyntax_typed_ast::type_registry::MethodImpl {
+                    signature: method_sig,
+                    is_default: false,
                 }
-            }).collect();
-
-            let method_sig = zyntax_typed_ast::type_registry::MethodSig {
-                name: method.name,
-                type_params,
-                params,
-                return_type: method.return_type.clone(),
-                where_clause: vec![],
-                is_static: false,
-                is_async: method.is_async,
-                visibility: zyntax_typed_ast::type_registry::Visibility::Public,
-                span: method.span,
-                is_extension: false,
-            };
-
-            zyntax_typed_ast::type_registry::MethodImpl {
-                signature: method_sig,
-                is_default: false,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Create ImplDef and register it (only for trait impls, not inherent impls)
         if let Some(tid) = trait_id {
@@ -2310,7 +2585,10 @@ impl LoweringContext {
             // TODO: Register impl in type registry before lowering starts
             // self.type_registry is Arc (immutable), so we can't register here
             // For now, method resolution relies on mangled names being available in SSA phase
-            eprintln!("[LOWERING] Built impl def for trait {:?} for type {:?} (registration TODO)", tid, implementing_type);
+            eprintln!(
+                "[LOWERING] Built impl def for trait {:?} for type {:?} (registration TODO)",
+                tid, implementing_type
+            );
             eprintln!("[LOWERING] ImplDef has {} methods", impl_def.methods.len());
         } else {
             eprintln!("[LOWERING] Skipping ImplDef creation for inherent impl (no trait)");
@@ -2318,39 +2596,51 @@ impl LoweringContext {
 
         // For each method in the impl block, convert it to a function and lower it
         for (method_idx, method) in impl_block.methods.iter().enumerate() {
-            eprintln!("[LOWERING] Processing method {} of {}: {}",
-                method_idx + 1, impl_block.methods.len(),
-                method.name.resolve_global().unwrap_or_default());
+            eprintln!(
+                "[LOWERING] Processing method {} of {}: {}",
+                method_idx + 1,
+                impl_block.methods.len(),
+                method.name.resolve_global().unwrap_or_default()
+            );
 
             // Resolve parameter types and track self parameters for body retyping
             let mut self_param_mappings: Vec<(zyntax_typed_ast::InternedString, Type)> = Vec::new();
 
-            let params: Vec<zyntax_typed_ast::TypedParameter> = method.params.iter().map(|p| {
-                eprintln!("[LOWERING] Param is_self={}, ty={:?}", p.is_self, p.ty);
-                let resolved_ty = if p.is_self && (matches!(p.ty, Type::Any) || matches!(p.ty, Type::Unresolved(_))) {
-                    // Self parameter without explicit type -> use implementing type
-                    eprintln!("[LOWERING] Resolving self param to {:?}", implementing_type);
-                    let resolved = implementing_type.clone();
-                    // Track this parameter for body retyping
-                    self_param_mappings.push((p.name, resolved.clone()));
-                    resolved
-                } else {
-                    p.ty.clone()
-                };
+            let params: Vec<zyntax_typed_ast::TypedParameter> = method
+                .params
+                .iter()
+                .map(|p| {
+                    eprintln!("[LOWERING] Param is_self={}, ty={:?}", p.is_self, p.ty);
+                    let resolved_ty = if p.is_self
+                        && (matches!(p.ty, Type::Any) || matches!(p.ty, Type::Unresolved(_)))
+                    {
+                        // Self parameter without explicit type -> use implementing type
+                        eprintln!("[LOWERING] Resolving self param to {:?}", implementing_type);
+                        let resolved = implementing_type.clone();
+                        // Track this parameter for body retyping
+                        self_param_mappings.push((p.name, resolved.clone()));
+                        resolved
+                    } else {
+                        p.ty.clone()
+                    };
 
-                zyntax_typed_ast::TypedParameter {
-                    name: p.name,
-                    ty: resolved_ty,
-                    mutability: p.mutability,
-                    kind: p.kind.clone(),
-                    default_value: p.default_value.clone(),
-                    attributes: p.attributes.clone(),
-                    span: p.span,
-                }
-            }).collect();
+                    zyntax_typed_ast::TypedParameter {
+                        name: p.name,
+                        ty: resolved_ty,
+                        mutability: p.mutability,
+                        kind: p.kind.clone(),
+                        default_value: p.default_value.clone(),
+                        attributes: p.attributes.clone(),
+                        span: p.span,
+                    }
+                })
+                .collect();
 
             // Re-type the method body to update self references
-            eprintln!("[LOWERING] Retyping method body, self_param_mappings: {:?}", self_param_mappings);
+            eprintln!(
+                "[LOWERING] Retyping method body, self_param_mappings: {:?}",
+                self_param_mappings
+            );
             let retyped_body = method.body.as_ref().map(|body| {
                 let result = self.retype_block_with_self(body, &self_param_mappings);
                 eprintln!("[LOWERING] Retyping complete");
@@ -2361,7 +2651,10 @@ impl LoweringContext {
             let resolved_return_type = match &method.return_type {
                 Type::Any => {
                     // Self type in return position -> use implementing type
-                    eprintln!("[LOWERING] Resolving return type Self -> {:?}", implementing_type);
+                    eprintln!(
+                        "[LOWERING] Resolving return type Self -> {:?}",
+                        implementing_type
+                    );
                     implementing_type.clone()
                 }
                 Type::Unresolved(name) => {
@@ -2394,17 +2687,20 @@ impl LoweringContext {
                             method.name // Fallback to original name
                         }
                     }
-                    Type::Extern { name, .. } => *name,  // Use the extern struct's name
-                    _ => method.name, // For other types, use original name
+                    Type::Extern { name, .. } => *name, // Use the extern struct's name
+                    _ => method.name,                   // For other types, use original name
                 };
 
                 // For inherent impls (empty trait name), use simpler mangling
                 if is_inherent {
-                    let type_name_str = type_name.resolve_global()
+                    let type_name_str = type_name
+                        .resolve_global()
                         .unwrap_or_else(|| "UnknownType".to_string());
                     // Strip $ prefix if present (extern struct names have runtime_prefix)
                     let base_type_name = type_name_str.strip_prefix('$').unwrap_or(&type_name_str);
-                    let method_name_str = method.name.resolve_global()
+                    let method_name_str = method
+                        .name
+                        .resolve_global()
                         .unwrap_or_else(|| "unknown_method".to_string());
 
                     // Use consistent TypeName$method naming for all extern struct methods
@@ -2422,8 +2718,12 @@ impl LoweringContext {
 
             // Get the existing function_id from collect_declarations, or create new if missing
             // This ensures consistency between the two phases
-            let function_id = if let Some(&existing_id) = self.symbols.functions.get(&mangled_name) {
-                eprintln!("[LOWERING] Using existing function_id for {:?}", mangled_name);
+            let function_id = if let Some(&existing_id) = self.symbols.functions.get(&mangled_name)
+            {
+                eprintln!(
+                    "[LOWERING] Using existing function_id for {:?}",
+                    mangled_name
+                );
                 existing_id
             } else {
                 // Fallback: create new (shouldn't happen if collect_declarations ran first)
@@ -2441,8 +2741,12 @@ impl LoweringContext {
                     let method_name_str = method.name.resolve_global().unwrap_or_default();
                     // ZRTL symbol format: $TypeName$method_name (e.g., $Tensor$matmul)
                     let zrtl_symbol = format!("${}${}", type_name, method_name_str);
-                    eprintln!("[LOWERING] Extern struct method: {} -> ZRTL symbol: {} (params: {})",
-                        mangled_name.resolve_global().unwrap_or_default(), zrtl_symbol, params.len());
+                    eprintln!(
+                        "[LOWERING] Extern struct method: {} -> ZRTL symbol: {} (params: {})",
+                        mangled_name.resolve_global().unwrap_or_default(),
+                        zrtl_symbol,
+                        params.len()
+                    );
 
                     let func = TypedFunction {
                         name: mangled_name,
@@ -2451,34 +2755,38 @@ impl LoweringContext {
                         type_params: vec![],
                         params,
                         return_type: resolved_return_type,
-                        body: None,  // No body - external function
+                        body: None, // No body - external function
                         visibility: zyntax_typed_ast::type_registry::Visibility::Public,
                         is_async: method.is_async,
                         is_pure: false,
-                        is_external: true,  // Mark as external
-                        calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
-                        link_name: Some(InternedString::new_global(&zrtl_symbol)),  // Link to ZRTL symbol
+                        is_external: true, // Mark as external
+                        calling_convention:
+                            zyntax_typed_ast::type_registry::CallingConvention::Default,
+                        link_name: Some(InternedString::new_global(&zrtl_symbol)), // Link to ZRTL symbol
                     };
 
                     if let Err(e) = self.lower_function(&func) {
                         let method_name_str = mangled_name.resolve_global().unwrap_or_default();
-                        eprintln!("[LOWERING WARN] Skipping extern method '{}': {:?}", method_name_str, e);
+                        eprintln!(
+                            "[LOWERING WARN] Skipping extern method '{}': {:?}",
+                            method_name_str, e
+                        );
                         self.symbols.functions.remove(&mangled_name);
                         continue;
                     }
-                    continue;  // Skip regular function lowering
+                    continue; // Skip regular function lowering
                 }
             }
 
             // Create a function from the method (regular, non-extern struct)
             let func = TypedFunction {
-                name: mangled_name,  // Use mangled name for trait method
+                name: mangled_name, // Use mangled name for trait method
                 annotations: vec![],
                 effects: vec![],
                 type_params: vec![],
                 params,
                 return_type: resolved_return_type,
-                body: retyped_body,  // Use retyped body with updated self types
+                body: retyped_body, // Use retyped body with updated self types
                 visibility: zyntax_typed_ast::type_registry::Visibility::Public,
                 is_async: method.is_async,
                 is_pure: false,
@@ -2492,7 +2800,10 @@ impl LoweringContext {
             // but we don't want to fail the entire impl block
             if let Err(e) = self.lower_function(&func) {
                 let method_name_str = mangled_name.resolve_global().unwrap_or_default();
-                eprintln!("[LOWERING WARN] Skipping method '{}': {:?}", method_name_str, e);
+                eprintln!(
+                    "[LOWERING WARN] Skipping method '{}': {:?}",
+                    method_name_str, e
+                );
                 // Remove the function from the symbols table so SSA doesn't try to process it
                 self.symbols.functions.remove(&mangled_name);
                 continue;
@@ -2508,8 +2819,8 @@ impl LoweringContext {
         expr: &zyntax_typed_ast::TypedExpression,
         expected_ty: &crate::hir::HirType,
     ) -> CompilerResult<crate::hir::HirConstant> {
-        use zyntax_typed_ast::{TypedExpression, TypedLiteral};
         use crate::hir::HirConstant;
+        use zyntax_typed_ast::{TypedExpression, TypedLiteral};
 
         match expr {
             // Simple literals
@@ -2539,9 +2850,9 @@ impl LoweringContext {
                     }
                 }
                 TypedLiteral::String(s) => Ok(HirConstant::String(*s)),
-                TypedLiteral::Char(_) => {
-                    Err(crate::CompilerError::Analysis("Char literals not yet supported in global initializers".into()))
-                }
+                TypedLiteral::Char(_) => Err(crate::CompilerError::Analysis(
+                    "Char literals not yet supported in global initializers".into(),
+                )),
                 TypedLiteral::Unit => {
                     // Unit type maps to null pointer type
                     Ok(HirConstant::Null(expected_ty.clone()))
@@ -2554,13 +2865,17 @@ impl LoweringContext {
                     // Undefined - use zeroed memory as placeholder
                     Ok(HirConstant::I32(0))
                 }
-            }
+            },
 
             // Array literals
             TypedExpression::Array(elements) => {
                 let element_ty = match expected_ty {
                     crate::hir::HirType::Array(elem_ty, _) => elem_ty.as_ref().clone(),
-                    _ => return Err(crate::CompilerError::Analysis("Array initializer for non-array type".into())),
+                    _ => {
+                        return Err(crate::CompilerError::Analysis(
+                            "Array initializer for non-array type".into(),
+                        ))
+                    }
                 };
 
                 let mut const_elements = Vec::new();
@@ -2575,12 +2890,17 @@ impl LoweringContext {
             TypedExpression::Struct(struct_lit) => {
                 let field_types = match expected_ty {
                     crate::hir::HirType::Struct(s) => &s.fields,
-                    _ => return Err(crate::CompilerError::Analysis("Struct initializer for non-struct type".into())),
+                    _ => {
+                        return Err(crate::CompilerError::Analysis(
+                            "Struct initializer for non-struct type".into(),
+                        ))
+                    }
                 };
 
                 let mut const_fields = Vec::new();
                 for (field_init, field_ty) in struct_lit.fields.iter().zip(field_types.iter()) {
-                    const_fields.push(self.eval_const_expression(&field_init.value.node, field_ty)?);
+                    const_fields
+                        .push(self.eval_const_expression(&field_init.value.node, field_ty)?);
                 }
 
                 Ok(HirConstant::Struct(const_fields))
@@ -2599,10 +2919,10 @@ impl LoweringContext {
                 self.eval_const_unary_op(&unary.op, &operand)
             }
 
-            _ => Err(crate::CompilerError::Analysis(
-                format!("Expression type {:?} not supported in global initializers",
-                    std::mem::discriminant(expr))
-            )),
+            _ => Err(crate::CompilerError::Analysis(format!(
+                "Expression type {:?} not supported in global initializers",
+                std::mem::discriminant(expr)
+            ))),
         }
     }
 
@@ -2613,8 +2933,8 @@ impl LoweringContext {
         left: &crate::hir::HirConstant,
         right: &crate::hir::HirConstant,
     ) -> CompilerResult<crate::hir::HirConstant> {
-        use zyntax_typed_ast::BinaryOp;
         use crate::hir::HirConstant;
+        use zyntax_typed_ast::BinaryOp;
 
         // Helper macros for arithmetic operations
         macro_rules! int_op {
@@ -2639,7 +2959,10 @@ impl LoweringContext {
             BinaryOp::Mul => int_op!(left, right, *),
             BinaryOp::Div => int_op!(left, right, /),
             BinaryOp::Rem => int_op!(left, right, %),
-            _ => Err(crate::CompilerError::Analysis(format!("Binary operator {:?} not supported in const context", op))),
+            _ => Err(crate::CompilerError::Analysis(format!(
+                "Binary operator {:?} not supported in const context",
+                op
+            ))),
         }
     }
 
@@ -2649,8 +2972,8 @@ impl LoweringContext {
         op: &zyntax_typed_ast::UnaryOp,
         operand: &crate::hir::HirConstant,
     ) -> CompilerResult<crate::hir::HirConstant> {
-        use zyntax_typed_ast::UnaryOp;
         use crate::hir::HirConstant;
+        use zyntax_typed_ast::UnaryOp;
 
         match op {
             UnaryOp::Minus => match operand {
@@ -2660,27 +2983,39 @@ impl LoweringContext {
                 HirConstant::I64(v) => Ok(HirConstant::I64(-v)),
                 HirConstant::F32(v) => Ok(HirConstant::F32(-v)),
                 HirConstant::F64(v) => Ok(HirConstant::F64(-v)),
-                _ => Err(crate::CompilerError::Analysis("Cannot negate non-numeric constant".into())),
-            }
+                _ => Err(crate::CompilerError::Analysis(
+                    "Cannot negate non-numeric constant".into(),
+                )),
+            },
             UnaryOp::Not => match operand {
                 HirConstant::Bool(v) => Ok(HirConstant::Bool(!v)),
-                _ => Err(crate::CompilerError::Analysis("Cannot apply NOT to non-boolean constant".into())),
-            }
-            _ => Err(crate::CompilerError::Analysis(format!("Unary operator {:?} not supported in const context", op))),
+                _ => Err(crate::CompilerError::Analysis(
+                    "Cannot apply NOT to non-boolean constant".into(),
+                )),
+            },
+            _ => Err(crate::CompilerError::Analysis(format!(
+                "Unary operator {:?} not supported in const context",
+                op
+            ))),
         }
     }
-    
+
     /// Lower an import declaration
     ///
     /// If an import resolver is configured, this will attempt to resolve the import
     /// and register the resolved symbols in the HIR module. Already-resolved modules
     /// are cached to avoid redundant resolution.
-    fn lower_import(&mut self, import: &zyntax_typed_ast::typed_ast::TypedImport) -> CompilerResult<()> {
+    fn lower_import(
+        &mut self,
+        import: &zyntax_typed_ast::typed_ast::TypedImport,
+    ) -> CompilerResult<()> {
         use zyntax_typed_ast::typed_ast::TypedImportItem;
 
         // Convert import items to our internal representation
-        let items: Vec<ImportedItem> = import.items.iter().map(|item| {
-            match item {
+        let items: Vec<ImportedItem> = import
+            .items
+            .iter()
+            .map(|item| match item {
                 TypedImportItem::Named { name, alias } => ImportedItem {
                     name: *name,
                     alias: *alias,
@@ -2699,11 +3034,12 @@ impl LoweringContext {
                     alias: None,
                     is_glob: false,
                 },
-            }
-        }).collect();
+            })
+            .collect();
 
         // Convert module path to string vec for cache lookup
-        let module_path_strings: Vec<String> = import.module_path
+        let module_path_strings: Vec<String> = import
+            .module_path
             .iter()
             .filter_map(|s| s.resolve_global())
             .collect();
@@ -2726,7 +3062,8 @@ impl LoweringContext {
                         resolved_imports.len()
                     );
                     // Cache the result
-                    self.resolved_module_cache.insert(module_path_strings.clone(), resolved_imports.clone());
+                    self.resolved_module_cache
+                        .insert(module_path_strings.clone(), resolved_imports.clone());
                     resolved_imports
                 }
                 Err(e) => {
@@ -2749,7 +3086,9 @@ impl LoweringContext {
         }
 
         // Track the module path in import context to detect cycles
-        self.import_context.imported_modules.push(module_path_strings);
+        self.import_context
+            .imported_modules
+            .push(module_path_strings);
 
         // Store import metadata
         self.import_metadata.push(ImportMetadata {
@@ -2770,12 +3109,18 @@ impl LoweringContext {
         resolved: &ResolvedImport,
         items: &[ImportedItem],
     ) -> CompilerResult<()> {
-        use crate::hir::{HirImport, ImportKind, ImportAttributes, HirFunctionSignature, HirParam};
+        use crate::hir::{HirFunctionSignature, HirImport, HirParam, ImportAttributes, ImportKind};
 
         match resolved {
-            ResolvedImport::Function { qualified_name, params, return_type, is_extern } => {
+            ResolvedImport::Function {
+                qualified_name,
+                params,
+                return_type,
+                is_extern,
+            } => {
                 // Register as an external function declaration in HIR
-                let func_name = qualified_name.last()
+                let func_name = qualified_name
+                    .last()
                     .map(|s| s.as_str())
                     .unwrap_or("unknown");
 
@@ -2785,9 +3130,11 @@ impl LoweringContext {
                 };
 
                 // Check if we need to apply an alias
-                let local_name = items.iter()
+                let local_name = items
+                    .iter()
                     .find(|item| {
-                        item.name.resolve_global()
+                        item.name
+                            .resolve_global()
                             .map(|n| n == func_name)
                             .unwrap_or(false)
                     })
@@ -2795,7 +3142,8 @@ impl LoweringContext {
                     .unwrap_or(interned_name);
 
                 // Convert typed_ast types to HIR types
-                let hir_params: Vec<HirParam> = params.iter()
+                let hir_params: Vec<HirParam> = params
+                    .iter()
                     .enumerate()
                     .map(|(i, ty)| {
                         let hir_type = self.convert_type(ty);
@@ -2839,13 +3187,22 @@ impl LoweringContext {
                 log::debug!(
                     "Registered imported function '{}' (alias: {:?})",
                     func_name,
-                    if local_name != interned_name { Some(local_name) } else { None }
+                    if local_name != interned_name {
+                        Some(local_name)
+                    } else {
+                        None
+                    }
                 );
             }
 
-            ResolvedImport::Type { qualified_name, ty, is_extern } => {
+            ResolvedImport::Type {
+                qualified_name,
+                ty,
+                is_extern,
+            } => {
                 // Register the type in our symbol table and as an import
-                let type_name = qualified_name.last()
+                let type_name = qualified_name
+                    .last()
                     .map(|s| s.as_str())
                     .unwrap_or("unknown");
 
@@ -2855,9 +3212,11 @@ impl LoweringContext {
                 };
 
                 // Check if we need to apply an alias
-                let local_name = items.iter()
+                let local_name = items
+                    .iter()
                     .find(|item| {
-                        item.name.resolve_global()
+                        item.name
+                            .resolve_global()
                             .map(|n| n == type_name)
                             .unwrap_or(false)
                     })
@@ -2873,9 +3232,7 @@ impl LoweringContext {
                     zyntax_typed_ast::Type::Named { id, .. } => *id,
                     _ => {
                         // For other types, create a synthetic TypeId from hash
-                        zyntax_typed_ast::TypeId::new(
-                            hash_string(&qualified_name.join("::")) as u32
-                        )
+                        zyntax_typed_ast::TypeId::new(hash_string(&qualified_name.join("::")) as u32)
                     }
                 };
 
@@ -2935,13 +3292,19 @@ impl LoweringContext {
 
                             self.module.imports.push(hir_import);
                         }
-                        SymbolKind::Type | SymbolKind::Class | SymbolKind::Enum |
-                        SymbolKind::Interface | SymbolKind::Trait => {
+                        SymbolKind::Type
+                        | SymbolKind::Class
+                        | SymbolKind::Enum
+                        | SymbolKind::Interface
+                        | SymbolKind::Trait => {
                             // Create an opaque type for the imported type
                             let hir_type = crate::hir::HirType::Opaque(symbol_name);
-                            let type_id = zyntax_typed_ast::TypeId::new(
-                                hash_string(&format!("{}::{}", path.join("::"), export.name)) as u32
-                            );
+                            let type_id = zyntax_typed_ast::TypeId::new(hash_string(&format!(
+                                "{}::{}",
+                                path.join("::"),
+                                export.name
+                            ))
+                                as u32);
 
                             self.module.types.insert(type_id, hir_type.clone());
                             self.symbols.types.insert(symbol_name, type_id);
@@ -2973,7 +3336,8 @@ impl LoweringContext {
 
             ResolvedImport::Constant { qualified_name, ty } => {
                 // Register as a global import
-                let const_name = qualified_name.last()
+                let const_name = qualified_name
+                    .last()
                     .map(|s| s.as_str())
                     .unwrap_or("unknown");
 
@@ -2993,7 +3357,10 @@ impl LoweringContext {
                 self.module.imports.push(hir_import);
             }
 
-            ResolvedImport::Glob { module_path, symbols } => {
+            ResolvedImport::Glob {
+                module_path,
+                symbols,
+            } => {
                 // For glob imports, register all public symbols from the module
                 for symbol in symbols {
                     if !symbol.is_public {
@@ -3027,12 +3394,18 @@ impl LoweringContext {
 
                             self.module.imports.push(hir_import);
                         }
-                        SymbolKind::Type | SymbolKind::Class | SymbolKind::Enum |
-                        SymbolKind::Interface | SymbolKind::Trait => {
+                        SymbolKind::Type
+                        | SymbolKind::Class
+                        | SymbolKind::Enum
+                        | SymbolKind::Interface
+                        | SymbolKind::Trait => {
                             let hir_type = crate::hir::HirType::Opaque(symbol_name);
-                            let type_id = zyntax_typed_ast::TypeId::new(
-                                hash_string(&format!("{}::{}", module_path.join("::"), symbol.name)) as u32
-                            );
+                            let type_id = zyntax_typed_ast::TypeId::new(hash_string(&format!(
+                                "{}::{}",
+                                module_path.join("::"),
+                                symbol.name
+                            ))
+                                as u32);
 
                             self.module.types.insert(type_id, hir_type.clone());
                             self.symbols.types.insert(symbol_name, type_id);
@@ -3066,7 +3439,10 @@ impl LoweringContext {
     }
 
     /// Lower a class declaration
-    fn lower_class(&mut self, class: &zyntax_typed_ast::typed_ast::TypedClass) -> CompilerResult<()> {
+    fn lower_class(
+        &mut self,
+        class: &zyntax_typed_ast::typed_ast::TypedClass,
+    ) -> CompilerResult<()> {
         // Lower each method as a free function with mangled name
         for method in &class.methods {
             self.lower_method(class.name, method)?;
@@ -3081,9 +3457,15 @@ impl LoweringContext {
     }
 
     /// Lower a method to a free function with `self` parameter
-    fn lower_method(&mut self, class_name: InternedString, method: &zyntax_typed_ast::typed_ast::TypedMethod) -> CompilerResult<()> {
-        use zyntax_typed_ast::typed_ast::{TypedFunction, TypedParameter, ParameterKind, typed_node};
-        use zyntax_typed_ast::type_registry::{Type, NullabilityKind, TypeId};
+    fn lower_method(
+        &mut self,
+        class_name: InternedString,
+        method: &zyntax_typed_ast::typed_ast::TypedMethod,
+    ) -> CompilerResult<()> {
+        use zyntax_typed_ast::type_registry::{NullabilityKind, Type, TypeId};
+        use zyntax_typed_ast::typed_ast::{
+            typed_node, ParameterKind, TypedFunction, TypedParameter,
+        };
 
         // Create mangled function name
         let mangled_name = self.mangle_method_name(class_name, method.name);
@@ -3094,7 +3476,8 @@ impl LoweringContext {
         // Add self parameter if not static
         if !method.is_static {
             // Look up the class TypeId from the registry
-            let class_type_id = self.type_registry
+            let class_type_id = self
+                .type_registry
                 .get_type_by_name(class_name)
                 .map(|def| def.id)
                 .unwrap_or_else(|| TypeId::new(0)); // Fallback if not found
@@ -3146,10 +3529,12 @@ impl LoweringContext {
             type_params: method.type_params.clone(),
             params,
             return_type: method.return_type.clone(),
-            body: method.body.clone().or_else(|| Some(zyntax_typed_ast::typed_ast::TypedBlock {
-                statements: vec![],
-                span: method.span,
-            })),
+            body: method.body.clone().or_else(|| {
+                Some(zyntax_typed_ast::typed_ast::TypedBlock {
+                    statements: vec![],
+                    span: method.span,
+                })
+            }),
             visibility: method.visibility,
             is_async: method.is_async,
             is_pure: false,
@@ -3163,32 +3548,43 @@ impl LoweringContext {
     }
 
     /// Lower a constructor
-    fn lower_constructor(&mut self, class_name: InternedString, index: usize, ctor: &zyntax_typed_ast::typed_ast::TypedConstructor) -> CompilerResult<()> {
-        use zyntax_typed_ast::typed_ast::{TypedFunction, TypedParameter, ParameterKind};
-        use zyntax_typed_ast::type_registry::{Type, NullabilityKind, TypeId};
+    fn lower_constructor(
+        &mut self,
+        class_name: InternedString,
+        index: usize,
+        ctor: &zyntax_typed_ast::typed_ast::TypedConstructor,
+    ) -> CompilerResult<()> {
+        use zyntax_typed_ast::type_registry::{NullabilityKind, Type, TypeId};
+        use zyntax_typed_ast::typed_ast::{ParameterKind, TypedFunction, TypedParameter};
 
         // Constructor name: ClassName_constructor_N
         // Use resolve_global() for portability across interner sources
         let ctor_name = {
-            let class_name_str = class_name.resolve_global()
+            let class_name_str = class_name
+                .resolve_global()
                 .unwrap_or_else(|| "UnknownClass".to_string());
             let mut arena = self.arena.lock().unwrap();
             arena.intern_string(&format!("{}_constructor_{}", class_name_str, index))
         };
 
         // Build parameters from constructor
-        let params: Vec<TypedParameter> = ctor.params.iter().map(|p| TypedParameter {
-            name: p.name,
-            ty: p.ty.clone(),
-            mutability: p.mutability,
-            kind: ParameterKind::Regular,
-            default_value: p.default_value.clone(),
-            attributes: vec![],
-            span: p.span,
-        }).collect();
+        let params: Vec<TypedParameter> = ctor
+            .params
+            .iter()
+            .map(|p| TypedParameter {
+                name: p.name,
+                ty: p.ty.clone(),
+                mutability: p.mutability,
+                kind: ParameterKind::Regular,
+                default_value: p.default_value.clone(),
+                attributes: vec![],
+                span: p.span,
+            })
+            .collect();
 
         // Constructor returns an instance of the class
-        let class_type_id = self.type_registry
+        let class_type_id = self
+            .type_registry
             .get_type_by_name(class_name)
             .map(|def| def.id)
             .unwrap_or_else(|| TypeId::new(0)); // Fallback if not found
@@ -3222,7 +3618,11 @@ impl LoweringContext {
 
     /// Resolve associated function call (Type::method) to mangled method name
     /// Returns None if the function cannot be resolved
-    fn resolve_associated_function_to_mangled(&self, type_name: &str, method_name: &str) -> Option<String> {
+    fn resolve_associated_function_to_mangled(
+        &self,
+        type_name: &str,
+        method_name: &str,
+    ) -> Option<String> {
         // First, check for inherent impl methods (including extern struct methods)
         // Try wrapper method name first: _zynml_{Type}_{method}
         let wrapper_name = format!("_zynml_{}_{}", type_name, method_name);
@@ -3247,7 +3647,8 @@ impl LoweringContext {
                     if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
                         let impl_type_name = {
                             let arena = self.arena.lock().unwrap();
-                            arena.resolve_string(type_def.name)
+                            arena
+                                .resolve_string(type_def.name)
                                 .map(|s| s.to_string())
                                 .unwrap_or_default()
                         };
@@ -3257,7 +3658,8 @@ impl LoweringContext {
                             for method in &impl_def.methods {
                                 let impl_method_name = {
                                     let arena = self.arena.lock().unwrap();
-                                    arena.resolve_string(method.signature.name)
+                                    arena
+                                        .resolve_string(method.signature.name)
                                         .map(|s| s.to_string())
                                         .unwrap_or_default()
                                 };
@@ -3265,16 +3667,19 @@ impl LoweringContext {
                                 if impl_method_name == method_name {
                                     // Found it! Return mangled name
                                     // Format: {TypeName}${TraitName}${method_name}
-                                    let trait_def = self.type_registry.get_trait_by_id(impl_def.trait_id);
+                                    let trait_def =
+                                        self.type_registry.get_trait_by_id(impl_def.trait_id);
                                     if let Some(trait_def) = trait_def {
                                         let trait_name = {
                                             let arena = self.arena.lock().unwrap();
-                                            arena.resolve_string(trait_def.name)
+                                            arena
+                                                .resolve_string(trait_def.name)
                                                 .map(|s| s.to_string())
                                                 .unwrap_or_default()
                                         };
 
-                                        let mangled = format!("{}${}${}", type_name, trait_name, method_name);
+                                        let mangled =
+                                            format!("{}${}${}", type_name, trait_name, method_name);
                                         return Some(mangled);
                                     }
                                 }
@@ -3303,7 +3708,8 @@ impl LoweringContext {
         let target_type_def = self.type_registry.get_type_by_id(target_type_id)?;
         let target_type_name = {
             let arena = self.arena.lock().unwrap();
-            arena.resolve_string(target_type_def.name)
+            arena
+                .resolve_string(target_type_def.name)
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         };
@@ -3315,10 +3721,13 @@ impl LoweringContext {
                 if let Type::Named { id, .. } = &impl_def.for_type {
                     if *id == target_type_id {
                         // Check if this is a From trait
-                        if let Some(trait_def) = self.type_registry.get_trait_by_id(impl_def.trait_id) {
+                        if let Some(trait_def) =
+                            self.type_registry.get_trait_by_id(impl_def.trait_id)
+                        {
                             let trait_name = {
                                 let arena = self.arena.lock().unwrap();
-                                arena.resolve_string(trait_def.name)
+                                arena
+                                    .resolve_string(trait_def.name)
                                     .map(|s| s.to_string())
                                     .unwrap_or_default()
                             };
@@ -3351,7 +3760,7 @@ impl LoweringContext {
         expr: zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>,
         expected_type: &Type,
     ) -> Option<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>> {
-        use zyntax_typed_ast::{TypedExpression, TypedCall, typed_ast::typed_node};
+        use zyntax_typed_ast::{typed_ast::typed_node, TypedCall, TypedExpression};
 
         // Don't convert if types already match
         if &expr.ty == expected_type {
@@ -3359,13 +3768,18 @@ impl LoweringContext {
         }
 
         // Don't convert if either type is Any or Unknown (type inference not done)
-        if matches!(expr.ty, Type::Any | Type::Unknown) || matches!(expected_type, Type::Any | Type::Unknown) {
+        if matches!(expr.ty, Type::Any | Type::Unknown)
+            || matches!(expected_type, Type::Any | Type::Unknown)
+        {
             return None;
         }
 
         // Check if there's a From<expr.ty> impl for expected_type
         if let Some(from_func) = self.find_from_impl(&expr.ty, expected_type) {
-            eprintln!("[IMPLICIT_CONVERSION] Converting {:?} to {:?} via {}", expr.ty, expected_type, from_func);
+            eprintln!(
+                "[IMPLICIT_CONVERSION] Converting {:?} to {:?} via {}",
+                expr.ty, expected_type, from_func
+            );
 
             // Capture span before moving expr
             let span = expr.span;
@@ -3394,12 +3808,18 @@ impl LoweringContext {
     }
 
     /// Mangle method name: ClassName_methodName
-    fn mangle_method_name(&self, class_name: InternedString, method_name: InternedString) -> InternedString {
+    fn mangle_method_name(
+        &self,
+        class_name: InternedString,
+        method_name: InternedString,
+    ) -> InternedString {
         // Use resolve_global() since InternedStrings may come from different sources
         // (global interner from ZynPEG runtime, local arena from JSON deserialization, etc.)
-        let class_name_str = class_name.resolve_global()
+        let class_name_str = class_name
+            .resolve_global()
             .unwrap_or_else(|| "UnknownClass".to_string());
-        let method_name_str = method_name.resolve_global()
+        let method_name_str = method_name
+            .resolve_global()
             .unwrap_or_else(|| "unknown_method".to_string());
         let mut arena = self.arena.lock().unwrap();
         arena.intern_string(&format!("{}_{}", class_name_str, method_name_str))
@@ -3413,11 +3833,14 @@ impl LoweringContext {
         trait_name: InternedString,
         method_name: InternedString,
     ) -> InternedString {
-        let type_name_str = type_name.resolve_global()
+        let type_name_str = type_name
+            .resolve_global()
             .unwrap_or_else(|| "UnknownType".to_string());
-        let trait_name_str = trait_name.resolve_global()
+        let trait_name_str = trait_name
+            .resolve_global()
             .unwrap_or_else(|| "UnknownTrait".to_string());
-        let method_name_str = method_name.resolve_global()
+        let method_name_str = method_name
+            .resolve_global()
             .unwrap_or_else(|| "unknown_method".to_string());
 
         let mangled = format!("{}${}${}", type_name_str, trait_name_str, method_name_str);
@@ -3433,7 +3856,7 @@ impl LoweringContext {
             Visibility::Internal => crate::hir::Linkage::Internal,
         }
     }
-    
+
     /// Convert visibility
     fn convert_visibility(&self, vis: Visibility) -> crate::hir::Visibility {
         match vis {
@@ -3445,7 +3868,10 @@ impl LoweringContext {
     }
 
     /// Convert TypedAST calling convention to HIR calling convention (Gap 11)
-    fn convert_calling_convention(&self, cc: zyntax_typed_ast::CallingConvention) -> crate::hir::CallingConvention {
+    fn convert_calling_convention(
+        &self,
+        cc: zyntax_typed_ast::CallingConvention,
+    ) -> crate::hir::CallingConvention {
         use zyntax_typed_ast::CallingConvention as TypedCC;
         match cc {
             // Default uses System which resolves to platform-native in backend (AppleAarch64 on ARM Mac, SystemV on x86)
@@ -3477,7 +3903,8 @@ impl LoweringContext {
         // Collect implementations to avoid borrow checker issues
         // (iter_implementations borrows self.type_registry immutably,
         //  but lower_impl borrows self mutably)
-        let implementations: Vec<_> = self.type_registry
+        let implementations: Vec<_> = self
+            .type_registry
             .iter_implementations()
             .map(|(trait_id, impl_defs)| (*trait_id, impl_defs.clone()))
             .collect();
@@ -3488,17 +3915,20 @@ impl LoweringContext {
                 // Skip impls that fail - methods may not have been lowered
                 if let Err(e) = self.lower_impl(trait_id, impl_def) {
                     let type_name = match &impl_def.for_type {
-                        zyntax_typed_ast::Type::Named { id, .. } => {
-                            self.type_registry.get_type_by_id(*id)
-                                .map(|t| t.name.resolve_global().unwrap_or_default().to_string())
-                                .unwrap_or_else(|| format!("{:?}", id))
-                        }
+                        zyntax_typed_ast::Type::Named { id, .. } => self
+                            .type_registry
+                            .get_type_by_id(*id)
+                            .map(|t| t.name.resolve_global().unwrap_or_default().to_string())
+                            .unwrap_or_else(|| format!("{:?}", id)),
                         zyntax_typed_ast::Type::Extern { name, .. } => {
                             name.resolve_global().unwrap_or_default().to_string()
                         }
                         other => format!("{:?}", other),
                     };
-                    eprintln!("[LOWERING WARN] Skipping trait impl for '{}': {:?}", type_name, e);
+                    eprintln!(
+                        "[LOWERING WARN] Skipping trait impl for '{}': {:?}",
+                        type_name, e
+                    );
                 }
             }
         }
@@ -3517,16 +3947,15 @@ impl LoweringContext {
     /// 6. Creates vtable global and adds to module
     ///
     /// NOTE: Ready to use once TypeRegistry provides access to ImplDef
-    #[allow(dead_code)]  // Will be used when TypeRegistry integration is complete
+    #[allow(dead_code)] // Will be used when TypeRegistry integration is complete
     fn lower_impl(
         &mut self,
         trait_id: TypeId,
         impl_def: &zyntax_typed_ast::ImplDef,
     ) -> CompilerResult<()> {
         use crate::trait_lowering::{
+            convert_type, create_vtable_global, generate_trait_method_table, generate_vtable,
             validate_trait_implementation,
-            generate_vtable, create_vtable_global, convert_type,
-            generate_trait_method_table
         };
 
         // Step 1: Convert for_type to HIR type
@@ -3538,8 +3967,10 @@ impl LoweringContext {
             zyntax_typed_ast::Type::Extern { name, .. } => {
                 // Extern types (like $Tensor) don't have TypeIds - they're handled by ZRTL
                 // Skip trait impl lowering for extern types as they use runtime dispatch
-                eprintln!("[LOWERING WARN] Skipping trait impl for extern type '{}' - ZRTL handles these",
-                    name.resolve_global().unwrap_or_default());
+                eprintln!(
+                    "[LOWERING WARN] Skipping trait impl for extern type '{}' - ZRTL handles these",
+                    name.resolve_global().unwrap_or_default()
+                );
                 return Ok(());
             }
             zyntax_typed_ast::Type::Unresolved(name) => {
@@ -3551,27 +3982,23 @@ impl LoweringContext {
             }
             _ => {
                 return Err(crate::CompilerError::Analysis(
-                    "Impl for_type must be a named type (nominal typing only)".to_string()
+                    "Impl for_type must be a named type (nominal typing only)".to_string(),
                 ));
             }
         };
 
         // Step 2.5: Register implementation in AssociatedTypeResolver
         // This enables resolution of associated types like <T as Trait>::Item
-        self.associated_type_resolver.register_impl(
-            trait_id,
-            type_id,
-            Arc::new(impl_def.clone()),
-        );
+        self.associated_type_resolver
+            .register_impl(trait_id, type_id, Arc::new(impl_def.clone()));
 
         // Step 3: Generate trait method table
-        let trait_def = self.type_registry.get_trait_def(trait_id)
+        let trait_def = self
+            .type_registry
+            .get_trait_def(trait_id)
             .ok_or_else(|| crate::CompilerError::Analysis("Trait not found".to_string()))?;
-        let trait_method_table = generate_trait_method_table(
-            trait_def,
-            trait_id,
-            &self.type_registry,
-        )?;
+        let trait_method_table =
+            generate_trait_method_table(trait_def, trait_id, &self.type_registry)?;
 
         // Step 4: Validate implementation
         validate_trait_implementation(&trait_method_table, impl_def)?;
@@ -3579,11 +4006,7 @@ impl LoweringContext {
         // Step 5: Lower each method and register in VtableRegistry
         for method_impl in &impl_def.methods {
             // Lower method body to HIR function
-            let method_func_id = self.lower_impl_method(
-                trait_id,
-                type_id,
-                method_impl,
-            )?;
+            let method_func_id = self.lower_impl_method(trait_id, type_id, method_impl)?;
 
             // Register method in vtable registry
             self.vtable_registry.register_method(
@@ -3606,8 +4029,12 @@ impl LoweringContext {
         // Step 7: Create vtable global
         // Generate vtable name: vtable_TraitName_TypeName
         let vtable_name = {
-            let name_str = format!("vtable_{}_{}",
-                self.type_registry.get_trait_def(trait_id).map(|t| t.name.to_string()).unwrap_or("unknown".to_string()),
+            let name_str = format!(
+                "vtable_{}_{}",
+                self.type_registry
+                    .get_trait_def(trait_id)
+                    .map(|t| t.name.to_string())
+                    .unwrap_or("unknown".to_string()),
                 format!("{:?}", impl_def.for_type)
             );
             self.arena.lock().unwrap().intern_string(name_str)
@@ -3635,7 +4062,7 @@ impl LoweringContext {
     /// find the corresponding function ID from the symbol table.
     ///
     /// Returns the function ID for vtable registration.
-    #[allow(dead_code)]  // Will be used when TypeRegistry integration is complete
+    #[allow(dead_code)] // Will be used when TypeRegistry integration is complete
     fn lower_impl_method(
         &mut self,
         trait_id: TypeId,
@@ -3643,10 +4070,9 @@ impl LoweringContext {
         method_impl: &zyntax_typed_ast::MethodImpl,
     ) -> CompilerResult<crate::hir::HirId> {
         // Get type name and trait name
-        let type_def = self.type_registry.get_type_by_id(type_id)
-            .ok_or_else(|| crate::CompilerError::Analysis(
-                format!("Type {:?} not found in registry", type_id)
-            ))?;
+        let type_def = self.type_registry.get_type_by_id(type_id).ok_or_else(|| {
+            crate::CompilerError::Analysis(format!("Type {:?} not found in registry", type_id))
+        })?;
         let type_name = type_def.name;
 
         // Try trait-based mangling first (Type$Trait$method)
@@ -3693,14 +4119,20 @@ impl LoweringContext {
         // Check all functions
         for (func_id, func) in &self.module.functions {
             if !self.symbols.functions.values().any(|id| id == func_id) {
-                missing_symbols.push(format!("Function '{}' has no symbol table entry", func.name));
+                missing_symbols.push(format!(
+                    "Function '{}' has no symbol table entry",
+                    func.name
+                ));
             }
         }
 
         // Check all globals
         for (global_id, global) in &self.module.globals {
             if !self.symbols.globals.values().any(|id| id == global_id) {
-                missing_symbols.push(format!("Global '{}' has no symbol table entry", global.name));
+                missing_symbols.push(format!(
+                    "Global '{}' has no symbol table entry",
+                    global.name
+                ));
             }
         }
 
@@ -3715,9 +4147,10 @@ impl LoweringContext {
             }
 
             if self.config.strict_mode {
-                return Err(crate::CompilerError::Analysis(
-                    format!("Symbol table verification failed: {} unresolved references", missing_symbols.len())
-                ));
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Symbol table verification failed: {} unresolved references",
+                    missing_symbols.len()
+                )));
             }
         }
 
@@ -3727,25 +4160,23 @@ impl LoweringContext {
 
 impl LoweringPipeline {
     pub fn new() -> Self {
-        Self {
-            passes: Vec::new(),
-        }
+        Self { passes: Vec::new() }
     }
-    
+
     /// Add a pass to the pipeline
     pub fn add_pass(&mut self, pass: Box<dyn LoweringPass>) {
         self.passes.push(pass);
     }
-    
+
     /// Run all passes
     pub fn run(&mut self, context: &mut LoweringContext) -> CompilerResult<()> {
         // Sort passes by dependencies
         self.sort_passes();
-        
+
         // Run each pass
         for pass in &mut self.passes {
             let pass_name = pass.name();
-            
+
             if context.config.debug_info {
                 context.diagnostic(
                     DiagnosticLevel::Info,
@@ -3753,13 +4184,13 @@ impl LoweringPipeline {
                     None,
                 );
             }
-            
+
             pass.run(context)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Sort passes by dependencies using topological sort (Kahn's algorithm)
     fn sort_passes(&mut self) {
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -3786,7 +4217,11 @@ impl LoweringPipeline {
             for dep in pass.dependencies() {
                 // Check if dependency exists
                 if !name_to_idx.contains_key(dep) {
-                    panic!("Pass '{}' depends on '{}' which is not registered", pass.name(), dep);
+                    panic!(
+                        "Pass '{}' depends on '{}' which is not registered",
+                        pass.name(),
+                        dep
+                    );
                 }
 
                 // Add edge: dep -> current pass
@@ -3841,7 +4276,7 @@ impl LoweringPipeline {
             // We need to temporarily take ownership - use swap_remove and rebuild
             sorted_passes.push(std::mem::replace(
                 &mut self.passes[idx],
-                Box::new(passes::CfgConstructionPass) // Dummy placeholder
+                Box::new(passes::CfgConstructionPass), // Dummy placeholder
             ));
         }
 
@@ -3852,93 +4287,102 @@ impl LoweringPipeline {
 /// Standard lowering passes
 pub mod passes {
     use super::*;
-    
+
     /// CFG construction pass
     pub struct CfgConstructionPass;
-    
+
     impl LoweringPass for CfgConstructionPass {
         fn name(&self) -> &'static str {
             "cfg-construction"
         }
-        
+
         fn dependencies(&self) -> &[&'static str] {
             &[]
         }
-        
+
         fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
             // CFG is built during function lowering
             Ok(())
         }
     }
-    
+
     /// SSA construction pass
     pub struct SsaConstructionPass;
-    
+
     impl LoweringPass for SsaConstructionPass {
         fn name(&self) -> &'static str {
             "ssa-construction"
         }
-        
+
         fn dependencies(&self) -> &[&'static str] {
             &["cfg-construction"]
         }
-        
+
         fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
             // SSA is built during function lowering
             Ok(())
         }
     }
-    
+
     /// Type validation pass
     pub struct TypeValidationPass;
-    
+
     impl LoweringPass for TypeValidationPass {
         fn name(&self) -> &'static str {
             "type-validation"
         }
-        
+
         fn dependencies(&self) -> &[&'static str] {
             &["ssa-construction"]
         }
-        
+
         fn run(&mut self, context: &mut LoweringContext) -> CompilerResult<()> {
             // Validate all types in HIR
             let functions: Vec<_> = context.module.functions.values().cloned().collect();
             for func in &functions {
                 Self::validate_function_types(func, context)?;
             }
-            
+
             Ok(())
         }
     }
-    
+
     impl TypeValidationPass {
-        fn validate_function_types(func: &HirFunction, context: &mut LoweringContext) -> CompilerResult<()> {
+        fn validate_function_types(
+            func: &HirFunction,
+            context: &mut LoweringContext,
+        ) -> CompilerResult<()> {
             // Validate parameter types
             for param in &func.signature.params {
                 if !Self::is_valid_hir_type(&param.ty) {
                     context.diagnostic(
                         DiagnosticLevel::Error,
-                        format!("Invalid parameter type in function {}: {:?}", func.name, param.ty),
+                        format!(
+                            "Invalid parameter type in function {}: {:?}",
+                            func.name, param.ty
+                        ),
                         None,
                     );
                 }
             }
-            
+
             // Validate return types
             for ret_ty in &func.signature.returns {
                 if !Self::is_valid_hir_type(ret_ty) {
                     context.diagnostic(
                         DiagnosticLevel::Error,
-                        format!("Invalid return type in function {}: {:?}", func.name, ret_ty),
+                        format!(
+                            "Invalid return type in function {}: {:?}",
+                            func.name, ret_ty
+                        ),
                         None,
                     );
                 }
             }
-            
+
             Ok(())
         }
-        
+
         fn is_valid_hir_type(ty: &HirType) -> bool {
             match ty {
                 HirType::Ptr(inner) => Self::is_valid_hir_type(inner),
@@ -3946,8 +4390,8 @@ pub mod passes {
                 HirType::Vector(inner, _) => Self::is_valid_hir_type(inner),
                 HirType::Struct(s) => s.fields.iter().all(Self::is_valid_hir_type),
                 HirType::Function(f) => {
-                    f.params.iter().all(Self::is_valid_hir_type) &&
-                    f.returns.iter().all(Self::is_valid_hir_type)
+                    f.params.iter().all(Self::is_valid_hir_type)
+                        && f.returns.iter().all(Self::is_valid_hir_type)
                 }
                 _ => true,
             }
@@ -3962,30 +4406,54 @@ mod tests {
     // Test passes for topological sort
     struct PassA;
     impl LoweringPass for PassA {
-        fn name(&self) -> &'static str { "pass-a" }
-        fn dependencies(&self) -> &[&'static str] { &[] }
-        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+        fn name(&self) -> &'static str {
+            "pass-a"
+        }
+        fn dependencies(&self) -> &[&'static str] {
+            &[]
+        }
+        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+            Ok(())
+        }
     }
 
     struct PassB;
     impl LoweringPass for PassB {
-        fn name(&self) -> &'static str { "pass-b" }
-        fn dependencies(&self) -> &[&'static str] { &["pass-a"] }
-        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+        fn name(&self) -> &'static str {
+            "pass-b"
+        }
+        fn dependencies(&self) -> &[&'static str] {
+            &["pass-a"]
+        }
+        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+            Ok(())
+        }
     }
 
     struct PassC;
     impl LoweringPass for PassC {
-        fn name(&self) -> &'static str { "pass-c" }
-        fn dependencies(&self) -> &[&'static str] { &["pass-a"] }
-        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+        fn name(&self) -> &'static str {
+            "pass-c"
+        }
+        fn dependencies(&self) -> &[&'static str] {
+            &["pass-a"]
+        }
+        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+            Ok(())
+        }
     }
 
     struct PassD;
     impl LoweringPass for PassD {
-        fn name(&self) -> &'static str { "pass-d" }
-        fn dependencies(&self) -> &[&'static str] { &["pass-b", "pass-c"] }
-        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+        fn name(&self) -> &'static str {
+            "pass-d"
+        }
+        fn dependencies(&self) -> &[&'static str] {
+            &["pass-b", "pass-c"]
+        }
+        fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -4036,18 +4504,12 @@ mod tests {
         pipeline.passes.push(Box::new(PassA));
         pipeline.passes.push(Box::new(PassC));
 
-        let original_order = vec![
-            pipeline.passes[0].name(),
-            pipeline.passes[1].name(),
-        ];
+        let original_order = vec![pipeline.passes[0].name(), pipeline.passes[1].name()];
 
         pipeline.sort_passes();
 
         assert_eq!(pipeline.passes.len(), 2);
-        let sorted_order = vec![
-            pipeline.passes[0].name(),
-            pipeline.passes[1].name(),
-        ];
+        let sorted_order = vec![pipeline.passes[0].name(), pipeline.passes[1].name()];
 
         // Independent passes keep their original relative order
         assert!(sorted_order == original_order);
@@ -4059,16 +4521,28 @@ mod tests {
         // Test circular dependencies are detected
         struct PassX;
         impl LoweringPass for PassX {
-            fn name(&self) -> &'static str { "pass-x" }
-            fn dependencies(&self) -> &[&'static str] { &["pass-y"] }
-            fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+            fn name(&self) -> &'static str {
+                "pass-x"
+            }
+            fn dependencies(&self) -> &[&'static str] {
+                &["pass-y"]
+            }
+            fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+                Ok(())
+            }
         }
 
         struct PassY;
         impl LoweringPass for PassY {
-            fn name(&self) -> &'static str { "pass-y" }
-            fn dependencies(&self) -> &[&'static str] { &["pass-x"] }
-            fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+            fn name(&self) -> &'static str {
+                "pass-y"
+            }
+            fn dependencies(&self) -> &[&'static str] {
+                &["pass-x"]
+            }
+            fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+                Ok(())
+            }
         }
 
         let mut pipeline = LoweringPipeline { passes: Vec::new() };
@@ -4084,9 +4558,15 @@ mod tests {
         // Test missing dependencies are detected
         struct PassMissing;
         impl LoweringPass for PassMissing {
-            fn name(&self) -> &'static str { "pass-missing" }
-            fn dependencies(&self) -> &[&'static str] { &["nonexistent-pass"] }
-            fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> { Ok(()) }
+            fn name(&self) -> &'static str {
+                "pass-missing"
+            }
+            fn dependencies(&self) -> &[&'static str] {
+                &["nonexistent-pass"]
+            }
+            fn run(&mut self, _context: &mut LoweringContext) -> CompilerResult<()> {
+                Ok(())
+            }
         }
 
         let mut pipeline = LoweringPipeline { passes: Vec::new() };

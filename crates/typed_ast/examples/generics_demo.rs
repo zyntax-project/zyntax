@@ -4,9 +4,8 @@
 //! with various type constraint types from different programming languages.
 
 use zyntax_typed_ast::{
-    Type, TypeId, PrimitiveType, Mutability, Visibility, typed_ast::*, 
-    NullabilityKind, AsyncKind, CallingConvention,
-    AstArena, Span, TypeVar, TypeVarKind, TypeVarId, Lifetime,
+    typed_ast::*, AstArena, AsyncKind, CallingConvention, Lifetime, Mutability, NullabilityKind,
+    PrimitiveType, Span, Type, TypeId, TypeVar, TypeVarId, TypeVarKind, Visibility,
 };
 
 /// Demonstrates Rust-style generic constraints
@@ -28,12 +27,13 @@ fn rust_style_generics() {
             attributes: vec![],
         }],
         return_type: Type::TypeVar(TypeVar::unbound(t_param)),
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![],
             span: Span::new(70, 80),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
 
     // Type parameters with Rust-style bounds
@@ -74,18 +74,18 @@ fn java_style_generics() {
                 TypedTypeBound::Subtype(Type::Named {
                     id: TypeId::next(), // "Comparable",
                     type_args: vec![Type::TypeVar(TypeVar::unbound(t_param))],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
                 // T extends Serializable
                 TypedTypeBound::Subtype(Type::Named {
                     id: TypeId::next(), // "Serializable",
                     type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
             ],
             default: None,
             span: Span::new(15, 55),
@@ -122,10 +122,10 @@ fn csharp_style_generics() {
                 TypedTypeBound::Trait(Type::Named {
                     id: TypeId::next(), // "IEntity",
                     type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
                 // where T : new() (constructor constraint)
                 TypedTypeBound::Constructor(vec![]),
             ],
@@ -202,12 +202,13 @@ fn typescript_style_generics() {
             base: Box::new(Type::TypeVar(TypeVar::unbound(t_param))),
             index: Box::new(Type::TypeVar(TypeVar::unbound(k_param))),
         },
-        body: TypedBlock {
+        body: Some(TypedBlock {
             statements: vec![],
             span: Span::new(70, 80),
-        },
+        }),
         visibility: Visibility::Public,
         is_async: false,
+        ..Default::default()
     };
 
     let type_params = vec![
@@ -249,10 +250,10 @@ fn haxe_style_generics() {
                 TypedTypeBound::Trait(Type::Named {
                     id: TypeId::next(), // "Iterable",
                     type_args: vec![Type::Primitive(PrimitiveType::String)],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
                 // T has method process():Void (structural constraint)
                 TypedTypeBound::Custom {
                     name: arena.intern_string("structural"),
@@ -300,19 +301,19 @@ fn advanced_constraint_combinations() {
                 TypedTypeBound::Trait(Type::Named {
                     id: TypeId::next(), // "Clone",
                     type_args: vec![],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
                 TypedTypeBound::Send,
                 TypedTypeBound::Static,
                 TypedTypeBound::Trait(Type::Named {
                     id: TypeId::next(), // "Into",
                     type_args: vec![Type::TypeVar(TypeVar::unbound(u_param))],
-                const_args: Vec::new(),
-                variance: Vec::new(),
-                nullability: NullabilityKind::NonNull,
-            }),
+                    const_args: Vec::new(),
+                    variance: Vec::new(),
+                    nullability: NullabilityKind::NonNull,
+                }),
             ],
             default: None,
             span: Span::new(10, 40),

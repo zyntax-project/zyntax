@@ -6,29 +6,24 @@
 //! - Handler resolution
 //! - Code generation infrastructure
 
-use std::sync::Arc;
-use std::collections::HashSet;
 use indexmap::IndexMap;
+use std::collections::HashSet;
+use std::sync::Arc;
 use zyntax_compiler::{
-    // HIR types
-    hir::{
-        HirModule, HirFunction, HirFunctionSignature, HirBlock, HirId,
-        HirInstruction, HirTerminator, HirType, HirEffect, HirEffectOp,
-        HirEffectHandler, HirEffectHandlerImpl, HirParam, CallingConvention,
-        FunctionAttributes, HirLifetime,
-    },
     // Effect analysis
-    effect_analysis::{
-        analyze_effects, ModuleEffectAnalysis, EffectErrorKind,
-    },
-    // Handler resolution
-    effect_handler_resolution::{
-        resolve_handlers, ModuleHandlerResolution, HandlerOptimization,
-    },
+    effect_analysis::{analyze_effects, EffectErrorKind, ModuleEffectAnalysis},
     // Codegen
     effect_codegen::{
-        EffectCodegenContext, analyze_perform_effect, analyze_handle_effect,
-        PerformStrategy, mangle_handler_op_name, get_handler_ops_info,
+        analyze_handle_effect, analyze_perform_effect, get_handler_ops_info,
+        mangle_handler_op_name, EffectCodegenContext, PerformStrategy,
+    },
+    // Handler resolution
+    effect_handler_resolution::{resolve_handlers, HandlerOptimization, ModuleHandlerResolution},
+    // HIR types
+    hir::{
+        CallingConvention, FunctionAttributes, HirBlock, HirEffect, HirEffectHandler,
+        HirEffectHandlerImpl, HirEffectOp, HirFunction, HirFunctionSignature, HirId,
+        HirInstruction, HirLifetime, HirModule, HirParam, HirTerminator, HirType,
     },
 };
 use zyntax_typed_ast::{InternedString, TypeId};
@@ -103,22 +98,26 @@ fn create_test_function(id: HirId, name: &str) -> HirFunction {
 
 fn create_simple_effect(name: &str, ops: Vec<&str>) -> (HirId, HirEffect) {
     let effect_id = HirId::new();
-    let operations = ops.iter().map(|op_name| {
-        HirEffectOp {
+    let operations = ops
+        .iter()
+        .map(|op_name| HirEffectOp {
             id: HirId::new(),
             name: InternedString::new_global(op_name),
             type_params: vec![],
             params: vec![],
             return_type: HirType::Void,
-        }
-    }).collect();
+        })
+        .collect();
 
-    (effect_id, HirEffect {
-        id: effect_id,
-        name: InternedString::new_global(name),
-        type_params: vec![],
-        operations,
-    })
+    (
+        effect_id,
+        HirEffect {
+            id: effect_id,
+            name: InternedString::new_global(name),
+            type_params: vec![],
+            operations,
+        },
+    )
 }
 
 fn create_simple_handler(
@@ -128,39 +127,48 @@ fn create_simple_handler(
     is_resumable: bool,
 ) -> (HirId, HirEffectHandler) {
     let handler_id = HirId::new();
-    let implementations = ops.iter().map(|op_name| {
-        let block_id = HirId::new();
-        let mut blocks = IndexMap::new();
-        blocks.insert(block_id, HirBlock {
-            id: block_id,
-            label: None,
-            phis: vec![],
-            instructions: vec![],
-            terminator: HirTerminator::Return { values: vec![] },
-            dominance_frontier: HashSet::new(),
-            predecessors: vec![],
-            successors: vec![],
-        });
+    let implementations = ops
+        .iter()
+        .map(|op_name| {
+            let block_id = HirId::new();
+            let mut blocks = IndexMap::new();
+            blocks.insert(
+                block_id,
+                HirBlock {
+                    id: block_id,
+                    label: None,
+                    phis: vec![],
+                    instructions: vec![],
+                    terminator: HirTerminator::Return { values: vec![] },
+                    dominance_frontier: HashSet::new(),
+                    predecessors: vec![],
+                    successors: vec![],
+                },
+            );
 
-        HirEffectHandlerImpl {
-            op_name: InternedString::new_global(op_name),
+            HirEffectHandlerImpl {
+                op_name: InternedString::new_global(op_name),
+                type_params: vec![],
+                params: vec![],
+                return_type: HirType::Void,
+                entry_block: block_id,
+                blocks,
+                is_resumable,
+            }
+        })
+        .collect();
+
+    (
+        handler_id,
+        HirEffectHandler {
+            id: handler_id,
+            name: InternedString::new_global(name),
+            effect_id,
             type_params: vec![],
-            params: vec![],
-            return_type: HirType::Void,
-            entry_block: block_id,
-            blocks,
-            is_resumable,
-        }
-    }).collect();
-
-    (handler_id, HirEffectHandler {
-        id: handler_id,
-        name: InternedString::new_global(name),
-        effect_id,
-        type_params: vec![],
-        state_fields: vec![],
-        implementations,
-    })
+            state_fields: vec![],
+            implementations,
+        },
+    )
 }
 
 // =============================================================================
@@ -211,48 +219,55 @@ fn test_effect_analysis_pure_violation() {
     let block_id = HirId::new();
 
     let mut blocks = IndexMap::new();
-    blocks.insert(block_id, HirBlock {
-        id: block_id,
-        label: None,
-        phis: vec![],
-        instructions: vec![
-            HirInstruction::PerformEffect {
+    blocks.insert(
+        block_id,
+        HirBlock {
+            id: block_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![HirInstruction::PerformEffect {
                 result: None,
                 effect_id,
                 op_name: InternedString::new_global("log"),
                 args: vec![],
                 return_ty: HirType::Void,
-            },
-        ],
-        terminator: HirTerminator::Return { values: vec![] },
-        dominance_frontier: HashSet::new(),
-        predecessors: vec![],
-        successors: vec![],
-    });
+            }],
+            terminator: HirTerminator::Return { values: vec![] },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        },
+    );
 
     let mut sig = create_test_signature();
     sig.is_pure = true;
 
-    module.functions.insert(func_id, HirFunction {
-        id: func_id,
-        name: InternedString::new_global("impure_fn"),
-        signature: sig,
-        entry_block: block_id,
-        blocks,
-        locals: IndexMap::new(),
-        values: IndexMap::new(),
-        previous_version: None,
-        is_external: false,
-        calling_convention: CallingConvention::Fast,
-        attributes: FunctionAttributes::default(),
-        link_name: None,
-    });
+    module.functions.insert(
+        func_id,
+        HirFunction {
+            id: func_id,
+            name: InternedString::new_global("impure_fn"),
+            signature: sig,
+            entry_block: block_id,
+            blocks,
+            locals: IndexMap::new(),
+            values: IndexMap::new(),
+            previous_version: None,
+            is_external: false,
+            calling_convention: CallingConvention::Fast,
+            attributes: FunctionAttributes::default(),
+            link_name: None,
+        },
+    );
 
     let result = analyze_effects(&module).unwrap();
 
     // Should have a pure violation error
     assert!(!result.errors.is_empty());
-    assert!(result.errors.iter().any(|e| matches!(e.kind, EffectErrorKind::PureViolation)));
+    assert!(result
+        .errors
+        .iter()
+        .any(|e| matches!(e.kind, EffectErrorKind::PureViolation)));
 }
 
 #[test]
@@ -295,7 +310,8 @@ fn test_handler_resolution_simple_handler_inlinable() {
 
     // Add effect and simple handler
     let (effect_id, effect) = create_simple_effect("Log", vec!["print"]);
-    let (handler_id, handler) = create_simple_handler("LogHandler", effect_id, vec!["print"], false);
+    let (handler_id, handler) =
+        create_simple_handler("LogHandler", effect_id, vec!["print"], false);
 
     module.effects.insert(effect_id, effect);
     module.handlers.insert(handler_id, handler);
@@ -312,7 +328,8 @@ fn test_handler_resolution_resumable_not_inlinable() {
 
     // Add effect and resumable handler
     let (effect_id, effect) = create_simple_effect("Async", vec!["await"]);
-    let (handler_id, handler) = create_simple_handler("AsyncHandler", effect_id, vec!["await"], true);
+    let (handler_id, handler) =
+        create_simple_handler("AsyncHandler", effect_id, vec!["await"], true);
 
     module.effects.insert(effect_id, effect);
     module.handlers.insert(handler_id, handler);
@@ -371,7 +388,8 @@ fn test_analyze_handle_effect() {
     let mut module = create_test_module();
 
     let (effect_id, effect) = create_simple_effect("State", vec!["get"]);
-    let (handler_id, handler) = create_simple_handler("StateHandler", effect_id, vec!["get"], false);
+    let (handler_id, handler) =
+        create_simple_handler("StateHandler", effect_id, vec!["get"], false);
 
     module.effects.insert(effect_id, effect);
     module.handlers.insert(handler_id, handler);
@@ -379,13 +397,8 @@ fn test_analyze_handle_effect() {
     let body_block = HirId::new();
     let continuation_block = HirId::new();
 
-    let codegen_info = analyze_handle_effect(
-        handler_id,
-        &[],
-        body_block,
-        continuation_block,
-        &module,
-    );
+    let codegen_info =
+        analyze_handle_effect(handler_id, &[], body_block, continuation_block, &module);
 
     assert!(codegen_info.is_some());
     let info = codegen_info.unwrap();
@@ -421,42 +434,46 @@ fn test_full_effect_pipeline() {
     let block_id = HirId::new();
 
     let mut blocks = IndexMap::new();
-    blocks.insert(block_id, HirBlock {
-        id: block_id,
-        label: None,
-        phis: vec![],
-        instructions: vec![
-            HirInstruction::PerformEffect {
+    blocks.insert(
+        block_id,
+        HirBlock {
+            id: block_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![HirInstruction::PerformEffect {
                 result: None,
                 effect_id,
                 op_name: InternedString::new_global("log"),
                 args: vec![],
                 return_ty: HirType::Void,
-            },
-        ],
-        terminator: HirTerminator::Return { values: vec![] },
-        dominance_frontier: HashSet::new(),
-        predecessors: vec![],
-        successors: vec![],
-    });
+            }],
+            terminator: HirTerminator::Return { values: vec![] },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        },
+    );
 
     let mut sig = create_test_signature();
     sig.effects = vec![InternedString::new_global("Logging")]; // Declares effect
 
-    module.functions.insert(func_id, HirFunction {
-        id: func_id,
-        name: InternedString::new_global("main"),
-        signature: sig,
-        entry_block: block_id,
-        blocks,
-        locals: IndexMap::new(),
-        values: IndexMap::new(),
-        previous_version: None,
-        is_external: false,
-        calling_convention: CallingConvention::Fast,
-        attributes: FunctionAttributes::default(),
-        link_name: None,
-    });
+    module.functions.insert(
+        func_id,
+        HirFunction {
+            id: func_id,
+            name: InternedString::new_global("main"),
+            signature: sig,
+            entry_block: block_id,
+            blocks,
+            locals: IndexMap::new(),
+            values: IndexMap::new(),
+            previous_version: None,
+            is_external: false,
+            calling_convention: CallingConvention::Fast,
+            attributes: FunctionAttributes::default(),
+            link_name: None,
+        },
+    );
 
     // Step 4: Run effect analysis
     let effect_analysis = analyze_effects(&module).unwrap();
@@ -488,8 +505,10 @@ fn test_nested_effects() {
     module.effects.insert(state_effect_id, state_effect);
 
     // Define handlers
-    let (io_handler_id, io_handler) = create_simple_handler("IOHandler", io_effect_id, vec!["print"], false);
-    let (state_handler_id, state_handler) = create_simple_handler("StateHandler", state_effect_id, vec!["get", "set"], false);
+    let (io_handler_id, io_handler) =
+        create_simple_handler("IOHandler", io_effect_id, vec!["print"], false);
+    let (state_handler_id, state_handler) =
+        create_simple_handler("StateHandler", state_effect_id, vec!["get", "set"], false);
 
     module.handlers.insert(io_handler_id, io_handler);
     module.handlers.insert(state_handler_id, state_handler);

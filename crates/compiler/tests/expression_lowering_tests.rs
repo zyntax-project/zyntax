@@ -21,19 +21,18 @@
 //! implemented, breaking the circular dependency between CFG and SSA construction.
 //! See CFG_REFACTORING_COMPLETE.md for technical details.
 
+use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
     hir::{HirInstruction, HirTerminator},
-    lowering::{LoweringContext, LoweringConfig, AstLowering},
+    lowering::{AstLowering, LoweringConfig, LoweringContext},
 };
 use zyntax_typed_ast::{
-    TypedProgram, TypedDeclaration, TypedFunction, TypedExpression, TypedLiteral,
-    TypedStatement, Mutability, Visibility, CallingConvention,
-    Type, PrimitiveType, BinaryOp, UnaryOp, Span,
-    typed_node,
-    typed_ast::{TypedBinary, TypedUnary, TypedIfExpr, TypedLet, TypedBlock},
-    arena::AstArena, TypeRegistry,
+    arena::AstArena,
+    typed_ast::{TypedBinary, TypedBlock, TypedIfExpr, TypedLet, TypedUnary},
+    typed_node, BinaryOp, CallingConvention, Mutability, PrimitiveType, Span, Type, TypeRegistry,
+    TypedDeclaration, TypedExpression, TypedFunction, TypedLiteral, TypedProgram, TypedStatement,
+    UnaryOp, Visibility,
 };
-use std::sync::{Arc, Mutex};
 
 /// Helper to create a test arena
 fn test_arena() -> AstArena {
@@ -105,15 +104,14 @@ fn test_literal_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower literal expression: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower literal expression: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
     assert_eq!(module.functions.len(), 1, "Expected 1 function in module");
@@ -164,15 +162,14 @@ fn test_binary_operation_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower binary operation: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower binary operation: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -182,14 +179,17 @@ fn test_binary_operation_lowering() {
 
     // Verify the entry block has a Binary instruction
     let entry_block = &func.blocks[&func.entry_block];
-    let has_binary = entry_block.instructions.iter().any(|inst| {
-        matches!(inst, HirInstruction::Binary { .. })
-    });
+    let has_binary = entry_block
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, HirInstruction::Binary { .. }));
     assert!(has_binary, "Expected Binary instruction in HIR");
 
     // Verify the block has a proper terminator (Return)
-    assert!(matches!(entry_block.terminator, HirTerminator::Return { .. }),
-            "Expected Return terminator")
+    assert!(
+        matches!(entry_block.terminator, HirTerminator::Return { .. }),
+        "Expected Return terminator"
+    )
 }
 
 #[test]
@@ -230,15 +230,14 @@ fn test_unary_operation_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower unary operation: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower unary operation: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -248,14 +247,17 @@ fn test_unary_operation_lowering() {
 
     // Verify the entry block has a Unary instruction
     let entry_block = &func.blocks[&func.entry_block];
-    let has_unary = entry_block.instructions.iter().any(|inst| {
-        matches!(inst, HirInstruction::Unary { .. })
-    });
+    let has_unary = entry_block
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, HirInstruction::Unary { .. }));
     assert!(has_unary, "Expected Unary instruction in HIR");
 
     // Verify the block has a proper terminator (Return)
-    assert!(matches!(entry_block.terminator, HirTerminator::Return { .. }),
-            "Expected Return terminator")
+    assert!(
+        matches!(entry_block.terminator, HirTerminator::Return { .. }),
+        "Expected Return terminator"
+    )
 }
 
 #[test]
@@ -309,15 +311,14 @@ fn test_if_expression_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower if expression: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower if expression: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -326,9 +327,11 @@ fn test_if_expression_lowering() {
 
     // ✅ CFG refactoring (Gap #4) is now complete!
     // If expressions should create multiple blocks for control flow
-    assert!(func.blocks.len() >= 3,
-            "If expression should create at least 3 blocks (entry, then, else, merge), got {}",
-            func.blocks.len());
+    assert!(
+        func.blocks.len() >= 3,
+        "If expression should create at least 3 blocks (entry, then, else, merge), got {}",
+        func.blocks.len()
+    );
 
     // Verify there's a phi node in one of the blocks (for merging if result)
     let has_phi = func.blocks.values().any(|block| !block.phis.is_empty());
@@ -384,15 +387,14 @@ fn test_variable_reference_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower variable reference: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower variable reference: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -446,34 +448,38 @@ fn test_tuple_construction_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower tuple construction: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower tuple construction: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
     // Verify the function has Alloca and InsertValue instructions
     let func = module.functions.values().next().unwrap();
     let has_alloca = func.blocks.values().any(|block| {
-        block.instructions.iter().any(|inst| {
-            matches!(inst, HirInstruction::Alloca { .. })
-        })
+        block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, HirInstruction::Alloca { .. }))
     });
 
     let has_insert = func.blocks.values().any(|block| {
-        block.instructions.iter().any(|inst| {
-            matches!(inst, HirInstruction::InsertValue { .. })
-        })
+        block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, HirInstruction::InsertValue { .. }))
     });
 
     assert!(has_alloca, "Expected Alloca instruction for tuple");
-    assert!(has_insert, "Expected InsertValue instruction for tuple elements");
+    assert!(
+        has_insert,
+        "Expected InsertValue instruction for tuple elements"
+    );
 }
 
 #[test]
@@ -527,15 +533,14 @@ fn test_array_construction_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower array construction: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower array construction: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -599,15 +604,14 @@ fn test_complex_expression_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower complex expression: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower complex expression: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -617,17 +621,23 @@ fn test_complex_expression_lowering() {
 
     // Verify multiple binary operations exist (for: (1 + 2) * 3)
     let entry_block = &func.blocks[&func.entry_block];
-    let binary_count = entry_block.instructions.iter()
+    let binary_count = entry_block
+        .instructions
+        .iter()
         .filter(|inst| matches!(inst, HirInstruction::Binary { .. }))
         .count();
 
-    assert!(binary_count >= 2,
-            "Expected at least 2 binary operations (+ and *), got {}",
-            binary_count);
+    assert!(
+        binary_count >= 2,
+        "Expected at least 2 binary operations (+ and *), got {}",
+        binary_count
+    );
 
     // Verify the block has a proper terminator (Return)
-    assert!(matches!(entry_block.terminator, HirTerminator::Return { .. }),
-            "Expected Return terminator")
+    assert!(
+        matches!(entry_block.terminator, HirTerminator::Return { .. }),
+        "Expected Return terminator"
+    )
 }
 
 // ============================================================================
@@ -825,15 +835,14 @@ fn test_assignment_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower assignment expression: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower assignment expression: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
     assert_eq!(module.functions.len(), 1, "Expected 1 function in module");
@@ -845,14 +854,22 @@ fn test_assignment_lowering() {
     let entry_block = &func.blocks[&func.entry_block];
 
     // Verify we have binary operations (for x + 5)
-    let binary_count = entry_block.instructions.iter()
+    let binary_count = entry_block
+        .instructions
+        .iter()
         .filter(|inst| matches!(inst, HirInstruction::Binary { .. }))
         .count();
-    assert!(binary_count >= 1, "Expected at least 1 binary operation (Add), got {}", binary_count);
+    assert!(
+        binary_count >= 1,
+        "Expected at least 1 binary operation (Add), got {}",
+        binary_count
+    );
 
     // Verify proper terminator exists
-    assert!(matches!(entry_block.terminator, HirTerminator::Return { .. }),
-            "Expected Return terminator");
+    assert!(
+        matches!(entry_block.terminator, HirTerminator::Return { .. }),
+        "Expected Return terminator"
+    );
 
     println!("✅ Gap 4: Assignment expression lowering works!");
     println!("   - Variable assignments compile successfully");
@@ -862,7 +879,9 @@ fn test_assignment_lowering() {
 
 #[test]
 fn test_pattern_matching_lowering() {
-    use zyntax_typed_ast::typed_ast::{TypedMatchExpr, TypedMatchArm, TypedPattern, TypedLiteralPattern};
+    use zyntax_typed_ast::typed_ast::{
+        TypedLiteralPattern, TypedMatchArm, TypedMatchExpr, TypedPattern,
+    };
 
     let mut arena = test_arena();
 
@@ -958,15 +977,14 @@ fn test_pattern_matching_lowering() {
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("test_module");
     let arena = Arc::new(Mutex::new(arena));
-    let mut ctx = LoweringContext::new(
-        module_name,
-        type_registry,
-        arena,
-        config,
-    );
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
     let result = ctx.lower_program(&mut program);
-    assert!(result.is_ok(), "Failed to lower match expression: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to lower match expression: {:?}",
+        result.err()
+    );
 
     let module = result.unwrap();
 
@@ -977,18 +995,26 @@ fn test_pattern_matching_lowering() {
     }
 
     // Find the test function
-    let (_func_id, test_func) = module.functions.iter()
+    let (_func_id, test_func) = module
+        .functions
+        .iter()
         .find(|(_, f)| f.name == module_name)
         .or_else(|| module.functions.iter().next())
         .expect("Could not find any function");
 
     println!("\n=== Match Expression Lowering Test ===");
-    println!("Generated {} blocks for match with 3 arms", test_func.blocks.len());
+    println!(
+        "Generated {} blocks for match with 3 arms",
+        test_func.blocks.len()
+    );
 
     // Verify we have multiple blocks (entry + test blocks + body blocks + next blocks + end block)
     // Expected: 1 entry + (3 arms * 3 blocks per arm) + 1 end = 11 blocks minimum
-    assert!(test_func.blocks.len() >= 10,
-        "Expected at least 10 blocks for match with 3 arms, got {}", test_func.blocks.len());
+    assert!(
+        test_func.blocks.len() >= 10,
+        "Expected at least 10 blocks for match with 3 arms, got {}",
+        test_func.blocks.len()
+    );
 
     // Verify we have comparison operations for literal pattern matching
     let mut has_comparisons = false;
@@ -997,7 +1023,13 @@ fn test_pattern_matching_lowering() {
     for block in test_func.blocks.values() {
         // Check for binary comparison instructions (for literal pattern testing)
         for inst in &block.instructions {
-            if matches!(inst, HirInstruction::Binary { op: zyntax_compiler::hir::BinaryOp::Eq, .. }) {
+            if matches!(
+                inst,
+                HirInstruction::Binary {
+                    op: zyntax_compiler::hir::BinaryOp::Eq,
+                    ..
+                }
+            ) {
                 has_comparisons = true;
             }
         }
@@ -1013,8 +1045,14 @@ fn test_pattern_matching_lowering() {
         }
     }
 
-    assert!(has_comparisons, "Expected to find Eq comparison instructions for literal patterns");
-    assert!(has_phi, "Expected to find phi node for collecting arm results");
+    assert!(
+        has_comparisons,
+        "Expected to find Eq comparison instructions for literal patterns"
+    );
+    assert!(
+        has_phi,
+        "Expected to find phi node for collecting arm results"
+    );
 
     println!("✅ Match expression lowering test passed!");
     println!("   - Multiple blocks created for decision tree");

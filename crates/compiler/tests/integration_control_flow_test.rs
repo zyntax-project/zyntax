@@ -8,7 +8,7 @@
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{InternedString, arena::AstArena};
+use zyntax_typed_ast::{arena::AstArena, InternedString};
 
 fn create_test_string(s: &str) -> InternedString {
     let mut arena = AstArena::new();
@@ -20,12 +20,13 @@ fn compile_and_get_ptr(func: HirFunction) -> (CraneliftBackend, Option<*const u8
     use cranelift_module::Module;
 
     let func_id = func.id;
-    let mut backend = CraneliftBackend::new()
-        .expect("Failed to create Cranelift backend");
-    backend.compile_function(func_id, &func)
+    let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
+    backend
+        .compile_function(func_id, &func)
         .expect("Failed to compile function");
 
-    backend.finalize_definitions()
+    backend
+        .finalize_definitions()
         .expect("Failed to finalize definitions");
 
     let func_ptr = backend.get_function_ptr(func_id);
@@ -40,9 +41,7 @@ fn test_if_else_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for max");
 
-    let max_fn: extern "C" fn(i32, i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let max_fn: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(max_fn(10, 5), 10, "max(10, 5) should equal 10");
@@ -62,9 +61,7 @@ fn test_abs_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for abs");
 
-    let abs_fn: extern "C" fn(i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let abs_fn: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(abs_fn(10), 10, "abs(10) should equal 10");
@@ -84,16 +81,18 @@ fn test_countdown_loop_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for countdown");
 
-    let countdown_fn: extern "C" fn(i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let countdown_fn: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(countdown_fn(0), 0, "countdown(0) should equal 0");
     assert_eq!(countdown_fn(1), 0, "countdown(1) should equal 0");
     assert_eq!(countdown_fn(5), 0, "countdown(5) should equal 0");
     assert_eq!(countdown_fn(10), 0, "countdown(10) should equal 0");
-    assert_eq!(countdown_fn(-5), -5, "countdown(-5) should equal -5 (no loop)");
+    assert_eq!(
+        countdown_fn(-5),
+        -5,
+        "countdown(-5) should equal -5 (no loop)"
+    );
 
     println!("✅ While loop executed correctly via JIT");
 }
@@ -106,9 +105,7 @@ fn test_factorial_loop_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for factorial");
 
-    let factorial_fn: extern "C" fn(i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let factorial_fn: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(factorial_fn(0), 1, "factorial(0) should equal 1");
@@ -128,9 +125,7 @@ fn test_phi_nodes_execution() {
     let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for sign");
 
-    let sign_fn: extern "C" fn(i32) -> i32 = unsafe {
-        std::mem::transmute(func_ptr)
-    };
+    let sign_fn: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(func_ptr) };
 
     // Verify actual execution results
     assert_eq!(sign_fn(10), 1, "sign(10) should equal 1");
@@ -207,26 +202,29 @@ fn create_max_function() -> HirFunction {
 
     // Then block: return a
     let then = func.blocks.get_mut(&then_block).unwrap();
-    then.set_terminator(HirTerminator::Branch { target: merge_block });
+    then.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Else block: return b
     let else_blk = func.blocks.get_mut(&else_block).unwrap();
-    else_blk.set_terminator(HirTerminator::Branch { target: merge_block });
+    else_blk.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Merge block: phi node to select between a and b
     let result = func.create_value(HirType::I32, HirValueKind::Instruction);
     let phi = HirPhi {
         result,
         ty: HirType::I32,
-        incoming: vec![
-            (then_block, param_a),
-            (else_block, param_b),
-        ],
+        incoming: vec![(then_block, param_a), (else_block, param_b)],
     };
 
     let merge = func.blocks.get_mut(&merge_block).unwrap();
     merge.add_phi(phi);
-    merge.set_terminator(HirTerminator::Return { values: vec![result] });
+    merge.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -236,14 +234,12 @@ fn create_abs_function() -> HirFunction {
     let name = create_test_string("abs");
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("x"),
-                ty: HirType::I32,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("x"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -293,26 +289,29 @@ fn create_abs_function() -> HirFunction {
 
     let then = func.blocks.get_mut(&then_block).unwrap();
     then.add_instruction(neg_inst);
-    then.set_terminator(HirTerminator::Branch { target: merge_block });
+    then.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Else block: use x as is
     let else_blk = func.blocks.get_mut(&else_block).unwrap();
-    else_blk.set_terminator(HirTerminator::Branch { target: merge_block });
+    else_blk.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Merge block: phi node
     let result = func.create_value(HirType::I32, HirValueKind::Instruction);
     let phi = HirPhi {
         result,
         ty: HirType::I32,
-        incoming: vec![
-            (then_block, neg_result),
-            (else_block, param_x),
-        ],
+        incoming: vec![(then_block, neg_result), (else_block, param_x)],
     };
 
     let merge = func.blocks.get_mut(&merge_block).unwrap();
     merge.add_phi(phi);
-    merge.set_terminator(HirTerminator::Return { values: vec![result] });
+    merge.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }
@@ -322,14 +321,12 @@ fn create_countdown_function() -> HirFunction {
     let name = create_test_string("countdown");
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("n"),
-                ty: HirType::I32,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("n"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -351,7 +348,9 @@ fn create_countdown_function() -> HirFunction {
 
     // Entry: jump to loop header
     let entry = func.blocks.get_mut(&entry_block).unwrap();
-    entry.set_terminator(HirTerminator::Branch { target: loop_header });
+    entry.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Loop header: phi node for n, check n > 0
     let n_phi = func.create_value(HirType::I32, HirValueKind::Instruction);
@@ -371,16 +370,15 @@ fn create_countdown_function() -> HirFunction {
 
     let body = func.blocks.get_mut(&loop_body).unwrap();
     body.add_instruction(sub_inst);
-    body.set_terminator(HirTerminator::Branch { target: loop_header });
+    body.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Now set up loop header with phi node
     let phi = HirPhi {
         result: n_phi,
         ty: HirType::I32,
-        incoming: vec![
-            (entry_block, param_n),
-            (loop_body, n_minus_1),
-        ],
+        incoming: vec![(entry_block, param_n), (loop_body, n_minus_1)],
     };
 
     let cmp_inst = HirInstruction::Binary {
@@ -402,7 +400,9 @@ fn create_countdown_function() -> HirFunction {
 
     // Exit block: return n
     let exit = func.blocks.get_mut(&exit_block).unwrap();
-    exit.set_terminator(HirTerminator::Return { values: vec![n_phi] });
+    exit.set_terminator(HirTerminator::Return {
+        values: vec![n_phi],
+    });
 
     func
 }
@@ -412,14 +412,12 @@ fn create_factorial_function() -> HirFunction {
     let name = create_test_string("factorial");
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("n"),
-                ty: HirType::I32,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("n"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -442,7 +440,9 @@ fn create_factorial_function() -> HirFunction {
 
     // Entry: jump to loop header
     let entry = func.blocks.get_mut(&entry_block).unwrap();
-    entry.set_terminator(HirTerminator::Branch { target: loop_header });
+    entry.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Phi nodes for counter (i) and accumulator (acc)
     let i_phi = func.create_value(HirType::I32, HirValueKind::Instruction);
@@ -470,7 +470,9 @@ fn create_factorial_function() -> HirFunction {
     let body = func.blocks.get_mut(&loop_body).unwrap();
     body.add_instruction(mul_inst);
     body.add_instruction(add_inst);
-    body.set_terminator(HirTerminator::Branch { target: loop_header });
+    body.set_terminator(HirTerminator::Branch {
+        target: loop_header,
+    });
 
     // Loop header: check i <= n
     let cmp_result = func.create_value(HirType::Bool, HirValueKind::Instruction);
@@ -485,19 +487,13 @@ fn create_factorial_function() -> HirFunction {
     let i_phi_node = HirPhi {
         result: i_phi,
         ty: HirType::I32,
-        incoming: vec![
-            (entry_block, one),
-            (loop_body, new_i),
-        ],
+        incoming: vec![(entry_block, one), (loop_body, new_i)],
     };
 
     let acc_phi_node = HirPhi {
         result: acc_phi,
         ty: HirType::I32,
-        incoming: vec![
-            (entry_block, one),
-            (loop_body, new_acc),
-        ],
+        incoming: vec![(entry_block, one), (loop_body, new_acc)],
     };
 
     let header = func.blocks.get_mut(&loop_header).unwrap();
@@ -512,7 +508,9 @@ fn create_factorial_function() -> HirFunction {
 
     // Exit block: return accumulator
     let exit = func.blocks.get_mut(&exit_block).unwrap();
-    exit.set_terminator(HirTerminator::Return { values: vec![acc_phi] });
+    exit.set_terminator(HirTerminator::Return {
+        values: vec![acc_phi],
+    });
 
     func
 }
@@ -522,14 +520,12 @@ fn create_sign_function() -> HirFunction {
     let name = create_test_string("sign");
 
     let sig = HirFunctionSignature {
-        params: vec![
-            HirParam {
-                id: HirId::new(),
-                name: create_test_string("x"),
-                ty: HirType::I32,
-                attributes: ParamAttributes::default(),
-            },
-        ],
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: create_test_string("x"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
         returns: vec![HirType::I32],
         type_params: vec![],
         const_params: vec![],
@@ -574,7 +570,9 @@ fn create_sign_function() -> HirFunction {
 
     // Positive block: return 1
     let positive = func.blocks.get_mut(&positive_block).unwrap();
-    positive.set_terminator(HirTerminator::Branch { target: merge_block });
+    positive.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Check negative: x < 0
     let cmp_negative = func.create_value(HirType::Bool, HirValueKind::Instruction);
@@ -596,11 +594,15 @@ fn create_sign_function() -> HirFunction {
 
     // Negative block: return -1
     let negative = func.blocks.get_mut(&negative_block).unwrap();
-    negative.set_terminator(HirTerminator::Branch { target: merge_block });
+    negative.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Zero block: return 0
     let zero_blk = func.blocks.get_mut(&zero_block).unwrap();
-    zero_blk.set_terminator(HirTerminator::Branch { target: merge_block });
+    zero_blk.set_terminator(HirTerminator::Branch {
+        target: merge_block,
+    });
 
     // Merge block: phi node with 3 predecessors
     let result = func.create_value(HirType::I32, HirValueKind::Instruction);
@@ -616,7 +618,9 @@ fn create_sign_function() -> HirFunction {
 
     let merge = func.blocks.get_mut(&merge_block).unwrap();
     merge.add_phi(phi);
-    merge.set_terminator(HirTerminator::Return { values: vec![result] });
+    merge.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
 
     func
 }

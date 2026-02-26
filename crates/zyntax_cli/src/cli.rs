@@ -83,7 +83,6 @@ pub enum Commands {
         entry_point: Option<String>,
 
         // === Import Resolution Options ===
-
         /// Module resolver architecture for import resolution
         #[arg(long = "resolver", value_enum, default_value = "haxe")]
         resolver: ModuleArch,
@@ -114,7 +113,6 @@ pub enum Commands {
         grammar1: bool,
 
         // === Runtime Library Options ===
-
         /// ZPack archive(s) to load runtime symbols from (.zpack files)
         /// For JIT mode: provides runtime symbols dynamically
         /// Can be specified multiple times for multiple runtime libraries

@@ -15,7 +15,7 @@
 //! }
 //! ```
 
-use crate::grammar::{GrammarIR, RuleIR, PatternIR, CharClass, RuleModifier};
+use crate::grammar::{CharClass, GrammarIR, PatternIR, RuleIR, RuleModifier};
 use std::collections::HashSet;
 
 /// Code generator for parser methods
@@ -134,14 +134,23 @@ impl ParserGenerator {
         self.current_rule = Some(rule.name.clone());
 
         // Generate rule method
-        let return_type = rule.return_type.clone().unwrap_or_else(|| "ParsedValue".to_string());
+        let return_type = rule
+            .return_type
+            .clone()
+            .unwrap_or_else(|| "ParsedValue".to_string());
 
         self.line(&format!("/// Parse rule: {}", rule.name));
-        self.line(&format!("pub fn parse_{}(&mut self) -> ParseResult<{}> {{", rule.name, return_type));
+        self.line(&format!(
+            "pub fn parse_{}(&mut self) -> ParseResult<{}> {{",
+            rule.name, return_type
+        ));
         self.indent += 1;
 
         // Memoization check
-        self.line(&format!("let rule_id = self.rule_ids.get_id(\"{}\");", rule.name));
+        self.line(&format!(
+            "let rule_id = self.rule_ids.get_id(\"{}\");",
+            rule.name
+        ));
         self.line("let start_pos = self.state.pos();");
         self.line("");
         self.line("// Check memoization cache");
@@ -152,7 +161,9 @@ impl ParserGenerator {
         self.line("MemoEntry::Success { value, end_pos } => {");
         self.indent += 1;
         self.line("self.state.set_pos(*end_pos);");
-        self.line(&format!("ParseResult::Success(value.clone().try_into().unwrap_or_default(), *end_pos)"));
+        self.line(&format!(
+            "ParseResult::Success(value.clone().try_into().unwrap_or_default(), *end_pos)"
+        ));
         self.indent -= 1;
         self.line("}");
         self.line("MemoEntry::Failure => self.state.fail(\"memoized failure\"),");
@@ -218,7 +229,9 @@ impl ParserGenerator {
             PatternIR::Literal(s) => {
                 self.line(&format!("match literal(&mut self.state, {:?}) {{", s));
                 self.indent += 1;
-                self.line("ParseResult::Success(_, pos) => ParseResult::Success(ParsedValue::None, pos),");
+                self.line(
+                    "ParseResult::Success(_, pos) => ParseResult::Success(ParsedValue::None, pos),",
+                );
                 self.line("ParseResult::Failure(e) => return ParseResult::Failure(e),");
                 self.indent -= 1;
                 self.line("}");
@@ -323,7 +336,12 @@ impl ParserGenerator {
                 self.line("}");
             }
 
-            PatternIR::Repeat { pattern, min, max, separator } => {
+            PatternIR::Repeat {
+                pattern,
+                min,
+                max,
+                separator,
+            } => {
                 self.line("{");
                 self.indent += 1;
                 self.line("let mut items = Vec::new();");
@@ -390,7 +408,10 @@ impl ParserGenerator {
                 if *min > 0 {
                     self.line(&format!("if items.len() < {} {{", min));
                     self.indent += 1;
-                    self.line(&format!("return self.state.fail(\"expected at least {} items\");", min));
+                    self.line(&format!(
+                        "return self.state.fail(\"expected at least {} items\");",
+                        min
+                    ));
                     self.indent -= 1;
                     self.line("}");
                 }
@@ -437,7 +458,9 @@ impl ParserGenerator {
                 self.line("match result {");
                 self.indent += 1;
                 self.line("ParseResult::Success(_, _) => self.state.fail(\"negative lookahead matched\"),");
-                self.line("ParseResult::Failure(_) => ParseResult::Success(ParsedValue::None, la_start),");
+                self.line(
+                    "ParseResult::Failure(_) => ParseResult::Success(ParsedValue::None, la_start),",
+                );
                 self.indent -= 1;
                 self.line("}");
                 self.indent -= 1;
@@ -467,7 +490,10 @@ impl ParserGenerator {
     fn generate_char_class(&mut self, class: &CharClass) {
         match class {
             CharClass::Single(c) => {
-                self.line(&format!("char_exact(&mut self.state, {:?}).map(|c| ParsedValue::Text(c.to_string()))", c));
+                self.line(&format!(
+                    "char_exact(&mut self.state, {:?}).map(|c| ParsedValue::Text(c.to_string()))",
+                    c
+                ));
             }
             CharClass::Range(start, end) => {
                 self.line(&format!("char_range(&mut self.state, {:?}, {:?}).map(|c| ParsedValue::Text(c.to_string()))", start, end));
@@ -482,9 +508,15 @@ impl ParserGenerator {
                     _ => "any_char",
                 };
                 if func == "newline" {
-                    self.line(&format!("{}(&mut self.state).map(|_| ParsedValue::None)", func));
+                    self.line(&format!(
+                        "{}(&mut self.state).map(|_| ParsedValue::None)",
+                        func
+                    ));
                 } else {
-                    self.line(&format!("{}(&mut self.state).map(|c| ParsedValue::Text(c.to_string()))", func));
+                    self.line(&format!(
+                        "{}(&mut self.state).map(|c| ParsedValue::Text(c.to_string()))",
+                        func
+                    ));
                 }
             }
             CharClass::Union(classes) => {

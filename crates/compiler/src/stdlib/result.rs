@@ -1,3 +1,4 @@
+use crate::hir::{BinaryOp, HirId, HirType, HirUnionVariant};
 /// Result<T,E> type implementation using HIR Builder
 ///
 /// Provides a generic result type for error handling:
@@ -7,9 +8,7 @@
 ///     Err(E),   // Error value
 /// }
 /// ```
-
 use crate::hir_builder::HirBuilder;
-use crate::hir::{HirType, HirUnionVariant, HirId, BinaryOp};
 
 /// Builds the Result<T,E> type and its methods
 pub fn build_result_type(builder: &mut HirBuilder) {
@@ -41,7 +40,8 @@ fn build_unwrap(builder: &mut HirBuilder) {
     ];
     let result_ty = builder.union_type(Some("Result"), variants);
 
-    let func_id = builder.begin_generic_function("result_unwrap", vec!["T", "E"])
+    let func_id = builder
+        .begin_generic_function("result_unwrap", vec!["T", "E"])
         .param("res", result_ty.clone())
         .returns(t_param.clone())
         .build();
@@ -96,7 +96,8 @@ fn build_unwrap_err(builder: &mut HirBuilder) {
     ];
     let result_ty = builder.union_type(Some("Result"), variants);
 
-    let func_id = builder.begin_generic_function("result_unwrap_err", vec!["T", "E"])
+    let func_id = builder
+        .begin_generic_function("result_unwrap_err", vec!["T", "E"])
         .param("res", result_ty.clone())
         .returns(e_param.clone())
         .build();
@@ -151,7 +152,8 @@ fn build_is_ok(builder: &mut HirBuilder) {
     ];
     let result_ty = builder.union_type(Some("Result"), variants);
 
-    let func_id = builder.begin_generic_function("result_is_ok", vec!["T", "E"])
+    let func_id = builder
+        .begin_generic_function("result_is_ok", vec!["T", "E"])
         .param("res", result_ty.clone())
         .returns(bool_ty.clone())
         .build();
@@ -190,7 +192,8 @@ fn build_is_err(builder: &mut HirBuilder) {
     ];
     let result_ty = builder.union_type(Some("Result"), variants);
 
-    let func_id = builder.begin_generic_function("result_is_err", vec!["T", "E"])
+    let func_id = builder
+        .begin_generic_function("result_is_err", vec!["T", "E"])
         .param("res", result_ty.clone())
         .returns(bool_ty.clone())
         .build();
@@ -228,7 +231,8 @@ fn build_unwrap_or(builder: &mut HirBuilder) {
     ];
     let result_ty = builder.union_type(Some("Result"), variants);
 
-    let func_id = builder.begin_generic_function("result_unwrap_or", vec!["T", "E"])
+    let func_id = builder
+        .begin_generic_function("result_unwrap_or", vec!["T", "E"])
         .param("res", result_ty.clone())
         .param("default", t_param.clone())
         .returns(t_param.clone())
@@ -282,7 +286,9 @@ mod tests {
         assert!(module.functions.len() >= 5);
 
         // Check function names
-        let func_names: Vec<String> = module.functions.values()
+        let func_names: Vec<String> = module
+            .functions
+            .values()
             .map(|f| arena.resolve_string(f.name).unwrap().to_string())
             .collect();
 
@@ -296,10 +302,17 @@ mod tests {
         for func in module.functions.values() {
             let name = arena.resolve_string(func.name).unwrap();
             if name.starts_with("result_") {
-                assert!(!func.signature.type_params.is_empty(),
-                    "Function {} should be generic", name);
-                assert_eq!(func.signature.type_params.len(), 2,
-                    "Function {} should have 2 type params (T and E)", name);
+                assert!(
+                    !func.signature.type_params.is_empty(),
+                    "Function {} should be generic",
+                    name
+                );
+                assert_eq!(
+                    func.signature.type_params.len(),
+                    2,
+                    "Function {} should have 2 type params (T and E)",
+                    name
+                );
             }
         }
     }
@@ -314,7 +327,9 @@ mod tests {
         let module = builder.finish();
 
         // Find the unwrap function
-        let unwrap_func = module.functions.values()
+        let unwrap_func = module
+            .functions
+            .values()
             .find(|f| arena.resolve_string(f.name) == Some("result_unwrap"))
             .expect("unwrap function should exist");
 

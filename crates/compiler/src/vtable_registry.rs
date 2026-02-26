@@ -25,10 +25,10 @@
 //! let super_vtable = registry.get_super_trait_vtable(sub_trait_id, super_trait_id, type_id)?;
 //! ```
 
-use std::collections::HashMap;
-use zyntax_typed_ast::{TypeId, InternedString};
-use crate::hir::{HirId, HirVTable, HirGlobal, HirType};
+use crate::hir::{HirGlobal, HirId, HirType, HirVTable};
 use crate::CompilerResult;
+use std::collections::HashMap;
+use zyntax_typed_ast::{InternedString, TypeId};
 
 /// Central registry for vtables and method-to-function mappings
 #[derive(Debug, Clone)]
@@ -78,10 +78,8 @@ impl VtableRegistry {
         method_name: InternedString,
         function_id: HirId,
     ) {
-        self.method_implementations.insert(
-            (trait_id, type_id, method_name),
-            function_id,
-        );
+        self.method_implementations
+            .insert((trait_id, type_id, method_name), function_id);
     }
 
     /// Lookup method implementation function ID
@@ -174,10 +172,8 @@ impl VtableRegistry {
         type_id: TypeId,
         super_vtable_id: HirId,
     ) {
-        self.super_trait_vtables.insert(
-            (sub_trait_id, super_trait_id, type_id),
-            super_vtable_id,
-        );
+        self.super_trait_vtables
+            .insert((sub_trait_id, super_trait_id, type_id), super_vtable_id);
     }
 
     /// Get super-trait vtable for upcasting

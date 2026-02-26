@@ -61,10 +61,11 @@ model User {
 
     let mut module = whirlwind_analyzer::Module::from_text(source);
     module.module_path = Some(std::path::PathBuf::from("testing://Test.wrl"));
-    let standpoint = Standpoint::build_from_module(module, false).expect("Failed to build standpoint");
+    let standpoint =
+        Standpoint::build_from_module(module, false).expect("Failed to build standpoint");
 
     let mut adapter = WhirlwindAdapter::new();
-   let program =  adapter
+    let program = adapter
         .convert_standpoint(&standpoint)
         .expect("Should convert model");
 
@@ -135,7 +136,8 @@ function createUser(id: UserId, name: string) -> User {
 
     let mut module = whirlwind_analyzer::Module::from_text(source);
     module.module_path = Some(std::path::PathBuf::from("testing://Test.wrl"));
-    let standpoint = Standpoint::build_from_module(module, false).expect("Failed to build standpoint");
+    let standpoint =
+        Standpoint::build_from_module(module, false).expect("Failed to build standpoint");
 
     let mut adapter = WhirlwindAdapter::new();
     let typed_program = adapter
@@ -149,7 +151,8 @@ function createUser(id: UserId, name: string) -> User {
     let expected_types = vec!["UserId", "Entity", "User"];
 
     // Intern all type names first (requires mutable borrow)
-    let interned_names: Vec<_> = expected_types.iter()
+    let interned_names: Vec<_> = expected_types
+        .iter()
         .map(|name| adapter.arena_mut().intern_string(name))
         .collect();
 

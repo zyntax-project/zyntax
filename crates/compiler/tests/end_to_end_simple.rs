@@ -3,10 +3,7 @@
 //! Tests that we can compile and execute real programs through the full pipeline.
 //! Uses realistic test cases that validate core functionality.
 
-use zyntax_compiler::{
-    cranelift_backend::CraneliftBackend,
-    stdlib,
-};
+use zyntax_compiler::{cranelift_backend::CraneliftBackend, stdlib};
 use zyntax_typed_ast::arena::AstArena;
 
 #[test]
@@ -17,19 +14,30 @@ fn test_stdlib_compiles_completely() {
     let stdlib_module = stdlib::build_stdlib(&mut arena);
 
     // Verify we have a comprehensive stdlib
-    println!("Standard library contains {} functions", stdlib_module.functions.len());
-    assert!(stdlib_module.functions.len() > 50, "Stdlib should have 50+ functions");
+    println!(
+        "Standard library contains {} functions",
+        stdlib_module.functions.len()
+    );
+    assert!(
+        stdlib_module.functions.len() > 50,
+        "Stdlib should have 50+ functions"
+    );
 
     // Verify key components exist by checking module
-    assert!(!stdlib_module.functions.is_empty(), "Stdlib must have functions");
-    assert!(!stdlib_module.globals.is_empty() || stdlib_module.functions.len() > 0,
-            "Stdlib must have either globals or functions");
+    assert!(
+        !stdlib_module.functions.is_empty(),
+        "Stdlib must have functions"
+    );
+    assert!(
+        !stdlib_module.globals.is_empty() || stdlib_module.functions.len() > 0,
+        "Stdlib must have either globals or functions"
+    );
 
     // Compile the entire stdlib
-    let mut backend = CraneliftBackend::new()
-        .expect("Failed to create Cranelift backend");
+    let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
 
-    backend.compile_module(&stdlib_module)
+    backend
+        .compile_module(&stdlib_module)
         .expect("Failed to compile standard library");
 
     // Verify we can get function pointers for compiled functions
@@ -40,10 +48,16 @@ fn test_stdlib_compiles_completely() {
         }
     }
 
-    println!("✅ Successfully compiled {}/{} stdlib functions",
-             compiled_count, stdlib_module.functions.len());
+    println!(
+        "✅ Successfully compiled {}/{} stdlib functions",
+        compiled_count,
+        stdlib_module.functions.len()
+    );
 
-    assert!(compiled_count > 0, "At least some stdlib functions should compile");
+    assert!(
+        compiled_count > 0,
+        "At least some stdlib functions should compile"
+    );
 }
 
 #[test]
@@ -61,7 +75,9 @@ fn test_full_pipeline_sanity() {
     let mut backend = CraneliftBackend::new().unwrap();
 
     // This should not panic
-    backend.compile_module(&stdlib).expect("Pipeline should work");
+    backend
+        .compile_module(&stdlib)
+        .expect("Pipeline should work");
 
     println!("✅ Full compilation pipeline works end-to-end");
 }
@@ -101,7 +117,9 @@ fn test_complete_compilation_stats() {
     println!("Module Types: {}", stdlib.types.len());
 
     let mut backend = CraneliftBackend::new().unwrap();
-    backend.compile_module(&stdlib).expect("Compilation should succeed");
+    backend
+        .compile_module(&stdlib)
+        .expect("Compilation should succeed");
 
     println!("\n✅ Complete compilation pipeline validated");
     println!("   - HIR construction: ✓");

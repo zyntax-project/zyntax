@@ -60,7 +60,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, LitStr, ItemFn, DeriveInput, parse::Parse, parse::ParseStream};
+use syn::{parse::Parse, parse::ParseStream, parse_macro_input, DeriveInput, ItemFn, LitStr};
 
 /// Defines the ZRTL plugin metadata and symbol table infrastructure
 ///
@@ -159,15 +159,17 @@ pub fn zrtl_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func_name = &func.sig.ident;
 
     // Ensure the function is extern "C"
-    let has_extern_c = func.sig.abi.as_ref()
+    let has_extern_c = func
+        .sig
+        .abi
+        .as_ref()
         .map(|abi| abi.name.as_ref().map(|n| n.value() == "C").unwrap_or(false))
         .unwrap_or(false);
 
     if !has_extern_c {
-        return syn::Error::new_spanned(
-            &func.sig,
-            "ZRTL exported functions must be extern \"C\""
-        ).to_compile_error().into();
+        return syn::Error::new_spanned(&func.sig, "ZRTL exported functions must be extern \"C\"")
+            .to_compile_error()
+            .into();
     }
 
     let symbol_name_with_null = format!("{}\0", symbol_name);
@@ -326,27 +328,35 @@ pub fn zrtl_async(attr: TokenStream, item: TokenStream) -> TokenStream {
     if func.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
             &func.sig,
-            "zrtl_async can only be applied to async functions"
-        ).to_compile_error().into();
+            "zrtl_async can only be applied to async functions",
+        )
+        .to_compile_error()
+        .into();
     }
 
     // Extract parameters
     let params = &func.sig.inputs;
-    let param_names: Vec<_> = params.iter().filter_map(|arg| {
-        if let syn::FnArg::Typed(pat) = arg {
-            if let syn::Pat::Ident(ident) = &*pat.pat {
-                return Some(&ident.ident);
+    let param_names: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pat) = arg {
+                if let syn::Pat::Ident(ident) = &*pat.pat {
+                    return Some(&ident.ident);
+                }
             }
-        }
-        None
-    }).collect();
+            None
+        })
+        .collect();
 
-    let _param_types: Vec<_> = params.iter().filter_map(|arg| {
-        if let syn::FnArg::Typed(pat) = arg {
-            return Some(&pat.ty);
-        }
-        None
-    }).collect();
+    let _param_types: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pat) = arg {
+                return Some(&pat.ty);
+            }
+            None
+        })
+        .collect();
 
     // Extract return type (remove async wrapper)
     let return_type = match &func.sig.output {
@@ -358,18 +368,10 @@ pub fn zrtl_async(attr: TokenStream, item: TokenStream) -> TokenStream {
     let body = &func.block;
 
     // Generate unique names for the state machine and poll function
-    let state_machine_name = syn::Ident::new(
-        &format!("__{}_StateMachine", func_name),
-        func_name.span()
-    );
-    let poll_fn_name = syn::Ident::new(
-        &format!("__{}_poll", func_name),
-        func_name.span()
-    );
-    let wrapper_fn_name = syn::Ident::new(
-        &format!("__{}_wrapper", func_name),
-        func_name.span()
-    );
+    let state_machine_name =
+        syn::Ident::new(&format!("__{}_StateMachine", func_name), func_name.span());
+    let poll_fn_name = syn::Ident::new(&format!("__{}_poll", func_name), func_name.span());
+    let wrapper_fn_name = syn::Ident::new(&format!("__{}_wrapper", func_name), func_name.span());
 
     // Symbol name for the poll function
     let poll_symbol_name = format!("{}$poll\0", symbol_name);
