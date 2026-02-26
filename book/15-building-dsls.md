@@ -97,37 +97,31 @@ line 0 550 800 550
     set_color: "$Paint$rgb",
 }
 
-canvas_stmt = { "canvas" ~ integer ~ integer }
-  -> TypedStatement {
-      "commands": [
-          { "define": "var_decl", "args": {
-              "name": "canvas",
-              "value": { "define": "call", "args": {
-                  "callee": "canvas_create",
-                  "args": ["$1", "$2"]
-              }}
-          }}
-      ]
+canvas_stmt = { "canvas" ~ w:integer ~ h:integer }
+  -> TypedStatement::Let {
+      name: intern("canvas"),
+      init: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("canvas_create") }),
+          args: [w, h],
+      },
   }
 
-fill_stmt = { "fill" ~ color }
-  -> TypedStatement {
-      "commands": [
-          { "define": "var_decl", "args": {
-              "name": "fill_color",
-              "value": "$1"
-          }}
-      ]
+fill_stmt = { "fill" ~ c:color }
+  -> TypedStatement::Let {
+      name: intern("fill_color"),
+      init: c,
   }
 
-circle_stmt = { "circle" ~ expr ~ expr ~ expr }
-  -> TypedStatement {
-      "commands": [
-          { "define": "call", "args": {
-              "callee": "fill_circle",
-              "args": ["canvas", "$1", "$2", "$3", "fill_color"]
-          }}
-      ]
+circle_stmt = { "circle" ~ x:expr ~ y:expr ~ r:expr }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("fill_circle") }),
+          args: [
+              TypedExpression::Variable { name: intern("canvas") },
+              x, y, r,
+              TypedExpression::Variable { name: intern("fill_color") },
+          ],
+      },
   }
 ```
 
@@ -303,86 +297,69 @@ Let's build a simple **charting DSL** that generates visualizations:
     chart_render: "$Chart$render",
 }
 
-// Entry point
-program = { SOI ~ chart_definition ~ EOI }
-  -> TypedProgram {
-      "get_child": { "index": 0 }
+// Entry point: produces TypedProgram containing the render_chart function
+program = { SOI ~ chart:chart_definition ~ EOI }
+  -> TypedProgram { declarations: [chart] }
+
+chart_definition = { ct:chart_type ~ t:title? ~ d:data_section ~ s:style_section? }
+  -> TypedDeclaration::Function {
+      name: intern("render_chart"),
+      params: [],
+      return_type: Type::Named { name: intern("void") },
+      body: Some(TypedBlock { stmts: d }),
+      is_async: false,
   }
 
-chart_definition = { chart_type ~ title? ~ data_section ~ style_section? }
-  -> TypedDeclaration {
-      "commands": [
-          { "define": "function", "args": {
-              "name": "render_chart",
-              "params": [],
-              "return_type": "void",
-              "body": { "get_all_children": true }
-          }}
-      ]
+chart_type = @{ ("bar" | "line" | "pie") ~ " chart" }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("chart_set_type") }),
+          args: [TypedExpression::StringLiteral { value: chart_type }],
+      },
   }
 
-chart_type = { ("bar" | "line" | "pie") ~ "chart" }
-  -> TypedStatement {
-      "commands": [
-          { "define": "call", "args": {
-              "callee": "chart_set_type",
-              "args": [{ "get_text": true }]
-          }}
-      ]
+title = { "title" ~ s:string_literal }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("chart_set_title") }),
+          args: [s],
+      },
   }
 
-title = { "title" ~ string_literal }
-  -> TypedStatement {
-      "commands": [
-          { "define": "call", "args": {
-              "callee": "chart_set_title",
-              "args": ["$1"]
-          }}
-      ]
+data_section = { "data" ~ "{" ~ points:data_point* ~ "}" }
+  -> points
+
+data_point = { label:string_literal ~ ":" ~ val:number }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("chart_add_data") }),
+          args: [label, val],
+      },
   }
 
-data_section = { "data" ~ "{" ~ data_point* ~ "}" }
-  -> TypedBlock {
-      "get_all_children": true
+style_section = { "style" ~ "{" ~ props:style_prop* ~ "}" }
+  -> props
+
+style_prop = { key:identifier ~ ":" ~ val:(color | number | string_literal) }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("chart_set_style") }),
+          args: [TypedExpression::StringLiteral { value: key }, val],
+      },
   }
 
-data_point = { string_literal ~ ":" ~ number }
-  -> TypedStatement {
-      "commands": [
-          { "define": "call", "args": {
-              "callee": "chart_add_data",
-              "args": ["$1", "$2"]
-          }}
-      ]
-  }
-
-style_section = { "style" ~ "{" ~ style_prop* ~ "}" }
-  -> TypedBlock {
-      "get_all_children": true
-  }
-
-style_prop = { identifier ~ ":" ~ (color | number | string_literal) }
-  -> TypedStatement {
-      "commands": [
-          { "define": "call", "args": {
-              "callee": "chart_set_style",
-              "args": ["$1", "$2"]
-          }}
-      ]
-  }
-
-// Terminals
+// Terminals — atomic rules capture their text automatically via the binding name
 string_literal = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
-  -> String { "get_text": true }
+  -> TypedExpression::StringLiteral { value: string_literal }
 
 number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
-  -> Number { "parse_float": true }
+  -> TypedExpression::FloatLiteral { value: number }
 
 color = @{ "#" ~ ASCII_HEX_DIGIT{6} }
-  -> Color { "get_text": true }
+  -> TypedExpression::StringLiteral { value: color }
 
 identifier = @{ ASCII_ALPHA ~ ASCII_ALPHANUMERIC* }
-  -> Identifier { "get_text": true }
+  -> intern(identifier)
 
 WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
@@ -546,31 +523,24 @@ The key insight: `zrtl_plugin!` **defines** what symbols a plugin exports. The r
 
 ### Domain-Specific Types
 
-Your DSL can define custom type names. Like the Zig grammar, use `"define": "primitive_type"` to create type nodes:
+Your DSL can define custom type names using atomic rules that capture their text automatically:
 
 ```zyn
-// Standard primitive types (same pattern as zig.zyn)
-primitive_type = { "i32" | "i64" | "f32" | "f64" | "bool" | "void" }
-  -> Type {
-      "get_text": true,
-      "define": "primitive_type",
-      "args": { "name": "$result" }
-  }
+// Standard primitive types — atomic rule captures text as a type name
+primitive_type = @{ "i32" | "i64" | "f32" | "f64" | "bool" | "void" }
+  -> Type::Named { name: intern(primitive_type) }
 
-// DSL-specific type aliases - parsed the same way
+// DSL-specific type aliases — treated the same way
 // The compiler treats these as their underlying types
-dsl_type = { "Currency" | "Percentage" | "Date" | "Duration" }
-  -> Type {
-      "get_text": true,
-      "define": "primitive_type",
-      "args": { "name": "$result" }
-  }
+dsl_type = @{ "Currency" | "Percentage" | "Date" | "Duration" }
+  -> Type::Named { name: intern(dsl_type) }
 
-// Combined type expression
-type_expr = { primitive_type | dsl_type | identifier }
-  -> Type {
-      "get_child": { "index": 0 }
-  }
+// For named types from an identifier (e.g. user-defined structs)
+name_type = { n:identifier }
+  -> Type::Named { name: intern(n) }
+
+// Combined type expression — passthrough, each alternative handles its own action
+type_expr = { primitive_type | dsl_type | name_type }
 ```
 
 Note: The grammar only parses type names as strings. Type semantics (e.g., treating `Currency` as `f64`) must be handled in your compiler or runtime, not in the grammar.

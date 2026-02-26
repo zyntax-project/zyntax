@@ -255,21 +255,25 @@ To support async in your language grammar, define the async keyword and function
 
 ```zyn
 // Function definition with optional async modifier
+// async_modifier? gives Option<()>; .is_some() converts to bool
 function_def = {
-    async_modifier? ~ "fn" ~ identifier ~ "(" ~ param_list? ~ ")" ~ return_type? ~ block
+    async_modifier? ~ "fn" ~ name:identifier
+    ~ "(" ~ params:param_list? ~ ")"
+    ~ ret:return_type?
+    ~ body:block
 }
-  -> TypedFunction {
-      "name": "$2",
-      "params": "$4",
-      "return_type": "$6",
-      "body": "$7",
-      "is_async": { "exists": "$1" }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params.unwrap_or([]),
+      return_type: ret,
+      body: Some(body),
+      is_async: async_modifier.is_some(),
   }
 
 async_modifier = { "async" }
 ```
 
-The `is_async` field in the TypedFunction tells the compiler to apply async transformation.
+The `is_async: async_modifier.is_some()` field tells the compiler to apply async transformation when the `async` keyword is present.
 
 ## Performance Considerations
 

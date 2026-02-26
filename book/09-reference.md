@@ -2,160 +2,174 @@
 
 Complete reference for Zyn grammar commands and the TypedAST builder API.
 
-## Command Reference
+## Action Reference
 
-### Data Extraction Commands
+Semantic actions follow the `->` arrow and build TypedAST nodes from named bindings. There are five action kinds.
 
-#### get_text
+### Construct — Build a TypedAST Node
 
-Extracts the matched text as a string.
+The primary action. Field values are expressions over bindings:
 
 ```zyn
-identifier = @{ ASCII_ALPHA+ }
-  -> String {
-      "get_text": true
+fn_param = { name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedParameter { name: intern(name), ty: ty }
+
+integer_literal = @{ ASCII_DIGIT+ }
+  -> TypedExpression::IntLiteral { value: integer_literal }
+```
+
+Atomic rules (`@`) capture matched text automatically — the binding name holds the text.
+
+### PassThrough — Return a Binding
+
+For wrapper/choice rules:
+
+```zyn
+statement = { if_stmt | while_stmt | return_stmt | expr_stmt }
+// no action needed — implicitly passes through the matched alternative
+
+factor = { inner:paren_expr | inner:number }
+  -> inner
+```
+
+### HelperCall — Built-in Helpers
+
+```zyn
+fn_params = { first:fn_param ~ rest:fn_param_comma* }
+  -> prepend_list(first, rest)
+
+additive_expr = { first:term ~ rest:additive_rest* }
+  -> fold_left_ops(first, rest)
+
+additive_rest = { op:add_op ~ operand:term }
+  -> make_pair(op, operand)
+
+type_name = { name:identifier }
+  -> intern(name)
+```
+
+### Match — Branch on a String Binding
+
+```zyn
+decl = { kind:("let" | "const") ~ name:identifier ~ "=" ~ val:expr }
+  -> match kind {
+      "let"   => TypedStatement::Let   { name: intern(name), init: val },
+      "const" => TypedStatement::Const { name: intern(name), init: val },
   }
 ```
 
-**Result**: The matched source text as a string.
-
-#### parse_int
-
-Parses extracted text as an integer. Must be preceded by `get_text`.
+### Conditional — If/Else
 
 ```zyn
-integer = @{ "-"? ~ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_int": true,
-      "define": "int_literal",
-      "args": { "value": "$result" }
+fn_decl = { "fn" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ret:type_expr? ~ body:block }
+  -> if ret.is_some() {
+      TypedDeclaration::Function { name: intern(name), params: params.unwrap_or([]), return_type: ret, body: Some(body) }
+  } else {
+      TypedDeclaration::Procedure { name: intern(name), params: params.unwrap_or([]), body: body }
   }
 ```
 
-**Result**: An integer value.
+## Action Expression Reference
 
-#### get_child
-
-Gets a specific child node by index.
+### Binding References
 
 ```zyn
-expr = { inner }
-  -> TypedExpression {
-      "get_child": { "index": 0 }
-  }
+name        // value of the binding 'name'
+params      // Vec<T> from 'params:rule*'
+ret         // Option<T> from 'ret:rule?'
 ```
 
-**Parameters**:
-- `index`: Zero-based child index
+### Helper Functions
 
-#### get_all_children
+| Call | Signature | Description |
+|------|-----------|-------------|
+| `intern(s)` | `text → InternedString` | Intern a string into the arena |
+| `prepend_list(first, rest)` | `(T, Vec<T>) → Vec<T>` | Prepend first to rest Vec |
+| `fold_left_ops(first, rest)` | `(Expr, Vec<(op,Expr)>) → Expr` | Build left-assoc binary tree |
+| `make_pair(op, operand)` | `(op, Expr) → (op, Expr)` | Package for `fold_left_ops` |
+| `Box::new(expr)` | `T → Box<T>` | Heap-box a value |
+| `Some(value)` | `T → Option<T>` | Wrap in Some |
 
-Collects all children into a list.
+### Method Calls
 
 ```zyn
-items = { item* }
-  -> List {
-      "get_all_children": true
-  }
+params.unwrap_or([])   // Option<Vec<T>> → Vec<T>
+opt.is_some()          // Option<T> → bool
+binding.text           // get matched text as String
+binding.span           // get source Span
 ```
 
-**Result**: Array of child nodes.
-
-### AST Construction Commands
-
-#### define
-
-Calls a builder method to create an AST node.
+### Nested Node Construction
 
 ```zyn
-{ "define": "method_name", "args": { "arg1": "value", "arg2": "$1" } }
+-> TypedExpression::Call {
+    callee: Box::new(TypedExpression::Variable { name: intern(name) }),
+    args: args.unwrap_or([]),
+}
 ```
 
-**Arguments**:
-- Static values: `"string"`, `42`, `true`, `false`, `[]`
-- Child references: `"$1"`, `"$2"`, etc.
-- Previous result: `"$result"`
-
-### Binary Expression Commands
-
-#### fold_binary
-
-Creates left-associative binary expression trees.
+### List Literals
 
 ```zyn
-addition = { term ~ (("+" | "-") ~ term)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "term", "operator": "+|-" }
-  }
+path: [intern(name)]   // single-element Vec
+params: []             // empty Vec
 ```
 
-**Parameters**:
-- `operand`: Name of the operand rule
-- `operator`: Operator rules (pipe-separated)
+### Primitives
 
-## Define Methods Reference
+```zyn
+"string"   42   true   false
+```
 
-### Literals
+## TypedAST Variant Quick Reference
 
-| Method | Arguments | Description |
-|--------|-----------|-------------|
-| `int_literal` | `value: i64` | Integer literal |
-| `bool_literal` | `value: "true"\|"false"` | Boolean literal |
-| `string_literal` | `value: string` | String literal |
-| `char_literal` | `value: char` | Character literal |
+### Expressions (`TypedExpression::`)
 
-### Expressions
+| Variant | Key Fields | Description |
+|---------|-----------|-------------|
+| `IntLiteral` | `value` | Integer literal |
+| `BoolLiteral` | `value` | Boolean literal |
+| `StringLiteral` | `value` | String literal |
+| `Variable` | `name` | Variable reference |
+| `Binary` | `op, left, right` | Binary operation |
+| `Unary` | `op, operand` | Unary operation |
+| `Call` | `callee, args` | Function call |
+| `FieldAccess` | `object, field` | Field access |
+| `Index` | `object, index` | Index access |
+| `StructLiteral` | `type_name, fields` | Struct literal |
+| `ArrayLiteral` | `elements` | Array literal |
 
-| Method | Arguments | Description |
-|--------|-----------|-------------|
-| `variable` | `name: string` | Variable reference |
-| `binary` | `op: string, left: expr, right: expr` | Binary operation |
-| `unary` | `op: string, operand: expr` | Unary operation |
-| `call` | `callee: expr, args: list` | Function call |
-| `field_access` | `object: expr, field: string` | Field access |
-| `index` | `object: expr, index: expr` | Index access |
-| `struct_init` | `type_name: string, fields: list` | Struct literal |
-| `struct_field_init` | `name: string, value: expr` | Field initializer |
-| `array_literal` | `elements: list` | Array literal |
-| `try` | `expr: expr` | Try expression |
+### Statements (`TypedStatement::`)
 
-### Statements
+| Variant | Key Fields | Description |
+|---------|-----------|-------------|
+| `Let` | `name, init` | Variable declaration |
+| `Const` | `name, init` | Constant declaration |
+| `Return` | `value?` | Return statement |
+| `Expr` | `expr` | Expression statement |
+| `Assign` | `target, value` | Assignment |
+| `If` | `condition, then_branch, else_branch?` | If statement |
+| `While` | `condition, body` | While loop |
+| `For` | `iterable, binding, body` | For loop |
 
-| Method | Arguments | Description |
-|--------|-----------|-------------|
-| `let_stmt` | `name, init?, is_const, type?` | Variable declaration |
-| `return_stmt` | `value?: expr` | Return statement |
-| `expression_stmt` | `expr: expr` | Expression statement |
-| `if` | `condition, then_branch, else_branch?` | If statement |
-| `while` | `condition, body` | While loop |
-| `for` | `iterable, binding, body` | For loop |
-| `assignment` | `target, value` | Assignment |
-| `break` | | Break statement |
-| `continue` | | Continue statement |
-| `block` | `statements: list` | Statement block |
+### Declarations (`TypedDeclaration::`)
 
-### Declarations
+| Variant | Key Fields | Description |
+|---------|-----------|-------------|
+| `Function` | `name, params, return_type, body` | Function declaration |
+| `Struct` | `name, fields` | Struct declaration |
+| `Enum` | `name, variants` | Enum declaration |
+| `Import` | `path, alias?` | Import declaration |
 
-| Method | Arguments | Description |
-|--------|-----------|-------------|
-| `function` | `name, params, return_type, body` | Function declaration |
-| `struct` | `name, fields` | Struct declaration |
-| `enum` | `name, variants` | Enum declaration |
-| `param` | `name, type` | Function parameter |
-| `field` | `name, type` | Struct field |
-| `variant` | `name` | Enum variant |
-| `program` | `declarations: list` | Program root |
+### Types (`Type::`)
 
-### Types
-
-| Method | Arguments | Description |
-|--------|-----------|-------------|
-| `primitive_type` | `name: string` | Primitive type |
-| `pointer_type` | `pointee: type` | Pointer type |
-| `optional_type` | `inner: type` | Optional type |
-| `array_type` | `size?, element: type` | Array type |
-| `error_union_type` | `payload: type` | Error union type |
+| Variant | Key Fields | Description |
+|---------|-----------|-------------|
+| `Named` | `name` | Named/primitive type |
+| `Pointer` | `pointee` | Pointer type |
+| `Optional` | `inner` | Optional type |
+| `Array` | `size?, element` | Array type |
+| `Extern` | `name` | Extern/opaque type |
 
 ## Grammar Syntax Reference
 
@@ -345,8 +359,8 @@ zyntax compile --grammar zig.zyn --source test.zig -b llvm -o test.o
 |-------|-------|----------|
 | "Rule not found" | Reference to undefined rule | Define the rule or check spelling |
 | "Left recursion detected" | `a = { a ~ ... }` | Rewrite using repetition |
-| "Invalid command" | Unknown JSON command | Check command spelling |
-| "Missing argument" | Required arg not provided | Add the missing argument |
+| `binding 'x' not found` | Action references a binding not in the pattern | Add `x:rule` to the pattern |
+| `left recursion detected` | Rule calls itself without consuming input | Refactor to use `rest*` style |
 
 ### Runtime Errors
 
@@ -375,5 +389,5 @@ zyntax compile --grammar zig.zyn --source test.zig -b llvm -o test.o
 
 1. **Test incrementally** - Add rules one at a time
 2. **Use verbose mode** - `--verbose` shows parse tree
-3. **Check child indices** - Print children to verify order
+3. **Use named bindings** - `name:rule` makes patterns self-documenting
 4. **Start simple** - Get basic cases working first

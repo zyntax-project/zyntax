@@ -35,44 +35,40 @@ Create `calc.zyn`:
     entry_point: "main",
 }
 
-// Program structure
-program = { SOI ~ expr ~ EOI }
+// Program structure: wrap the expression in a main function
+program = { SOI ~ e:expr ~ EOI }
   -> TypedProgram {
-      "commands": [
-          { "define": "program_expr", "args": { "expr": "$1" } }
-      ]
+      declarations: [
+          TypedDeclaration::Function {
+              name: intern("main"),
+              params: [],
+              return_type: Type::Named { name: intern("i64") },
+              body: Some(TypedBlock {
+                  stmts: [TypedStatement::Return { value: Some(e) }],
+              }),
+              is_async: false,
+          }
+      ],
   }
 
-// Expression with addition/subtraction
-expr = { term ~ ((add_op | sub_op) ~ term)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "term", "operator": "add_op|sub_op" }
-  }
+// Expression with addition/subtraction (left-associative)
+expr = { first:term ~ rest:expr_rest* }
+  -> fold_left_ops(first, rest)
 
-// Terms are atoms or parenthesized expressions
+expr_rest = { op:add_sub_op ~ operand:term }
+  -> make_pair(op, operand)
+
+add_sub_op = @{ "+" | "-" }
+
+// Terms are atoms or parenthesized expressions — passthrough
 term = { integer | paren_expr }
-  -> TypedExpression {
-      "get_child": { "index": 0 }
-  }
 
 // Parenthesized expression (silent rule - doesn't create node)
 paren_expr = _{ "(" ~ expr ~ ")" }
 
-// Integer literal
+// Integer literal — atomic rule captures text automatically
 integer = @{ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_int": true,
-      "define": "int_literal",
-      "args": { "value": "$result" }
-  }
-
-// Operators
-add_op = { "+" }
-  -> String { "get_text": true }
-
-sub_op = { "-" }
-  -> String { "get_text": true }
+  -> TypedExpression::IntLiteral { value: integer }
 
 // Whitespace handling
 WHITESPACE = _{ " " | "\t" | "\n" }
@@ -113,13 +109,11 @@ This block defines metadata about your language:
 
 ### Grammar Rules
 
-Rules follow PEG syntax with semantic action blocks:
+Rules follow PEG syntax with optional semantic actions:
 
 ```zyn
 rule_name = { pattern }
-  -> ResultType {
-      // JSON commands
-  }
+  -> TypedAST::Variant { field: value, ... }
 ```
 
 | Syntax | Meaning |
@@ -155,32 +149,37 @@ rule_name = { pattern }
 
 ## Semantic Actions
 
-Each rule can have a semantic action block that describes how to build AST nodes:
+Each rule can have a semantic action that builds a TypedAST node directly from parsed bindings:
 
 ```zyn
+// Atomic rule (@) — matched text is available via the binding name 'integer'
 integer = @{ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,      // Get matched text
-      "parse_int": true,     // Parse as integer
-      "define": "int_literal",
-      "args": { "value": "$result" }
-  }
+  -> TypedExpression::IntLiteral { value: integer }
 ```
 
-The `->` arrow connects the grammar rule to its semantic action:
-- `TypedExpression` is the expected result type
-- The JSON block contains commands to execute
+The `->` arrow connects the grammar rule to its action:
+- `TypedExpression::IntLiteral` is the TypedAST variant to construct
+- `value: integer` sets the field using the captured text from the binding
 
-### Common Commands
+Named bindings in the pattern make values available to the action:
 
-| Command | Purpose |
-|---------|---------|
-| `get_text` | Extract matched text |
-| `get_child` | Get a specific child node |
-| `get_all_children` | Collect all child nodes |
-| `parse_int` | Parse text as integer |
-| `define` | Call an AST builder method |
-| `fold_binary` | Build left-associative binary expressions |
+```zyn
+fn_param = { name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedParameter { name: intern(name), ty: ty }
+//                          ^^^^                ^^
+//                    binding 'name'      binding 'ty'
+```
+
+### Common Action Patterns
+
+| Pattern | Description |
+|---------|-------------|
+| `TypedX::Y { field: binding }` | Construct a TypedAST node from bindings |
+| `-> binding` | Passthrough — return a binding directly |
+| `-> fold_left_ops(first, rest)` | Build a left-associative binary expression tree |
+| `-> prepend_list(first, rest)` | Combine first element + rest Vec into a Vec |
+| `-> intern(name)` | Intern a string binding into the arena |
+| `-> if cond { ... } else { ... }` | Branch on a boolean binding |
 
 ## Project Structure
 

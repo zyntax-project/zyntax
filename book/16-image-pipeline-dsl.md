@@ -162,32 +162,21 @@ The `@language` block defines metadata, and `@builtin` maps DSL function names t
 ### Program Structure
 
 ```zyn
-// Entry point: collect statements, then wrap in run_pipeline function
-program = { SOI ~ statements ~ EOI }
+// Entry point: collect statements, wrap them in the run_pipeline function
+program = { SOI ~ stmts:statement* ~ EOI }
   -> TypedProgram {
-      "get_child": { "index": 0 }
+      declarations: [
+          TypedDeclaration::Function {
+              name: intern("run_pipeline"),
+              params: [],
+              return_type: Type::Named { name: intern("void") },
+              body: Some(TypedBlock { stmts: stmts }),
+              is_async: false,
+          }
+      ],
   }
 
-// Collect all statements into a program with a single function
-statements = { statement* }
-  -> TypedProgram {
-      "get_all_children": true,
-      "define": "program",
-      "args": {
-          "declarations": [
-              { "define": "function", "args": {
-                  "name": "run_pipeline",
-                  "params": [],
-                  "return_type": "void",
-                  "body": { "define": "block", "args": {
-                      "statements": "$result"
-                  }}
-              }}
-          ]
-      }
-  }
-
-// Statements in the DSL
+// Statements in the DSL — passthrough, each alternative has its own action
 statement = {
     load_stmt |
     save_stmt |
@@ -202,9 +191,6 @@ statement = {
     invert_stmt |
     print_stmt
 }
-  -> TypedStatement {
-      "get_child": { "index": 0 }
-  }
 ```
 
 This wraps all statements in a `run_pipeline` function, which serves as the entry point.
@@ -213,44 +199,32 @@ This wraps all statements in a `run_pipeline` function, which serves as the entr
 
 ```zyn
 // load "image.jpg" as varname
-// $1 = string_literal (path), $2 = identifier (variable name as text)
-load_stmt = { "load" ~ string_literal ~ "as" ~ identifier }
-  -> TypedStatement {
-      "commands": [
-          { "define": "let_stmt", "args": {
-              "name": "$2",
-              "type": { "define": "primitive_type", "args": { "name": "u64" } },
-              "init": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "image_load" } },
-                  "args": ["$1"]
-              }},
-              "is_const": false
-          }}
-      ]
+load_stmt = { "load" ~ path:string_literal ~ "as" ~ name:identifier }
+  -> TypedStatement::Let {
+      name: intern(name),
+      init: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("image_load") }),
+          args: [path],
+      },
   }
 
 // save varname as "output.png"
-// $1 = identifier (variable name as text), $2 = string_literal (path)
-save_stmt = { "save" ~ identifier ~ "as" ~ string_literal }
-  -> TypedStatement {
-      "commands": [
-          { "define": "expression_stmt", "args": {
-              "expr": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "image_save" } },
-                  "args": [
-                      { "define": "variable", "args": { "name": "$1" } },
-                      "$2"
-                  ]
-              }}
-          }}
-      ]
+save_stmt = { "save" ~ img:identifier ~ "as" ~ path:string_literal }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("image_save") }),
+          args: [
+              TypedExpression::Variable { name: intern(img) },
+              path,
+          ],
+      },
   }
 ```
 
 Key points:
-- `$1`, `$2` refer to child nodes by position (1-based)
-- The `identifier` rule returns text directly (via `"get_text": true`)
-- We use `"define": "let_stmt"` to create a variable declaration
+- Named bindings (`path:string_literal`, `name:identifier`) replace the old `$1`, `$2` positional references
+- `identifier` is an atomic rule — its text is captured automatically via the binding name
+- `TypedStatement::Let` creates a variable binding; `TypedStatement::Expr` wraps a call expression
 
 ### Transformation Operations
 
@@ -258,22 +232,17 @@ Each operation follows a pattern: `operation varname [parameters]`
 
 ```zyn
 // resize varname to 800x600
-// $1 = identifier (image), $2 = integer (width), $3 = integer (height)
-resize_stmt = { "resize" ~ identifier ~ "to" ~ integer ~ "x" ~ integer }
-  -> TypedStatement {
-      "commands": [
-          { "define": "assignment", "args": {
-              "target": { "define": "variable", "args": { "name": "$1" } },
-              "value": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "image_resize" } },
-                  "args": [
-                      { "define": "variable", "args": { "name": "$1" } },
-                      "$2",
-                      "$3"
-                  ]
-              }}
-          }}
-      ]
+resize_stmt = { "resize" ~ img:identifier ~ "to" ~ w:integer ~ "x" ~ h:integer }
+  -> TypedStatement::Assign {
+      target: TypedExpression::Variable { name: intern(img) },
+      value: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("image_resize") }),
+          args: [
+              TypedExpression::Variable { name: intern(img) },
+              w,
+              h,
+          ],
+      },
   }
 ```
 
@@ -283,95 +252,64 @@ The same pattern applies to other operations:
 
 ```zyn
 // blur varname by 2.5
-blur_stmt = { "blur" ~ identifier ~ "by" ~ number }
-  -> TypedStatement {
-      "commands": [
-          { "define": "assignment", "args": {
-              "target": { "define": "variable", "args": { "name": "$1" } },
-              "value": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "image_blur" } },
-                  "args": [
-                      { "define": "variable", "args": { "name": "$1" } },
-                      "$2"
-                  ]
-              }}
-          }}
-      ]
+blur_stmt = { "blur" ~ img:identifier ~ "by" ~ sigma:number }
+  -> TypedStatement::Assign {
+      target: TypedExpression::Variable { name: intern(img) },
+      value: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("image_blur") }),
+          args: [
+              TypedExpression::Variable { name: intern(img) },
+              sigma,
+          ],
+      },
   }
 
 // grayscale varname (no parameters)
-grayscale_stmt = { "grayscale" ~ identifier }
-  -> TypedStatement {
-      "commands": [
-          { "define": "assignment", "args": {
-              "target": { "define": "variable", "args": { "name": "$1" } },
-              "value": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "image_grayscale" } },
-                  "args": [{ "define": "variable", "args": { "name": "$1" } }]
-              }}
-          }}
-      ]
+grayscale_stmt = { "grayscale" ~ img:identifier }
+  -> TypedStatement::Assign {
+      target: TypedExpression::Variable { name: intern(img) },
+      value: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("image_grayscale") }),
+          args: [TypedExpression::Variable { name: intern(img) }],
+      },
   }
 
 // print "message"
-print_stmt = { "print" ~ string_literal }
-  -> TypedStatement {
-      "commands": [
-          { "define": "expression_stmt", "args": {
-              "expr": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "println" } },
-                  "args": ["$1"]
-              }}
-          }}
-      ]
+print_stmt = { "print" ~ msg:string_literal }
+  -> TypedStatement::Expr {
+      expr: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("println") }),
+          args: [msg],
+      },
   }
 ```
 
 ### Terminal Rules
 
+Atomic rules (`@`) capture their matched text automatically. The binding name in the action refers to that text directly — no `"get_text"` boilerplate needed.
+
 ```zyn
 // String literal: "hello world"
 string_literal = @{ "\"" ~ string_inner* ~ "\"" }
-  -> TypedExpression {
-      "get_text": true,
-      "define": "string_literal",
-      "args": { "value": "$result" }
-  }
+  -> TypedExpression::StringLiteral { value: string_literal }
 
 string_inner = { !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 
 // Integer: 123
 integer = @{ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_int": true,
-      "define": "int_literal",
-      "args": { "value": "$result" }
-  }
+  -> TypedExpression::IntLiteral { value: integer }
 
 // Signed integer: +30 or -20 or 15
 signed_integer = @{ ("+" | "-")? ~ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_int": true,
-      "define": "int_literal",
-      "args": { "value": "$result" }
-  }
+  -> TypedExpression::IntLiteral { value: signed_integer }
 
 // Floating point: 1.5 or 0.5
 number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_float": true,
-      "define": "float_literal",
-      "args": { "value": "$result" }
-  }
+  -> TypedExpression::FloatLiteral { value: number }
 
-// Identifier: my_image
+// Identifier: my_image — returns an interned string (not a TypedExpression)
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
-  -> String {
-      "get_text": true
-  }
+  -> intern(identifier)
 
 // Whitespace and comments (ignored)
 WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
@@ -613,20 +551,16 @@ image_sharpen: "$Image$sharpen",
 
 ```zyn
 // sharpen varname by 1.5
-sharpen_stmt = { "sharpen" ~ identifier ~ "by" ~ number }
-  -> TypedStatement {
-      "commands": [
-          { "define": "assignment", "args": {
-              "target": { "define": "variable", "args": { "name": "$1" } },
-              "value": { "define": "call", "args": {
-                  "callee": { "define": "variable", "args": { "name": "image_sharpen" } },
-                  "args": [
-                      { "define": "variable", "args": { "name": "$1" } },
-                      "$2"
-                  ]
-              }}
-          }}
-      ]
+sharpen_stmt = { "sharpen" ~ img:identifier ~ "by" ~ sigma:number }
+  -> TypedStatement::Assign {
+      target: TypedExpression::Variable { name: intern(img) },
+      value: TypedExpression::Call {
+          callee: Box::new(TypedExpression::Variable { name: intern("image_sharpen") }),
+          args: [
+              TypedExpression::Variable { name: intern(img) },
+              sigma,
+          ],
+      },
   }
 ```
 
@@ -654,7 +588,7 @@ pub extern "C" fn image_sharpen(handle: u64, sigma: f32) -> u64 {
 ## Key Concepts Learned
 
 1. **DSL Design**: Syntax should be readable and domain-focused
-2. **Semantic Actions**: JSON command blocks transform parse trees into TypedAST
+2. **Semantic Actions**: TypedAST construct expressions (`TypedStatement::Let { ... }`) build the AST directly from named bindings — no JSON serialization needed
 3. **Builtin Mapping**: `@builtin` connects DSL names to plugin symbols
 4. **Statement Pattern**: `operation varname [params]` generates assignments
 5. **Plugin Loading**: Plugins are loaded at runtime and symbols are registered with the JIT

@@ -200,42 +200,67 @@ PEG handles operator precedence through grammar structure, not precedence tables
 
 ### Left-Associative Operators
 
-Build a chain of rules from lowest to highest precedence:
+Build a chain of rules from lowest to highest precedence. Each level uses `fold_left_ops` with a companion `rest` rule that packages `(op, operand)` pairs using `make_pair`:
 
 ```zyn
 // Lowest precedence: logical OR
-expr = { logical_or }
+expr = { e:logical_or }
+  -> e
 
-logical_or = { logical_and ~ ("or" ~ logical_and)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "logical_and", "operator": "or" }
-  }
+logical_or = { first:logical_and ~ rest:logical_or_rest* }
+  -> fold_left_ops(first, rest)
 
-logical_and = { comparison ~ ("and" ~ comparison)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "comparison", "operator": "and" }
-  }
+logical_or_rest = { op:or_op ~ operand:logical_and }
+  -> make_pair(op, operand)
 
-comparison = { addition ~ (("==" | "!=" | "<" | ">") ~ addition)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "addition", "operator": "==|!=|<|>" }
-  }
+or_op = @{ "or" }
 
-addition = { multiplication ~ (("+" | "-") ~ multiplication)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "multiplication", "operator": "+|-" }
-  }
+logical_and = { first:comparison ~ rest:logical_and_rest* }
+  -> fold_left_ops(first, rest)
 
-multiplication = { unary ~ (("*" | "/") ~ unary)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "unary", "operator": "*|/" }
-  }
+logical_and_rest = { op:and_op ~ operand:comparison }
+  -> make_pair(op, operand)
+
+and_op = @{ "and" }
+
+comparison = { first:addition ~ rest:comparison_rest* }
+  -> fold_left_ops(first, rest)
+
+comparison_rest = { op:comparison_op ~ operand:addition }
+  -> make_pair(op, operand)
+
+comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">" }
+
+addition = { first:multiplication ~ rest:addition_rest* }
+  -> fold_left_ops(first, rest)
+
+addition_rest = { op:add_op ~ operand:multiplication }
+  -> make_pair(op, operand)
+
+add_op = @{ "+" | "-" }
+
+multiplication = { first:unary ~ rest:multiplication_rest* }
+  -> fold_left_ops(first, rest)
+
+multiplication_rest = { op:mul_op ~ operand:unary }
+  -> make_pair(op, operand)
+
+mul_op = @{ "*" | "/" }
 
 // Highest precedence: unary then atoms
-unary = { ("-" | "!") ~ unary | atom }
+unary = { unary_with_op | atom }
 
-atom = { number | identifier | "(" ~ expr ~ ")" }
+unary_with_op = { op:unary_op ~ operand:atom }
+  -> TypedExpression::Unary { op: op, operand: Box::new(operand) }
+
+unary_op = @{ "-" | "!" }
+
+atom = { number | identifier | paren_expr }
+
+paren_expr = _{ "(" ~ expr ~ ")" }
 ```
+
+`fold_left_ops` takes the `first` value and the `rest` Vec of `(op, operand)` pairs and builds a left-associative binary tree. For input `a + b - c` it produces `Binary(-, Binary(+, a, b), c)`.
 
 ### Right-Associative Operators
 

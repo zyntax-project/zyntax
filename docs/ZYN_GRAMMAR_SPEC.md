@@ -1,65 +1,64 @@
 # ZynPEG Grammar Specification
 
-**Version**: 2.0 (JSON Action Blocks)
-**Last Updated**: November 23, 2025
+**Version**: 3.0 (TypedAST Actions)
+**Last Updated**: February 2026
 
 ## Overview
 
-ZynPEG is a parser generator that extends pest PEG syntax with TypedAST action blocks. Version 2.0 introduces JSON-based action mappings that enable runtime interpretation without requiring Rust compilation.
+ZynPEG is a PEG parser generator with semantic actions that construct TypedAST nodes directly. Version 3.0 replaces the previous JSON command-block system with a typed action language that mirrors Rust struct/enum syntax, enabling grammars to build type-safe ASTs at parse time without an intermediate representation.
+
+The runtime is provided by `zyn_peg::runtime2` — a Packrat-memoized interpreter that achieves O(n × grammar_size) parsing time.
 
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                    Compile Time                             │
-├─────────────────────────────────────────────────────────────┤
-│  .zyn grammar  →  ZynPEG Compiler  →  .zpeg module          │
-│                                                              │
-│  .zpeg contains:                                            │
-│  - pest grammar (string)                                    │
-│  - Rule command mappings (JSON)                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  .zyn grammar  →  parse_grammar()  →  GrammarIR  │
+└──────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────┐
+│  source code  →  GrammarInterpreter  →  TypedAST │
+│                                                  │
+│  • Packrat memoization (O(n) per rule)           │
+│  • No JSON serialization                         │
+│  • No pest VM or code generation                 │
+└──────────────────────────────────────────────────┘
+```
 
-┌─────────────────────────────────────────────────────────────┐
-│                    Runtime                                  │
-├─────────────────────────────────────────────────────────────┤
-│  source.lang + .zpeg  →  pest_vm  →  Host Functions  →  AST │
-│                                                              │
-│  No Rust compilation required!                              │
-└─────────────────────────────────────────────────────────────┘
+The `Grammar2` struct in `zyntax_embed` wraps this pipeline:
+
+```rust
+let grammar = Grammar2::from_source(include_str!("my_lang.zyn"))?;
+let program: TypedProgram = grammar.parse(source_code)?;
 ```
 
 ## Grammar File Structure
 
-A `.zyn` grammar file consists of:
-
-1. **Directives** - Metadata and configuration
-2. **Rule Definitions** - PEG patterns with action blocks
+A `.zyn` grammar file consists of directives followed by rule definitions:
 
 ```zyn
-// Directives (optional)
+// Directives
 @language { ... }
-@imports { ... }
-@context { ... }
+@types { ... }       // optional
+@builtin { ... }     // optional
 
 // Rule definitions
-rule_name = { pattern }
-  -> ReturnType {
-      // JSON action block
-  }
+rule_name = modifier? { pattern }
+  -> action
 ```
 
 ## Directives
 
 ### @language
 
-Defines metadata about the language being parsed.
+Defines metadata about the language.
 
 ```zyn
 @language {
-    name: "MyLang",
+    name: "ZynML",
     version: "1.0",
-    file_extensions: [".mylang", ".ml"],
+    file_extensions: [".ml", ".zynml"],
     entry_point: "main",
 }
 ```
@@ -68,29 +67,42 @@ Defines metadata about the language being parsed.
 |-------|------|----------|-------------|
 | `name` | string | Yes | Language name |
 | `version` | string | Yes | Language version |
-| `file_extensions` | string[] | Yes | File extensions to associate |
-| `entry_point` | string | No | Function name to call with `--run` flag |
+| `file_extensions` | string[] | No | File extensions to associate |
+| `entry_point` | string | No | Function to call with `--run` flag |
 
-The `entry_point` field tells the CLI which function to execute when using the `--run` flag. The grammar is responsible for creating this function in the TypedAST.
+### @types
 
-### @imports (Legacy)
-
-Used for Rust code generation mode. Ignored in JSON runtime mode.
+Declares opaque extern types and their function return mappings.
 
 ```zyn
-@imports {
-    use zyntax_typed_ast::*;
+@types {
+    opaque: [$Tensor, $Audio, $Model],
+    returns: {
+        tensor_zeros: $Tensor,
+        audio_load: $Audio,
+    }
 }
 ```
 
-### @context (Legacy)
+- **`opaque`**: Types that are opaque at the language level (backed by ZRTL plugins)
+- **`returns`**: Maps builtin alias names to their return type, overriding ZRTL signature inference
 
-Defines context variables for Rust code generation. Ignored in JSON runtime mode.
+### @builtin
+
+Maps grammar-level function/method/operator names to ZRTL symbol names. `Grammar2::parse_with_signatures()` uses this to inject extern declarations.
 
 ```zyn
-@context {
-    arena: &mut AstArena,
-    type_registry: &mut TypeRegistry,
+@builtin {
+    // Function aliases: grammar_name -> symbol_name
+    tensor_zeros: "$Tensor$zeros",
+    tensor_arange: "$Tensor$arange",
+
+    // Method aliases (prefixed with @)
+    @sum: "tensor_sum_f32",
+    @mean: "tensor_mean_f32",
+
+    // Operator aliases (prefixed with $@)
+    $@add: "tensor_add_f32",
 }
 ```
 
@@ -99,40 +111,44 @@ Defines context variables for Rust code generation. Ignored in JSON runtime mode
 ### Basic Syntax
 
 ```zyn
-rule_name = modifier? { pattern } action_block?
+rule_name = modifier? { pattern }
+  -> action
 ```
 
 ### Rule Modifiers
 
 | Modifier | Name | Description |
 |----------|------|-------------|
-| `@` | Atomic | No whitespace skipping inside |
-| `_` | Silent | Rule doesn't appear in parse tree |
-| `$` | Compound | Atomic but keeps inner structure |
-| `!` | Non-atomic | Force whitespace skipping |
+| `@` | Atomic | No implicit whitespace skipping inside the rule |
+| `_` | Silent | Rule is consumed but produces no value |
+| `$` | Compound | Atomic but preserves inner token structure |
+| `!` | Non-atomic | Forces whitespace skipping even inside atomic context |
 
 ### PEG Pattern Syntax
 
-ZynPEG uses pest-compatible PEG syntax:
+ZynPEG uses standard PEG operators extended with named bindings:
 
 ```zyn
-// Sequence
+// Sequence (whitespace is skipped between elements by default)
 a ~ b ~ c
 
-// Choice
+// Named binding: binds result of rule to a local variable
+name:rule_ref
+
+// Choice (ordered, first match wins)
 a | b | c
 
 // Repetition
-a*      // Zero or more
-a+      // One or more
-a?      // Optional
-a{n}    // Exactly n times
-a{n,}   // At least n times
-a{n,m}  // Between n and m times
+a*        // Zero or more → Vec<T>
+a+        // One or more  → Vec<T>
+a?        // Optional     → Option<T>
+a{n}      // Exactly n
+a{n,}     // At least n
+a{n,m}    // Between n and m
 
-// Predicates
-&a      // Positive lookahead
-!a      // Negative lookahead
+// Predicates (consume no input)
+&a        // Positive lookahead
+!a        // Negative lookahead
 
 // Grouping
 (a ~ b) | c
@@ -141,420 +157,321 @@ a{n,m}  // Between n and m times
 "keyword"
 'a'..'z'
 
-// Built-in rules
-SOI             // Start of input
-EOI             // End of input
-ANY             // Any character
-ASCII_DIGIT     // 0-9
-ASCII_ALPHA     // a-z, A-Z
+// Built-in terminals
+SOI              // Start of input
+EOI              // End of input
+ANY              // Any single character
+ASCII_DIGIT      // 0-9
+ASCII_ALPHA      // a-z, A-Z
 ASCII_ALPHANUMERIC
 ASCII_HEX_DIGIT
 NEWLINE
-WHITESPACE      // Auto-skipped between tokens
-COMMENT         // Auto-skipped between tokens
+WHITESPACE       // Auto-skipped between sequence elements
+COMMENT          // Auto-skipped between sequence elements
 ```
 
-## Action Blocks (JSON Format)
+### Named Bindings
 
-Action blocks define how to construct TypedAST nodes from parsed content.
-
-### Basic Structure
-
-Single command:
+Bindings capture rule results into local variables for use in actions:
 
 ```zyn
-rule_name = { pattern }
-  -> ReturnType {
-      "define": "int_literal",
-      "args": { "value": "$result" }
+fn_def = { "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ body:block }
+//                   ^^^^^                   ^^^^^^                   ^^^^
+//               bound to 'name'        bound to 'params'      bound to 'body'
+```
+
+Binding types follow from the pattern:
+- `name:rule` → `T` (the rule's return type)
+- `items:rule*` → `Vec<T>`
+- `opt:rule?` → `Option<T>`
+
+## Actions
+
+Actions follow the `->` arrow and describe how to construct TypedAST nodes from the parsed bindings. There are five action kinds.
+
+### Construct — Direct AST Node Construction
+
+The primary action type. Syntax mirrors Rust struct/enum construction:
+
+```zyn
+rule_name = { "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ body:block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params.unwrap_or([]),
+      return_type: ret,
+      body: Some(body),
+      is_async: false,
   }
 ```
 
-Multiple sequential commands using the `commands` wrapper:
+The type path (`TypedDeclaration::Function`) identifies the enum variant or struct to construct. Field values are **ExprIR** expressions (see [Action Expressions](#action-expressions) below).
+
+### PassThrough — Forward a Binding
+
+For wrapper rules that just select between alternatives, `-> binding` returns the binding directly:
 
 ```zyn
-rule_name = { pattern }
-  -> ReturnType {
-      "commands": [
-          { "define": "return_stmt", "args": { "value": "$1" }, "store": "ret" },
-          { "define": "function", "args": { "name": "main", "params": [], "body": "$ret" } },
-          { "define": "program", "args": { "declarations": ["$result"] } }
-      ]
+// Choice rule: returns whichever alternative matched
+statement = { let_stmt | assign_stmt | expr_stmt | return_stmt }
+  -> stmt   // if the binding is named 'stmt'
+
+// Or with implicit binding from a single-rule pattern:
+factor = { inner:paren_expr | inner:number }
+  -> inner
+```
+
+When a rule has no action, the last successfully bound value is returned.
+
+### HelperCall — Built-in Helper Functions
+
+Calls a built-in helper that operates on bindings:
+
+```zyn
+// prepend_list: combines first element with rest Vec into Vec
+fn_params = { first:fn_param ~ rest:fn_param_comma* }
+  -> prepend_list(first, rest)
+
+// fold_left_ops: builds left-associative binary expression tree
+additive_expr = { first:multiplicative_expr ~ rest:additive_rest* }
+  -> fold_left_ops(first, rest)
+
+// intern: interns a string into the arena
+type_param = { name:identifier ~ (":" ~ type_bounds)? }
+  -> intern(name)
+```
+
+Available helpers:
+
+| Helper | Signature | Description |
+|--------|-----------|-------------|
+| `intern(s)` | `(text) → InternedString` | Intern a string into the arena |
+| `prepend_list(first, rest)` | `(T, Vec<T>) → Vec<T>` | Prepend first element to rest |
+| `fold_left_ops(first, rest)` | `(Expr, Vec<(op, Expr)>) → Expr` | Build left-associative binary tree |
+| `make_pair(op, operand)` | `(op, Expr) → (op, Expr)` | Package an operator and operand for `fold_left_ops` |
+
+### Match — Branch on a Binding Value
+
+Dispatches to different construct actions based on a string binding value:
+
+```zyn
+stmt = { kind:("let" | "const") ~ name:identifier ~ "=" ~ value:expr }
+  -> match kind {
+      "let"   => TypedStatement::Let   { name: intern(name), value: value },
+      "const" => TypedStatement::Const { name: intern(name), value: value },
   }
 ```
 
-### Command Reference
+### Conditional — If/Else on an Expression
 
-#### `define` - Create AST Node
-
-Defines an AST node by invoking a host function with named arguments. Optionally stores the result.
-
-```json
-{
-    "define": "node_type",
-    "args": {
-        "param_name": "$1",
-        "other_param": "literal_value"
-    },
-    "store": "variable_name"
-}
-```
-
-Using named arguments makes grammars self-documenting. The `store` field saves the result to a named variable (accessible as `$variable_name`).
-
-**Available node types:**
-
-**Literals:**
-
-| Node Type | Arguments | Description |
-|-----------|-----------|-------------|
-| `int_literal` | value: i64 | Create integer literal |
-| `float_literal` | value: f64 | Create float literal |
-| `string_literal` | value: string | Create string literal |
-| `bool_literal` | value: bool | Create boolean literal |
-| `char_literal` | value: string | Create character literal (first char of string) |
-
-**Expressions:**
-
-| Node Type | Arguments | Description |
-|-----------|-----------|-------------|
-| `identifier` | name: string | Create identifier expression |
-| `variable` / `var_ref` | name: string | Create variable reference |
-| `binary_op` | op, left, right | Create binary operation |
-| `unary_op` | op / operator, operand | Create unary operation |
-| `call_expr` / `call` | callee, args[] | Create function call expression |
-| `method_call` | receiver, method, args[] | Create method call expression |
-| `index` / `index_expr` | object / array, index | Create array/index access |
-| `field_access` | object, field | Create field access |
-| `array` / `array_literal` | elements[] | Create array literal |
-| `struct_literal` | name, fields[] | Create struct literal |
-| `cast` | expr, target_type / type | Create cast expression |
-| `lambda` | params[], body | Create lambda expression |
-
-**Statements:**
-
-| Node Type | Arguments | Description |
-|-----------|-----------|-------------|
-| `let_stmt` / `var_decl` | name, type?, init / value?, is_const / const? | Create variable declaration |
-| `assignment` / `assign` | target, value | Create assignment |
-| `return_stmt` | value? | Create return statement |
-| `if_stmt` / `if` | condition, then / then_block, else / else_block? | Create if statement |
-| `while_stmt` / `while` | condition, body | Create while loop |
-| `for_stmt` / `for` | variable / iterator, iterable, body | Create for loop |
-| `break_stmt` / `break` | value? | Create break statement |
-| `continue_stmt` / `continue` | - | Create continue statement |
-| `expression_stmt` | expr | Create expression statement |
-| `block` | statements[] | Create block |
-
-**Declarations:**
-
-| Node Type | Arguments | Description |
-|-----------|-----------|-------------|
-| `function` | name, params[], body | Create function declaration |
-| `param` | name, type | Create parameter |
-| `program` | declarations[] | Create program with declarations |
-
-**Types:**
-
-| Node Type | Arguments | Description |
-|-----------|-----------|-------------|
-| `primitive_type` | name | Create primitive type (i32, i64, bool, etc.) |
-| `pointer_type` | pointee | Create pointer type |
-| `array_type` | element, size? | Create array type |
-| `named_type` | name | Create named/user type |
-| `function_type` | params[], return_type | Create function type |
-
-#### `get_child` - Access Child Node
-
-Gets a child node by index (0-based) or name.
-
-```json
-{
-    "get_child": { "index": 0 }
-}
-// or
-{
-    "get_child": { "name": "expr" }
-}
-```
-
-#### `get_text` - Get Matched Text
-
-Gets the text content of the current match.
-
-```json
-{
-    "get_text": true
-}
-```
-
-#### `parse_int` / `parse_float`
-
-Parses the current text as a number.
-
-```json
-{
-    "parse_int": true
-}
-```
-
-#### `fold_binary` - Left-Associative Binary Operations
-
-Folds a sequence of binary operations left-to-right. The operator rules must return their text (using `"get_text": true`).
-
-```json
-{
-    "fold_binary": {
-        "operand": "term",
-        "operator": "add_op|sub_op"
-    }
-}
-```
-
-The `operator` field specifies which rules are operators (pipe-separated). The runtime extracts the operator text (e.g., "+", "-") and creates `binary_op` nodes automatically.
-
-Example with a typical expression grammar:
+Branches on a boolean expression:
 
 ```zyn
-expr = { term ~ ((add_op | sub_op) ~ term)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "term", "operator": "add_op|sub_op" }
+fn_decl = { "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ret:(":" ~ type_expr)? ~ body:block }
+  -> if ret.is_some() {
+      TypedDeclaration::Function { name: intern(name), params: params.unwrap_or([]), return_type: ret, body: Some(body) }
+  } else {
+      TypedDeclaration::Procedure { name: intern(name), params: params.unwrap_or([]), body: body }
   }
-
-add_op = { "+" }
-  -> String { "get_text": true }
-
-sub_op = { "-" }
-  -> String { "get_text": true }
 ```
 
-#### `map_children` - Process All Children
+## Action Expressions
 
-Processes all children matching a rule.
+Action field values are **ExprIR** expressions. The following forms are available:
 
-```json
-{
-    "map_children": {
-        "rule": "statement",
-        "commands": [...]
-    }
-}
-```
-
-#### `match_rule` - Conditional Processing
-
-Branches based on which rule matched.
-
-```json
-{
-    "match_rule": {
-        "number": [...],
-        "identifier": [...],
-        "call_expr": [...]
-    }
-}
-```
-
-#### `store` / `load` - Temporary Variables
-
-Stores and retrieves intermediate values.
-
-```json
-{
-    "store": { "name": "left_operand" }
-}
-// later
-{
-    "load": { "name": "left_operand" }
-}
-```
-
-### Capture References
-
-Use `$N` syntax to reference captured children (1-based indexing):
-
-| Reference | Meaning |
-|-----------|---------|
-| `"$1"` | First captured child |
-| `"$2"` | Second captured child |
-| `"$name"` | Named variable (from `store` field) |
-| `"$text"` | Text content of current match |
-| `"$result"` | Result of previous command in sequence |
-
-The `$result` variable is automatically set after each command in a `commands` array, allowing you to chain operations:
+### Binding Reference
 
 ```zyn
-program = { SOI ~ expr ~ EOI }
-  -> TypedProgram {
-      "commands": [
-          { "define": "return_stmt", "args": { "value": "$1" }, "store": "ret" },
-          // $ret now contains the return statement
-          { "define": "function", "args": { "name": "main", "params": [], "body": "$ret" } },
-          // $result now contains the function
-          { "define": "program", "args": { "declarations": ["$result"] } }
-      ]
-  }
+name        // value of the binding 'name'
+```
+
+### Function Calls
+
+```zyn
+intern(name)                  // intern string → InternedString
+prepend_list(first, rest)     // Vec construction helper
+Some(value)                   // wrap in Option::Some
+Box::new(expr)                // heap-box a value
+```
+
+### Method Calls
+
+```zyn
+params.unwrap_or([])          // Option<T> → T, using [] as default
+opt.is_some()                 // bool
+binding.text                  // get matched text as String
+binding.span                  // get Span for the match
+```
+
+### Struct / Enum Construction
+
+Inline struct or enum variant expressions within a field value:
+
+```zyn
+-> TypedExpression::Binary {
+    left: Box::new(TypedExpression::Variable { name: intern(obj) }),
+    op: op,
+    right: right,
+}
+```
+
+### List Literals
+
+```zyn
+path: [intern(name)]          // single-element Vec
+declarations: []              // empty Vec
+```
+
+### Primitives
+
+```zyn
+"string"
+42
+true / false
+```
+
+### Binary Operations
+
+```zyn
+a == b
+a && b
+a || b
 ```
 
 ## Complete Examples
 
-### Calculator Grammar
-
-This example demonstrates a complete calculator grammar with proper entry point declaration and the `commands` wrapper for sequential AST construction.
+### Simple Import Rule
 
 ```zyn
-@language {
-    name: "Calculator",
-    version: "1.0",
-    file_extensions: [".calc"],
-    entry_point: "main",
-}
-
-// Build a program with a main function that returns the expression
-// Sequential commands: return_stmt -> function -> program
-program = { SOI ~ expr ~ EOI }
-  -> TypedProgram {
-      "commands": [
-          { "define": "return_stmt", "args": { "value": "$1" }, "store": "ret" },
-          { "define": "function", "args": { "name": "main", "params": [], "body": "$ret" } },
-          { "define": "program", "args": { "declarations": ["$result"] } }
-      ]
+import_simple = { "import" ~ name:identifier }
+  -> TypedDeclaration::Import {
+      path: [intern(name)],
   }
-
-expr = { term ~ ((add_op | sub_op) ~ term)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "term", "operator": "add_op|sub_op" }
-  }
-
-term = { factor ~ ((mul_op | div_op) ~ factor)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "factor", "operator": "mul_op|div_op" }
-  }
-
-// factor: pass through the child node directly
-factor = { number | paren_expr }
-  -> TypedExpression {
-      "get_child": { "index": 0 }
-  }
-
-// Silent rule - parentheses don't appear in parse tree
-paren_expr = _{ "(" ~ expr ~ ")" }
-
-number = @{ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_int": true,
-      "define": "int_literal",
-      "args": { "value": "$result" }
-  }
-
-// Operator rules return their text for fold_binary
-add_op = { "+" }
-  -> String { "get_text": true }
-
-sub_op = { "-" }
-  -> String { "get_text": true }
-
-mul_op = { "*" }
-  -> String { "get_text": true }
-
-div_op = { "/" }
-  -> String { "get_text": true }
-
-WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 ```
 
-### Function Declaration
+### Function Definition
 
 ```zyn
-fn_decl = {
-    "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ type_expr ~ block
+fn_def = {
+    "def" ~ name:identifier
+    ~ "(" ~ params:fn_params? ~ ")"
+    ~ ":" ~ ret:type_expr
+    ~ body:block
 }
-  -> TypedDeclaration {
-      "define": "function",
-      "args": {
-          "name": "$1",
-          "params": "$2",
-          "return_type": "$3",
-          "body": "$4"
-      }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params.unwrap_or([]),
+      return_type: ret,
+      body: Some(body),
+      is_async: false,
   }
 
-fn_params = { fn_param ~ ("," ~ fn_param)* }
-  -> Vec<TypedParameter> {
-      "map_children": {
-          "rule": "fn_param",
-          "commands": [{ "get_child": { "index": 0 } }]
-      }
-  }
+// Parameters accumulate via prepend_list
+fn_params = { first:fn_param ~ rest:fn_param_comma* }
+  -> prepend_list(first, rest)
 
-fn_param = { identifier ~ ":" ~ type_expr }
+fn_param_comma = { "," ~ param:fn_param }
+  -> param
+
+fn_param = { name:identifier ~ ":" ~ ty:type_expr }
   -> TypedParameter {
-      "define": "param",
-      "args": { "name": "$1", "type": "$2" }
+      name: intern(name),
+      ty: ty,
   }
 ```
 
-## ZPEG Module Format
-
-The compiled `.zpeg` format is a JSON file:
-
-```json
-{
-    "metadata": {
-        "name": "Calculator",
-        "version": "1.0",
-        "file_extensions": [".calc"],
-        "entry_point": "main",
-        "zpeg_version": "0.1.0"
-    },
-    "pest_grammar": "program = { SOI ~ expr ~ EOI }\n...",
-    "rules": {
-        "program": {
-            "return_type": "TypedProgram",
-            "commands": [
-                { "type": "define", "node": "return_stmt", "args": { "value": "$1" }, "store": "ret" },
-                { "type": "define", "node": "function", "args": { "name": "main", "params": [], "body": "$ret" } },
-                { "type": "define", "node": "program", "args": { "declarations": ["$result"] } }
-            ]
-        },
-        "number": {
-            "return_type": "TypedExpression",
-            "commands": [
-                { "type": "get_text" },
-                { "type": "parse_int" },
-                { "type": "define", "node": "int_literal", "args": { "value": "$result" } }
-            ]
-        }
-    }
-}
-```
-
-## CLI Usage
-
-```bash
-# Compile and run with grammar
-zyntax compile --source my_code.lang --grammar my_lang.zyn --format zyn --run
-
-# Verbose mode shows compilation steps
-zyntax compile -v --source code.zig --grammar zig.zyn --format zyn -o output
-```
-
-## Migration from Legacy Format
-
-### Legacy (Rust Code)
+### Left-Associative Binary Expressions
 
 ```zyn
-number = @{ ASCII_DIGIT+ }
-  -> TypedExpression {
-      expr: IntLiteral($1.parse()),
-      ty: Type::I32,
-      span: $1.span,
+// additive_rest packages (op, operand) pairs for fold_left_ops
+additive_expr = { first:multiplicative_expr ~ rest:additive_rest* }
+  -> fold_left_ops(first, rest)
+
+additive_rest = { op:additive_op ~ operand:multiplicative_expr }
+  -> make_pair(op, operand)
+
+additive_op = @{ "+" | "-" }
+```
+
+### Wrapper / Pass-Through Rule
+
+```zyn
+// Choice rule: delegates to whichever alternative matched
+type_expr = { optional_type | fn_type | generic_type | primitive_type | simple_type }
+
+// Each alternative handles its own action; type_expr has no explicit action
+// (implicitly passes through the result of the matched alternative)
+```
+
+### Struct Literal
+
+```zyn
+struct_field = { name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedField {
+      name: intern(name),
+      ty: ty,
+  }
+
+struct_fields = { first:struct_field ~ rest:struct_field_comma* ~ ","? }
+  -> prepend_list(first, rest)
+```
+
+### Boxed Sub-Expressions
+
+```zyn
+comparison_with_op = { left:range_expr ~ op:comparison_op ~ right:range_expr }
+  -> TypedExpression::Binary {
+      op: op,
+      left: Box::new(left),
+      right: Box::new(right),
   }
 ```
 
-### New (JSON Commands)
+### Program Entry Rule
 
+```zyn
+program = { SOI ~ items:top_level_items ~ EOI }
+  -> TypedProgram {
+      declarations: items,
+  }
+
+top_level_items = { decl:top_level_item* }
+  -> decl   // Vec<TypedDeclaration> collected by the repeat
+
+top_level_item = { fn_def | struct_def | import_stmt | ... }
+  // passthrough — no action needed
+```
+
+## Grammar2 API
+
+`Grammar2` (in `zyntax_embed`) is the primary interface for using a `.zyn` grammar at runtime:
+
+```rust
+use zyntax_embed::Grammar2;
+
+// Load from embedded grammar source
+let grammar = Grammar2::from_source(include_str!("my_lang.zyn"))?;
+
+// Parse source → TypedProgram (direct, no signatures)
+let program = grammar.parse(source_code)?;
+
+// Parse with ZRTL plugin signatures for proper extern type resolution
+let program = grammar.parse_with_signatures(source, filename, &plugin_sigs)?;
+
+// Metadata access
+grammar.name()             // → &str
+grammar.version()          // → &str
+grammar.file_extensions()  // → &[String]
+grammar.entry_point()      // → Option<&str>
+grammar.grammar_ir()       // → &GrammarIR (for inspection)
+```
+
+`parse_with_signatures` additionally injects `extern` function declarations for all entries in the `@builtin` directive, with types resolved from ZRTL plugin signatures or `@types.returns` overrides.
+
+## Legacy JSON Actions (Backwards Compatibility)
+
+The old JSON command-block syntax is still parsed and executed, but is deprecated. New grammars should use TypedAST actions exclusively.
+
+**Old (JSON):**
 ```zyn
 number = @{ ASCII_DIGIT+ }
   -> TypedExpression {
@@ -564,14 +481,45 @@ number = @{ ASCII_DIGIT+ }
       "args": { "value": "$result" }
   }
 ```
+
+**New (TypedAST):**
+```zyn
+number = @{ ASCII_DIGIT+ }
+  -> TypedExpression::IntLiteral {
+      value: number,
+  }
+```
+
+Key differences:
+
+| JSON (v2) | TypedAST (v3) |
+|-----------|---------------|
+| `"$1"`, `"$2"` positional references | Named bindings: `name:rule` |
+| `"define": "node_type"` with args dict | `TypedAST::Variant { field: value }` |
+| `"commands": [...]` sequential blocks | Inline expressions in field values |
+| `"get_text": true` / `"parse_int": true` | Atomic rule (`@`) captures text automatically |
+| `"fold_binary": { ... }` | `fold_left_ops(first, rest)` helper |
+| `"store"` / `"load"` temporaries | Direct binding references |
+
+## Packrat Memoization
+
+The `runtime2` interpreter uses Packrat memoization keyed on `(position, rule_id)`. Each `execute_rule` call:
+
+1. Checks `state.check_memo(rule_id)` — returns cached `Success`/`Failure` immediately on hit
+2. Marks the entry as `InProgress` to detect left-recursive cycles
+3. Executes the rule pattern and action
+4. Stores the result via `state.store_memo_at(start_pos, rule_id, entry)`
+
+This ensures each `(position, rule)` pair is evaluated at most once, converting exponential PEG backtracking to O(n × grammar_size).
 
 ## Best Practices
 
-1. **Use atomic rules for tokens**: Mark lexical rules with `@` to prevent whitespace interference
-2. **Use silent rules for delimiters**: Mark punctuation rules with `_` to keep parse trees clean
-3. **Use fold_binary for operators**: Handles left-associativity correctly
-4. **Name your captures**: Use named rules for clarity in complex patterns
-5. **Test incrementally**: Build and test grammar rules one at a time
+1. **Use atomic rules for tokens** — mark lexical rules with `@` so the matched text is captured automatically and whitespace is not skipped
+2. **Use `_` (silent) for delimiters** — punctuation rules like commas, semicolons, and brackets rarely need to appear in the AST
+3. **Use `prepend_list` for lists** — pair a `first:rule` binding with `rest:rule_comma*` (where `rule_comma = { "," ~ item:rule } -> item`) and combine with `prepend_list(first, rest)`
+4. **Use `fold_left_ops` for binary operators** — pair with `make_pair(op, operand)` in the rest rule for correct left-associativity
+5. **Use `intern()` for all identifier strings** — interns into the global arena for cheap equality and deduplication
+6. **Prefer passthrough for choice rules** — if a rule just selects between alternatives, each alternative can have its own action; the choice rule needs no action
 
 ## Error Handling
 
@@ -579,13 +527,16 @@ Common errors and solutions:
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| "Failed to parse pest grammar" | Invalid PEG syntax | Check pattern syntax |
-| "Unknown host function" | Misspelled function name | Check function reference |
-| "Invalid child reference" | `$N` out of bounds | Verify pattern captures |
-| "Type mismatch" | Wrong argument types | Check host function signature |
+| `Parse error at L:C: expected [...]` | PEG match failure | Check pattern syntax and token spelling |
+| `unknown rule: foo` | Rule referenced but not defined | Define the missing rule |
+| `binding 'name' not found` | Action references a binding not in the pattern | Add `name:rule` to the pattern |
+| `left recursion detected` | Rule calls itself without consuming input | Refactor to use `rest*` style (no direct left recursion) |
+| `UnexpectedResult` | Entry rule did not return `TypedProgram` | Ensure the `program` rule action returns `TypedProgram { ... }` |
 
 ## See Also
 
-- [GRAMMAR_CONVENTIONS.md](../crates/zyn_peg/GRAMMAR_CONVENTIONS.md) - Style guide for .zyn files
-- [ZYN_PARSER_IMPLEMENTATION.md](ZYN_PARSER_IMPLEMENTATION.md) - Implementation details
-- [BYTECODE_FORMAT_SPEC.md](BYTECODE_FORMAT_SPEC.md) - HIR bytecode format
+- [ZYN_PARSER_IMPLEMENTATION.md](ZYN_PARSER_IMPLEMENTATION.md) — Implementation details of the grammar parser and interpreter
+- [BYTECODE_FORMAT_SPEC.md](BYTECODE_FORMAT_SPEC.md) — HIR/SSA bytecode format produced after parsing
+- `crates/zyn_peg/src/grammar/ir.rs` — `GrammarIR`, `RuleIR`, `ActionIR`, `ExprIR`, `PatternIR` definitions
+- `crates/zyn_peg/src/runtime2/interpreter.rs` — `GrammarInterpreter` and Packrat memoization
+- `crates/zynml/ml.zyn` — Full reference grammar for ZynML showing all action patterns in use

@@ -8,7 +8,7 @@ A comprehensive guide to building language frontends with ZynPEG.
 2. [Getting Started](./02-getting-started.md) - Your first Zyn grammar
 3. [Using the CLI](./03-using-the-cli.md) - Compilation, execution, and REPL
 4. [Grammar Syntax](./04-grammar-syntax.md) - PEG-based grammar rules
-5. [Semantic Actions](./05-semantic-actions.md) - JSON command blocks
+5. [Semantic Actions](./05-semantic-actions.md) - TypedAST action expressions
 6. [The TypedAST](./06-typed-ast.md) - Understanding the target representation
 7. [TypedAST Builder](./07-typed-ast-builder.md) - Building AST nodes programmatically
 8. [Complete Example: Zig](./08-zig-example.md) - A real-world grammar walkthrough
@@ -41,28 +41,22 @@ cargo build --release
 
 Zyn is a Parser Expression Grammar (PEG) system that combines:
 
-1. **Pest-compatible grammar syntax** - Familiar PEG rules for parsing
-2. **JSON semantic actions** - Declarative AST construction
+1. **Packrat-memoized PEG parsing** - O(n) parsing with named bindings
+2. **TypedAST semantic actions** - Direct AST construction at parse time
 3. **TypedAST target** - A universal, typed intermediate representation
 
-Instead of writing imperative code to build AST nodes, you declare *what* to build using JSON command blocks attached to grammar rules.
+Instead of writing imperative code to build AST nodes, you write typed construct expressions that mirror Rust struct/enum syntax:
 
 ## Example
 
 ```zyn
-// Grammar rule for integer literals
+// Atomic rule (@) captures matched text automatically via the binding name
 integer_literal = @{ "-"? ~ ASCII_DIGIT+ }
-  -> TypedExpression {
-      "get_text": true,
-      "parse_int": true,
-      "define": "int_literal",
-      "args": { "value": "$result" }
-  }
+  -> TypedExpression::IntLiteral { value: integer_literal }
 ```
 
 This single rule:
 
 - Parses signed integers
-- Extracts the matched text
-- Converts it to an integer
-- Creates a TypedAST literal node
+- Captures the matched text automatically (no `get_text` needed)
+- Constructs a `TypedExpression::IntLiteral` node directly

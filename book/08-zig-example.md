@@ -74,106 +74,66 @@ This metadata tells the compiler:
 ### The Entry Point
 
 ```zyn
-program = { SOI ~ declarations ~ EOI }
-  -> TypedProgram {
-      "get_child": { "index": 0 }
-  }
+program = { SOI ~ decls:declaration* ~ EOI }
+  -> TypedProgram { declarations: decls }
 ```
 
-This matches the entire file (`SOI` to `EOI`) and extracts the declarations.
-
-### Collecting Declarations
-
-```zyn
-declarations = { declaration* }
-  -> TypedProgram {
-      "get_all_children": true,
-      "define": "program",
-      "args": { "declarations": "$result" }
-  }
-```
-
-Key pattern: `get_all_children` collects all `declaration` matches into a list, then `define: "program"` creates the root node.
+This matches the entire file (`SOI` to `EOI`) and collects declarations into a `Vec`.
 
 ### Declaration Dispatch
 
 ```zyn
 declaration = { struct_decl | enum_decl | fn_decl | const_decl | var_decl }
-  -> TypedDeclaration {
-      "get_child": { "index": 0 }
-  }
 ```
 
-Order matters! More specific rules should come first if there's ambiguity.
+Passthrough — each alternative handles its own action. Order matters! More specific rules should come first if there's ambiguity.
 
 ## Struct Declarations
 
 ```zyn
-struct_decl = { "const" ~ identifier ~ "=" ~ "struct" ~ "{" ~ struct_fields? ~ "}" ~ ";" }
-  -> TypedDeclaration {
-      "commands": [
-          { "define": "struct", "args": {
-              "name": "$1",
-              "fields": "$2"
-          }}
-      ]
+struct_decl = { "const" ~ name:identifier ~ "=" ~ "struct" ~ "{" ~ fields:struct_fields? ~ "}" ~ ";" }
+  -> TypedDeclaration::Struct {
+      name: intern(name),
+      fields: fields.unwrap_or([]),
   }
 ```
 
-Example input:
-```zig
-const Point = struct {
-    x: i32,
-    y: i32,
-};
-```
-
-Child mapping:
-- `$1` = `identifier` → "Point"
-- `$2` = `struct_fields?` → list of fields (or null)
+Named bindings make the mapping explicit:
+- `name:identifier` → the struct name
+- `fields:struct_fields?` → `Option<Vec<TypedField>>`; `.unwrap_or([])` gives an empty list when absent
 
 ### Struct Fields
 
 ```zyn
-struct_fields = { struct_field ~ ("," ~ struct_field)* ~ ","? }
-  -> List {
-      "get_all_children": true
-  }
+struct_fields = { first:struct_field ~ rest:struct_field_comma* ~ ","? }
+  -> prepend_list(first, rest)
 
-struct_field = { identifier ~ ":" ~ type_expr }
-  -> TypedField {
-      "commands": [
-          { "define": "field", "args": { "name": "$1", "type": "$2" } }
-      ]
-  }
+struct_field_comma = { "," ~ f:struct_field }
+  -> f
+
+struct_field = { name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedField { name: intern(name), ty: ty }
 ```
 
-Pattern: Optional trailing comma (`","?`) is common in modern languages.
+Pattern: `prepend_list(first, rest)` accumulates a comma-separated list. Optional trailing comma (`","?`) is common in modern languages.
 
 ## Enum Declarations
 
 ```zyn
-enum_decl = { "const" ~ identifier ~ "=" ~ "enum" ~ "{" ~ enum_variants? ~ "}" ~ ";" }
-  -> TypedDeclaration {
-      "commands": [
-          { "define": "enum", "args": {
-              "name": "$1",
-              "variants": "$2"
-          }}
-      ]
+enum_decl = { "const" ~ name:identifier ~ "=" ~ "enum" ~ "{" ~ variants:enum_variants? ~ "}" ~ ";" }
+  -> TypedDeclaration::Enum {
+      name: intern(name),
+      variants: variants.unwrap_or([]),
   }
 
-enum_variants = { enum_variant ~ ("," ~ enum_variant)* ~ ","? }
-  -> List {
-      "get_all_children": true
-  }
+enum_variants = { first:enum_variant ~ rest:enum_variant_comma* ~ ","? }
+  -> prepend_list(first, rest)
 
-enum_variant = { identifier }
-  -> TypedVariant {
-      "get_text": true,
-      "define": "variant",
-      "args": { "name": "$result" }
-  }
+enum_variant_comma = { "," ~ v:enum_variant }
+  -> v
+
+enum_variant = { name:identifier }
+  -> TypedVariant { name: intern(name) }
 ```
 
 Example:
@@ -189,72 +149,34 @@ The runtime assigns discriminant values (0, 1, 2) automatically.
 
 ## Function Declarations
 
-### The Split Pattern
+### No Split Needed
+
+With named bindings, a single rule handles both with and without parameters:
 
 ```zyn
-fn_decl = { fn_decl_with_params | fn_decl_no_params }
-  -> TypedDeclaration {
-      "get_child": { "index": 0 }
+fn_decl = { "fn" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ret:type_expr ~ body:block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params.unwrap_or([]),
+      return_type: ret,
+      body: Some(body),
+      is_async: false,
   }
 ```
 
-**Why split?** PEG doesn't produce placeholder children for missing optionals. With a single rule like:
-
-```zyn
-// PROBLEMATIC
-fn_decl = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ type_expr ~ block }
-```
-
-If params are missing, `$3` would be `type_expr`, not `block`. By splitting, each variant has predictable child indices.
-
-### With Parameters
-
-```zyn
-fn_decl_with_params = { "fn" ~ identifier ~ "(" ~ fn_params ~ ")" ~ type_expr ~ block }
-  -> TypedDeclaration {
-      "commands": [
-          { "define": "function", "args": {
-              "name": "$1",
-              "params": "$2",
-              "return_type": "$3",
-              "body": "$4"
-          }}
-      ]
-  }
-```
-
-### Without Parameters
-
-```zyn
-fn_decl_no_params = { "fn" ~ identifier ~ "(" ~ ")" ~ type_expr ~ block }
-  -> TypedDeclaration {
-      "commands": [
-          { "define": "function", "args": {
-              "name": "$1",
-              "params": [],
-              "return_type": "$2",
-              "body": "$3"
-          }}
-      ]
-  }
-```
-
-Note: `"params": []` provides an empty list literal.
+**Why no split?** The old JSON `$N` positional references shifted when optional children were absent — `$3` could be `type_expr` or `block` depending on whether params existed. Named bindings (`params:fn_params?`) give you an `Option<Vec<TypedParameter>>` regardless of position. `.unwrap_or([])` provides the empty list default inline.
 
 ### Parameters
 
 ```zyn
-fn_params = { fn_param ~ ("," ~ fn_param)* }
-  -> List {
-      "get_child": { "index": 0 }
-  }
+fn_params = { first:fn_param ~ rest:fn_param_comma* }
+  -> prepend_list(first, rest)
 
-fn_param = { identifier ~ ":" ~ type_expr }
-  -> TypedParameter {
-      "commands": [
-          { "define": "param", "args": { "name": "$1", "type": "$2" } }
-      ]
-  }
+fn_param_comma = { "," ~ p:fn_param }
+  -> p
+
+fn_param = { name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedParameter { name: intern(name), ty: ty }
 ```
 
 ## Statements
@@ -264,38 +186,27 @@ fn_param = { identifier ~ ":" ~ type_expr }
 ```zyn
 statement = { if_stmt | while_stmt | for_stmt | return_stmt | break_stmt |
               continue_stmt | local_const | local_var | assign_stmt | expr_stmt }
-  -> TypedStatement {
-      "get_child": { "index": 0 }
-  }
 ```
 
-Order consideration: `if_stmt` before `expr_stmt` because an identifier `if_something` could otherwise match.
+Passthrough — each alternative handles its own action. Order consideration: `if_stmt` before `expr_stmt` because an identifier `if_something` could otherwise match.
 
-### If Statement (Split Pattern Again)
+### If Statement
 
 ```zyn
 if_stmt = { if_else | if_only }
-  -> TypedStatement { "get_child": { "index": 0 } }
 
-if_only = { "if" ~ "(" ~ expr ~ ")" ~ block }
-  -> TypedStatement {
-      "commands": [
-          { "define": "if", "args": {
-              "condition": "$1",
-              "then_branch": "$2"
-          }}
-      ]
+if_only = { "if" ~ "(" ~ cond:expr ~ ")" ~ body:block }
+  -> TypedStatement::If {
+      condition: cond,
+      then_branch: body,
+      else_branch: None,
   }
 
-if_else = { "if" ~ "(" ~ expr ~ ")" ~ block ~ "else" ~ block }
-  -> TypedStatement {
-      "commands": [
-          { "define": "if", "args": {
-              "condition": "$1",
-              "then_branch": "$2",
-              "else_branch": "$3"
-          }}
-      ]
+if_else = { "if" ~ "(" ~ cond:expr ~ ")" ~ then_b:block ~ "else" ~ else_b:block }
+  -> TypedStatement::If {
+      condition: cond,
+      then_branch: then_b,
+      else_branch: Some(else_b),
   }
 ```
 
@@ -304,30 +215,15 @@ if_else = { "if" ~ "(" ~ expr ~ ")" ~ block ~ "else" ~ block }
 ### While Loop
 
 ```zyn
-while_stmt = { "while" ~ "(" ~ expr ~ ")" ~ block }
-  -> TypedStatement {
-      "commands": [
-          { "define": "while", "args": {
-              "condition": "$1",
-              "body": "$2"
-          }}
-      ]
-  }
+while_stmt = { "while" ~ "(" ~ cond:expr ~ ")" ~ body:block }
+  -> TypedStatement::While { condition: cond, body: body }
 ```
 
 ### For Loop (Zig Style)
 
 ```zyn
-for_stmt = { "for" ~ "(" ~ expr ~ ")" ~ "|" ~ identifier ~ "|" ~ block }
-  -> TypedStatement {
-      "commands": [
-          { "define": "for", "args": {
-              "iterable": "$1",
-              "binding": "$2",
-              "body": "$3"
-          }}
-      ]
-  }
+for_stmt = { "for" ~ "(" ~ iter:expr ~ ")" ~ "|" ~ binding:identifier ~ "|" ~ body:block }
+  -> TypedStatement::For { iterable: iter, binding: intern(binding), body: body }
 ```
 
 Zig's for loop: `for (slice) |item| { ... }`
@@ -335,25 +231,17 @@ Zig's for loop: `for (slice) |item| { ... }`
 ### Return Statement
 
 ```zyn
-return_stmt = { "return" ~ expr? ~ ";" }
-  -> TypedStatement {
-      "commands": [
-          { "define": "return_stmt", "args": { "value": "$1" } }
-      ]
-  }
+return_stmt = { "return" ~ val:expr? ~ ";" }
+  -> TypedStatement::Return { value: val }
 ```
 
-`$1` will be null if `expr?` doesn't match.
+`val` is `Option<TypedExpression>` — `None` when `expr?` doesn't match.
 
 ### Block
 
 ```zyn
-block = { "{" ~ statement* ~ "}" }
-  -> TypedBlock {
-      "get_all_children": true,
-      "define": "block",
-      "args": { "statements": "$result" }
-  }
+block = { "{" ~ stmts:statement* ~ "}" }
+  -> TypedBlock { stmts: stmts }
 ```
 
 ## Switch Expressions
@@ -363,26 +251,22 @@ Zig supports switch expressions for pattern matching against values. The grammar
 ### Basic Structure
 
 ```zyn
-switch_expr = { "switch" ~ "(" ~ expr ~ ")" ~ "{" ~ switch_cases? ~ "}" }
-  -> TypedExpression {
-      "commands": [
-          { "define": "switch_expr", "args": {
-              "scrutinee": "$1",
-              "cases": "$2"
-          }}
-      ]
+switch_expr = { "switch" ~ "(" ~ scrutinee:expr ~ ")" ~ "{" ~ cases:switch_cases? ~ "}" }
+  -> TypedExpression::Switch {
+      scrutinee: Box::new(scrutinee),
+      cases: cases.unwrap_or([]),
   }
 
-switch_cases = { switch_case ~ ("," ~ switch_case)* ~ ","? }
-  -> List {
-      "get_all_children": true
-  }
+switch_cases = { first:switch_case ~ rest:switch_case_comma* ~ ","? }
+  -> prepend_list(first, rest)
+
+switch_case_comma = { "," ~ c:switch_case }
+  -> c
 ```
 
-The `switch_expr` command creates a switch expression node with:
-
+`TypedExpression::Switch` takes:
 - `scrutinee`: The expression being matched against
-- `cases`: List of case arms
+- `cases`: Vec of case arms
 
 ### Switch Cases
 
@@ -390,29 +274,21 @@ Each case has a pattern and a body:
 
 ```zyn
 // Value case: pattern => expr
-switch_case_value = { switch_pattern ~ "=>" ~ expr }
-  -> TypedExpression {
-      "commands": [
-          { "define": "switch_case", "args": {
-              "pattern": { "get_child": { "index": 0 } },
-              "body": { "get_child": { "index": 1 } }
-          }}
-      ]
+switch_case_value = { pat:switch_pattern ~ "=>" ~ body:expr }
+  -> TypedExpression::SwitchCase {
+      pattern: pat,
+      body: Box::new(body),
   }
 
 // Else case: else => expr
-switch_case_else = { "else" ~ "=>" ~ expr }
-  -> TypedExpression {
-      "commands": [
-          { "define": "switch_case", "args": {
-              "pattern": { "define": "wildcard_pattern" },
-              "body": "$1"
-          }}
-      ]
+switch_case_else = { "else" ~ "=>" ~ body:expr }
+  -> TypedExpression::SwitchCase {
+      pattern: TypedPattern::Wildcard,
+      body: Box::new(body),
   }
 ```
 
-Note the `else` case uses an inline `{ "define": "wildcard_pattern" }` to create the pattern directly in the args.
+The `else` case inlines `TypedPattern::Wildcard` directly as a field value.
 
 ### Pattern Types
 
@@ -421,12 +297,8 @@ Note the `else` case uses an inline `{ "define": "wildcard_pattern" }` to create
 Match exact values:
 
 ```zyn
-switch_literal_pattern = { integer_literal | string_literal }
-  -> TypedExpression {
-      "commands": [
-          { "define": "literal_pattern", "args": { "value": "$1" } }
-      ]
-  }
+switch_literal_pattern = { val:(integer_literal | string_literal) }
+  -> TypedPattern::Literal { value: val }
 ```
 
 Example:
@@ -444,11 +316,7 @@ Match anything (used for `_` or `else`):
 
 ```zyn
 switch_wildcard_pattern = { "_" }
-  -> TypedExpression {
-      "commands": [
-          { "define": "wildcard_pattern" }
-      ]
-  }
+  -> TypedPattern::Wildcard
 ```
 
 #### Range Patterns
@@ -456,16 +324,8 @@ switch_wildcard_pattern = { "_" }
 Match values within a range:
 
 ```zyn
-switch_range_pattern = { integer_literal ~ ".." ~ integer_literal }
-  -> TypedExpression {
-      "commands": [
-          { "define": "range_pattern", "args": {
-              "start": { "define": "literal_pattern", "args": { "value": "$1" } },
-              "end": { "define": "literal_pattern", "args": { "value": "$2" } },
-              "inclusive": false
-          }}
-      ]
-  }
+switch_range_pattern = { start:integer_literal ~ ".." ~ end:integer_literal }
+  -> TypedPattern::Range { start: start, end: end, inclusive: false }
 ```
 
 Example:
@@ -483,16 +343,8 @@ const result = switch (x) {
 Match enum or tagged union variants (Zig uses `.variant` syntax):
 
 ```zyn
-switch_tagged_union_pattern = { "." ~ identifier }
-  -> TypedExpression {
-      "commands": [
-          { "define": "enum_pattern", "args": {
-              "name": "",
-              "variant": { "text": "$1" },
-              "fields": []
-          }}
-      ]
-  }
+switch_tagged_union_pattern = { "." ~ name:identifier }
+  -> TypedPattern::EnumVariant { name: intern(name) }
 ```
 
 Example:
@@ -511,25 +363,11 @@ const result = switch (optional_value) {
 Match struct values by field:
 
 ```zyn
-switch_struct_pattern = { identifier ~ "{" ~ struct_field_patterns? ~ "}" }
-  -> TypedExpression {
-      "commands": [
-          { "define": "struct_pattern", "args": {
-              "name": { "text": "$1" },
-              "fields": "$2"
-          }}
-      ]
-  }
+switch_struct_pattern = { type_name:identifier ~ "{" ~ fields:struct_field_patterns? ~ "}" }
+  -> TypedPattern::Struct { name: intern(type_name), fields: fields.unwrap_or([]) }
 
-switch_struct_field_pattern = { "." ~ identifier ~ ("=" ~ switch_pattern)? }
-  -> TypedExpression {
-      "commands": [
-          { "define": "field_pattern", "args": {
-              "name": { "text": "$1" },
-              "pattern": "$2"
-          }}
-      ]
-  }
+switch_struct_field_pattern = { "." ~ name:identifier ~ pat:("=" ~ switch_pattern)? }
+  -> TypedPattern::FieldPattern { name: intern(name), pattern: pat }
 ```
 
 Example:
@@ -547,14 +385,8 @@ const result = switch (point) {
 Match error values from error unions:
 
 ```zyn
-switch_error_pattern = { "error" ~ "." ~ identifier }
-  -> TypedExpression {
-      "commands": [
-          { "define": "error_pattern", "args": {
-              "name": { "text": "$1" }
-          }}
-      ]
-  }
+switch_error_pattern = { "error" ~ "." ~ name:identifier }
+  -> TypedPattern::Error { name: intern(name) }
 ```
 
 Example:
@@ -572,15 +404,8 @@ const result = switch (error_union) {
 Match through pointer dereference:
 
 ```zyn
-switch_pointer_pattern = { "*" ~ switch_pattern }
-  -> TypedExpression {
-      "commands": [
-          { "define": "pointer_pattern", "args": {
-              "inner": "$1",
-              "mutable": false
-          }}
-      ]
-  }
+switch_pointer_pattern = { "*" ~ inner:switch_pattern }
+  -> TypedPattern::Pointer { inner: Box::new(inner), mutable: false }
 ```
 
 ### Testing Switch Expressions
@@ -623,93 +448,95 @@ fn main() i32 {
 
 ### The Precedence Chain
 
-Operators are handled by a chain from lowest to highest precedence:
+Operators are handled by a chain from lowest to highest precedence. Each level uses `fold_left_ops` with a companion `rest` rule that packages `(op, operand)` pairs using `make_pair`:
 
 ```zyn
-expr = { logical_or }
-  -> TypedExpression { "get_child": { "index": 0 } }
+expr = { e:logical_or }
+  -> e
 
 // Lowest: OR
-logical_or = { logical_and ~ (or_op ~ logical_and)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "logical_and", "operator": "or_op" }
-  }
+logical_or = { first:logical_and ~ rest:logical_or_rest* }
+  -> fold_left_ops(first, rest)
+
+logical_or_rest = { op:or_op ~ operand:logical_and }
+  -> make_pair(op, operand)
 
 // AND
-logical_and = { comparison ~ (and_op ~ comparison)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "comparison", "operator": "and_op" }
-  }
+logical_and = { first:comparison ~ rest:logical_and_rest* }
+  -> fold_left_ops(first, rest)
+
+logical_and_rest = { op:and_op ~ operand:comparison }
+  -> make_pair(op, operand)
 
 // Comparison
-comparison = { addition ~ ((eq_op | neq_op | lte_op | gte_op | lt_op | gt_op) ~ addition)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "addition", "operator": "eq_op|neq_op|lte_op|gte_op|lt_op|gt_op" }
-  }
+comparison = { first:addition ~ rest:comparison_rest* }
+  -> fold_left_ops(first, rest)
+
+comparison_rest = { op:comparison_op ~ operand:addition }
+  -> make_pair(op, operand)
+
+comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">" }
 
 // Addition/Subtraction
-addition = { multiplication ~ ((add_op | sub_op) ~ multiplication)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "multiplication", "operator": "add_op|sub_op" }
-  }
+addition = { first:multiplication ~ rest:addition_rest* }
+  -> fold_left_ops(first, rest)
+
+addition_rest = { op:add_sub_op ~ operand:multiplication }
+  -> make_pair(op, operand)
+
+add_sub_op = @{ "+" | "-" }
 
 // Multiplication/Division
-multiplication = { unary ~ ((mul_op | div_op) ~ unary)* }
-  -> TypedExpression {
-      "fold_binary": { "operand": "unary", "operator": "mul_op|div_op" }
-  }
+multiplication = { first:unary ~ rest:multiplication_rest* }
+  -> fold_left_ops(first, rest)
+
+multiplication_rest = { op:mul_div_op ~ operand:unary }
+  -> make_pair(op, operand)
+
+mul_div_op = @{ "*" | "/" }
 
 // Unary (highest before atoms)
 unary = { unary_with_op | primary }
-  -> TypedExpression { "get_child": { "index": 0 } }
 
-unary_with_op = { unary_op ~ primary }
-  -> TypedExpression {
-      "commands": [
-          { "define": "unary", "args": { "op": "$1", "operand": "$2" } }
-      ]
-  }
+unary_with_op = { op:unary_op ~ operand:primary }
+  -> TypedExpression::Unary { op: op, operand: Box::new(operand) }
+
+unary_op = @{ "-" | "!" }
 ```
 
-### The `fold_binary` Pattern
+### The `fold_left_ops` Pattern
 
 For `1 + 2 + 3`:
 
-1. Parse: `[term(1), +, term(2), +, term(3)]`
-2. Start: `result = 1`
-3. Fold: `result = binary(+, 1, 2)` → `(1+2)`
-4. Fold: `result = binary(+, (1+2), 3)` → `((1+2)+3)`
+1. Parse: `first = 1`, `rest = [("+", 2), ("+", 3)]`
+2. Fold: `Binary(+, 1, 2)` → `Binary(+, Binary(+, 1, 2), 3)`
 
-This creates left-associative trees automatically.
+This creates left-associative trees automatically. The atomic operator rules (`add_sub_op = @{ "+" | "-" }`) capture operator text without whitespace interference.
 
 ### Postfix Expressions
 
 ```zyn
 postfix_expr = { call_expr | field_expr | index_expr | atom }
-  -> TypedExpression { "get_child": { "index": 0 } }
 
 // Function call
-call_expr = { atom ~ "(" ~ call_args? ~ ")" }
-  -> TypedExpression {
-      "commands": [
-          { "define": "call", "args": { "callee": "$1", "args": "$2" } }
-      ]
+call_expr = { callee:atom ~ "(" ~ args:call_args? ~ ")" }
+  -> TypedExpression::Call {
+      callee: Box::new(callee),
+      args: args.unwrap_or([]),
   }
 
 // Field access
-field_expr = { atom ~ "." ~ identifier }
-  -> TypedExpression {
-      "commands": [
-          { "define": "field_access", "args": { "object": "$1", "field": "$2" } }
-      ]
+field_expr = { obj:atom ~ "." ~ name:identifier }
+  -> TypedExpression::FieldAccess {
+      object: Box::new(obj),
+      field: intern(name),
   }
 
 // Index access
-index_expr = { atom ~ "[" ~ expr ~ "]" }
-  -> TypedExpression {
-      "commands": [
-          { "define": "index", "args": { "object": "$1", "index": "$2" } }
-      ]
+index_expr = { obj:atom ~ "[" ~ idx:expr ~ "]" }
+  -> TypedExpression::Index {
+      object: Box::new(obj),
+      index: Box::new(idx),
   }
 ```
 
@@ -718,30 +545,27 @@ index_expr = { atom ~ "[" ~ expr ~ "]" }
 ```zyn
 atom = { try_expr | struct_init | array_literal | bool_literal |
          string_literal | integer_literal | identifier_expr | paren_expr }
-  -> TypedExpression { "get_child": { "index": 0 } }
 ```
 
-Order matters: `struct_init` (starts with identifier) before `identifier_expr`.
+Passthrough — each alternative has its own action. Order matters: `struct_init` (starts with identifier) before `identifier_expr`.
 
 ### Struct Initialization
 
 ```zyn
-struct_init = { identifier ~ "{" ~ struct_init_fields? ~ "}" }
-  -> TypedExpression {
-      "commands": [
-          { "define": "struct_init", "args": { "type_name": "$1", "fields": "$2" } }
-      ]
+struct_init = { type_name:identifier ~ "{" ~ fields:struct_init_fields? ~ "}" }
+  -> TypedExpression::StructLiteral {
+      type_name: intern(type_name),
+      fields: fields.unwrap_or([]),
   }
 
-struct_init_fields = { struct_init_field ~ ("," ~ struct_init_field)* ~ ","? }
-  -> List { "get_all_children": true }
+struct_init_fields = { first:struct_init_field ~ rest:struct_init_field_comma* ~ ","? }
+  -> prepend_list(first, rest)
 
-struct_init_field = { "." ~ identifier ~ "=" ~ expr }
-  -> TypedExpression {
-      "commands": [
-          { "define": "struct_field_init", "args": { "name": "$1", "value": "$2" } }
-      ]
-  }
+struct_init_field_comma = { "," ~ f:struct_init_field }
+  -> f
+
+struct_init_field = { "." ~ name:identifier ~ "=" ~ val:expr }
+  -> TypedExpression::FieldInit { name: intern(name), value: Box::new(val) }
 ```
 
 Example: `Point{ .x = 10, .y = 20 }`
@@ -758,37 +582,24 @@ Silent rule (`_{ }`) - matches but doesn't create a node. The inner `expr` passe
 
 ```zyn
 type_expr = { pointer_type | optional_type | error_union_type | array_type |
-              primitive_type | identifier }
-  -> Type { "get_child": { "index": 0 } }
+              primitive_type | name_type }
 
-pointer_type = { "*" ~ "const"? ~ type_expr }
-  -> Type {
-      "commands": [
-          { "define": "pointer_type", "args": { "pointee": "$1" } }
-      ]
-  }
+pointer_type = { "*" ~ "const"? ~ pointee:type_expr }
+  -> Type::Pointer { pointee: Box::new(pointee) }
 
-optional_type = { "?" ~ type_expr }
-  -> Type {
-      "commands": [
-          { "define": "optional_type", "args": { "inner": "$1" } }
-      ]
-  }
+optional_type = { "?" ~ inner:type_expr }
+  -> Type::Optional { inner: Box::new(inner) }
 
-array_type = { "[" ~ integer_literal? ~ "]" ~ type_expr }
-  -> Type {
-      "commands": [
-          { "define": "array_type", "args": { "size": "$1", "element": "$2" } }
-      ]
-  }
+array_type = { "[" ~ size:integer_literal? ~ "]" ~ element:type_expr }
+  -> Type::Array { size: size, element: Box::new(element) }
 
-primitive_type = { "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" |
-                   "f32" | "f64" | "bool" | "void" }
-  -> Type {
-      "get_text": true,
-      "define": "primitive_type",
-      "args": { "name": "$result" }
-  }
+primitive_type = @{ "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" |
+                    "f32" | "f64" | "bool" | "void" }
+  -> Type::Named { name: intern(primitive_type) }
+
+// Fall-through for user-defined type names
+name_type = { name:identifier }
+  -> Type::Named { name: intern(name) }
 ```
 
 ## Identifiers and Keywords
@@ -804,8 +615,9 @@ keyword = @{
     ~ !(ASCII_ALPHANUMERIC | "_")
 }
 
+// Atomic rule captures text; action interns it into the arena
 identifier = @{ !keyword ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
-  -> String { "get_text": true }
+  -> intern(identifier)
 ```
 
 **Key patterns**:
@@ -815,27 +627,22 @@ identifier = @{ !keyword ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 ## Operators
 
-Each operator is a separate rule for use with `fold_binary`:
+Operators are atomic rules (`@`) so their text is captured automatically. Longer operators must come first in alternatives to avoid partial matches:
 
 ```zyn
 // Must check longer operators first
-lte_op = { "<=" } -> String { "get_text": true }
-gte_op = { ">=" } -> String { "get_text": true }
-eq_op = { "==" } -> String { "get_text": true }
-neq_op = { "!=" } -> String { "get_text": true }
-lt_op = { "<" } -> String { "get_text": true }
-gt_op = { ">" } -> String { "get_text": true }
+comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">" }
 
-add_op = { "+" } -> String { "get_text": true }
-sub_op = { "-" } -> String { "get_text": true }
-mul_op = { "*" } -> String { "get_text": true }
-div_op = { "/" } -> String { "get_text": true }
+add_sub_op = @{ "+" | "-" }
+mul_div_op = @{ "*" | "/" }
 
-and_op = { "and" } -> String { "get_text": true }
-or_op = { "or" } -> String { "get_text": true }
+and_op = @{ "and" }
+or_op  = @{ "or" }
 
-unary_op = { "-" | "!" } -> String { "get_text": true }
+unary_op = @{ "-" | "!" }
 ```
+
+These are used as the `op` binding in rest rules (e.g. `addition_rest = { op:add_sub_op ~ operand:multiplication } -> make_pair(op, operand)`).
 
 ## Whitespace and Comments
 
@@ -913,12 +720,13 @@ fn main() i32 {
 
 | Pattern | Use Case |
 |---------|----------|
-| Split rules | Handle optional children with predictable indices |
-| `fold_binary` | Left-associative binary operators |
-| `get_all_children` | Collect repetitions into lists |
+| Named bindings (`name:rule`) | Self-documenting patterns; optional `?` → `Option<T>`, star `*` → `Vec<T>` |
+| `fold_left_ops` + `make_pair` | Left-associative binary operators |
+| `prepend_list(first, rest)` | Collect comma-separated lists |
+| `.unwrap_or([])` | Default for optional list bindings |
 | Keyword protection | Prevent identifiers matching keywords |
-| Silent rules | Grouping without AST nodes |
-| Atomic rules | Token-level matching |
+| Silent rules (`_{}`) | Grouping/delimiters without AST nodes |
+| Atomic rules (`@{}`) | Token-level matching; text auto-captured |
 
 ## Next Steps
 
