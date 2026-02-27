@@ -22,6 +22,8 @@ use zyntax_typed_ast::{
 /// Internal alias used when lowering `compute(...) { ... }` expressions.
 /// This must not collide with user code.
 const INTERNAL_COMPUTE_ALIAS: &str = "__internal_compute_dispatch";
+const INTERNAL_RENDER_EVENT_ALIAS: &str = "__internal_render_event";
+const INTERNAL_STREAM_EVENT_ALIAS: &str = "__internal_stream_event";
 
 /// SSA builder state
 pub struct SsaBuilder {
@@ -1957,6 +1959,20 @@ impl SsaBuilder {
                             .unwrap_or_default()
                     });
 
+                    if name_str == INTERNAL_RENDER_EVENT_ALIAS
+                        || name_str == INTERNAL_STREAM_EVENT_ALIAS
+                    {
+                        // Internal runtime event calls are lowered as side-effect markers.
+                        // Evaluate arguments for side effects, then erase the call from HIR.
+                        for arg in &call.positional_args {
+                            self.translate_expression(block_id, arg)?;
+                        }
+                        for named in &call.named_args {
+                            self.translate_expression(block_id, &named.value)?;
+                        }
+                        return Ok(self.create_undef(HirType::Void));
+                    }
+
                     // Check for enum constructors (Some, Ok, Err)
                     if name_str == "Some" || name_str == "Ok" || name_str == "Err" {
                         return self
@@ -2077,20 +2093,7 @@ impl SsaBuilder {
                 self.compute_yield_stack.push(Vec::new());
                 let mut current_block = block_id;
                 for stmt in &compute.body.statements {
-                    match &stmt.node {
-                        zyntax_typed_ast::typed_ast::TypedStatement::Let(_)
-                        | zyntax_typed_ast::typed_ast::TypedStatement::Expression(_)
-                        | zyntax_typed_ast::typed_ast::TypedStatement::Yield(_) => {
-                            current_block = self.process_statement(current_block, stmt)?;
-                        }
-                        _ => {
-                            self.compute_yield_stack.pop();
-                            return Err(crate::CompilerError::Analysis(
-                                "compute body fallback currently supports only let/expression/yield statements"
-                                    .to_string(),
-                            ));
-                        }
-                    }
+                    current_block = self.process_statement(current_block, stmt)?;
                 }
 
                 let yields = self.compute_yield_stack.pop().unwrap_or_default();

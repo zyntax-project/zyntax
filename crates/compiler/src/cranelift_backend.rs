@@ -15,6 +15,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::effect_codegen::{
@@ -27,6 +28,18 @@ use crate::hir::{
     Intrinsic, UnaryOp,
 };
 use crate::{CompilerError, CompilerResult};
+
+static CRANELIFT_SKIPPED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of function bodies skipped by Cranelift due to recoverable codegen errors.
+pub fn cranelift_skipped_function_count() -> usize {
+    CRANELIFT_SKIPPED_FUNCTIONS.load(Ordering::Relaxed)
+}
+
+/// Reset Cranelift skip diagnostics counter.
+pub fn reset_cranelift_skipped_function_count() {
+    CRANELIFT_SKIPPED_FUNCTIONS.store(0, Ordering::Relaxed);
+}
 
 /// Convert ZRTL TypeTag to Cranelift type
 fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
@@ -372,6 +385,7 @@ impl CraneliftBackend {
             if !function.is_external {
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 if let Err(e) = self.compile_function_body(*id, function, module) {
+                    CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "[CRANELIFT WARN] Skipping function '{}': {:?}",
                         function.name, e
@@ -4061,10 +4075,16 @@ impl CraneliftBackend {
                 // Function pointers
                 Ok(self.module.target_config().pointer_type())
             }
-            HirType::Vector(elem_ty, _count) => {
-                // Vector types for SIMD - use the element type for now
-                self.translate_type(elem_ty)
-            }
+            HirType::Vector(elem_ty, count) => match (&**elem_ty, *count) {
+                (HirType::F32, 4) => Ok(types::F32X4),
+                (HirType::F64, 2) => Ok(types::F64X2),
+                (HirType::I32, 4) | (HirType::U32, 4) => Ok(types::I32X4),
+                (HirType::I64, 2) | (HirType::U64, 2) => Ok(types::I64X2),
+                _ => Err(CompilerError::CodeGen(format!(
+                    "unsupported SIMD vector lane shape in Cranelift backend: Vector({:?}, {})",
+                    elem_ty, count
+                ))),
+            },
             HirType::Union(_) => {
                 // Unions are treated as pointers to stack-allocated memory
                 Ok(self.module.target_config().pointer_type())

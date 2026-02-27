@@ -69,6 +69,9 @@ pub use borrow_check::{
 };
 pub use cfg::{BasicBlock, CfgEdge, ControlFlowGraph};
 pub use const_eval::{ConstEvalContext, ConstEvaluator};
+pub use cranelift_backend::{
+    cranelift_skipped_function_count, reset_cranelift_skipped_function_count,
+};
 pub use effect_analysis::{
     analyze_effects, analyze_effects_with_call_graph, get_function_effect_summary,
     has_effect_errors, EffectAnalyzer, EffectCallGraph, EffectError, EffectErrorKind,
@@ -90,6 +93,8 @@ pub use hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue}
 pub use hir_builder::HirBuilder; // HIR Builder API
 use log::debug;
 pub use lowering::{
+    lowering_skipped_function_count,
+    reset_lowering_skipped_function_count,
     AstLowering,
     BuiltinResolver,
     ChainedResolver,

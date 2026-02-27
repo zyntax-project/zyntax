@@ -10,9 +10,10 @@
 //! docs/ml-dsl-plans/00-unified-ml-dsl.md
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use zynml::{
-    Grammar2, LanguageGrammar, ZynML, ZynMLConfig, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE,
-    ZYNML_STDLIB_TENSOR,
+    Grammar2, LanguageGrammar, RuntimeEvent, ZynML, ZynMLConfig, ZynMLRuntimeProfile,
+    ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_TENSOR,
 };
 
 // ============================================================================
@@ -3414,6 +3415,17 @@ mod algebraic_effects {
 mod runtime {
     use super::*;
 
+    fn log_skip_counters() {
+        println!(
+            "[diag] lowering skipped functions: {}",
+            zyntax_compiler::lowering_skipped_function_count()
+        );
+        println!(
+            "[diag] cranelift skipped functions: {}",
+            zyntax_compiler::cranelift_skipped_function_count()
+        );
+    }
+
     fn plugins_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent() // crates/
@@ -3429,6 +3441,7 @@ mod runtime {
             plugins_dir: "/nonexistent".to_string(),
             load_optional: false,
             verbose: false,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
         };
 
         let result = ZynML::with_config(config);
@@ -3466,6 +3479,161 @@ mod runtime {
     }
 
     #[test]
+    fn test_runtime_profile_tiered_development() {
+        let config = ZynMLConfig {
+            plugins_dir: "/nonexistent".to_string(),
+            load_optional: false,
+            verbose: false,
+            runtime_profile: ZynMLRuntimeProfile::TieredDevelopment,
+        };
+
+        let mut zynml = ZynML::with_config(config).expect("tiered runtime should initialize");
+        let result = zynml.load_source(
+            r#"
+            fn main() {
+                let x = 1
+            }
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "tiered runtime should compile simple module: {:?}",
+            result.err()
+        );
+        log_skip_counters();
+    }
+
+    #[test]
+    fn test_runtime_event_capture_render_and_stream() {
+        let config = ZynMLConfig {
+            plugins_dir: "/nonexistent".to_string(),
+            load_optional: false,
+            verbose: false,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
+        };
+
+        let mut zynml = ZynML::with_config(config).expect("runtime should initialize");
+        let result = zynml.load_source(
+            r#"
+            fn main() {
+                render "photo"
+                let sensor_data = 1
+                stream sensor_data |> window(100) |> sink(alert_system)
+            }
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "event-bridged render/stream should compile: {:?}",
+            result.err()
+        );
+
+        let events = zynml.runtime_events();
+        assert_eq!(
+            events.len(),
+            2,
+            "expected render + stream events: {:?}",
+            events
+        );
+        assert!(
+            matches!(&events[0], RuntimeEvent::Render { .. }),
+            "first event should be render, got: {:?}",
+            events
+        );
+        assert!(
+            matches!(&events[1], RuntimeEvent::Stream { .. }),
+            "second event should be stream, got: {:?}",
+            events
+        );
+
+        match &events[0] {
+            RuntimeEvent::Render { value, options } => {
+                assert_eq!(
+                    value, "photo",
+                    "render payload should preserve rendered value"
+                );
+                assert!(
+                    options.is_empty(),
+                    "simple render should not carry options, got: {:?}",
+                    options
+                );
+            }
+            other => panic!("expected first event to be Render, got: {:?}", other),
+        }
+
+        match &events[1] {
+            RuntimeEvent::Stream {
+                pipeline,
+                stage_count,
+            } => {
+                assert!(
+                    pipeline.contains("window"),
+                    "stream pipeline should include transform stages: {}",
+                    pipeline
+                );
+                assert!(
+                    pipeline.contains("sink"),
+                    "stream pipeline should include sink stage: {}",
+                    pipeline
+                );
+                assert!(
+                    *stage_count >= 3,
+                    "stream pipeline should include source + stages, got {} in {}",
+                    stage_count,
+                    pipeline
+                );
+            }
+            other => panic!("expected second event to be Stream, got: {:?}", other),
+        }
+        log_skip_counters();
+    }
+
+    #[test]
+    fn test_runtime_event_sink_callback() {
+        let config = ZynMLConfig {
+            plugins_dir: "/nonexistent".to_string(),
+            load_optional: false,
+            verbose: false,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
+        };
+
+        let mut zynml = ZynML::with_config(config).expect("runtime should initialize");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        zynml.set_event_sink(move |event| {
+            let mut lock = captured_clone
+                .lock()
+                .expect("event sink lock should not be poisoned");
+            lock.push(event.clone());
+        });
+
+        let result = zynml.load_source(
+            r#"
+            fn main() {
+                render "preview"
+                let source = 1
+                stream source |> sink(db)
+            }
+        "#,
+        );
+        assert!(
+            result.is_ok(),
+            "event sink runtime should compile render/stream: {:?}",
+            result.err()
+        );
+
+        let events = captured
+            .lock()
+            .expect("event sink lock should not be poisoned");
+        assert_eq!(
+            events.len(),
+            2,
+            "event sink should receive render + stream events: {:?}",
+            *events
+        );
+    }
+
+    #[test]
     fn test_runtime_with_plugins() {
         let plugins_path = plugins_dir();
 
@@ -3479,6 +3647,7 @@ mod runtime {
             plugins_dir: plugins_path.to_string_lossy().to_string(),
             load_optional: false,
             verbose: true,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
         };
 
         let result = ZynML::with_config(config);
@@ -3532,6 +3701,7 @@ mod execution {
             plugins_dir: plugins_path.to_string_lossy().to_string(),
             load_optional: true,
             verbose: false,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
         };
 
         ZynML::with_config(config).ok()

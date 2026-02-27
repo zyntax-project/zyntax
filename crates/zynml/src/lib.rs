@@ -48,7 +48,7 @@ use std::path::Path;
 use thiserror::Error;
 
 // Re-export zyntax_embed types for convenience
-pub use zyntax_embed::{FromZyntax, LanguageGrammar, ZyntaxRuntime};
+pub use zyntax_embed::{FromZyntax, LanguageGrammar, RuntimeEvent, TieredRuntime, ZyntaxRuntime};
 // Re-export Grammar2 for direct TypedAST parsing
 pub use zyntax_embed::{Grammar2, Grammar2Error, Grammar2Result};
 
@@ -95,6 +95,20 @@ pub const REQUIRED_PLUGINS: &[&str] = &[
 /// Optional ZRTL plugins that enhance functionality
 pub const OPTIONAL_PLUGINS: &[&str] = &["zrtl_image", "zrtl_json", "zrtl_http"];
 
+/// Runtime profile used by ZynML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZynMLRuntimeProfile {
+    /// Classic single-tier Cranelift runtime.
+    Classic,
+    /// Tiered runtime tuned for development iterations.
+    TieredDevelopment,
+    /// Tiered runtime tuned for production.
+    TieredProduction,
+    /// Tiered runtime with LLVM hot-path tier.
+    #[cfg(feature = "llvm-backend")]
+    TieredProductionLlvm,
+}
+
 /// ZynML runtime configuration
 #[derive(Debug, Clone)]
 pub struct ZynMLConfig {
@@ -106,6 +120,9 @@ pub struct ZynMLConfig {
 
     /// Enable verbose logging
     pub verbose: bool,
+
+    /// Runtime profile / backend tiering mode.
+    pub runtime_profile: ZynMLRuntimeProfile,
 }
 
 impl Default for ZynMLConfig {
@@ -114,13 +131,19 @@ impl Default for ZynMLConfig {
             plugins_dir: "plugins/target/zrtl".to_string(),
             load_optional: false,
             verbose: false,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
         }
     }
 }
 
+enum RuntimeEngine {
+    Classic(ZyntaxRuntime),
+    Tiered(TieredRuntime),
+}
+
 /// ZynML runtime - the main entry point for running ZynML programs
 pub struct ZynML {
-    runtime: ZyntaxRuntime,
+    runtime: RuntimeEngine,
     config: ZynMLConfig,
     grammar: LanguageGrammar,
     /// Grammar2 for direct TypedAST parsing (optional, used for advanced workflows)
@@ -139,18 +162,35 @@ impl ZynML {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR)
             .map_err(|e| ZynMLError::GrammarError(e.to_string()))?;
 
-        // Create the runtime
-        let mut runtime = ZyntaxRuntime::new().context("Failed to create Zyntax runtime")?;
+        // Create runtime engine according to profile.
+        let mut runtime = match config.runtime_profile {
+            ZynMLRuntimeProfile::Classic => RuntimeEngine::Classic(
+                ZyntaxRuntime::new().context("Failed to create Zyntax runtime")?,
+            ),
+            ZynMLRuntimeProfile::TieredDevelopment => RuntimeEngine::Tiered(
+                TieredRuntime::development().context("Failed to create tiered runtime")?,
+            ),
+            ZynMLRuntimeProfile::TieredProduction => RuntimeEngine::Tiered(
+                TieredRuntime::production().context("Failed to create tiered runtime")?,
+            ),
+            #[cfg(feature = "llvm-backend")]
+            ZynMLRuntimeProfile::TieredProductionLlvm => RuntimeEngine::Tiered(
+                TieredRuntime::production_llvm().context("Failed to create tiered LLVM runtime")?,
+            ),
+        };
 
-        // Register stdlib import resolver
-        // This allows `import prelude` and `import tensor` to resolve
-        runtime.add_import_resolver(Box::new(|module_name| {
-            match module_name {
+        // Register stdlib import resolver in classic runtime mode.
+        if let RuntimeEngine::Classic(rt) = &mut runtime {
+            rt.add_import_resolver(Box::new(|module_name| match module_name {
                 "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
                 "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
                 _ => Ok(None), // Not a stdlib module
-            }
-        }));
+            }));
+        } else if config.verbose {
+            log::info!(
+                "Tiered runtime profile selected; stdlib import resolvers are not enabled in this mode"
+            );
+        }
 
         // Load required plugins BEFORE registering grammar
         // This ensures builtin mappings (e.g., println -> $IO$println_dynamic) can find their targets
@@ -161,12 +201,14 @@ impl ZynML {
                 if config.verbose {
                     log::info!("Loading plugin: {}", plugin_name);
                 }
-                runtime
-                    .load_plugin(&plugin_path)
-                    .map_err(|e| ZynMLError::PluginError {
-                        plugin: plugin_name.to_string(),
-                        reason: e.to_string(),
-                    })?;
+                match &mut runtime {
+                    RuntimeEngine::Classic(rt) => rt.load_plugin(&plugin_path),
+                    RuntimeEngine::Tiered(rt) => rt.load_plugin(&plugin_path),
+                }
+                .map_err(|e| ZynMLError::PluginError {
+                    plugin: plugin_name.to_string(),
+                    reason: e.to_string(),
+                })?;
             } else if config.verbose {
                 log::warn!("Required plugin not found: {}", plugin_path.display());
             }
@@ -180,14 +222,24 @@ impl ZynML {
                     if config.verbose {
                         log::info!("Loading optional plugin: {}", plugin_name);
                     }
-                    let _ = runtime.load_plugin(&plugin_path);
+                    match &mut runtime {
+                        RuntimeEngine::Classic(rt) => {
+                            let _ = rt.load_plugin(&plugin_path);
+                        }
+                        RuntimeEngine::Tiered(rt) => {
+                            let _ = rt.load_plugin(&plugin_path);
+                        }
+                    }
                 }
             }
         }
 
         // Register the grammar AFTER loading plugins
         // This ensures builtin mappings can find the target external functions
-        runtime.register_grammar("zynml", grammar.clone());
+        match &mut runtime {
+            RuntimeEngine::Classic(rt) => rt.register_grammar("zynml", grammar.clone()),
+            RuntimeEngine::Tiered(rt) => rt.register_grammar("zynml", grammar.clone()),
+        }
 
         // Optionally compile Grammar2 for direct TypedAST parsing
         let grammar2 = Grammar2::from_source(ZYNML_GRAMMAR).ok();
@@ -210,9 +262,11 @@ impl ZynML {
 
     /// Load and compile ZynML source code
     pub fn load_source(&mut self, source: &str) -> Result<Vec<String>> {
-        self.runtime
-            .load_module("zynml", source)
-            .context("Failed to compile ZynML program")
+        match &mut self.runtime {
+            RuntimeEngine::Classic(rt) => rt.load_module("zynml", source),
+            RuntimeEngine::Tiered(rt) => rt.load_module("zynml", source),
+        }
+        .context("Failed to compile ZynML program")
     }
 
     /// Parse source and return the AST as JSON
@@ -261,16 +315,20 @@ impl ZynML {
 
     /// Call a function by name with no arguments
     pub fn call(&mut self, name: &str) -> Result<()> {
-        self.runtime
-            .call::<()>(name, &[])
-            .with_context(|| format!("Failed to call function: {}", name))
+        match &self.runtime {
+            RuntimeEngine::Classic(rt) => rt.call::<()>(name, &[]),
+            RuntimeEngine::Tiered(rt) => rt.call::<()>(name, &[]),
+        }
+        .with_context(|| format!("Failed to call function: {}", name))
     }
 
     /// Call a function and get a result
     pub fn call_with_result<T: FromZyntax + 'static>(&mut self, name: &str) -> Result<T> {
-        self.runtime
-            .call::<T>(name, &[])
-            .with_context(|| format!("Failed to call function: {}", name))
+        match &self.runtime {
+            RuntimeEngine::Classic(rt) => rt.call::<T>(name, &[]),
+            RuntimeEngine::Tiered(rt) => rt.call::<T>(name, &[]),
+        }
+        .with_context(|| format!("Failed to call function: {}", name))
     }
 
     /// Run a ZynML program (calls 'main' if it exists)
@@ -299,10 +357,11 @@ impl ZynML {
     /// Run a ZynML program from a file
     pub fn run_file(&mut self, path: &Path) -> Result<()> {
         // Load the file with proper filename tracking for diagnostics
-        let functions = self
-            .runtime
-            .load_module_file(path)
-            .with_context(|| format!("Failed to load file: {}", path.display()))?;
+        let functions = match &mut self.runtime {
+            RuntimeEngine::Classic(rt) => rt.load_module_file(path),
+            RuntimeEngine::Tiered(rt) => rt.load_module_file(path),
+        }
+        .with_context(|| format!("Failed to load file: {}", path.display()))?;
 
         if self.config.verbose {
             println!("Loaded {} functions", functions.len());
@@ -321,12 +380,75 @@ impl ZynML {
 
     /// Get reference to the underlying runtime
     pub fn runtime(&self) -> &ZyntaxRuntime {
-        &self.runtime
+        match &self.runtime {
+            RuntimeEngine::Classic(rt) => rt,
+            RuntimeEngine::Tiered(_) => {
+                panic!("runtime() is only available in Classic profile; use tiered_runtime()")
+            }
+        }
     }
 
     /// Get mutable reference to the underlying runtime
     pub fn runtime_mut(&mut self) -> &mut ZyntaxRuntime {
-        &mut self.runtime
+        match &mut self.runtime {
+            RuntimeEngine::Classic(rt) => rt,
+            RuntimeEngine::Tiered(_) => {
+                panic!(
+                    "runtime_mut() is only available in Classic profile; use tiered_runtime_mut()"
+                )
+            }
+        }
+    }
+
+    /// Get reference to the underlying tiered runtime (if active).
+    pub fn tiered_runtime(&self) -> Option<&TieredRuntime> {
+        match &self.runtime {
+            RuntimeEngine::Classic(_) => None,
+            RuntimeEngine::Tiered(rt) => Some(rt),
+        }
+    }
+
+    /// Get mutable reference to the underlying tiered runtime (if active).
+    pub fn tiered_runtime_mut(&mut self) -> Option<&mut TieredRuntime> {
+        match &mut self.runtime {
+            RuntimeEngine::Classic(_) => None,
+            RuntimeEngine::Tiered(rt) => Some(rt),
+        }
+    }
+
+    /// Get captured runtime semantic events from the active runtime.
+    pub fn runtime_events(&self) -> &[RuntimeEvent] {
+        match &self.runtime {
+            RuntimeEngine::Classic(rt) => rt.runtime_events(),
+            RuntimeEngine::Tiered(rt) => rt.runtime_events(),
+        }
+    }
+
+    /// Drain captured runtime semantic events from the active runtime.
+    pub fn drain_runtime_events(&mut self) -> Vec<RuntimeEvent> {
+        match &mut self.runtime {
+            RuntimeEngine::Classic(rt) => rt.drain_runtime_events(),
+            RuntimeEngine::Tiered(rt) => rt.drain_runtime_events(),
+        }
+    }
+
+    /// Register a runtime event sink callback.
+    pub fn set_event_sink<F>(&mut self, sink: F)
+    where
+        F: Fn(&RuntimeEvent) + Send + Sync + 'static,
+    {
+        match &mut self.runtime {
+            RuntimeEngine::Classic(rt) => rt.set_event_sink(sink),
+            RuntimeEngine::Tiered(rt) => rt.set_event_sink(sink),
+        }
+    }
+
+    /// Clear the runtime event sink callback.
+    pub fn clear_event_sink(&mut self) {
+        match &mut self.runtime {
+            RuntimeEngine::Classic(rt) => rt.clear_event_sink(),
+            RuntimeEngine::Tiered(rt) => rt.clear_event_sink(),
+        }
     }
 
     /// Check if a plugin is loaded
@@ -532,6 +654,7 @@ mod tests {
             plugins_dir: plugins_dir.to_string_lossy().to_string(),
             load_optional: false,
             verbose: true,
+            runtime_profile: ZynMLRuntimeProfile::Classic,
         };
 
         // Create runtime (this loads plugins and registers grammar)

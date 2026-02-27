@@ -35,3 +35,9 @@ env_logger = "0.11"
 
 [dev-dependencies]
 tempfile = "3.16"
+zyntax_compiler = { path = "../compiler" }
+
+[features]
+default = []
+llvm-backend = ["zyntax_embed/llvm-backend"]
+all-backends = ["llvm-backend"]

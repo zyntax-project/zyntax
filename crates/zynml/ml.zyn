@@ -31,6 +31,8 @@
 @builtin {
     // Internal dispatch aliases (language-level constructs lowered to plugin calls)
     __internal_compute_dispatch: "$ZynML$compute",
+    __internal_render_event: "$ZynML$render_event",
+    __internal_stream_event: "$ZynML$stream_event",
 
     // === Tensor Operations (zrtl_tensor) ===
     tensor: "tensor_from_array",          // tensor([1.0, 2.0]) -> tensor_from_array([1.0, 2.0])
@@ -640,7 +642,7 @@ render_stmt = { stmt:render_with_options | stmt:render_simple }
 render_with_options = { "render" ~ value:expr ~ "{" ~ config_entries ~ "}" }
   -> TypedStatement::Expression {
       expr: TypedExpression::Call {
-          callee: Box::new(TypedExpression::Variable { name: intern("render") }),
+          callee: Box::new(TypedExpression::Variable { name: intern("__internal_render_event") }),
           args: [value],
           named_args: config_entries,
       }
@@ -650,7 +652,7 @@ render_with_options = { "render" ~ value:expr ~ "{" ~ config_entries ~ "}" }
 render_simple = { "render" ~ value:expr }
   -> TypedStatement::Expression {
       expr: TypedExpression::Call {
-          callee: Box::new(TypedExpression::Variable { name: intern("render") }),
+          callee: Box::new(TypedExpression::Variable { name: intern("__internal_render_event") }),
           args: [value],
       }
   }
@@ -659,12 +661,21 @@ render_simple = { "render" ~ value:expr }
 // Stream Statement
 // ============================================================================
 
+stream_source_call = { "stream" ~ source:identifier }
+  -> TypedExpression::Call {
+      callee: Box::new(TypedExpression::Variable { name: intern("stream") }),
+      args: [TypedExpression::Variable { name: intern(source) }],
+  }
+
+stream_chain_expr = { first:stream_source_call ~ rest:pipe_rest* }
+  -> fold_pipe(first, rest)
+
 // stream sensor_data |> window(100) |> sink(alert_system)
-stream_stmt = { "stream" ~ source:identifier ~ ("|>" ~ pipe_call)+ }
+stream_stmt = { chain:stream_chain_expr }
   -> TypedStatement::Expression {
       expr: TypedExpression::Call {
-          callee: Box::new(TypedExpression::Variable { name: intern("stream") }),
-          args: [TypedExpression::Variable { name: intern(source) }],
+          callee: Box::new(TypedExpression::Variable { name: intern("__internal_stream_event") }),
+          args: [chain],
       }
   }
 
@@ -1908,6 +1919,8 @@ statement = {
     break_stmt |
     continue_stmt |
     assign_stmt |
+    render_stmt |
+    stream_stmt |
     expr_stmt
 }
 

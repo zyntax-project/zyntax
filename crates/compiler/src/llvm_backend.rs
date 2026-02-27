@@ -3291,6 +3291,18 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Return function pointer type
                 fn_type.ptr_type(AddressSpace::default()).into()
             }
+            Vector(elem_ty, count) => match (&**elem_ty, *count) {
+                (F32, 4) => self.context.f32_type().vec_type(4).into(),
+                (F64, 2) => self.context.f64_type().vec_type(2).into(),
+                (I32, 4) | (U32, 4) => self.context.i32_type().vec_type(4).into(),
+                (I64, 2) | (U64, 2) => self.context.i64_type().vec_type(2).into(),
+                _ => {
+                    return Err(CompilerError::CodeGen(format!(
+                        "unsupported SIMD vector lane shape in LLVM backend: Vector({:?}, {})",
+                        elem_ty, count
+                    )));
+                }
+            },
             _ => {
                 return Err(CompilerError::CodeGen(format!(
                     "Type translation not yet implemented: {:?}",

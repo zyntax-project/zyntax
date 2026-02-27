@@ -4,6 +4,7 @@
 //! ready for both Cranelift and LLVM backends.
 
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use zyntax_typed_ast::{
     AstArena, InternedString, Mutability, Type, TypeId, TypedDeclaration, TypedEffect,
@@ -25,6 +26,18 @@ use crate::hir::{
 use crate::ssa::{SsaBuilder, SsaForm};
 use crate::CompilerResult;
 use std::collections::HashMap;
+
+static LOWERING_SKIPPED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of functions skipped by lowering due to recoverable errors.
+pub fn lowering_skipped_function_count() -> usize {
+    LOWERING_SKIPPED_FUNCTIONS.load(Ordering::Relaxed)
+}
+
+/// Reset lowering skip diagnostics counter.
+pub fn reset_lowering_skipped_function_count() {
+    LOWERING_SKIPPED_FUNCTIONS.store(0, Ordering::Relaxed);
+}
 
 /// Target data layout information for precise size and alignment calculations
 #[derive(Debug, Clone)]
@@ -1650,6 +1663,7 @@ impl LoweringContext {
                 // but we shouldn't fail the entire compilation for unused code
                 if let Err(e) = self.lower_function(func) {
                     let func_name = func.name.resolve_global().unwrap_or_default();
+                    LOWERING_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[LOWERING WARN] Skipping function '{}': {:?}", func_name, e);
                     // Remove from symbol table if it was registered
                     self.symbols.functions.remove(&func.name);

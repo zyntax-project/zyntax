@@ -98,6 +98,7 @@ pub use runtime::{
     PromiseState,
     ResolvedImport,
     RuntimeError,
+    RuntimeEvent,
     RuntimeResult,
     SettledResult,
     SymbolKind,

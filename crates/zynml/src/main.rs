@@ -123,6 +123,7 @@ fn run_program(
         plugins_dir: plugins_dir.to_string_lossy().to_string(),
         load_optional: all_plugins,
         verbose,
+        runtime_profile: zynml::ZynMLRuntimeProfile::Classic,
     };
 
     let mut zynml = ZynML::with_config(config)?;
@@ -265,6 +266,7 @@ fn run_repl(plugins_dir: &PathBuf, verbose: bool) -> Result<()> {
         plugins_dir: plugins_dir.to_string_lossy().to_string(),
         verbose,
         load_optional: true,
+        runtime_profile: zynml::ZynMLRuntimeProfile::Classic,
     };
 
     let mut zynml = ZynML::with_config(config)?;
