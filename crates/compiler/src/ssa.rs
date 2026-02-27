@@ -69,6 +69,9 @@ pub struct SsaBuilder {
     /// External function link names (alias -> ZRTL symbol)
     /// e.g., "tensor_add" -> "$Tensor$add"
     extern_link_names: IndexMap<InternedString, String>,
+    /// Captured yield values for active compute-expression lowering contexts.
+    /// Empty outside compute expression translation.
+    compute_yield_stack: Vec<Vec<HirId>>,
 }
 
 /// Context for pattern matching
@@ -314,6 +317,7 @@ impl SsaBuilder {
             address_taken_vars: HashSet::new(),
             stack_slots: IndexMap::new(),
             extern_link_names: IndexMap::new(),
+            compute_yield_stack: Vec::new(),
         }
     }
 
@@ -1368,8 +1372,16 @@ impl SsaBuilder {
                 self.translate_expression(block_id, expr)?;
             }
             TypedStatement::Yield(expr) => {
-                // Yield behaves like an expression statement at the SSA level.
-                self.translate_expression(block_id, expr)?;
+                if self.compute_yield_stack.is_empty() {
+                    return Err(crate::CompilerError::Analysis(
+                        "`yield` is only valid inside compute expression bodies".to_string(),
+                    ));
+                }
+
+                let yielded = self.translate_expression(block_id, expr)?;
+                if let Some(active_yields) = self.compute_yield_stack.last_mut() {
+                    active_yields.push(yielded);
+                }
             }
 
             TypedStatement::Match(match_stmt) => {
@@ -1492,6 +1504,31 @@ impl SsaBuilder {
         }
 
         Ok(())
+    }
+
+    fn translate_compute_dispatch_call(
+        &mut self,
+        block_id: HirId,
+        expr: &TypedNode<TypedExpression>,
+        compute: &zyntax_typed_ast::typed_ast::TypedComputeExpr,
+    ) -> CompilerResult<HirId> {
+        let compute_name = InternedString::new_global(INTERNAL_COMPUTE_ALIAS);
+        let lowered = zyntax_typed_ast::typed_ast::TypedCall {
+            callee: Box::new(zyntax_typed_ast::typed_node(
+                TypedExpression::Variable(compute_name),
+                Type::Any,
+                expr.span,
+            )),
+            positional_args: compute.args.clone(),
+            named_args: vec![],
+            type_args: vec![],
+        };
+        let lowered_expr = zyntax_typed_ast::typed_node(
+            TypedExpression::Call(lowered),
+            expr.ty.clone(),
+            expr.span,
+        );
+        self.translate_expression(block_id, &lowered_expr)
     }
 
     /// Translate expression to SSA value
@@ -1941,25 +1978,49 @@ impl SsaBuilder {
             }
 
             TypedExpression::Compute(compute) => {
-                // Lower compute expressions through the existing call pipeline for now.
-                // This preserves call-based execution while keeping typed compute structure.
-                let compute_name = InternedString::new_global(INTERNAL_COMPUTE_ALIAS);
-                let lowered = zyntax_typed_ast::typed_ast::TypedCall {
-                    callee: Box::new(zyntax_typed_ast::typed_node(
-                        TypedExpression::Variable(compute_name),
-                        Type::Any,
-                        expr.span,
-                    )),
-                    positional_args: compute.args.clone(),
-                    named_args: vec![],
-                    type_args: vec![],
-                };
-                let lowered_expr = zyntax_typed_ast::typed_node(
-                    TypedExpression::Call(lowered),
-                    expr.ty.clone(),
-                    expr.span,
-                );
-                self.translate_expression(block_id, &lowered_expr)
+                let has_direct_yield = compute.body.statements.iter().any(|stmt| {
+                    matches!(
+                        stmt.node,
+                        zyntax_typed_ast::typed_ast::TypedStatement::Yield(_)
+                    )
+                });
+
+                if !has_direct_yield {
+                    // Preserve legacy runtime behavior for non-reduction compute blocks.
+                    return self.translate_compute_dispatch_call(block_id, expr, compute);
+                }
+
+                // CPU fallback path for reduction-style compute blocks.
+                // Evaluate explicit compute args for side effects, then execute compute body.
+                for arg in &compute.args {
+                    self.translate_expression(block_id, arg)?;
+                }
+
+                self.compute_yield_stack.push(Vec::new());
+                let mut current_block = block_id;
+                for stmt in &compute.body.statements {
+                    match &stmt.node {
+                        zyntax_typed_ast::typed_ast::TypedStatement::Let(_)
+                        | zyntax_typed_ast::typed_ast::TypedStatement::Expression(_)
+                        | zyntax_typed_ast::typed_ast::TypedStatement::Yield(_) => {
+                            current_block = self.process_statement(current_block, stmt)?;
+                        }
+                        _ => {
+                            self.compute_yield_stack.pop();
+                            return Err(crate::CompilerError::Analysis(
+                                "compute body fallback currently supports only let/expression/yield statements"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                let yields = self.compute_yield_stack.pop().unwrap_or_default();
+                if let Some(last_yield) = yields.last().copied() {
+                    Ok(last_yield)
+                } else {
+                    self.translate_compute_dispatch_call(block_id, expr, compute)
+                }
             }
 
             TypedExpression::Field(field_access) => {

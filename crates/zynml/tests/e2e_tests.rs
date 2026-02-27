@@ -3590,6 +3590,55 @@ mod execution {
         }
     }
 
+    #[test]
+    fn test_execute_compute_yield_fallback() {
+        let Some(mut zynml) = create_runtime_with_plugins() else {
+            println!("Skipping: plugins not available");
+            return;
+        };
+
+        let source = r#"
+            fn compute_fallback() {
+                let x = 41
+                let _y = compute(x) @device("cpu") {
+                    yield x
+                }
+            }
+        "#;
+
+        let functions = zynml
+            .load_source(source)
+            .expect("compute fallback program should compile");
+        assert!(
+            functions.iter().any(|f| f == "compute_fallback"),
+            "compute_fallback should be exported"
+        );
+    }
+
+    #[test]
+    fn test_execute_yield_outside_compute_rejected() {
+        let Some(mut zynml) = create_runtime_with_plugins() else {
+            println!("Skipping: plugins not available");
+            return;
+        };
+
+        let source = r#"
+            fn invalid_yield() {
+                yield 1
+            }
+        "#;
+
+        let functions = zynml
+            .load_source(source)
+            .expect("compiler should continue while skipping invalid function");
+        let message = format!("{:?}", functions);
+        assert!(
+            functions.is_empty(),
+            "yield outside compute should prevent function export, got: {}",
+            message
+        );
+    }
+
     // Regression coverage for the full hello example (prelude + tensor + dynamic println).
     // Keep panic isolation via catch_unwind so runtime regressions produce actionable test output.
     #[test]

@@ -809,11 +809,11 @@ impl<'g> GrammarInterpreter<'g> {
             _ => return Err(format!("unknown TypedExpression variant: {}", variant)),
         };
 
-        // Determine the type based on the expression variant
-        // Default to I64 for integers (64-bit system) and F64 for floats
+        // Determine the type based on the expression variant.
+        // Integer literals default to I32; assignment/context-driven inference can refine later.
         let ty = match &expr {
             TypedExpression::Literal(TypedLiteral::Integer(_)) => {
-                Type::Primitive(PrimitiveType::I64)
+                Type::Primitive(PrimitiveType::I32)
             }
             TypedExpression::Literal(TypedLiteral::Float(_)) => Type::Primitive(PrimitiveType::F64),
             TypedExpression::Literal(TypedLiteral::String(_)) => {
@@ -824,6 +824,7 @@ impl<'g> GrammarInterpreter<'g> {
             // Use Type::Any to signal that lowering should infer the type
             TypedExpression::Call(_) => Type::Any,
             TypedExpression::Variable(_) => Type::Any,
+            TypedExpression::Compute(_) => Type::Any,
             // Struct literal gets its type from the struct name - use Unresolved for compiler to resolve
             TypedExpression::Struct(lit) => Type::Unresolved(lit.name),
             _ => Type::Primitive(PrimitiveType::Unit),
