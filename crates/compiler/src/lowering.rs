@@ -272,6 +272,12 @@ pub struct ImportedItem {
     pub is_glob: bool,
 }
 
+#[derive(Debug, Clone)]
+struct CallParamSpec {
+    name: InternedString,
+    ty: Type,
+}
+
 // Re-export import resolver types from typed_ast
 pub use zyntax_typed_ast::import_resolver::{
     BuiltinResolver, ChainedResolver, ExportedSymbol, ImportContext, ImportError, ImportManager,
@@ -645,13 +651,23 @@ impl LoweringContext {
         use zyntax_typed_ast::Type;
         use zyntax_typed_ast::TypedExpression;
 
+        let function_param_specs = self.collect_declared_function_param_specs(program);
+
         // Iterate through all declarations and resolve method calls
         for decl in &mut program.declarations {
             match &mut decl.node {
                 TypedDeclaration::Function(func) => {
                     if let Some(body) = &mut func.body {
                         let mut var_types = HashMap::new();
-                        self.resolve_method_calls_in_block(body, &mut var_types)?;
+                        for param in &func.params {
+                            var_types.insert(param.name, param.ty.clone());
+                        }
+                        self.resolve_method_calls_in_block(
+                            body,
+                            &mut var_types,
+                            &function_param_specs,
+                            &func.return_type,
+                        )?;
                     }
                 }
                 _ => {}
@@ -668,9 +684,19 @@ impl LoweringContext {
             zyntax_typed_ast::InternedString,
             zyntax_typed_ast::Type,
         >,
+        function_param_specs: &std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            Vec<CallParamSpec>,
+        >,
+        function_return_type: &zyntax_typed_ast::Type,
     ) -> CompilerResult<()> {
         for stmt in &mut block.statements {
-            self.resolve_method_calls_in_statement(stmt, var_types)?;
+            self.resolve_method_calls_in_statement(
+                stmt,
+                var_types,
+                function_param_specs,
+                function_return_type,
+            )?;
         }
         Ok(())
     }
@@ -683,17 +709,31 @@ impl LoweringContext {
             zyntax_typed_ast::InternedString,
             zyntax_typed_ast::Type,
         >,
+        function_param_specs: &std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            Vec<CallParamSpec>,
+        >,
+        function_return_type: &zyntax_typed_ast::Type,
     ) -> CompilerResult<()> {
         use zyntax_typed_ast::typed_ast::TypedStatement;
-        use zyntax_typed_ast::Type;
+        use zyntax_typed_ast::{PrimitiveType, Type};
 
         match &mut stmt.node {
             TypedStatement::Expression(expr) => {
-                self.resolve_method_calls_in_expression(expr, var_types)?;
+                self.resolve_method_calls_in_expression(expr, var_types, function_param_specs)?;
             }
             TypedStatement::Let(let_stmt) => {
                 if let Some(init) = &mut let_stmt.initializer {
-                    self.resolve_method_calls_in_expression(init, var_types)?;
+                    self.resolve_method_calls_in_expression(init, var_types, function_param_specs)?;
+
+                    if !matches!(let_stmt.ty, Type::Any | Type::Unknown) {
+                        if let Some(converted) =
+                            self.try_implicit_from_conversion((**init).clone(), &let_stmt.ty)
+                        {
+                            *init = Box::new(converted);
+                        }
+                    }
+
                     // If the let statement has type Any/Unknown and the initializer has a resolved type, update it
                     let needs_update = matches!(let_stmt.ty, Type::Any | Type::Unknown);
                     let has_resolved = !matches!(init.ty, Type::Any | Type::Unknown);
@@ -706,10 +746,329 @@ impl LoweringContext {
             }
             TypedStatement::Return(opt_expr) => {
                 if let Some(expr) = opt_expr {
-                    self.resolve_method_calls_in_expression(expr, var_types)?;
+                    self.resolve_method_calls_in_expression(expr, var_types, function_param_specs)?;
+
+                    if !matches!(function_return_type, Type::Any | Type::Unknown)
+                        && !matches!(function_return_type, Type::Primitive(PrimitiveType::Unit))
+                    {
+                        if let Some(converted) = self
+                            .try_implicit_from_conversion((**expr).clone(), function_return_type)
+                        {
+                            *expr = Box::new(converted);
+                        }
+                    }
                 }
             }
-            _ => {}
+            TypedStatement::Yield(expr) => {
+                self.resolve_method_calls_in_expression(expr, var_types, function_param_specs)?;
+            }
+            TypedStatement::If(if_stmt) => {
+                self.resolve_method_calls_in_expression(
+                    &mut if_stmt.condition,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_block(
+                    &mut if_stmt.then_block,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+                if let Some(else_block) = &mut if_stmt.else_block {
+                    self.resolve_method_calls_in_block(
+                        else_block,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+            }
+            TypedStatement::While(while_stmt) => {
+                self.resolve_method_calls_in_expression(
+                    &mut while_stmt.condition,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_block(
+                    &mut while_stmt.body,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+            }
+            TypedStatement::Block(block) => {
+                self.resolve_method_calls_in_block(
+                    block,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+            }
+            TypedStatement::For(for_stmt) => {
+                self.resolve_method_calls_in_expression(
+                    &mut for_stmt.iterator,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_block(
+                    &mut for_stmt.body,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+            }
+            TypedStatement::ForCStyle(for_stmt) => {
+                if let Some(init) = &mut for_stmt.init {
+                    self.resolve_method_calls_in_statement(
+                        init,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+                if let Some(condition) = &mut for_stmt.condition {
+                    self.resolve_method_calls_in_expression(
+                        condition,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+                if let Some(update) = &mut for_stmt.update {
+                    self.resolve_method_calls_in_expression(
+                        update,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+                self.resolve_method_calls_in_block(
+                    &mut for_stmt.body,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+            }
+            TypedStatement::Loop(loop_stmt) => match loop_stmt {
+                zyntax_typed_ast::typed_ast::TypedLoop::ForEach { iterator, body, .. } => {
+                    self.resolve_method_calls_in_expression(
+                        iterator,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                    self.resolve_method_calls_in_block(
+                        body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+                zyntax_typed_ast::typed_ast::TypedLoop::ForCStyle {
+                    init,
+                    condition,
+                    update,
+                    body,
+                } => {
+                    if let Some(init_stmt) = init {
+                        self.resolve_method_calls_in_statement(
+                            init_stmt,
+                            var_types,
+                            function_param_specs,
+                            function_return_type,
+                        )?;
+                    }
+                    if let Some(condition_expr) = condition {
+                        self.resolve_method_calls_in_expression(
+                            condition_expr,
+                            var_types,
+                            function_param_specs,
+                        )?;
+                    }
+                    if let Some(update_expr) = update {
+                        self.resolve_method_calls_in_expression(
+                            update_expr,
+                            var_types,
+                            function_param_specs,
+                        )?;
+                    }
+                    self.resolve_method_calls_in_block(
+                        body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+                zyntax_typed_ast::typed_ast::TypedLoop::While { condition, body } => {
+                    self.resolve_method_calls_in_expression(
+                        condition,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                    self.resolve_method_calls_in_block(
+                        body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+                zyntax_typed_ast::typed_ast::TypedLoop::DoWhile { body, condition } => {
+                    self.resolve_method_calls_in_block(
+                        body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                    self.resolve_method_calls_in_expression(
+                        condition,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+                zyntax_typed_ast::typed_ast::TypedLoop::Infinite { body } => {
+                    self.resolve_method_calls_in_block(
+                        body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+            },
+            TypedStatement::Match(match_stmt) => {
+                self.resolve_method_calls_in_expression(
+                    &mut match_stmt.scrutinee,
+                    var_types,
+                    function_param_specs,
+                )?;
+                for arm in &mut match_stmt.arms {
+                    if let Some(guard) = &mut arm.guard {
+                        self.resolve_method_calls_in_expression(
+                            guard,
+                            var_types,
+                            function_param_specs,
+                        )?;
+                    }
+                    self.resolve_method_calls_in_expression(
+                        &mut arm.body,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+            }
+            TypedStatement::Try(try_stmt) => {
+                self.resolve_method_calls_in_block(
+                    &mut try_stmt.body,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+                for catch in &mut try_stmt.catch_clauses {
+                    self.resolve_method_calls_in_block(
+                        &mut catch.body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+                if let Some(finally_block) = &mut try_stmt.finally_block {
+                    self.resolve_method_calls_in_block(
+                        finally_block,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+            }
+            TypedStatement::Throw(expr) => {
+                self.resolve_method_calls_in_expression(expr, var_types, function_param_specs)?;
+            }
+            TypedStatement::Break(value) => {
+                if let Some(value_expr) = value {
+                    self.resolve_method_calls_in_expression(
+                        value_expr,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+            }
+            TypedStatement::LetPattern(let_pattern) => {
+                self.resolve_method_calls_in_expression(
+                    &mut let_pattern.initializer,
+                    var_types,
+                    function_param_specs,
+                )?;
+            }
+            TypedStatement::Coroutine(coroutine) => {
+                self.resolve_method_calls_in_expression(
+                    &mut coroutine.body,
+                    var_types,
+                    function_param_specs,
+                )?;
+                for param in &mut coroutine.params {
+                    self.resolve_method_calls_in_expression(
+                        param,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+            }
+            TypedStatement::Defer(defer_stmt) => {
+                self.resolve_method_calls_in_expression(
+                    &mut defer_stmt.body,
+                    var_types,
+                    function_param_specs,
+                )?;
+            }
+            TypedStatement::Select(select_stmt) => {
+                for arm in &mut select_stmt.arms {
+                    match &mut arm.operation {
+                        zyntax_typed_ast::typed_ast::TypedSelectOperation::Receive {
+                            channel,
+                            pattern: _,
+                        } => {
+                            self.resolve_method_calls_in_expression(
+                                channel,
+                                var_types,
+                                function_param_specs,
+                            )?;
+                        }
+                        zyntax_typed_ast::typed_ast::TypedSelectOperation::Send {
+                            channel,
+                            value,
+                        } => {
+                            self.resolve_method_calls_in_expression(
+                                channel,
+                                var_types,
+                                function_param_specs,
+                            )?;
+                            self.resolve_method_calls_in_expression(
+                                value,
+                                var_types,
+                                function_param_specs,
+                            )?;
+                        }
+                        zyntax_typed_ast::typed_ast::TypedSelectOperation::Timeout { duration } => {
+                            self.resolve_method_calls_in_expression(
+                                duration,
+                                var_types,
+                                function_param_specs,
+                            )?;
+                        }
+                    }
+                    self.resolve_method_calls_in_block(
+                        &mut arm.body,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+                if let Some(default_block) = &mut select_stmt.default {
+                    self.resolve_method_calls_in_block(
+                        default_block,
+                        var_types,
+                        function_param_specs,
+                        function_return_type,
+                    )?;
+                }
+            }
+            TypedStatement::Continue => {}
         }
         Ok(())
     }
@@ -722,15 +1081,30 @@ impl LoweringContext {
             zyntax_typed_ast::InternedString,
             zyntax_typed_ast::Type,
         >,
+        function_param_specs: &std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            Vec<CallParamSpec>,
+        >,
     ) -> CompilerResult<()> {
         use zyntax_typed_ast::{Type, TypedExpression};
 
         match &mut expr.node {
             TypedExpression::MethodCall(method_call) => {
                 // Recursively process receiver and arguments FIRST
-                self.resolve_method_calls_in_expression(&mut method_call.receiver, var_types)?;
+                self.resolve_method_calls_in_expression(
+                    &mut method_call.receiver,
+                    var_types,
+                    function_param_specs,
+                )?;
                 for arg in &mut method_call.positional_args {
-                    self.resolve_method_calls_in_expression(arg, var_types)?;
+                    self.resolve_method_calls_in_expression(arg, var_types, function_param_specs)?;
+                }
+                for arg in &mut method_call.named_args {
+                    self.resolve_method_calls_in_expression(
+                        &mut arg.value,
+                        var_types,
+                        function_param_specs,
+                    )?;
                 }
 
                 // If the method call has Type::Any or Type::Unknown, resolve it
@@ -817,6 +1191,8 @@ impl LoweringContext {
                 }
             }
             TypedExpression::Call(call) => {
+                let mut associated_param_specs: Option<Vec<CallParamSpec>> = None;
+
                 // Check if this is an associated function call (Type::method syntax)
                 // First check for Path expressions (Tensor::arange parsed as Path)
                 if let TypedExpression::Path(path) = &call.callee.node {
@@ -835,6 +1211,8 @@ impl LoweringContext {
                                 if method.name == method_name_interned {
                                     // Found it! Set the Call expression's return type
                                     expr.ty = method.return_type.clone();
+                                    associated_param_specs =
+                                        Some(self.param_specs_from_method_sig(method));
                                     break;
                                 }
                             }
@@ -856,6 +1234,10 @@ impl LoweringContext {
                                             for method in &impl_def.methods {
                                                 if method.signature.name == method_name_interned {
                                                     expr.ty = method.signature.return_type.clone();
+                                                    associated_param_specs =
+                                                        Some(self.param_specs_from_method_sig(
+                                                            &method.signature,
+                                                        ));
                                                     break;
                                                 }
                                             }
@@ -905,24 +1287,81 @@ impl LoweringContext {
                     }
                 }
 
-                self.resolve_method_calls_in_expression(&mut call.callee, var_types)?;
+                self.resolve_method_calls_in_expression(
+                    &mut call.callee,
+                    var_types,
+                    function_param_specs,
+                )?;
                 for arg in &mut call.positional_args {
-                    self.resolve_method_calls_in_expression(arg, var_types)?;
+                    self.resolve_method_calls_in_expression(arg, var_types, function_param_specs)?;
+                }
+                for arg in &mut call.named_args {
+                    self.resolve_method_calls_in_expression(
+                        &mut arg.value,
+                        var_types,
+                        function_param_specs,
+                    )?;
+                }
+
+                let expected_params = if let Some(params) = associated_param_specs {
+                    Some(params)
+                } else if let TypedExpression::Variable(callee_name) = &call.callee.node {
+                    function_param_specs.get(callee_name).cloned()
+                } else {
+                    None
+                };
+
+                if let Some(params) = expected_params {
+                    self.apply_implicit_from_to_call_args(
+                        &mut call.positional_args,
+                        &mut call.named_args,
+                        &params,
+                    );
                 }
             }
             TypedExpression::Binary(binary) => {
-                self.resolve_method_calls_in_expression(&mut binary.left, var_types)?;
-                self.resolve_method_calls_in_expression(&mut binary.right, var_types)?;
+                self.resolve_method_calls_in_expression(
+                    &mut binary.left,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_expression(
+                    &mut binary.right,
+                    var_types,
+                    function_param_specs,
+                )?;
+
+                if matches!(binary.op, zyntax_typed_ast::BinaryOp::Assign)
+                    || Self::supports_rhs_implicit_conversion(binary.op)
+                {
+                    if let Some(converted) =
+                        self.try_implicit_from_conversion((*binary.right).clone(), &binary.left.ty)
+                    {
+                        binary.right = Box::new(converted);
+                    }
+                }
             }
             TypedExpression::Unary(unary) => {
-                self.resolve_method_calls_in_expression(&mut unary.operand, var_types)?;
+                self.resolve_method_calls_in_expression(
+                    &mut unary.operand,
+                    var_types,
+                    function_param_specs,
+                )?;
             }
             TypedExpression::Field(field_access) => {
-                self.resolve_method_calls_in_expression(&mut field_access.object, var_types)?;
+                self.resolve_method_calls_in_expression(
+                    &mut field_access.object,
+                    var_types,
+                    function_param_specs,
+                )?;
             }
             TypedExpression::Struct(struct_lit) => {
                 for field in &mut struct_lit.fields {
-                    self.resolve_method_calls_in_expression(&mut field.value, var_types)?;
+                    self.resolve_method_calls_in_expression(
+                        &mut field.value,
+                        var_types,
+                        function_param_specs,
+                    )?;
                 }
             }
             TypedExpression::Variable(_var_name) => {
@@ -932,6 +1371,90 @@ impl LoweringContext {
         }
 
         Ok(())
+    }
+
+    fn collect_declared_function_param_specs(
+        &self,
+        program: &TypedProgram,
+    ) -> std::collections::HashMap<InternedString, Vec<CallParamSpec>> {
+        use zyntax_typed_ast::typed_ast::TypedDeclaration;
+
+        let mut specs = std::collections::HashMap::new();
+        for decl in &program.declarations {
+            if let TypedDeclaration::Function(func) = &decl.node {
+                let params = func
+                    .params
+                    .iter()
+                    .map(|p| CallParamSpec {
+                        name: p.name,
+                        ty: p.ty.clone(),
+                    })
+                    .collect();
+                specs.insert(func.name, params);
+            }
+        }
+        specs
+    }
+
+    fn param_specs_from_method_sig(
+        &self,
+        method: &zyntax_typed_ast::type_registry::MethodSig,
+    ) -> Vec<CallParamSpec> {
+        method
+            .params
+            .iter()
+            .filter(|p| !p.is_self)
+            .map(|p| CallParamSpec {
+                name: p.name,
+                ty: p.ty.clone(),
+            })
+            .collect()
+    }
+
+    fn apply_implicit_from_to_call_args(
+        &self,
+        positional_args: &mut Vec<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>>,
+        named_args: &mut Vec<zyntax_typed_ast::typed_ast::TypedNamedArg>,
+        expected_params: &[CallParamSpec],
+    ) {
+        for (arg, expected) in positional_args.iter_mut().zip(expected_params.iter()) {
+            if let Some(converted) = self.try_implicit_from_conversion(arg.clone(), &expected.ty) {
+                *arg = converted;
+            }
+        }
+
+        for named in named_args.iter_mut() {
+            if let Some(expected) = expected_params.iter().find(|p| p.name == named.name) {
+                if let Some(converted) =
+                    self.try_implicit_from_conversion((*named.value).clone(), &expected.ty)
+                {
+                    named.value = Box::new(converted);
+                }
+            }
+        }
+    }
+
+    fn supports_rhs_implicit_conversion(op: zyntax_typed_ast::BinaryOp) -> bool {
+        matches!(
+            op,
+            zyntax_typed_ast::BinaryOp::Add
+                | zyntax_typed_ast::BinaryOp::Sub
+                | zyntax_typed_ast::BinaryOp::Mul
+                | zyntax_typed_ast::BinaryOp::MatMul
+                | zyntax_typed_ast::BinaryOp::Div
+                | zyntax_typed_ast::BinaryOp::Rem
+                | zyntax_typed_ast::BinaryOp::Eq
+                | zyntax_typed_ast::BinaryOp::Ne
+                | zyntax_typed_ast::BinaryOp::Lt
+                | zyntax_typed_ast::BinaryOp::Le
+                | zyntax_typed_ast::BinaryOp::Gt
+                | zyntax_typed_ast::BinaryOp::Ge
+                | zyntax_typed_ast::BinaryOp::BitAnd
+                | zyntax_typed_ast::BinaryOp::BitOr
+                | zyntax_typed_ast::BinaryOp::BitXor
+                | zyntax_typed_ast::BinaryOp::Shl
+                | zyntax_typed_ast::BinaryOp::Shr
+        )
     }
 
     /// Debug helper: check for Unknown types in the program

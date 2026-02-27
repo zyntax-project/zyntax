@@ -29,9 +29,10 @@ use zyntax_compiler::{
 use zyntax_typed_ast::{
     arena::AstArena,
     typed_ast::{ParameterKind, TypedBinary, TypedBlock, TypedIfExpr, TypedLet, TypedUnary},
-    typed_node, BinaryOp, CallingConvention, Mutability, PrimitiveType, Span, Type, TypeRegistry,
-    TypedDeclaration, TypedExpression, TypedFunction, TypedLiteral, TypedParameter, TypedProgram,
-    TypedStatement, UnaryOp, Visibility,
+    typed_node, BinaryOp, CallingConvention, ImplDef, MethodImpl, MethodSig, Mutability, ParamDef,
+    PrimitiveType, Span, TraitDef, Type, TypeId, TypeRegistry, TypedCall, TypedDeclaration,
+    TypedExpression, TypedFunction, TypedLiteral, TypedParameter, TypedProgram, TypedStatement,
+    UnaryOp, Visibility,
 };
 
 /// Helper to create a test arena
@@ -664,7 +665,601 @@ fn test_matmul_missing_impl_reports_clear_error() {
         !matmul_fn_present,
         "Invalid matmul function should be dropped from lowered module"
     );
+}
 
+#[test]
+fn test_implicit_from_conversion_inserted_for_call_arguments() {
+    let _skip_type_check = skip_type_check();
+    let mut arena = test_arena();
+    let mut type_registry = TypeRegistry::new();
+
+    let source_name = arena.intern_string("Source");
+    let source_id = type_registry.register_struct_type(
+        source_name,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        zyntax_typed_ast::TypeMetadata::default(),
+        test_span(),
+    );
+    let target_name = arena.intern_string("Target");
+    let target_id = type_registry.register_struct_type(
+        target_name,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        zyntax_typed_ast::TypeMetadata::default(),
+        test_span(),
+    );
+
+    let source_ty = Type::Named {
+        id: source_id,
+        type_args: vec![],
+        const_args: vec![],
+        variance: vec![],
+        nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+    };
+    let target_ty = Type::Named {
+        id: target_id,
+        type_args: vec![],
+        const_args: vec![],
+        variance: vec![],
+        nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+    };
+
+    let from_trait_name = arena.intern_string("From");
+    let from_method_name = arena.intern_string("from");
+    let value_name = arena.intern_string("value");
+    let from_trait = TraitDef {
+        id: TypeId::next(),
+        name: from_trait_name,
+        type_params: vec![],
+        super_traits: vec![],
+        methods: vec![MethodSig {
+            name: from_method_name,
+            type_params: vec![],
+            params: vec![ParamDef {
+                name: value_name,
+                ty: source_ty.clone(),
+                is_self: false,
+                is_varargs: false,
+                is_mut: false,
+            }],
+            return_type: target_ty.clone(),
+            where_clause: vec![],
+            is_static: true,
+            is_async: false,
+            visibility: Visibility::Public,
+            span: test_span(),
+            is_extension: false,
+        }],
+        associated_types: vec![],
+        is_object_safe: true,
+        span: test_span(),
+    };
+    let from_trait_id = from_trait.id;
+    type_registry.register_trait(from_trait);
+
+    type_registry.register_implementation(ImplDef {
+        trait_id: from_trait_id,
+        for_type: target_ty.clone(),
+        type_args: vec![source_ty.clone()],
+        methods: vec![MethodImpl {
+            signature: MethodSig {
+                name: from_method_name,
+                type_params: vec![],
+                params: vec![ParamDef {
+                    name: value_name,
+                    ty: source_ty.clone(),
+                    is_self: false,
+                    is_varargs: false,
+                    is_mut: false,
+                }],
+                return_type: target_ty.clone(),
+                where_clause: vec![],
+                is_static: true,
+                is_async: false,
+                visibility: Visibility::Public,
+                span: test_span(),
+                is_extension: false,
+            },
+            is_default: false,
+        }],
+        associated_types: std::collections::HashMap::new(),
+        where_clause: vec![],
+        span: test_span(),
+    });
+
+    let src_param_name = arena.intern_string("src");
+    let from_fn = TypedFunction {
+        name: arena.intern_string("Target$From$from"),
+        params: vec![TypedParameter {
+            name: value_name,
+            ty: source_ty.clone(),
+            mutability: Mutability::Immutable,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: test_span(),
+        }],
+        type_params: vec![],
+        return_type: target_ty.clone(),
+        body: None,
+        visibility: Visibility::Public,
+        is_async: false,
+        is_external: true,
+        calling_convention: CallingConvention::Default,
+        link_name: None,
+        annotations: vec![],
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let take_target_name = arena.intern_string("take_target");
+    let take_target = TypedFunction {
+        name: take_target_name,
+        params: vec![TypedParameter {
+            name: arena.intern_string("t"),
+            ty: target_ty.clone(),
+            mutability: Mutability::Immutable,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: test_span(),
+        }],
+        type_params: vec![],
+        return_type: Type::Primitive(PrimitiveType::I32),
+        body: None,
+        visibility: Visibility::Public,
+        is_async: false,
+        is_external: true,
+        calling_convention: CallingConvention::Default,
+        link_name: None,
+        annotations: vec![],
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let entry_call = typed_node(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(typed_node(
+                TypedExpression::Variable(take_target_name),
+                Type::Any,
+                test_span(),
+            )),
+            positional_args: vec![typed_node(
+                TypedExpression::Variable(src_param_name),
+                source_ty.clone(),
+                test_span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I32),
+        test_span(),
+    );
+    let entry = TypedFunction {
+        name: arena.intern_string("entry"),
+        params: vec![TypedParameter {
+            name: src_param_name,
+            ty: source_ty.clone(),
+            mutability: Mutability::Immutable,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: test_span(),
+        }],
+        type_params: vec![],
+        return_type: Type::Primitive(PrimitiveType::I32),
+        body: Some(TypedBlock {
+            statements: vec![typed_node(
+                TypedStatement::Return(Some(Box::new(entry_call))),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            )],
+            span: test_span(),
+        }),
+        visibility: Visibility::Public,
+        is_async: false,
+        is_external: false,
+        calling_convention: CallingConvention::Default,
+        link_name: None,
+        annotations: vec![],
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let mut program = TypedProgram {
+        declarations: vec![
+            typed_node(
+                TypedDeclaration::Function(from_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+            typed_node(
+                TypedDeclaration::Function(take_target),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+            typed_node(
+                TypedDeclaration::Function(entry),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+        ],
+        span: test_span(),
+        source_files: vec![],
+        type_registry: type_registry.clone(),
+    };
+
+    let type_registry = Arc::new(type_registry);
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("test_module");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+
+    let result = ctx.lower_program(&mut program);
+    assert!(
+        result.is_ok(),
+        "Failed to lower implicit From conversion program: {:?}",
+        result.err()
+    );
+
+    let module = result.unwrap();
+    let entry = module
+        .functions
+        .values()
+        .find(|f| f.name.resolve_global().as_deref() == Some("entry"))
+        .expect("entry function should exist");
+
+    let mut id_to_name = std::collections::HashMap::new();
+    for func in module.functions.values() {
+        if let Some(name) = func.name.resolve_global() {
+            id_to_name.insert(func.id, name);
+        }
+    }
+
+    let called_names: Vec<String> = entry
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Function(id),
+                ..
+            } => id_to_name.get(id).cloned(),
+            HirInstruction::Call {
+                callee: HirCallable::Symbol(name),
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        called_names.iter().any(|n| n == "Target$From$from"),
+        "Expected inserted implicit conversion call, got calls: {:?}",
+        called_names
+    );
+    assert!(
+        called_names.iter().any(|n| n == "take_target"),
+        "Expected target function call, got calls: {:?}",
+        called_names
+    );
+}
+
+#[test]
+fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
+    let _skip_type_check = skip_type_check();
+    let mut arena = test_arena();
+    let mut type_registry = TypeRegistry::new();
+
+    let source_name = arena.intern_string("Source");
+    let source_id = type_registry.register_struct_type(
+        source_name,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        zyntax_typed_ast::TypeMetadata::default(),
+        test_span(),
+    );
+    let target_name = arena.intern_string("Target");
+    let target_id = type_registry.register_struct_type(
+        target_name,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        zyntax_typed_ast::TypeMetadata::default(),
+        test_span(),
+    );
+
+    let source_ty = Type::Named {
+        id: source_id,
+        type_args: vec![],
+        const_args: vec![],
+        variance: vec![],
+        nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+    };
+    let target_ty = Type::Named {
+        id: target_id,
+        type_args: vec![],
+        const_args: vec![],
+        variance: vec![],
+        nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+    };
+
+    let from_trait_name = arena.intern_string("From");
+    let from_method_name = arena.intern_string("from");
+    let value_name = arena.intern_string("value");
+    let from_trait = TraitDef {
+        id: TypeId::next(),
+        name: from_trait_name,
+        type_params: vec![],
+        super_traits: vec![],
+        methods: vec![MethodSig {
+            name: from_method_name,
+            type_params: vec![],
+            params: vec![ParamDef {
+                name: value_name,
+                ty: source_ty.clone(),
+                is_self: false,
+                is_varargs: false,
+                is_mut: false,
+            }],
+            return_type: target_ty.clone(),
+            where_clause: vec![],
+            is_static: true,
+            is_async: false,
+            visibility: Visibility::Public,
+            span: test_span(),
+            is_extension: false,
+        }],
+        associated_types: vec![],
+        is_object_safe: true,
+        span: test_span(),
+    };
+    let from_trait_id = from_trait.id;
+    type_registry.register_trait(from_trait);
+
+    type_registry.register_implementation(ImplDef {
+        trait_id: from_trait_id,
+        for_type: target_ty.clone(),
+        type_args: vec![source_ty.clone()],
+        methods: vec![MethodImpl {
+            signature: MethodSig {
+                name: from_method_name,
+                type_params: vec![],
+                params: vec![ParamDef {
+                    name: value_name,
+                    ty: source_ty.clone(),
+                    is_self: false,
+                    is_varargs: false,
+                    is_mut: false,
+                }],
+                return_type: target_ty.clone(),
+                where_clause: vec![],
+                is_static: true,
+                is_async: false,
+                visibility: Visibility::Public,
+                span: test_span(),
+                is_extension: false,
+            },
+            is_default: false,
+        }],
+        associated_types: std::collections::HashMap::new(),
+        where_clause: vec![],
+        span: test_span(),
+    });
+
+    let src_param_name = arena.intern_string("src");
+    let from_fn = TypedFunction {
+        name: arena.intern_string("Target$From$from"),
+        params: vec![TypedParameter {
+            name: value_name,
+            ty: source_ty.clone(),
+            mutability: Mutability::Immutable,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: test_span(),
+        }],
+        type_params: vec![],
+        return_type: target_ty.clone(),
+        body: None,
+        visibility: Visibility::Public,
+        is_async: false,
+        is_external: true,
+        calling_convention: CallingConvention::Default,
+        link_name: None,
+        annotations: vec![],
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let make_target_name = arena.intern_string("make_target");
+    let make_target = TypedFunction {
+        name: make_target_name,
+        params: vec![],
+        type_params: vec![],
+        return_type: target_ty.clone(),
+        body: None,
+        visibility: Visibility::Public,
+        is_async: false,
+        is_external: true,
+        calling_convention: CallingConvention::Default,
+        link_name: None,
+        annotations: vec![],
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let dst_name = arena.intern_string("dst");
+    let make_target_call = typed_node(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(typed_node(
+                TypedExpression::Variable(make_target_name),
+                Type::Any,
+                test_span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        target_ty.clone(),
+        test_span(),
+    );
+    let let_stmt = typed_node(
+        TypedStatement::Let(TypedLet {
+            name: dst_name,
+            ty: target_ty.clone(),
+            mutability: Mutability::Mutable,
+            initializer: Some(Box::new(make_target_call)),
+            span: test_span(),
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        test_span(),
+    );
+
+    let assign_expr = typed_node(
+        TypedExpression::Binary(TypedBinary {
+            op: BinaryOp::Assign,
+            left: Box::new(typed_node(
+                TypedExpression::Variable(dst_name),
+                target_ty.clone(),
+                test_span(),
+            )),
+            right: Box::new(typed_node(
+                TypedExpression::Variable(src_param_name),
+                source_ty.clone(),
+                test_span(),
+            )),
+        }),
+        target_ty.clone(),
+        test_span(),
+    );
+    let assign_stmt = typed_node(
+        TypedStatement::Expression(Box::new(assign_expr)),
+        Type::Primitive(PrimitiveType::Unit),
+        test_span(),
+    );
+
+    let return_stmt = typed_node(
+        TypedStatement::Return(Some(Box::new(typed_node(
+            TypedExpression::Variable(src_param_name),
+            source_ty.clone(),
+            test_span(),
+        )))),
+        Type::Primitive(PrimitiveType::Unit),
+        test_span(),
+    );
+
+    let entry = TypedFunction {
+        name: arena.intern_string("entry"),
+        params: vec![TypedParameter {
+            name: src_param_name,
+            ty: source_ty.clone(),
+            mutability: Mutability::Immutable,
+            kind: ParameterKind::Regular,
+            default_value: None,
+            attributes: vec![],
+            span: test_span(),
+        }],
+        type_params: vec![],
+        return_type: target_ty.clone(),
+        body: Some(TypedBlock {
+            statements: vec![let_stmt, assign_stmt, return_stmt],
+            span: test_span(),
+        }),
+        visibility: Visibility::Public,
+        is_async: false,
+        is_external: false,
+        calling_convention: CallingConvention::Default,
+        link_name: None,
+        annotations: vec![],
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let mut program = TypedProgram {
+        declarations: vec![
+            typed_node(
+                TypedDeclaration::Function(from_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+            typed_node(
+                TypedDeclaration::Function(make_target),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+            typed_node(
+                TypedDeclaration::Function(entry),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+        ],
+        span: test_span(),
+        source_files: vec![],
+        type_registry: type_registry.clone(),
+    };
+
+    let type_registry = Arc::new(type_registry);
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("test_module");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+
+    let result = ctx.lower_program(&mut program);
+    assert!(
+        result.is_ok(),
+        "Failed to lower implicit From assignment/return conversion program: {:?}",
+        result.err()
+    );
+
+    let module = result.unwrap();
+    let entry = module
+        .functions
+        .values()
+        .find(|f| f.name.resolve_global().as_deref() == Some("entry"))
+        .expect("entry function should exist");
+
+    let mut id_to_name = std::collections::HashMap::new();
+    for func in module.functions.values() {
+        if let Some(name) = func.name.resolve_global() {
+            id_to_name.insert(func.id, name);
+        }
+    }
+
+    let called_names: Vec<String> = entry
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Function(id),
+                ..
+            } => id_to_name.get(id).cloned(),
+            HirInstruction::Call {
+                callee: HirCallable::Symbol(name),
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let from_calls = called_names
+        .iter()
+        .filter(|name| *name == "Target$From$from")
+        .count();
+    assert!(
+        from_calls >= 2,
+        "Expected implicit conversion calls for both assignment and return, got calls: {:?}",
+        called_names
+    );
 }
 
 #[test]
