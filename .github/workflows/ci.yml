@@ -30,3 +30,40 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets
+
+  parse-conformance:
+    name: parse conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run docs snippet parse conformance
+        run: RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests docs_conformance:: -- --nocapture
+
+      - name: Run examples parse regression suite
+        run: RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests examples_regression:: -- --nocapture
+
+  runtime-smoke:
+    name: runtime smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run runtime smoke tests
+        run: |
+          RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests execution::test_execute_simple_expression -- --nocapture
+          RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests execution::test_execute_prelude_only_example -- --nocapture

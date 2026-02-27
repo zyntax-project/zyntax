@@ -3566,6 +3566,30 @@ mod execution {
         }
     }
 
+    #[test]
+    fn test_execute_prelude_only_example() {
+        let Some(mut zynml) = create_runtime_with_plugins() else {
+            println!("Skipping: plugins not available");
+            return;
+        };
+
+        let example_path = examples_dir().join("test_prelude_only.zynml");
+        if !example_path.exists() {
+            println!("Skipping: test_prelude_only.zynml not found");
+            return;
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            zynml.run_file(&example_path)
+        }));
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("test_prelude_only.zynml should execute successfully: {}", e),
+            Err(_) => panic!("test_prelude_only.zynml caused a runtime panic"),
+        }
+    }
+
     // Ignored: this test crashes the test process with SIGABRT (stack overflow in Grammar2
     // interpreter parsing the complex prelude.zynml) or SIGSEGV (tensor runtime bug in
     // println_any). Both are pre-existing issues that kill the test runner via signal.
