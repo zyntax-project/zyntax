@@ -396,7 +396,7 @@
     <a href="#" class="nav-logo">Zyntax</a>
 
     <ul class="nav-links">
-      <li><a href="https://darmie.github.io/zyntax/book">The Zyn Book</a></li>
+      <li><a href="https://darmie.github.io/zyntax/book/">The Zyn Book</a></li>
       <li><a href="#" class="nav-link-badge">Playground <span class="coming-soon">Soon</span></a></li>
       <li>
         <a href="https://github.com/darmie/zyntax" class="nav-cta" target="_blank" rel="noopener">
@@ -431,7 +431,7 @@
         </p>
 
         <div class="hero-actions">
-          <a href="https://darmie.github.io/zyntax/book" class="btn btn-primary">
+          <a href="https://darmie.github.io/zyntax/book/" class="btn btn-primary">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
               <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
@@ -495,7 +495,7 @@
 
     const containerRect = container.getBoundingClientRect();
     const camera = new THREE.PerspectiveCamera(50, containerRect.width / containerRect.height, 0.1, 100);
-    camera.position.set(0, 0.2, 5);
+    camera.position.set(0, -0.3, 5);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(containerRect.width, containerRect.height);
