@@ -39,16 +39,24 @@ pub struct ZyntaxArray<T: Copy> {
 
 impl<T: Copy> ZyntaxArray<T> {
     /// Create a new empty array with the given capacity
+    ///
+    /// # Panics
+    /// Panics if the allocation size overflows or if allocation fails.
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1) as i32;
-        let total_size = ARRAY_HEADER_SIZE + (capacity as usize) * std::mem::size_of::<T>();
+        let capacity = capacity.max(1).min(i32::MAX as usize) as i32;
+        let elem_bytes = (capacity as usize)
+            .checked_mul(std::mem::size_of::<T>())
+            .expect("ZyntaxArray: capacity * element size overflows");
+        let total_size = ARRAY_HEADER_SIZE
+            .checked_add(elem_bytes)
+            .expect("ZyntaxArray: total allocation size overflows");
 
         unsafe {
             let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
             let ptr = std::alloc::alloc(layout) as *mut i32;
 
             if ptr.is_null() {
-                panic!("Failed to allocate ZyntaxArray");
+                std::alloc::handle_alloc_error(layout);
             }
 
             // Write header
@@ -239,11 +247,16 @@ impl<T: Copy> ZyntaxArray<T> {
     /// Grow the array capacity (doubles it)
     fn grow(&mut self) {
         let old_cap = self.capacity();
-        let new_cap = (old_cap * 2).max(8);
+        let new_cap = (old_cap * 2).max(8).min(i32::MAX as usize);
         let len = self.len();
 
         let old_size = ARRAY_HEADER_SIZE + old_cap * std::mem::size_of::<T>();
-        let new_size = ARRAY_HEADER_SIZE + new_cap * std::mem::size_of::<T>();
+        let new_elem_bytes = new_cap
+            .checked_mul(std::mem::size_of::<T>())
+            .expect("ZyntaxArray grow: capacity * element size overflows");
+        let new_size = ARRAY_HEADER_SIZE
+            .checked_add(new_elem_bytes)
+            .expect("ZyntaxArray grow: total allocation size overflows");
 
         unsafe {
             let old_layout = std::alloc::Layout::from_size_align_unchecked(old_size, 4);
@@ -251,7 +264,8 @@ impl<T: Copy> ZyntaxArray<T> {
                 std::alloc::realloc(self.ptr.as_ptr() as *mut u8, old_layout, new_size) as *mut i32;
 
             if new_ptr.is_null() {
-                panic!("Failed to grow ZyntaxArray");
+                let new_layout = std::alloc::Layout::from_size_align_unchecked(new_size, 4);
+                std::alloc::handle_alloc_error(new_layout);
             }
 
             *new_ptr = new_cap as i32;

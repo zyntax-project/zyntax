@@ -433,10 +433,13 @@ impl Default for DynamicBox {
     }
 }
 
-// Default dropper uses std::alloc::dealloc
+// Default dropper — cannot safely dealloc because the dropper signature
+// `fn(*mut u8)` does not carry the allocation size needed for `dealloc`.
+// Code should prefer `from_value<T>()` which uses `drop_box::<T>` instead.
+// This exists only as a fallback for `alloc()` and `clone_box()`.
 extern "C" fn default_dropper(ptr: *mut u8) {
-    // We can't know the exact layout, so we just leak it
-    // Real usage should use typed droppers
+    // Cannot dealloc without knowing the Layout (size + align).
+    // Callers should use typed droppers via `from_value<T>()`.
     let _ = ptr;
 }
 

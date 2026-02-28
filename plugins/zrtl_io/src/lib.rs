@@ -33,6 +33,20 @@ use zrtl::{
 };
 
 // ============================================================================
+// DynamicBox Dropper Functions
+// ============================================================================
+
+/// Dropper for DynamicBox values whose `data` field is a ZRTL string pointer.
+/// Frees the string using the ZRTL allocation layout (header + data bytes).
+extern "C" fn drop_zrtl_string(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe { string_free(ptr as StringPtr) }
+}
+
+
+// ============================================================================
 // String I/O Functions (using ZRTL string format)
 // ============================================================================
 
@@ -456,7 +470,15 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
                 return;
             }
 
+            let capacity = zrtl::array_capacity(arr_ptr) as usize;
             let len = zrtl::array_length(arr_ptr) as usize;
+
+            // Validate: length must not exceed capacity
+            if len > capacity || capacity > (1 << 28) {
+                let _ = write!(output, "<array len={} cap={} (invalid)>", len, capacity);
+                return;
+            }
+
             output.push('[');
 
             // Determine element type from size (heuristic)
@@ -469,7 +491,14 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
 
             // Try to print elements based on common element sizes
             let data_ptr = zrtl::array_data::<u8>(arr_ptr);
-            for i in 0..len.min(10) { // Limit to 10 elements for display
+            if data_ptr.is_null() {
+                output.push_str("<null data>");
+                output.push(']');
+                return;
+            }
+
+            let display_len = len.min(10);
+            for i in 0..display_len {
                 if i > 0 { output.push_str(", "); }
 
                 match elem_size {
@@ -515,10 +544,24 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
         TypeCategory::Tuple => {
             // Tuple is stored as consecutive DynamicBox values
             // Size tells us total bytes, each DynamicBox is 32 bytes (on 64-bit)
-            let num_elements = value.size as usize / std::mem::size_of::<zrtl::DynamicBox>();
+            let box_size = std::mem::size_of::<zrtl::DynamicBox>();
+            if box_size == 0 || (value.size as usize) % box_size != 0 {
+                let _ = write!(output, "<tuple {} bytes (misaligned)>", value.size);
+                return;
+            }
+            let num_elements = value.size as usize / box_size;
+            if num_elements > 256 {
+                let _ = write!(output, "<tuple {} elements (suspicious)>", num_elements);
+                return;
+            }
             output.push('(');
             let elements = value.data as *const zrtl::DynamicBox;
-            for i in 0..num_elements.min(10) {
+            if elements.is_null() {
+                output.push_str("<null>)");
+                return;
+            }
+            let display_count = num_elements.min(10);
+            for i in 0..display_count {
                 if i > 0 { output.push_str(", "); }
                 let elem = &*elements.add(i);
                 format_dynamic_box(elem, output);
@@ -607,15 +650,15 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
                 // Call the display function to format the value
                 let formatted_ptr = display_fn(value.data as *const u8);
                 if !formatted_ptr.is_null() {
-                    // Display function returned a ZRTL string pointer
-                    // Cast from *const u8 to StringConstPtr (*const i32)
+                    // Display function returned a heap-allocated ZRTL string pointer
                     let str_ptr = formatted_ptr as StringConstPtr;
                     if let Some(formatted_str) = zrtl::string_as_str(str_ptr) {
                         output.push_str(formatted_str);
                     } else {
                         output.push_str("<opaque (display invalid utf8)>");
                     }
-                    // The string is owned by the display function, don't free it here
+                    // Free the display function's returned string (it was heap-allocated)
+                    string_free(formatted_ptr as StringPtr);
                 } else {
                     // Display function returned null - fall back to hex dump
                     output.push_str("<opaque (display failed)>");
@@ -822,8 +865,12 @@ pub unsafe extern "C" fn io_println_array_f64(arr: zrtl::ArrayConstPtr) {
 // String Concatenation
 // ============================================================================
 
-/// Convert a string pointer to a DynamicBox
-/// Used by f-string desugaring to make string results compatible with println_dynamic
+/// Convert a string pointer to a DynamicBox (borrows the string, caller manages lifetime)
+///
+/// # Safety
+/// - `s` must be a valid ZRTL string pointer or null
+/// - The string must remain valid for the lifetime of the returned DynamicBox
+/// - The caller must free the returned DynamicBox with `Box::from_raw`
 #[no_mangle]
 pub unsafe extern "C" fn io_string_to_dynamic(s: StringConstPtr) -> *mut zrtl::DynamicBox {
     use zrtl::{DynamicBox, TypeTag};
@@ -832,15 +879,15 @@ pub unsafe extern "C" fn io_string_to_dynamic(s: StringConstPtr) -> *mut zrtl::D
         return Box::into_raw(Box::new(DynamicBox::null()));
     }
 
-    // The DynamicBox for String category expects data to be a StringConstPtr
-    // (pointer to ZRTL string format: [i32 length][utf8 bytes])
-    // We just wrap the existing pointer - caller is responsible for memory
+    // Copy the string so the DynamicBox owns its data and can free it via dropper
+    let copy = zrtl::string_copy(s);
+
     Box::into_raw(Box::new(DynamicBox {
         tag: TypeTag::STRING,
         size: std::mem::size_of::<*const u8>() as u32,
-        data: s as *mut u8,
-        dropper: None,     // Don't free the string, caller manages it
-        display_fn: None,  // Use default string formatting
+        data: copy as *mut u8,
+        dropper: Some(drop_zrtl_string),
+        display_fn: None,
     }))
 }
 
@@ -933,7 +980,7 @@ pub unsafe extern "C" fn io_concat_dynamic(a: *const zrtl::DynamicBox, b: *const
         tag: TypeTag::STRING,
         size: std::mem::size_of::<*const u8>() as u32,
         data: str_ptr as *mut u8,
-        dropper: None,  // TODO: Add dropper to free the string
+        dropper: Some(drop_zrtl_string),
         display_fn: None,
     }))
 }
@@ -1116,6 +1163,193 @@ mod tests {
                 rendered
             );
             string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_string_to_dynamic_copies_string() {
+        // Verify io_string_to_dynamic creates an owned copy
+        let original = string_new("hello");
+        unsafe {
+            let boxed_ptr = io_string_to_dynamic(original);
+            assert!(!boxed_ptr.is_null());
+
+            let boxed = &*boxed_ptr;
+            assert_eq!(boxed.tag.category(), TypeCategory::String);
+            assert!(boxed.dropper.is_some(), "DynamicBox should have a dropper");
+
+            // The data pointer should be different from the original (it's a copy)
+            assert_ne!(boxed.data as *const u8, original as *const u8 as *const u8);
+
+            // Verify the copied string content
+            let str_ptr = boxed.data as StringConstPtr;
+            assert_eq!(string_as_str(str_ptr), Some("hello"));
+
+            // Clean up: free the DynamicBox's string via dropper, the Box, and the original
+            if let Some(dropper) = boxed.dropper {
+                dropper(boxed.data);
+            }
+            let _ = Box::from_raw(boxed_ptr);
+            string_free(original);
+        }
+    }
+
+    #[test]
+    fn test_string_to_dynamic_null_input() {
+        unsafe {
+            let boxed_ptr = io_string_to_dynamic(std::ptr::null());
+            assert!(!boxed_ptr.is_null());
+            let boxed = &*boxed_ptr;
+            assert!(boxed.data.is_null(), "null input should produce null DynamicBox");
+            let _ = Box::from_raw(boxed_ptr);
+        }
+    }
+
+    #[test]
+    fn test_concat_dynamic_has_dropper() {
+        // Verify io_concat_dynamic creates DynamicBox with string dropper
+        let s1 = string_new("hello ");
+        let s2 = string_new("world");
+
+        unsafe {
+            let box1 = io_string_to_dynamic(s1);
+            let box2 = io_string_to_dynamic(s2);
+
+            let result = io_concat_dynamic(box1, box2);
+            assert!(!result.is_null());
+
+            let result_box = &*result;
+            assert_eq!(result_box.tag.category(), TypeCategory::String);
+            assert!(result_box.dropper.is_some(), "concat result should have a string dropper");
+
+            // Verify content
+            let str_ptr = result_box.data as StringConstPtr;
+            assert_eq!(string_as_str(str_ptr), Some("hello world"));
+
+            // Clean up (call dropper for the string, then free the Box)
+            if let Some(dropper) = result_box.dropper {
+                dropper(result_box.data);
+            }
+            let _ = Box::from_raw(result);
+
+            // Clean up inputs
+            let b1 = &*box1;
+            if let Some(dropper) = b1.dropper { dropper(b1.data); }
+            let _ = Box::from_raw(box1);
+            let b2 = &*box2;
+            if let Some(dropper) = b2.dropper { dropper(b2.data); }
+            let _ = Box::from_raw(box2);
+
+            string_free(s1);
+            string_free(s2);
+        }
+    }
+
+    #[test]
+    fn test_format_dynamic_null_safety() {
+        unsafe {
+            // Null pointer should return "null"
+            let formatted = io_format_dynamic(std::ptr::null());
+            assert!(!formatted.is_null());
+            assert_eq!(string_as_str(formatted), Some("null"));
+            string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_format_dynamic_null_data_box() {
+        // DynamicBox with null data field
+        let boxed = zrtl::DynamicBox::null();
+        unsafe {
+            let formatted = io_format_dynamic(&boxed as *const zrtl::DynamicBox);
+            assert!(!formatted.is_null());
+            assert_eq!(string_as_str(formatted), Some("null"));
+            string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_format_dynamic_int_types() {
+        // Test various integer sizes
+        let val: i32 = -42;
+        let boxed = zrtl::DynamicBox {
+            tag: TypeTag::new(TypeCategory::Int, 0, TypeFlags::NONE),
+            size: 4,
+            data: &val as *const i32 as *mut u8,
+            dropper: None,
+            display_fn: None,
+        };
+        unsafe {
+            let formatted = io_format_dynamic(&boxed as *const zrtl::DynamicBox);
+            assert_eq!(string_as_str(formatted), Some("-42"));
+            string_free(formatted);
+        }
+
+        let val64: i64 = 9999999;
+        let boxed64 = zrtl::DynamicBox {
+            tag: TypeTag::new(TypeCategory::Int, 0, TypeFlags::NONE),
+            size: 8,
+            data: &val64 as *const i64 as *mut u8,
+            dropper: None,
+            display_fn: None,
+        };
+        unsafe {
+            let formatted = io_format_dynamic(&boxed64 as *const zrtl::DynamicBox);
+            assert_eq!(string_as_str(formatted), Some("9999999"));
+            string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_format_dynamic_float_types() {
+        let val: f64 = 3.14;
+        let boxed = zrtl::DynamicBox {
+            tag: TypeTag::new(TypeCategory::Float, 0, TypeFlags::NONE),
+            size: 8,
+            data: &val as *const f64 as *mut u8,
+            dropper: None,
+            display_fn: None,
+        };
+        unsafe {
+            let formatted = io_format_dynamic(&boxed as *const zrtl::DynamicBox);
+            let s = string_as_str(formatted).unwrap_or_default();
+            assert!(s.starts_with("3.14"), "expected 3.14..., got: {}", s);
+            string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_format_dynamic_bool() {
+        let val: u8 = 1;
+        let boxed = zrtl::DynamicBox {
+            tag: TypeTag::new(TypeCategory::Bool, 0, TypeFlags::NONE),
+            size: 1,
+            data: &val as *const u8 as *mut u8,
+            dropper: None,
+            display_fn: None,
+        };
+        unsafe {
+            let formatted = io_format_dynamic(&boxed as *const zrtl::DynamicBox);
+            assert_eq!(string_as_str(formatted), Some("true"));
+            string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_format_dynamic_string() {
+        let s = string_new("test string");
+        let boxed = zrtl::DynamicBox {
+            tag: TypeTag::STRING,
+            size: std::mem::size_of::<*const u8>() as u32,
+            data: s as *mut u8,
+            dropper: None,
+            display_fn: None,
+        };
+        unsafe {
+            let formatted = io_format_dynamic(&boxed as *const zrtl::DynamicBox);
+            assert_eq!(string_as_str(formatted), Some("test string"));
+            string_free(formatted);
+            string_free(s);
         }
     }
 }
