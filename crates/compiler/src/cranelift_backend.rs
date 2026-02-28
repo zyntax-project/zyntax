@@ -1173,8 +1173,7 @@ impl CraneliftBackend {
                                 BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
                                 BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
                                 BinaryOp::FRem => {
-                                    // TODO: Re-implement fmod import in multi-block context
-                                    builder.ins().f64const(0.0)
+                                    Self::call_libm_fmod(&mut self.module, &mut builder, lhs, rhs)?
                                 }
                                 // Float comparisons also always return bool (i8)
                                 BinaryOp::FEq
@@ -4148,27 +4147,49 @@ impl CraneliftBackend {
         }
     }
 
-    /// Call libm fmod function for float remainder operation
-    fn call_libm_fmod(
-        &mut self,
+    /// Call libm fmod function for float remainder operation.
+    /// Supports scalar f32 (fmodf) and f64 (fmod); vector frem is rejected.
+    fn call_libm_fmod<M: Module>(
+        module: &mut M,
         builder: &mut FunctionBuilder,
         lhs: Value,
         rhs: Value,
     ) -> CompilerResult<Value> {
-        // Declare fmod signature: double fmod(double x, double y)
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::F64));
-        sig.params.push(AbiParam::new(types::F64));
-        sig.returns.push(AbiParam::new(types::F64));
+        let lhs_ty = builder.func.dfg.value_type(lhs);
+        let rhs_ty = builder.func.dfg.value_type(rhs);
+        if lhs_ty != rhs_ty {
+            return Err(CompilerError::CodeGen(format!(
+                "frem operand type mismatch: lhs={:?}, rhs={:?}",
+                lhs_ty, rhs_ty
+            )));
+        }
 
-        // Declare fmod as an external function
-        let fmod_id = self
-            .module
-            .declare_function("fmod", Linkage::Import, &sig)
-            .map_err(|e| CompilerError::Backend(format!("Failed to declare fmod: {}", e)))?;
+        let (symbol_name, param_ty) = match lhs_ty {
+            types::F64 => ("fmod", types::F64),
+            types::F32 => ("fmodf", types::F32),
+            other => {
+                return Err(CompilerError::CodeGen(format!(
+                    "frem currently supports scalar f32/f64 only, got {:?}",
+                    other
+                )));
+            }
+        };
+
+        // Declare fmod signature for the selected scalar float width.
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(param_ty));
+        sig.params.push(AbiParam::new(param_ty));
+        sig.returns.push(AbiParam::new(param_ty));
+
+        // Declare fmod/fmodf as an external function.
+        let fmod_id = module
+            .declare_function(symbol_name, Linkage::Import, &sig)
+            .map_err(|e| {
+                CompilerError::Backend(format!("Failed to declare {}: {}", symbol_name, e))
+            })?;
 
         // Import the function into the current function
-        let fmod_func = self.module.declare_func_in_func(fmod_id, builder.func);
+        let fmod_func = module.declare_func_in_func(fmod_id, builder.func);
 
         // Call fmod
         let call = builder.ins().call(fmod_func, &[lhs, rhs]);
@@ -4467,7 +4488,7 @@ impl CraneliftBackend {
                     BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
                     BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
                     // Float remainder requires libm fmod function call
-                    BinaryOp::FRem => self.call_libm_fmod(builder, lhs, rhs)?,
+                    BinaryOp::FRem => Self::call_libm_fmod(&mut self.module, builder, lhs, rhs)?,
 
                     // Bitwise
                     BinaryOp::And => builder.ins().band(lhs, rhs),
@@ -4618,7 +4639,7 @@ impl CraneliftBackend {
                     BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
                     BinaryOp::FRem => {
                         // Cranelift doesn't have frem, use libm fmod
-                        self.call_libm_fmod(builder, lhs, rhs)?
+                        Self::call_libm_fmod(&mut self.module, builder, lhs, rhs)?
                     }
                     // Floating point comparisons - always return i8 (bool), never uextend
                     BinaryOp::FEq => builder.ins().fcmp(FloatCC::Equal, lhs, rhs),
@@ -6079,7 +6100,7 @@ impl CraneliftBackend {
                     BinaryOp::FSub => builder.ins().fsub(lhs, rhs),
                     BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
                     BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
-                    BinaryOp::FRem => self.call_libm_fmod(builder, lhs, rhs)?,
+                    BinaryOp::FRem => Self::call_libm_fmod(&mut self.module, builder, lhs, rhs)?,
                     // Float comparisons - also always return bool (i8)
                     BinaryOp::FEq
                     | BinaryOp::FNe

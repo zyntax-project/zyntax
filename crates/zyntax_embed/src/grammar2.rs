@@ -113,35 +113,65 @@ impl Grammar2 {
     ) -> Grammar2Result<TypedProgram> {
         use zyntax_typed_ast::source::SourceFile;
 
-        let interpreter = GrammarInterpreter::new(&self.grammar);
+        const PARSE_STACK_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
-        let mut builder = TypedASTBuilder::new();
-        let mut registry = TypeRegistry::new();
-        let mut state = ParserState::new(source, &mut builder, &mut registry);
+        let grammar = Arc::clone(&self.grammar);
+        let source_owned = source.to_string();
+        let filename_owned = filename.to_string();
 
-        // Parse from the entry rule
-        let result = interpreter.parse(&mut state);
+        let handle = std::thread::Builder::new()
+            .name("grammar2-parse".to_string())
+            .stack_size(PARSE_STACK_SIZE_BYTES)
+            .spawn(move || {
+                let interpreter = GrammarInterpreter::new(&grammar);
 
-        match result {
-            ParseResult::Success(ParsedValue::Program(mut program), _) => {
-                // Add source file for diagnostics
-                program.source_files =
-                    vec![SourceFile::new(filename.to_string(), source.to_string())];
-                Ok(*program)
-            }
-            ParseResult::Success(other, _) => {
-                // If we get something other than a program, wrap it
-                eprintln!(
-                    "[Grammar2] Warning: parse returned {:?}, expected Program",
-                    std::mem::discriminant(&other)
-                );
-                Err(Grammar2Error::UnexpectedResult)
-            }
-            ParseResult::Failure(e) => Err(Grammar2Error::SourceParseError(format!(
-                "Parse error at {}:{}: expected {:?}",
-                e.line, e.column, e.expected
-            ))),
-        }
+                let mut builder = TypedASTBuilder::new();
+                let mut registry = TypeRegistry::new();
+                let mut state = ParserState::new(&source_owned, &mut builder, &mut registry);
+
+                // Parse from the entry rule
+                let result = interpreter.parse(&mut state);
+
+                match result {
+                    ParseResult::Success(ParsedValue::Program(mut program), _) => {
+                        // Add source file for diagnostics
+                        program.source_files = vec![SourceFile::new(
+                            filename_owned.clone(),
+                            source_owned.clone(),
+                        )];
+                        Ok(*program)
+                    }
+                    ParseResult::Success(other, _) => {
+                        // If we get something other than a program, wrap it
+                        eprintln!(
+                            "[Grammar2] Warning: parse returned {:?}, expected Program",
+                            std::mem::discriminant(&other)
+                        );
+                        Err(Grammar2Error::UnexpectedResult)
+                    }
+                    ParseResult::Failure(e) => Err(Grammar2Error::SourceParseError(format!(
+                        "Parse error at {}:{}: expected {:?}",
+                        e.line, e.column, e.expected
+                    ))),
+                }
+            })
+            .map_err(|e| {
+                Grammar2Error::SourceParseError(format!("Failed to spawn parser thread: {}", e))
+            })?;
+
+        handle.join().map_err(|panic_payload| {
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            Grammar2Error::SourceParseError(format!(
+                "Grammar2 parser thread panicked: {}",
+                panic_msg
+            ))
+        })?
     }
 
     /// Parse source code with plugin signatures (for proper extern declarations)

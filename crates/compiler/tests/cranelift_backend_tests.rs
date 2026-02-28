@@ -226,6 +226,38 @@ fn test_vector_f32x4_add_compilation() {
         .expect("Failed to compile f32x4 add function");
 }
 
+/// Test scalar float remainder codegen (f64 + f32).
+#[test]
+fn test_scalar_float_remainder_compilation() {
+    let mut backend = CraneliftBackend::new().expect("Failed to create backend");
+
+    let f64_func = create_float_arithmetic_function("f64_rem", BinaryOp::FRem, HirType::F64);
+    backend
+        .compile_function(f64_func.id, &f64_func)
+        .expect("Failed to compile f64 remainder function");
+
+    let f32_func = create_float_arithmetic_function("f32_rem", BinaryOp::FRem, HirType::F32);
+    backend
+        .compile_function(f32_func.id, &f32_func)
+        .expect("Failed to compile f32 remainder function");
+}
+
+/// Vector float remainder is currently unsupported in Cranelift path.
+#[test]
+fn test_vector_float_remainder_rejected() {
+    let mut backend = CraneliftBackend::new().expect("Failed to create backend");
+    let func = create_vector_arithmetic_function("vec_f32x4_rem", BinaryOp::FRem, HirType::F32, 4);
+    let err = backend
+        .compile_function(func.id, &func)
+        .expect_err("Expected vector frem to be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("frem currently supports scalar f32/f64 only"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
 /// Test comparison operations
 #[test]
 fn test_comparison_operations() {
@@ -425,6 +457,57 @@ fn create_vector_arithmetic_function(
         op,
         result,
         ty: vec_ty,
+        left: param_a,
+        right: param_b,
+    };
+
+    let block = func.blocks.get_mut(&entry_block_id).unwrap();
+    block.add_instruction(inst);
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
+
+    func
+}
+
+/// Helper function to create scalar float arithmetic operations.
+fn create_float_arithmetic_function(name: &str, op: BinaryOp, ty: HirType) -> HirFunction {
+    let name = create_test_string(name);
+
+    let sig = HirFunctionSignature {
+        params: vec![
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("a"),
+                ty: ty.clone(),
+                attributes: ParamAttributes::default(),
+            },
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("b"),
+                ty: ty.clone(),
+                attributes: ParamAttributes::default(),
+            },
+        ],
+        returns: vec![ty.clone()],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let mut func = HirFunction::new(name, sig);
+    let entry_block_id = func.entry_block;
+    let param_a = func.create_value(ty.clone(), HirValueKind::Parameter(0));
+    let param_b = func.create_value(ty.clone(), HirValueKind::Parameter(1));
+    let result = func.create_value(ty.clone(), HirValueKind::Instruction);
+    let inst = HirInstruction::Binary {
+        op,
+        result,
+        ty,
         left: param_a,
         right: param_b,
     };
