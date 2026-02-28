@@ -478,6 +478,15 @@ impl AnalysisRunner {
 
             // CaptureContinuation always has a result
             HirInstruction::CaptureContinuation { result, .. } => Some(*result),
+
+            // SIMD instructions: Splat/Extract/Insert/Reduce/Load produce a result
+            HirInstruction::VectorSplat { result, .. }
+            | HirInstruction::VectorExtractLane { result, .. }
+            | HirInstruction::VectorInsertLane { result, .. }
+            | HirInstruction::VectorHorizontalReduce { result, .. }
+            | HirInstruction::VectorLoad { result, .. } => Some(*result),
+            // VectorStore only writes to memory, no result
+            HirInstruction::VectorStore { .. } => None,
         }
     }
 

@@ -918,6 +918,38 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
                 fmt_type(resume_ty)
             )
         }
+        // SIMD instructions
+        HirInstruction::VectorSplat { result, ty, scalar } => {
+            let r = mapper.value(result);
+            let s = mapper.value(scalar);
+            format!("{}: {} = vector_splat {}", r, fmt_type(ty), s)
+        }
+        HirInstruction::VectorExtractLane { result, ty, vector, lane } => {
+            let r = mapper.value(result);
+            let v = mapper.value(vector);
+            format!("{}: {} = extract_lane {}, lane {}", r, fmt_type(ty), v, lane)
+        }
+        HirInstruction::VectorInsertLane { result, ty, vector, scalar, lane } => {
+            let r = mapper.value(result);
+            let v = mapper.value(vector);
+            let s = mapper.value(scalar);
+            format!("{}: {} = insert_lane {}, lane {}, {}", r, fmt_type(ty), v, lane, s)
+        }
+        HirInstruction::VectorHorizontalReduce { result, ty, vector, op } => {
+            let r = mapper.value(result);
+            let v = mapper.value(vector);
+            format!("{}: {} = hreduce.{} {}", r, fmt_type(ty), fmt_binary_op(op), v)
+        }
+        HirInstruction::VectorLoad { result, ty, ptr, align } => {
+            let r = mapper.value(result);
+            let p = mapper.value(ptr);
+            format!("{}: {} = vload {}, align {}", r, fmt_type(ty), p, align)
+        }
+        HirInstruction::VectorStore { value, ptr, align } => {
+            let v = mapper.value(value);
+            let p = mapper.value(ptr);
+            format!("vstore {}, {}, align {}", v, p, align)
+        }
     }
 }
 

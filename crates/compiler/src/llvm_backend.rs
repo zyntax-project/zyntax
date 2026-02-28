@@ -2998,7 +2998,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                     format!("Intrinsic {:?} not yet implemented in LLVM backend", intrinsic)
                 ))
             }
-            _ => todo!()
+
+            ClosureToZrtl | BoxToZrtl | PrimitiveToBox | TypeTagOf => {
+                Err(CompilerError::CodeGen(
+                    format!("Intrinsic {:?} not yet implemented in LLVM backend", intrinsic)
+                ))
+            }
         }
     }
 

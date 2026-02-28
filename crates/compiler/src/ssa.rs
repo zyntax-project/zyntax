@@ -19,6 +19,23 @@ use zyntax_typed_ast::{
     ConstValue, InternedString, Type,
 };
 
+/// Kernel types recognised in `compute()` body statements (M2).
+///
+/// `@kernel elementwise` / `@kernel reduce` inside a compute body are
+/// lowered by the grammar into a sentinel call statement:
+///   `Call { callee: Variable("kernel"), args: [Variable("elementwise")] }`
+/// `extract_kernel_type` scans the body for that call and returns the
+/// matching variant.
+#[derive(Debug, Clone, PartialEq)]
+enum ComputeKernelType {
+    /// `@kernel elementwise` — each output element independently computed.
+    Elementwise,
+    /// `@kernel reduce` — body accumulates a scalar result.
+    Reduce,
+    /// No `@kernel` directive; fall back to runtime dispatch.
+    Generic,
+}
+
 /// Internal alias used when lowering `compute(...) { ... }` expressions.
 /// This must not collide with user code.
 const INTERNAL_COMPUTE_ALIAS: &str = "__internal_compute_dispatch";
@@ -74,6 +91,11 @@ pub struct SsaBuilder {
     /// Captured yield values for active compute-expression lowering contexts.
     /// Empty outside compute expression translation.
     compute_yield_stack: Vec<Vec<HirId>>,
+    /// After a `@kernel elementwise` SIMD loop is emitted inside a
+    /// `compute()` expression, this field holds the `after_block` ID.
+    /// `process_statement` picks it up and redirects the current block so
+    /// that subsequent statements land in the correct block.
+    simd_continue_block: Option<HirId>,
 }
 
 /// Context for pattern matching
@@ -320,6 +342,74 @@ impl SsaBuilder {
             stack_slots: IndexMap::new(),
             extern_link_names: IndexMap::new(),
             compute_yield_stack: Vec::new(),
+            simd_continue_block: None,
+        }
+    }
+
+    /// Create an `SsaBuilder` that wraps an existing `HirFunction`.
+    ///
+    /// Intended for tests and for code that directly emits HIR blocks
+    /// (e.g. via `emit_elementwise_simd_loop`) without going through the
+    /// full frontend pipeline.  All blocks present in `function` at
+    /// construction time are pre-registered in the `definitions` map.
+    pub fn new_from_function(function: HirFunction) -> Self {
+        use std::sync::Mutex;
+        let type_registry = Arc::new(zyntax_typed_ast::TypeRegistry::new());
+        let arena = Arc::new(Mutex::new(zyntax_typed_ast::AstArena::new()));
+        let mut builder = Self {
+            definitions: IndexMap::new(),
+            incomplete_phis: IndexMap::new(),
+            var_counter: IndexMap::new(),
+            var_types: IndexMap::new(),
+            var_typed_ast_types: IndexMap::new(),
+            sealed_blocks: HashSet::new(),
+            filled_blocks: HashSet::new(),
+            type_registry,
+            arena,
+            closure_functions: Vec::new(),
+            function_symbols: IndexMap::new(),
+            string_globals: Vec::new(),
+            variable_writes: IndexMap::new(),
+            idf_placement_done: false,
+            match_context: None,
+            continuation_block: None,
+            original_return_type: None,
+            address_taken_vars: HashSet::new(),
+            stack_slots: IndexMap::new(),
+            extern_link_names: IndexMap::new(),
+            compute_yield_stack: Vec::new(),
+            simd_continue_block: None,
+            function,
+        };
+        // Pre-register all existing blocks in the definitions map
+        let block_ids: Vec<HirId> = builder.function.blocks.keys().copied().collect();
+        for blk in block_ids {
+            builder.definitions.insert(blk, IndexMap::new());
+        }
+        builder
+    }
+
+    /// Consume the builder and return the completed `HirFunction`.
+    pub fn finish(self) -> HirFunction {
+        self.function
+    }
+
+    /// Allocate a new HIR value in the function (convenience for tests and direct emitters).
+    pub fn alloc_value(&mut self, ty: HirType, kind: HirValueKind) -> HirId {
+        self.function.create_value(ty, kind)
+    }
+
+    /// Append an instruction to a block (convenience for tests and direct emitters).
+    pub fn push_instruction(&mut self, block_id: HirId, inst: HirInstruction) {
+        if let Some(blk) = self.function.blocks.get_mut(&block_id) {
+            blk.add_instruction(inst);
+        }
+    }
+
+    /// Set the terminator on a block (convenience for tests and direct emitters).
+    pub fn set_terminator(&mut self, block_id: HirId, term: HirTerminator) {
+        if let Some(blk) = self.function.blocks.get_mut(&block_id) {
+            blk.set_terminator(term);
         }
     }
 
@@ -1445,6 +1535,16 @@ impl SsaBuilder {
             }
         }
 
+        // After a `@kernel elementwise` SIMD loop, simd_continue_block holds the
+        // after-block.  Take it (clearing the field) and prefer it over continuation_block.
+        if let Some(simd_after) = self.simd_continue_block.take() {
+            log::debug!(
+                "[SSA] process_statement: redirecting to simd_continue_block {:?}",
+                simd_after
+            );
+            return Ok(simd_after);
+        }
+
         // Return the continuation block if set (try expression), otherwise the original block
         let result_block = self.continuation_block.unwrap_or(block_id);
         if self.continuation_block.is_some() {
@@ -1508,6 +1608,69 @@ impl SsaBuilder {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // compute() kernel type classification (M2)
+    // ------------------------------------------------------------------
+
+    /// Returns `true` if `stmt` is the `@kernel <name>` sentinel call that the
+    /// grammar emits as `Call { callee: Variable("kernel"), args: [Variable(name)] }`.
+    /// These statements are pure metadata and must be skipped when lowering
+    /// the compute body at runtime (they don't correspond to any real function).
+    fn is_kernel_directive_stmt(
+        stmt: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>,
+    ) -> bool {
+        use zyntax_typed_ast::typed_ast::{TypedExpression, TypedStatement};
+        if let TypedStatement::Expression(expr_box) = &stmt.node {
+            if let TypedExpression::Call(call) = &expr_box.node {
+                if let TypedExpression::Variable(callee_name) = &call.callee.node {
+                    return callee_name
+                        .resolve_global()
+                        .map_or(false, |s| s == "kernel");
+                }
+            }
+        }
+        false
+    }
+
+    fn extract_kernel_type(
+        body: &zyntax_typed_ast::typed_ast::TypedBlock,
+    ) -> ComputeKernelType {
+        use zyntax_typed_ast::typed_ast::{TypedExpression, TypedStatement};
+
+        for stmt in &body.statements {
+            if let TypedStatement::Expression(expr_box) = &stmt.node {
+                if let TypedExpression::Call(call) = &expr_box.node {
+                    // Match `kernel(...)` callee
+                    if let TypedExpression::Variable(callee_name) = &call.callee.node {
+                        let is_kernel = callee_name
+                            .resolve_global()
+                            .map_or(false, |s| s == "kernel");
+                        if is_kernel {
+                            // First positional arg names the kernel kind
+                            if let Some(first_arg) = call.positional_args.first() {
+                                if let TypedExpression::Variable(kind_name) = &first_arg.node {
+                                    match kind_name
+                                        .resolve_global()
+                                        .as_deref()
+                                        .unwrap_or("")
+                                    {
+                                        "elementwise" => return ComputeKernelType::Elementwise,
+                                        "reduce" => return ComputeKernelType::Reduce,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            // `@kernel` with no recognised sub-type still
+                            // marks this as an explicitly-kernelled block.
+                            return ComputeKernelType::Generic;
+                        }
+                    }
+                }
+            }
+        }
+        ComputeKernelType::Generic
+    }
+
     fn translate_compute_dispatch_call(
         &mut self,
         block_id: HirId,
@@ -1531,6 +1694,556 @@ impl SsaBuilder {
             expr.span,
         );
         self.translate_expression(block_id, &lowered_expr)
+    }
+
+    /// Emit a stride-4 SIMD vectorised elementwise loop.
+    ///
+    /// Transforms `entry_block` into a loop preamble that drives a
+    /// vector-width (4-element) main loop with a scalar remainder path.
+    ///
+    /// # Parameters
+    /// - `entry_block`   — block that precedes the loop; its terminator will be
+    ///                     set to unconditionally enter the loop header.
+    /// - `data_ptr`      — `*mut elem_ty` HIR value pointing to the first element.
+    /// - `len`           — `i64` HIR value holding the element count.
+    /// - `scalar`        — scalar operand applied to every element (same type as elements).
+    /// - `vec_op`        — the `BinaryOp` to apply element-wise (e.g. `FMul`, `FAdd`).
+    /// - `elem_ty`       — the scalar element type (`F32`, `F64`, `I32`, or `I64`).
+    ///
+    /// # Returns
+    /// The `after_block` HIR block ID, which the caller should use for any
+    /// instructions that follow the loop.
+    pub fn emit_elementwise_simd_loop(
+        &mut self,
+        entry_block: HirId,
+        data_ptr: HirId,
+        len: HirId,
+        scalar: HirId,
+        vec_op: crate::hir::BinaryOp,
+        elem_ty: HirType,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::{BinaryOp, HirConstant};
+
+        // Determine element byte size and vector width (always 4 lanes for stride-4)
+        let elem_size: u32 = match &elem_ty {
+            HirType::F32 | HirType::I32 | HirType::U32 => 4,
+            HirType::F64 | HirType::I64 | HirType::U64 => 8,
+            HirType::I16 | HirType::U16 => 2,
+            HirType::I8 | HirType::U8 => 1,
+            _ => 4,
+        };
+        let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), 4);
+        let stride: i64 = 4;
+
+        // ----------------------------------------------------------------
+        // Block IDs
+        // ----------------------------------------------------------------
+        let header_block    = HirId::new();
+        let vec_check_block = HirId::new();
+        let vec_body_block  = HirId::new();
+        let scalar_body_block = HirId::new();
+        let after_block     = HirId::new();
+
+        // Register all new blocks in the function
+        for &blk in &[header_block, vec_check_block, vec_body_block, scalar_body_block, after_block] {
+            self.function.blocks.insert(blk, HirBlock::new(blk));
+            self.definitions.insert(blk, IndexMap::new());
+        }
+
+        // ----------------------------------------------------------------
+        // Preamble: allocate loop-counter stack slot, initialise to 0
+        // ----------------------------------------------------------------
+        let i_slot = self.create_value(HirType::Ptr(Box::new(HirType::I64)), HirValueKind::Instruction);
+        self.add_instruction(entry_block, HirInstruction::Alloca {
+            result: i_slot,
+            ty: HirType::I64,
+            count: None,
+            align: 8,
+        });
+        let zero = self.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(0)));
+        self.add_instruction(entry_block, HirInstruction::Store {
+            value: zero,
+            ptr: i_slot,
+            align: 8,
+            volatile: false,
+        });
+
+        // entry_block → header
+        {
+            let blk = self.function.blocks.get_mut(&entry_block).unwrap();
+            blk.terminator = HirTerminator::Branch { target: header_block };
+            blk.successors  = vec![header_block];
+        }
+        self.function.blocks.get_mut(&header_block).unwrap().predecessors.push(entry_block);
+
+        // ----------------------------------------------------------------
+        // header_block: load i; if i < len → vec_check else → after
+        // ----------------------------------------------------------------
+        let i_val = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(header_block, HirInstruction::Load {
+            result: i_val,
+            ty: HirType::I64,
+            ptr: i_slot,
+            align: 8,
+            volatile: false,
+        });
+        let cond_lt_len = self.create_value(HirType::Bool, HirValueKind::Instruction);
+        self.add_instruction(header_block, HirInstruction::Binary {
+            op: BinaryOp::Lt,
+            result: cond_lt_len,
+            ty: HirType::I64,
+            left: i_val,
+            right: len,
+        });
+        {
+            let blk = self.function.blocks.get_mut(&header_block).unwrap();
+            blk.terminator = HirTerminator::CondBranch {
+                condition: cond_lt_len,
+                true_target: vec_check_block,
+                false_target: after_block,
+            };
+            blk.successors = vec![vec_check_block, after_block];
+        }
+        self.function.blocks.get_mut(&vec_check_block).unwrap().predecessors.push(header_block);
+        self.function.blocks.get_mut(&after_block).unwrap().predecessors.push(header_block);
+
+        // ----------------------------------------------------------------
+        // vec_check_block: if i + 3 < len → vec_body else → scalar_body
+        // ----------------------------------------------------------------
+        let three = self.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(3)));
+        let i_plus_3 = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(vec_check_block, HirInstruction::Binary {
+            op: BinaryOp::Add,
+            result: i_plus_3,
+            ty: HirType::I64,
+            left: i_val,
+            right: three,
+        });
+        let vec_cond = self.create_value(HirType::Bool, HirValueKind::Instruction);
+        self.add_instruction(vec_check_block, HirInstruction::Binary {
+            op: BinaryOp::Lt,
+            result: vec_cond,
+            ty: HirType::I64,
+            left: i_plus_3,
+            right: len,
+        });
+        {
+            let blk = self.function.blocks.get_mut(&vec_check_block).unwrap();
+            blk.terminator = HirTerminator::CondBranch {
+                condition: vec_cond,
+                true_target: vec_body_block,
+                false_target: scalar_body_block,
+            };
+            blk.successors = vec![vec_body_block, scalar_body_block];
+        }
+        self.function.blocks.get_mut(&vec_body_block).unwrap().predecessors.push(vec_check_block);
+        self.function.blocks.get_mut(&scalar_body_block).unwrap().predecessors.push(vec_check_block);
+
+        // ----------------------------------------------------------------
+        // vec_body_block: ptr = gep(data_ptr, i), vload, splat, vec_op, vstore, i+=4
+        // ----------------------------------------------------------------
+        {
+            // GEP to element address: data_ptr + i * elem_size
+            // We compute the byte offset as i * elem_size then GEP as byte offset
+            let byte_offset = if elem_size == 1 {
+                i_val
+            } else {
+                let esz_val = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(HirConstant::I64(elem_size as i64)),
+                );
+                let off = self.create_value(HirType::I64, HirValueKind::Instruction);
+                self.add_instruction(vec_body_block, HirInstruction::Binary {
+                    op: BinaryOp::Mul,
+                    result: off,
+                    ty: HirType::I64,
+                    left: i_val,
+                    right: esz_val,
+                });
+                off
+            };
+            let elem_ptr = self.create_value(
+                HirType::Ptr(Box::new(elem_ty.clone())),
+                HirValueKind::Instruction,
+            );
+            self.add_instruction(vec_body_block, HirInstruction::GetElementPtr {
+                result: elem_ptr,
+                ty: HirType::U8,    // byte-level offset
+                ptr: data_ptr,
+                indices: vec![byte_offset],
+            });
+
+            // VectorLoad
+            let vec_val = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+            self.add_instruction(vec_body_block, HirInstruction::VectorLoad {
+                result: vec_val,
+                ty: vec_ty.clone(),
+                ptr: elem_ptr,
+                align: elem_size,
+            });
+
+            // Splat scalar into vec type
+            let splat_val = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+            self.add_instruction(vec_body_block, HirInstruction::VectorSplat {
+                result: splat_val,
+                ty: vec_ty.clone(),
+                scalar,
+            });
+
+            // Vector binary op
+            let vec_result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+            self.add_instruction(vec_body_block, HirInstruction::Binary {
+                op: vec_op.clone(),
+                result: vec_result,
+                ty: vec_ty.clone(),
+                left: vec_val,
+                right: splat_val,
+            });
+
+            // VectorStore back to same ptr
+            self.add_instruction(vec_body_block, HirInstruction::VectorStore {
+                value: vec_result,
+                ptr: elem_ptr,
+                align: elem_size,
+            });
+
+            // i += 4  →  store new i, jump to header
+            let stride_val = self.create_value(
+                HirType::I64,
+                HirValueKind::Constant(HirConstant::I64(stride)),
+            );
+            let i_next = self.create_value(HirType::I64, HirValueKind::Instruction);
+            self.add_instruction(vec_body_block, HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: i_next,
+                ty: HirType::I64,
+                left: i_val,
+                right: stride_val,
+            });
+            self.add_instruction(vec_body_block, HirInstruction::Store {
+                value: i_next,
+                ptr: i_slot,
+                align: 8,
+                volatile: false,
+            });
+            let blk = self.function.blocks.get_mut(&vec_body_block).unwrap();
+            blk.terminator = HirTerminator::Branch { target: header_block };
+            blk.successors  = vec![header_block];
+        }
+        self.function.blocks.get_mut(&header_block).unwrap().predecessors.push(vec_body_block);
+
+        // ----------------------------------------------------------------
+        // scalar_body_block: ptr = gep(data_ptr, i), load, scalar_op, store, i+=1
+        // ----------------------------------------------------------------
+        {
+            let byte_offset = if elem_size == 1 {
+                i_val
+            } else {
+                let esz_val = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(HirConstant::I64(elem_size as i64)),
+                );
+                let off = self.create_value(HirType::I64, HirValueKind::Instruction);
+                self.add_instruction(scalar_body_block, HirInstruction::Binary {
+                    op: BinaryOp::Mul,
+                    result: off,
+                    ty: HirType::I64,
+                    left: i_val,
+                    right: esz_val,
+                });
+                off
+            };
+            let elem_ptr = self.create_value(
+                HirType::Ptr(Box::new(elem_ty.clone())),
+                HirValueKind::Instruction,
+            );
+            self.add_instruction(scalar_body_block, HirInstruction::GetElementPtr {
+                result: elem_ptr,
+                ty: HirType::U8,
+                ptr: data_ptr,
+                indices: vec![byte_offset],
+            });
+            let scalar_val = self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+            self.add_instruction(scalar_body_block, HirInstruction::Load {
+                result: scalar_val,
+                ty: elem_ty.clone(),
+                ptr: elem_ptr,
+                align: elem_size,
+                volatile: false,
+            });
+            let result_val = self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+            self.add_instruction(scalar_body_block, HirInstruction::Binary {
+                op: vec_op.clone(),
+                result: result_val,
+                ty: elem_ty.clone(),
+                left: scalar_val,
+                right: scalar,
+            });
+            self.add_instruction(scalar_body_block, HirInstruction::Store {
+                value: result_val,
+                ptr: elem_ptr,
+                align: elem_size,
+                volatile: false,
+            });
+            let one = self.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(1)));
+            let i_next = self.create_value(HirType::I64, HirValueKind::Instruction);
+            self.add_instruction(scalar_body_block, HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: i_next,
+                ty: HirType::I64,
+                left: i_val,
+                right: one,
+            });
+            self.add_instruction(scalar_body_block, HirInstruction::Store {
+                value: i_next,
+                ptr: i_slot,
+                align: 8,
+                volatile: false,
+            });
+            let blk = self.function.blocks.get_mut(&scalar_body_block).unwrap();
+            blk.terminator = HirTerminator::Branch { target: header_block };
+            blk.successors  = vec![header_block];
+        }
+        self.function.blocks.get_mut(&header_block).unwrap().predecessors.push(scalar_body_block);
+
+        Ok(after_block)
+    }
+
+    // ========== @kernel elementwise pattern extraction helpers ==========
+
+    /// Try to extract an elementwise kernel pattern from a compute body.
+    ///
+    /// Looks for (after filtering out `@kernel` directive sentinels):
+    ///   ```text
+    ///   for <loop_var> in <range> {
+    ///       arr[loop_var] = arr[loop_var] OP scalar
+    ///   }
+    ///   ```
+    ///
+    /// Returns `(arr_name, loop_var, hir_op, elem_ty_hint, scalar_expr)` if matched.
+    fn try_extract_elementwise_pattern(
+        body: &zyntax_typed_ast::typed_ast::TypedBlock,
+    ) -> Option<(
+        InternedString,
+        InternedString,
+        crate::hir::BinaryOp,
+        HirType,
+        zyntax_typed_ast::TypedNode<TypedExpression>,
+    )> {
+        use zyntax_typed_ast::typed_ast::{BinaryOp as AstOp, TypedPattern, TypedStatement};
+
+        // Filter out @kernel directive sentinels.
+        let non_kernel: Vec<_> = body
+            .statements
+            .iter()
+            .filter(|s| !Self::is_kernel_directive_stmt(s))
+            .collect();
+
+        // Exactly one statement: the for loop.
+        if non_kernel.len() != 1 {
+            return None;
+        }
+        let TypedStatement::For(for_stmt) = &non_kernel[0].node else {
+            return None;
+        };
+
+        // Extract the loop variable name from the pattern.
+        let TypedPattern::Identifier { name: loop_var, .. } = &for_stmt.pattern.node else {
+            return None;
+        };
+        let loop_var = *loop_var;
+
+        // Body must have exactly one statement.
+        if for_stmt.body.statements.len() != 1 {
+            return None;
+        }
+
+        // That statement must be an Expression.
+        let TypedStatement::Expression(assign_expr) = &for_stmt.body.statements[0].node else {
+            return None;
+        };
+
+        // The expression must be a Binary Assign.
+        let TypedExpression::Binary(assign_bin) = &assign_expr.node else {
+            return None;
+        };
+        if assign_bin.op != AstOp::Assign {
+            return None;
+        }
+
+        // LHS must be arr[loop_var].
+        let TypedExpression::Index(lhs_idx) = &assign_bin.left.node else {
+            return None;
+        };
+        let TypedExpression::Variable(arr_name) = &lhs_idx.object.node else {
+            return None;
+        };
+        let arr_name = *arr_name;
+        let TypedExpression::Variable(idx_var) = &lhs_idx.index.node else {
+            return None;
+        };
+        if *idx_var != loop_var {
+            return None;
+        }
+
+        // RHS must be arr[loop_var] OP scalar  (or  scalar OP arr[loop_var]).
+        let TypedExpression::Binary(rhs_bin) = &assign_bin.right.node else {
+            return None;
+        };
+
+        // Determine which side is the array access and which is the scalar.
+        let (rhs_arr_name, scalar_expr): (
+            InternedString,
+            &zyntax_typed_ast::TypedNode<TypedExpression>,
+        ) = match (&rhs_bin.left.node, &rhs_bin.right.node) {
+            (TypedExpression::Index(idx), _) => {
+                let TypedExpression::Variable(n) = &idx.object.node else {
+                    return None;
+                };
+                (*n, rhs_bin.right.as_ref())
+            }
+            (_, TypedExpression::Index(idx)) => {
+                let TypedExpression::Variable(n) = &idx.object.node else {
+                    return None;
+                };
+                (*n, rhs_bin.left.as_ref())
+            }
+            _ => return None,
+        };
+
+        // Array names on both sides must match.
+        if arr_name != rhs_arr_name {
+            return None;
+        }
+
+        // Determine element type hint from scalar expression.
+        let elem_ty = Self::hint_elem_ty_from_expr(scalar_expr);
+
+        // Map AST op → HIR op (choosing float or integer variant based on elem_ty).
+        let hir_op = Self::ast_arith_to_hir_op(&rhs_bin.op, &elem_ty)?;
+
+        Some((arr_name, loop_var, hir_op, elem_ty, scalar_expr.clone()))
+    }
+
+    /// Determine an element type hint from a scalar expression's declared or inferred type.
+    /// Defaults to `F32` (most common for ML kernels).
+    fn hint_elem_ty_from_expr(expr: &zyntax_typed_ast::TypedNode<TypedExpression>) -> HirType {
+        use zyntax_typed_ast::typed_ast::{TypedExpression as TE, TypedLiteral};
+        use zyntax_typed_ast::PrimitiveType;
+
+        // Try the declared type annotation first.
+        // Note: We map F64 → F32 because the SIMD path uses 128-bit vectors which
+        // support F32x4 (4 lanes) but only F64x2 (2 lanes).  ML kernels universally
+        // use F32, and float literals are typed F64 by the grammar by default, so
+        // normalising here keeps the most useful SIMD width.
+        match &expr.ty {
+            Type::Primitive(PrimitiveType::F32) | Type::Primitive(PrimitiveType::F64) => {
+                return HirType::F32;
+            }
+            Type::Primitive(PrimitiveType::I32) => return HirType::I32,
+            Type::Primitive(PrimitiveType::I64) => return HirType::I64,
+            _ => {}
+        }
+
+        // Fallback: inspect the literal kind.
+        match &expr.node {
+            TE::Literal(TypedLiteral::Float(_)) => HirType::F32,
+            TE::Literal(TypedLiteral::Integer(_)) => HirType::I32,
+            _ => HirType::F32,
+        }
+    }
+
+    /// Map an AST arithmetic operator to its HIR equivalent.
+    ///
+    /// Uses `elem_ty` to select the integer (`Add`) or float (`FAdd`) variant.
+    fn ast_arith_to_hir_op(
+        op: &zyntax_typed_ast::typed_ast::BinaryOp,
+        elem_ty: &HirType,
+    ) -> Option<crate::hir::BinaryOp> {
+        use crate::hir::BinaryOp as HirOp;
+        use zyntax_typed_ast::typed_ast::BinaryOp as AstOp;
+
+        let is_float = matches!(elem_ty, HirType::F32 | HirType::F64);
+        match op {
+            AstOp::Add => Some(if is_float { HirOp::FAdd } else { HirOp::Add }),
+            AstOp::Sub => Some(if is_float { HirOp::FSub } else { HirOp::Sub }),
+            AstOp::Mul => Some(if is_float { HirOp::FMul } else { HirOp::Mul }),
+            AstOp::Div => Some(if is_float { HirOp::FDiv } else { HirOp::Div }),
+            _ => None,
+        }
+    }
+
+    /// Load the element data pointer (field 0) from a `List<T>` struct pointer.
+    ///
+    /// Layout: `{ i64 data_ptr, i64 len, i64 cap }`.  Field 0 is the raw
+    /// element buffer address stored as `i64`.  This helper loads it and
+    /// casts it to `*mut elem_ty`.
+    fn emit_list_data_ptr(
+        &mut self,
+        block_id: HirId,
+        list_ptr: HirId,
+        elem_ty: &HirType,
+    ) -> CompilerResult<HirId> {
+        // Load i64 from the start of the List struct (field 0 = data pointer).
+        let data_ptr_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Load {
+                result: data_ptr_i64,
+                ty: HirType::I64,
+                ptr: list_ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+
+        // Cast i64 → *mut elem_ty.
+        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let data_ptr = self.create_value(ptr_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Cast {
+                result: data_ptr,
+                ty: ptr_ty,
+                operand: data_ptr_i64,
+                op: CastOp::IntToPtr,
+            },
+        );
+        Ok(data_ptr)
+    }
+
+    /// Load the element count (field 1, byte offset 8) from a `List<T>` pointer.
+    fn emit_list_len(&mut self, block_id: HirId, list_ptr: HirId) -> CompilerResult<HirId> {
+        let offset_8 = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(8)),
+        );
+        let len_field_ptr = self.create_value(
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        self.add_instruction(
+            block_id,
+            HirInstruction::GetElementPtr {
+                result: len_field_ptr,
+                ty: HirType::U8, // byte-offset GEP
+                ptr: list_ptr,
+                indices: vec![offset_8],
+            },
+        );
+
+        let len = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Load {
+                result: len,
+                ty: HirType::I64,
+                ptr: len_field_ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        Ok(len)
     }
 
     fn int_type_width_and_sign(ty: &HirType) -> Option<(u8, bool)> {
@@ -1849,8 +2562,6 @@ impl SsaBuilder {
                 // First, resolve the actual type from the variable if the expression is a Variable
                 let left_actual_ty = self.resolve_actual_type(&left.node, &left.ty);
                 let right_actual_ty = self.resolve_actual_type(&right.node, &right.ty);
-                eprintln!("[DEBUG SSA] Binary op {:?}, left.ty={:?} (actual: {:?}), right.ty={:?} (actual: {:?})",
-                    op, left.ty, left_actual_ty, right.ty, right_actual_ty);
 
                 // Create a modified left/right with resolved types for trait dispatch
                 let mut left_with_type = left.clone();
@@ -1865,10 +2576,8 @@ impl SsaBuilder {
                     &right_with_type,
                     &expr.ty,
                 )? {
-                    eprintln!("[DEBUG SSA] Using trait dispatch for binary op");
                     return Ok(trait_call);
                 }
-                eprintln!("[DEBUG SSA] No trait dispatch, using native binary op");
 
                 // `@` must dispatch through MatMul::matmul; do not silently alias to numeric `mul`.
                 if matches!(op, FrontendOp::MatMul) {
@@ -2072,6 +2781,7 @@ impl SsaBuilder {
             }
 
             TypedExpression::Compute(compute) => {
+                let kernel_ty = Self::extract_kernel_type(&compute.body);
                 let has_direct_yield = compute.body.statements.iter().any(|stmt| {
                     matches!(
                         stmt.node,
@@ -2079,13 +2789,128 @@ impl SsaBuilder {
                     )
                 });
 
-                if !has_direct_yield {
-                    // Preserve legacy runtime behavior for non-reduction compute blocks.
-                    return self.translate_compute_dispatch_call(block_id, expr, compute);
+                match kernel_ty {
+                    // ----------------------------------------------------------------
+                    // @kernel elementwise — stride-4 SIMD vectorised element transform.
+                    //
+                    // Pattern matched: for i in range { arr[i] = arr[i] OP scalar }
+                    //
+                    // Emits a stride-4 SIMD loop using `emit_elementwise_simd_loop`.
+                    // Sets `simd_continue_block` so that `process_statement` redirects
+                    // subsequent statements to the loop's after-block.
+                    //
+                    // Falls back to runtime dispatch if the body pattern is not recognised.
+                    // ----------------------------------------------------------------
+                    ComputeKernelType::Elementwise => {
+                        if let Some((arr_name, _loop_var, vec_op, elem_ty, scalar_expr)) =
+                            Self::try_extract_elementwise_pattern(&compute.body)
+                        {
+                            // Find the compute arg that matches the array variable.
+                            let arr_arg = compute.args.iter().find(|a| {
+                                matches!(&a.node, TypedExpression::Variable(n) if *n == arr_name)
+                            });
+
+                            if let Some(arr_arg) = arr_arg {
+                                // Evaluate the array arg → *List<T> pointer.
+                                let list_ptr =
+                                    self.translate_expression(block_id, arr_arg)?;
+
+                                // Extract data pointer (field 0 of the List struct).
+                                let data_ptr = self
+                                    .emit_list_data_ptr(block_id, list_ptr, &elem_ty)?;
+
+                                // Extract length (field 1 of the List struct).
+                                let len = self.emit_list_len(block_id, list_ptr)?;
+
+                                // Evaluate the scalar operand.
+                                let scalar_raw =
+                                    self.translate_expression(block_id, &scalar_expr)?;
+
+                                // Cast the scalar to elem_ty if necessary.
+                                // Example: float literals default to F64 in the grammar,
+                                // but the SIMD loop needs F32 when elem_ty = F32.
+                                let scalar_needs_cast = matches!(
+                                    (&scalar_expr.ty, &elem_ty),
+                                    (
+                                        zyntax_typed_ast::Type::Primitive(
+                                            zyntax_typed_ast::PrimitiveType::F64
+                                        ),
+                                        HirType::F32
+                                    )
+                                );
+                                let scalar = if scalar_needs_cast {
+                                    let casted =
+                                        self.create_value(HirType::F32, HirValueKind::Instruction);
+                                    self.add_instruction(
+                                        block_id,
+                                        HirInstruction::Cast {
+                                            result: casted,
+                                            ty: HirType::F32,
+                                            operand: scalar_raw,
+                                            op: CastOp::FpTrunc,
+                                        },
+                                    );
+                                    casted
+                                } else {
+                                    scalar_raw
+                                };
+
+                                log::debug!(
+                                    "[SSA] compute(): @kernel elementwise → \
+                                     emit_elementwise_simd_loop arr={:?} op={:?} elem={:?}",
+                                    arr_name,
+                                    vec_op,
+                                    elem_ty
+                                );
+
+                                let after_block = self.emit_elementwise_simd_loop(
+                                    block_id, data_ptr, len, scalar, vec_op, elem_ty,
+                                )?;
+
+                                // Signal to process_statement that subsequent code
+                                // belongs in after_block, not the (now-terminated) block_id.
+                                self.simd_continue_block = Some(after_block);
+
+                                // The compute() expression's value is the list pointer
+                                // (the array is mutated in-place).
+                                return Ok(list_ptr);
+                            }
+                        }
+
+                        // Pattern not matched — fall back to runtime dispatch.
+                        log::debug!(
+                            "[SSA] compute(): @kernel elementwise → runtime dispatch \
+                             (pattern not matched)"
+                        );
+                        return self.translate_compute_dispatch_call(block_id, expr, compute);
+                    }
+
+                    // ----------------------------------------------------------------
+                    // @kernel reduce — accumulation over a sequence.
+                    // Uses the existing yield-stack path.  Full vector accumulator
+                    // (VectorSplat + VectorHorizontalReduce) is planned for M3.
+                    // ----------------------------------------------------------------
+                    ComputeKernelType::Reduce => {
+                        if !has_direct_yield {
+                            // No yield in body — fall through to dispatch.
+                            return self.translate_compute_dispatch_call(block_id, expr, compute);
+                        }
+                        // Fall through to the yield-stack path below.
+                    }
+
+                    // ----------------------------------------------------------------
+                    // Generic (no recognised @kernel directive)
+                    // ----------------------------------------------------------------
+                    ComputeKernelType::Generic => {
+                        if !has_direct_yield {
+                            return self.translate_compute_dispatch_call(block_id, expr, compute);
+                        }
+                        // Fall through to yield-stack path.
+                    }
                 }
 
-                // CPU fallback path for reduction-style compute blocks.
-                // Evaluate explicit compute args for side effects, then execute compute body.
+                // Yield-stack path: evaluate compute args for side-effects,
+                // then process body statements collecting yielded HIR values.
                 for arg in &compute.args {
                     self.translate_expression(block_id, arg)?;
                 }
@@ -2093,6 +2918,11 @@ impl SsaBuilder {
                 self.compute_yield_stack.push(Vec::new());
                 let mut current_block = block_id;
                 for stmt in &compute.body.statements {
+                    // Skip @kernel directive sentinels — they are metadata only
+                    // and have no runtime representation.
+                    if Self::is_kernel_directive_stmt(stmt) {
+                        continue;
+                    }
                     current_block = self.process_statement(current_block, stmt)?;
                 }
 
@@ -2113,28 +2943,12 @@ impl SsaBuilder {
                 let object_type = if let TypedExpression::Variable(var_name) = &object.node {
                     // Variable - get actual type from var_types (which was updated during type resolution)
                     if let Some(hir_type) = self.var_types.get(var_name) {
-                        eprintln!(
-                            "[FIELD ACCESS DEBUG] Variable '{}' has hir_type: {:?}",
-                            var_name.resolve_global().unwrap_or_default(),
-                            hir_type
-                        );
                         // Convert HIR type back to TypedAST Type for get_field_index
-                        let converted = self.hir_type_to_typed_ast_type(hir_type);
-                        eprintln!(
-                            "[FIELD ACCESS DEBUG] Converted to typed_ast_type: {:?}",
-                            converted
-                        );
-                        converted
+                        self.hir_type_to_typed_ast_type(hir_type)
                     } else {
-                        eprintln!("[FIELD ACCESS DEBUG] Variable '{}' not in var_types, using object.ty: {:?}",
-                            var_name.resolve_global().unwrap_or_default(), object.ty);
                         object.ty.clone()
                     }
                 } else {
-                    eprintln!(
-                        "[FIELD ACCESS DEBUG] Not a variable, using object.ty: {:?}",
-                        object.ty
-                    );
                     object.ty.clone()
                 };
 
@@ -2156,9 +2970,7 @@ impl SsaBuilder {
                             };
 
                             if field_name_str == "value" {
-                                // For abstract types, accessing 'value' just returns the object itself
-                                // since abstract types ARE their underlying value (zero-cost abstraction)
-                                eprintln!("[FIELD ACCESS] Abstract type field access optimization: returning object directly");
+                                // Abstract types are zero-cost: .value just returns the object itself.
                                 return Ok(object_val);
                             }
                         }
@@ -2853,8 +3665,6 @@ impl SsaBuilder {
                 //
                 // The async transformation phase will then convert this into proper
                 // state machine code that yields and resumes.
-
-                eprintln!("[DEBUG] SSA: Matched TypedExpression::Await!");
 
                 // The result type is what the await expression evaluates to (T, not *Promise<T>)
                 let result_ty = self.convert_type(&expr.ty);
@@ -4867,31 +5677,18 @@ impl SsaBuilder {
         })?;
 
         // Find the field index in the type definition
-        eprintln!(
-            "[DEBUG] Looking for field {:?} in type {:?} which has {} fields",
-            field_name,
-            type_def.name,
-            type_def.fields.len()
-        );
         for (idx, field) in type_def.fields.iter().enumerate() {
-            eprintln!("[DEBUG]   Field {}: name={:?}", idx, field.name);
             if &field.name == field_name {
                 return Ok(idx as u32);
             }
         }
 
         // Field not found - also try string comparison as fallback
-        eprintln!("[DEBUG] Direct comparison failed, trying string resolution");
         for (idx, field) in type_def.fields.iter().enumerate() {
             if let (Some(field_name_str), Some(lookup_name_str)) =
                 (field.name.resolve_global(), field_name.resolve_global())
             {
-                eprintln!(
-                    "[DEBUG]   Comparing '{}' == '{}'",
-                    field_name_str, lookup_name_str
-                );
                 if field_name_str == lookup_name_str {
-                    eprintln!("[DEBUG] Found match by string comparison!");
                     return Ok(idx as u32);
                 }
             }
@@ -6869,6 +7666,15 @@ impl HirInstruction {
 
             // CaptureContinuation always has a result
             HirInstruction::CaptureContinuation { result, .. } => Some(*result),
+
+            // SIMD instructions: Splat/Extract/Insert/Reduce/Load produce a result
+            HirInstruction::VectorSplat { result, .. }
+            | HirInstruction::VectorExtractLane { result, .. }
+            | HirInstruction::VectorInsertLane { result, .. }
+            | HirInstruction::VectorHorizontalReduce { result, .. }
+            | HirInstruction::VectorLoad { result, .. } => Some(*result),
+            // VectorStore writes to memory, no result value
+            HirInstruction::VectorStore { .. } => None,
         }
     }
 }

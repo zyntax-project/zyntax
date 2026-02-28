@@ -1,0 +1,55 @@
+// compute_simd.zynml - demonstrates compute() with @kernel annotations.
+//
+// ── @kernel reduce ────────────────────────────────────────────────────────────
+//   Scalar accumulation via yield (fully working).
+//
+// ── @kernel elementwise ───────────────────────────────────────────────────────
+//   Stride-4 SIMD load/store loop (fully working end-to-end).
+//
+//   When the body matches:
+//     for i in <range> { arr[i] = arr[i] OP scalar }
+//
+//   the compiler pattern-extracts (arr, loop_var, op, scalar) and emits
+//   a stride-4 SIMD loop via SsaBuilder::emit_elementwise_simd_loop():
+//
+//     header: if i < len → vec_check else → after
+//     vec_check: if i+3 < len → vec_body else → scalar_body
+//     vec_body:  GEP, VectorLoad(F32x4), VectorSplat(scalar,F32x4),
+//                FMul/FAdd/FSub/FDiv, VectorStore, i+=4 → header
+//     scalar_body: GEP, Load(f32), fmul/fadd/..., Store, i+=1 → header
+//     after: (continuation)
+//
+//   HIR instructions used:
+//     Phase 1: VectorSplat, VectorExtractLane, VectorInsertLane,
+//              VectorHorizontalReduce
+//     Phase 2: VectorLoad, VectorStore  (added for this path)
+//
+//   Grammar support:
+//     index_assign_stmt: arr[idx] = expr  (Grammar2 rule, added M2 Phase 2)
+
+def main() {
+    println("compute_simd: @kernel annotation routing")
+
+    // @kernel reduce with explicit yield.
+    let x = 5
+    let result = compute(x) {
+        @kernel reduce
+        yield 100
+    }
+    println("reduce result (yield 100):")
+    println(result)
+
+    // @kernel elementwise — stride-4 SIMD multiply.
+    // The compiler detects the for-loop body pattern and emits VectorLoad /
+    // VectorSplat / FMul / VectorStore for 4-wide SIMD, plus scalar fallback
+    // for the remainder (len % 4 elements).
+    let data = [1.0, 2.0, 3.0, 4.0]
+    let doubled = compute(data) {
+        @kernel elementwise
+        for i in 0..4 {
+            data[i] = data[i] * 2.0
+        }
+    }
+
+    println("Done!")
+}

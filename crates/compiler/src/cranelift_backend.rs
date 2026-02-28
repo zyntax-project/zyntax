@@ -11,6 +11,7 @@ use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_codegen::verify_function;
+use cranelift_frontend::Switch as ClifSwitch;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use log::{debug, error, info, warn};
@@ -750,6 +751,15 @@ impl CraneliftBackend {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    HirInstruction::VectorSplat { ty, .. }
+                    | HirInstruction::VectorExtractLane { ty, .. }
+                    | HirInstruction::VectorInsertLane { ty, .. }
+                    | HirInstruction::VectorHorizontalReduce { ty, .. }
+                    | HirInstruction::VectorLoad { ty, .. } => {
+                        if let Ok(cranelift_ty) = self.translate_type(ty) {
+                            type_cache.insert(ty.clone(), cranelift_ty);
                         }
                     }
                     _ => {} // Add more as needed
@@ -2422,14 +2432,33 @@ impl CraneliftBackend {
 
                         HirInstruction::CreateUnion {
                             result,
-                            union_ty: _,
+                            union_ty,
                             variant_index,
                             value,
                         } => {
-                            // Create a tagged union value
-                            // TODO: Calculate proper union layout - for now use fixed size of 16 bytes
-                            // (4 bytes discriminant + 12 bytes data, sufficient for i32/i64/ptr)
-                            let union_size = 16u32;
+                            // Compute union layout without calling &self methods
+                            // (avoids E0502 while builder holds &mut into self).
+                            // Tagged layout: [discriminant:i32][pad][max_variant_data], 8-byte aligned.
+                            let union_size: u32 = if let HirType::Union(u) = union_ty {
+                                let discrim_sz: u32 = match u.discriminant_type.as_ref() {
+                                    HirType::I64 | HirType::U64 | HirType::F64 => 8,
+                                    HirType::I16 | HirType::U16 => 2,
+                                    HirType::I8 | HirType::U8 | HirType::Bool => 1,
+                                    _ => 4, // i32/u32/f32 and default
+                                };
+                                let max_var: u32 = u.variants.iter().map(|v| match &v.ty {
+                                    HirType::Void => 0,
+                                    HirType::Bool | HirType::I8 | HirType::U8 => 1,
+                                    HirType::I16 | HirType::U16 => 2,
+                                    HirType::I32 | HirType::U32 | HirType::F32 => 4,
+                                    HirType::I128 | HirType::U128 => 16,
+                                    _ => 8, // i64/u64/f64/ptr/complex → 8 bytes
+                                }).max().unwrap_or(0);
+                                let data_offset = (discrim_sz + 7) & !7;
+                                ((data_offset + max_var) + 7) & !7
+                            } else {
+                                16 // non-union fallback
+                            };
                             let ptr_ty = self.module.target_config().pointer_type();
 
                             // Allocate space for the union on the stack
@@ -3421,6 +3450,107 @@ impl CraneliftBackend {
                             }
                         }
 
+                        // SIMD instructions — inlined (cannot delegate to translate_instruction
+                        // while builder holds &mut references into self).
+                        HirInstruction::VectorSplat { result, ty, scalar } => {
+                            if let Some(&scalar_val) = self.value_map.get(scalar) {
+                                // Resolve vector type without borrowing self (avoid E0502).
+                                let clif_ty_opt = if let HirType::Vector(elem_ty, count) = ty {
+                                    match (&**elem_ty, *count) {
+                                        (HirType::F32, 4) => Some(types::F32X4),
+                                        (HirType::F64, 2) => Some(types::F64X2),
+                                        (HirType::I32, 4) | (HirType::U32, 4) => Some(types::I32X4),
+                                        (HirType::I64, 2) | (HirType::U64, 2) => Some(types::I64X2),
+                                        _ => None,
+                                    }
+                                } else { None };
+                                if let Some(vec_clif_ty) = clif_ty_opt {
+                                    let value = builder.ins().splat(vec_clif_ty, scalar_val);
+                                    self.value_map.insert(*result, value);
+                                } else {
+                                    warn!("[Cranelift] VectorSplat: unsupported type {:?}", ty);
+                                }
+                            }
+                        }
+                        HirInstruction::VectorExtractLane { result, vector, lane, .. } => {
+                            if let Some(&vec_val) = self.value_map.get(vector) {
+                                let value = builder.ins().extractlane(vec_val, *lane);
+                                self.value_map.insert(*result, value);
+                            }
+                        }
+                        HirInstruction::VectorInsertLane { result, vector, scalar, lane, .. } => {
+                            if let (Some(&vec_val), Some(&scalar_val)) = (
+                                self.value_map.get(vector),
+                                self.value_map.get(scalar),
+                            ) {
+                                let value = builder.ins().insertlane(vec_val, scalar_val, *lane);
+                                self.value_map.insert(*result, value);
+                            }
+                        }
+                        HirInstruction::VectorHorizontalReduce { result, ty: _, vector, op } => {
+                            if let Some(&vec_val) = self.value_map.get(vector) {
+                                // Derive lane count from the input vector's Cranelift type
+                                // (avoids borrowing self via translate_type while builder is live).
+                                let vec_clif_ty = builder.func.dfg.value_type(vec_val);
+                                let lane_count: u8 = match vec_clif_ty {
+                                    types::F32X4 | types::I32X4 => 4,
+                                    types::F64X2 | types::I64X2 => 2,
+                                    _ => {
+                                        warn!("[Cranelift] VectorHorizontalReduce: unsupported type {:?}", vec_clif_ty);
+                                        0
+                                    }
+                                };
+                                if lane_count > 0 {
+                                    let mut acc = builder.ins().extractlane(vec_val, 0u8);
+                                    for lane_idx in 1..lane_count {
+                                        let lane_val = builder.ins().extractlane(vec_val, lane_idx);
+                                        acc = match op {
+                                            BinaryOp::Add => builder.ins().iadd(acc, lane_val),
+                                            BinaryOp::FAdd => builder.ins().fadd(acc, lane_val),
+                                            BinaryOp::Sub => builder.ins().isub(acc, lane_val),
+                                            BinaryOp::FSub => builder.ins().fsub(acc, lane_val),
+                                            BinaryOp::Mul => builder.ins().imul(acc, lane_val),
+                                            BinaryOp::FMul => builder.ins().fmul(acc, lane_val),
+                                            _ => { warn!("[Cranelift] VectorHorizontalReduce: unsupported op {:?}", op); acc }
+                                        };
+                                    }
+                                    self.value_map.insert(*result, acc);
+                                }
+                            }
+                        }
+
+                        // SIMD memory operations: load/store an entire vector register
+                        // from/to a contiguous block of elements in memory.
+                        HirInstruction::VectorLoad { result, ty, ptr, align: _ } => {
+                            if let Some(&ptr_val) = self.value_map.get(ptr) {
+                                let clif_ty_opt = if let HirType::Vector(elem_ty, count) = ty {
+                                    match (&**elem_ty, *count) {
+                                        (HirType::F32, 4) => Some(types::F32X4),
+                                        (HirType::F64, 2) => Some(types::F64X2),
+                                        (HirType::I32, 4) | (HirType::U32, 4) => Some(types::I32X4),
+                                        (HirType::I64, 2) | (HirType::U64, 2) => Some(types::I64X2),
+                                        _ => None,
+                                    }
+                                } else { None };
+                                if let Some(vec_clif_ty) = clif_ty_opt {
+                                    let flags = MemFlags::new().with_notrap();
+                                    let value = builder.ins().load(vec_clif_ty, flags, ptr_val, 0);
+                                    self.value_map.insert(*result, value);
+                                } else {
+                                    warn!("[Cranelift] VectorLoad: unsupported type {:?}", ty);
+                                }
+                            }
+                        }
+                        HirInstruction::VectorStore { value, ptr, align: _ } => {
+                            if let (Some(&vec_val), Some(&ptr_val)) = (
+                                self.value_map.get(value),
+                                self.value_map.get(ptr),
+                            ) {
+                                let flags = MemFlags::new().with_notrap();
+                                builder.ins().store(flags, vec_val, ptr_val, 0);
+                            }
+                        }
+
                         _ => {
                             // Other instructions not yet implemented
                             // This will cause values to be unmapped, leading to verifier errors
@@ -3557,88 +3687,47 @@ impl CraneliftBackend {
                         let switch_val = self.value_map[value];
                         let default_block = self.block_map[default];
 
-                        // Create a switch using Cranelift's br_table for integer switches
-                        // For now, use a series of conditional branches
-                        // TODO: Optimize to use br_table for dense integer ranges
+                        // Use cranelift_frontend::Switch which automatically emits
+                        // br_table for dense integer ranges and brif chains for sparse
+                        // ranges, choosing the more efficient representation.
+                        let mut clif_switch = ClifSwitch::new();
 
-                        let mut current_block_filled = false;
-
-                        for (i, (constant, target)) in cases.iter().enumerate() {
+                        for (constant, target) in cases.iter() {
                             let target_block = self.block_map[target];
-
-                            // Create constant value for comparison
-                            // Handle both signed and unsigned integer types
-                            let const_val = match constant {
-                                HirConstant::I8(v) => {
-                                    let extended = (*v as u8) as i64;
-                                    builder.ins().iconst(types::I8, extended)
-                                }
-                                HirConstant::I16(v) => {
-                                    let extended = (*v as u16) as i64;
-                                    builder.ins().iconst(types::I16, extended)
-                                }
-                                HirConstant::I32(v) => {
-                                    let extended = (*v as u32) as i64;
-                                    builder.ins().iconst(types::I32, extended)
-                                }
-                                HirConstant::I64(v) => builder.ins().iconst(types::I64, *v),
-                                // Unsigned integer types
-                                HirConstant::U8(v) => builder.ins().iconst(types::I8, *v as i64),
-                                HirConstant::U16(v) => builder.ins().iconst(types::I16, *v as i64),
-                                HirConstant::U32(v) => builder.ins().iconst(types::I32, *v as i64),
-                                HirConstant::U64(v) => builder.ins().iconst(types::I64, *v as i64),
-                                _ => continue, // Skip non-integer constants
+                            // Extract the integer discriminant value
+                            let disc: Option<u128> = match constant {
+                                HirConstant::I8(v)  => Some(*v as u8 as u128),
+                                HirConstant::I16(v) => Some(*v as u16 as u128),
+                                HirConstant::I32(v) => Some(*v as u32 as u128),
+                                HirConstant::I64(v) => Some(*v as u64 as u128),
+                                HirConstant::U8(v)  => Some(*v as u128),
+                                HirConstant::U16(v) => Some(*v as u128),
+                                HirConstant::U32(v) => Some(*v as u128),
+                                HirConstant::U64(v) => Some(*v as u128),
+                                _ => None,
                             };
-
-                            // Compare switch value with this case
-                            let cmp = builder.ins().icmp(IntCC::Equal, switch_val, const_val);
-
-                            if i == cases.len() - 1 {
-                                // Last case: branch to target or default
-                                builder
-                                    .ins()
-                                    .brif(cmp, target_block, &[], default_block, &[]);
-                                current_block_filled = true;
-
-                                // Seal both targets
-                                for target_id in [target, default] {
-                                    if let Some(count) = seal_tracker.get_mut(target_id) {
-                                        *count = count.saturating_sub(1);
-                                        if *count == 0 && !sealed_blocks.contains(target_id) {
-                                            builder.seal_block(self.block_map[target_id]);
-                                            sealed_blocks.insert(*target_id);
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Not last case: need to create a fallthrough block for next comparison
-                                let next_block = builder.create_block();
-                                builder.ins().brif(cmp, target_block, &[], next_block, &[]);
-
-                                // Seal target
-                                if let Some(count) = seal_tracker.get_mut(target) {
-                                    *count = count.saturating_sub(1);
-                                    if *count == 0 && !sealed_blocks.contains(target) {
-                                        builder.seal_block(target_block);
-                                        sealed_blocks.insert(*target);
-                                    }
-                                }
-
-                                // Switch to next block for next comparison
-                                builder.switch_to_block(next_block);
-                                builder.seal_block(next_block); // No predecessors from outside
+                            if let Some(idx) = disc {
+                                clif_switch.set_entry(idx, target_block);
                             }
                         }
 
-                        // If no cases, just jump to default
-                        if cases.is_empty() && !current_block_filled {
-                            builder.ins().jump(default_block, &[]);
-                            if let Some(count) = seal_tracker.get_mut(default) {
+                        clif_switch.emit(&mut builder, switch_val, default_block);
+
+                        // Seal all target blocks (Switch already finalised the terminator)
+                        for (_, target) in cases.iter() {
+                            if let Some(count) = seal_tracker.get_mut(target) {
                                 *count = count.saturating_sub(1);
-                                if *count == 0 && !sealed_blocks.contains(default) {
-                                    builder.seal_block(default_block);
-                                    sealed_blocks.insert(*default);
+                                if *count == 0 && !sealed_blocks.contains(target) {
+                                    builder.seal_block(self.block_map[target]);
+                                    sealed_blocks.insert(*target);
                                 }
+                            }
+                        }
+                        if let Some(count) = seal_tracker.get_mut(default) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 && !sealed_blocks.contains(default) {
+                                builder.seal_block(default_block);
+                                sealed_blocks.insert(*default);
                             }
                         }
                     }
@@ -4686,6 +4775,8 @@ impl CraneliftBackend {
                 let ptr_val = self.value_map[ptr];
                 let cranelift_ty = self.translate_type(ty)?;
                 let flags = if *volatile {
+                    // Cranelift 0.106 has no explicit volatile flag; omitting with_aligned()
+                    // prevents alignment-based coalescing for volatile-marked accesses.
                     MemFlags::new().with_notrap()
                 } else {
                     MemFlags::new().with_aligned().with_notrap()
@@ -4703,6 +4794,8 @@ impl CraneliftBackend {
                 let val = self.value_map[value];
                 let ptr_val = self.value_map[ptr];
                 let flags = if *volatile {
+                    // Cranelift 0.106 has no explicit volatile flag; omitting with_aligned()
+                    // prevents alignment-based coalescing for volatile-marked accesses.
                     MemFlags::new().with_notrap()
                 } else {
                     MemFlags::new().with_aligned().with_notrap()
@@ -5907,6 +6000,68 @@ impl CraneliftBackend {
                     let dummy_result = builder.ins().iconst(types::I64, 0);
                     self.value_map.insert(*result_id, dummy_result);
                 }
+            }
+
+            // ----------------------------------------------------------------
+            // SIMD / Vector instructions
+            // ----------------------------------------------------------------
+
+            HirInstruction::VectorSplat { result, ty, scalar } => {
+                let scalar_val = self.value_map[scalar];
+                let vec_clif_ty = self.translate_type(ty)?;
+                let value = builder.ins().splat(vec_clif_ty, scalar_val);
+                self.value_map.insert(*result, value);
+            }
+
+            HirInstruction::VectorExtractLane { result, ty: _, vector, lane } => {
+                let vec_val = self.value_map[vector];
+                let value = builder.ins().extractlane(vec_val, *lane);
+                self.value_map.insert(*result, value);
+            }
+
+            HirInstruction::VectorInsertLane { result, ty: _, vector, scalar, lane } => {
+                let vec_val = self.value_map[vector];
+                let scalar_val = self.value_map[scalar];
+                let value = builder.ins().insertlane(vec_val, scalar_val, *lane);
+                self.value_map.insert(*result, value);
+            }
+
+            HirInstruction::VectorHorizontalReduce { result, ty, vector, op } => {
+                // Cranelift has no native horizontal-reduce CLIF op.
+                // Extract all lanes and fold with the requested scalar operation.
+                let vec_val = self.value_map[vector];
+                let clif_ty = self.translate_type(ty)?;
+                let lane_count = match clif_ty {
+                    cranelift_codegen::ir::types::F32X4 | cranelift_codegen::ir::types::I32X4 => 4u8,
+                    cranelift_codegen::ir::types::F64X2 | cranelift_codegen::ir::types::I64X2 => 2u8,
+                    _ => {
+                        return Err(CompilerError::Backend(format!(
+                            "VectorHorizontalReduce: unsupported vector type {:?}",
+                            clif_ty
+                        )))
+                    }
+                };
+
+                // Extract lane 0 as the accumulator seed
+                let mut acc = builder.ins().extractlane(vec_val, 0u8);
+                for lane_idx in 1..lane_count {
+                    let lane_val = builder.ins().extractlane(vec_val, lane_idx);
+                    acc = match op {
+                        BinaryOp::Add => builder.ins().iadd(acc, lane_val),
+                        BinaryOp::FAdd => builder.ins().fadd(acc, lane_val),
+                        BinaryOp::Sub => builder.ins().isub(acc, lane_val),
+                        BinaryOp::FSub => builder.ins().fsub(acc, lane_val),
+                        BinaryOp::Mul => builder.ins().imul(acc, lane_val),
+                        BinaryOp::FMul => builder.ins().fmul(acc, lane_val),
+                        _ => {
+                            return Err(CompilerError::Backend(format!(
+                                "VectorHorizontalReduce: unsupported op {:?}",
+                                op
+                            )))
+                        }
+                    };
+                }
+                self.value_map.insert(*result, acc);
             }
 
             _ => {

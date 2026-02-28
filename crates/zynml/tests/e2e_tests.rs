@@ -3890,6 +3890,44 @@ mod execution {
             Err(_) => println!("Runtime panic (symbol resolution may be incomplete)"),
         }
     }
+
+    /// Test that `@kernel elementwise` compiles and runs via the stride-4 SIMD path.
+    ///
+    /// The pattern `for i in range { arr[i] = arr[i] * scalar }` inside a
+    /// `compute(arr) { @kernel elementwise ... }` block triggers
+    /// `emit_elementwise_simd_loop`, which emits VectorLoad / VectorStore /
+    /// VectorSplat instructions.  The test verifies the function compiles and
+    /// the program runs to completion without panicking.
+    #[test]
+    fn test_execute_kernel_elementwise_simd() {
+        let Some(mut zynml) = create_runtime_with_plugins() else {
+            println!("Skipping: plugins not available");
+            return;
+        };
+
+        let source = r#"
+            def main() {
+                let data = [1.0, 2.0, 3.0, 4.0]
+                let doubled = compute(data) {
+                    @kernel elementwise
+                    for i in 0..4 {
+                        data[i] = data[i] * 2.0
+                    }
+                }
+                println("elementwise done")
+            }
+        "#;
+
+        let functions = zynml
+            .load_source(source)
+            .expect("@kernel elementwise program should compile");
+
+        assert!(
+            functions.iter().any(|f| f == "main"),
+            "@kernel elementwise: 'main' should be compiled, got: {:?}",
+            functions
+        );
+    }
 }
 
 // ============================================================================

@@ -618,6 +618,79 @@ pub enum HirInstruction {
         /// Type of value the continuation expects when resumed
         resume_ty: HirType,
     },
+
+    // ========================================================================
+    // SIMD / Vector Instructions
+    // ========================================================================
+
+    /// Broadcast a scalar value to all lanes of a SIMD vector.
+    ///
+    /// `ty` must be `HirType::Vector(elem_ty, lanes)`.
+    /// `scalar` must be a value of type `elem_ty`.
+    VectorSplat {
+        result: HirId,
+        ty: HirType,
+        scalar: HirId,
+    },
+
+    /// Extract a single lane from a SIMD vector register to a scalar.
+    ///
+    /// `ty` is the scalar element type (output).
+    /// `lane` must be less than the vector's lane count.
+    VectorExtractLane {
+        result: HirId,
+        ty: HirType,
+        vector: HirId,
+        lane: u8,
+    },
+
+    /// Insert a scalar into a specific lane of a SIMD vector.
+    ///
+    /// `ty` must be `HirType::Vector(elem_ty, lanes)` (output type).
+    /// `scalar` must match the element type of `vector`.
+    VectorInsertLane {
+        result: HirId,
+        ty: HirType,
+        vector: HirId,
+        scalar: HirId,
+        lane: u8,
+    },
+
+    /// Reduce all lanes of a SIMD vector to a single scalar using a
+    /// commutative binary operation.
+    ///
+    /// `ty` is the scalar output type (element type of `vector`).
+    /// Supported ops: Add, Sub, FAdd, FSub — only Add and FAdd make sense
+    /// semantically for reductions; Sub/FSub reduce left-to-right.
+    VectorHorizontalReduce {
+        result: HirId,
+        ty: HirType,
+        vector: HirId,
+        op: BinaryOp,
+    },
+
+    /// Load a SIMD vector from a memory pointer.
+    ///
+    /// `ty` must be `HirType::Vector(elem_ty, lanes)`.
+    /// `ptr` must point to the first element (element type, not vector type).
+    /// Loads `lanes` contiguous elements starting at `ptr`.
+    VectorLoad {
+        result: HirId,
+        ty: HirType,
+        ptr: HirId,
+        align: u32,
+    },
+
+    /// Store a SIMD vector to a memory pointer.
+    ///
+    /// `value` must have type `HirType::Vector(elem_ty, lanes)`.
+    /// `ptr` must point to the first element (element type, not vector type).
+    /// Stores `lanes` contiguous elements starting at `ptr`.
+    VectorStore {
+        value: HirId,
+        ptr: HirId,
+        align: u32,
+    },
 }
 
 /// Block terminator instructions
@@ -837,6 +910,27 @@ impl HirInstruction {
                 replace(handler_scope, replacements);
             }
             HirInstruction::CaptureContinuation { .. } => {}
+            // SIMD instructions
+            HirInstruction::VectorSplat { scalar, .. } => {
+                replace(scalar, replacements);
+            }
+            HirInstruction::VectorExtractLane { vector, .. } => {
+                replace(vector, replacements);
+            }
+            HirInstruction::VectorInsertLane { vector, scalar, .. } => {
+                replace(vector, replacements);
+                replace(scalar, replacements);
+            }
+            HirInstruction::VectorHorizontalReduce { vector, .. } => {
+                replace(vector, replacements);
+            }
+            HirInstruction::VectorLoad { ptr, .. } => {
+                replace(ptr, replacements);
+            }
+            HirInstruction::VectorStore { value, ptr, .. } => {
+                replace(value, replacements);
+                replace(ptr, replacements);
+            }
         }
     }
 
@@ -993,6 +1087,27 @@ impl HirInstruction {
                 ops.push(*handler_scope);
             }
             HirInstruction::CaptureContinuation { .. } => {}
+            // SIMD instructions
+            HirInstruction::VectorSplat { scalar, .. } => {
+                ops.push(*scalar);
+            }
+            HirInstruction::VectorExtractLane { vector, .. } => {
+                ops.push(*vector);
+            }
+            HirInstruction::VectorInsertLane { vector, scalar, .. } => {
+                ops.push(*vector);
+                ops.push(*scalar);
+            }
+            HirInstruction::VectorHorizontalReduce { vector, .. } => {
+                ops.push(*vector);
+            }
+            HirInstruction::VectorLoad { ptr, .. } => {
+                ops.push(*ptr);
+            }
+            HirInstruction::VectorStore { value, ptr, .. } => {
+                ops.push(*value);
+                ops.push(*ptr);
+            }
         }
         ops
     }

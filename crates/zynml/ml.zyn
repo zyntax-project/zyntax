@@ -2017,8 +2017,8 @@ typed_let = { name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr }
       is_mutable: false,
   }
 
-// x = expr
-assign_stmt = { field_assign_stmt | simple_assign_stmt }
+// x = expr  (or  arr[idx] = expr  or  obj.field = expr)
+assign_stmt = { field_assign_stmt | index_assign_stmt | simple_assign_stmt }
 
 // self.field = expr
 field_assign_stmt = { obj:identifier ~ "." ~ field:identifier ~ "=" ~ value:expr }
@@ -2026,6 +2026,16 @@ field_assign_stmt = { obj:identifier ~ "." ~ field:identifier ~ "=" ~ value:expr
       target: TypedExpression::FieldAccess {
           object: Box::new(TypedExpression::Variable { name: intern(obj) }),
           field: intern(field),
+      },
+      value: value,
+  }
+
+// arr[idx] = expr
+index_assign_stmt = { obj:identifier ~ "[" ~ idx:expr ~ "]" ~ "=" ~ value:expr }
+  -> TypedStatement::Assignment {
+      target: TypedExpression::Index {
+          object: Box::new(TypedExpression::Variable { name: intern(obj) }),
+          index: Box::new(idx),
       },
       value: value,
   }
