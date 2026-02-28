@@ -15,7 +15,7 @@ use cranelift_frontend::Switch as ClifSwitch;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -223,6 +223,9 @@ pub struct CraneliftBackend {
     symbol_signatures: HashMap<String, crate::zrtl::ZrtlSymbolSig>,
     /// External function link names (HirId → symbol name) for boxing support
     external_link_names: HashMap<HirId, String>,
+    /// Pre-scanned call-site inferred signatures for extern functions with 0-param placeholders
+    /// Maps HirId → (param_types, return_type) inferred from first call site
+    inferred_extern_sigs: HashMap<HirId, (Vec<HirType>, Option<HirType>)>,
     /// Effect codegen context for algebraic effects
     effect_context: EffectCodegenContext,
 }
@@ -324,6 +327,7 @@ impl CraneliftBackend {
             runtime_symbols,
             symbol_signatures: HashMap::new(),
             external_link_names: HashMap::new(),
+            inferred_extern_sigs: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
         })
     }
@@ -377,8 +381,13 @@ impl CraneliftBackend {
 
         // Two-pass function compilation:
         // Pass 1: Declare all functions (populate function_map)
+        // Pre-scan: Build map of call-site-inferred param types for extern functions
+        // with 0-param placeholder signatures. This must happen BEFORE declaration so
+        // the first Cranelift declaration is already correct.
+        self.prescan_extern_call_sites(module);
+
         for (id, function) in &module.functions {
-            self.declare_function(*id, function)?;
+            self.declare_function(*id, function, module)?;
         }
 
         // Pass 2: Compile all function bodies
@@ -518,8 +527,8 @@ impl CraneliftBackend {
     }
 
     /// Declare a function signature without compiling its body
-    fn declare_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
-        let sig = self.translate_signature(function)?;
+    fn declare_function(&mut self, id: HirId, function: &HirFunction, module: &HirModule) -> CompilerResult<()> {
+        let mut sig = self.translate_signature(function)?;
 
         if function.is_external {
             // External functions use Import linkage
@@ -536,18 +545,86 @@ impl CraneliftBackend {
                         .unwrap_or_else(|| format!("{:?}", function.name))
                 });
 
+            // If the HIR has a placeholder signature (0 params from import resolution),
+            // override with the real signature from either:
+            // 1. ZRTL plugin registration (symbol_signatures), or
+            // 2. Call-site inferred types (inferred_extern_sigs)
+            if function.signature.params.is_empty() {
+                let func_name_str = function
+                    .name
+                    .resolve_global()
+                    .unwrap_or_default();
+                let real_sig = self.symbol_signatures.get(&link_name)
+                    .or_else(|| self.symbol_signatures.get(&func_name_str));
+                if let Some(zrtl_sig) = real_sig {
+                    // Use ZRTL plugin signature
+                    let base_call_conv = sig.call_conv;
+                    sig = self.module.make_signature();
+                    sig.call_conv = base_call_conv;
+                    for i in 0..zrtl_sig.param_count as usize {
+                        let ty = type_tag_to_cranelift_type(&zrtl_sig.params[i]);
+                        sig.params.push(AbiParam::new(ty));
+                    }
+                    let ret_ty = type_tag_to_cranelift_type(&zrtl_sig.return_type);
+                    if ret_ty != types::I8 || !zrtl_sig.return_type.is_category(crate::zrtl::TypeCategory::Void) {
+                        sig.returns.push(AbiParam::new(ret_ty));
+                    }
+                } else if let Some((param_hir_types, ret_hir_type)) = self.inferred_extern_sigs.get(&id).cloned() {
+                    // Use call-site inferred types
+                    let base_call_conv = sig.call_conv;
+                    sig = self.module.make_signature();
+                    sig.call_conv = base_call_conv;
+                    for hir_ty in &param_hir_types {
+                        let ty = self.translate_type(hir_ty)?;
+                        sig.params.push(AbiParam::new(ty));
+                    }
+                    // Use inferred return type if available, else keep original
+                    if let Some(ret_ty) = &ret_hir_type {
+                        if *ret_ty != HirType::Void {
+                            let ty = self.translate_type(ret_ty)?;
+                            sig.returns.push(AbiParam::new(ty));
+                        }
+                    } else {
+                        // Preserve original returns
+                        for ret_ty in &function.signature.returns {
+                            if *ret_ty != HirType::Void {
+                                let ty = self.translate_type(ret_ty)?;
+                                sig.returns.push(AbiParam::new(ty));
+                            }
+                        }
+                    }
+                }
+            }
+
             log::debug!(
-                "[Cranelift] Declaring external function: {:?} -> '{}'",
+                "[Cranelift] Declaring external function: {:?} -> '{}' (params: {})",
                 function.name,
-                link_name
+                link_name,
+                sig.params.len()
             );
 
-            let func_id = self
+            let func_id = match self
                 .module
                 .declare_function(&link_name, Linkage::Import, &sig)
-                .map_err(|e| {
-                    CompilerError::Backend(format!("Failed to declare extern function: {}", e))
-                })?;
+            {
+                Ok(fid) => fid,
+                Err(_) => {
+                    // Declaration failed due to incompatible signature — another
+                    // HirFunction already declared this symbol (e.g., both
+                    // `tensor_sqrt` and `$Tensor$sqrt` map to the same ZRTL symbol).
+                    // Reuse the existing FuncId.
+                    if let Some((&existing_hir_id, _)) = self.external_link_names.iter()
+                        .find(|(_, name)| **name == link_name)
+                    {
+                        *self.function_map.get(&existing_hir_id).unwrap()
+                    } else {
+                        return Err(CompilerError::Backend(format!(
+                            "Failed to declare extern function '{}' and no prior declaration found",
+                            link_name
+                        )));
+                    }
+                }
+            };
 
             self.function_map.insert(id, func_id);
             // Store link_name for external function boxing support
@@ -580,13 +657,74 @@ impl CraneliftBackend {
         Ok(())
     }
 
+    /// Pre-scan call sites to infer param types for extern functions with 0-param placeholders.
+    /// Must be called BEFORE declare_function pass so the first declaration is already correct.
+    fn prescan_extern_call_sites(&mut self, module: &HirModule) {
+        // Collect HirIds of extern functions with 0 params
+        let mut zero_param_externs: HashSet<HirId> = HashSet::new();
+        for (id, function) in &module.functions {
+            if function.is_external && function.signature.params.is_empty() {
+                zero_param_externs.insert(*id);
+            }
+        }
+
+        if zero_param_externs.is_empty() {
+            return;
+        }
+
+        // Scan all function bodies for calls to these extern functions
+        for (_caller_id, caller_func) in &module.functions {
+            if caller_func.is_external {
+                continue;
+            }
+            for block in caller_func.blocks.values() {
+                for inst in &block.instructions {
+                    if let HirInstruction::Call {
+                        callee: HirCallable::Function(func_id),
+                        args,
+                        result,
+                        ..
+                    } = inst
+                    {
+                        if zero_param_externs.contains(func_id)
+                            && !args.is_empty()
+                            && !self.inferred_extern_sigs.contains_key(func_id)
+                        {
+                            // Infer param types from call arguments' HIR types
+                            let param_types: Vec<HirType> = args
+                                .iter()
+                                .map(|arg_id| {
+                                    caller_func
+                                        .values
+                                        .get(arg_id)
+                                        .map(|v| v.ty.clone())
+                                        .unwrap_or(HirType::I64)
+                                })
+                                .collect();
+
+                            // Infer return type from call result
+                            let ret_type = result.and_then(|r| {
+                                caller_func.values.get(&r).map(|v| v.ty.clone())
+                            });
+
+                            self.inferred_extern_sigs
+                                .insert(*func_id, (param_types, ret_type));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Compile a single function with hot-reload support (legacy, calls declare + compile_body)
     ///
     /// Note: This legacy path does not support algebraic effects. Use compile_module() for
     /// full effect support.
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         eprintln!("[Backend] compile_function called for {:?}", id);
-        self.declare_function(id, function)?;
+        let empty_module_for_decl =
+            HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
+        self.declare_function(id, function, &empty_module_for_decl)?;
         eprintln!("[Backend] After declare_function, IR:");
         eprintln!("{}", self.codegen_context.func);
         if !function.is_external {
@@ -3563,20 +3701,42 @@ impl CraneliftBackend {
                 match &hir_block.terminator {
                     HirTerminator::Return { values } => {
                         log::debug!("[Cranelift] Return terminator with values: {:?}", values);
-                        let cranelift_vals: Vec<_> = values
-                            .iter()
-                            .filter_map(|v| {
-                                let result = self.value_map.get(v).copied();
-                                if result.is_none() {
-                                    eprintln!(
-                                        "[Cranelift ERROR] Return value {:?} not in value_map",
-                                        v
-                                    );
-                                }
-                                result
-                            })
-                            .collect();
-                        log::debug!("[Cranelift] Returning {} values", cranelift_vals.len());
+                        let expected_returns =
+                            builder.func.signature.returns.clone();
+                        let mut cranelift_vals = Vec::new();
+                        for (i, v) in values.iter().enumerate() {
+                            if let Some(&val) = self.value_map.get(v) {
+                                let coerced =
+                                    if let Some(expected_abi) = expected_returns.get(i) {
+                                        let actual_ty =
+                                            builder.func.dfg.value_type(val);
+                                        Self::coerce_value(
+                                            &mut builder,
+                                            val,
+                                            actual_ty,
+                                            expected_abi.value_type,
+                                        )
+                                    } else {
+                                        val
+                                    };
+                                cranelift_vals.push(coerced);
+                            } else {
+                                eprintln!(
+                                    "[Cranelift ERROR] Return value {:?} not in value_map",
+                                    v
+                                );
+                            }
+                        }
+                        // Bare return: pad with zero values if signature expects more
+                        while cranelift_vals.len() < expected_returns.len() {
+                            let ty = expected_returns[cranelift_vals.len()].value_type;
+                            let zero = Self::emit_zero_value(&mut builder, ty);
+                            cranelift_vals.push(zero);
+                        }
+                        log::debug!(
+                            "[Cranelift] Returning {} values",
+                            cranelift_vals.len()
+                        );
                         builder.ins().return_(&cranelift_vals);
                     }
 
@@ -4089,18 +4249,61 @@ impl CraneliftBackend {
             } else {
                 builder.ins().fpromote(expected, val)
             }
-        } else if actual.is_int() && expected.is_float() && actual.bits() == expected.bits() {
-            builder
-                .ins()
-                .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
-        } else if actual.is_float() && expected.is_int() && actual.bits() == expected.bits() {
-            builder
-                .ins()
-                .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+        } else if actual.is_int() && expected.is_float() {
+            if actual.bits() == expected.bits() {
+                // Same size: bitcast (e.g., i32 -> f32, i64 -> f64)
+                builder
+                    .ins()
+                    .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+            } else {
+                // Different sizes: signed int to float conversion (e.g., i64 -> f32)
+                // First narrow/widen the int to match the float's bit width if needed,
+                // then use fcvt_from_sint
+                let int_for_cvt = if actual.bits() > 32 && expected == types::F32 {
+                    // i64 -> f32: ireduce to i32 first (lossy but matches semantics)
+                    builder.ins().ireduce(types::I32, val)
+                } else if actual.bits() < 64 && expected == types::F64 {
+                    // i32 -> f64: extend to i64 first
+                    builder.ins().sextend(types::I64, val)
+                } else {
+                    val
+                };
+                builder.ins().fcvt_from_sint(expected, int_for_cvt)
+            }
+        } else if actual.is_float() && expected.is_int() {
+            if actual.bits() == expected.bits() {
+                // Same size: bitcast (e.g., f32 -> i32, f64 -> i64)
+                builder
+                    .ins()
+                    .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+            } else {
+                // Different sizes: float to signed int conversion (e.g., f32 -> i64)
+                let int_from_cvt = builder.ins().fcvt_to_sint_sat(types::I32, val);
+                if expected.bits() > 32 {
+                    builder.ins().sextend(expected, int_from_cvt)
+                } else if expected.bits() < 32 {
+                    builder.ins().ireduce(expected, int_from_cvt)
+                } else {
+                    int_from_cvt
+                }
+            }
         } else {
-            // Can't coerce, return as-is (may produce verification error)
+            // Can't coerce (e.g., vector types), return as-is
             log::warn!("[Cranelift] Cannot coerce {:?} to {:?}", actual, expected);
             val
+        }
+    }
+
+    /// Emit a zero/default value for the given Cranelift type
+    fn emit_zero_value(builder: &mut FunctionBuilder, ty: types::Type) -> Value {
+        if ty.is_float() {
+            if ty == types::F32 {
+                builder.ins().f32const(0.0)
+            } else {
+                builder.ins().f64const(0.0)
+            }
+        } else {
+            builder.ins().iconst(ty, 0)
         }
     }
 
@@ -4625,7 +4828,24 @@ impl CraneliftBackend {
     ) -> CompilerResult<()> {
         match terminator {
             HirTerminator::Return { values } => {
-                let ret_vals: Vec<_> = values.iter().map(|v| self.value_map[v]).collect();
+                let expected_returns = builder.func.signature.returns.clone();
+                let mut ret_vals = Vec::new();
+                for (i, v) in values.iter().enumerate() {
+                    let val = self.value_map[v];
+                    let coerced = if let Some(expected_abi) = expected_returns.get(i) {
+                        let actual_ty = builder.func.dfg.value_type(val);
+                        Self::coerce_value(builder, val, actual_ty, expected_abi.value_type)
+                    } else {
+                        val
+                    };
+                    ret_vals.push(coerced);
+                }
+                // Bare return: pad with zero values if signature expects more
+                while ret_vals.len() < expected_returns.len() {
+                    let ty = expected_returns[ret_vals.len()].value_type;
+                    let zero = Self::emit_zero_value(builder, ty);
+                    ret_vals.push(zero);
+                }
                 builder.ins().return_(&ret_vals);
                 Ok(())
             }
@@ -6324,10 +6544,31 @@ impl CraneliftBackend {
     ) -> CompilerResult<()> {
         match terminator {
             HirTerminator::Return { values } => {
-                let cranelift_vals: Vec<_> = values
-                    .iter()
-                    .filter_map(|v| self.value_map.get(v).copied())
-                    .collect();
+                let expected_returns = builder.func.signature.returns.clone();
+                let mut cranelift_vals = Vec::new();
+                for (i, v) in values.iter().enumerate() {
+                    if let Some(&val) = self.value_map.get(v) {
+                        let coerced =
+                            if let Some(expected_abi) = expected_returns.get(i) {
+                                let actual_ty = builder.func.dfg.value_type(val);
+                                Self::coerce_value(
+                                    builder,
+                                    val,
+                                    actual_ty,
+                                    expected_abi.value_type,
+                                )
+                            } else {
+                                val
+                            };
+                        cranelift_vals.push(coerced);
+                    }
+                }
+                // Bare return: pad with zero values if signature expects more
+                while cranelift_vals.len() < expected_returns.len() {
+                    let ty = expected_returns[cranelift_vals.len()].value_type;
+                    let zero = Self::emit_zero_value(builder, ty);
+                    cranelift_vals.push(zero);
+                }
                 builder.ins().return_(&cranelift_vals);
                 Ok(())
             }
