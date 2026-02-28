@@ -87,7 +87,11 @@ jobs:
           echo "$HOME/.markflow" >> $GITHUB_PATH
 
       - name: Build site
+        shell: bash
         run: |
+          # Ignore SIGPIPE to prevent broken pipe errors in markflow
+          trap '' PIPE
+
           mkdir -p site
 
           # Copy website landing page to site root
