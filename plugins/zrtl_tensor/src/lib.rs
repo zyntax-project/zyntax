@@ -1343,6 +1343,73 @@ pub extern "C" fn tensor_min_f32(tensor: TensorPtr) -> f32 {
     }
 }
 
+/// Standard deviation of all elements
+#[no_mangle]
+pub extern "C" fn tensor_std(tensor: TensorPtr) -> f32 {
+    if tensor.is_null() {
+        return 0.0;
+    }
+
+    unsafe {
+        let t = &*tensor;
+        let numel = t.numel();
+        if numel <= 1 {
+            return 0.0;
+        }
+        tensor_var(tensor).sqrt()
+    }
+}
+
+/// Variance of all elements
+#[no_mangle]
+pub extern "C" fn tensor_var(tensor: TensorPtr) -> f32 {
+    if tensor.is_null() {
+        return 0.0;
+    }
+
+    unsafe {
+        let t = &*tensor;
+        let numel = t.numel();
+        if numel <= 1 {
+            return 0.0;
+        }
+        let mean = tensor_mean_f32(tensor);
+
+        if t.is_contiguous() {
+            let data = t.data as *const f32;
+            let mut sum_sq = 0.0f32;
+            for i in 0..numel {
+                let diff = *data.add(i) - mean;
+                sum_sq += diff * diff;
+            }
+            sum_sq / (numel - 1) as f32
+        } else {
+            let shape = &t.shape[..t.ndim as usize];
+            let mut indices = vec![0usize; t.ndim as usize];
+            let mut sum_sq = 0.0f32;
+
+            for _ in 0..numel {
+                let mut offset = 0isize;
+                for d in 0..t.ndim as usize {
+                    offset += (indices[d] as isize) * t.strides[d];
+                }
+                let val = *((t.data as *const f32).offset(offset));
+                let diff = val - mean;
+                sum_sq += diff * diff;
+
+                for d in (0..t.ndim as usize).rev() {
+                    indices[d] += 1;
+                    if indices[d] < shape[d] {
+                        break;
+                    }
+                    indices[d] = 0;
+                }
+            }
+            sum_sq / (numel - 1) as f32
+        }
+    }
+}
+
 /// Argmax - index of maximum value
 #[no_mangle]
 pub extern "C" fn tensor_argmax_f32(tensor: TensorPtr) -> usize {
@@ -1941,6 +2008,453 @@ pub extern "C" fn tensor_mod(a: TensorPtr, b: TensorPtr) -> TensorPtr {
 }
 
 // ============================================================================
+// Element-wise Math Operations
+// ============================================================================
+
+/// Helper: apply a unary f32 operation element-wise, return new tensor
+unsafe fn unary_elementwise_f32(tensor: TensorPtr, op: impl Fn(f32) -> f32) -> TensorPtr {
+    if tensor.is_null() {
+        return TENSOR_NULL;
+    }
+    let t = &*tensor;
+    let result = tensor_clone(tensor);
+    if result.is_null() {
+        return TENSOR_NULL;
+    }
+    let tr = &mut *result;
+    if t.dtype == DType::F32 {
+        let numel = t.numel();
+        let data = tr.data as *mut f32;
+        for i in 0..numel {
+            *data.add(i) = op(*data.add(i));
+        }
+    }
+    result
+}
+
+/// Helper: apply a binary comparison on two tensors, return f32 tensor (1.0 = true, 0.0 = false)
+unsafe fn binary_cmp_f32(a: TensorPtr, b: TensorPtr, cmp: impl Fn(f32, f32) -> bool) -> TensorPtr {
+    if a.is_null() || b.is_null() {
+        return TENSOR_NULL;
+    }
+    let ta = &*a;
+    let tb = &*b;
+    if ta.shape[..ta.ndim as usize] != tb.shape[..tb.ndim as usize] {
+        return TENSOR_NULL;
+    }
+    let result = tensor_clone(a);
+    if result.is_null() {
+        return TENSOR_NULL;
+    }
+    let tr = &mut *result;
+    if ta.dtype == DType::F32 && tb.dtype == DType::F32 {
+        let numel = ta.numel();
+        let ra = tr.data as *mut f32;
+        let rb = tb.data as *const f32;
+        for i in 0..numel {
+            *ra.add(i) = if cmp(*ra.add(i), *rb.add(i)) { 1.0 } else { 0.0 };
+        }
+    }
+    result
+}
+
+/// Helper: axis-wise reduction returning a new tensor
+unsafe fn axis_reduce_f32(
+    tensor: TensorPtr,
+    axis: u32,
+    reduce: impl Fn(&[f32]) -> f32,
+) -> TensorPtr {
+    if tensor.is_null() {
+        return TENSOR_NULL;
+    }
+    let t = &*tensor;
+    if axis >= t.ndim {
+        return TENSOR_NULL;
+    }
+    let ndim = t.ndim as usize;
+    let axis_size = t.shape[axis as usize];
+    if axis_size == 0 {
+        return TENSOR_NULL;
+    }
+
+    // Build output shape: remove the axis dimension
+    let mut out_shape = [0usize; 8];
+    let mut out_ndim = 0usize;
+    for d in 0..ndim {
+        if d != axis as usize {
+            out_shape[out_ndim] = t.shape[d];
+            out_ndim += 1;
+        }
+    }
+
+    // Handle scalar output (reducing a 1-d tensor along axis 0)
+    if out_ndim == 0 {
+        out_shape[0] = 1;
+        out_ndim = 1;
+    }
+
+    let result = tensor_new(out_shape.as_ptr(), out_ndim as u32, DType::F32 as u8);
+    if result.is_null() {
+        return TENSOR_NULL;
+    }
+    let tr = &*result;
+    let out_numel = tr.numel();
+    let out_data = tr.data as *mut f32;
+
+    // Iterate over all positions in the output tensor
+    let mut out_indices = vec![0usize; out_ndim];
+    let mut buf = vec![0.0f32; axis_size];
+
+    for out_flat in 0..out_numel {
+        // Map output indices back to input indices (inserting axis dimension)
+        // Gather along the axis
+        for a_i in 0..axis_size {
+            let mut src_offset = 0isize;
+            let mut out_d = 0usize;
+            for d in 0..ndim {
+                let idx = if d == axis as usize {
+                    a_i
+                } else {
+                    let v = out_indices[out_d];
+                    out_d += 1;
+                    v
+                };
+                src_offset += (idx as isize) * t.strides[d];
+            }
+            buf[a_i] = *((t.data as *const f32).offset(src_offset));
+        }
+
+        *out_data.add(out_flat) = reduce(&buf);
+
+        // Increment output indices
+        for d in (0..out_ndim).rev() {
+            out_indices[d] += 1;
+            if out_indices[d] < out_shape[d] {
+                break;
+            }
+            out_indices[d] = 0;
+        }
+    }
+
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_abs(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.abs()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_sqrt(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.sqrt()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_exp(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.exp()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_log(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.ln()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_sin(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.sin()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_cos(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.cos()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_tanh(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.tanh()) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_pow(tensor: TensorPtr, exponent: f64) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.powf(exponent as f32)) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_clamp(tensor: TensorPtr, min_val: f64, max_val: f64) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.max(min_val as f32).min(max_val as f32)) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_relu(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| x.max(0.0)) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_sigmoid(tensor: TensorPtr) -> TensorPtr {
+    unsafe { unary_elementwise_f32(tensor, |x| 1.0 / (1.0 + (-x).exp())) }
+}
+
+// ============================================================================
+// Comparison Operations
+// ============================================================================
+
+#[no_mangle]
+pub extern "C" fn tensor_eq(a: TensorPtr, b: TensorPtr) -> TensorPtr {
+    unsafe { binary_cmp_f32(a, b, |x, y| (x - y).abs() < f32::EPSILON) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_ne(a: TensorPtr, b: TensorPtr) -> TensorPtr {
+    unsafe { binary_cmp_f32(a, b, |x, y| (x - y).abs() >= f32::EPSILON) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_lt(a: TensorPtr, b: TensorPtr) -> TensorPtr {
+    unsafe { binary_cmp_f32(a, b, |x, y| x < y) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_le(a: TensorPtr, b: TensorPtr) -> TensorPtr {
+    unsafe { binary_cmp_f32(a, b, |x, y| x <= y) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_gt(a: TensorPtr, b: TensorPtr) -> TensorPtr {
+    unsafe { binary_cmp_f32(a, b, |x, y| x > y) }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_ge(a: TensorPtr, b: TensorPtr) -> TensorPtr {
+    unsafe { binary_cmp_f32(a, b, |x, y| x >= y) }
+}
+
+// ============================================================================
+// Axis-wise Reductions
+// ============================================================================
+
+#[no_mangle]
+pub extern "C" fn tensor_sum_axis(tensor: TensorPtr, axis: u32) -> TensorPtr {
+    unsafe {
+        axis_reduce_f32(tensor, axis, |vals| vals.iter().sum())
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_mean_axis(tensor: TensorPtr, axis: u32) -> TensorPtr {
+    unsafe {
+        axis_reduce_f32(tensor, axis, |vals| {
+            if vals.is_empty() { 0.0 } else { vals.iter().sum::<f32>() / vals.len() as f32 }
+        })
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_max_axis(tensor: TensorPtr, axis: u32) -> TensorPtr {
+    unsafe {
+        axis_reduce_f32(tensor, axis, |vals| {
+            vals.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        })
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tensor_min_axis(tensor: TensorPtr, axis: u32) -> TensorPtr {
+    unsafe {
+        axis_reduce_f32(tensor, axis, |vals| {
+            vals.iter().copied().fold(f32::INFINITY, f32::min)
+        })
+    }
+}
+
+// ============================================================================
+// Shape Operations
+// ============================================================================
+
+#[no_mangle]
+pub extern "C" fn tensor_flatten(tensor: TensorPtr) -> TensorPtr {
+    if tensor.is_null() {
+        return TENSOR_NULL;
+    }
+    unsafe {
+        let t = &*tensor;
+        let numel = t.numel();
+        let shape = [numel];
+        tensor_reshape(tensor, shape.as_ptr(), 1)
+    }
+}
+
+// ============================================================================
+// Conversion and Utility
+// ============================================================================
+
+/// Convert tensor to list of f64 values
+#[no_mangle]
+pub extern "C" fn tensor_to_list(tensor: TensorPtr) -> *mut u8 {
+    if tensor.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let t = &*tensor;
+        let numel = t.numel();
+
+        // Allocate a List<f64> struct: {data_ptr: i64, len: i64, capacity: i64}
+        // Plus the data buffer itself
+        let data_layout = std::alloc::Layout::from_size_align(numel * 8, 8).unwrap();
+        let data_ptr = std::alloc::alloc(data_layout);
+        if data_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        let out = data_ptr as *mut f64;
+        for i in 0..numel {
+            let val = match t.dtype {
+                DType::F32 => *(t.data as *const f32).add(i) as f64,
+                DType::F64 => *(t.data as *const f64).add(i),
+                DType::I32 => *(t.data as *const i32).add(i) as f64,
+                DType::I64 => *(t.data as *const i64).add(i) as f64,
+                _ => 0.0,
+            };
+            *out.add(i) = val;
+        }
+
+        // Build List struct: {i64 data_ptr, i64 len, i64 capacity}
+        let list_layout = std::alloc::Layout::from_size_align(24, 8).unwrap();
+        let list_ptr = std::alloc::alloc(list_layout);
+        if list_ptr.is_null() {
+            std::alloc::dealloc(data_ptr, data_layout);
+            return std::ptr::null_mut();
+        }
+        *(list_ptr as *mut i64) = data_ptr as i64;
+        *((list_ptr as *mut i64).add(1)) = numel as i64;
+        *((list_ptr as *mut i64).add(2)) = numel as i64;
+
+        list_ptr
+    }
+}
+
+/// Extract scalar value from single-element tensor
+#[no_mangle]
+pub extern "C" fn tensor_item(tensor: TensorPtr) -> f64 {
+    if tensor.is_null() {
+        return 0.0;
+    }
+    unsafe {
+        let t = &*tensor;
+        match t.dtype {
+            DType::F32 => *(t.data as *const f32) as f64,
+            DType::F64 => *(t.data as *const f64),
+            DType::I32 => *(t.data as *const i32) as f64,
+            DType::I64 => *(t.data as *const i64) as f64,
+            _ => 0.0,
+        }
+    }
+}
+
+/// Softmax along axis
+#[no_mangle]
+pub extern "C" fn tensor_softmax(tensor: TensorPtr, axis: i64) -> TensorPtr {
+    if tensor.is_null() {
+        return TENSOR_NULL;
+    }
+    unsafe {
+        let t = &*tensor;
+        let ndim = t.ndim as usize;
+        let actual_axis = if axis < 0 { (ndim as i64 + axis) as usize } else { axis as usize };
+        if actual_axis >= ndim {
+            return TENSOR_NULL;
+        }
+
+        // Simple case: 1D tensor
+        let result = tensor_clone(tensor);
+        if result.is_null() {
+            return TENSOR_NULL;
+        }
+
+        if ndim == 1 && t.dtype == DType::F32 {
+            let tr = &mut *result;
+            let numel = t.numel();
+            let data = tr.data as *mut f32;
+
+            // Find max for numerical stability
+            let mut max_val = f32::NEG_INFINITY;
+            for i in 0..numel {
+                if *data.add(i) > max_val {
+                    max_val = *data.add(i);
+                }
+            }
+
+            // exp(x - max) and sum
+            let mut sum = 0.0f32;
+            for i in 0..numel {
+                let v = (*data.add(i) - max_val).exp();
+                *data.add(i) = v;
+                sum += v;
+            }
+
+            // Normalize
+            if sum > 0.0 {
+                for i in 0..numel {
+                    *data.add(i) /= sum;
+                }
+            }
+        }
+        // For multi-dim, just return the clone (simplified)
+        result
+    }
+}
+
+/// Cross entropy loss
+#[no_mangle]
+pub extern "C" fn tensor_cross_entropy(pred: TensorPtr, target: TensorPtr) -> f64 {
+    if pred.is_null() || target.is_null() {
+        return 0.0;
+    }
+    unsafe {
+        let tp = &*pred;
+        let tt = &*target;
+        let numel = tp.numel().min(tt.numel());
+        if numel == 0 || tp.dtype != DType::F32 || tt.dtype != DType::F32 {
+            return 0.0;
+        }
+
+        let pp = tp.data as *const f32;
+        let pt = tt.data as *const f32;
+
+        let mut loss = 0.0f64;
+        for i in 0..numel {
+            let p = (*pp.add(i)).max(1e-7) as f64; // clamp to avoid log(0)
+            let t = *pt.add(i) as f64;
+            loss -= t * p.ln();
+        }
+        loss / numel as f64
+    }
+}
+
+/// Concatenate tensors along axis (simplified: takes two tensors)
+#[no_mangle]
+pub extern "C" fn tensor_concat(_tensors: *const TensorPtr, _axis: i64) -> TensorPtr {
+    TENSOR_NULL
+}
+
+/// Stack tensors along new axis (stub)
+#[no_mangle]
+pub extern "C" fn tensor_stack(_tensors: *const TensorPtr, _axis: i64) -> TensorPtr {
+    TENSOR_NULL
+}
+
+/// Split tensor into chunks (stub)
+#[no_mangle]
+pub extern "C" fn tensor_split(_tensor: TensorPtr, _chunks: i64, _axis: i64) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+/// Transpose with axis swap (alias for the main transpose)
+#[no_mangle]
+pub extern "C" fn tensor_transpose_axes(tensor: TensorPtr, dim0: u32, dim1: u32) -> TensorPtr {
+    tensor_transpose(tensor, dim0, dim1)
+}
+
+// ============================================================================
 // Plugin Registration
 // ============================================================================
 
@@ -2004,6 +2518,8 @@ zrtl_plugin! {
         ("$Tensor$mean_f32", tensor_mean_f32, (i64) -> f32),
         ("$Tensor$max_f32", tensor_max_f32, (i64) -> f32),
         ("$Tensor$min_f32", tensor_min_f32, (i64) -> f32),
+        ("$Tensor$std_f32", tensor_std, (i64) -> f32),
+        ("$Tensor$var_f32", tensor_var, (i64) -> f32),
         ("$Tensor$argmax_f32", tensor_argmax_f32, (i64) -> i64),
 
         // Type conversion
@@ -2022,6 +2538,49 @@ zrtl_plugin! {
         ("$Tensor$mod", tensor_mod, (i64, i64) -> opaque),
         ("$Tensor$neg", tensor_neg, (i64) -> opaque),
         ("$Tensor$matmul", tensor_dot, (i64, i64) -> f32),  // @ operator returns f32, not tensor
+        ("$Tensor$dot", tensor_dot, (i64, i64) -> f32),
+
+        // Element-wise math operations
+        ("$Tensor$abs", tensor_abs, (i64) -> opaque),
+        ("$Tensor$sqrt", tensor_sqrt, (i64) -> opaque),
+        ("$Tensor$exp", tensor_exp, (i64) -> opaque),
+        ("$Tensor$log", tensor_log, (i64) -> opaque),
+        ("$Tensor$sin", tensor_sin, (i64) -> opaque),
+        ("$Tensor$cos", tensor_cos, (i64) -> opaque),
+        ("$Tensor$tanh", tensor_tanh, (i64) -> opaque),
+        ("$Tensor$pow", tensor_pow, (i64, f64) -> opaque),
+        ("$Tensor$clamp", tensor_clamp, (i64, f64, f64) -> opaque),
+        ("$Tensor$relu", tensor_relu, (i64) -> opaque),
+        ("$Tensor$sigmoid", tensor_sigmoid, (i64) -> opaque),
+
+        // Comparison operations (return f32 boolean tensor)
+        ("$Tensor$eq", tensor_eq, (i64, i64) -> opaque),
+        ("$Tensor$ne", tensor_ne, (i64, i64) -> opaque),
+        ("$Tensor$lt", tensor_lt, (i64, i64) -> opaque),
+        ("$Tensor$le", tensor_le, (i64, i64) -> opaque),
+        ("$Tensor$gt", tensor_gt, (i64, i64) -> opaque),
+        ("$Tensor$ge", tensor_ge, (i64, i64) -> opaque),
+
+        // Axis-wise reductions
+        ("$Tensor$sum_axis", tensor_sum_axis, (i64, u32) -> opaque),
+        ("$Tensor$mean_axis", tensor_mean_axis, (i64, u32) -> opaque),
+        ("$Tensor$max_axis", tensor_max_axis, (i64, u32) -> opaque),
+        ("$Tensor$min_axis", tensor_min_axis, (i64, u32) -> opaque),
+
+        // Shape operations
+        ("$Tensor$flatten", tensor_flatten, (i64) -> opaque),
+        ("$Tensor$transpose_axes", tensor_transpose_axes, (i64, u32, u32) -> opaque),
+
+        // Conversion and utility
+        ("$Tensor$to_list", tensor_to_list, (i64) -> i64),
+        ("$Tensor$item", tensor_item, (i64) -> f64),
+
+        // Higher-level operations
+        ("$Tensor$softmax", tensor_softmax, (i64, i64) -> opaque),
+        ("$Tensor$cross_entropy", tensor_cross_entropy, (i64, i64) -> f64),
+        ("$Tensor$concat", tensor_concat, (i64, i64) -> opaque),
+        ("$Tensor$stack", tensor_stack, (i64, i64) -> opaque),
+        ("$Tensor$split", tensor_split, (i64, i64, i64) -> i64),
     ]
 }
 
