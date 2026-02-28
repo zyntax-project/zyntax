@@ -11,3 +11,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 zrtl = { path = "../../sdk/zrtl" }
 lazy_static = "1.5"
+
+[lints]
+workspace = true

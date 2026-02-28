@@ -27,3 +27,6 @@ zyntax_compiler = { path = "../compiler" }
 # [[bench]]
 # name = "parser_benchmarks"
 # harness = false
+
+[lints]
+workspace = true

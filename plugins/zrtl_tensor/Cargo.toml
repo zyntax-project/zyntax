@@ -13,3 +13,6 @@ zrtl = { path = "../../sdk/zrtl" }
 
 # SIMD operations for high-performance compute
 zrtl_simd = { path = "../zrtl_simd" }
+
+[lints]
+workspace = true

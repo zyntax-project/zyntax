@@ -42,3 +42,6 @@ regex = "1.10"
 # Dynamic grammar loading for runtime tests
 pest_vm = "2.8"
 pest_meta = "2.8"
+
+[lints]
+workspace = true

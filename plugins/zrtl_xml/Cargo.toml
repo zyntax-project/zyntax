@@ -11,3 +11,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 zrtl = { path = "../../sdk/zrtl" }
 quick-xml = { version = "0.31", features = ["serialize"] }
+
+[lints]
+workspace = true

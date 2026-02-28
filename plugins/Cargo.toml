@@ -39,3 +39,6 @@ zrtl = { path = "../sdk/zrtl" }
 # Common dependencies
 thiserror = "2.0"
 log = "0.4"
+
+[lints]
+workspace = true

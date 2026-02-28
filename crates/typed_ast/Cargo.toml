@@ -33,3 +33,5 @@ operator_traits = []  # Enable built-in operator traits (Add, Sub, Mul, etc.)
 [[example]]
 name = "generics_demo"
 path = "examples/generics_demo.rs"
+[lints]
+workspace = true

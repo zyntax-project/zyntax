@@ -12,3 +12,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 zrtl = { path = "../../sdk/zrtl" }
 tungstenite = "0.24"
 lazy_static = "1.5"
+
+[lints]
+workspace = true

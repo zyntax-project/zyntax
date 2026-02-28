@@ -11,3 +11,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 zrtl = { path = "../../sdk/zrtl" }
 getrandom = "0.2"
+
+[lints]
+workspace = true

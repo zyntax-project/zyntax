@@ -10,3 +10,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 zrtl = { path = "../../sdk/zrtl" }
+
+[lints]
+workspace = true

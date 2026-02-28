@@ -19,3 +19,6 @@ zyntax_compiler = { path = "../../compiler" }
 
 [dev-dependencies]
 # None needed - tests are in the crate itself
+
+[lints]
+workspace = true

@@ -71,3 +71,6 @@ default = ["cranelift-backend"]
 cranelift-backend = ["cranelift", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 llvm-backend = ["inkwell"]
 all-backends = ["cranelift-backend", "llvm-backend"]
+
+[lints]
+workspace = true

@@ -23,3 +23,6 @@ manifest = ["serde", "serde_json"]
 [[example]]
 name = "generate_manifest"
 required-features = ["manifest"]
+
+[lints]
+workspace = true

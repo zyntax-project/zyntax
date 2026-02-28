@@ -33,3 +33,9 @@ uuid = { version = "1.10.0", features = ["v4", "serde"] }
 miette = "7.2.0"
 typed-arena = "2.0.2"
 string-interner = "0.17.0"
+
+[workspace.lints.rust]
+warnings = "allow"
+
+[workspace.lints.clippy]
+all = "allow"

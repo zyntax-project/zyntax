@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
 use zrtl::async_support::*;
 
@@ -206,7 +206,7 @@ fn test_future_adapter_take_result() {
     }
 
     let mut adapter = FutureAdapter::new(compute());
-    adapter.poll(); // Complete the future
+    let _ = adapter.poll(); // Complete the future
 
     let result = adapter.take_result();
     assert_eq!(result, Some(42));

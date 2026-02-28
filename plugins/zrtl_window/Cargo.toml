@@ -12,3 +12,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 zrtl = { path = "../../sdk/zrtl" }
 # Use SDL2 as the backend for cross-platform windowing
 sdl2 = { version = "0.36", features = ["bundled"] }
+
+[lints]
+workspace = true

@@ -16,3 +16,6 @@ hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1.11", features = ["v4", "v7"] }
 getrandom = "0.2"
+
+[lints]
+workspace = true

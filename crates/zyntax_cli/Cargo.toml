@@ -56,3 +56,6 @@ inkwell = { version = "0.7.1", features = ["llvm21-1"], optional = true }
 default = []
 llvm-backend = ["zyntax_compiler/llvm-backend", "inkwell"]
 all-backends = ["llvm-backend"]
+
+[lints]
+workspace = true

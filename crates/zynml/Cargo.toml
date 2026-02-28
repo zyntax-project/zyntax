@@ -41,3 +41,6 @@ zyntax_compiler = { path = "../compiler" }
 default = []
 llvm-backend = ["zyntax_embed/llvm-backend"]
 all-backends = ["llvm-backend"]
+
+[lints]
+workspace = true

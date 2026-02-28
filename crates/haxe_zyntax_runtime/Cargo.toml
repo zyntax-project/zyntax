@@ -15,3 +15,6 @@ libc = "0.2"
 zyntax_compiler = { path = "../compiler" }
 zyntax_plugin_macros = { path = "../zyntax_plugin_macros" }
 inventory = "0.3"
+
+[lints]
+workspace = true

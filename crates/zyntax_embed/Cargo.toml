@@ -29,3 +29,6 @@ pest_vm = "2.8"
 default = []
 llvm-backend = ["zyntax_compiler/llvm-backend"]
 all-backends = ["zyntax_compiler/all-backends", "llvm-backend"]
+
+[lints]
+workspace = true

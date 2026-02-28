@@ -12,3 +12,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 zrtl = { path = "../../sdk/zrtl" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 lazy_static = "1.5"
+
+[lints]
+workspace = true

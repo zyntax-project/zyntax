@@ -13,3 +13,6 @@ zrtl = { path = "../../sdk/zrtl" }
 
 # SIMD support with runtime feature detection
 wide = "0.7"
+
+[lints]
+workspace = true

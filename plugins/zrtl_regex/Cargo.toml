@@ -11,3 +11,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 zrtl = { path = "../../sdk/zrtl" }
 regex = "1.10"
+
+[lints]
+workspace = true

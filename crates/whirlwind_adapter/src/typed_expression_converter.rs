@@ -877,7 +877,12 @@ impl TypedExpressionConverter {
             | BinaryOp::Gt
             | BinaryOp::Ge => Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool),
             // Arithmetic operators return the type of operands (if both are same)
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::MatMul
+            | BinaryOp::Div
+            | BinaryOp::Rem => {
                 // If both operands have the same type, use that type
                 if left.ty == right.ty {
                     left.ty.clone()

@@ -11,3 +11,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 zrtl = { path = "../../sdk/zrtl" }
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+
+[lints]
+workspace = true

@@ -12,3 +12,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 zrtl = { path = "../../sdk/zrtl" }
 ureq = { version = "2.12", features = ["json"] }
 lazy_static = "1.5"
+
+[lints]
+workspace = true

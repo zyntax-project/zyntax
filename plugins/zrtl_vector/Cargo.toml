@@ -16,3 +16,6 @@ zrtl_simd = { path = "../zrtl_simd" }
 
 # Parallel processing for batch operations
 rayon = "1.10"
+
+[lints]
+workspace = true

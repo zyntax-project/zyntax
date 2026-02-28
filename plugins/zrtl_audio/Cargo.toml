@@ -22,3 +22,6 @@ rubato = "0.15"
 
 # FFT for spectrograms
 rustfft = "6.2"
+
+[lints]
+workspace = true

@@ -17,3 +17,6 @@ safetensors = "0.4"
 # Memory mapping for large files
 memmap2 = "0.9"
 
+
+[lints]
+workspace = true
