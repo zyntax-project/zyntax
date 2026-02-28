@@ -1995,9 +1995,9 @@ zrtl_plugin! {
         // Shape operations - return new tensors
         ("$Tensor$reshape", tensor_reshape, (i64, i64, u32) -> opaque),
         ("$Tensor$transpose", tensor_transpose, (i64, u32, u32) -> opaque),
-        ("$Tensor$squeeze", tensor_squeeze, (i64, u32) -> opaque),
+        ("$Tensor$squeeze", tensor_squeeze, (i64) -> opaque),
         ("$Tensor$unsqueeze", tensor_unsqueeze, (i64, u32) -> opaque),
-        ("$Tensor$slice", tensor_slice, (i64, u32, i64, i64, i64) -> opaque),
+        ("$Tensor$slice", tensor_slice, (i64, u32, i64, i64) -> opaque),
 
         // Reductions - return scalars
         ("$Tensor$sum_f32", tensor_sum_f32, (i64) -> f32),

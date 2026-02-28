@@ -136,9 +136,10 @@ impl Tensor {
 // ============================================================================
 
 impl Tensor {
-    // Shape and dimensions - ZRTL returns different types, use wrappers
-    def shape(self): List<i64> {
-        extern tensor_shape(self)
+    // Shape and dimensions - ZRTL returns size of a single dimension
+    // Usage: t.shape(0) returns size of dim 0, t.shape(1) returns size of dim 1
+    def shape(self, dim: i64): i64 {
+        extern tensor_shape(self, dim)
     }
     def ndim(self): i64 {
         extern tensor_ndim(self)
@@ -185,11 +186,10 @@ impl Tensor {
     def reshape(self, shape: List<i64>): Tensor {
         extern tensor_reshape(self, shape.data, shape.len)
     }
-    def transpose(self): Tensor {
-        extern tensor_transpose(self)
-    }
-    def transpose_axes(self, dim0: i64, dim1: i64): Tensor {
-        extern tensor_transpose_axes(self, dim0, dim1)
+    // Transpose: swap two dimensions
+    // Usage: t.transpose(0, 1) swaps dim 0 and dim 1
+    def transpose(self, dim0: i64, dim1: i64): Tensor {
+        extern tensor_transpose(self, dim0, dim1)
     }
     def flatten(self): Tensor {
         extern tensor_flatten(self)
@@ -233,14 +233,17 @@ impl Tensor {
     }
 
     // Indexing and slicing
-    def get(self, indices: List<i64>): f64 {
-        extern tensor_get(self, indices)
+    // ZRTL get/set use flat index (i64), not multi-dim List
+    def get(self, index: i64): f32 {
+        extern tensor_get_f32(self, index)
     }
-    def set(self, indices: List<i64>, value: f64) {
-        extern tensor_set(self, indices, value)
+    def set(self, index: i64, value: f32) {
+        extern tensor_set_f32(self, index, value)
     }
-    def slice(self, start: List<i64>, end: List<i64>): Tensor {
-        extern tensor_slice(self, start, end)
+    // Slice along a single dimension: t.slice(dim, start, end)
+    // Usage: t.slice(0, 2, 5) slices dim 0 from index 2 to 5
+    def slice(self, dim: i64, start: i64, end: i64): Tensor {
+        extern tensor_slice(self, dim, start, end)
     }
 
     // Comparison (returns boolean tensor) - use wrappers

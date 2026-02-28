@@ -40,5 +40,4 @@ zrtl = { path = "../sdk/zrtl" }
 thiserror = "2.0"
 log = "0.4"
 
-[lints]
-workspace = true
+[workspace.lints]
