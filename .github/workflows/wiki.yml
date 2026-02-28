@@ -7,6 +7,8 @@ on:
     paths:
       - 'book/**'
       - 'website/**'
+      - '.env.markflow'
+      - '.github/workflows/wiki.yml'
   workflow_dispatch:
 
 permissions:
@@ -91,9 +93,13 @@ jobs:
 
           # Copy website landing page to site root
           cp website/index.html site/index.html
+          touch site/.nojekyll
 
           # Build book docs with Markflow into /book subdirectory
           markflow build --prebake --source ./book --output ./site/book --config .env.markflow
+
+          # Verify book output exists
+          ls -la site/book/
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
