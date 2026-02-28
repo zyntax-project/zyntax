@@ -82,16 +82,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Markflow
-        run: |
-          curl -sL https://raw.githubusercontent.com/darmie/markflow/main/install.sh | bash
-          echo "$HOME/.markflow" >> $GITHUB_PATH
+        run: curl -sL https://raw.githubusercontent.com/darmie/markflow/main/install.sh | bash
 
       - name: Build site
-        shell: bash
         run: |
-          # Ignore SIGPIPE to prevent broken pipe errors in markflow
-          trap '' PIPE
-
+          export PATH="$HOME/.markflow:$PATH"
           mkdir -p site
 
           # Copy website landing page to site root
