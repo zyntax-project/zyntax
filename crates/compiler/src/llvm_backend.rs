@@ -2541,8 +2541,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                                     self.builder.build_call(box_fn, &[arg_val.into()], "box")
                                 {
                                     call_site
-                                        .try_as_basic_value()
-                                        .left()
+                                        .try_as_basic_value().basic()
                                         .unwrap_or(arg_val)
                                         .into()
                                 } else {
@@ -2998,6 +2997,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     format!("Intrinsic {:?} not yet implemented in LLVM backend", intrinsic)
                 ))
             }
+            _ => todo!()
         }
     }
 
