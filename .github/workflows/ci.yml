@@ -31,10 +31,17 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets
 
-  llvm-feature-check:
-    name: llvm feature check
+  backend-feature-matrix:
+    name: backend features (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: default
+            cargo_features: ""
+          - lane: llvm-backend
+            cargo_features: "--features llvm-backend"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,8 +52,12 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Check zynml with llvm-backend feature
-        run: cargo check -p zynml --features llvm-backend
+      - name: Build zynml for selected backend lane
+        run: cargo check -p zynml ${{ matrix.cargo_features }}
+
+      - name: Run runtime-profile smoke test for selected backend lane
+        run: |
+          RUST_MIN_STACK=134217728 cargo test -p zynml ${{ matrix.cargo_features }} --test e2e_tests runtime::test_runtime_profile_tiered_development -- --nocapture
 
   parse-conformance:
     name: parse conformance
