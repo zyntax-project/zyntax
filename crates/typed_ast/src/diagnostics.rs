@@ -504,12 +504,12 @@ impl DiagnosticCollector {
     }
 
     /// Emit an error
-    pub fn error(&mut self, message: impl Into<String>) -> DiagnosticBuilder {
+    pub fn error(&mut self, message: impl Into<String>) -> DiagnosticBuilder<'_> {
         DiagnosticBuilder::new(self, Diagnostic::error(message))
     }
 
     /// Emit a warning
-    pub fn warning(&mut self, message: impl Into<String>) -> DiagnosticBuilder {
+    pub fn warning(&mut self, message: impl Into<String>) -> DiagnosticBuilder<'_> {
         DiagnosticBuilder::new(self, Diagnostic::warning(message))
     }
 

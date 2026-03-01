@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! ZynPEG: Parser Generator for Multi-Language Zyntax Frontends
 //!
 //! ZynPEG extends pest PEG syntax with TypedAST action blocks, enabling

@@ -7,7 +7,7 @@ use crate::symbol_extractor::SymbolExtractor;
 use crate::type_converter::TypeConverter;
 use crate::typed_expression_converter::TypedExpressionConverter;
 use whirlwind_analyzer::Standpoint;
-use zyntax_typed_ast::{AstArena, Type, TypeRegistry, TypedProgram};
+use zyntax_typed_ast::{AstArena, TypeRegistry, TypedProgram};
 
 /// The main adapter that converts Whirlwind's Standpoint IR to Zyntax's TypedAST
 ///

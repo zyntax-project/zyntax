@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! Zyntax Runtime Library
 //!
 //! This library provides **language-agnostic** runtime primitives that can be used

@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! ZynML CLI - Command-line interface for the ZynML DSL
 //!
 //! ## Usage

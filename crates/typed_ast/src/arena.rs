@@ -313,7 +313,7 @@ impl ThreadSafeArenaManager {
     /// Get or create an arena for the current thread
     pub fn get_arena(
         &self,
-    ) -> std::sync::RwLockWriteGuard<HashMap<std::thread::ThreadId, AstArena>> {
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<std::thread::ThreadId, AstArena>> {
         let thread_id = std::thread::current().id();
         let mut arenas = self.arenas.write().unwrap();
 

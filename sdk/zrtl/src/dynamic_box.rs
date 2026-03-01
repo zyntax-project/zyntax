@@ -419,7 +419,7 @@ impl DynamicBox {
             return Self::null();
         }
 
-        let mut cloned = Self::alloc(self.tag, self.size);
+        let cloned = Self::alloc(self.tag, self.size);
         unsafe {
             std::ptr::copy_nonoverlapping(self.data, cloned.data, self.size as usize);
         }

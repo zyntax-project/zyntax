@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! Zyntax CLI - Command-line interface for the Zyntax compiler
 //!
 //! Supports multiple input formats:

@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! # Whirlwind to TypedAST Adapter
 //!
 //! This crate provides translation from Whirlwind's Standpoint IR to Zyntax's TypedAST.

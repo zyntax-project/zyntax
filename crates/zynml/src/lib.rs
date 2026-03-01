@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! # ZynML - Machine Learning DSL for Zyntax
 //!
 //! ZynML is a domain-specific language for machine learning that provides:

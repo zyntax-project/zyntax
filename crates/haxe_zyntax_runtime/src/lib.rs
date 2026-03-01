@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! Haxe-specific Runtime for Zyntax
 //!
 //! This crate provides Haxe-specific runtime functions for the Zyntax compiler.

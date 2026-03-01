@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! # Zyntax Compiler Infrastructure
 //!
 //! This crate provides the compilation pipeline from TypedAST to executable code,

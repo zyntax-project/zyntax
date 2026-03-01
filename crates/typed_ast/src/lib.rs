@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! # Zyntax TypedAST
 //!
 //! A robust TypedAST that serves as the common intermediate representation

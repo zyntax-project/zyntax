@@ -1,3 +1,5 @@
+#![allow(unused, dead_code, deprecated)]
+
 //! # Zyntax Embed - Rust SDK for Embedding Zyntax JIT
 //!
 //! This crate provides ergonomic Rust APIs for embedding Zyntax as a JIT runtime,
