@@ -89,9 +89,11 @@ enum Commands {
 
 fn main() -> Result<()> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp(None)
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,cranelift_codegen=error"),
+    )
+    .format_timestamp(None)
+    .init();
 
     let cli = Cli::parse();
 

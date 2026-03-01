@@ -371,7 +371,7 @@ impl CraneliftBackend {
         // Dump HIR if ZYNTAX_DUMP_HIR is set
         if std::env::var("ZYNTAX_DUMP_HIR").is_ok() {
             let dump = crate::hir_dump::dump_module(module);
-            eprintln!("{}", dump);
+            log::trace!("{}", dump);
         }
 
         // Process globals first (including vtables)
@@ -396,10 +396,7 @@ impl CraneliftBackend {
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 if let Err(e) = self.compile_function_body(*id, function, module) {
                     CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "[CRANELIFT WARN] Skipping function '{}': {:?}",
-                        function.name, e
-                    );
+                    log::debug!("[CRANELIFT] Skipping function '{}': {:?}", function.name, e);
                     // Remove from function_map to prevent later lookup failures
                     self.function_map.remove(id);
                 }
@@ -732,19 +729,23 @@ impl CraneliftBackend {
     /// Note: This legacy path does not support algebraic effects. Use compile_module() for
     /// full effect support.
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
-        eprintln!("[Backend] compile_function called for {:?}", id);
+        log::trace!("[Backend] compile_function called for {:?}", id);
         let empty_module_for_decl =
             HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
         self.declare_function(id, function, &empty_module_for_decl)?;
-        eprintln!("[Backend] After declare_function, IR:");
-        eprintln!("{}", self.codegen_context.func);
+        log::trace!(
+            "[Backend] After declare_function, IR:\n{}",
+            self.codegen_context.func
+        );
         if !function.is_external {
             // Create empty module for legacy path (effects won't work)
             let empty_module =
                 HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
             self.compile_function_body(id, function, &empty_module)?;
-            eprintln!("[Backend] After compile_function_body, IR:");
-            eprintln!("{}", self.codegen_context.func);
+            log::trace!(
+                "[Backend] After compile_function_body, IR:\n{}",
+                self.codegen_context.func
+            );
         }
         Ok(())
     }
@@ -1149,9 +1150,10 @@ impl CraneliftBackend {
                         );
                         let ptr = builder.ins().stack_addr(pointer_type, slot, 0);
                         self.value_map.insert(value.id, ptr);
-                        eprintln!(
+                        log::trace!(
                             "[CRANELIFT UNDEF] Allocated {} bytes stack for aggregate undef {:?}",
-                            alloc_size, value.id
+                            alloc_size,
+                            value.id
                         );
                     } else {
                         // For scalar types, use zero constant
@@ -2361,7 +2363,7 @@ impl CraneliftBackend {
                             let func_ptr_val = match self.value_map.get(func_ptr).copied() {
                                 Some(v) => v,
                                 None => {
-                                    eprintln!("[WARN] IndirectCall: func_ptr {:?} not found in value_map! Using 0.", func_ptr);
+                                    log::trace!("[WARN] IndirectCall: func_ptr {:?} not found in value_map! Using 0.", func_ptr);
                                     builder.ins().iconst(types::I64, 0)
                                 }
                             };
@@ -3782,7 +3784,7 @@ impl CraneliftBackend {
                                 };
                                 cranelift_vals.push(coerced);
                             } else {
-                                eprintln!(
+                                log::trace!(
                                     "[Cranelift ERROR] Return value {:?} not in value_map",
                                     v
                                 );
@@ -4093,12 +4095,10 @@ impl CraneliftBackend {
 
         // Verify the generated IR (catches errors before they become cryptic panics)
         if let Err(errors) = verify_function(&self.codegen_context.func, self.module.isa()) {
-            error!(
-                "[Cranelift] IR verification failed for function '{}':",
-                function.name
+            debug!(
+                "[Cranelift] IR verification failed for function '{}': {}",
+                function.name, errors
             );
-            error!("  {}", errors);
-            debug!("Function IR dump:\n{}", self.codegen_context.func.display());
             return Err(CompilerError::Backend(format!(
                 "Cranelift IR verification failed for function '{}': {}",
                 function.name, errors
@@ -5950,9 +5950,11 @@ impl CraneliftBackend {
                 op,
                 operand,
             } => {
-                eprintln!(
+                log::trace!(
                     "[Cranelift Cast] operand={:?}, op={:?}, target_ty={:?}",
-                    operand, op, ty
+                    operand,
+                    op,
+                    ty
                 );
                 let val = self
                     .value_map
@@ -5960,7 +5962,7 @@ impl CraneliftBackend {
                     .copied()
                     .unwrap_or_else(|| panic!("Cast operand {:?} not in value_map", operand));
                 let target_ty = self.translate_type(ty)?;
-                eprintln!("[Cranelift Cast] val={:?}, target_ty={:?}", val, target_ty);
+                log::trace!("[Cranelift Cast] val={:?}, target_ty={:?}", val, target_ty);
 
                 let cast_val = match op {
                     crate::hir::CastOp::Bitcast => {
@@ -5968,15 +5970,7 @@ impl CraneliftBackend {
                         val
                     }
                     crate::hir::CastOp::ZExt => builder.ins().uextend(target_ty, val),
-                    crate::hir::CastOp::SExt => {
-                        eprintln!(
-                            "[Cranelift Cast] Doing sextend from val={:?} to target_ty={:?}",
-                            val, target_ty
-                        );
-                        let result = builder.ins().sextend(target_ty, val);
-                        eprintln!("[Cranelift Cast] sextend result={:?}", result);
-                        result
-                    }
+                    crate::hir::CastOp::SExt => builder.ins().sextend(target_ty, val),
                     crate::hir::CastOp::Trunc => builder.ins().ireduce(target_ty, val),
                     crate::hir::CastOp::FpToUi => builder.ins().fcvt_to_uint(target_ty, val),
                     crate::hir::CastOp::FpToSi => builder.ins().fcvt_to_sint(target_ty, val),

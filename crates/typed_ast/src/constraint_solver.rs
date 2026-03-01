@@ -296,17 +296,65 @@ impl Substitution {
                 methods,
                 is_structural,
                 nullability,
-            } => todo!(),
+            } => {
+                let methods = methods
+                    .iter()
+                    .map(|m| {
+                        let mut m = m.clone();
+                        m.return_type = self.apply(&m.return_type);
+                        m.params = m
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let mut p = p.clone();
+                                p.ty = self.apply(&p.ty);
+                                p
+                            })
+                            .collect();
+                        m
+                    })
+                    .collect();
+                Type::Interface {
+                    methods,
+                    is_structural: *is_structural,
+                    nullability: *nullability,
+                }
+            }
             Type::Struct {
                 fields,
                 is_anonymous,
                 nullability,
-            } => todo!(),
+            } => {
+                let fields = fields
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.clone();
+                        f.ty = self.apply(&f.ty);
+                        f
+                    })
+                    .collect();
+                Type::Struct {
+                    fields,
+                    is_anonymous: *is_anonymous,
+                    nullability: *nullability,
+                }
+            }
             Type::Trait {
                 id,
                 associated_types,
                 super_traits,
-            } => todo!(),
+            } => {
+                let associated_types = associated_types
+                    .iter()
+                    .map(|(name, ty)| (*name, self.apply(ty)))
+                    .collect();
+                let super_traits = super_traits.iter().map(|t| self.apply(t)).collect();
+                Type::Trait {
+                    id: *id,
+                    associated_types,
+                    super_traits,
+                }
+            }
         }
     }
 
@@ -925,11 +973,61 @@ impl ConstraintSolver {
                                 ),
                             ]))
                         }
-                        TypeKind::Atomic => todo!(),
-                        TypeKind::Class => todo!(),
-                        TypeKind::Function => todo!(),
-                        TypeKind::Array => todo!(),
-                        TypeKind::Generic => todo!(),
+                        TypeKind::Atomic => {
+                            // Atomic types (primitives, extern types) — check type methods
+                            if let Some(method_sig) =
+                                type_def.methods.iter().find(|m| m.name == member)
+                            {
+                                let method_type = self.method_sig_to_function_type(
+                                    method_sig,
+                                    &type_def.type_params,
+                                    type_args,
+                                );
+                                Ok(ConstraintResult::NewConstraints(vec![Constraint::Equal(
+                                    member_ty,
+                                    method_type,
+                                    span,
+                                )]))
+                            } else {
+                                // No method found — defer, may be resolved via trait
+                                Ok(ConstraintResult::Solved)
+                            }
+                        }
+                        TypeKind::Class => {
+                            // Class types — check fields first, then methods
+                            if let Some(field_def) =
+                                type_def.fields.iter().find(|f| f.name == member)
+                            {
+                                let field_type = self.apply_type_args(
+                                    &field_def.ty,
+                                    &type_def.type_params,
+                                    type_args,
+                                );
+                                Ok(ConstraintResult::NewConstraints(vec![Constraint::Equal(
+                                    member_ty, field_type, span,
+                                )]))
+                            } else if let Some(method_sig) =
+                                type_def.methods.iter().find(|m| m.name == member)
+                            {
+                                let method_type = self.method_sig_to_function_type(
+                                    method_sig,
+                                    &type_def.type_params,
+                                    type_args,
+                                );
+                                Ok(ConstraintResult::NewConstraints(vec![Constraint::Equal(
+                                    member_ty,
+                                    method_type,
+                                    span,
+                                )]))
+                            } else {
+                                Ok(ConstraintResult::Solved)
+                            }
+                        }
+                        TypeKind::Function | TypeKind::Array | TypeKind::Generic => {
+                            // These TypeKinds don't typically have named members
+                            // Defer to trait resolution
+                            Ok(ConstraintResult::Solved)
+                        }
                     }
                 } else {
                     // Type definition not found - defer constraint
@@ -968,6 +1066,44 @@ impl ConstraintSolver {
     }
 
     /// Apply type arguments to a type based on type parameters
+    /// Convert a MethodSig to a Function type, applying type argument substitution
+    fn method_sig_to_function_type(
+        &self,
+        method_sig: &crate::type_registry::MethodSig,
+        type_params: &[crate::type_registry::TypeParam],
+        type_args: &[Type],
+    ) -> Type {
+        let method_params: Vec<ParamInfo> = method_sig
+            .params
+            .iter()
+            .filter(|p| !p.is_self)
+            .map(|p| ParamInfo {
+                name: Some(p.name),
+                ty: p.ty.clone(),
+                is_optional: false,
+                is_varargs: p.is_varargs,
+                is_keyword_only: false,
+                is_positional_only: false,
+                is_out: false,
+                is_ref: p.is_mut,
+                is_inout: false,
+            })
+            .collect();
+
+        let method_type = Type::Function {
+            params: method_params,
+            return_type: Box::new(method_sig.return_type.clone()),
+            is_varargs: false,
+            has_named_params: true,
+            has_default_params: false,
+            async_kind: crate::type_registry::AsyncKind::default(),
+            calling_convention: crate::type_registry::CallingConvention::default(),
+            nullability: crate::type_registry::NullabilityKind::default(),
+        };
+
+        self.apply_type_args(&method_type, type_params, type_args)
+    }
+
     fn apply_type_args(
         &self,
         ty: &Type,
@@ -2687,18 +2823,48 @@ impl ConstraintSolver {
             Type::Interface {
                 methods,
                 is_structural,
-                nullability,
-            } => todo!(),
+                ..
+            } => {
+                let kind = if *is_structural { "structural " } else { "" };
+                let method_names: Vec<_> = methods
+                    .iter()
+                    .map(|m| m.name.resolve_global().unwrap_or_else(|| "?".to_string()))
+                    .collect();
+                format!("{}interface {{ {} }}", kind, method_names.join(", "))
+            }
             Type::Struct {
                 fields,
                 is_anonymous,
-                nullability,
-            } => todo!(),
+                ..
+            } => {
+                let field_strs: Vec<_> = fields
+                    .iter()
+                    .map(|f| {
+                        let name = f.name.resolve_global().unwrap_or_else(|| "?".to_string());
+                        let ty = self.format_type(&f.ty);
+                        format!("{}: {}", name, ty)
+                    })
+                    .collect();
+                if *is_anonymous {
+                    format!("{{ {} }}", field_strs.join(", "))
+                } else {
+                    format!("struct {{ {} }}", field_strs.join(", "))
+                }
+            }
             Type::Trait {
                 id,
                 associated_types,
-                super_traits,
-            } => todo!(),
+                ..
+            } => {
+                if let Some(trait_def) = self.type_registry.get_trait_by_id(*id) {
+                    trait_def
+                        .name
+                        .resolve_global()
+                        .unwrap_or_else(|| format!("Trait({:?})", id))
+                } else {
+                    format!("Trait({:?})", id)
+                }
+            }
             Type::Extern { name, .. } => {
                 // Format extern/opaque type by name
                 name.resolve_global()
@@ -2983,7 +3149,10 @@ impl ConstraintSolver {
         // Fall back to checking impl methods directly for matching types.
         for (_trait_id, impls) in self.type_registry.iter_implementations() {
             for impl_def in impls {
-                if self.type_registry.impl_matches_type(&impl_def.for_type, receiver_ty) {
+                if self
+                    .type_registry
+                    .impl_matches_type(&impl_def.for_type, receiver_ty)
+                {
                     for method_impl in &impl_def.methods {
                         if method_impl.signature.name == method_name {
                             return self.resolve_and_verify_method(
@@ -3537,17 +3706,69 @@ impl ConstraintSolver {
                 methods,
                 is_structural,
                 nullability,
-            } => todo!(),
+            } => {
+                let methods = methods
+                    .iter()
+                    .map(|m| {
+                        let mut m = m.clone();
+                        m.return_type =
+                            self.resolve_associated_types(&m.return_type, receiver_type);
+                        m.params = m
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let mut p = p.clone();
+                                p.ty = self.resolve_associated_types(&p.ty, receiver_type);
+                                p
+                            })
+                            .collect();
+                        m
+                    })
+                    .collect();
+                Type::Interface {
+                    methods,
+                    is_structural: *is_structural,
+                    nullability: *nullability,
+                }
+            }
             Type::Struct {
                 fields,
                 is_anonymous,
                 nullability,
-            } => todo!(),
+            } => {
+                let fields = fields
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.clone();
+                        f.ty = self.resolve_associated_types(&f.ty, receiver_type);
+                        f
+                    })
+                    .collect();
+                Type::Struct {
+                    fields,
+                    is_anonymous: *is_anonymous,
+                    nullability: *nullability,
+                }
+            }
             Type::Trait {
                 id,
                 associated_types,
                 super_traits,
-            } => todo!(),
+            } => {
+                let associated_types = associated_types
+                    .iter()
+                    .map(|(name, ty)| (*name, self.resolve_associated_types(ty, receiver_type)))
+                    .collect();
+                let super_traits = super_traits
+                    .iter()
+                    .map(|t| self.resolve_associated_types(t, receiver_type))
+                    .collect();
+                Type::Trait {
+                    id: *id,
+                    associated_types,
+                    super_traits,
+                }
+            }
             Type::Extern { .. } | Type::Unresolved(_) => ty.clone(),
         }
     }
@@ -3709,17 +3930,68 @@ impl ConstraintSolver {
                 methods,
                 is_structural,
                 nullability,
-            } => todo!(),
+            } => {
+                let methods = methods
+                    .iter()
+                    .map(|m| {
+                        let mut m = m.clone();
+                        m.return_type = self.substitute_self_type(&m.return_type, receiver_type);
+                        m.params = m
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let mut p = p.clone();
+                                p.ty = self.substitute_self_type(&p.ty, receiver_type);
+                                p
+                            })
+                            .collect();
+                        m
+                    })
+                    .collect();
+                Type::Interface {
+                    methods,
+                    is_structural: *is_structural,
+                    nullability: *nullability,
+                }
+            }
             Type::Struct {
                 fields,
                 is_anonymous,
                 nullability,
-            } => todo!(),
+            } => {
+                let fields = fields
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.clone();
+                        f.ty = self.substitute_self_type(&f.ty, receiver_type);
+                        f
+                    })
+                    .collect();
+                Type::Struct {
+                    fields,
+                    is_anonymous: *is_anonymous,
+                    nullability: *nullability,
+                }
+            }
             Type::Trait {
                 id,
                 associated_types,
                 super_traits,
-            } => todo!(),
+            } => {
+                let associated_types = associated_types
+                    .iter()
+                    .map(|(name, ty)| (*name, self.substitute_self_type(ty, receiver_type)))
+                    .collect();
+                let super_traits = super_traits
+                    .iter()
+                    .map(|t| self.substitute_self_type(t, receiver_type))
+                    .collect();
+                Type::Trait {
+                    id: *id,
+                    associated_types,
+                    super_traits,
+                }
+            }
         }
     }
 

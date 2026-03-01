@@ -1217,12 +1217,13 @@ impl TypeRegistry {
         // Resolve the queried type's name for cross-variant matching
         // (Type::Named vs Type::Extern can refer to the same type)
         let query_type_name: Option<String> = match for_type {
-            Type::Named { id, .. } => {
-                self.types.get(id).and_then(|td| td.name.resolve_global().map(|s| s.to_string()))
-            }
-            Type::Extern { name, .. } => {
-                name.resolve_global().map(|s| s.strip_prefix('$').unwrap_or(&s).to_string())
-            }
+            Type::Named { id, .. } => self
+                .types
+                .get(id)
+                .and_then(|td| td.name.resolve_global().map(|s| s.to_string())),
+            Type::Extern { name, .. } => name
+                .resolve_global()
+                .map(|s| s.strip_prefix('$').unwrap_or(&s).to_string()),
             _ => None,
         };
 
@@ -1234,20 +1235,19 @@ impl TypeRegistry {
                 } else if let Some(ref qname) = query_type_name {
                     // Cross-variant name match (Named ↔ Extern)
                     match &impl_def.for_type {
-                        Type::Named { id, .. } => {
-                            self.types.get(id)
-                                .and_then(|td| td.name.resolve_global())
-                                .map(|n| n == qname.as_str())
-                                .unwrap_or(false)
-                        }
-                        Type::Extern { name, .. } => {
-                            name.resolve_global()
-                                .map(|n| {
-                                    let n = n.strip_prefix('$').unwrap_or(&n).to_string();
-                                    n == *qname
-                                })
-                                .unwrap_or(false)
-                        }
+                        Type::Named { id, .. } => self
+                            .types
+                            .get(id)
+                            .and_then(|td| td.name.resolve_global())
+                            .map(|n| n == qname.as_str())
+                            .unwrap_or(false),
+                        Type::Extern { name, .. } => name
+                            .resolve_global()
+                            .map(|n| {
+                                let n = n.strip_prefix('$').unwrap_or(&n).to_string();
+                                n == *qname
+                            })
+                            .unwrap_or(false),
                         _ => false,
                     }
                 } else {
@@ -1275,12 +1275,16 @@ impl TypeRegistry {
         // Resolve names for cross-variant matching
         let impl_name = match impl_for_type {
             Type::Named { id, .. } => self.types.get(id).and_then(|td| td.name.resolve_global()),
-            Type::Extern { name, .. } => name.resolve_global().map(|s| s.strip_prefix('$').unwrap_or(&s).to_string()),
+            Type::Extern { name, .. } => name
+                .resolve_global()
+                .map(|s| s.strip_prefix('$').unwrap_or(&s).to_string()),
             _ => None,
         };
         let recv_name = match receiver_ty {
             Type::Named { id, .. } => self.types.get(id).and_then(|td| td.name.resolve_global()),
-            Type::Extern { name, .. } => name.resolve_global().map(|s| s.strip_prefix('$').unwrap_or(&s).to_string()),
+            Type::Extern { name, .. } => name
+                .resolve_global()
+                .map(|s| s.strip_prefix('$').unwrap_or(&s).to_string()),
             _ => None,
         };
         match (impl_name, recv_name) {
@@ -1367,6 +1371,146 @@ impl TypeRegistry {
             const_args,
             variance,
             nullability,
+        }
+    }
+
+    /// Substitute type parameters with concrete type arguments in a type.
+    ///
+    /// Given a type that references generic parameters (e.g., `T` in `List<T>`),
+    /// replaces each occurrence with the corresponding type argument.
+    pub fn substitute_type_params(ty: &Type, params: &[TypeParam], args: &[Type]) -> Type {
+        if params.is_empty() || args.is_empty() {
+            return ty.clone();
+        }
+
+        // Build substitution map: param name → concrete type
+        let subst: std::collections::HashMap<InternedString, &Type> = params
+            .iter()
+            .zip(args.iter())
+            .map(|(p, a)| (p.name, a))
+            .collect();
+
+        Self::apply_type_substitution(ty, &subst)
+    }
+
+    /// Recursively apply a substitution map to a type
+    fn apply_type_substitution(
+        ty: &Type,
+        subst: &std::collections::HashMap<InternedString, &Type>,
+    ) -> Type {
+        match ty {
+            // Type variable whose name matches a parameter → replace
+            Type::TypeVar(tv) => {
+                if let Some(replacement) = tv.name.and_then(|n| subst.get(&n)) {
+                    (*replacement).clone()
+                } else {
+                    ty.clone()
+                }
+            }
+            // Unresolved name matching a parameter → replace
+            Type::Unresolved(name) => {
+                if let Some(replacement) = subst.get(name) {
+                    (*replacement).clone()
+                } else {
+                    ty.clone()
+                }
+            }
+            // Named type — recurse into type_args
+            Type::Named {
+                id,
+                type_args,
+                const_args,
+                variance,
+                nullability,
+            } => Type::Named {
+                id: *id,
+                type_args: type_args
+                    .iter()
+                    .map(|a| Self::apply_type_substitution(a, subst))
+                    .collect(),
+                const_args: const_args.clone(),
+                variance: variance.clone(),
+                nullability: *nullability,
+            },
+            // Array — recurse into element type
+            Type::Array {
+                element_type,
+                size,
+                nullability,
+            } => Type::Array {
+                element_type: Box::new(Self::apply_type_substitution(element_type, subst)),
+                size: size.clone(),
+                nullability: *nullability,
+            },
+            // Tuple — recurse into each element
+            Type::Tuple(types) => Type::Tuple(
+                types
+                    .iter()
+                    .map(|t| Self::apply_type_substitution(t, subst))
+                    .collect(),
+            ),
+            // Optional — recurse into inner
+            Type::Optional(inner) => {
+                Type::Optional(Box::new(Self::apply_type_substitution(inner, subst)))
+            }
+            // Result — recurse into both types
+            Type::Result { ok_type, err_type } => Type::Result {
+                ok_type: Box::new(Self::apply_type_substitution(ok_type, subst)),
+                err_type: Box::new(Self::apply_type_substitution(err_type, subst)),
+            },
+            // Reference — recurse into target
+            Type::Reference {
+                ty: inner,
+                mutability,
+                lifetime,
+                nullability,
+            } => Type::Reference {
+                ty: Box::new(Self::apply_type_substitution(inner, subst)),
+                mutability: *mutability,
+                lifetime: lifetime.clone(),
+                nullability: *nullability,
+            },
+            // Function — recurse into params and return type
+            Type::Function {
+                params,
+                return_type,
+                is_varargs,
+                has_named_params,
+                has_default_params,
+                async_kind,
+                calling_convention,
+                nullability,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| ParamInfo {
+                        ty: Self::apply_type_substitution(&p.ty, subst),
+                        ..p.clone()
+                    })
+                    .collect(),
+                return_type: Box::new(Self::apply_type_substitution(return_type, subst)),
+                is_varargs: *is_varargs,
+                has_named_params: *has_named_params,
+                has_default_params: *has_default_params,
+                async_kind: async_kind.clone(),
+                calling_convention: calling_convention.clone(),
+                nullability: *nullability,
+            },
+            // Union/Intersection — recurse into each member
+            Type::Union(types) => Type::Union(
+                types
+                    .iter()
+                    .map(|t| Self::apply_type_substitution(t, subst))
+                    .collect(),
+            ),
+            Type::Intersection(types) => Type::Intersection(
+                types
+                    .iter()
+                    .map(|t| Self::apply_type_substitution(t, subst))
+                    .collect(),
+            ),
+            // All other types (primitives, extern, never, any, etc.) — no substitution
+            _ => ty.clone(),
         }
     }
 

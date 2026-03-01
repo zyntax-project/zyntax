@@ -98,7 +98,8 @@ pub struct SsaBuilder {
     simd_continue_block: Option<HirId>,
     /// Default parameter info for functions with optional parameters.
     /// Maps function name -> Vec<TypedParameter> (for filling in defaults at call sites).
-    function_default_params: IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
+    function_default_params:
+        IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
 }
 
 /// Context for pattern matching
@@ -433,7 +434,10 @@ impl SsaBuilder {
     }
 
     /// Set default parameter info for functions with optional parameters
-    pub fn with_function_default_params(mut self, params: IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>) -> Self {
+    pub fn with_function_default_params(
+        mut self,
+        params: IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
+    ) -> Self {
         self.function_default_params = params;
         self
     }
@@ -601,7 +605,7 @@ impl SsaBuilder {
             }
         }
         if !found_entry {
-            eprintln!(
+            log::trace!(
                 "[SSA DEBUG] WARNING: entry_block {:?} NOT FOUND in CFG!",
                 entry_block
             );
@@ -2872,82 +2876,92 @@ impl SsaBuilder {
 
                 // Check if callee is a function name (direct call) vs expression (indirect call)
                 // Path expressions should be resolved to Variable during lowering/type resolution
-                let (hir_callable, indirect_callee_val, callee_func_key) = if let TypedExpression::Variable(
-                    func_name,
-                ) = &callee.node
-                {
-                    // Resolve the function name string using global interner
-                    // (InternedString.resolve_global() returns the actual string value)
-                    let name_str = func_name.resolve_global().unwrap_or_else(|| {
-                        // Fallback to local arena if global resolution fails
-                        let arena = self.arena.lock().unwrap();
-                        arena
-                            .resolve_string(*func_name)
-                            .map(|s| s.to_string())
-                            .unwrap_or_default()
-                    });
+                let (hir_callable, indirect_callee_val, callee_func_key) =
+                    if let TypedExpression::Variable(func_name) = &callee.node {
+                        // Resolve the function name string using global interner
+                        // (InternedString.resolve_global() returns the actual string value)
+                        let name_str = func_name.resolve_global().unwrap_or_else(|| {
+                            // Fallback to local arena if global resolution fails
+                            let arena = self.arena.lock().unwrap();
+                            arena
+                                .resolve_string(*func_name)
+                                .map(|s| s.to_string())
+                                .unwrap_or_default()
+                        });
 
-                    if name_str == INTERNAL_RENDER_EVENT_ALIAS
-                        || name_str == INTERNAL_STREAM_EVENT_ALIAS
-                    {
-                        // Internal runtime event calls are lowered as side-effect markers.
-                        // Evaluate arguments for side effects, then erase the call from HIR.
-                        for arg in &call.positional_args {
-                            self.translate_expression(block_id, arg)?;
+                        if name_str == INTERNAL_RENDER_EVENT_ALIAS
+                            || name_str == INTERNAL_STREAM_EVENT_ALIAS
+                        {
+                            // Internal runtime event calls are lowered as side-effect markers.
+                            // Evaluate arguments for side effects, then erase the call from HIR.
+                            for arg in &call.positional_args {
+                                self.translate_expression(block_id, arg)?;
+                            }
+                            for named in &call.named_args {
+                                self.translate_expression(block_id, &named.value)?;
+                            }
+                            return Ok(self.create_undef(HirType::Void));
                         }
-                        for named in &call.named_args {
-                            self.translate_expression(block_id, &named.value)?;
-                        }
-                        return Ok(self.create_undef(HirType::Void));
-                    }
 
-                    // Check for enum constructors (Some, Ok, Err)
-                    if name_str == "Some" || name_str == "Ok" || name_str == "Err" {
-                        return self
-                            .translate_enum_constructor(block_id, &name_str, args, &expr.ty);
-                    } else if name_str.starts_with('$') {
-                        // Check if this is an external runtime symbol (e.g., "$haxe$trace$int")
-                        // External symbols start with '$' and are resolved at link time
-                        (crate::hir::HirCallable::Symbol(name_str), None, Some(*func_name))
-                    } else if let Some(&func_id) = self.function_symbols.get(func_name) {
-                        // Direct function call to known function
-                        (crate::hir::HirCallable::Function(func_id), None, Some(*func_name))
-                    } else if let Some(link_name) = self.extern_link_names.get(func_name) {
-                        // External function with link_name (e.g., tensor_add -> $Tensor$add)
-                        log::debug!(
-                            "[SSA] Resolved extern call '{}' -> '{}'",
-                            name_str,
-                            link_name
-                        );
-                        (crate::hir::HirCallable::Symbol(link_name.clone()), None, Some(*func_name))
-                    } else {
-                        // Debug: Log what we're looking for and what's available
-                        if !self.extern_link_names.is_empty() {
-                            let available: Vec<_> = self
-                                .extern_link_names
-                                .keys()
-                                .filter_map(|k| k.resolve_global())
-                                .collect();
-                            log::debug!("[SSA] Function '{}' not in extern_link_names ({} entries). Sample: {:?}",
+                        // Check for enum constructors (Some, Ok, Err)
+                        if name_str == "Some" || name_str == "Ok" || name_str == "Err" {
+                            return self
+                                .translate_enum_constructor(block_id, &name_str, args, &expr.ty);
+                        } else if name_str.starts_with('$') {
+                            // Check if this is an external runtime symbol (e.g., "$haxe$trace$int")
+                            // External symbols start with '$' and are resolved at link time
+                            (
+                                crate::hir::HirCallable::Symbol(name_str),
+                                None,
+                                Some(*func_name),
+                            )
+                        } else if let Some(&func_id) = self.function_symbols.get(func_name) {
+                            // Direct function call to known function
+                            (
+                                crate::hir::HirCallable::Function(func_id),
+                                None,
+                                Some(*func_name),
+                            )
+                        } else if let Some(link_name) = self.extern_link_names.get(func_name) {
+                            // External function with link_name (e.g., tensor_add -> $Tensor$add)
+                            log::debug!(
+                                "[SSA] Resolved extern call '{}' -> '{}'",
+                                name_str,
+                                link_name
+                            );
+                            (
+                                crate::hir::HirCallable::Symbol(link_name.clone()),
+                                None,
+                                Some(*func_name),
+                            )
+                        } else {
+                            // Debug: Log what we're looking for and what's available
+                            if !self.extern_link_names.is_empty() {
+                                let available: Vec<_> = self
+                                    .extern_link_names
+                                    .keys()
+                                    .filter_map(|k| k.resolve_global())
+                                    .collect();
+                                log::debug!("[SSA] Function '{}' not in extern_link_names ({} entries). Sample: {:?}",
                                 name_str, self.extern_link_names.len(), &available[..available.len().min(10)]);
+                            }
+                            // Variable lookup (function pointer)
+                            let callee_val = self.translate_expression(block_id, callee)?;
+                            (
+                                crate::hir::HirCallable::Indirect(callee_val),
+                                Some(callee_val),
+                                Some(*func_name),
+                            )
                         }
-                        // Variable lookup (function pointer)
+                    } else {
+                        // General expression (e.g., field access, method call result)
                         let callee_val = self.translate_expression(block_id, callee)?;
                         (
                             crate::hir::HirCallable::Indirect(callee_val),
                             Some(callee_val),
-                            Some(*func_name),
+                            None,
                         )
-                    }
-                } else {
-                    // General expression (e.g., field access, method call result)
-                    let callee_val = self.translate_expression(block_id, callee)?;
-                    (
-                        crate::hir::HirCallable::Indirect(callee_val),
-                        Some(callee_val),
-                        None,
-                    )
-                };
+                    };
 
                 // Translate arguments
                 let mut arg_vals = Vec::new();
@@ -2960,7 +2974,8 @@ impl SsaBuilder {
                 if let Some(func_key) = callee_func_key {
                     if let Some(params) = self.function_default_params.get(&func_key).cloned() {
                         // Filter to non-self params only
-                        let non_self_params: Vec<_> = params.iter()
+                        let non_self_params: Vec<_> = params
+                            .iter()
                             .filter(|p| {
                                 let name = p.name.resolve_global().unwrap_or_default();
                                 name != "self"
@@ -2969,7 +2984,8 @@ impl SsaBuilder {
                         while arg_vals.len() < non_self_params.len() {
                             let idx = arg_vals.len();
                             if let Some(default_expr) = &non_self_params[idx].default_value {
-                                let default_val = self.translate_expression(block_id, default_expr)?;
+                                let default_val =
+                                    self.translate_expression(block_id, default_expr)?;
                                 arg_vals.push(default_val);
                             } else {
                                 break; // No more defaults available
@@ -3401,7 +3417,7 @@ impl SsaBuilder {
                 // Build struct value directly using InsertValue operations
                 let struct_ty = self.convert_type(&expr.ty);
 
-                eprintln!(
+                log::trace!(
                     "[SSA STRUCT LIT] Building struct literal with type {:?}, {} fields",
                     struct_ty,
                     struct_lit.fields.len()
@@ -3738,16 +3754,16 @@ impl SsaBuilder {
                 // This works around the issue where type inference doesn't update variable references in the AST
                 let receiver_type =
                     if let TypedExpression::Variable(var_name) = &method_call.receiver.node {
-                        eprintln!(
+                        log::trace!(
                             "[METHOD_CALL] Receiver is variable '{}'",
                             var_name.resolve_global().unwrap_or_default()
                         );
                         // Look up the variable's actual type from when it was declared
                         if let Some(var_ty) = self.var_typed_ast_types.get(var_name) {
-                            eprintln!("[METHOD_CALL] Found variable type: {:?}", var_ty);
+                            log::trace!("[METHOD_CALL] Found variable type: {:?}", var_ty);
                             var_ty.clone()
                         } else {
-                            eprintln!(
+                            log::trace!(
                                 "[METHOD_CALL] Variable type not found, using receiver type: {:?}",
                                 method_call.receiver.ty
                             );
@@ -3755,7 +3771,7 @@ impl SsaBuilder {
                         }
                     } else {
                         // Non-variable expression - use the type directly
-                        eprintln!(
+                        log::trace!(
                             "[METHOD_CALL] Receiver is expression with type: {:?}",
                             method_call.receiver.ty
                         );
@@ -3986,7 +4002,7 @@ impl SsaBuilder {
                     };
 
                     self.add_instruction(block_id, call_inst);
-                    eprintln!(
+                    log::trace!(
                         "[DEBUG] SSA: Created async Call with Promise result type, future_val={:?}",
                         future_val
                     );
@@ -4984,7 +5000,10 @@ impl SsaBuilder {
                     crate::CompilerError::Analysis("Could not resolve method name".into())
                 })?;
 
-                let base_type_name = type_name_str.strip_prefix('$').unwrap_or(&type_name_str).to_string();
+                let base_type_name = type_name_str
+                    .strip_prefix('$')
+                    .unwrap_or(&type_name_str)
+                    .to_string();
                 let method_name_owned = method_name_str.to_string();
                 let inherent_mangled = format!("{}${}", base_type_name, method_name_owned);
                 drop(arena);
@@ -5003,24 +5022,30 @@ impl SsaBuilder {
                     for impl_def in impls {
                         // Match impl blocks by comparing type name strings
                         let impl_matches = match &impl_def.for_type {
-                            Type::Named { id: impl_type_id, .. } => {
-                                self.type_registry.get_type_by_id(*impl_type_id)
-                                    .map(|td| {
-                                        td.name.resolve_global()
-                                            .map(|n| n == base_type_name)
-                                            .unwrap_or(false)
-                                    })
-                                    .unwrap_or(false)
-                            }
-                            Type::Extern { name: impl_name, .. } => {
-                                self.arena.lock().unwrap()
-                                    .resolve_string(*impl_name)
-                                    .map(|n| {
-                                        let n = n.strip_prefix('$').unwrap_or(n);
-                                        n == base_type_name
-                                    })
-                                    .unwrap_or(false)
-                            }
+                            Type::Named {
+                                id: impl_type_id, ..
+                            } => self
+                                .type_registry
+                                .get_type_by_id(*impl_type_id)
+                                .map(|td| {
+                                    td.name
+                                        .resolve_global()
+                                        .map(|n| n == base_type_name)
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false),
+                            Type::Extern {
+                                name: impl_name, ..
+                            } => self
+                                .arena
+                                .lock()
+                                .unwrap()
+                                .resolve_string(*impl_name)
+                                .map(|n| {
+                                    let n = n.strip_prefix('$').unwrap_or(n);
+                                    n == base_type_name
+                                })
+                                .unwrap_or(false),
                             _ => false,
                         };
 
@@ -5039,8 +5064,9 @@ impl SsaBuilder {
 
                                     let trait_mangled = {
                                         let arena = self.arena.lock().unwrap();
-                                        let trait_name_str =
-                                            arena.resolve_string(trait_def.name).unwrap_or_default();
+                                        let trait_name_str = arena
+                                            .resolve_string(trait_def.name)
+                                            .unwrap_or_default();
                                         format!(
                                             "{}${}${}",
                                             base_type_name, trait_name_str, method_name_owned
@@ -5107,7 +5133,8 @@ impl SsaBuilder {
 
                     log::trace!(
                         "[METHOD DISPATCH] Found inherent method '{}' for type '{}'",
-                        method_name, type_def.name
+                        method_name,
+                        type_def.name
                     );
                     return Ok(InternedString::new_global(&mangled));
                 }
@@ -5120,7 +5147,9 @@ impl SsaBuilder {
         }
 
         // Resolve the type name for name-based matching
-        let type_name_for_match = self.type_registry.get_type_by_id(type_id)
+        let type_name_for_match = self
+            .type_registry
+            .get_type_by_id(type_id)
             .and_then(|td| td.name.resolve_global().map(|s| s.to_string()));
 
         // Look up which traits this type implements
@@ -5130,11 +5159,17 @@ impl SsaBuilder {
                 // Check if this impl is for our type
                 // Match by TypeId for Named types, or by name for Extern types
                 let impl_matches = match &impl_def.for_type {
-                    Type::Named { id: impl_type_id, .. } => *impl_type_id == type_id,
-                    Type::Extern { name: impl_name, .. } => {
+                    Type::Named {
+                        id: impl_type_id, ..
+                    } => *impl_type_id == type_id,
+                    Type::Extern {
+                        name: impl_name, ..
+                    } => {
                         // Extern impl blocks match Named receiver types by name
                         if let Some(ref tn) = type_name_for_match {
-                            self.arena.lock().unwrap()
+                            self.arena
+                                .lock()
+                                .unwrap()
                                 .resolve_string(*impl_name)
                                 .map(|n| {
                                     let n = n.strip_prefix('$').unwrap_or(n);
@@ -5149,52 +5184,47 @@ impl SsaBuilder {
                 };
 
                 if impl_matches {
-                        // Check if this impl has the method we're looking for
-                        for method in &impl_def.methods {
-                            if method.signature.name == method_name {
-                                // Found it! Return mangled name
-                                // Format: {TypeName}${TraitName}${method_name}
-                                let type_def = self
-                                    .type_registry
-                                    .get_type_by_id(type_id)
-                                    .ok_or_else(|| {
-                                        crate::CompilerError::Analysis(format!(
-                                            "Type {:?} not found in registry",
-                                            type_id
-                                        ))
-                                    })?;
+                    // Check if this impl has the method we're looking for
+                    for method in &impl_def.methods {
+                        if method.signature.name == method_name {
+                            // Found it! Return mangled name
+                            // Format: {TypeName}${TraitName}${method_name}
+                            let type_def =
+                                self.type_registry.get_type_by_id(type_id).ok_or_else(|| {
+                                    crate::CompilerError::Analysis(format!(
+                                        "Type {:?} not found in registry",
+                                        type_id
+                                    ))
+                                })?;
 
-                                let trait_def = self
-                                    .type_registry
-                                    .get_trait_by_id(impl_def.trait_id)
-                                    .ok_or_else(|| {
-                                        crate::CompilerError::Analysis(format!(
-                                            "Trait {:?} not found in registry",
-                                            impl_def.trait_id
-                                        ))
-                                    })?;
-
-                                let mangled = {
-                                    let arena = self.arena.lock().unwrap();
-                                    let type_name_str =
-                                        arena.resolve_string(type_def.name).unwrap_or_default();
-                                    let trait_name_str =
-                                        arena.resolve_string(trait_def.name).unwrap_or_default();
-                                    let method_name_str =
-                                        arena.resolve_string(method_name).unwrap_or_default();
-                                    format!(
-                                        "{}${}${}",
-                                        type_name_str, trait_name_str, method_name_str
-                                    )
-                                };
-
-                                log::trace!(
-                                    "[METHOD DISPATCH] Found trait method (trait: {:?})",
+                            let trait_def = self
+                                .type_registry
+                                .get_trait_by_id(impl_def.trait_id)
+                                .ok_or_else(|| {
+                                crate::CompilerError::Analysis(format!(
+                                    "Trait {:?} not found in registry",
                                     impl_def.trait_id
-                                );
-                                return Ok(InternedString::new_global(&mangled));
-                            }
+                                ))
+                            })?;
+
+                            let mangled = {
+                                let arena = self.arena.lock().unwrap();
+                                let type_name_str =
+                                    arena.resolve_string(type_def.name).unwrap_or_default();
+                                let trait_name_str =
+                                    arena.resolve_string(trait_def.name).unwrap_or_default();
+                                let method_name_str =
+                                    arena.resolve_string(method_name).unwrap_or_default();
+                                format!("{}${}${}", type_name_str, trait_name_str, method_name_str)
+                            };
+
+                            log::trace!(
+                                "[METHOD DISPATCH] Found trait method (trait: {:?})",
+                                impl_def.trait_id
+                            );
+                            return Ok(InternedString::new_global(&mangled));
                         }
+                    }
                 }
             }
         }
@@ -5351,7 +5381,7 @@ impl SsaBuilder {
                     // They must be treated as structs for field access to work
                     // The backend will optimize away the wrapper at codegen time
                     if let TypeKind::Abstract { .. } = &type_def.kind {
-                        eprintln!(
+                        log::trace!(
                             "[CONVERT TYPE SSA] Abstract type '{}' → struct with {} fields",
                             type_def.name.resolve_global().unwrap_or_default(),
                             type_def.fields.len()
@@ -5384,7 +5414,7 @@ impl SsaBuilder {
                         packed: false,
                     })
                 } else {
-                    eprintln!(
+                    log::trace!(
                         "[WARN] Named type {:?} not found in registry, defaulting to I64",
                         id
                     );
@@ -5397,7 +5427,7 @@ impl SsaBuilder {
                     use crate::hir::HirStructType;
                     use zyntax_typed_ast::type_registry::TypeKind;
 
-                    eprintln!(
+                    log::trace!(
                         "[CONVERT TYPE SSA] Unresolved type '{}' → resolved to {:?}",
                         name.resolve_global().unwrap_or_default(),
                         type_def.kind
@@ -5441,7 +5471,7 @@ impl SsaBuilder {
                         packed: false,
                     })
                 } else {
-                    eprintln!(
+                    log::trace!(
                         "[WARN] Unresolved type '{}' not found in registry, defaulting to I64",
                         name.resolve_global().unwrap_or_default()
                     );
@@ -5451,7 +5481,7 @@ impl SsaBuilder {
             Type::Any => {
                 // Type::Any means "infer from context" - we need to check the initializer's type
                 // For now, default to I64 but this should be improved
-                eprintln!("[WARN] Type::Any encountered in convert_type, defaulting to I64");
+                log::trace!("[WARN] Type::Any encountered in convert_type, defaulting to I64");
                 HirType::I64
             }
             _ => HirType::I64, // Default for complex types

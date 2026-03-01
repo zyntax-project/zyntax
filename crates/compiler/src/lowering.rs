@@ -261,7 +261,8 @@ pub struct SymbolTable {
     pub extern_link_names: indexmap::IndexMap<InternedString, String>,
     /// Default parameter info for functions with optional parameters
     /// Maps function name -> Vec<TypedParameter> (for filling in defaults at call sites)
-    pub function_default_params: indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
+    pub function_default_params:
+        indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
 }
 
 /// Import metadata for debugging and error messages
@@ -418,14 +419,18 @@ impl LoweringContext {
             for impl_def in impls {
                 if let zyntax_typed_ast::Type::Extern { name, .. } = &impl_def.for_type {
                     let type_name = name.resolve_global().unwrap_or_default();
-                    let base_type_name = type_name.strip_prefix('$').unwrap_or(&type_name).to_string();
+                    let base_type_name = type_name
+                        .strip_prefix('$')
+                        .unwrap_or(&type_name)
+                        .to_string();
                     let trait_def = type_registry.get_trait_by_id(*trait_id);
                     let trait_name = trait_def
                         .and_then(|td| td.name.resolve_global())
                         .unwrap_or_default();
 
                     for method in &impl_def.methods {
-                        let method_name = method.signature.name.resolve_global().unwrap_or_default();
+                        let method_name =
+                            method.signature.name.resolve_global().unwrap_or_default();
                         // SSA generates trait-mangled name: TypeName$TraitName$method
                         let mangled = format!("{}${}${}", base_type_name, trait_name, method_name);
                         // ZRTL exports inherent name: $TypeName$method (no trait name)
@@ -624,9 +629,10 @@ impl LoweringContext {
             .source_files
             .iter()
             .any(|sf| sf.name.contains("stdlib/"))
-            || program.declarations.iter().any(|d| {
-                matches!(&d.node, TypedDeclaration::Import(_))
-            });
+            || program
+                .declarations
+                .iter()
+                .any(|d| matches!(&d.node, TypedDeclaration::Import(_)));
 
         // Display diagnostics using the built-in pretty formatter
         if total_errors > 0 || total_warnings > 0 {
@@ -635,20 +641,23 @@ impl LoweringContext {
             if !has_stdlib {
                 use zyntax_typed_ast::diagnostics::{ConsoleDiagnosticDisplay, DiagnosticDisplay};
                 use zyntax_typed_ast::source::SourceMap;
-                eprintln!("\n=== Type Checking Diagnostics ===");
+                if std::env::var("ZYNTAX_DEBUG_TYPES").is_ok() {
+                    eprintln!("\n=== Type Checking Diagnostics ===");
 
-                // Create a source map and populate it with source files from the program
-                let mut source_map = SourceMap::new();
-                for source_file in &program.source_files {
-                    source_map.add_file(source_file.name.clone(), source_file.content.clone());
+                    // Create a source map and populate it with source files from the program
+                    let mut source_map = SourceMap::new();
+                    for source_file in &program.source_files {
+                        source_map.add_file(source_file.name.clone(), source_file.content.clone());
+                    }
+                    let display = ConsoleDiagnosticDisplay::default();
+
+                    // Use the built-in pretty formatter
+                    let diagnostic_output =
+                        diagnostics_collector.display_all(&display, &source_map);
+                    eprintln!("{}", diagnostic_output);
+
+                    eprintln!("=================================\n");
                 }
-                let display = ConsoleDiagnosticDisplay::default();
-
-                // Use the built-in pretty formatter
-                let diagnostic_output = diagnostics_collector.display_all(&display, &source_map);
-                eprintln!("{}", diagnostic_output);
-
-                eprintln!("=================================\n");
             }
         }
 
@@ -662,12 +671,11 @@ impl LoweringContext {
         // TODO (Issue 0 Phase 2): Make type checking stricter once inference properly modifies AST
         // For now, just warn about errors rather than failing compilation
         if error_count > 0 {
-            eprintln!(
+            log::trace!(
                 "WARNING: Type checking found {} error(s), {} warning(s) - continuing compilation",
-                error_count, warning_count
+                error_count,
+                warning_count
             );
-            eprintln!("NOTE: Issue 0 Phase 1 complete - type checking integrated but lenient");
-            eprintln!("      Enable strict checking with ZYNTAX_STRICT_TYPES=1\n");
 
             if std::env::var("ZYNTAX_STRICT_TYPES").is_ok() {
                 return Err(crate::CompilerError::Lowering(format!(
@@ -1561,6 +1569,9 @@ impl LoweringContext {
 
     /// Debug helper: check for Unknown types in the program
     fn check_for_unknown_types(&self, program: &TypedProgram) {
+        if std::env::var("ZYNTAX_DEBUG_TYPES").is_err() {
+            return;
+        }
         use zyntax_typed_ast::Type;
 
         let mut unknown_count = 0;
@@ -1570,13 +1581,11 @@ impl LoweringContext {
             if let zyntax_typed_ast::TypedDeclaration::Function(func) = &decl.node {
                 func_count += 1;
 
-                // Check return type
                 if matches!(func.return_type, Type::Unknown) {
                     eprintln!("  - Function has Unknown return type");
                     unknown_count += 1;
                 }
 
-                // Check parameter types
                 for param in &func.params {
                     if matches!(param.ty, Type::Unknown) {
                         eprintln!("  - Parameter has Unknown type");
@@ -1591,10 +1600,6 @@ impl LoweringContext {
                 "\n[ZYNTAX_DEBUG_TYPES] Found {} Unknown types in {} functions",
                 unknown_count, func_count
             );
-            eprintln!("[ZYNTAX_DEBUG_TYPES] Issue 0 Phase 1: Type checking integrated but inference doesn't modify AST yet");
-            eprintln!("[ZYNTAX_DEBUG_TYPES] Next step: Implement AST transformation to apply inferred types\n");
-        } else {
-            eprintln!("\n[ZYNTAX_DEBUG_TYPES] ✓ No Unknown types found in program\n");
         }
     }
 
@@ -1607,7 +1612,9 @@ impl LoweringContext {
                     self.symbols.functions.insert(func.name, func_id);
                     // Record default parameter info for functions with optional params
                     if func.params.iter().any(|p| p.default_value.is_some()) {
-                        self.symbols.function_default_params.insert(func.name, func.params.clone());
+                        self.symbols
+                            .function_default_params
+                            .insert(func.name, func.params.clone());
                     }
                 }
 
@@ -1757,7 +1764,7 @@ impl LoweringContext {
                 if let Err(e) = self.lower_function(func) {
                     let func_name = func.name.resolve_global().unwrap_or_default();
                     LOWERING_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[LOWERING WARN] Skipping function '{}': {:?}", func_name, e);
+                    log::trace!("[LOWERING WARN] Skipping function '{}': {:?}", func_name, e);
                     // Remove from symbol table if it was registered
                     self.symbols.functions.remove(&func.name);
                 }
@@ -1792,9 +1799,11 @@ impl LoweringContext {
                             .unwrap_or_else(|| format!("{:?}", id)),
                         _ => format!("{:?}", impl_block.for_type),
                     };
-                    eprintln!(
+                    log::trace!(
                         "[LOWERING WARN] Skipping impl {} for {}: {:?}",
-                        trait_name, type_name, e
+                        trait_name,
+                        type_name,
+                        e
                     );
                 }
             }
@@ -2186,7 +2195,7 @@ impl LoweringContext {
                     underlying_type, ..
                 } = &type_def.kind
                 {
-                    eprintln!(
+                    log::trace!(
                         "[CONVERT_ABI] Abstract type '{}' → underlying ABI type",
                         type_def.name.resolve_global().unwrap_or_default()
                     );
@@ -2414,7 +2423,7 @@ impl LoweringContext {
                                 .map(|field| self.convert_type(&field.ty))
                                 .collect();
 
-                            eprintln!(
+                            log::trace!(
                                 "[CONVERT TYPE] Abstract type '{}' → struct with {} fields",
                                 type_def.name.resolve_global().unwrap_or_default(),
                                 field_types.len()
@@ -3077,7 +3086,7 @@ impl LoweringContext {
                         .resolve_string(*name)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "<unknown>".to_string());
-                    eprintln!(
+                    log::trace!(
                         "[LOWERING] WARNING: Type '{}' not found in registry",
                         type_name_str
                     );
@@ -3103,7 +3112,8 @@ impl LoweringContext {
         let is_inherent = trait_name_str.is_empty();
         log::trace!(
             "[LOWERING] Impl block is_inherent: {}, trait_name: '{}'",
-            is_inherent, trait_name_str
+            is_inherent,
+            trait_name_str
         );
 
         // Check if the implementing type is an extern struct
@@ -3120,7 +3130,8 @@ impl LoweringContext {
         };
         log::trace!(
             "[LOWERING] is_extern_struct: {}, extern_type_name: {:?}",
-            is_extern_struct, extern_type_name
+            is_extern_struct,
+            extern_type_name
         );
 
         // For trait impls, register the implementation in the type registry
@@ -3245,7 +3256,8 @@ impl LoweringContext {
             // For now, method resolution relies on mangled names being available in SSA phase
             log::trace!(
                 "[LOWERING] Built impl def for trait {:?} for type {:?} (registration TODO)",
-                tid, implementing_type
+                tid,
+                implementing_type
             );
             log::trace!("[LOWERING] ImplDef has {} methods", impl_def.methods.len());
         } else {
@@ -3385,7 +3397,7 @@ impl LoweringContext {
                 existing_id
             } else {
                 // Fallback: create new (shouldn't happen if collect_declarations ran first)
-                eprintln!("[LOWERING] WARNING: Creating new function_id for {:?} (should have been pre-registered)", mangled_name);
+                log::trace!("[LOWERING] WARNING: Creating new function_id for {:?} (should have been pre-registered)", mangled_name);
                 let new_id = crate::hir::HirId::new();
                 self.symbols.functions.insert(mangled_name, new_id);
                 new_id
@@ -3425,9 +3437,10 @@ impl LoweringContext {
 
                     if let Err(e) = self.lower_function(&func) {
                         let method_name_str = mangled_name.resolve_global().unwrap_or_default();
-                        eprintln!(
+                        log::trace!(
                             "[LOWERING WARN] Skipping extern method '{}': {:?}",
-                            method_name_str, e
+                            method_name_str,
+                            e
                         );
                         self.symbols.functions.remove(&mangled_name);
                         continue;
@@ -3458,9 +3471,10 @@ impl LoweringContext {
             // but we don't want to fail the entire impl block
             if let Err(e) = self.lower_function(&func) {
                 let method_name_str = mangled_name.resolve_global().unwrap_or_default();
-                eprintln!(
+                log::trace!(
                     "[LOWERING WARN] Skipping method '{}': {:?}",
-                    method_name_str, e
+                    method_name_str,
+                    e
                 );
                 // Remove the function from the symbols table so SSA doesn't try to process it
                 self.symbols.functions.remove(&mangled_name);
@@ -4512,9 +4526,11 @@ impl LoweringContext {
 
         // Check if there's a From<expr.ty> impl for expected_type
         if let Some(from_func) = self.find_from_impl(&expr.ty, expected_type) {
-            eprintln!(
+            log::trace!(
                 "[IMPLICIT_CONVERSION] Converting {:?} to {:?} via {}",
-                expr.ty, expected_type, from_func
+                expr.ty,
+                expected_type,
+                from_func
             );
 
             // Capture span before moving expr
@@ -4661,9 +4677,10 @@ impl LoweringContext {
                         }
                         other => format!("{:?}", other),
                     };
-                    eprintln!(
+                    log::trace!(
                         "[LOWERING WARN] Skipping trait impl for '{}': {:?}",
-                        type_name, e
+                        type_name,
+                        e
                     );
                 }
             }
@@ -4708,7 +4725,7 @@ impl LoweringContext {
             zyntax_typed_ast::Type::Unresolved(name) => {
                 // Unresolved types are generic type parameters (like I, T, etc.)
                 // Skip trait impl lowering for these as they require monomorphization
-                eprintln!("[LOWERING WARN] Skipping trait impl for unresolved type '{}' - requires monomorphization",
+                log::trace!("[LOWERING WARN] Skipping trait impl for unresolved type '{}' - requires monomorphization",
                     name.resolve_global().unwrap_or_default());
                 return Ok(());
             }

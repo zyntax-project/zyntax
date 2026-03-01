@@ -504,14 +504,165 @@ impl NominalTypeChecker {
         Ok(true)
     }
 
-    /// Recursive subtype checking helper (to avoid borrowing issues)
+    /// Recursive subtype checking helper (immutable — no inheritance cache updates)
     fn is_subtype_recursive(
         &self,
         sub_type: &Type,
         super_type: &Type,
     ) -> Result<bool, NominalTypeError> {
-        // Simplified recursive check - in practice would need full implementation
-        Ok(sub_type == super_type)
+        // Same type is always a subtype
+        if sub_type == super_type {
+            return Ok(true);
+        }
+
+        match (sub_type, super_type) {
+            // Never is a subtype of everything (bottom type)
+            (Type::Never, _) => Ok(true),
+
+            // Everything is a subtype of Any (top type)
+            (_, Type::Any) => Ok(true),
+
+            // Primitive widening: i8 <: i16 <: i32 <: i64
+            (Type::Primitive(sub_prim), Type::Primitive(super_prim)) => {
+                use crate::type_registry::PrimitiveType;
+                let widening_compatible = matches!(
+                    (sub_prim, super_prim),
+                    (
+                        PrimitiveType::I8,
+                        PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64
+                    ) | (PrimitiveType::I16, PrimitiveType::I32 | PrimitiveType::I64)
+                        | (PrimitiveType::I32, PrimitiveType::I64)
+                        | (
+                            PrimitiveType::U8,
+                            PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64
+                        )
+                        | (PrimitiveType::U16, PrimitiveType::U32 | PrimitiveType::U64)
+                        | (PrimitiveType::U32, PrimitiveType::U64)
+                        | (PrimitiveType::F32, PrimitiveType::F64)
+                );
+                Ok(widening_compatible)
+            }
+
+            // Named type subtyping: check inheritance hierarchy (read-only)
+            (
+                Type::Named {
+                    id: sub_id,
+                    type_args: sub_args,
+                    ..
+                },
+                Type::Named {
+                    id: super_id,
+                    type_args: super_args,
+                    ..
+                },
+            ) => {
+                if sub_id == super_id {
+                    // Same nominal type — check variance of type arguments
+                    self.check_type_arg_variance(*sub_id, sub_args, super_args)
+                } else {
+                    // Check cached hierarchy (read-only — no BFS here to avoid &mut self)
+                    if let Some(cached) = self.inheritance_cache.get(sub_id) {
+                        Ok(cached.contains(super_id))
+                    } else {
+                        Ok(false)
+                    }
+                }
+            }
+
+            // Named implements trait
+            (Type::Named { id: type_id, .. }, Type::Trait { id: trait_id, .. }) => {
+                self.implements_trait(*type_id, *trait_id)
+            }
+
+            // Optional subtyping: T <: Optional(T)
+            (inner, Type::Optional(opt_inner)) => self.is_subtype_recursive(inner, opt_inner),
+
+            // Array covariance: Array<A> <: Array<B> if A <: B
+            (
+                Type::Array {
+                    element_type: sub_elem,
+                    ..
+                },
+                Type::Array {
+                    element_type: super_elem,
+                    ..
+                },
+            ) => self.is_subtype_recursive(sub_elem, super_elem),
+
+            // Reference subtyping: shared references are covariant
+            (
+                Type::Reference {
+                    ty: sub_inner,
+                    mutability: sub_mut,
+                    ..
+                },
+                Type::Reference {
+                    ty: super_inner,
+                    mutability: super_mut,
+                    ..
+                },
+            ) => {
+                use crate::Mutability;
+                match (sub_mut, super_mut) {
+                    // &mut T <: &T (mutable ref can be used as immutable)
+                    (Mutability::Mutable, Mutability::Immutable) => {
+                        self.is_subtype_recursive(sub_inner, super_inner)
+                    }
+                    // &T <: &T (same mutability, covariant)
+                    (Mutability::Immutable, Mutability::Immutable) => {
+                        self.is_subtype_recursive(sub_inner, super_inner)
+                    }
+                    // &mut T <: &mut T (invariant for mutable)
+                    (Mutability::Mutable, Mutability::Mutable) => Ok(sub_inner == super_inner),
+                    // &T </: &mut T
+                    _ => Ok(false),
+                }
+            }
+
+            // Tuple subtyping: element-wise
+            (Type::Tuple(sub_elems), Type::Tuple(super_elems)) => {
+                if sub_elems.len() != super_elems.len() {
+                    return Ok(false);
+                }
+                for (sub_e, super_e) in sub_elems.iter().zip(super_elems.iter()) {
+                    if !self.is_subtype_recursive(sub_e, super_e)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            // Function subtyping: contravariant params, covariant return
+            (
+                Type::Function {
+                    params: sub_params,
+                    return_type: sub_ret,
+                    ..
+                },
+                Type::Function {
+                    params: super_params,
+                    return_type: super_ret,
+                    ..
+                },
+            ) => {
+                if sub_params.len() != super_params.len() {
+                    return Ok(false);
+                }
+                // Return type: covariant
+                if !self.is_subtype_recursive(sub_ret, super_ret)? {
+                    return Ok(false);
+                }
+                // Parameters: contravariant
+                for (sub_p, super_p) in sub_params.iter().zip(super_params.iter()) {
+                    if !self.is_subtype_recursive(&super_p.ty, &sub_p.ty)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            _ => Ok(false),
+        }
     }
 
     /// Check if adding an inheritance relationship would create a cycle

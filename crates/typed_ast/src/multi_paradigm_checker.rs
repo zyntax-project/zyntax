@@ -629,14 +629,50 @@ impl TypeChecker {
         Ok(current_type)
     }
 
-    /// Detect which paradigms are needed based on expression complexity
+    /// Detect which paradigms are needed based on expression features
     fn detect_required_paradigms(
         &self,
-        _expr: &crate::typed_ast::TypedNode<TypedExpression>,
+        expr: &crate::typed_ast::TypedNode<TypedExpression>,
     ) -> Vec<Paradigm> {
-        // For now, return configured paradigms
-        // TODO: Implement smart detection based on expression features
-        self.config.paradigms.clone()
+        let mut paradigms = Vec::new();
+
+        // Always include configured paradigms as baseline
+        for p in &self.config.paradigms {
+            if !paradigms.contains(p) {
+                paradigms.push(p.clone());
+            }
+        }
+
+        // Auto-detect additional paradigms based on expression type features
+        let ty = &expr.ty;
+        match ty {
+            // Dependent types: const-dependent or array with known size
+            Type::ConstDependent { .. } => {
+                let dep = Paradigm::Dependent {
+                    const_generics: true,
+                    refinement_types: true,
+                };
+                if !paradigms.contains(&dep) {
+                    paradigms.push(dep);
+                }
+            }
+            // Dynamic or Any types suggest gradual typing
+            Type::Dynamic | Type::Any => {
+                let grad = Paradigm::Gradual {
+                    any_propagation: GradualMode::Lenient,
+                    runtime_checks: true,
+                };
+                if !paradigms
+                    .iter()
+                    .any(|p| matches!(p, Paradigm::Gradual { .. }))
+                {
+                    paradigms.push(grad);
+                }
+            }
+            _ => {}
+        }
+
+        paradigms
     }
 
     /// Check if result is cached
@@ -989,8 +1025,26 @@ impl TypeChecker {
                 // For complex predicates, use a placeholder
                 RefinementPredicate::Constant(true)
             }
-            ConstConstraint::And(const_constraints) => todo!(),
-            ConstConstraint::Or(const_constraints) => todo!(),
+            ConstConstraint::And(const_constraints) => {
+                let predicates: Vec<_> = const_constraints
+                    .iter()
+                    .map(|c| self.const_constraint_to_predicate(c))
+                    .collect();
+                predicates
+                    .into_iter()
+                    .reduce(|acc, p| RefinementPredicate::And(Box::new(acc), Box::new(p)))
+                    .unwrap_or(RefinementPredicate::Constant(true))
+            }
+            ConstConstraint::Or(const_constraints) => {
+                let predicates: Vec<_> = const_constraints
+                    .iter()
+                    .map(|c| self.const_constraint_to_predicate(c))
+                    .collect();
+                predicates
+                    .into_iter()
+                    .reduce(|acc, p| RefinementPredicate::Or(Box::new(acc), Box::new(p)))
+                    .unwrap_or(RefinementPredicate::Constant(false))
+            }
         }
     }
 }

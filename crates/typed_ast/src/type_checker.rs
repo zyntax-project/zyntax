@@ -8,6 +8,7 @@
 use crate::arena::InternedString;
 use crate::constraint_solver::{Constraint as SolverConstraint, ConstraintSolver};
 use crate::diagnostics::{codes, DiagnosticCollector};
+use crate::multi_paradigm_checker::Paradigm;
 use crate::source::Span;
 use crate::type_inference::{InferenceContext, InferenceError};
 use crate::type_registry::{
@@ -33,6 +34,14 @@ pub struct TypeChecker {
     options: TypeCheckOptions,
     /// Diagnostic collector for error reporting
     diagnostics: DiagnosticCollector,
+    /// Active paradigms for multi-paradigm type checking
+    paradigms: Vec<Paradigm>,
+    /// Nominal type checker (lazy-loaded when Nominal paradigm active)
+    nominal_checker: Option<crate::nominal_type_checker::NominalTypeChecker>,
+    /// Structural type checker (lazy-loaded when Structural paradigm active)
+    structural_checker: Option<crate::structural_type_checker::StructuralTypeChecker>,
+    /// Linear type checker (lazy-loaded when Linear paradigm active)
+    linear_checker: Option<crate::linear_types::LinearTypeChecker>,
 }
 
 /// Type checking options
@@ -133,6 +142,10 @@ impl TypeChecker {
             loop_type: None,
             options: TypeCheckOptions::default(),
             diagnostics: DiagnosticCollector::new(),
+            paradigms: vec![Paradigm::Nominal],
+            nominal_checker: None,
+            structural_checker: None,
+            linear_checker: None,
         }
     }
 
@@ -150,6 +163,116 @@ impl TypeChecker {
             loop_type: None,
             options,
             diagnostics: DiagnosticCollector::new(),
+            paradigms: vec![Paradigm::Nominal],
+            nominal_checker: None,
+            structural_checker: None,
+            linear_checker: None,
+        }
+    }
+
+    /// Set active paradigms for multi-paradigm type checking
+    pub fn set_paradigms(&mut self, paradigms: Vec<Paradigm>) {
+        self.paradigms = paradigms;
+    }
+
+    /// Check if a specific paradigm is active
+    pub fn has_paradigm(&self, paradigm: &Paradigm) -> bool {
+        self.paradigms.contains(paradigm)
+    }
+
+    /// Check if structural typing is active
+    fn is_structural_active(&self) -> bool {
+        self.paradigms
+            .iter()
+            .any(|p| matches!(p, Paradigm::Structural { .. }))
+    }
+
+    /// Check if linear typing is active
+    fn is_linear_active(&self) -> bool {
+        self.paradigms
+            .iter()
+            .any(|p| matches!(p, Paradigm::Linear { .. }))
+    }
+
+    /// Get or create the nominal type checker
+    fn get_nominal_checker(&mut self) -> &mut crate::nominal_type_checker::NominalTypeChecker {
+        if self.nominal_checker.is_none() {
+            self.nominal_checker = Some(crate::nominal_type_checker::NominalTypeChecker::new());
+        }
+        self.nominal_checker.as_mut().unwrap()
+    }
+
+    /// Get or create the structural type checker
+    fn get_structural_checker(
+        &mut self,
+    ) -> &mut crate::structural_type_checker::StructuralTypeChecker {
+        if self.structural_checker.is_none() {
+            self.structural_checker =
+                Some(crate::structural_type_checker::StructuralTypeChecker::new());
+        }
+        self.structural_checker.as_mut().unwrap()
+    }
+
+    /// Get or create the linear type checker
+    fn get_linear_checker(&mut self) -> &mut crate::linear_types::LinearTypeChecker {
+        if self.linear_checker.is_none() {
+            self.linear_checker = Some(crate::linear_types::LinearTypeChecker::new());
+        }
+        self.linear_checker.as_mut().unwrap()
+    }
+
+    /// Run a linear type checking pass over the full program
+    pub fn check_program_linear(&mut self, program: &TypedProgram) -> Result<(), TypeError> {
+        if !self.is_linear_active() {
+            return Ok(());
+        }
+        let checker = self.get_linear_checker();
+        checker
+            .check_program(program)
+            .map_err(|e| TypeError::TypeMismatch {
+                expected: Type::Primitive(PrimitiveType::Unit),
+                found: Type::Error,
+            })
+    }
+
+    /// Check structural compatibility between two types (when structural paradigm is active)
+    pub fn check_structural_compatibility(
+        &mut self,
+        sub_type: &Type,
+        super_type: &Type,
+    ) -> Result<bool, TypeError> {
+        if !self.is_structural_active() {
+            return Ok(sub_type == super_type);
+        }
+
+        let mode = self
+            .paradigms
+            .iter()
+            .find_map(|p| match p {
+                Paradigm::Structural {
+                    duck_typing,
+                    strict,
+                } => Some(if *duck_typing {
+                    crate::StructuralMode::Duck
+                } else if *strict {
+                    crate::StructuralMode::Strict
+                } else {
+                    crate::StructuralMode::Nominal
+                }),
+                _ => None,
+            })
+            .unwrap_or(crate::StructuralMode::Nominal);
+
+        let checker = self.get_structural_checker();
+        match checker.is_structurally_compatible(sub_type, super_type, mode) {
+            Ok(crate::structural_type_checker::StructuralCompatibility::Compatible) => Ok(true),
+            Ok(
+                crate::structural_type_checker::StructuralCompatibility::RequiresAdapterPattern(_),
+            ) => Ok(true),
+            Ok(crate::structural_type_checker::StructuralCompatibility::Incompatible(_)) => {
+                Ok(false)
+            }
+            Err(_errors) => Ok(false),
         }
     }
 
@@ -1236,24 +1359,27 @@ impl TypeChecker {
 
             TypedExpression::Index(index) => self.check_index_expr(index),
 
-            // TODO: Implement other expression types
-            TypedExpression::Array(_)
-            | TypedExpression::Tuple(_)
-            | TypedExpression::Struct(_)
-            | TypedExpression::Lambda(_)
-            | TypedExpression::Match(_)
-            | TypedExpression::If(_)
-            | TypedExpression::Cast(_)
-            | TypedExpression::Await(_)
-            | TypedExpression::Try(_)
-            | TypedExpression::Reference(_)
-            | TypedExpression::Dereference(_)
-            | TypedExpression::Range(_)
-            | TypedExpression::Block(_)
-            | TypedExpression::ListComprehension(_)
-            | TypedExpression::Slice(_)
-            | TypedExpression::Compute(_) => {
-                // Placeholder for now
+            TypedExpression::Array(elements) => self.check_array_expr(elements),
+            TypedExpression::Tuple(elements) => self.check_tuple_expr(elements),
+            TypedExpression::Struct(struct_lit) => self.check_struct_expr(struct_lit),
+            TypedExpression::Lambda(lambda) => self.check_lambda_expr(lambda),
+            TypedExpression::Match(match_expr) => self.check_match_expr(match_expr),
+            TypedExpression::If(if_expr) => self.check_if_expr(if_expr),
+            TypedExpression::Cast(cast) => self.check_cast_expr(cast),
+            TypedExpression::Await(expr) => {
+                // Check inner expression; async types not yet fully tracked
+                let _ = self.check_expression(&expr.node)?;
+                Ok(self.inference.fresh_type_var())
+            }
+            TypedExpression::Try(expr) => self.check_try_expr(expr),
+            TypedExpression::Reference(reference) => self.check_reference_expr(reference),
+            TypedExpression::Dereference(expr) => self.check_dereference_expr(expr),
+            TypedExpression::Range(range) => self.check_range_expr(range),
+            TypedExpression::Block(block) => self.check_block(block),
+            TypedExpression::ListComprehension(comp) => self.check_list_comprehension_expr(comp),
+            TypedExpression::Slice(slice) => self.check_slice_expr(slice),
+            TypedExpression::Compute(_) => {
+                // Compute expressions are SIMD/kernel-specific; type checked at lowering
                 Ok(self.inference.fresh_type_var())
             }
             TypedExpression::MethodCall(method_call) => self.check_method_call(method_call),
@@ -1632,17 +1758,35 @@ impl TypeChecker {
 
         match &object_type {
             Type::Named { id, type_args, .. } => {
-                // Look up the type definition in the type registry
-                if let Some(type_def) = self.inference.registry.get_type_by_id(*id) {
-                    match &type_def.kind {
+                // Look up the type definition — clone data out to avoid borrow conflicts
+                use crate::type_registry::TypeRegistry;
+                let lookup = self.inference.registry.get_type_by_id(*id).map(|td| {
+                    let kind = td.kind.clone();
+                    let type_params = td.type_params.clone();
+                    kind
+                });
+                let type_params = self
+                    .inference
+                    .registry
+                    .get_type_by_id(*id)
+                    .map(|td| td.type_params.clone())
+                    .unwrap_or_default();
+                let type_args = type_args.clone();
+
+                if let Some(kind) = lookup {
+                    match &kind {
                         crate::type_registry::TypeKind::Struct { fields, .. } => {
                             // Look up the field in the struct definition
                             if let Some(field_def) = fields.iter().find(|f| f.name == field.field) {
                                 // Apply type arguments to the field type if needed
-                                let field_type = if type_args.is_empty() {
-                                    field_def.ty.clone()
+                                let field_type = if !type_args.is_empty() && !type_params.is_empty()
+                                {
+                                    TypeRegistry::substitute_type_params(
+                                        &field_def.ty,
+                                        &type_params,
+                                        &type_args,
+                                    )
                                 } else {
-                                    // TODO: Substitute type parameters with type arguments
                                     field_def.ty.clone()
                                 };
                                 Ok(field_type)
@@ -1653,8 +1797,17 @@ impl TypeChecker {
                         crate::type_registry::TypeKind::Interface { methods, .. } => {
                             // Look for a method or property with this name
                             if let Some(method) = methods.iter().find(|m| m.name == field.field) {
-                                // TODO: Handle method types properly
-                                Ok(method.return_type.clone())
+                                let return_ty = if !type_args.is_empty() && !type_params.is_empty()
+                                {
+                                    TypeRegistry::substitute_type_params(
+                                        &method.return_type,
+                                        &type_params,
+                                        &type_args,
+                                    )
+                                } else {
+                                    method.return_type.clone()
+                                };
+                                Ok(return_ty)
                             } else {
                                 Err(TypeError::UnknownParameter(field.field))
                             }
@@ -1760,6 +1913,387 @@ impl TypeChecker {
                     },
                     found: container_type,
                 })
+            }
+        }
+    }
+
+    // ========================================================================
+    // Expression type checking implementations
+    // ========================================================================
+
+    /// Type check array literal — unify all element types
+    fn check_array_expr(
+        &mut self,
+        elements: &[TypedNode<TypedExpression>],
+    ) -> Result<Type, TypeError> {
+        if elements.is_empty() {
+            return Ok(Type::Array {
+                element_type: Box::new(self.inference.fresh_type_var()),
+                size: None,
+                nullability: crate::NullabilityKind::NonNull,
+            });
+        }
+        let mut elem_type = self.check_expression(&elements[0].node)?;
+        for elem in &elements[1..] {
+            let ty = self.check_expression(&elem.node)?;
+            elem_type = self.inference.unify(elem_type.clone(), ty)?;
+        }
+        Ok(Type::Array {
+            element_type: Box::new(elem_type),
+            size: None,
+            nullability: crate::NullabilityKind::NonNull,
+        })
+    }
+
+    /// Type check tuple literal — each element can be a different type
+    fn check_tuple_expr(
+        &mut self,
+        elements: &[TypedNode<TypedExpression>],
+    ) -> Result<Type, TypeError> {
+        let mut types = Vec::with_capacity(elements.len());
+        for elem in elements {
+            types.push(self.check_expression(&elem.node)?);
+        }
+        Ok(Type::Tuple(types))
+    }
+
+    /// Type check struct literal — look up type, validate fields
+    fn check_struct_expr(&mut self, struct_lit: &TypedStructLiteral) -> Result<Type, TypeError> {
+        // Look up the type by name in the registry — clone data out to avoid borrow conflicts
+        let type_info = self
+            .inference
+            .registry
+            .get_type_by_name(struct_lit.name)
+            .map(|td| {
+                let id = td.id;
+                let field_defs: Vec<_> =
+                    if let crate::type_registry::TypeKind::Struct { fields, .. } = &td.kind {
+                        fields.iter().map(|f| (f.name, f.ty.clone())).collect()
+                    } else {
+                        vec![]
+                    };
+                (id, field_defs)
+            });
+
+        if let Some((type_id, field_defs)) = type_info {
+            // Check each field initializer
+            for field_init in &struct_lit.fields {
+                let init_ty = self.check_expression(&field_init.value.node)?;
+                if let Some((_, field_ty)) = field_defs.iter().find(|(n, _)| *n == field_init.name)
+                {
+                    let _ = self.inference.unify(init_ty, field_ty.clone());
+                }
+            }
+
+            Ok(Type::Named {
+                id: type_id,
+                type_args: vec![],
+                const_args: vec![],
+                variance: vec![],
+                nullability: crate::NullabilityKind::NonNull,
+            })
+        } else {
+            // Type not found — check fields anyway and return fresh type var
+            for field_init in &struct_lit.fields {
+                let _ = self.check_expression(&field_init.value.node)?;
+            }
+            Ok(self.inference.fresh_type_var())
+        }
+    }
+
+    /// Type check lambda/closure expression
+    fn check_lambda_expr(&mut self, lambda: &TypedLambda) -> Result<Type, TypeError> {
+        self.push_scope();
+
+        // Add parameters to scope
+        let mut param_types = Vec::new();
+        for param in &lambda.params {
+            let param_type = param
+                .ty
+                .clone()
+                .unwrap_or_else(|| self.inference.fresh_type_var());
+            param_types.push(param_type.clone());
+            self.add_local(param.name, param_type, crate::Mutability::Immutable);
+        }
+
+        // Check body
+        let return_type = match &lambda.body {
+            TypedLambdaBody::Expression(expr) => self.check_expression(&expr.node)?,
+            TypedLambdaBody::Block(block) => self.check_block(block)?,
+        };
+
+        self.pop_scope();
+
+        Ok(Type::Function {
+            params: param_types
+                .into_iter()
+                .map(|ty| crate::ParamInfo {
+                    name: None,
+                    ty,
+                    is_optional: false,
+                    is_varargs: false,
+                    is_keyword_only: false,
+                    is_positional_only: false,
+                    is_out: false,
+                    is_ref: false,
+                    is_inout: false,
+                })
+                .collect(),
+            return_type: Box::new(return_type),
+            is_varargs: false,
+            has_named_params: false,
+            has_default_params: false,
+            async_kind: crate::AsyncKind::Sync,
+            calling_convention: crate::CallingConvention::Default,
+            nullability: crate::NullabilityKind::NonNull,
+        })
+    }
+
+    /// Type check match expression — unify all arm body types
+    fn check_match_expr(&mut self, match_expr: &TypedMatchExpr) -> Result<Type, TypeError> {
+        let scrutinee_ty = self.check_expression(&match_expr.scrutinee.node)?;
+
+        let mut result_type: Option<Type> = None;
+
+        for arm in &match_expr.arms {
+            self.push_scope();
+
+            // Check pattern against scrutinee type (adds bindings to scope)
+            self.check_pattern_against_type(&arm.pattern.node, &scrutinee_ty);
+
+            // Check guard if present
+            if let Some(guard) = &arm.guard {
+                let guard_ty = self.check_expression(&guard.node)?;
+                let _ = self
+                    .inference
+                    .unify(guard_ty, Type::Primitive(PrimitiveType::Bool));
+            }
+
+            // Check arm body
+            let body_ty = self.check_expression(&arm.body.node)?;
+
+            // Unify with previous arm types
+            if let Some(ref prev_ty) = result_type {
+                result_type = Some(
+                    self.inference
+                        .unify(prev_ty.clone(), body_ty)
+                        .unwrap_or(prev_ty.clone()),
+                );
+            } else {
+                result_type = Some(body_ty);
+            }
+
+            self.pop_scope();
+        }
+
+        Ok(result_type.unwrap_or(Type::Never))
+    }
+
+    /// Type check if expression — condition must be Bool, unify branches
+    fn check_if_expr(&mut self, if_expr: &TypedIfExpr) -> Result<Type, TypeError> {
+        let cond_ty = self.check_expression(&if_expr.condition.node)?;
+        let _ = self
+            .inference
+            .unify(cond_ty, Type::Primitive(PrimitiveType::Bool));
+
+        let then_ty = self.check_expression(&if_expr.then_branch.node)?;
+        let else_ty = self.check_expression(&if_expr.else_branch.node)?;
+
+        Ok(self
+            .inference
+            .unify(then_ty.clone(), else_ty)
+            .unwrap_or(then_ty))
+    }
+
+    /// Type check cast expression — return target type directly
+    fn check_cast_expr(&mut self, cast: &TypedCast) -> Result<Type, TypeError> {
+        let _ = self.check_expression(&cast.expr.node)?;
+        Ok(cast.target_type.clone())
+    }
+
+    /// Type check try expression — extract ok_type from Result
+    fn check_try_expr(&mut self, expr: &TypedNode<TypedExpression>) -> Result<Type, TypeError> {
+        let ty = self.check_expression(&expr.node)?;
+        match ty {
+            Type::Result { ok_type, .. } => Ok(*ok_type),
+            _ => Ok(self.inference.fresh_type_var()),
+        }
+    }
+
+    /// Type check reference expression — wrap in Reference type
+    fn check_reference_expr(&mut self, reference: &TypedReference) -> Result<Type, TypeError> {
+        let inner_ty = self.check_expression(&reference.expr.node)?;
+        Ok(Type::Reference {
+            ty: Box::new(inner_ty),
+            mutability: reference.mutability,
+            lifetime: None,
+            nullability: crate::NullabilityKind::NonNull,
+        })
+    }
+
+    /// Type check dereference expression — unwrap Reference type
+    fn check_dereference_expr(
+        &mut self,
+        expr: &TypedNode<TypedExpression>,
+    ) -> Result<Type, TypeError> {
+        let ty = self.check_expression(&expr.node)?;
+        match ty {
+            Type::Reference { ty: inner, .. } => Ok(*inner),
+            _ => {
+                // In lenient mode, return fresh type var
+                Ok(self.inference.fresh_type_var())
+            }
+        }
+    }
+
+    /// Type check range expression — unify start/end types
+    fn check_range_expr(&mut self, range: &TypedRange) -> Result<Type, TypeError> {
+        let mut range_type = self.inference.fresh_type_var();
+
+        if let Some(start) = &range.start {
+            let start_ty = self.check_expression(&start.node)?;
+            range_type = self
+                .inference
+                .unify(range_type, start_ty)
+                .unwrap_or(Type::Primitive(PrimitiveType::I32));
+        }
+        if let Some(end) = &range.end {
+            let end_ty = self.check_expression(&end.node)?;
+            range_type = self
+                .inference
+                .unify(range_type, end_ty)
+                .unwrap_or(Type::Primitive(PrimitiveType::I32));
+        }
+
+        // Return as a named Range type or just the element type
+        // (Range type depends on language — for now return fresh var with constraint)
+        Ok(self.inference.fresh_type_var())
+    }
+
+    /// Type check list comprehension — [expr for var in iter if cond]
+    fn check_list_comprehension_expr(
+        &mut self,
+        comp: &TypedListComprehension,
+    ) -> Result<Type, TypeError> {
+        let iter_ty = self.check_expression(&comp.iterator.node)?;
+
+        // Extract element type from iterator
+        let elem_ty = match &iter_ty {
+            Type::Array { element_type, .. } => *element_type.clone(),
+            _ => self.inference.fresh_type_var(),
+        };
+
+        self.push_scope();
+        self.add_local(comp.variable, elem_ty, crate::Mutability::Immutable);
+
+        // Check filter condition if present
+        if let Some(cond) = &comp.condition {
+            let cond_ty = self.check_expression(&cond.node)?;
+            let _ = self
+                .inference
+                .unify(cond_ty, Type::Primitive(PrimitiveType::Bool));
+        }
+
+        // Check output expression
+        let output_ty = self.check_expression(&comp.output_expr.node)?;
+        self.pop_scope();
+
+        Ok(Type::Array {
+            element_type: Box::new(output_ty),
+            size: None,
+            nullability: crate::NullabilityKind::NonNull,
+        })
+    }
+
+    /// Type check slice expression — preserves container type
+    fn check_slice_expr(&mut self, slice: &TypedSlice) -> Result<Type, TypeError> {
+        let obj_ty = self.check_expression(&slice.object.node)?;
+
+        // Check indices are numeric
+        if let Some(start) = &slice.start {
+            let _ = self.check_expression(&start.node)?;
+        }
+        if let Some(end) = &slice.end {
+            let _ = self.check_expression(&end.node)?;
+        }
+        if let Some(step) = &slice.step {
+            let _ = self.check_expression(&step.node)?;
+        }
+
+        // Slice returns the same container type
+        Ok(obj_ty)
+    }
+
+    /// Check pattern against expected type — adds variable bindings to scope
+    fn check_pattern_against_type(&mut self, pattern: &TypedPattern, expected: &Type) {
+        match pattern {
+            TypedPattern::Wildcard => {
+                // Matches anything, no bindings
+            }
+            TypedPattern::Identifier { name, mutability } => {
+                // Bind variable to expected type in current scope
+                self.add_local(*name, expected.clone(), *mutability);
+            }
+            TypedPattern::Literal(_) => {
+                // Literal patterns should match the expected type
+                // Full validation would unify literal type with expected
+            }
+            TypedPattern::Tuple(patterns) => {
+                if let Type::Tuple(types) = expected {
+                    for (pat, ty) in patterns.iter().zip(types.iter()) {
+                        self.check_pattern_against_type(&pat.node, ty);
+                    }
+                }
+            }
+            TypedPattern::Struct { fields, .. } => {
+                // For struct patterns, try to match field names to expected type fields
+                for field in fields {
+                    let fresh = self.inference.fresh_type_var();
+                    self.check_pattern_against_type(&field.pattern.node, &fresh);
+                }
+            }
+            TypedPattern::Enum { fields, .. } => {
+                // For enum patterns, bind any field patterns
+                for field in fields {
+                    let fresh = self.inference.fresh_type_var();
+                    self.check_pattern_against_type(&field.node, &fresh);
+                }
+            }
+            TypedPattern::Array(patterns) => {
+                let elem_ty = if let Type::Array { element_type, .. } = expected {
+                    *element_type.clone()
+                } else {
+                    self.inference.fresh_type_var()
+                };
+                for pat in patterns {
+                    self.check_pattern_against_type(&pat.node, &elem_ty);
+                }
+            }
+            TypedPattern::Or(alternatives) => {
+                for alt in alternatives {
+                    self.check_pattern_against_type(&alt.node, expected);
+                }
+            }
+            TypedPattern::Guard { pattern, .. } => {
+                self.check_pattern_against_type(&pattern.node, expected);
+            }
+            TypedPattern::Rest { name, mutability } => {
+                if let Some(name) = name {
+                    self.add_local(*name, expected.clone(), *mutability);
+                }
+            }
+            TypedPattern::Reference { pattern, .. } => {
+                if let Type::Reference { ty: inner, .. } = expected {
+                    self.check_pattern_against_type(&pattern.node, inner);
+                } else {
+                    self.check_pattern_against_type(&pattern.node, expected);
+                }
+            }
+            TypedPattern::Box(inner) => {
+                self.check_pattern_against_type(&inner.node, expected);
+            }
+            _ => {
+                // Slice, Range patterns — handle minimally
             }
         }
     }
@@ -2027,14 +2561,57 @@ impl TypeChecker {
         }
     }
 
-    /// Resolve trait method for a given type
+    /// Resolve trait method for a given type by searching trait implementations
     fn resolve_trait_method(
         &self,
         receiver_ty: &Type,
         method_name: InternedString,
     ) -> Result<Option<MethodSig>, TypeError> {
-        // For now, we don't have trait resolution in the type checker
-        // This would need to be implemented with the type registry
+        let registry = &self.inference.registry;
+
+        // 1. Check inherent methods on the type definition itself
+        match receiver_ty {
+            Type::Named { id, .. } => {
+                if let Some(type_def) = registry.get_type_by_id(*id) {
+                    for method in &type_def.methods {
+                        if method.name == method_name {
+                            return Ok(Some(method.clone()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // 2. Get all traits implemented by this type and search their methods
+        let implemented_traits = registry.get_implementations(receiver_ty);
+
+        for trait_id in &implemented_traits {
+            // Check trait definition's declared methods
+            if let Some(trait_def) = registry.get_trait_by_id(*trait_id) {
+                for method in &trait_def.methods {
+                    if method.name == method_name {
+                        return Ok(Some(method.clone()));
+                    }
+                }
+            }
+        }
+
+        // 3. Fall back to searching impl methods directly
+        //    (impl blocks may add methods not declared in the trait definition,
+        //     e.g. extern trait impls with 0 declared methods)
+        for (_trait_id, impls) in registry.iter_implementations() {
+            for impl_def in impls {
+                if registry.impl_matches_type(&impl_def.for_type, receiver_ty) {
+                    for method_impl in &impl_def.methods {
+                        if method_impl.signature.name == method_name {
+                            return Ok(Some(method_impl.signature.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -2044,19 +2621,37 @@ impl TypeChecker {
         receiver_ty: &Type,
         method_sig: &MethodSig,
     ) -> Result<(), TypeError> {
-        // For each trait bound required by the method, verify the receiver type implements it
         for type_param in &method_sig.type_params {
             for bound in &type_param.bounds {
                 match bound {
                     TypeBound::Trait {
                         name: trait_name, ..
                     } => {
-                        // For now, skip trait bound verification
-                        // This would need to be implemented with the type registry
-                        let _ = trait_name; // Avoid unused variable warning
+                        // Look up the trait by name, get its ID
+                        let trait_id = self
+                            .inference
+                            .registry
+                            .get_trait_by_name(*trait_name)
+                            .map(|td| td.id);
+
+                        if let Some(trait_id) = trait_id {
+                            if !self
+                                .inference
+                                .registry
+                                .type_implements(receiver_ty, trait_id)
+                            {
+                                return Err(TypeError::TraitNotImplemented {
+                                    ty: receiver_ty.clone(),
+                                    trait_name: *trait_name,
+                                    span: method_sig.span,
+                                });
+                            }
+                        }
+                        // If trait not found in registry, skip (may be external/unresolved)
                     }
                     _ => {
-                        // Handle other bound types as needed
+                        // Other bound types (Sized, Copy, Send, Sync, Lifetime, etc.)
+                        // are handled by dedicated checkers or deferred
                     }
                 }
             }
@@ -2073,25 +2668,51 @@ impl TypeChecker {
     ) -> Result<(), TypeError> {
         // Exclude 'self' parameter from arity check — callers only provide non-self args
         let non_self_params: Vec<_> = method_sig.params.iter().filter(|p| !p.is_self).collect();
-        let expected_param_count = non_self_params.len();
-        let provided_arg_count = arg_types.len();
 
-        if provided_arg_count != expected_param_count {
+        // Determine arity bounds:
+        // - Required: params that are not varargs and not Optional-typed
+        // - Maximum: all non-self params (or unlimited if varargs present)
+        let has_varargs = non_self_params.iter().any(|p| p.is_varargs);
+
+        let required_count = non_self_params
+            .iter()
+            .filter(|p| !p.is_varargs && !matches!(p.ty, Type::Optional(_)))
+            .count();
+
+        let max_count = if has_varargs {
+            usize::MAX
+        } else {
+            non_self_params.len()
+        };
+
+        let provided = arg_types.len();
+
+        if provided < required_count || provided > max_count {
             return Err(TypeError::ArityMismatch {
-                expected: expected_param_count,
-                found: provided_arg_count,
-                span: Span::new(0, 0), // TODO: Get proper span
+                expected: non_self_params.len(),
+                found: provided,
+                span: method_sig.span,
             });
         }
 
-        // Check type compatibility for each non-self argument
-        for (param, arg_ty) in non_self_params.iter().zip(arg_types.iter()) {
-            self.inference
-                .unify(arg_ty.clone(), param.ty.clone())
-                .map_err(|_| TypeError::TypeMismatch {
-                    expected: param.ty.clone(),
-                    found: arg_ty.clone(),
-                })?;
+        // Check type compatibility for each provided argument
+        for (i, arg_ty) in arg_types.iter().enumerate() {
+            if i < non_self_params.len() {
+                let param = &non_self_params[i];
+                // If param type is Optional(T) but arg is not Optional, accept T directly
+                let target_ty = match &param.ty {
+                    Type::Optional(inner) if !matches!(arg_ty, Type::Optional(_)) => *inner.clone(),
+                    other => other.clone(),
+                };
+                self.inference
+                    .unify(arg_ty.clone(), target_ty)
+                    .map_err(|_| TypeError::TypeMismatch {
+                        expected: param.ty.clone(),
+                        found: arg_ty.clone(),
+                    })?;
+            }
+            // If i >= non_self_params.len() and has_varargs, skip type checking
+            // (varargs are dynamically typed)
         }
 
         Ok(())
