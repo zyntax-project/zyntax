@@ -23,6 +23,17 @@
 
   <!-- General Meta -->
   <meta name="description" content="A high-performance, multi-paradigm compiler infrastructure with an advanced type system, tiered JIT compilation, and async/await runtime — everything you need to create modern programming languages.">
+  <meta name="author" content="Zyntax Contributors">
+  <meta name="robots" content="index, follow">
+  <meta name="theme-color" content="#eaeaf2">
+  <meta property="og:locale" content="en_US">
+  <link rel="canonical" href="https://zyntax.org">
+
+  <!-- Favicon & Icons -->
+  <link rel="icon" href="/favicon.ico" sizes="32x32">
+  <link rel="icon" href="/favicon.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -516,30 +527,59 @@
       .hero-feature { align-items: center; }
     }
   </style>
+
+  <!-- Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Zyntax",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Cross-platform",
+    "description": "A high-performance, multi-paradigm compiler infrastructure with an advanced type system, tiered JIT compilation, and async/await runtime.",
+    "url": "https://zyntax.org",
+    "license": "https://opensource.org/licenses/Apache-2.0",
+    "codeRepository": "https://github.com/darmie/zyntax",
+    "programmingLanguage": "Rust",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Organization",
+      "name": "Zyntax",
+      "url": "https://github.com/darmie/zyntax"
+    }
+  }
+  </script>
 </head>
 <body>
 
   <!-- ── Navigation ── -->
-  <nav>
+  <header>
+  <nav role="navigation" aria-label="Main navigation">
     <a href="#" class="nav-logo" aria-label="Zyntax"><svg xmlns="http://www.w3.org/2000/svg" viewBox="16.5 -380.5 2308.0 477.0" fill="currentColor" class="logo-svg"><path d="M393.5 0L21.5 0L21.5-91.5L246-299L343-276.5L23-276.5L23-375.5L392-375.5L392-284L168-76.5L85-99L393.5-99L393.5 0ZM540 91.5L540 91.5Q504 91.5 476.75 82.75Q449.5 74 422.5 54L422.5 54L422.5-31Q449-14 471.75-6.75Q494.5 0.5 521 0.5L521 0.5Q542 0.5 557.75-8.25Q573.5-17 583.5-42L583.5-42L681-287.5L816-287.5L685-4Q668.5 32 644.75 53Q621 74 594 82.75Q567 91.5 540 91.5ZM645-38.5L524-38.5L408.5-287.5L548.5-287.5L645-38.5ZM834.5-184.5L814.5-287.5L941.5-287.5L961.5-165L961.5 0L834.5 0L834.5-184.5ZM1061-296.5L1061-296.5Q1103-296.5 1132.5-279.75Q1162-263 1177.75-232.75Q1193.5-202.5 1193.5-162L1193.5-162L1193.5 0L1066.5 0L1066.5-144Q1066.5-168 1053.25-181Q1040-194 1016-194L1016-194Q999-194 986.75-187.25Q974.5-180.5 968-167.75Q961.5-155 961.5-137L961.5-137L924-156Q931-203 951-234.25Q971-265.5 999.5-281Q1028-296.5 1061-296.5ZM1263.5-195L1207-195L1207-249.5L1263.5-278L1319-366L1390.5-366L1390.5-287.5L1503-287.5L1503-195L1390.5-195L1390.5-136Q1390.5-108.5 1401-97.25Q1411.5-86 1444-86L1444-86Q1464-86 1479.75-88.75Q1495.5-91.5 1508-95.5L1508-95.5L1508-3.5Q1491 1.5 1466.25 5.25Q1441.5 9 1414.5 9L1414.5 9Q1363.5 9 1330-6.25Q1296.5-21.5 1280-50.5Q1263.5-79.5 1263.5-119.5L1263.5-119.5L1263.5-195ZM1921 0L1789 0L1774.5-101.5L1789-143.5L1774.5-185L1789-287.5L1921-287.5L1901-144L1921 0ZM1815.5-143.5L1815.5-143.5Q1810.5-97.5 1790.75-63.25Q1771-29 1739.25-10Q1707.5 9 1666.5 9L1666.5 9Q1624.5 9 1592.75-10Q1561-29 1543.25-63.5Q1525.5-98 1525.5-143.5L1525.5-143.5Q1525.5-189.5 1543.25-224Q1561-258.5 1592.75-277.5Q1624.5-296.5 1666.5-296.5L1666.5-296.5Q1707.5-296.5 1739.25-277.75Q1771-259 1791-224.75Q1811-190.5 1815.5-143.5ZM1653.5-143.5L1653.5-143.5Q1653.5-127 1660.25-114.25Q1667-101.5 1679.25-94Q1691.5-86.5 1707.5-86.5L1707.5-86.5Q1724-86.5 1739.5-94Q1755-101.5 1766.75-114.25Q1778.5-127 1783-143.5L1783-143.5Q1778.5-160 1766.75-173Q1755-186 1739.5-193.5Q1724-201 1707.5-201L1707.5-201Q1691.5-201 1679.25-193.5Q1667-186 1660.25-173Q1653.5-160 1653.5-143.5ZM2061 0L1919.5 0L2049-159L2049-130.5L1927-287.5L2066-287.5L2136-199.5L2104-199.5L2173.5-287.5L2312-287.5L2184-129L2177-171.5L2319.5 0L2176 0L2101-93.5L2135-93.5L2061 0Z"/></svg></a>
 
-    <ul class="nav-links">
+    <ul class="nav-links" id="nav-links" role="list">
       <li><a href="https://zyntax.org/book/">The Zyn Book</a></li>
       <li><a href="#" class="nav-link-badge">Playground <span class="coming-soon">Soon</span></a></li>
       <li>
         <a href="https://github.com/darmie/zyntax" class="nav-cta" target="_blank" rel="noopener">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
           GitHub
         </a>
       </li>
     </ul>
 
-    <button class="nav-toggle" aria-label="Menu">
+    <button class="nav-toggle" aria-label="Menu" aria-expanded="false" aria-controls="nav-links">
       <span></span><span></span><span></span>
     </button>
   </nav>
+  </header>
 
   <!-- ── Hero Section ── -->
+  <main>
   <section class="hero">
     <div class="hero-content">
 
@@ -560,14 +600,14 @@
 
         <div class="hero-actions">
           <a href="https://zyntax.org/book/" class="btn btn-primary">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
               <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
             </svg>
             Read the Zyn Book
           </a>
           <a href="https://github.com/darmie/zyntax" class="btn btn-secondary" target="_blank" rel="noopener">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <polyline points="4 17 10 11 4 5"/>
               <line x1="12" y1="19" x2="20" y2="19"/>
             </svg>
@@ -580,28 +620,32 @@
           <code>cargo install zyntax</code>
         </div>
 
-        <div class="hero-features">
-          <div class="hero-feature">
-            <span class="hero-feature-label">Compilation</span>
+        <div class="hero-features" role="list" aria-label="Key features">
+          <div class="hero-feature" role="listitem">
+            <h2 class="hero-feature-label">Compilation</h2>
             <span class="hero-feature-value">3-Tier JIT</span>
           </div>
-          <div class="hero-feature">
-            <span class="hero-feature-label">Backends</span>
+          <div class="hero-feature" role="listitem">
+            <h2 class="hero-feature-label">Backends</h2>
             <span class="hero-feature-value">Cranelift + LLVM</span>
           </div>
-          <div class="hero-feature">
-            <span class="hero-feature-label">Type System</span>
+          <div class="hero-feature" role="listitem">
+            <h2 class="hero-feature-label">Type System</h2>
             <span class="hero-feature-value">Generics · Traits · Lifetimes</span>
           </div>
         </div>
       </div>
 
-      <div class="hero-visual">
+      <div class="hero-visual" aria-hidden="true">
         <div id="three-canvas"></div>
+        <noscript>
+          <p style="text-align:center;color:var(--text-muted);padding:2rem;">Interactive 3D visualization of a geodesic hex sphere.</p>
+        </noscript>
       </div>
 
     </div>
   </section>
+  </main>
 
   <!-- ── Three.js ── -->
   <script type="importmap">
@@ -617,8 +661,9 @@
     const navToggle = document.querySelector('.nav-toggle');
     const navLinks = document.querySelector('.nav-links');
     navToggle.addEventListener('click', () => {
-      navToggle.classList.toggle('open');
+      const isOpen = navToggle.classList.toggle('open');
       navLinks.classList.toggle('open');
+      navToggle.setAttribute('aria-expanded', isOpen);
     });
   </script>
 

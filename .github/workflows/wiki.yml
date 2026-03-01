@@ -94,6 +94,11 @@ jobs:
           # Copy website landing page and assets to site root
           cp website/index.html site/index.html
           cp website/og-image.png site/og-image.png
+          cp website/favicon.ico site/favicon.ico
+          cp website/favicon.png site/favicon.png
+          cp website/apple-touch-icon.png site/apple-touch-icon.png
+          cp website/icon-192x192.png site/icon-192x192.png
+          cp website/site.webmanifest site/site.webmanifest
           touch site/.nojekyll
           echo "zyntax.org" > site/CNAME
 
