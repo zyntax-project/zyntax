@@ -28,7 +28,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
+      - name: Run clippy (default features, no LLVM)
         run: cargo clippy --workspace --all-targets
 
   backend-feature-matrix:
