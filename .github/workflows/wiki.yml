@@ -91,8 +91,9 @@ jobs:
           export PATH="$HOME/.markflow:$PATH"
           mkdir -p site
 
-          # Copy website landing page to site root
+          # Copy website landing page and assets to site root
           cp website/index.html site/index.html
+          cp website/og-image.png site/og-image.png
           touch site/.nojekyll
           echo "zyntax.org" > site/CNAME
 
