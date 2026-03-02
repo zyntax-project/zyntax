@@ -756,14 +756,16 @@ impl TypedCfgBuilder {
                         TypedExpression::Call(call) => {
                             let is_range = match &call.callee.node {
                                 TypedExpression::Variable(name) => {
-                                    let mut arena =
-                                        zyntax_typed_ast::arena::AstArena::new();
+                                    let mut arena = zyntax_typed_ast::arena::AstArena::new();
                                     let range_sym = arena.intern_string("range");
                                     *name == range_sym
                                 }
                                 _ => false,
                             };
-                            if is_range && (call.positional_args.len() == 2 || call.positional_args.len() == 3) {
+                            if is_range
+                                && (call.positional_args.len() == 2
+                                    || call.positional_args.len() == 3)
+                            {
                                 Some(call.positional_args.clone())
                             } else {
                                 None

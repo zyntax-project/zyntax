@@ -2721,9 +2721,7 @@ impl SsaBuilder {
                     );
                     let call_inst = HirInstruction::Call {
                         result: Some(result),
-                        callee: crate::hir::HirCallable::Symbol(
-                            "$IO$string_concat".to_string(),
-                        ),
+                        callee: crate::hir::HirCallable::Symbol("$IO$string_concat".to_string()),
                         args: vec![left_val, right_val],
                         type_args: vec![],
                         const_args: vec![],
@@ -3039,10 +3037,13 @@ impl SsaBuilder {
                 // when the parser hasn't propagated it (expr.ty is Unit/Unknown/Any)
                 let result_type = {
                     let raw = self.convert_type(&expr.ty);
-                    if matches!(raw, HirType::Void) || matches!(&expr.ty, Type::Unknown | Type::Any) {
+                    if matches!(raw, HirType::Void) || matches!(&expr.ty, Type::Unknown | Type::Any)
+                    {
                         // Try to resolve from function_return_types
                         let from_table = callee_func_key.and_then(|fk| {
-                            self.function_return_types.get(&fk).map(|rt| self.convert_type(rt))
+                            self.function_return_types
+                                .get(&fk)
+                                .map(|rt| self.convert_type(rt))
                         });
                         if let Some(resolved) = from_table {
                             if resolved != HirType::Void {

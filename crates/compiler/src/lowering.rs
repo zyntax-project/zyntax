@@ -355,9 +355,7 @@ impl Default for LoweringConfig {
 }
 
 /// Re-export the proper diagnostic types from typed_ast
-pub use zyntax_typed_ast::diagnostics::{
-    Diagnostic as LoweringDiagnostic, DiagnosticLevel,
-};
+pub use zyntax_typed_ast::diagnostics::{Diagnostic as LoweringDiagnostic, DiagnosticLevel};
 
 /// Main AST lowering interface
 pub trait AstLowering {
@@ -441,7 +439,9 @@ impl LoweringContext {
             type_registry,
             arena,
             symbols,
-            diagnostics: std::cell::RefCell::new(zyntax_typed_ast::diagnostics::DiagnosticCollector::new()),
+            diagnostics: std::cell::RefCell::new(
+                zyntax_typed_ast::diagnostics::DiagnosticCollector::new(),
+            ),
             config,
             vtable_registry: crate::vtable_registry::VtableRegistry::new(),
             associated_type_resolver: crate::associated_type_resolver::AssociatedTypeResolver::new(
@@ -1617,9 +1617,7 @@ impl LoweringContext {
                     // infer Dynamic — the return type will be evaluated at runtime.
                     let effective_return_type = if matches!(
                         func.return_type,
-                        zyntax_typed_ast::Type::Primitive(
-                            zyntax_typed_ast::PrimitiveType::Unit
-                        )
+                        zyntax_typed_ast::Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)
                     ) {
                         let has_return_with_value = func.body.as_ref().map_or(false, |body| {
                             body.statements.iter().any(|stmt| {
@@ -2071,20 +2069,23 @@ impl LoweringContext {
             // Warn about untyped parameters — they will be treated as Dynamic.
             // Skip warnings for: main(), internal runtime functions ($-prefixed),
             // and stdlib IO functions that intentionally accept DynamicBox.
-            if matches!(
-                param.ty,
-                Type::Any | Type::Unknown | Type::Dynamic
-            ) {
+            if matches!(param.ty, Type::Any | Type::Unknown | Type::Dynamic) {
                 let param_name = param.name.resolve_global().unwrap_or_default();
                 let is_internal = func_name == "main"
                     || func_name.starts_with('$')
                     || func_name.starts_with("__")
                     || matches!(
                         func_name.as_str(),
-                        "println" | "print" | "eprintln" | "eprint"
-                            | "println_dynamic" | "print_dynamic"
-                            | "eprintln_dynamic" | "eprint_dynamic"
-                            | "format_dynamic" | "to_string"
+                        "println"
+                            | "print"
+                            | "eprintln"
+                            | "eprint"
+                            | "println_dynamic"
+                            | "print_dynamic"
+                            | "eprintln_dynamic"
+                            | "eprint_dynamic"
+                            | "format_dynamic"
+                            | "to_string"
                     );
                 if !is_internal {
                     self.emit_diagnostic(
@@ -2135,11 +2136,10 @@ impl LoweringContext {
                     ))
                     .with_code(zyntax_typed_ast::diagnostics::codes::W0002)
                     .with_help(format!(
-                        "consider adding a return type annotation to `{}`", func_name
+                        "consider adding a return type annotation to `{}`",
+                        func_name
                     ))
-                    .with_note(
-                        "the return type will be inferred dynamically at runtime"
-                    ),
+                    .with_note("the return type will be inferred dynamically at runtime"),
                 );
                 // Dynamic maps to I64 at the machine level
                 vec![HirType::I64]
@@ -2439,12 +2439,13 @@ impl LoweringContext {
                     let type_name = name.resolve_global().unwrap_or_default();
                     // Suppress warnings for generic type params (T, U, E, etc.)
                     // These are known false positives from stdlib generic types
-                    let is_generic_param = type_name.len() <= 2
-                        && type_name.chars().all(|c| c.is_ascii_uppercase());
+                    let is_generic_param =
+                        type_name.len() <= 2 && type_name.chars().all(|c| c.is_ascii_uppercase());
                     if !is_generic_param {
                         self.emit_diagnostic(
                             LoweringDiagnostic::warning(format!(
-                                "could not resolve type `{}`", type_name
+                                "could not resolve type `{}`",
+                                type_name
                             ))
                             .with_note("this type will be treated as a dynamically typed value"),
                         );
@@ -2581,7 +2582,8 @@ impl LoweringContext {
                         LoweringDiagnostic::error(format!(
                             "Global variable '{}' has non-constant initializer: {}",
                             var.name, e
-                        )).with_primary(init_expr.span, "non-constant expression"),
+                        ))
+                        .with_primary(init_expr.span, "non-constant expression"),
                     );
                     None
                 }
@@ -2642,8 +2644,10 @@ impl LoweringContext {
                     _ => {
                         self.emit_diagnostic(
                             LoweringDiagnostic::error(format!(
-                                "Invalid discriminant for enum variant '{}'", variant.name
-                            )).with_primary(variant.span, "invalid discriminant value"),
+                                "Invalid discriminant for enum variant '{}'",
+                                variant.name
+                            ))
+                            .with_primary(variant.span, "invalid discriminant value"),
                         );
                         variant_idx as u64
                     }
@@ -2716,8 +2720,10 @@ impl LoweringContext {
             // Type not found in registry - this shouldn't happen for well-typed programs
             self.emit_diagnostic(
                 LoweringDiagnostic::warning(format!(
-                    "Enum type '{}' not found in type registry", enum_decl.name
-                )).with_primary(enum_decl.span, "unknown enum type"),
+                    "Enum type '{}' not found in type registry",
+                    enum_decl.name
+                ))
+                .with_primary(enum_decl.span, "unknown enum type"),
             );
         }
 
@@ -3844,9 +3850,8 @@ impl LoweringContext {
                 Err(e) => {
                     // Log the error but don't fail - imports might be resolved externally
                     self.emit_diagnostic(
-                        LoweringDiagnostic::warning(format!(
-                            "Import resolution warning: {}", e
-                        )).with_primary(import.span, "failed to resolve import"),
+                        LoweringDiagnostic::warning(format!("Import resolution warning: {}", e))
+                            .with_primary(import.span, "failed to resolve import"),
                     );
                     Vec::new()
                 }
@@ -5029,11 +5034,10 @@ impl LoweringPipeline {
             let pass_name = pass.name();
 
             if context.config.debug_info {
-                context.emit_diagnostic(
-                    LoweringDiagnostic::new(DiagnosticLevel::Note, format!(
-                        "Running lowering pass: {}", pass_name
-                    )),
-                );
+                context.emit_diagnostic(LoweringDiagnostic::new(
+                    DiagnosticLevel::Note,
+                    format!("Running lowering pass: {}", pass_name),
+                ));
             }
 
             pass.run(context)?;
@@ -5206,24 +5210,20 @@ pub mod passes {
             // Validate parameter types
             for param in &func.signature.params {
                 if !Self::is_valid_hir_type(&param.ty) {
-                    context.emit_diagnostic(
-                        LoweringDiagnostic::error(format!(
-                            "Invalid parameter type in function {}: {:?}",
-                            func.name, param.ty
-                        )),
-                    );
+                    context.emit_diagnostic(LoweringDiagnostic::error(format!(
+                        "Invalid parameter type in function {}: {:?}",
+                        func.name, param.ty
+                    )));
                 }
             }
 
             // Validate return types
             for ret_ty in &func.signature.returns {
                 if !Self::is_valid_hir_type(ret_ty) {
-                    context.emit_diagnostic(
-                        LoweringDiagnostic::error(format!(
-                            "Invalid return type in function {}: {:?}",
-                            func.name, ret_ty
-                        )),
-                    );
+                    context.emit_diagnostic(LoweringDiagnostic::error(format!(
+                        "Invalid return type in function {}: {:?}",
+                        func.name, ret_ty
+                    )));
                 }
             }
 
