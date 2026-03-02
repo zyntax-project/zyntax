@@ -283,7 +283,7 @@ impl CraneliftBackend {
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
         flag_builder.set("opt_level", "speed").unwrap(); // Optimize for JIT speed
-        flag_builder.set("enable_verifier", "false").unwrap(); // TODO: Re-enable after fixing verifier issues with arrays
+        flag_builder.set("enable_verifier", "true").unwrap();
 
         let isa_builder = cranelift_native::builder().unwrap();
         let isa = isa_builder
