@@ -75,12 +75,17 @@ impl Default for RewriteBenefit {
 }
 
 // --- Concrete rewrite types for each AST node kind ---
+// Apply receives the matched node so transformations can read it directly.
 
 pub struct ExprRewrite {
     pub id: RewriteId,
     pub name: &'static str,
     pub pattern: Pattern<TypedExpression>,
-    pub apply: Arc<dyn Fn(Bindings, &mut TypedASTBuilder) -> RewriteOutput + Send + Sync>,
+    pub apply: Arc<
+        dyn Fn(&TypedNode<TypedExpression>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
+            + Send
+            + Sync,
+    >,
     pub priority: Priority,
     pub benefit: RewriteBenefit,
 }
@@ -89,7 +94,11 @@ pub struct StmtRewrite {
     pub id: RewriteId,
     pub name: &'static str,
     pub pattern: Pattern<TypedStatement>,
-    pub apply: Arc<dyn Fn(Bindings, &mut TypedASTBuilder) -> RewriteOutput + Send + Sync>,
+    pub apply: Arc<
+        dyn Fn(&TypedNode<TypedStatement>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
+            + Send
+            + Sync,
+    >,
     pub priority: Priority,
     pub benefit: RewriteBenefit,
 }
@@ -98,7 +107,11 @@ pub struct DeclRewrite {
     pub id: RewriteId,
     pub name: &'static str,
     pub pattern: Pattern<TypedDeclaration>,
-    pub apply: Arc<dyn Fn(Bindings, &mut TypedASTBuilder) -> RewriteOutput + Send + Sync>,
+    pub apply: Arc<
+        dyn Fn(&TypedNode<TypedDeclaration>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
+            + Send
+            + Sync,
+    >,
     pub priority: Priority,
     pub benefit: RewriteBenefit,
 }
@@ -108,7 +121,10 @@ impl ExprRewrite {
         name: &'static str,
         priority: Priority,
         pattern: Pattern<TypedExpression>,
-        apply: impl Fn(Bindings, &mut TypedASTBuilder) -> RewriteOutput + Send + Sync + 'static,
+        apply: impl Fn(&TypedNode<TypedExpression>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             id: RewriteId::fresh(),
@@ -131,7 +147,10 @@ impl StmtRewrite {
         name: &'static str,
         priority: Priority,
         pattern: Pattern<TypedStatement>,
-        apply: impl Fn(Bindings, &mut TypedASTBuilder) -> RewriteOutput + Send + Sync + 'static,
+        apply: impl Fn(&TypedNode<TypedStatement>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             id: RewriteId::fresh(),
@@ -154,7 +173,10 @@ impl DeclRewrite {
         name: &'static str,
         priority: Priority,
         pattern: Pattern<TypedDeclaration>,
-        apply: impl Fn(Bindings, &mut TypedASTBuilder) -> RewriteOutput + Send + Sync + 'static,
+        apply: impl Fn(&TypedNode<TypedDeclaration>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             id: RewriteId::fresh(),

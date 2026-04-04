@@ -54,7 +54,7 @@ pub fn walk_program(
         // Then try decl-level rewrites on this declaration
         for rw in decl_rewrites {
             if let Some(bindings) = rw.pattern.try_match(decl, ctx) {
-                let output = (rw.apply)(bindings, builder);
+                let output = (rw.apply)(decl, bindings, builder);
                 match output {
                     RewriteOutput::ReplaceDecl(new_decl) => {
                         *decl = new_decl;
@@ -212,7 +212,7 @@ fn walk_block(
         // Then try stmt-level rewrites
         for rw in stmt_rewrites {
             if let Some(bindings) = rw.pattern.try_match(stmt, ctx) {
-                let output = (rw.apply)(bindings, builder);
+                let output = (rw.apply)(stmt, bindings, builder);
                 let mut did_fire = false;
                 match output {
                     RewriteOutput::ReplaceStmt(new_stmt) => {
@@ -474,7 +474,7 @@ fn walk_expression(
     // Then try expr-level rewrites on this node
     for rw in expr_rewrites {
         if let Some(bindings) = rw.pattern.try_match(expr, ctx) {
-            let output = (rw.apply)(bindings, builder);
+            let output = (rw.apply)(expr, bindings, builder);
             match output {
                 RewriteOutput::ReplaceExpr(new_expr) => {
                     *expr = new_expr;

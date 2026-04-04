@@ -128,7 +128,7 @@ fn test_literal_rewrite_fires() {
         "replace_42_with_0",
         Priority::NORMALIZATION,
         pattern,
-        |_bindings, _builder| {
+        |_node, _bindings, _builder| {
             let replacement = TypedNode::new(
                 TypedExpression::Literal(TypedLiteral::Integer(0)),
                 Type::Primitive(PrimitiveType::I64),
@@ -167,7 +167,7 @@ fn test_rewrite_is_idempotent() {
         "replace_42_with_0",
         Priority::NORMALIZATION,
         pattern,
-        |_bindings, _builder| {
+        |_node, _bindings, _builder| {
             RewriteOutput::ReplaceExpr(TypedNode::new(
                 TypedExpression::Literal(TypedLiteral::Integer(0)),
                 Type::Primitive(PrimitiveType::I64),
@@ -204,7 +204,7 @@ fn test_fixpoint_chain() {
             matches!(&n.node, TypedExpression::Literal(TypedLiteral::Integer(42)))
                 .then(Bindings::new)
         }),
-        |_, _| {
+        |_, _, _| {
             RewriteOutput::ReplaceExpr(TypedNode::new(
                 TypedExpression::Literal(TypedLiteral::Integer(21)),
                 Type::Primitive(PrimitiveType::I64),
@@ -220,7 +220,7 @@ fn test_fixpoint_chain() {
             matches!(&n.node, TypedExpression::Literal(TypedLiteral::Integer(21)))
                 .then(Bindings::new)
         }),
-        |_, _| {
+        |_, _, _| {
             RewriteOutput::ReplaceExpr(TypedNode::new(
                 TypedExpression::Literal(TypedLiteral::Integer(10)),
                 Type::Primitive(PrimitiveType::I64),
@@ -258,7 +258,7 @@ fn test_target_guard() {
     })
     .for_target(LoweringTarget::Nvptx);
 
-    let rewrite = ExprRewrite::new("gpu_only_rewrite", Priority::TARGET, pattern, |_, _| {
+    let rewrite = ExprRewrite::new("gpu_only_rewrite", Priority::TARGET, pattern, |_, _, _| {
         RewriteOutput::ReplaceExpr(TypedNode::new(
             TypedExpression::Literal(TypedLiteral::Integer(0)),
             Type::Primitive(PrimitiveType::I64),

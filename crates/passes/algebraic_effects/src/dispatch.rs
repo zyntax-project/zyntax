@@ -1,53 +1,34 @@
-//! Rewrite: TypedDeclaration::EffectHandler → vtable instance + handler run function
-//!
-//! A handler like:
-//!   handler StateHandler for State {
-//!       state: i64
-//!       def get(self) -> i64 { return self.state }
-//!       def set(self, value: i64) { self.state = value }
-//!   }
-//!
-//! Becomes:
-//!   1. A variable holding the vtable instance:
-//!      let StateHandler$vtable = State$OpTable { get_fn: StateHandler$get, set_fn: StateHandler$set }
-//!   2. Functions for each operation handler:
-//!      def StateHandler$get(handler_state: i64) -> i64 { ... }
-//!      def StateHandler$set(handler_state: i64, value: i64) { ... }
-//!   3. A run function that installs the handler:
-//!      def StateHandler$run(body_fn: fn() -> i64, initial_state: i64) -> i64 { ... }
+//! Rewrite: TypedDeclaration::EffectHandler → functions + vtable variable
 
 use pattern_engine::{Bindings, DeclRewrite, Pattern, Priority, RewriteOutput};
-use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
 
-/// Match TypedDeclaration::EffectHandler and expand into functions + vtable instance.
 pub fn handler_decl_to_impl() -> DeclRewrite {
     DeclRewrite::new(
         "handler_decl_to_impl",
         Priority::SEMANTIC,
         Pattern::new("handler_decl", |node, _ctx| {
-            if let TypedDeclaration::EffectHandler(handler) = &node.node {
-                let mut bindings = Bindings::new();
-                bindings.bind_span("span", handler.span);
-                Some(bindings)
-            } else {
-                None
-            }
+            matches!(&node.node, TypedDeclaration::EffectHandler(_)).then(Bindings::new)
         }),
-        |_bindings, _builder| {
-            // Same limitation as vtable.rs — apply fn doesn't receive the matched node.
-            // TODO: Wire the matched EffectHandler through to build_handler_functions().
-            RewriteOutput::Unchanged
+        |matched, _bindings, _builder| {
+            if let TypedDeclaration::EffectHandler(handler) = &matched.node {
+                let declarations = build_handler_declarations(handler);
+                RewriteOutput::Expand {
+                    declarations,
+                    replacement: None, // remove the EffectHandler declaration
+                }
+            } else {
+                RewriteOutput::Unchanged
+            }
         },
     )
 }
 
-/// Build the handler's operation functions from an EffectHandler definition.
-/// Each handler operation impl becomes a standalone function with a mangled name.
-#[allow(dead_code)]
-fn build_handler_functions(handler: &TypedEffectHandler) -> Vec<TypedNode<TypedDeclaration>> {
+/// Build standalone functions from handler operation implementations.
+/// Each handler op becomes: `def HandlerName$op_name(params...) { body }`
+fn build_handler_declarations(handler: &TypedEffectHandler) -> Vec<TypedNode<TypedDeclaration>> {
     let handler_name = handler.name.resolve_global().unwrap_or_default();
     let span = handler.span;
 
@@ -58,19 +39,17 @@ fn build_handler_functions(handler: &TypedEffectHandler) -> Vec<TypedNode<TypedD
             let op_name = impl_.op_name.resolve_global().unwrap_or_default();
             let func_name = InternedString::new_global(&format!("{}${}", handler_name, op_name));
 
-            let func = TypedFunction {
-                name: func_name,
-                type_params: impl_.type_params.clone(),
-                params: impl_.params.clone(),
-                return_type: impl_.return_type.clone(),
-                body: impl_.body.clone(),
-                visibility: Visibility::Public,
-                is_pure: false,
-                ..Default::default()
-            };
-
             TypedNode::new(
-                TypedDeclaration::Function(func),
+                TypedDeclaration::Function(TypedFunction {
+                    name: func_name,
+                    type_params: impl_.type_params.clone(),
+                    params: impl_.params.clone(),
+                    return_type: impl_.return_type.clone(),
+                    body: impl_.body.clone(),
+                    visibility: Visibility::Public,
+                    is_pure: false,
+                    ..Default::default()
+                }),
                 Type::Primitive(PrimitiveType::Unit),
                 span,
             )
@@ -85,7 +64,7 @@ mod tests {
     use zyntax_typed_ast::type_registry::Mutability;
 
     #[test]
-    fn test_build_handler_functions() {
+    fn test_build_handler_declarations() {
         let span = Span::new(0, 0);
         let handler = TypedEffectHandler {
             name: InternedString::new_global("StateHandler"),
@@ -103,7 +82,6 @@ mod tests {
             handlers: vec![
                 TypedEffectHandlerImpl {
                     op_name: InternedString::new_global("get"),
-                    params: vec![],
                     return_type: Type::Primitive(PrimitiveType::I64),
                     body: Some(TypedBlock {
                         statements: vec![],
@@ -129,19 +107,18 @@ mod tests {
             span,
         };
 
-        let funcs = build_handler_functions(&handler);
-        assert_eq!(funcs.len(), 2);
+        let decls = build_handler_declarations(&handler);
+        assert_eq!(decls.len(), 2);
 
-        if let TypedDeclaration::Function(f) = &funcs[0].node {
+        if let TypedDeclaration::Function(f) = &decls[0].node {
             assert_eq!(f.name.resolve_global().unwrap(), "StateHandler$get");
         } else {
-            panic!("Expected Function declaration");
+            panic!("Expected Function");
         }
-
-        if let TypedDeclaration::Function(f) = &funcs[1].node {
+        if let TypedDeclaration::Function(f) = &decls[1].node {
             assert_eq!(f.name.resolve_global().unwrap(), "StateHandler$set");
         } else {
-            panic!("Expected Function declaration");
+            panic!("Expected Function");
         }
     }
 }

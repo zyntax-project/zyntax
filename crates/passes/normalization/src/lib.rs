@@ -1,18 +1,17 @@
 //! Normalization pass — structural cleanup rewrites that run first.
 //!
-//! Three rewrites:
+//! Two rewrites that produce real transformations:
 //! - `flatten_nested_blocks`: Block containing only another Block → hoist inner statements
-//! - `unit_return_explicit`: Function returning Unit without terminal Return → append Return(None)
-//! - `dead_let_elimination`: Let with zero uses and pure initializer → Delete
+//! - `unit_return_explicit`: Void function without terminal Return → append Return(None)
 
 use pattern_engine::{
     Bindings, DeclRewrite, Pattern, PatternEngine, PatternPass, Priority, RewriteOutput,
     StmtRewrite,
 };
+use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 use zyntax_typed_ast::typed_ast::*;
 
-/// The normalization pass.
 pub struct Pass;
 
 impl PatternPass for Pass {
@@ -21,27 +20,22 @@ impl PatternPass for Pass {
     }
 
     fn description(&self) -> &'static str {
-        "Structural cleanup: block flattening, explicit returns, dead let elimination"
+        "Structural cleanup: block flattening, explicit returns"
     }
 
     fn register(&self, engine: &mut PatternEngine) {
         engine.register_stmt_rewrite(flatten_nested_blocks());
         engine.register_decl_rewrite(unit_return_explicit());
-        engine.register_stmt_rewrite(dead_let_elimination());
     }
 }
 
 /// Block containing a single statement that is itself a Block → hoist inner statements.
-///
-/// Before: `{ { stmt1; stmt2; } }`
-/// After:  `{ stmt1; stmt2; }`
 fn flatten_nested_blocks() -> StmtRewrite {
     StmtRewrite::new(
         "flatten_nested_blocks",
         Priority::NORMALIZATION,
         Pattern::new("nested_block", |node, _ctx| {
             if let TypedStatement::Block(outer) = &node.node {
-                // A block with exactly one statement that is itself a block
                 if outer.statements.len() == 1 {
                     if let TypedStatement::Block(_) = &outer.statements[0].node {
                         return Some(Bindings::new());
@@ -50,79 +44,78 @@ fn flatten_nested_blocks() -> StmtRewrite {
             }
             None
         }),
-        |_bindings, _builder| {
-            // The rewrite needs access to the matched node to extract inner statements.
-            // Since Bindings doesn't carry the original node, we return Unchanged here
-            // and instead implement this as a direct AST mutation in a future iteration.
-            // For now, this pattern demonstrates the registration mechanism.
+        |matched, _bindings, _builder| {
+            if let TypedStatement::Block(outer) = &matched.node {
+                if let Some(inner_stmt) = outer.statements.first() {
+                    if let TypedStatement::Block(inner) = &inner_stmt.node {
+                        // Replace the outer block wrapping a single inner block
+                        // with just the inner block
+                        return RewriteOutput::ReplaceStmt(TypedNode::new(
+                            TypedStatement::Block(inner.clone()),
+                            matched.ty.clone(),
+                            matched.span,
+                        ));
+                    }
+                }
+            }
             RewriteOutput::Unchanged
         },
     )
 }
 
-/// Function returning Unit with no terminal Return statement → append Return(None).
-///
-/// This normalizes control flow so subsequent passes can assume every function
-/// body ends with an explicit Return.
+/// Function returning Unit with no terminal Return → append Return(None).
 fn unit_return_explicit() -> DeclRewrite {
     DeclRewrite::new(
         "unit_return_explicit",
         Priority::NORMALIZATION,
         Pattern::new("void_fn_no_return", |node, _ctx| {
             if let TypedDeclaration::Function(func) = &node.node {
-                // Only void functions (Unit return type)
                 if !matches!(func.return_type, Type::Primitive(PrimitiveType::Unit)) {
                     return None;
                 }
-                // Must have a body
                 let body = func.body.as_ref()?;
                 if body.statements.is_empty() {
+                    // Empty body — needs Return(None)
                     return Some(Bindings::new());
                 }
-                // Check if last statement is already a Return
                 let last = body.statements.last()?;
                 if matches!(&last.node, TypedStatement::Return(_)) {
-                    return None;
+                    return None; // already has return
                 }
                 Some(Bindings::new())
             } else {
                 None
             }
         }),
-        |_bindings, _builder| {
-            // We can't mutate the matched node through Bindings alone.
-            // Return Unchanged — in a real implementation, the walker would
-            // pass the matched node mutably to the apply function.
-            // This demonstrates the pattern matching + registration contract.
-            RewriteOutput::Unchanged
-        },
-    )
-}
+        |matched, _bindings, _builder| {
+            if let TypedDeclaration::Function(func) = &matched.node {
+                let mut new_func = func.clone();
+                let span = func.body.as_ref().map(|b| b.span).unwrap_or(matched.span);
 
-/// Let binding with no uses and a pure initializer → Delete.
-///
-/// A `let x = <pure_expr>` where `x` is never referenced can be removed.
-/// Without DFG analysis, we conservatively only match lets with literal initializers.
-fn dead_let_elimination() -> StmtRewrite {
-    StmtRewrite::new(
-        "dead_let_elimination",
-        Priority::NORMALIZATION,
-        Pattern::new("dead_let", |node, _ctx| {
-            if let TypedStatement::Let(let_stmt) = &node.node {
-                // Conservative: only match lets with literal initializers (definitely pure)
-                if let Some(init) = &let_stmt.initializer {
-                    if matches!(&init.node, TypedExpression::Literal(_)) {
-                        // TODO: Check AnalysisContext DFG for zero uses of this variable.
-                        // For now, skip — we don't want to delete lets that are actually used.
-                        // This pattern is registered to exercise the engine but won't fire
-                        // until DFG integration is wired.
-                        return None;
-                    }
+                let return_stmt = TypedNode::new(
+                    TypedStatement::Return(None),
+                    Type::Primitive(PrimitiveType::Unit),
+                    span,
+                );
+
+                if let Some(body) = &mut new_func.body {
+                    body.statements.push(return_stmt);
+                } else {
+                    new_func.body = Some(TypedBlock {
+                        statements: vec![return_stmt],
+                        span,
+                    });
                 }
+
+                RewriteOutput::ReplaceDecl(TypedNode::new(
+                    TypedDeclaration::Function(new_func),
+                    matched.ty.clone(),
+                    matched.span,
+                ))
+            } else {
+                RewriteOutput::Unchanged
             }
-            None
-        }),
-        |_bindings, _builder| RewriteOutput::Delete,
+        },
     )
 }
 
@@ -130,81 +123,168 @@ fn dead_let_elimination() -> StmtRewrite {
 mod tests {
     use super::*;
     use pattern_engine::{EngineConfig, PatternEngine};
-    use zyntax_typed_ast::source::Span;
+    use zyntax_typed_ast::InternedString;
 
-    #[test]
-    fn test_pass_registers() {
-        let mut engine = PatternEngine::new(EngineConfig::default());
-        engine.register_pass(Pass);
-        engine.finalize().unwrap();
-        // No panic = pass registered successfully
+    fn span() -> Span {
+        Span::new(0, 0)
     }
 
     #[test]
-    fn test_unit_return_pattern_matches() {
-        let span = Span::new(0, 0);
+    fn test_flatten_nested_blocks() {
+        let s = span();
+        let inner_stmt = TypedNode::new(
+            TypedStatement::Expression(Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(1)),
+                Type::Primitive(PrimitiveType::I64),
+                s,
+            ))),
+            Type::Primitive(PrimitiveType::Unit),
+            s,
+        );
+        let inner_block = TypedNode::new(
+            TypedStatement::Block(TypedBlock {
+                statements: vec![inner_stmt],
+                span: s,
+            }),
+            Type::Primitive(PrimitiveType::Unit),
+            s,
+        );
+        let outer_block = TypedNode::new(
+            TypedStatement::Block(TypedBlock {
+                statements: vec![inner_block],
+                span: s,
+            }),
+            Type::Primitive(PrimitiveType::Unit),
+            s,
+        );
 
-        // A void function with no Return at the end
+        // Wrap in a function so the engine can walk it
         let func = TypedFunction {
-            name: zyntax_typed_ast::InternedString::new_global("foo"),
+            name: InternedString::new_global("test"),
+            return_type: Type::Primitive(PrimitiveType::Unit),
+            body: Some(TypedBlock {
+                statements: vec![outer_block],
+                span: s,
+            }),
+            ..Default::default()
+        };
+        let mut program = TypedProgram {
+            declarations: vec![TypedNode::new(
+                TypedDeclaration::Function(func),
+                Type::Primitive(PrimitiveType::Unit),
+                s,
+            )],
+            ..Default::default()
+        };
+
+        let registry = zyntax_typed_ast::TypeRegistry::new();
+        let mut engine = PatternEngine::new(EngineConfig::default());
+        engine.register_pass(Pass);
+        engine.finalize().unwrap();
+
+        let result = engine.run(&mut program, &registry);
+        assert!(result.changed);
+
+        // The nested block should be flattened AND unit_return_explicit fires
+        assert!(result.rewrites_fired.len() >= 1);
+    }
+
+    #[test]
+    fn test_unit_return_explicit() {
+        let s = span();
+        let expr_stmt = TypedNode::new(
+            TypedStatement::Expression(Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(42)),
+                Type::Primitive(PrimitiveType::I64),
+                s,
+            ))),
+            Type::Primitive(PrimitiveType::Unit),
+            s,
+        );
+
+        let func = TypedFunction {
+            name: InternedString::new_global("foo"),
+            return_type: Type::Primitive(PrimitiveType::Unit),
+            body: Some(TypedBlock {
+                statements: vec![expr_stmt],
+                span: s,
+            }),
+            ..Default::default()
+        };
+        let mut program = TypedProgram {
+            declarations: vec![TypedNode::new(
+                TypedDeclaration::Function(func),
+                Type::Primitive(PrimitiveType::Unit),
+                s,
+            )],
+            ..Default::default()
+        };
+
+        let registry = zyntax_typed_ast::TypeRegistry::new();
+        let mut engine = PatternEngine::new(EngineConfig::default());
+        engine.register_pass(Pass);
+        engine.finalize().unwrap();
+
+        let result = engine.run(&mut program, &registry);
+        assert!(result.changed);
+
+        // Verify the function now ends with Return(None)
+        if let TypedDeclaration::Function(func) = &program.declarations[0].node {
+            let body = func.body.as_ref().unwrap();
+            let last = body.statements.last().unwrap();
+            assert!(
+                matches!(&last.node, TypedStatement::Return(None)),
+                "Expected Return(None) at end, got {:?}",
+                last.node
+            );
+        } else {
+            panic!("Expected Function declaration");
+        }
+    }
+
+    #[test]
+    fn test_idempotent() {
+        let s = span();
+        let func = TypedFunction {
+            name: InternedString::new_global("bar"),
             return_type: Type::Primitive(PrimitiveType::Unit),
             body: Some(TypedBlock {
                 statements: vec![TypedNode::new(
                     TypedStatement::Expression(Box::new(TypedNode::new(
                         TypedExpression::Literal(TypedLiteral::Integer(1)),
                         Type::Primitive(PrimitiveType::I64),
-                        span,
+                        s,
                     ))),
                     Type::Primitive(PrimitiveType::Unit),
-                    span,
+                    s,
                 )],
-                span,
+                span: s,
             }),
             ..Default::default()
         };
-
-        let decl_node = TypedNode::new(
-            TypedDeclaration::Function(func),
-            Type::Primitive(PrimitiveType::Unit),
-            span,
-        );
-
-        let pattern = Pattern::<TypedDeclaration>::new("void_fn_no_return", |node, _ctx| {
-            if let TypedDeclaration::Function(func) = &node.node {
-                if !matches!(func.return_type, Type::Primitive(PrimitiveType::Unit)) {
-                    return None;
-                }
-                let body = func.body.as_ref()?;
-                let last = body.statements.last()?;
-                if matches!(&last.node, TypedStatement::Return(_)) {
-                    return None;
-                }
-                Some(Bindings::new())
-            } else {
-                None
-            }
-        });
-
-        // Build a minimal MatchContext
-        let registry = zyntax_typed_ast::TypeRegistry::new();
-        let analysis = zyntax_typed_ast::advanced_analysis::AnalysisContext::new();
-        let effects = zyntax_typed_ast::effect_system::EffectSystem::new();
-        let metadata = pattern_engine::MetadataTable::new();
-        let fired = pattern_engine::FiredSet::new();
-
-        let ctx = pattern_engine::MatchContext {
-            registry: &registry,
-            analysis: &analysis,
-            effects: &effects,
-            target: pattern_engine::LoweringTarget::Cpu,
-            metadata: &metadata,
-            fired: &fired,
+        let mut program = TypedProgram {
+            declarations: vec![TypedNode::new(
+                TypedDeclaration::Function(func),
+                Type::Primitive(PrimitiveType::Unit),
+                s,
+            )],
+            ..Default::default()
         };
 
-        let result = pattern.try_match(&decl_node, &ctx);
-        assert!(
-            result.is_some(),
-            "Pattern should match void function without terminal Return"
-        );
+        let registry = zyntax_typed_ast::TypeRegistry::new();
+
+        // First run
+        let mut engine = PatternEngine::new(EngineConfig::default());
+        engine.register_pass(Pass);
+        engine.finalize().unwrap();
+        let r1 = engine.run(&mut program, &registry);
+        assert!(r1.changed);
+
+        // Second run — should be no-op
+        let mut engine2 = PatternEngine::new(EngineConfig::default());
+        engine2.register_pass(Pass);
+        engine2.finalize().unwrap();
+        let r2 = engine2.run(&mut program, &registry);
+        assert!(!r2.changed, "Normalization should be idempotent");
     }
 }
