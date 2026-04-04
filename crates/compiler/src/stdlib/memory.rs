@@ -281,7 +281,7 @@ mod tests {
         let malloc_func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("malloc"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("malloc"))
             .expect("malloc function should exist");
 
         // Should be external
@@ -308,7 +308,7 @@ mod tests {
         let allocate_func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("allocate"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("allocate"))
             .expect("allocate function should exist");
 
         // Should have 6 blocks: entry, call_malloc, check_null, success, failure, plus extras from malloc call

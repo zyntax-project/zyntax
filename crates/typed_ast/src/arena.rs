@@ -194,15 +194,9 @@ impl AstArena {
     /// Resolve an interned string back to its value
     ///
     /// Since `intern_string` returns symbols from the global interner,
-    /// we must resolve via global interner. The string is leaked to provide
-    /// a stable &str reference (acceptable since interned strings are never freed).
-    pub fn resolve_string(&self, interned: InternedString) -> Option<&str> {
-        // Always use global interner since intern_string returns global symbols
-        interned.resolve_global().map(|s| {
-            // Leak the string to provide stable &str lifetime
-            // This is safe because interned strings live for the program duration
-            Box::leak(s.into_boxed_str()) as &str
-        })
+    /// we must resolve via global interner.
+    pub fn resolve_string(&self, interned: InternedString) -> Option<String> {
+        interned.resolve_global()
     }
 
     /// Get statistics about arena usage
@@ -405,8 +399,8 @@ mod tests {
         assert_ne!(str1, str3);
 
         // Should be able to resolve back
-        assert_eq!(arena.resolve_string(str1), Some("hello"));
-        assert_eq!(arena.resolve_string(str3), Some("world"));
+        assert_eq!(arena.resolve_string(str1).as_deref(), Some("hello"));
+        assert_eq!(arena.resolve_string(str3).as_deref(), Some("world"));
     }
 
     #[test]
@@ -451,7 +445,7 @@ mod tests {
         // The symbol from arena1 should still resolve correctly via global interner
         let resolved = arena2.resolve_string(std_symbol);
         assert_eq!(
-            resolved,
+            resolved.as_deref(),
             Some("std"),
             "Cross-arena resolution should work via global interner"
         );
@@ -466,8 +460,8 @@ mod tests {
             let mut arena = AstArena::new();
             let hash_fn = arena.intern_string("hash_fn");
             let eq_fn = arena.intern_string("eq_fn");
-            assert_eq!(arena.resolve_string(hash_fn), Some("hash_fn"));
-            assert_eq!(arena.resolve_string(eq_fn), Some("eq_fn"));
+            assert_eq!(arena.resolve_string(hash_fn).as_deref(), Some("hash_fn"));
+            assert_eq!(arena.resolve_string(eq_fn).as_deref(), Some("eq_fn"));
         }
 
         // Test 2: builds memory functions
@@ -475,8 +469,8 @@ mod tests {
             let mut arena = AstArena::new();
             let malloc = arena.intern_string("malloc");
             let free = arena.intern_string("free");
-            assert_eq!(arena.resolve_string(malloc), Some("malloc"));
-            assert_eq!(arena.resolve_string(free), Some("free"));
+            assert_eq!(arena.resolve_string(malloc).as_deref(), Some("malloc"));
+            assert_eq!(arena.resolve_string(free).as_deref(), Some("free"));
         }
 
         // Test 3: builds full stdlib with module name "std"
@@ -485,7 +479,7 @@ mod tests {
             let std_name = arena.intern_string("std");
             // The symbol should resolve correctly even though global interner
             // already has many other strings from previous "tests"
-            assert_eq!(arena.resolve_string(std_name), Some("std"));
+            assert_eq!(arena.resolve_string(std_name).as_deref(), Some("std"));
         }
     }
 }

@@ -480,6 +480,9 @@ impl ConstraintSolver {
 
     /// Solve all constraints
     pub fn solve(&mut self) -> Result<Substitution, Vec<SolverError>> {
+        // Clear errors from any previous solve() call to avoid accumulation
+        self.errors.clear();
+
         let mut work_list = VecDeque::from(self.constraints.clone());
         let mut iteration_count = 0;
         const MAX_ITERATIONS: usize = 1000; // Prevent infinite loops
@@ -513,11 +516,13 @@ impl ConstraintSolver {
                 }
                 ConstraintResult::Deferred => {
                     // Constraint deferred, add back to end of work list for later retry
-                    // Only defer a limited number of times to prevent infinite loops
                     if iteration_count < MAX_ITERATIONS / 2 {
                         work_list.push_back(constraint);
+                    } else {
+                        // Report unsolved deferred constraints as errors
+                        self.errors
+                            .push(SolverError::UnsolvableConstraint(constraint));
                     }
-                    // If we've hit the defer limit, just skip the constraint
                 }
             }
         }

@@ -284,7 +284,7 @@ mod tests {
         let unwrap_func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("option_unwrap"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("option_unwrap"))
             .expect("unwrap function should exist");
 
         // Should have 4 blocks: entry, some_case, none_case, and panic block

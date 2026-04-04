@@ -1031,7 +1031,10 @@ fn test_print_constructed_typed_ast() {
                 println!("Declaration [{}]:", i);
                 if let TypedDeclaration::Function(func) = &decl.node {
                     let func_name = builder.arena().resolve_string(func.name);
-                    println!("  Function: {}", func_name.unwrap_or("<unknown>"));
+                    println!(
+                        "  Function: {}",
+                        func_name.as_deref().unwrap_or("<unknown>")
+                    );
                     println!("  Return type: {:?}", func.return_type);
 
                     if let Some(ref body) = func.body {
@@ -1044,7 +1047,7 @@ fn test_print_constructed_typed_ast() {
                                     let var_name = builder.arena().resolve_string(let_stmt.name);
                                     println!(
                                         "Let {} : {:?}",
-                                        var_name.unwrap_or("<unknown>"),
+                                        var_name.as_deref().unwrap_or("<unknown>"),
                                         let_stmt.ty
                                     );
                                 }
@@ -1056,7 +1059,7 @@ fn test_print_constructed_typed_ast() {
                                             let name = builder.arena().resolve_string(*callee_name);
                                             println!(
                                                 "Call {}(...) [{} args]",
-                                                name.unwrap_or("<unknown>"),
+                                                name.as_deref().unwrap_or("<unknown>"),
                                                 call.positional_args.len()
                                             );
                                         } else {
@@ -1115,7 +1118,7 @@ fn test_statement_produces_typed_ast_nodes() {
             ParseResult::Success(ParsedValue::Statement(stmt), _) => match &stmt.node {
                 TypedStatement::Let(let_stmt) => {
                     let name = builder.arena().resolve_string(let_stmt.name);
-                    assert_eq!(name, Some("img"));
+                    assert_eq!(name.as_deref(), Some("img"));
                     assert!(let_stmt.initializer.is_some());
                 }
                 _ => panic!("Expected Let statement"),
@@ -1140,7 +1143,7 @@ fn test_statement_produces_typed_ast_nodes() {
                                 // The callee should be a Variable referencing "println"
                                 if let TypedExpression::Variable(callee_name) = &call.callee.node {
                                     let name = builder.arena().resolve_string(*callee_name);
-                                    assert_eq!(name, Some("println"));
+                                    assert_eq!(name.as_deref(), Some("println"));
                                 }
                                 // Should have 1 argument (the string literal)
                                 assert_eq!(call.positional_args.len(), 1);

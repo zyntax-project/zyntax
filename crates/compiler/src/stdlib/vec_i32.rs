@@ -610,14 +610,14 @@ mod tests {
             let found = module
                 .functions
                 .values()
-                .any(|f| arena.resolve_string(f.name) == Some(func_name));
+                .any(|f| arena.resolve_string(f.name).as_deref() == Some(func_name));
             assert!(found, "Function {} not found", func_name);
 
             // Verify it's NOT generic (no type params)
             let func = module
                 .functions
                 .values()
-                .find(|f| arena.resolve_string(f.name) == Some(func_name))
+                .find(|f| arena.resolve_string(f.name).as_deref() == Some(func_name))
                 .unwrap();
             assert!(
                 func.signature.type_params.is_empty(),

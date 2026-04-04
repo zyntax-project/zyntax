@@ -85,6 +85,6 @@ mod tests {
         assert!(!stdlib.functions.is_empty());
 
         // Module should be named "std"
-        assert_eq!(arena.resolve_string(stdlib.name), Some("std"));
+        assert_eq!(arena.resolve_string(stdlib.name).as_deref(), Some("std"));
     }
 }

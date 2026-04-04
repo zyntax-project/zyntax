@@ -5112,7 +5112,7 @@ impl SsaBuilder {
                                 .unwrap()
                                 .resolve_string(*impl_name)
                                 .map(|n| {
-                                    let n = n.strip_prefix('$').unwrap_or(n);
+                                    let n = n.strip_prefix('$').unwrap_or(&n);
                                     n == base_type_name
                                 })
                                 .unwrap_or(false),
@@ -5242,7 +5242,7 @@ impl SsaBuilder {
                                 .unwrap()
                                 .resolve_string(*impl_name)
                                 .map(|n| {
-                                    let n = n.strip_prefix('$').unwrap_or(n);
+                                    let n = n.strip_prefix('$').unwrap_or(&n);
                                     n == tn.as_str()
                                 })
                                 .unwrap_or(false)
@@ -5303,8 +5303,7 @@ impl SsaBuilder {
         let arena = self.arena.lock().unwrap();
         let method_name_str = arena
             .resolve_string(method_name)
-            .unwrap_or("unknown")
-            .to_string();
+            .unwrap_or_else(|| "unknown".to_string());
         drop(arena);
 
         Err(crate::CompilerError::Analysis(format!(

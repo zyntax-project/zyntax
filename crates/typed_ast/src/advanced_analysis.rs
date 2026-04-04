@@ -253,82 +253,173 @@ impl DataFlowGraph {
         self.edges.entry(from).or_default().push(edge);
     }
 
-    /// Compute dominance frontiers for SSA construction
+    /// Compute dominance frontiers for SSA construction using a precomputed
+    /// dominator tree (Cooper, Harvey, Kennedy iterative algorithm).
     pub fn compute_dominance_frontiers(&mut self) {
-        // Implementation of dominance frontier algorithm
-        // This is a simplified version - full implementation would use
-        // Lengauer-Tarjan algorithm for efficiency
+        let idom = self.compute_dominator_tree();
 
-        for &node_id in self.nodes.keys() {
-            let mut frontier = HashSet::new();
+        // Build dominance frontiers from the dominator tree.
+        // DF(n) = { y | ∃ pred(y) dominated by n, but y not strictly dominated by n }
+        let mut frontiers: HashMap<AnalysisNodeId, HashSet<AnalysisNodeId>> =
+            self.nodes.keys().map(|&id| (id, HashSet::new())).collect();
 
-            // Find all nodes that this node dominates
-            for &other_id in self.nodes.keys() {
-                if node_id != other_id && self.dominates(node_id, other_id) {
-                    // Check if there's a successor not dominated by node_id
-                    if let Some(edges) = self.edges.get(&other_id) {
-                        for edge in edges {
-                            if !self.dominates(node_id, edge.target) {
-                                frontier.insert(edge.target);
+        // Collect predecessors: for each node, who has an edge to it?
+        let mut predecessors: HashMap<AnalysisNodeId, Vec<AnalysisNodeId>> = HashMap::new();
+        for (&from, edges) in &self.edges {
+            for edge in edges {
+                predecessors.entry(edge.target).or_default().push(from);
+            }
+        }
+
+        for &node in self.nodes.keys() {
+            if let Some(preds) = predecessors.get(&node) {
+                if preds.len() >= 2 {
+                    for &pred in preds {
+                        let mut runner = pred;
+                        while Some(&runner) != idom.get(&node) {
+                            frontiers.entry(runner).or_default().insert(node);
+                            if let Some(&next) = idom.get(&runner) {
+                                runner = next;
+                            } else {
+                                break;
                             }
                         }
                     }
                 }
             }
-
-            self.dominance_frontiers.insert(node_id, frontier);
         }
+
+        self.dominance_frontiers = frontiers;
     }
 
-    /// Check if node 'a' dominates node 'b'
-    fn dominates(&self, a: AnalysisNodeId, b: AnalysisNodeId) -> bool {
-        // Simplified dominance check
-        // In practice, this would use pre-computed dominance trees
-        if a == b {
-            return true;
-        }
+    /// Compute immediate dominators using the iterative algorithm
+    /// (Cooper, Harvey, Kennedy — "A Simple, Fast Dominance Algorithm").
+    /// Returns a map from node → immediate dominator.
+    fn compute_dominator_tree(&self) -> HashMap<AnalysisNodeId, AnalysisNodeId> {
+        // Assign reverse-postorder numbers
+        let entry = match self.entry_points.first() {
+            Some(&e) => e,
+            None => return HashMap::new(),
+        };
 
-        // For now, just check if 'a' is reachable from all entry points to 'b'
-        self.entry_points
-            .iter()
-            .all(|&entry| self.path_exists_through(entry, b, a))
-    }
-
-    fn path_exists_through(
-        &self,
-        start: AnalysisNodeId,
-        end: AnalysisNodeId,
-        through: AnalysisNodeId,
-    ) -> bool {
-        if start == end {
-            return start == through;
-        }
-
+        // BFS to get reverse-postorder numbering
+        let mut rpo: Vec<AnalysisNodeId> = Vec::new();
         let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
+        self.rpo_dfs(entry, &mut visited, &mut rpo);
+        rpo.reverse();
 
-        while let Some(current) = queue.pop_front() {
-            if !visited.insert(current) {
-                continue;
+        let rpo_num: HashMap<AnalysisNodeId, usize> =
+            rpo.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+        // Collect predecessors
+        let mut predecessors: HashMap<AnalysisNodeId, Vec<AnalysisNodeId>> = HashMap::new();
+        for (&from, edges) in &self.edges {
+            for edge in edges {
+                predecessors.entry(edge.target).or_default().push(from);
             }
+        }
 
-            if current == end {
-                return true;
+        // Initialize: idom(entry) = entry, rest undefined
+        let mut idom: HashMap<AnalysisNodeId, AnalysisNodeId> = HashMap::new();
+        idom.insert(entry, entry);
+
+        let intersect = |mut a: AnalysisNodeId,
+                         mut b: AnalysisNodeId,
+                         idom: &HashMap<AnalysisNodeId, AnalysisNodeId>,
+                         rpo_num: &HashMap<AnalysisNodeId, usize>|
+         -> AnalysisNodeId {
+            while a != b {
+                while rpo_num.get(&a).copied().unwrap_or(usize::MAX)
+                    > rpo_num.get(&b).copied().unwrap_or(usize::MAX)
+                {
+                    a = *idom.get(&a).unwrap_or(&a);
+                }
+                while rpo_num.get(&b).copied().unwrap_or(usize::MAX)
+                    > rpo_num.get(&a).copied().unwrap_or(usize::MAX)
+                {
+                    b = *idom.get(&b).unwrap_or(&b);
+                }
             }
+            a
+        };
 
-            if current != through && current != start {
-                continue; // Must go through 'through' node
-            }
+        // Iterate until stable
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &node in &rpo {
+                if node == entry {
+                    continue;
+                }
+                let preds = match predecessors.get(&node) {
+                    Some(p) => p,
+                    None => continue,
+                };
 
-            if let Some(edges) = self.edges.get(&current) {
-                for edge in edges {
-                    queue.push_back(edge.target);
+                // Find first processed predecessor
+                let mut new_idom = None;
+                for &pred in preds {
+                    if idom.contains_key(&pred) {
+                        new_idom = Some(pred);
+                        break;
+                    }
+                }
+                let mut new_idom = match new_idom {
+                    Some(n) => n,
+                    None => continue,
+                };
+
+                // Intersect with remaining processed predecessors
+                for &pred in preds {
+                    if pred != new_idom && idom.contains_key(&pred) {
+                        new_idom = intersect(pred, new_idom, &idom, &rpo_num);
+                    }
+                }
+
+                if idom.get(&node) != Some(&new_idom) {
+                    idom.insert(node, new_idom);
+                    changed = true;
                 }
             }
         }
 
-        false
+        idom
+    }
+
+    /// Depth-first traversal for reverse-postorder numbering
+    fn rpo_dfs(
+        &self,
+        node: AnalysisNodeId,
+        visited: &mut HashSet<AnalysisNodeId>,
+        rpo: &mut Vec<AnalysisNodeId>,
+    ) {
+        if !visited.insert(node) {
+            return;
+        }
+        if let Some(edges) = self.edges.get(&node) {
+            for edge in edges {
+                self.rpo_dfs(edge.target, visited, rpo);
+            }
+        }
+        rpo.push(node);
+    }
+
+    /// Check if node 'a' dominates node 'b' using the precomputed dominator tree
+    fn dominates_with_idom(
+        idom: &HashMap<AnalysisNodeId, AnalysisNodeId>,
+        a: AnalysisNodeId,
+        b: AnalysisNodeId,
+    ) -> bool {
+        let mut current = b;
+        loop {
+            if current == a {
+                return true;
+            }
+            match idom.get(&current) {
+                Some(&parent) if parent != current => current = parent,
+                _ => return false,
+            }
+        }
     }
 
     /// Convert to SSA form
@@ -337,14 +428,15 @@ impl DataFlowGraph {
 
         // Insert phi nodes at dominance frontiers
         let mut phi_nodes = HashMap::new();
+        // Use a counter starting beyond all existing node IDs to guarantee uniqueness
+        let mut next_phi_id = self.nodes.keys().map(|id| id.0).max().unwrap_or(0) + 1;
 
         for (&node_id, frontier) in &self.dominance_frontiers {
             if let Some(node) = self.nodes.get(&node_id) {
                 for &var in &node.defines {
                     for &frontier_node in frontier {
-                        // Insert phi node for this variable
-                        let phi_id =
-                            AnalysisNodeId::new(self.nodes.len() as u32 + phi_nodes.len() as u32);
+                        let phi_id = AnalysisNodeId::new(next_phi_id);
+                        next_phi_id += 1;
                         let phi = DFGNode {
                             id: phi_id,
                             kind: DFGNodeKind::Phi { inputs: Vec::new() },

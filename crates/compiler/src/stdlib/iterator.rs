@@ -465,7 +465,7 @@ mod tests {
         let for_each_func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("vec_for_each"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("vec_for_each"))
             .expect("vec_for_each should exist");
 
         assert!(
@@ -487,7 +487,7 @@ mod tests {
         let func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("vec_for_each"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("vec_for_each"))
             .expect("vec_for_each function should exist");
 
         // Should have 4 blocks: entry, loop_header, loop_body, loop_exit
@@ -524,7 +524,7 @@ mod tests {
         let func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("vec_map"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("vec_map"))
             .expect("vec_map function should exist");
 
         // Should have 4 blocks: entry, loop_header, loop_body, loop_exit
@@ -556,7 +556,7 @@ mod tests {
         let func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("vec_filter"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("vec_filter"))
             .expect("vec_filter function should exist");
 
         // Should have 7 blocks: entry, loop_header, loop_body, check_pred, copy_elem, skip_elem, loop_exit
@@ -585,7 +585,7 @@ mod tests {
         let func = module
             .functions
             .values()
-            .find(|f| arena.resolve_string(f.name) == Some("vec_fold"))
+            .find(|f| arena.resolve_string(f.name).as_deref() == Some("vec_fold"))
             .expect("vec_fold function should exist");
 
         // Should have 4 blocks: entry, loop_header, loop_body, loop_exit

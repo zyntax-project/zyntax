@@ -1496,31 +1496,24 @@ impl TypeChecker {
         if let TypedExpression::Variable(var_name) = &call.callee.node {
             let name_str = var_name.resolve_global().unwrap_or_default();
             if let Some((type_name_str, suffix_part)) = name_str.split_once("::from_") {
-                // This looks like a suffix constructor call
-                // Check all types in the registry to find if any abstract type matches this name
+                // This looks like a suffix constructor call (e.g., Duration::from_ms)
                 let registry = self.constraint_solver.type_registry();
+                let type_name_interned = InternedString::new_global(type_name_str);
 
-                for type_def in registry.get_all_types() {
-                    // Check if this type's name matches
-                    let type_name_resolved = type_def.name.resolve_global().unwrap_or_default();
-                    if type_name_resolved == type_name_str {
-                        // Found the type, check if it's abstract with suffixes
-                        if let crate::type_registry::TypeKind::Abstract { suffixes, .. } =
-                            &type_def.kind
-                        {
-                            // Check if this suffix is registered for this abstract type
-                            if !suffixes.contains(&suffix_part.to_string()) {
-                                return Err(TypeError::MissingSuffixFunction {
-                                    type_name: type_name_str.to_string(),
-                                    suffix: suffix_part.to_string(),
-                                    available_suffixes: suffixes.clone(),
-                                    span: call.callee.span,
-                                });
-                            }
-                            // If suffix is valid but the from_{suffix} function isn't implemented,
-                            // that will be caught when we try to resolve the variable below
+                if let Some(type_def) = registry.get_type_by_name(type_name_interned) {
+                    // Found the type, check if it's abstract with suffixes
+                    if let crate::type_registry::TypeKind::Abstract { suffixes, .. } =
+                        &type_def.kind
+                    {
+                        // Check if this suffix is registered for this abstract type
+                        if !suffixes.contains(&suffix_part.to_string()) {
+                            return Err(TypeError::MissingSuffixFunction {
+                                type_name: type_name_str.to_string(),
+                                suffix: suffix_part.to_string(),
+                                available_suffixes: suffixes.clone(),
+                                span: call.callee.span,
+                            });
                         }
-                        break;
                     }
                 }
             }

@@ -1712,7 +1712,7 @@ mod tests {
         let (_, hashmap_new) = module
             .functions
             .iter()
-            .find(|(_, f)| arena.resolve_string(f.name) == Some("hashmap_new"))
+            .find(|(_, f)| arena.resolve_string(f.name).as_deref() == Some("hashmap_new"))
             .expect("hashmap_new not found");
 
         // Should be generic with 2 type params (K, V)
@@ -1743,7 +1743,7 @@ mod tests {
         let (_, hashmap_insert) = module
             .functions
             .iter()
-            .find(|(_, f)| arena.resolve_string(f.name) == Some("hashmap_insert"))
+            .find(|(_, f)| arena.resolve_string(f.name).as_deref() == Some("hashmap_insert"))
             .expect("hashmap_insert not found");
 
         // Should be generic with 2 type params
@@ -1770,7 +1770,7 @@ mod tests {
         let (_, hashmap_get) = module
             .functions
             .iter()
-            .find(|(_, f)| arena.resolve_string(f.name) == Some("hashmap_get"))
+            .find(|(_, f)| arena.resolve_string(f.name).as_deref() == Some("hashmap_get"))
             .expect("hashmap_get not found");
 
         // Should be generic with 2 type params
