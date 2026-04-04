@@ -8,6 +8,8 @@ description = "Layered compilation system for Zyntax language"
 [dependencies]
 # Parser dependency
 zyntax_typed_ast = { path = "../typed_ast", features = ["operator_traits"] }
+pattern_engine = { path = "../pattern_engine" }
+normalization_pass = { path = "../passes/normalization" }
 
 # Core data structures
 dashmap = { workspace = true }

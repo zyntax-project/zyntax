@@ -1427,6 +1427,28 @@ pub fn compile_to_hir(
     // Extract module name from program or use default
     let module_name = arena.intern_string("main");
 
+    // Run pattern engine (term-rewriting passes on TypedAST)
+    {
+        let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
+            target: pattern_engine::LoweringTarget::Cpu,
+            max_iterations: 64,
+            trace: cfg!(debug_assertions),
+            verify_after: false,
+        });
+        engine.register_pass(normalization_pass::Pass);
+        engine.finalize().map_err(|e| {
+            CompilerError::Analysis(format!("Pattern engine finalize error: {}", e))
+        })?;
+        let result = engine.run(program, &type_registry);
+        if result.changed {
+            log::debug!(
+                "[pattern_engine] {} rewrites fired in {} iterations",
+                result.rewrites_fired.len(),
+                result.iterations
+            );
+        }
+    }
+
     let arena_arc = Arc::new(Mutex::new(arena));
     let mut lowering_ctx = lowering::LoweringContext::new(
         module_name,

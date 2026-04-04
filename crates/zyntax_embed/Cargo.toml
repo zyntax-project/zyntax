@@ -12,6 +12,8 @@ categories = ["compilers", "development-tools"]
 zyntax_compiler = { path = "../compiler" }
 zyn_peg = { path = "../zyn_peg" }
 zyntax_typed_ast = { path = "../typed_ast" }
+pattern_engine = { path = "../pattern_engine" }
+normalization_pass = { path = "../passes/normalization" }
 thiserror = "1.0"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }

@@ -1159,15 +1159,34 @@ impl ZyntaxRuntime {
             ..LoweringConfig::default()
         };
 
+        // Run pattern engine (term-rewriting passes on TypedAST)
+        {
+            let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
+                target: pattern_engine::LoweringTarget::Cpu,
+                max_iterations: 64,
+                trace: cfg!(debug_assertions),
+                verify_after: false,
+            });
+            engine.register_pass(normalization_pass::Pass);
+            engine.finalize().map_err(|e| {
+                RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
+            })?;
+            let result = engine.run(&mut program, &type_registry_arc);
+            if result.changed {
+                log::debug!(
+                    "[pattern_engine] {} rewrites fired in {} iterations",
+                    result.rewrites_fired.len(),
+                    result.iterations
+                );
+            }
+        }
+
         let mut lowering_ctx = LoweringContext::new(
             module_name,
             type_registry_arc.clone(),
             std::sync::Arc::new(std::sync::Mutex::new(arena)),
             lowering_config,
         );
-
-        // Don't skip type checking - enable type inference for trait resolution
-        // The parser produces TypedAST with Type::Any and placeholder TypeIds that need inference
 
         let mut hir_module = lowering_ctx
             .lower_program(&mut program)
@@ -3597,6 +3616,21 @@ impl TieredRuntime {
             builtins,
             ..LoweringConfig::default()
         };
+
+        // Run pattern engine
+        {
+            let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
+                target: pattern_engine::LoweringTarget::Cpu,
+                max_iterations: 64,
+                trace: cfg!(debug_assertions),
+                verify_after: false,
+            });
+            engine.register_pass(normalization_pass::Pass);
+            engine.finalize().map_err(|e| {
+                RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
+            })?;
+            let _result = engine.run(&mut program, &type_registry);
+        }
 
         let mut lowering_ctx = LoweringContext::new(
             module_name,

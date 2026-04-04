@@ -12,6 +12,7 @@ members = [
     "crates/zyntax_embed",
     "crates/zynml",
     "crates/pattern_engine",
+    "crates/passes/normalization",
     "sdk/zrtl",
     "sdk/zrtl_macros",
     "examples/imagepipe",

@@ -1,0 +1,10 @@
+[package]
+name = "normalization_pass"
+version = "0.1.0"
+edition = "2021"
+description = "Normalization pass for the pattern engine — structural cleanup rewrites"
+
+[dependencies]
+pattern_engine = { path = "../../pattern_engine" }
+zyntax_typed_ast = { path = "../../typed_ast" }
+log = "0.4"
