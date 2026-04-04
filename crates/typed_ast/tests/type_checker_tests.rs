@@ -549,13 +549,13 @@ mod type_checker_tests {
         let span = create_test_span();
 
         // Create function that takes 2 parameters
-        let param1 = builder.parameter(
+        let _param1 = builder.parameter(
             "x",
             Type::Primitive(PrimitiveType::I32),
             Mutability::Immutable,
             span,
         );
-        let param2 = builder.parameter(
+        let _param2 = builder.parameter(
             "y",
             Type::Primitive(PrimitiveType::I32),
             Mutability::Immutable,

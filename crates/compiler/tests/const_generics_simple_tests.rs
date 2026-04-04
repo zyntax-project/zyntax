@@ -1,9 +1,6 @@
 //! Simplified tests for const generics and monomorphization
 
-use std::collections::HashMap;
-use zyntax_compiler::{
-    hir::*, monomorphize_module, ConstEvalContext, ConstEvaluator, MonomorphizationContext,
-};
+use zyntax_compiler::{hir::*, monomorphize_module, ConstEvalContext, MonomorphizationContext};
 use zyntax_typed_ast::arena::AstArena;
 
 fn create_test_arena() -> AstArena {
@@ -56,7 +53,7 @@ fn test_const_generic_function_signature() {
 
 #[test]
 fn test_const_evaluation_arithmetic() {
-    let mut eval_ctx = ConstEvalContext::new();
+    let eval_ctx = ConstEvalContext::new();
 
     // Test arithmetic operations
     let result = eval_ctx

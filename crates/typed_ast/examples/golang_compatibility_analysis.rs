@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Go Language Compatibility Analysis
 //!
 //! This analysis demonstrates how Go language features map to our Zyntax TypedAST,

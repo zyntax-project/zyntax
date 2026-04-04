@@ -1,3 +1,4 @@
+#![allow(unused)]
 // Tests for higher-ranked trait bounds (for<'a>)
 
 use std::collections::HashMap;

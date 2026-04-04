@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! Tests for the extended TypedAST features
 
 use zyntax_typed_ast::{

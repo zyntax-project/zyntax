@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use whirlwind_adapter::WhirlwindAdapter;
 use whirlwind_analyzer::{Module, Standpoint};
 use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedStatement};
-use zyntax_typed_ast::Type;
 
 /// Helper to convert source and extract the first function's body
 fn convert_and_extract_function(

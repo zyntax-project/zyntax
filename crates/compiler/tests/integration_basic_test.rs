@@ -21,7 +21,7 @@ fn test_simple_addition_execution() {
     let func = create_binary_op_function("add", BinaryOp::Add);
 
     // Compile through Cranelift
-    let (backend, func_ptr) = compile_and_get_ptr(func);
+    let (_backend, func_ptr) = compile_and_get_ptr(func);
     let func_ptr = func_ptr.expect("Failed to get function pointer for add");
 
     // Execute the compiled function
@@ -154,8 +154,6 @@ fn test_comparison_execution() {
 
 /// Compiles a function and returns the backend with the function pointer
 fn compile_and_get_ptr(func: HirFunction) -> (CraneliftBackend, Option<*const u8>) {
-    use cranelift_module::Module;
-
     let func_id = func.id;
     let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
     backend

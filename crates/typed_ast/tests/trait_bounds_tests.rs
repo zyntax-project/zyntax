@@ -1,3 +1,4 @@
+#![allow(unused)]
 // Integration tests for trait bound constraint system
 
 use std::collections::HashMap;

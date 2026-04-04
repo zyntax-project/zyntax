@@ -17,8 +17,6 @@ fn create_test_string(s: &str) -> InternedString {
 
 /// Compiles a function and returns the backend with the function pointer
 fn compile_and_get_ptr(func: HirFunction) -> (CraneliftBackend, Option<*const u8>) {
-    use cranelift_module::Module;
-
     let func_id = func.id;
     let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
     backend

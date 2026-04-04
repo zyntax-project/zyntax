@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Function Arguments Support Demonstration
 //!
 //! This example showcases the comprehensive function argument support in the Zyntax TypedAST,

@@ -257,7 +257,7 @@ fn test_comparison_operations() {
     let ten = builder.const_i32(10);
 
     // Compare: 10 == 10 should be true
-    let cmp = builder.icmp_eq(ten, ten, i32_ty.clone());
+    let _cmp = builder.icmp_eq(ten, ten, i32_ty.clone());
 
     // For now, just skip the comparison test since we'd need
     // a cast or select instruction. Just return a constant.

@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! Tests for the effect system
 //!
 //! Tests include:
@@ -12,7 +13,6 @@ use std::collections::BTreeSet;
 use zyntax_typed_ast::effect_system::EffectPermissions;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::*;
-use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
 
 #[test]
 fn test_effect_system_creation() {

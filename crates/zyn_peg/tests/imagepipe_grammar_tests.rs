@@ -12,7 +12,7 @@
 //! 3. Action structure (Construct, not LegacyJson)
 //! 4. Using GrammarInterpreter to parse actual ImagePipe source files
 
-use zyn_peg::grammar::{parse_grammar, ActionIR, CharClass, PatternIR, RuleModifier};
+use zyn_peg::grammar::{parse_grammar, ActionIR, PatternIR, RuleModifier};
 use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
 use zyntax_typed_ast::type_registry::TypeRegistry;
 use zyntax_typed_ast::{TypedASTBuilder, TypedDeclaration};

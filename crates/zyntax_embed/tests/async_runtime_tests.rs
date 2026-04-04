@@ -2088,10 +2088,7 @@ async fn add_to_sum(n: i32) i32 {
 
 mod promise_combinator_tests {
     use super::*;
-    use zyntax_embed::{
-        PromiseAll, PromiseAllSettled, PromiseAllState, PromiseRace, PromiseRaceState,
-        SettledResult,
-    };
+    use zyntax_embed::{PromiseAll, PromiseAllSettled, PromiseRace, SettledResult};
 
     fn setup_async_runtime() -> Option<ZyntaxRuntime> {
         // Try multiple paths for the grammar file

@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Comprehensive TypedAST Builder Demonstration
 //!
 //! This example showcases the full capabilities of the enhanced TypedAST builder,

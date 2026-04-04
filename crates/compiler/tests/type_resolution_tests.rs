@@ -5,15 +5,13 @@
 
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
-    hir::{HirModule, HirStructType, HirType, HirUnionType},
+    hir::HirType,
     lowering::{AstLowering, LoweringConfig, LoweringContext},
-    CompilerResult,
 };
 use zyntax_typed_ast::{
-    arena::AstArena, typed_ast::TypedBlock, typed_node, CallingConvention, ConstructorSig,
-    FieldDef, MethodSig, Mutability, PrimitiveType, Span, Type, TypeConstraint, TypeDefinition,
-    TypeId, TypeKind, TypeMetadata, TypeParam, TypeRegistry, TypedDeclaration, TypedFunction,
-    TypedNode, TypedProgram, VariantDef, VariantFields, Visibility,
+    arena::AstArena, typed_ast::TypedBlock, typed_node, CallingConvention, FieldDef, Mutability,
+    PrimitiveType, Span, Type, TypeDefinition, TypeId, TypeKind, TypeMetadata, TypeRegistry,
+    TypedDeclaration, TypedFunction, TypedProgram, VariantDef, VariantFields, Visibility,
 };
 
 fn test_span() -> Span {

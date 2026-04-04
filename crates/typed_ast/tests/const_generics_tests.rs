@@ -4,7 +4,6 @@
 //! compile-time constant evaluation in type parameters.
 
 use std::collections::HashMap;
-use zyntax_typed_ast::arena::InternedString;
 use zyntax_typed_ast::const_evaluator::{ConstConstraint, ConstEvalContext, ConstEvaluator};
 use zyntax_typed_ast::multi_paradigm_checker::Paradigm;
 use zyntax_typed_ast::type_registry::{

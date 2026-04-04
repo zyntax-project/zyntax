@@ -9,7 +9,7 @@ use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 use zyntax_typed_ast::typed_ast::*;
 
-fn create_test_program_with_variable(var_name: &str, var_type: Type) -> TypedProgram {
+fn create_test_program_with_variable(_var_name: &str, var_type: Type) -> TypedProgram {
     let name =
         InternedString::from_symbol(string_interner::DefaultSymbol::try_from_usize(1).unwrap());
     let span = Span::new(0, 10);

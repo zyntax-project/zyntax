@@ -297,10 +297,10 @@ fn test_pest_grammar_structure() {
     let (pest_grammar, _, _) = generate_parser_files();
 
     // Verify each rule has the format: name = modifier? { pattern }
-    let rule_pattern = regex::Regex::new(r"^\s*(\w+)\s*=\s*([_@$!])?\s*\{\s*.*\s*\}\s*$").unwrap();
+    let _rule_pattern = regex::Regex::new(r"^\s*(\w+)\s*=\s*([_@$!])?\s*\{\s*.*\s*\}\s*$").unwrap();
 
     let mut valid_rules = 0;
-    let mut invalid_rules: Vec<String> = Vec::new();
+    let invalid_rules: Vec<String> = Vec::new();
 
     for line in pest_grammar.lines() {
         let trimmed = line.trim();

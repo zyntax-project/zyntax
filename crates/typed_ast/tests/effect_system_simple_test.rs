@@ -2,12 +2,11 @@
 
 use zyntax_typed_ast::effect_system::*;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
 
 #[test]
 fn test_effect_system_basic_creation() {
     // Test that we can create an effect system
-    let mut effect_system = EffectSystem::new();
+    let _effect_system = EffectSystem::new();
 
     // Test basic effect type creation
     let io_effect = Effect {

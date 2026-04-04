@@ -8,25 +8,23 @@
 
 use indexmap::IndexMap;
 use std::collections::HashSet;
-use std::sync::Arc;
 use zyntax_compiler::{
     // Effect analysis
-    effect_analysis::{analyze_effects, EffectErrorKind, ModuleEffectAnalysis},
+    effect_analysis::{analyze_effects, EffectErrorKind},
     // Codegen
     effect_codegen::{
-        analyze_handle_effect, analyze_perform_effect, get_handler_ops_info,
-        mangle_handler_op_name, EffectCodegenContext, PerformStrategy,
+        analyze_handle_effect, get_handler_ops_info, mangle_handler_op_name, EffectCodegenContext,
     },
     // Handler resolution
-    effect_handler_resolution::{resolve_handlers, HandlerOptimization, ModuleHandlerResolution},
+    effect_handler_resolution::resolve_handlers,
     // HIR types
     hir::{
         CallingConvention, FunctionAttributes, HirBlock, HirEffect, HirEffectHandler,
         HirEffectHandlerImpl, HirEffectOp, HirFunction, HirFunctionSignature, HirId,
-        HirInstruction, HirLifetime, HirModule, HirParam, HirTerminator, HirType,
+        HirInstruction, HirModule, HirTerminator, HirType,
     },
 };
-use zyntax_typed_ast::{InternedString, TypeId};
+use zyntax_typed_ast::InternedString;
 
 // =============================================================================
 // Test Helpers

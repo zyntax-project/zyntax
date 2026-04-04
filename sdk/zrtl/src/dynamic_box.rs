@@ -474,8 +474,12 @@ mod tests {
         assert_eq!(b.tag, TypeTag::I32);
         assert_eq!(b.as_i32(), Some(42));
 
-        // Modify through the box
-        value = 100;
+        // Modify the original value — DynamicBox holds a pointer to it,
+        // so as_i32() should see the new value through the pointer.
+        #[allow(unused_assignments)]
+        {
+            value = 100;
+        }
         assert_eq!(b.as_i32(), Some(100));
     }
 

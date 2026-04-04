@@ -1,12 +1,11 @@
+#![allow(unused)]
 //! Integration test for effect system with the universal type system
 //!
 //! This test demonstrates how effect systems integrate with the broader
 //! universal type system and provides comprehensive workflow testing.
 
-use std::collections::BTreeSet;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::*;
-use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
 
 #[test]
 fn test_effect_system_integration() {

@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Generics Support Demonstration
 //!
 //! This example shows how the Zyntax TypedAST supports comprehensive generics
@@ -5,17 +6,17 @@
 
 use zyntax_typed_ast::{
     typed_ast::*, AstArena, AsyncKind, CallingConvention, Lifetime, Mutability, NullabilityKind,
-    PrimitiveType, Span, Type, TypeId, TypeVar, TypeVarId, TypeVarKind, Visibility,
+    PrimitiveType, Span, Type, TypeId, TypeVar, Visibility,
 };
 
 /// Demonstrates Rust-style generic constraints
 fn rust_style_generics() {
     let mut arena = AstArena::new();
     let t_param = arena.intern_string("T");
-    let u_param = arena.intern_string("U");
+    let _u_param = arena.intern_string("U");
 
     // Generic function: fn process<T: Clone + Send + Sync + 'static>(value: T) -> T
-    let rust_function = TypedFunction {
+    let _rust_function = TypedFunction {
         name: arena.intern_string("process"),
         params: vec![TypedParameter {
             name: arena.intern_string("value"),
@@ -37,7 +38,7 @@ fn rust_style_generics() {
     };
 
     // Type parameters with Rust-style bounds
-    let type_params = vec![TypedTypeParam {
+    let _type_params = vec![TypedTypeParam {
         name: t_param,
         bounds: vec![
             TypedTypeBound::Trait(Type::Named {
@@ -62,7 +63,7 @@ fn rust_style_generics() {
 fn java_style_generics() {
     let mut arena = AstArena::new();
     let t_param = arena.intern_string("T");
-    let u_param = arena.intern_string("U");
+    let _u_param = arena.intern_string("U");
 
     // Java: class Container<T extends Comparable<T> & Serializable>
     let java_class = TypedClass {

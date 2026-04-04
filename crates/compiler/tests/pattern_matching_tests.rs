@@ -1,10 +1,7 @@
 //! Pattern matching tests for Phase 4 implementation
 
-use std::sync::{Arc, Mutex};
-use zyntax_compiler::{
-    check_exhaustiveness, hir::*, DecisionNode, LoweringContext, PatternMatchCompiler,
-};
-use zyntax_typed_ast::{arena::AstArena, typed_ast::*, Type, TypeRegistry};
+use zyntax_compiler::{check_exhaustiveness, hir::*, DecisionNode, PatternMatchCompiler};
+use zyntax_typed_ast::{arena::AstArena, Type};
 
 fn create_test_arena() -> AstArena {
     AstArena::new()
@@ -16,7 +13,7 @@ fn intern_str(arena: &mut AstArena, s: &str) -> zyntax_typed_ast::InternedString
 
 #[test]
 fn test_simple_constant_pattern_match() {
-    let mut arena = create_test_arena();
+    let _arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
 
     let scrutinee = HirId::new();
@@ -132,7 +129,7 @@ fn test_union_variant_pattern_match() {
 
 #[test]
 fn test_wildcard_pattern_match() {
-    let mut arena = create_test_arena();
+    let _arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
 
     let scrutinee = HirId::new();
@@ -206,7 +203,7 @@ fn test_binding_pattern() {
 
 #[test]
 fn test_exhaustiveness_checking_bool() {
-    let mut arena = create_test_arena();
+    let _arena = create_test_arena();
 
     // Test exhaustive bool patterns (true + false)
     let true_pattern = HirPattern {
@@ -458,7 +455,7 @@ fn test_struct_pattern_basic() {
 
 #[test]
 fn test_complex_pattern_combinations() {
-    let mut arena = create_test_arena();
+    let _arena = create_test_arena();
     let mut compiler = PatternMatchCompiler::new();
 
     let scrutinee = HirId::new();

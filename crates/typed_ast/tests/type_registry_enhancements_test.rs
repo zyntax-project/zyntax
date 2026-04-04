@@ -1,6 +1,6 @@
 //! Test for type registry enhancements from universal type system
 
-use zyntax_typed_ast::arena::{AstArena, InternedString};
+use zyntax_typed_ast::arena::AstArena;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::*;
 

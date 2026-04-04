@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Advanced Pattern Matching System Demonstration
 //!
 //! This example showcases the comprehensive pattern matching capabilities

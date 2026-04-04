@@ -1,3 +1,4 @@
+#![allow(unused)]
 // Tests for lifetime inference and checking
 
 use string_interner::Symbol;

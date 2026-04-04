@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # Type Registry API Demonstration
 //!
 //! This example shows how language implementers can use the TypeRegistry

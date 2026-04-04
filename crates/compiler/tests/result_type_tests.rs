@@ -70,7 +70,7 @@ fn test_result_enum_structure() {
     let span = Span::default();
 
     // Register Result<T, E>
-    let result_type_id = registry.register_result_type(&mut arena, span);
+    let _result_type_id = registry.register_result_type(&mut arena, span);
 
     // Get the type definition
     let result_name = arena.intern_string("Result");

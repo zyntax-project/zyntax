@@ -47,8 +47,6 @@ fn test_while_with_continue() {
         println!("    Terminator: {:?}", block.terminator);
     }
 
-    use cranelift_module::Module;
-
     let func_id = func.id;
     let mut backend = CraneliftBackend::new().expect("Failed to create Cranelift backend");
 

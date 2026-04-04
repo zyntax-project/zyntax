@@ -1,3 +1,4 @@
+#![allow(unused)]
 // Tests for static lifetime constraints and implicit resolution
 
 use zyntax_typed_ast::arena::AstArena;

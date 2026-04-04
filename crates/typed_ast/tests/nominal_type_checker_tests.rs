@@ -13,7 +13,6 @@ use zyntax_typed_ast::{
 };
 // use zyntax_typed_ast::type_registry::{Type, PrimitiveType, NullabilityKind, TypeVarKind, Variance};
 use std::collections::HashMap;
-use string_interner::Symbol;
 
 fn create_test_string(s: &str) -> InternedString {
     use std::sync::{Mutex, OnceLock};

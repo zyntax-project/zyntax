@@ -5,12 +5,12 @@
 // Note: These tests use internal types from nominal_type_checker
 use std::collections::HashMap;
 use string_interner::Symbol;
-use zyntax_typed_ast::arena::{AstArena, InternedString};
+use zyntax_typed_ast::arena::InternedString;
 use zyntax_typed_ast::nominal_type_checker::*;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{
-    MethodSig, NullabilityKind, ParamDef, PrimitiveType, Type, TypeId, TypeParam, TypeVarKind,
-    Variance, Visibility,
+    MethodSig, NullabilityKind, ParamDef, PrimitiveType, Type, TypeId, TypeParam, Variance,
+    Visibility,
 };
 
 #[test]
@@ -160,7 +160,7 @@ fn test_circular_inheritance_detection() {
     checker.register_type(type_b_def).unwrap();
 
     // Try to create type C : B and then modify A : C (circular)
-    let type_c_id = TypeId::next();
+    let _type_c_id = TypeId::next();
     let type_c_def_circular = TypeDefinition {
         id: type_a_id, // Reuse A's ID to modify it
         name: InternedString::from_symbol(

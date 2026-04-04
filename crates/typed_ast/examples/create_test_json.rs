@@ -1,3 +1,4 @@
+#![allow(unused)]
 // Create a proper TypedAST JSON file using the TypedASTBuilder API
 
 use std::fs;

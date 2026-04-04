@@ -32,7 +32,7 @@ impl TestContext {
     }
 
     /// Define a function and automatically track it
-    pub fn define_function(&mut self, name: &str) -> FunctionDefiner {
+    pub fn define_function(&mut self, name: &str) -> FunctionDefiner<'_> {
         FunctionDefiner::new(self, name.to_string())
     }
 
@@ -47,7 +47,7 @@ impl TestContext {
     }
 
     /// Define a variable with optional initialization
-    pub fn define_var(&mut self, name: &str, ty: impl Into<TypeDef>) -> VarDefiner {
+    pub fn define_var(&mut self, name: &str, ty: impl Into<TypeDef>) -> VarDefiner<'_> {
         VarDefiner::new(self, name.to_string(), ty.into())
     }
 
@@ -69,7 +69,7 @@ impl TestContext {
     }
 
     /// Create a function call
-    pub fn call(&mut self, func_name: &str) -> CallBuilder {
+    pub fn call(&mut self, func_name: &str) -> CallBuilder<'_> {
         let func_ref = self.function_ref(func_name);
         CallBuilder::new(self, func_ref)
     }

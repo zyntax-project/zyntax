@@ -7,12 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use zyntax_compiler::{
-    hir::HirConstant,
-    lowering::{AstLowering, LoweringConfig, LoweringContext},
-};
+use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
 use zyntax_typed_ast::{
-    arena::AstArena, ImplDef, MethodImpl, MethodSig, ParamDef, Span, Type, TypeId, TypeRegistry,
+    arena::AstArena, ImplDef, MethodImpl, MethodSig, Span, Type, TypeId, TypeRegistry,
     TypedProgram, Visibility,
 };
 
@@ -125,7 +122,7 @@ fn test_vtable_generation_simple() {
     };
 
     // 5. Create program with the method function
-    use zyntax_typed_ast::{typed_node, TypedDeclaration, TypedNode};
+    use zyntax_typed_ast::{typed_node, TypedDeclaration};
     let mut program = TypedProgram {
         declarations: vec![typed_node(
             TypedDeclaration::Function(impl_function),

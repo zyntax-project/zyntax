@@ -25,7 +25,7 @@
 //! - `model_interface.wrl` - Classes and interfaces
 //! - `enum_record.wrl` - Enums and records
 
-use whirlwind_adapter::{AdapterError, WhirlwindAdapter};
+use whirlwind_adapter::WhirlwindAdapter;
 
 /// Test fixture helper - loads Whirlwind source files
 fn load_fixture(name: &str) -> String {
@@ -449,6 +449,7 @@ fn test_type_registry_all_symbols_registered() {
 // Snapshot testing helpers (for future use)
 #[cfg(test)]
 mod snapshot_helpers {
+    #[allow(unused_imports)]
     use super::*;
 
     /// Helper to serialize TypedProgram for snapshot comparison

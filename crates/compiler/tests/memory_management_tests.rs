@@ -2,7 +2,7 @@
 
 use zyntax_compiler::{
     hir::*, ARCManager, AllocationInfo, DropManager, EscapeAnalysis, EscapeInfo, MemoryContext,
-    MemoryStrategy, RefCountInfo,
+    MemoryStrategy,
 };
 use zyntax_typed_ast::arena::AstArena;
 

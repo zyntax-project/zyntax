@@ -6,7 +6,7 @@
 //! 3. Runs analysis passes
 //! 4. Produces valid HIR ready for backend code generation
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use zyntax_compiler::{
     async_support::AsyncRuntimeType, compile_to_hir, hir::*, monomorphize_module,
     CompilationConfig, CompilerResult, MonomorphizationContext,

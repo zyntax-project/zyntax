@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_compiler::ssa::SsaBuilder;
 use zyntax_typed_ast::{arena::AstArena, InternedString};
 
 /// Test basic function compilation

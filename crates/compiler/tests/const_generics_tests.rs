@@ -144,7 +144,7 @@ fn test_const_generic_in_struct() {
     let mut arena = create_test_arena();
 
     // Create a struct with const generic: FixedBuffer<T, const SIZE: usize>
-    let size_param = intern_str(&mut arena, "SIZE");
+    let _size_param = intern_str(&mut arena, "SIZE");
 
     let buffer_struct = HirStructType {
         name: Some(intern_str(&mut arena, "FixedBuffer")),

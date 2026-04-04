@@ -3,11 +3,9 @@
 //! This module tests dynamic/static hybrid typing, runtime type checks, and type evidence.
 
 // Note: These tests use internal types from gradual_type_checker
-use string_interner::Symbol;
-use zyntax_typed_ast::arena::InternedString;
 use zyntax_typed_ast::gradual_type_checker::*;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::type_registry::{NullabilityKind, PrimitiveType, Type};
+use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 
 #[test]
 fn test_gradual_compatibility_any_type() {
