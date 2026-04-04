@@ -1,0 +1,11 @@
+[package]
+name = "algebraic_effects_pass"
+version = "0.1.0"
+edition = "2021"
+description = "Algebraic effects pass — CPS-transforms effect operations and generates handler dispatch"
+
+[dependencies]
+pattern_engine = { path = "../../pattern_engine" }
+zyntax_typed_ast = { path = "../../typed_ast" }
+normalization_pass = { path = "../normalization" }
+log = "0.4"

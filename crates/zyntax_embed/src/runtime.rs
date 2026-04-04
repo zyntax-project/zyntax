@@ -1168,6 +1168,8 @@ impl ZyntaxRuntime {
                 verify_after: false,
             });
             engine.register_pass(normalization_pass::Pass);
+            engine.register_pass(algebraic_effects_pass::Pass);
+            engine.register_pass(async_ir_pass::Pass);
             engine.finalize().map_err(|e| {
                 RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
             })?;
@@ -3626,6 +3628,8 @@ impl TieredRuntime {
                 verify_after: false,
             });
             engine.register_pass(normalization_pass::Pass);
+            engine.register_pass(algebraic_effects_pass::Pass);
+            engine.register_pass(async_ir_pass::Pass);
             engine.finalize().map_err(|e| {
                 RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
             })?;
