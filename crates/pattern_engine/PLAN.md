@@ -1,140 +1,220 @@
 # Pattern Engine — Implementation Plan
 
-## Spec Review
+## Insertion Point
 
-The spec is architecturally sound. The term-rewriting model, fixpoint loop, priority-based first-match-wins strategy, and external metadata table are all good choices for this stage of the compiler. Three adjustments are needed based on what actually exists in the codebase.
+Two compilation paths exist. Both need the engine in the same position.
 
-### What the spec gets right
+### Path 1: `compile_typed_program` (`crates/compiler/src/lib.rs:1437`)
 
-- **Pipeline position** — after TypeChecker, before lowering. This is exactly where the existing `LoweringContext` sits. The engine slots in naturally.
-- **MetadataTable** — external to TypedNode. This is the right call; `TypedNode<T>` has no ID field and shouldn't grow per-target data.
-- **Pass ordering via dependencies** — topological sort catches cycles at registration time. Better than implicit priority-only ordering.
-- **Analysis rebuild per iteration** — `AnalysisContext::analyze_program()` exists and is real. Rebuilding per iteration is correct; incremental invalidation can come later.
-- **Effect system types** — `TypedEffect`, `TypedEffectHandler`, `TypedEffectOp` all exist in `typed_ast.rs` with full structure. Effect analysis (`effect_analysis.rs`) and codegen (`effect_codegen.rs`) are real implementations, not stubs.
-- **Async state machine** — `AsyncCompiler` in `async_support.rs` already builds state machines with await point detection, capture analysis, and poll generation. The async-ir pass can delegate to this.
-- **TypedASTBuilder** — comprehensive. Covers all expression, statement, and declaration types with a fluent API. Rewrites can use it directly.
-
-### What needs adjustment
-
-**1. TypedNode has no NodeId**
-
-`TypedNode<T>` is `{ node: T, ty: Type, span: Span }`. There is no unique ID. The spec's `MetadataTable` keys on `NodeId` which doesn't exist.
-
-Options:
-- **A.** Add a `NodeId` field to `TypedNode` (invasive — touches every node constructor)
-- **B.** Use `Span` as the key (works if spans are unique per node, which they are for parsed programs but not for synthesized nodes)
-- **C.** Assign IDs in a pre-pass walk before the engine runs (the `node_id.rs` file in the spec). IDs live in a side table `HashMap<*const (), NodeId>` keyed by pointer, or in a parallel vec built during the walk.
-
-**Recommendation:** Option C. The spec already has `node_id.rs` in the crate structure. Implement it as a pre-pass that walks `TypedProgram` once, assigns monotonic IDs, and stores them in a `NodeIdMap` side table. The `MetadataTable` then keys on these IDs. Synthesized nodes from rewrites get fresh IDs from the same counter.
-
-**2. No TypedAST walker exists**
-
-The compiler's `LoweringContext` manually walks `TypedProgram` by iterating `program.declarations` and pattern-matching each `TypedDeclaration` variant. There is no generic visitor or mutable walker trait.
-
-The spec lists `walk.rs` in the crate structure but doesn't define the walker interface. This is the critical missing piece.
-
-**Recommendation:** Implement a bottom-up mutable walker as a trait:
-
-```rust
-pub trait TypedWalker {
-    fn walk_program(&mut self, program: &mut TypedProgram);
-    fn walk_declaration(&mut self, decl: &mut TypedNode<TypedDeclaration>);
-    fn walk_statement(&mut self, stmt: &mut TypedNode<TypedStatement>);
-    fn walk_expression(&mut self, expr: &mut TypedNode<TypedExpression>);
-}
+```
+register_impl_blocks(&mut program)
+generate_abstract_trait_impls(&mut program)
+register_impl_blocks(&mut program)           // second pass for generated impls
+                                             // ← engine.run() goes here
+lowering_ctx.lower_program(&mut program)     // → HIR → Cranelift/LLVM
 ```
 
-The engine implements this trait. Each `walk_*` method iterates the applicable rewrites, tries to match, and applies the first successful rewrite. Child nodes are walked recursively before the parent (bottom-up), so inner rewrites fire first and outer rewrites see already-transformed children.
+### Path 2: ZynML runtime (`crates/zyntax_embed/src/runtime.rs:1138`)
 
-**3. Async transformation lives at HIR level, not TypedAST level**
+```
+register_impl_blocks(&mut program)
+generate_abstract_trait_impls(&mut program)
+register_impl_blocks(&mut program)
+                                             // ← engine.run() goes here
+lowering_ctx.lower_program(&mut program)     // → HIR → Cranelift JIT
+```
 
-The spec proposes `async_fn_to_state_machine` as a TypedAST rewrite that produces `Enum(StateEnum)`, `Class(FutureStruct)`, `Function(poll_fn)`. But the existing `AsyncCompiler` in `async_support.rs` operates on `HirFunction`, not `TypedFunction`. It builds `AsyncStateMachine` with `AsyncState` structs containing `HirInstruction` and `HirTerminator`.
+Both paths share the same shape: impl registration, then lowering. The engine inserts between them. `lower_program` already calls `run_type_checking()` internally (line 567), so the engine receives a type-checked program.
 
-Moving this to TypedAST level means reimplementing the state machine builder at a higher abstraction level.
-
-**Recommendation:** Keep async transformation at HIR level for now. The pattern engine can handle the *detection* and *marking* phase (identify async functions, annotate suspension points in metadata), and the actual state machine construction stays in `async_support.rs` where it already works. The `async-ir` pass becomes:
-
-1. **At TypedAST level (pattern engine):** Mark async functions and await sites in the MetadataTable. Validate that awaited expressions implement Future.
-2. **At HIR level (existing):** `AsyncCompiler::compile_async_function()` consumes the metadata and builds the state machine.
-
-This avoids duplicating the state machine builder and leverages existing working code.
+The engine takes `&mut TypedProgram` and the `TypeRegistry` (available as `program.type_registry` or as the `Arc<TypeRegistry>` created just before lowering). It returns the program mutated in-place.
 
 ---
 
-## Implementation Order
+## What Exists Today
 
-### Phase 0 — Foundation (the crate skeleton)
+| Component | Location | Status |
+|---|---|---|
+| `TypedNode<T>` | `typed_ast.rs:19` | `{ node: T, ty: Type, span: Span }` — no NodeId |
+| `TypedProgram` | `typed_ast.rs:43` | `{ declarations: Vec<TypedNode<TypedDeclaration>>, span, source_files, type_registry }` |
+| `TypedASTBuilder` | `typed_builder.rs` | Full coverage — all expression/statement/declaration types, fluent API |
+| `TypeRegistry` | `type_registry.rs` | Types, traits, impls, aliases, coherence caches |
+| `AnalysisContext` | `advanced_analysis.rs:40` | DFG, CFG, ownership, lifetime analysis. `analyze_program()` runs full pipeline |
+| `EffectSystem` | `effect_system.rs:32` | Effect types, function signatures, inference context |
+| `EffectAnalyzer` | `compiler/effect_analysis.rs` | Handler scope analysis, pure function validation, transitive propagation |
+| `EffectCodegenContext` | `compiler/effect_codegen.rs` | Handler dispatch strategies (DirectCall, Inline, RuntimeDispatch) |
+| `AsyncCompiler` | `compiler/async_support.rs` | State machine builder at HIR level — await detection, capture analysis, poll generation |
+| `TypedEffect`, `TypedEffectHandler`, `TypedEffectOp` | `typed_ast.rs:250-335` | Full AST node types for algebraic effects |
+| `TypedFunction.is_async`, `TypedExpression::Await` | `typed_ast.rs` | Async markers in the AST |
+| `Span` | `source.rs:69` | `{ start: usize, end: usize }` — `Copy`, `Eq`, `Hash` |
+| TypedAST walker | — | Does not exist. `LoweringContext` manually iterates `program.declarations`. |
 
-Create `crates/pattern_engine/` with the core types. No passes yet, just the framework.
+---
 
-Files:
-- `Cargo.toml` — depends on `zyntax_typed_ast`
-- `src/lib.rs` — re-exports
-- `src/bindings.rs` — `Bindings` struct (typed map from names to AST fragments)
-- `src/context.rs` — `MatchContext`, `LoweringTarget`
-- `src/pattern.rs` — `Pattern<T>` with `and`/`or`/`when`/`for_target` combinators
-- `src/rewrite.rs` — `Rewrite<T>`, `RewriteOutput`, `Priority`, `RewriteBenefit`
-- `src/pass.rs` — `PatternPass` trait
-- `src/metadata.rs` — `MetadataTable` keyed by `NodeId`
-- `src/node_id.rs` — `NodeId` type + assignment walk
-- `src/walk.rs` — `TypedWalker` trait + default depth-first implementation
-- `src/engine.rs` — `PatternEngine`, `EngineConfig`, registration, `finalize()`, `run()`
-- `src/trace.rs` — `FiredRewrite`, rewrite trace emission
-- `src/verify.rs` — post-rewrite type soundness check (calls `TypeChecker`)
+## What Needs Building
 
-**Milestone:** `PatternEngine::new()` compiles. Registration API works. `run()` walks the program and returns `EngineResult` with `changed: false` (no passes registered).
+### 1. `NodeId` assignment (`node_id.rs`)
 
-**Test:** Register a no-op pass with one expression rewrite that matches `IntLiteral(42)` and replaces it with `IntLiteral(0)`. Verify the program is transformed. Verify `EngineResult.rewrites_fired` contains the rewrite.
+`TypedNode` has no unique ID. The `MetadataTable` needs one.
+
+Add a `NodeId` newtype (`u32`) and a pre-pass that walks `TypedProgram` depth-first, assigns a monotonic ID to every `TypedNode`, and stores the mapping in a `NodeIdMap`. The map is keyed by `Span` for parsed nodes. Synthesized nodes (produced by rewrites via `TypedASTBuilder`) get fresh IDs from the same counter.
+
+`MetadataTable` keys on `NodeId`. The `NodeIdMap` is built once at the start of `engine.run()` and rebuilt each fixpoint iteration (since rewrites create new nodes).
+
+### 2. Mutable AST walker (`walk.rs`)
+
+The engine needs to walk `TypedProgram` depth-first, trying rewrites at each node. No visitor trait exists today.
+
+Implement as a concrete function, not a trait — the engine is the only consumer:
+
+```
+walk_program(program, |node_kind, node, ctx| -> Option<RewriteOutput>)
+```
+
+Walk order: depth-first, children before parent (bottom-up). This means inner rewrites fire first; outer rewrites see already-transformed subtrees.
+
+The walker must handle `RewriteOutput::Expand` by collecting new declarations into a pending buffer, inserted into `program.declarations` after the current walk completes. The next fixpoint iteration picks them up.
+
+The walker descends into:
+- `TypedDeclaration::Function` → body statements → expressions
+- `TypedDeclaration::Class` → methods → bodies
+- `TypedDeclaration::Impl` → method bodies
+- `TypedDeclaration::Effect`, `TypedDeclaration::EffectHandler` → handler bodies
+- `TypedStatement::If`, `While`, `For`, `Match` → nested blocks
+- `TypedExpression::Call`, `Binary`, `If`, `Lambda`, `Block` → sub-expressions
+
+### 3. Post-rewrite verification (`verify.rs`)
+
+In debug builds, after each fixpoint iteration, run `TypeChecker::check_program()` on the transformed program. This catches rewrites that produce type-unsound AST at the specific iteration that broke things. Controlled by `EngineConfig.verify_after`.
+
+Use the same `TypeChecker::with_options()` setup that `LoweringContext::run_type_checking()` uses (line 600).
+
+---
+
+## Implementation Phases
+
+### Phase 0 — Crate skeleton + engine loop
+
+**Create `crates/pattern_engine/`:**
+
+```
+src/
+  lib.rs           pub mod + re-exports
+  bindings.rs      Bindings struct
+  context.rs       MatchContext, LoweringTarget
+  pattern.rs       Pattern<T>, combinators (and/or/when/for_target)
+  rewrite.rs       Rewrite<T>, RewriteOutput, Priority, RewriteBenefit
+  pass.rs          PatternPass trait
+  engine.rs        PatternEngine, EngineConfig, registration, finalize(), run()
+  metadata.rs      MetadataTable
+  node_id.rs       NodeId, NodeIdMap, assignment walk
+  walk.rs          depth-first mutable walker
+  trace.rs         FiredRewrite, trace emission
+  verify.rs        post-rewrite type checker call
+```
+
+**Cargo.toml dependencies:**
+- `zyntax_typed_ast` — TypedProgram, TypedASTBuilder, TypeRegistry, AnalysisContext, EffectSystem
+- No dependency on `zyntax_compiler` — the engine operates purely on TypedAST
+
+**Wire into the pipeline:**
+
+In `crates/compiler/src/lib.rs` after `register_impl_blocks`, before `lowering_ctx.lower_program`:
+```rust
+let mut engine = PatternEngine::new(EngineConfig {
+    target: LoweringTarget::Cpu,
+    max_iterations: 64,
+    trace: cfg!(debug_assertions),
+    verify_after: cfg!(debug_assertions),
+});
+engine.finalize()?;
+let _result = engine.run(&mut program, &registry);
+```
+
+Same in `crates/zyntax_embed/src/runtime.rs` at the equivalent point.
+
+With no passes registered, `engine.run()` walks the program, fires nothing, returns `EngineResult { changed: false, iterations: 1, rewrites_fired: vec![] }`.
+
+**Test:** Register one expression rewrite matching `IntLiteral(42)` → `IntLiteral(0)`. Build a `TypedProgram` with a `println(42)` call. Run engine. Assert the literal changed. Assert `rewrites_fired.len() == 1`.
 
 ### Phase 1 — Normalization pass
 
-Implement `crates/passes/normalization/` with the three rewrites from the spec:
-- `flatten_nested_blocks`
-- `unit_return_explicit`
-- `dead_let_elimination` (requires DFG query — uses `AnalysisContext`)
+**Create `crates/passes/normalization/`:**
 
-This is the simplest pass and exercises every part of the engine: pattern matching, AST mutation, the walker, analysis integration, and the fixpoint loop.
+Three rewrites at `Priority::NORMALIZATION (100)`:
 
-**Test:** Write ZynML programs that trigger each rewrite. Verify before/after AST structure. Verify idempotency (running twice produces same result).
+| Rewrite | Match | Output |
+|---|---|---|
+| `flatten_nested_blocks` | `Block` whose only content is another `Block` | Hoist inner statements to outer |
+| `unit_return_explicit` | `Function` returning `Unit` with no terminal `Return` | Append `Return(None)` |
+| `dead_let_elimination` | `Let(name)` where `AnalysisContext` DFG shows zero uses and initializer is pure | `Delete` |
+
+`dead_let_elimination` is the first rewrite that uses `MatchContext.analysis`. This exercises the `AnalysisContext::analyze_program()` integration — the DFG must be rebuilt each iteration so deleted lets don't leave stale edges.
+
+**Test:** Verify idempotency — running the engine twice produces the same AST as running it once.
 
 ### Phase 2 — Algebraic effects pass
 
-Implement `crates/passes/algebraic_effects/`. This is the first semantically complex pass and the primary motivator for the pattern engine.
+**Create `crates/passes/algebraic_effects/`:**
 
-Leverage existing infrastructure:
-- `TypedEffect`/`TypedEffectHandler`/`TypedEffectOp` — already defined in typed_ast
-- `EffectAnalyzer` in `effect_analysis.rs` — already does handler scope analysis
-- `EffectCodegenContext` in `effect_codegen.rs` — already has handler dispatch strategies
+Three rewrites at `Priority::SEMANTIC (200)`:
 
-The pass translates these into plain TypedAST constructs (classes, functions, vtables) that the existing lowering pipeline already handles.
+| Rewrite | Match | Output |
+|---|---|---|
+| `effect_op_to_continuation` | `Call` where callee resolves to a `TypedEffectOp` | `Replace` with handler dispatch call |
+| `effect_decl_to_vtable` | `TypedDeclaration::Effect` | `Expand` into `Class(OpTable)` |
+| `handler_decl_to_impl` | `TypedDeclaration::EffectHandler` | `Expand` into vtable instance + handler run function |
 
-**Key integration:** The `MatchContext.effects` field should wrap the existing `EffectAnalyzer` results, not reimplement effect scope analysis.
+The `MatchContext.effects` field wraps the existing `EffectSystem` from `typed_ast/effect_system.rs`. Handler scope resolution uses `EffectAnalyzer` results from `compiler/effect_analysis.rs`, exposed through `MatchContext.analysis`.
 
-### Phase 3 — Async-IR pass (marking only)
+After this pass, the program contains no `TypedEffect` or `TypedEffectHandler` declarations — they've been rewritten into classes and functions that the existing `LoweringContext` can lower to HIR without special-casing effects.
 
-Implement `crates/passes/async_ir/` as a metadata-only pass:
-- Walk async functions, record suspension points in `MetadataTable`
-- Validate Future trait implementations
-- Does NOT build state machines (that stays at HIR level in `AsyncCompiler`)
+**Dependencies:** `normalization` (effects pass assumes normalized control flow)
 
-Wire the metadata into the existing `LoweringContext` → `AsyncCompiler` path so that async lowering consumes pattern engine metadata instead of re-analyzing.
+### Phase 3 — Async-IR pass
+
+**Create `crates/passes/async_ir/`:**
+
+Two rewrites at `Priority::SEMANTIC (200)`:
+
+| Rewrite | Match | Output |
+|---|---|---|
+| `async_fn_to_state_machine` | `Function` where `is_async == true` and body contains `Await` | `Expand` into `Enum(StateEnum)` + `Class(FutureStruct)` + `Function(poll_fn)` |
+| `await_expr_to_poll` | `TypedExpression::Await(inner)` where `inner.ty` implements `Future` | `Replace` with `Match(poll_dispatch)` |
+
+The state machine construction uses `TypedASTBuilder` to synthesize the enum, struct, and poll function at TypedAST level. The existing `AsyncCompiler` in `async_support.rs` operates at HIR level — once the async-ir pass is complete, `AsyncCompiler` is no longer needed because async/await is already eliminated from the TypedAST before lowering.
+
+**Dependencies:** `normalization`; if effects can be async, also `algebraic-effects`.
 
 ### Phase 4 — Target-specific passes
 
-Once the framework is proven with Phases 1-3, add target-specific passes:
-- **NVPTX pass** — annotate kernel functions, thread hierarchy in metadata
-- **RTLIL pass** — clock domain analysis, combinational/sequential classification
+**NVPTX pass** (`Priority::TARGET (400)`, target: `LoweringTarget::Nvptx`):
+- Annotate `@kernel` functions with `NvptxMetadata` (thread block dims, shared memory) in the `MetadataTable`
+- No AST rewriting — purely metadata population for the NVPTX backend to consume
 
-These are metadata-heavy (they don't rewrite the AST much, they populate the MetadataTable for backend consumption).
+**RTLIL pass** (`Priority::TARGET (400)`, target: `LoweringTarget::Rtlil`):
+- Clock domain analysis, combinational/sequential classification
+- Metadata-only
+
+These passes use `Pattern::for_target()` so they never fire when targeting CPU.
 
 ---
 
-## Open Questions
+## Crate Dependency Graph
 
-1. **Should `RewriteOutput::Expand` inject declarations at program scope or at the nearest enclosing scope?** The spec says program scope, which works for effect-to-vtable. But async state machines may need to inject structs in the same module scope as the original function, not necessarily top-level.
+```
+zyntax_typed_ast
+       ↑
+pattern_engine          (core framework)
+       ↑
+  ┌────┼────────┐
+  │    │        │
+normalization  algebraic_effects  async_ir    (passes)
+  │    │        │
+  └────┼────────┘
+       ↑
+zyntax_compiler         (wires engine.run() into the pipeline)
+       ↑
+zyntax_embed            (wires engine.run() into the runtime path)
+```
 
-2. **Should the walker be top-down or bottom-up?** The spec says depth-first but doesn't specify direction. Bottom-up (children first) means rewrites see already-normalized children. Top-down means a rewrite can prevent walking into children it's about to delete. The normalization pass wants bottom-up; the async pass might want top-down. Consider making direction configurable per pass.
-
-3. **How does `Expand` interact with the walker?** When a rewrite expands a declaration into multiple declarations, the walker needs to know where to insert them and whether to walk the new declarations in the current iteration. Inserting into a `pending_declarations` buffer and processing them in the next iteration avoids mutation-during-iteration issues.
-
-4. **Should `Bindings` use `&'static str` or `InternedString` for keys?** The spec uses `&'static str` which is ergonomic for hardcoded pattern names. But if patterns are ever generated dynamically (e.g., from a DSL), `InternedString` would be more flexible. Start with `&'static str` and migrate if needed.
+No pass crate depends on `zyntax_compiler`. Passes only depend on `pattern_engine` and `zyntax_typed_ast`. The compiler and runtime wire the engine into their respective pipelines.
