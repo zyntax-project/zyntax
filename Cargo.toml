@@ -11,6 +11,7 @@ members = [
     "crates/haxe_zyntax_runtime",
     "crates/zyntax_embed",
     "crates/zynml",
+    "crates/pattern_engine",
     "sdk/zrtl",
     "sdk/zrtl_macros",
     "examples/imagepipe",
