@@ -230,6 +230,7 @@ impl PatternEngine {
             }
 
             let fired_set = FiredSet::new();
+            let effect_ops = crate::context::EffectOpIndex::build(program);
             let ctx = MatchContext {
                 registry,
                 analysis: &analysis,
@@ -237,6 +238,7 @@ impl PatternEngine {
                 target: self.config.target,
                 metadata: &self.metadata,
                 fired: &fired_set,
+                effect_ops: &effect_ops,
             };
 
             let walk_result = walk::walk_program(

@@ -19,7 +19,7 @@ pub mod verify;
 pub mod walk;
 
 pub use bindings::Bindings;
-pub use context::{LoweringTarget, MatchContext};
+pub use context::{EffectOpIndex, LoweringTarget, MatchContext};
 pub use engine::{EngineConfig, EngineResult, PassOrderError, PatternEngine};
 pub use metadata::MetadataTable;
 pub use node_id::NodeId;
