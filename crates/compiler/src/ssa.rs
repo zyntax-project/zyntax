@@ -3381,6 +3381,23 @@ impl SsaBuilder {
 
                 // Calculate field index
                 let field_index = self.get_field_index(&object_type, field)?;
+
+                // Single-field structs are flattened by Cranelift's ABI — the struct
+                // value IS the field value. ExtractValue on a bare scalar is invalid.
+                let num_fields = if let Type::Named { id, .. } = &object_type {
+                    self.type_registry
+                        .get_type_by_id(*id)
+                        .map(|td| td.fields.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                if num_fields == 1 && field_index == 0 {
+                    // Single-field struct: the object value IS the field
+                    return Ok(object_val);
+                }
+
                 let result_type = self.convert_type(&expr.ty);
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
