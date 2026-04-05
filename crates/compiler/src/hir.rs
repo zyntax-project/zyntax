@@ -1726,6 +1726,8 @@ pub enum HirCallable {
     /// External symbol call (e.g., "$haxe$trace$int" for runtime functions)
     /// The symbol name is looked up in the runtime symbol registry at link time
     Symbol(String),
+    /// Get function address as a pointer value (for passing functions as arguments)
+    FuncRef(HirId),
 }
 
 /// Compiler intrinsics

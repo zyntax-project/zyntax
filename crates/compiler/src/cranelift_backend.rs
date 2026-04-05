@@ -1251,6 +1251,20 @@ impl CraneliftBackend {
                                 panic!("Binary op right operand {:?} not in value_map", right)
                             });
 
+                            // Widen integer operands to match if types differ (e.g., i32 vs i64)
+                            let lhs_ty = builder.func.dfg.value_type(lhs);
+                            let rhs_ty = builder.func.dfg.value_type(rhs);
+                            let (lhs, rhs) =
+                                if lhs_ty != rhs_ty && lhs_ty.is_int() && rhs_ty.is_int() {
+                                    if lhs_ty.bits() < rhs_ty.bits() {
+                                        (builder.ins().sextend(rhs_ty, lhs), rhs)
+                                    } else {
+                                        (lhs, builder.ins().sextend(lhs_ty, rhs))
+                                    }
+                                } else {
+                                    (lhs, rhs)
+                                };
+
                             let value = match op {
                                 BinaryOp::Add => {
                                     if ty.is_float() {
@@ -1979,6 +1993,29 @@ impl CraneliftBackend {
                                                     builder.ins().iconst(types::I64, 0),
                                                 );
                                             }
+                                        }
+                                    }
+                                }
+                                HirCallable::FuncRef(func_id) => {
+                                    // Get function address as a pointer value
+                                    if let Some(&cranelift_func_id) = self.function_map.get(func_id)
+                                    {
+                                        let func_ref = self
+                                            .module
+                                            .declare_func_in_func(cranelift_func_id, builder.func);
+                                        let ptr_ty = types::I64;
+                                        let addr = builder.ins().func_addr(ptr_ty, func_ref);
+                                        if let Some(result_id) = result {
+                                            self.value_map.insert(*result_id, addr);
+                                        }
+                                    } else {
+                                        warn!(
+                                            "FuncRef: function {:?} not in function_map",
+                                            func_id
+                                        );
+                                        if let Some(result_id) = result {
+                                            let zero = builder.ins().iconst(types::I64, 0);
+                                            self.value_map.insert(*result_id, zero);
                                         }
                                     }
                                 }
@@ -5145,6 +5182,18 @@ impl CraneliftBackend {
                             if !results.is_empty() {
                                 self.value_map.insert(*result_id, results[0]);
                             }
+                        }
+                    }
+                    HirCallable::FuncRef(func_id) => {
+                        // Get function address (same as main path)
+                        let cranelift_func = self.function_map[func_id];
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(cranelift_func, builder.func);
+                        let ptr_ty = self.module.target_config().pointer_type();
+                        let addr = builder.ins().func_addr(ptr_ty, func_ref);
+                        if let Some(result_id) = result {
+                            self.value_map.insert(*result_id, addr);
                         }
                     }
                     HirCallable::Indirect(func_ptr) => {

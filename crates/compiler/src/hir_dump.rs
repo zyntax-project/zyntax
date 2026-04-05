@@ -391,6 +391,7 @@ fn fmt_callable(c: &HirCallable, mapper: &IdMapper) -> String {
         }
         HirCallable::Intrinsic(i) => format!("intrinsic.{}", fmt_intrinsic(i)),
         HirCallable::Symbol(s) => format!("sym \"{}\"", s),
+        HirCallable::FuncRef(id) => format!("funcref @{}", mapper.func_name(id)),
     }
 }
 

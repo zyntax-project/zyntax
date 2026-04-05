@@ -2524,8 +2524,29 @@ impl SsaBuilder {
                         Ok(self.read_variable(*name, block_id))
                     }
                     _ => {
-                        // If not an enum constructor, reading as undefined variable
-                        log::debug!("[SSA] Not an enum constructor, reading as undefined variable");
+                        // Check if this is a function name — emit a GetFunctionPointer call
+                        // that the Cranelift backend will resolve to func_addr
+                        if let Some(&func_id) = self.function_symbols.get(name) {
+                            log::debug!(
+                                "[SSA] Variable '{}' is a function — emitting function ref",
+                                name_str
+                            );
+                            let addr = self.create_value(HirType::I64, HirValueKind::Instruction);
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Call {
+                                    result: Some(addr),
+                                    callee: crate::hir::HirCallable::FuncRef(func_id),
+                                    args: vec![],
+                                    type_args: vec![],
+                                    const_args: vec![],
+                                    is_tail: false,
+                                },
+                            );
+                            return Ok(addr);
+                        }
+                        // Not a function — reading as undefined variable
+                        log::debug!("[SSA] Not an enum constructor or function, reading as undefined variable");
                         Ok(self.read_variable(*name, block_id))
                     }
                 }
