@@ -1,16 +1,18 @@
 //! Normalization pass — structural cleanup rewrites that run first.
 //!
-//! Two rewrites that produce real transformations:
+//! Three rewrites:
 //! - `flatten_nested_blocks`: Block containing only another Block → hoist inner statements
 //! - `unit_return_explicit`: Void function without terminal Return → append Return(None)
+//! - `fstring_to_concat`: __fstring__(parts...) → chain of string_concat + format_dynamic calls
 
 use pattern_engine::{
-    Bindings, DeclRewrite, Pattern, PatternEngine, PatternPass, Priority, RewriteOutput,
-    StmtRewrite,
+    Bindings, DeclRewrite, ExprRewrite, Pattern, PatternEngine, PatternPass, Priority,
+    RewriteOutput, StmtRewrite,
 };
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 use zyntax_typed_ast::typed_ast::*;
+use zyntax_typed_ast::InternedString;
 
 pub struct Pass;
 
@@ -26,6 +28,7 @@ impl PatternPass for Pass {
     fn register(&self, engine: &mut PatternEngine) {
         engine.register_stmt_rewrite(flatten_nested_blocks());
         engine.register_decl_rewrite(unit_return_explicit());
+        engine.register_expr_rewrite(fstring_to_concat());
     }
 }
 
@@ -120,6 +123,110 @@ fn unit_return_explicit() -> DeclRewrite {
                     matched.ty.clone(),
                     matched.span,
                 ))
+            } else {
+                RewriteOutput::Unchanged
+            }
+        },
+    )
+}
+
+/// F-string desugaring: `__fstring__(part1, part2, ...)` →
+/// `string_concat(to_string(part1), string_concat(to_string(part2), ...))`.
+///
+/// Each non-string part is wrapped in `__fstring_format__(part)` (which the
+/// runtime maps to format_dynamic). String literal parts pass through directly.
+/// Parts are chained with `string_concat(a, b)`.
+fn fstring_to_concat() -> ExprRewrite {
+    ExprRewrite::new(
+        "fstring_to_concat",
+        Priority::NORMALIZATION,
+        Pattern::new("fstring_call", |node, _ctx| {
+            if let TypedExpression::Call(call) = &node.node {
+                if let TypedExpression::Variable(name) = &call.callee.node {
+                    let n = name.resolve_global().unwrap_or_default();
+                    if n == "__fstring__" {
+                        return Some(Bindings::new());
+                    }
+                }
+            }
+            None
+        }),
+        |matched, _bindings, _builder| {
+            if let TypedExpression::Call(call) = &matched.node {
+                let parts = &call.positional_args;
+                let span = matched.span;
+                let str_ty = Type::Primitive(PrimitiveType::String);
+
+                if parts.is_empty() {
+                    return RewriteOutput::ReplaceExpr(TypedNode::new(
+                        TypedExpression::Literal(TypedLiteral::String(InternedString::new_global(
+                            "",
+                        ))),
+                        str_ty,
+                        span,
+                    ));
+                }
+
+                // Convert each part to a string-typed expression:
+                // - String literals pass through
+                // - Other values: wrap in __fstring_format__(val) call
+                let string_parts: Vec<TypedNode<TypedExpression>> = parts
+                    .iter()
+                    .map(|part| {
+                        let is_string = matches!(&part.ty, Type::Primitive(PrimitiveType::String))
+                            || matches!(
+                                &part.node,
+                                TypedExpression::Literal(TypedLiteral::String(_))
+                            );
+
+                        if is_string {
+                            part.clone()
+                        } else {
+                            // __fstring_format__(part) — the runtime resolves this to $IO$format_dynamic
+                            let format_fn = InternedString::new_global("__fstring_format__");
+                            TypedNode::new(
+                                TypedExpression::Call(TypedCall {
+                                    callee: Box::new(TypedNode::new(
+                                        TypedExpression::Variable(format_fn),
+                                        Type::Any,
+                                        span,
+                                    )),
+                                    positional_args: vec![part.clone()],
+                                    named_args: vec![],
+                                    type_args: vec![],
+                                }),
+                                str_ty.clone(),
+                                span,
+                            )
+                        }
+                    })
+                    .collect();
+
+                if string_parts.len() == 1 {
+                    return RewriteOutput::ReplaceExpr(string_parts.into_iter().next().unwrap());
+                }
+
+                // Chain: string_concat(string_concat(s1, s2), s3)
+                let concat_fn = InternedString::new_global("string_concat");
+                let mut acc = string_parts[0].clone();
+                for part in &string_parts[1..] {
+                    acc = TypedNode::new(
+                        TypedExpression::Call(TypedCall {
+                            callee: Box::new(TypedNode::new(
+                                TypedExpression::Variable(concat_fn),
+                                Type::Any,
+                                span,
+                            )),
+                            positional_args: vec![acc, part.clone()],
+                            named_args: vec![],
+                            type_args: vec![],
+                        }),
+                        str_ty.clone(),
+                        span,
+                    );
+                }
+
+                RewriteOutput::ReplaceExpr(acc)
             } else {
                 RewriteOutput::Unchanged
             }
