@@ -7761,7 +7761,7 @@ impl SsaBuilder {
     ) -> CompilerResult<HirId> {
         use zyntax_typed_ast::typed_ast::TypedLambdaBody;
 
-        // Build function signature from lambda type
+        // Build function signature from lambda type or infer from params
         let (param_types, return_type) = match closure_ty {
             Type::Function {
                 params,
@@ -7774,8 +7774,17 @@ impl SsaBuilder {
                 (hir_params, hir_return)
             }
             _ => {
-                // Fallback: no params, i32 return
-                (vec![], HirType::I32)
+                // Infer from lambda params — each untyped param becomes I64
+                let hir_params: Vec<HirType> = lambda
+                    .params
+                    .iter()
+                    .map(|p| {
+                        p.ty.as_ref()
+                            .map(|t| self.convert_type(t))
+                            .unwrap_or(HirType::I64)
+                    })
+                    .collect();
+                (hir_params, HirType::I64)
             }
         };
 
