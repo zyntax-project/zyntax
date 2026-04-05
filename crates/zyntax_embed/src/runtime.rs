@@ -1128,6 +1128,71 @@ impl ZyntaxRuntime {
                 };
                 program.type_registry.register_type(type_def);
             }
+
+            // Register enum types
+            if let TypedDeclaration::Enum(enum_decl) = &decl_node.node {
+                if program
+                    .type_registry
+                    .get_type_by_name(enum_decl.name)
+                    .is_none()
+                {
+                    let type_id = if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
+                        *id
+                    } else {
+                        TypeId::next()
+                    };
+
+                    let variants: Vec<zyntax_typed_ast::type_registry::VariantDef> = enum_decl
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            use zyntax_typed_ast::type_registry::VariantFields as VF;
+                            use zyntax_typed_ast::typed_ast::TypedVariantFields as TVF;
+                            let fields = match &v.fields {
+                                TVF::Unit => VF::Unit,
+                                TVF::Tuple(types) => VF::Tuple(types.clone()),
+                                TVF::Named(fields) => VF::Named(
+                                    fields
+                                        .iter()
+                                        .map(|f| FieldDef {
+                                            name: f.name,
+                                            ty: f.ty.clone(),
+                                            visibility: Visibility::Public,
+                                            mutability: f.mutability,
+                                            is_static: false,
+                                            span: f.span,
+                                            getter: None,
+                                            setter: None,
+                                            is_synthetic: false,
+                                        })
+                                        .collect(),
+                                ),
+                            };
+                            zyntax_typed_ast::type_registry::VariantDef {
+                                name: v.name,
+                                fields,
+                                discriminant: Some(i as i64),
+                                span: v.span,
+                            }
+                        })
+                        .collect();
+
+                    let type_def = TypeDefinition {
+                        id: type_id,
+                        name: enum_decl.name,
+                        kind: TypeKind::Enum { variants },
+                        type_params: vec![],
+                        constraints: vec![],
+                        fields: vec![],
+                        methods: vec![],
+                        constructors: vec![],
+                        metadata: Default::default(),
+                        span: enum_decl.span,
+                    };
+                    program.type_registry.register_type(type_def);
+                }
+            }
         }
 
         let arena = AstArena::new();
