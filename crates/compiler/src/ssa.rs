@@ -2995,11 +2995,64 @@ impl SsaBuilder {
                         )
                     };
 
-                // Translate arguments
+                // Arity-based dispatch: when a tensor constructor (zeros, ones)
+                // is called with an array literal shape argument, redirect to the
+                // dimension-specific variant and flatten the array elements.
+                // e.g., Tensor::zeros([2, 3]) → $Tensor$zeros_2d(2, 3)
+                // Arity-based dispatch for tensor shape constructors.
+                // Tensor::zeros([2, 3]) → $Tensor$zeros_2d(2, 3)
+                // Matches on callee function name pattern "Tensor$zeros" / "Tensor$ones".
+                let mut arity_dispatched = false;
+                let hir_callable = if args.len() == 1 {
+                    let func_name_str = callee_func_key.and_then(|k| k.resolve_global());
+                    let is_shape_constructor = func_name_str
+                        .as_ref()
+                        .map_or(false, |n| n == "Tensor$zeros" || n == "Tensor$ones");
+                    if is_shape_constructor {
+                        if let TypedExpression::Array(elements) = &args[0].node {
+                            // Map function name to the $-prefixed ZRTL symbol with arity suffix
+                            let base = if func_name_str.as_ref().unwrap().contains("zeros") {
+                                "$Tensor$zeros"
+                            } else {
+                                "$Tensor$ones"
+                            };
+                            match elements.len() {
+                                1 => {
+                                    arity_dispatched = true;
+                                    crate::hir::HirCallable::Symbol(format!("{}_1d", base))
+                                }
+                                2 => {
+                                    arity_dispatched = true;
+                                    crate::hir::HirCallable::Symbol(format!("{}_2d", base))
+                                }
+                                3 => {
+                                    arity_dispatched = true;
+                                    crate::hir::HirCallable::Symbol(format!("{}_3d", base))
+                                }
+                                _ => hir_callable,
+                            }
+                        } else {
+                            hir_callable
+                        }
+                    } else {
+                        hir_callable
+                    }
+                } else {
+                    hir_callable
+                };
+
+                // Translate arguments — flatten array literals for arity-dispatched calls
                 let mut arg_vals = Vec::new();
-                for arg in args {
-                    let arg_val = self.translate_expression(block_id, arg)?;
-                    arg_vals.push(arg_val);
+                if arity_dispatched && args.len() == 1 {
+                    if let TypedExpression::Array(elements) = &args[0].node {
+                        for elem in elements {
+                            arg_vals.push(self.translate_expression(block_id, elem)?);
+                        }
+                    }
+                } else {
+                    for arg in args {
+                        arg_vals.push(self.translate_expression(block_id, arg)?);
+                    }
                 }
 
                 // Fill in default values for missing optional arguments
