@@ -80,7 +80,15 @@ fn unit_return_explicit() -> DeclRewrite {
                 }
                 let last = body.statements.last()?;
                 if matches!(&last.node, TypedStatement::Return(_)) {
-                    return None; // already has return
+                    return None; // already has explicit return
+                }
+                // If the function body is a single bare expression, it's an
+                // implicit return — do NOT append Return(None).
+                // The CFG builder will wrap it as Return(Some(expr)).
+                if body.statements.len() == 1 {
+                    if matches!(&last.node, TypedStatement::Expression(_)) {
+                        return None; // implicit return, not void
+                    }
                 }
                 Some(Bindings::new())
             } else {
@@ -192,9 +200,26 @@ mod tests {
     #[test]
     fn test_unit_return_explicit() {
         let s = span();
+        // Use a Let + Expression body (multi-statement) so the single-expression
+        // implicit-return guard doesn't skip this function
+        let let_stmt = TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: InternedString::new_global("x"),
+                ty: Type::Primitive(PrimitiveType::I64),
+                initializer: Some(Box::new(TypedNode::new(
+                    TypedExpression::Literal(TypedLiteral::Integer(42)),
+                    Type::Primitive(PrimitiveType::I64),
+                    s,
+                ))),
+                mutability: zyntax_typed_ast::type_registry::Mutability::Immutable,
+                span: s,
+            }),
+            Type::Primitive(PrimitiveType::Unit),
+            s,
+        );
         let expr_stmt = TypedNode::new(
             TypedStatement::Expression(Box::new(TypedNode::new(
-                TypedExpression::Literal(TypedLiteral::Integer(42)),
+                TypedExpression::Variable(InternedString::new_global("x")),
                 Type::Primitive(PrimitiveType::I64),
                 s,
             ))),
@@ -206,7 +231,7 @@ mod tests {
             name: InternedString::new_global("foo"),
             return_type: Type::Primitive(PrimitiveType::Unit),
             body: Some(TypedBlock {
-                statements: vec![expr_stmt],
+                statements: vec![let_stmt, expr_stmt],
                 span: s,
             }),
             ..Default::default()
@@ -245,19 +270,37 @@ mod tests {
     #[test]
     fn test_idempotent() {
         let s = span();
+        // Multi-statement void function (not single-expression implicit return)
         let func = TypedFunction {
             name: InternedString::new_global("bar"),
             return_type: Type::Primitive(PrimitiveType::Unit),
             body: Some(TypedBlock {
-                statements: vec![TypedNode::new(
-                    TypedStatement::Expression(Box::new(TypedNode::new(
-                        TypedExpression::Literal(TypedLiteral::Integer(1)),
-                        Type::Primitive(PrimitiveType::I64),
+                statements: vec![
+                    TypedNode::new(
+                        TypedStatement::Let(TypedLet {
+                            name: InternedString::new_global("x"),
+                            ty: Type::Primitive(PrimitiveType::I64),
+                            initializer: Some(Box::new(TypedNode::new(
+                                TypedExpression::Literal(TypedLiteral::Integer(1)),
+                                Type::Primitive(PrimitiveType::I64),
+                                s,
+                            ))),
+                            mutability: zyntax_typed_ast::type_registry::Mutability::Immutable,
+                            span: s,
+                        }),
+                        Type::Primitive(PrimitiveType::Unit),
                         s,
-                    ))),
-                    Type::Primitive(PrimitiveType::Unit),
-                    s,
-                )],
+                    ),
+                    TypedNode::new(
+                        TypedStatement::Expression(Box::new(TypedNode::new(
+                            TypedExpression::Variable(InternedString::new_global("x")),
+                            Type::Primitive(PrimitiveType::I64),
+                            s,
+                        ))),
+                        Type::Primitive(PrimitiveType::Unit),
+                        s,
+                    ),
+                ],
                 span: s,
             }),
             ..Default::default()

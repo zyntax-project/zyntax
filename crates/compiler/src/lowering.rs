@@ -1605,6 +1605,33 @@ impl LoweringContext {
         }
     }
 
+    /// Check if a function body returns a value — either via explicit `return <expr>`
+    /// or via an implicit single-expression body (matching CFG builder behavior).
+    fn body_returns_value(func_name: &str, body: &zyntax_typed_ast::typed_ast::TypedBlock) -> bool {
+        use zyntax_typed_ast::typed_ast::TypedStatement;
+
+        // Explicit return statements always indicate a returning function
+        let has_explicit_return = body
+            .statements
+            .iter()
+            .any(|stmt| matches!(&stmt.node, TypedStatement::Return(Some(_))));
+        if has_explicit_return {
+            return true;
+        }
+
+        // Implicit single-expression return (matching CFG builder behavior at line 1365):
+        // A function body with exactly one statement that is a bare expression
+        // is treated as an implicit return by the CFG builder.
+        // Skip for main() — it's always void.
+        if func_name != "main" && body.statements.len() == 1 {
+            if let TypedStatement::Expression(_) = &body.statements[0].node {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Collect all declarations for forward references
     fn collect_declarations(&mut self, program: &TypedProgram) -> CompilerResult<()> {
         for decl in &program.declarations {
@@ -1619,15 +1646,12 @@ impl LoweringContext {
                         func.return_type,
                         zyntax_typed_ast::Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)
                     ) {
-                        let has_return_with_value = func.body.as_ref().map_or(false, |body| {
-                            body.statements.iter().any(|stmt| {
-                                matches!(
-                                    &stmt.node,
-                                    zyntax_typed_ast::typed_ast::TypedStatement::Return(Some(_))
-                                )
-                            })
-                        });
-                        if has_return_with_value {
+                        let fn_name = func.name.resolve_global().unwrap_or_default();
+                        let returns_value = func
+                            .body
+                            .as_ref()
+                            .map_or(false, |b| Self::body_returns_value(&fn_name, b));
+                        if returns_value {
                             zyntax_typed_ast::Type::Dynamic
                         } else {
                             func.return_type.clone()
@@ -2120,27 +2144,50 @@ impl LoweringContext {
         // the function has a Dynamic return type — evaluated at runtime as i64.
         let hir_return_type = self.convert_type(&func.return_type);
         let returns = if matches!(hir_return_type, HirType::Void) {
-            let has_return_with_value = func.body.as_ref().map_or(false, |body| {
-                body.statements.iter().any(|stmt| {
-                    matches!(
-                        &stmt.node,
-                        zyntax_typed_ast::typed_ast::TypedStatement::Return(Some(_))
-                    )
-                })
-            });
-            if has_return_with_value {
-                self.emit_diagnostic(
-                    LoweringDiagnostic::warning(format!(
-                        "function `{}` returns a value but has no return type annotation",
-                        func_name
-                    ))
-                    .with_code(zyntax_typed_ast::diagnostics::codes::W0002)
-                    .with_help(format!(
-                        "consider adding a return type annotation to `{}`",
-                        func_name
-                    ))
-                    .with_note("the return type will be inferred dynamically at runtime"),
-                );
+            let returns_value = func
+                .body
+                .as_ref()
+                .map_or(false, |b| Self::body_returns_value(&func_name, b));
+            if returns_value {
+                // Only warn for user-defined functions, not internal/stdlib
+                let is_internal = func_name == "main"
+                    || func_name.starts_with('$')
+                    || func_name.starts_with("__")
+                    || func_name.contains('$')
+                    || matches!(
+                        func_name.as_str(),
+                        "for_each"
+                            | "map"
+                            | "filter"
+                            | "fold"
+                            | "reduce"
+                            | "enumerate"
+                            | "zip"
+                            | "take"
+                            | "skip"
+                            | "println"
+                            | "print"
+                            | "eprintln"
+                            | "eprint"
+                            | "println_dynamic"
+                            | "print_dynamic"
+                            | "format_dynamic"
+                            | "to_string"
+                    );
+                if !is_internal {
+                    self.emit_diagnostic(
+                        LoweringDiagnostic::warning(format!(
+                            "function `{}` returns a value but has no return type annotation",
+                            func_name
+                        ))
+                        .with_code(zyntax_typed_ast::diagnostics::codes::W0002)
+                        .with_help(format!(
+                            "consider adding a return type annotation to `{}`",
+                            func_name
+                        ))
+                        .with_note("the return type will be inferred dynamically at runtime"),
+                    );
+                }
                 // Dynamic maps to I64 at the machine level
                 vec![HirType::I64]
             } else {
