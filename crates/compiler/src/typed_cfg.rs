@@ -1455,6 +1455,8 @@ impl TypedCfgBuilder {
                     _ => return None, // Other literals not yet supported
                 };
 
+                // Use the scrutinee's type for the comparison — ensures both sides
+                // have matching types in the Cranelift verifier.
                 // Generate: scrutinee == literal
                 Some(typed_node(
                     TypedExpression::Binary(TypedBinary {

@@ -1344,7 +1344,19 @@ impl CraneliftBackend {
                                         }
                                         _ => unreachable!(),
                                     };
-                                    // icmp always returns i8 (bool) - no extension needed
+                                    // Widen operands to match types if needed (e.g., i32 vs i64)
+                                    let lhs_ty = builder.func.dfg.value_type(lhs);
+                                    let rhs_ty = builder.func.dfg.value_type(rhs);
+                                    let (lhs, rhs) =
+                                        if lhs_ty != rhs_ty && lhs_ty.is_int() && rhs_ty.is_int() {
+                                            if lhs_ty.bits() < rhs_ty.bits() {
+                                                (builder.ins().sextend(rhs_ty, lhs), rhs)
+                                            } else {
+                                                (lhs, builder.ins().sextend(lhs_ty, rhs))
+                                            }
+                                        } else {
+                                            (lhs, rhs)
+                                        };
                                     builder.ins().icmp(cc, lhs, rhs)
                                 }
                                 BinaryOp::FAdd => builder.ins().fadd(lhs, rhs),
