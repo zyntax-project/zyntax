@@ -28,11 +28,11 @@ def main() {
     let avg = a.mean()
     println(f"Mean of a: {avg}")
 
-    // Create matrices
-    let matrix = Tensor::zeros([2, 3])
+    // Create matrices (use _2d convenience API for correct shape)
+    let matrix = Tensor::zeros_2d(2, 3)
     println(f"2x3 zeros matrix: {matrix}")
 
-    let ones = Tensor::ones([3, 2])
+    let ones = Tensor::ones_2d(3, 2)
     println(f"3x2 ones matrix: {ones}")
 
     println("Done!")
