@@ -2726,8 +2726,11 @@ struct_literal = { type_name:identifier ~ "{" ~ fields:struct_literal_fields? ~ 
       fields: fields,
   }
 
-struct_literal_fields = { f:struct_literal_field ~ ("," ~ f:struct_literal_field)* }
+struct_literal_field_comma = { "," ~ f:struct_literal_field }
   -> f
+
+struct_literal_fields = { first:struct_literal_field ~ rest:struct_literal_field_comma* }
+  -> prepend_list(first, rest)
 
 struct_literal_field = { name:identifier ~ ":" ~ value:expr }
   -> TypedFieldInit {

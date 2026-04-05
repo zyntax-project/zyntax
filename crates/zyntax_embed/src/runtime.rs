@@ -1074,42 +1074,59 @@ impl ZyntaxRuntime {
                     continue;
                 }
 
-                // Check if this is a struct (no methods, just fields)
-                // Create TypeDefinition and register it
-                if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
-                    let field_defs: Vec<FieldDef> = class
-                        .fields
-                        .iter()
-                        .map(|f| FieldDef {
-                            name: f.name,
-                            ty: f.ty.clone(),
-                            visibility: f.visibility,
-                            mutability: f.mutability,
-                            is_static: f.is_static,
-                            span: f.span,
-                            getter: None,
-                            setter: None,
-                            is_synthetic: false,
-                        })
-                        .collect();
+                // Register the struct type. Use the TypeId from the declaration
+                // node if available, otherwise generate a fresh one (Grammar2
+                // parser sets ty: Type::Never instead of Type::Named).
+                let type_id = if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
+                    *id
+                } else {
+                    TypeId::next()
+                };
 
-                    let type_def = TypeDefinition {
-                        id: *id,
-                        name: class.name,
-                        kind: TypeKind::Struct {
-                            fields: field_defs.clone(),
-                            is_tuple: false,
-                        },
-                        type_params: vec![],
-                        constraints: vec![],
-                        fields: field_defs,
-                        methods: vec![],
-                        constructors: vec![],
-                        metadata: Default::default(),
-                        span: class.span,
-                    };
-                    program.type_registry.register_type(type_def);
-                }
+                let field_defs: Vec<FieldDef> = class
+                    .fields
+                    .iter()
+                    .map(|f| FieldDef {
+                        name: f.name,
+                        ty: f.ty.clone(),
+                        visibility: f.visibility,
+                        mutability: f.mutability,
+                        is_static: f.is_static,
+                        span: f.span,
+                        getter: None,
+                        setter: None,
+                        is_synthetic: false,
+                    })
+                    .collect();
+
+                let type_params: Vec<TypeParam> = class
+                    .type_params
+                    .iter()
+                    .map(|tp| TypeParam {
+                        name: tp.name,
+                        bounds: vec![],
+                        variance: Variance::Invariant,
+                        default: tp.default.clone(),
+                        span: tp.span,
+                    })
+                    .collect();
+
+                let type_def = TypeDefinition {
+                    id: type_id,
+                    name: class.name,
+                    kind: TypeKind::Struct {
+                        fields: field_defs.clone(),
+                        is_tuple: false,
+                    },
+                    type_params,
+                    constraints: vec![],
+                    fields: field_defs,
+                    methods: vec![],
+                    constructors: vec![],
+                    metadata: Default::default(),
+                    span: class.span,
+                };
+                program.type_registry.register_type(type_def);
             }
         }
 
@@ -3550,46 +3567,47 @@ impl TieredRuntime {
             type_registry::*, AstArena, InternedString, TypeRegistry, TypedDeclaration,
         };
 
-        // Rebuild type registry from declarations (TypeRegistry is not serializable)
-        // Scan for struct definitions (TypedDeclaration::Class) and register them
+        // Rebuild type registry from declarations
         for decl_node in &program.declarations {
             if let TypedDeclaration::Class(class) = &decl_node.node {
-                // Check if this is a struct (no methods, just fields)
-                // Create TypeDefinition and register it
-                if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
-                    let field_defs: Vec<FieldDef> = class
-                        .fields
-                        .iter()
-                        .map(|f| FieldDef {
-                            name: f.name,
-                            ty: f.ty.clone(),
-                            visibility: f.visibility,
-                            mutability: f.mutability,
-                            is_static: f.is_static,
-                            span: f.span,
-                            getter: None,
-                            setter: None,
-                            is_synthetic: false,
-                        })
-                        .collect();
+                let type_id = if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
+                    *id
+                } else {
+                    TypeId::next()
+                };
 
-                    let type_def = TypeDefinition {
-                        id: *id,
-                        name: class.name,
-                        kind: TypeKind::Struct {
-                            fields: field_defs.clone(),
-                            is_tuple: false,
-                        },
-                        type_params: vec![],
-                        constraints: vec![],
-                        fields: field_defs,
-                        methods: vec![],
-                        constructors: vec![],
-                        metadata: Default::default(),
-                        span: class.span,
-                    };
-                    program.type_registry.register_type(type_def);
-                }
+                let field_defs: Vec<FieldDef> = class
+                    .fields
+                    .iter()
+                    .map(|f| FieldDef {
+                        name: f.name,
+                        ty: f.ty.clone(),
+                        visibility: f.visibility,
+                        mutability: f.mutability,
+                        is_static: f.is_static,
+                        span: f.span,
+                        getter: None,
+                        setter: None,
+                        is_synthetic: false,
+                    })
+                    .collect();
+
+                let type_def = TypeDefinition {
+                    id: type_id,
+                    name: class.name,
+                    kind: TypeKind::Struct {
+                        fields: field_defs.clone(),
+                        is_tuple: false,
+                    },
+                    type_params: vec![],
+                    constraints: vec![],
+                    fields: field_defs,
+                    methods: vec![],
+                    constructors: vec![],
+                    metadata: Default::default(),
+                    span: class.span,
+                };
+                program.type_registry.register_type(type_def);
             }
         }
 
