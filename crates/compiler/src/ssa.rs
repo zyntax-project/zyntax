@@ -1400,36 +1400,21 @@ impl SsaBuilder {
                     // If so, subsequent writes should go to that block
                     let write_block = self.continuation_block.unwrap_or(block_id);
 
-                    // Record variable type (both HIR and TypedAST versions)
-                    let hir_type = self.convert_type(&let_stmt.ty);
+                    // Record variable type (both HIR and TypedAST versions).
+                    // If let binding has no annotation (Type::Any/Unknown), resolve
+                    // the actual type from the initializer expression so subsequent
+                    // field access can find the struct type.
+                    let effective_ty = if matches!(let_stmt.ty, Type::Any | Type::Unknown) {
+                        self.resolve_expr_type(value)
+                    } else {
+                        let_stmt.ty.clone()
+                    };
+                    let hir_type = self.convert_type(&effective_ty);
                     self.var_types.insert(let_stmt.name, hir_type.clone());
 
                     // For TypedAST type, use initializer's type if variable type is Any/Unknown
                     // This works around the issue where type inference doesn't update the AST
-                    let typed_ast_type = if matches!(let_stmt.ty, Type::Any | Type::Unknown) {
-                        // For unary expressions, the node type may also be Unknown;
-                        // in that case, look through to the operand's type
-                        let init_ty = &value.ty;
-                        if matches!(init_ty, Type::Any | Type::Unknown) {
-                            if let TypedExpression::Unary(unary) = &value.node {
-                                let operand_ty = self
-                                    .resolve_actual_type(&unary.operand.node, &unary.operand.ty);
-                                if !matches!(operand_ty, Type::Any | Type::Unknown) {
-                                    operand_ty
-                                } else {
-                                    init_ty.clone()
-                                }
-                            } else {
-                                init_ty.clone()
-                            }
-                        } else {
-                            init_ty.clone()
-                        }
-                    } else {
-                        let_stmt.ty.clone()
-                    };
-                    self.var_typed_ast_types
-                        .insert(let_stmt.name, typed_ast_type);
+                    self.var_typed_ast_types.insert(let_stmt.name, effective_ty);
 
                     // Check if this variable has its address taken
                     if self.address_taken_vars.contains(&let_stmt.name) {
@@ -3341,18 +3326,9 @@ impl SsaBuilder {
                 let field = &field_access.field;
                 let object_val = self.translate_expression(block_id, object)?;
 
-                // Resolve actual type - if object is a variable, look up its type from var_types
-                let object_type = if let TypedExpression::Variable(var_name) = &object.node {
-                    // Variable - get actual type from var_types (which was updated during type resolution)
-                    if let Some(hir_type) = self.var_types.get(var_name) {
-                        // Convert HIR type back to TypedAST Type for get_field_index
-                        self.hir_type_to_typed_ast_type(hir_type)
-                    } else {
-                        object.ty.clone()
-                    }
-                } else {
-                    object.ty.clone()
-                };
+                // Resolve actual type — handles both variables (via var_typed_ast_types)
+                // and nested field accesses (via type registry walk)
+                let object_type = self.resolve_expr_type(object);
 
                 // Special case: accessing 'value' field on an abstract type
                 // Abstract types are zero-cost - they ARE their underlying value
@@ -3398,7 +3374,21 @@ impl SsaBuilder {
                     return Ok(object_val);
                 }
 
-                let result_type = self.convert_type(&expr.ty);
+                // Resolve the field's actual type from the struct definition.
+                // The expr.ty may be Type::Unknown if the parser didn't propagate types.
+                let result_type = if matches!(&expr.ty, Type::Unknown | Type::Any) {
+                    if let Type::Named { id, .. } = &object_type {
+                        self.type_registry
+                            .get_type_by_id(*id)
+                            .and_then(|td| td.fields.get(field_index as usize))
+                            .map(|f| self.convert_type(&f.ty))
+                            .unwrap_or_else(|| self.convert_type(&expr.ty))
+                    } else {
+                        self.convert_type(&expr.ty)
+                    }
+                } else {
+                    self.convert_type(&expr.ty)
+                };
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let inst = HirInstruction::ExtractValue {
@@ -6111,6 +6101,43 @@ impl SsaBuilder {
                 fallback.clone()
             }
             _ => fallback.clone(),
+        }
+    }
+
+    /// Resolve the actual type of any expression node, handling cases where
+    /// the parser left expr.ty as Type::Any/Unknown. Recursively resolves
+    /// field accesses by looking up the field type in the registry.
+    fn resolve_expr_type(
+        &self,
+        node: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> Type {
+        use zyntax_typed_ast::typed_ast::TypedExpression;
+
+        // If the parser already gave us a real type, use it
+        if !matches!(node.ty, Type::Any | Type::Unknown) {
+            return node.ty.clone();
+        }
+
+        match &node.node {
+            TypedExpression::Variable(name) => self
+                .var_typed_ast_types
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| node.ty.clone()),
+            TypedExpression::Field(field_access) => {
+                let object_ty = self.resolve_expr_type(&field_access.object);
+                if let Type::Named { id, .. } = &object_ty {
+                    if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
+                        for f in &type_def.fields {
+                            if f.name == field_access.field {
+                                return f.ty.clone();
+                            }
+                        }
+                    }
+                }
+                node.ty.clone()
+            }
+            _ => node.ty.clone(),
         }
     }
 
