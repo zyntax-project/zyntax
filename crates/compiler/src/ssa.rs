@@ -1064,15 +1064,36 @@ impl SsaBuilder {
             fields: field_patterns,
         } = &pattern.node
         {
+            // Resolve the struct type. For named patterns (Point { ... }) use the
+            // pattern name. For anonymous record patterns ({ ... }) fall back to
+            // the scrutinee's actual struct type from the HIR value map.
+            let resolved_name = if struct_name.resolve_global().as_deref() == Some("") {
+                self.function
+                    .values
+                    .get(&scrutinee_val)
+                    .and_then(|v| match &v.ty {
+                        HirType::Struct(st) => st.name,
+                        _ => None,
+                    })
+            } else {
+                Some(*struct_name)
+            };
+
+            let resolved_name = resolved_name.ok_or_else(|| {
+                crate::CompilerError::Analysis(
+                    "Cannot resolve struct type for record pattern".into(),
+                )
+            })?;
+
             // Snapshot field info from the type registry to avoid borrow conflict
             let field_info: Vec<(InternedString, usize, Type)> = {
                 let type_def = self
                     .type_registry
-                    .get_type_by_name(*struct_name)
+                    .get_type_by_name(resolved_name)
                     .ok_or_else(|| {
                         crate::CompilerError::Analysis(format!(
                             "Struct type {:?} not in registry",
-                            struct_name
+                            resolved_name
                         ))
                     })?;
                 type_def
@@ -1095,7 +1116,7 @@ impl SsaBuilder {
                         .ok_or_else(|| {
                             crate::CompilerError::Analysis(format!(
                                 "Field {:?} not found in struct {:?}",
-                                fp.name, struct_name
+                                fp.name, resolved_name
                             ))
                         })?
                         .clone();

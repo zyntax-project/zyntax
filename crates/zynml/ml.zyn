@@ -2158,6 +2158,7 @@ match_arm = { "case" ~ pat:pattern ~ body:block }
 // Pattern: literal, constructor, identifier (binding), or wildcard (_)
 pattern = {
     pat:pattern_tuple_two |
+    pat:pattern_record |
     pat:pattern_struct |
     pat:pattern_constructor_with_field |
     pat:pattern_constructor_unit |
@@ -2171,6 +2172,14 @@ pattern = {
 pattern_tuple_two = { "(" ~ p1:pattern ~ "," ~ p2:pattern ~ ")" }
   -> TypedPattern::Tuple {
       elements: [p1, p2],
+  }
+
+// Anonymous record pattern: { x, y } or { x: 0, y: a }
+// Matches any struct/record shape by field names — type-agnostic.
+pattern_record = { "{" ~ fields:pattern_struct_fields ~ "}" }
+  -> TypedPattern::Struct {
+      name: intern(""),
+      fields: fields,
   }
 
 // Struct pattern for destructuring: Point { x, y } or Point { x: a, y: b }
