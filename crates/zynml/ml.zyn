@@ -2158,15 +2158,33 @@ match_arm = { "case" ~ pat:pattern ~ body:block }
 // Pattern: literal, constructor, identifier (binding), or wildcard (_)
 pattern = {
     pat:pattern_tuple_two |
+    pat:pattern_array |
     pat:pattern_record |
     pat:pattern_struct |
     pat:pattern_constructor_with_field |
     pat:pattern_constructor_unit |
     pat:pattern_literal |
+    pat:pattern_rest |
     pat:pattern_wildcard |
     pat:pattern_binding
 }
   -> pat
+
+// Rest/spread pattern: `..` (ignore remaining)
+pattern_rest = { ".." }
+  -> TypedPattern::Rest {}
+
+// Array pattern: [a, b, c] or [a, b, ..] or [a, ..rest]
+pattern_array = { "[" ~ elements:pattern_array_elements? ~ "]" }
+  -> TypedPattern::Array {
+      elements: elements,
+  }
+
+pattern_array_element_comma = { "," ~ p:pattern }
+  -> p
+
+pattern_array_elements = { first:pattern ~ rest:pattern_array_element_comma* ~ ","? }
+  -> prepend_list(first, rest)
 
 // Tuple pattern for destructuring: (a, b)
 pattern_tuple_two = { "(" ~ p1:pattern ~ "," ~ p2:pattern ~ ")" }
@@ -2192,7 +2210,9 @@ pattern_struct = { name:identifier ~ "{" ~ fields:pattern_struct_fields ~ "}" }
 pattern_struct_field_comma = { "," ~ f:pattern_struct_field }
   -> f
 
-pattern_struct_fields = { first:pattern_struct_field ~ rest:pattern_struct_field_comma* ~ ","? }
+pattern_struct_fields = {
+    first:pattern_struct_field ~ rest:pattern_struct_field_comma* ~ ("," ~ "..")? ~ ","?
+}
   -> prepend_list(first, rest)
 
 // Field pattern: `x` (binds to field x) or `x: pat` (binds field x to pat)

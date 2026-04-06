@@ -1058,92 +1058,12 @@ impl SsaBuilder {
             return Ok(()); // No match context, nothing to extract
         };
 
-        // Handle struct patterns first — they don't need union_type
-        if let TypedPattern::Struct {
-            name: struct_name,
-            fields: field_patterns,
-        } = &pattern.node
-        {
-            // Resolve the struct type. For named patterns (Point { ... }) use the
-            // pattern name. For anonymous record patterns ({ ... }) fall back to
-            // the scrutinee's actual struct type from the HIR value map.
-            let resolved_name = if struct_name.resolve_global().as_deref() == Some("") {
-                self.function
-                    .values
-                    .get(&scrutinee_val)
-                    .and_then(|v| match &v.ty {
-                        HirType::Struct(st) => st.name,
-                        _ => None,
-                    })
-            } else {
-                Some(*struct_name)
-            };
-
-            let resolved_name = resolved_name.ok_or_else(|| {
-                crate::CompilerError::Analysis(
-                    "Cannot resolve struct type for record pattern".into(),
-                )
-            })?;
-
-            // Snapshot field info from the type registry to avoid borrow conflict
-            let field_info: Vec<(InternedString, usize, Type)> = {
-                let type_def = self
-                    .type_registry
-                    .get_type_by_name(resolved_name)
-                    .ok_or_else(|| {
-                        crate::CompilerError::Analysis(format!(
-                            "Struct type {:?} not in registry",
-                            resolved_name
-                        ))
-                    })?;
-                type_def
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, f)| (f.name, idx, f.ty.clone()))
-                    .collect()
-            };
-            let num_fields = field_info.len();
-
-            for fp in field_patterns {
-                if let TypedPattern::Identifier {
-                    name: bind_name, ..
-                } = &fp.pattern.node
-                {
-                    let (_, field_idx, field_ty_ast) = field_info
-                        .iter()
-                        .find(|(name, _, _)| *name == fp.name)
-                        .ok_or_else(|| {
-                            crate::CompilerError::Analysis(format!(
-                                "Field {:?} not found in struct {:?}",
-                                fp.name, resolved_name
-                            ))
-                        })?
-                        .clone();
-                    let field_ty = self.convert_type(&field_ty_ast);
-
-                    // Single-field structs are flattened by Cranelift's ABI —
-                    // the struct value IS the field value
-                    if num_fields == 1 && field_idx == 0 {
-                        self.write_variable(*bind_name, block_id, scrutinee_val);
-                        continue;
-                    }
-
-                    // Generate ExtractValue
-                    let extracted_id =
-                        self.create_value(field_ty.clone(), crate::hir::HirValueKind::Instruction);
-                    self.add_instruction(
-                        block_id,
-                        HirInstruction::ExtractValue {
-                            result: extracted_id,
-                            ty: field_ty,
-                            aggregate: scrutinee_val,
-                            indices: vec![field_idx as u32],
-                        },
-                    );
-                    self.write_variable(*bind_name, block_id, extracted_id);
-                }
-            }
+        // Handle struct/tuple/array patterns recursively (no union_type needed)
+        if matches!(
+            &pattern.node,
+            TypedPattern::Struct { .. } | TypedPattern::Tuple(_) | TypedPattern::Array(_)
+        ) {
+            self.extract_pattern_recursive(block_id, scrutinee_val, pattern)?;
             return Ok(());
         }
 
@@ -1199,6 +1119,259 @@ impl SsaBuilder {
         }
 
         Ok(())
+    }
+
+    /// Recursively extract bindings from struct/tuple patterns.
+    /// `aggregate` is the HIR value being matched against `pattern`.
+    /// `aggregate_ty` is the value's TypedAST type (if known) — used to record
+    /// types for binding identifiers so subsequent field access can resolve.
+    fn extract_pattern_recursive(
+        &mut self,
+        block_id: HirId,
+        aggregate: HirId,
+        pattern: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedPattern>,
+    ) -> CompilerResult<()> {
+        self.extract_pattern_recursive_with_ty(block_id, aggregate, None, pattern)
+    }
+
+    fn extract_pattern_recursive_with_ty(
+        &mut self,
+        block_id: HirId,
+        aggregate: HirId,
+        aggregate_ty: Option<Type>,
+        pattern: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedPattern>,
+    ) -> CompilerResult<()> {
+        use zyntax_typed_ast::typed_ast::TypedPattern;
+
+        match &pattern.node {
+            // Wildcards, literals, and rest patterns don't bind anything
+            TypedPattern::Wildcard | TypedPattern::Literal(_) | TypedPattern::Rest { .. } => Ok(()),
+
+            // Identifier pattern: bind the aggregate value directly to this name.
+            // Record both the HIR type (from value map) and TypedAST type (if provided).
+            TypedPattern::Identifier { name, .. } => {
+                self.write_variable(*name, block_id, aggregate);
+                if let Some(v) = self.function.values.get(&aggregate) {
+                    self.var_types.insert(*name, v.ty.clone());
+                }
+                if let Some(ty) = aggregate_ty {
+                    self.var_typed_ast_types.insert(*name, ty);
+                }
+                Ok(())
+            }
+
+            // Struct pattern: extract each named field and recurse into its sub-pattern
+            TypedPattern::Struct {
+                name: struct_name,
+                fields: field_patterns,
+            } => {
+                // Resolve the struct type from the aggregate's HIR type
+                let aggregate_hir_ty = self.function.values.get(&aggregate).map(|v| v.ty.clone());
+
+                let resolved_name = if struct_name.resolve_global().as_deref() == Some("") {
+                    // Anonymous record: get name from HIR type
+                    aggregate_hir_ty.as_ref().and_then(|t| match t {
+                        HirType::Struct(st) => st.name,
+                        _ => None,
+                    })
+                } else {
+                    Some(*struct_name)
+                };
+
+                let resolved_name = resolved_name.ok_or_else(|| {
+                    crate::CompilerError::Analysis(
+                        "Cannot resolve struct type for record pattern".into(),
+                    )
+                })?;
+
+                // Snapshot field info from the type registry
+                let field_info: Vec<(InternedString, usize, Type)> = {
+                    let type_def = self
+                        .type_registry
+                        .get_type_by_name(resolved_name)
+                        .ok_or_else(|| {
+                            crate::CompilerError::Analysis(format!(
+                                "Struct type {:?} not in registry",
+                                resolved_name
+                            ))
+                        })?;
+                    type_def
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, f)| (f.name, idx, f.ty.clone()))
+                        .collect()
+                };
+                let num_fields = field_info.len();
+
+                for fp in field_patterns {
+                    let (_, field_idx, field_ty_ast) = field_info
+                        .iter()
+                        .find(|(name, _, _)| *name == fp.name)
+                        .ok_or_else(|| {
+                            crate::CompilerError::Analysis(format!(
+                                "Field {:?} not found in struct {:?}",
+                                fp.name, resolved_name
+                            ))
+                        })?
+                        .clone();
+                    let field_ty = self.convert_type(&field_ty_ast);
+
+                    // Single-field structs are flattened by Cranelift's ABI
+                    let field_val = if num_fields == 1 && field_idx == 0 {
+                        aggregate
+                    } else {
+                        let extracted_id = self
+                            .create_value(field_ty.clone(), crate::hir::HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::ExtractValue {
+                                result: extracted_id,
+                                ty: field_ty,
+                                aggregate,
+                                indices: vec![field_idx as u32],
+                            },
+                        );
+                        extracted_id
+                    };
+
+                    // Recurse into the sub-pattern with the extracted value
+                    // Pass the field's TypedAST type so identifier bindings record it.
+                    self.extract_pattern_recursive_with_ty(
+                        block_id,
+                        field_val,
+                        Some(field_ty_ast),
+                        &fp.pattern,
+                    )?;
+                }
+                Ok(())
+            }
+
+            // Array pattern: load each element by index from the List's data pointer.
+            // [a, b, c] binds a, b, c to elements 0, 1, 2 of the list.
+            // [a, b, ..] (with Rest) binds first elements, ignores the rest.
+            TypedPattern::Array(element_patterns) => {
+                use zyntax_typed_ast::typed_ast::TypedPattern;
+
+                // The aggregate must be a pointer to a List struct.
+                // Use I64 as the element type — works for any pointer-sized
+                // primitive (matches array literal lowering which stores i64 elems).
+                let elem_ty = HirType::I64;
+
+                let data_ptr = self.emit_list_data_ptr(block_id, aggregate, &elem_ty)?;
+                let elem_size: i64 = 8;
+
+                for (i, elem_pat) in element_patterns.iter().enumerate() {
+                    // Stop at rest pattern
+                    if matches!(&elem_pat.node, TypedPattern::Rest { .. }) {
+                        break;
+                    }
+
+                    // Compute element pointer: data_ptr + i * elem_size
+                    let offset_const = self.create_value(
+                        HirType::I64,
+                        HirValueKind::Constant(crate::hir::HirConstant::I64(
+                            (i as i64) * elem_size,
+                        )),
+                    );
+                    let elem_ptr = self.create_value(
+                        HirType::Ptr(Box::new(elem_ty.clone())),
+                        HirValueKind::Instruction,
+                    );
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::GetElementPtr {
+                            result: elem_ptr,
+                            ty: HirType::U8, // byte-offset GEP
+                            ptr: data_ptr,
+                            indices: vec![offset_const],
+                        },
+                    );
+
+                    // Load the element
+                    let elem_val = self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Load {
+                            result: elem_val,
+                            ty: elem_ty.clone(),
+                            ptr: elem_ptr,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
+
+                    self.extract_pattern_recursive(block_id, elem_val, elem_pat)?;
+                }
+                Ok(())
+            }
+
+            // Tuple pattern: extract each element by index and recurse
+            TypedPattern::Tuple(element_patterns) => {
+                let aggregate_hir_ty = self.function.values.get(&aggregate).map(|v| v.ty.clone());
+
+                let element_types: Vec<HirType> = match &aggregate_hir_ty {
+                    Some(HirType::Struct(st)) => st.fields.clone(),
+                    _ => return Ok(()), // Can't extract — type mismatch
+                };
+
+                let num_elements = element_types.len();
+                for (i, elem_pat) in element_patterns.iter().enumerate() {
+                    if i >= num_elements {
+                        break;
+                    }
+                    let elem_hir_ty = element_types[i].clone();
+
+                    // Single-element tuples are flattened by Cranelift's ABI
+                    let elem_val = if num_elements == 1 && i == 0 {
+                        aggregate
+                    } else {
+                        let extracted_id = self.create_value(
+                            elem_hir_ty.clone(),
+                            crate::hir::HirValueKind::Instruction,
+                        );
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::ExtractValue {
+                                result: extracted_id,
+                                ty: elem_hir_ty.clone(),
+                                aggregate,
+                                indices: vec![i as u32],
+                            },
+                        );
+                        extracted_id
+                    };
+
+                    // Reconstruct a TypedAST type from the HIR type for nested
+                    // bindings (so field access on tuple elements can resolve).
+                    let elem_typed_ast_ty = match &elem_hir_ty {
+                        HirType::Struct(st) => st.name.and_then(|n| {
+                            self.type_registry
+                                .get_type_by_name(n)
+                                .map(|td| Type::Named {
+                                    id: td.id,
+                                    type_args: vec![],
+                                    const_args: vec![],
+                                    variance: vec![],
+                                    nullability:
+                                        zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+                                })
+                        }),
+                        _ => None,
+                    };
+
+                    self.extract_pattern_recursive_with_ty(
+                        block_id,
+                        elem_val,
+                        elem_typed_ast_ty,
+                        elem_pat,
+                    )?;
+                }
+                Ok(())
+            }
+
+            _ => Ok(()),
+        }
     }
 
     /// Translate enum constructors (Some, None, Ok, Err) to CreateUnion instructions

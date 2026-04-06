@@ -1530,6 +1530,25 @@ impl TypedCfgBuilder {
                 Some(combined)
             }
 
+            // Tuple pattern: AND together each element's pattern check.
+            // Element bindings (Identifier/Wildcard) don't generate checks.
+            // Note: tuple element access requires positional field access which
+            // we represent as Field with synthetic field names "_0", "_1", etc.
+            // For now we only support binding/wildcard tuples (no literal checks).
+            TypedPattern::Tuple(element_patterns) => {
+                use zyntax_typed_ast::typed_ast::TypedPattern;
+                // If any element pattern needs a check, we'd need positional
+                // field access which isn't expressible in TypedAST. For now,
+                // require all elements to be bindings or wildcards.
+                for ep in element_patterns {
+                    match &ep.node {
+                        TypedPattern::Identifier { .. } | TypedPattern::Wildcard => continue,
+                        _ => return None, // Can't generate check for nested patterns yet
+                    }
+                }
+                None // All bindings — no check needed
+            }
+
             // Other patterns not yet implemented
             _ => None,
         }
@@ -1559,14 +1578,16 @@ impl TypedCfgBuilder {
                 })
             }
 
-            // Struct patterns: SSA needs to extract field bindings.
-            // variant_index is None — struct patterns aren't union variants.
-            TypedPattern::Struct { .. } => Some(PatternCheckInfo {
-                scrutinee: scrutinee.clone(),
-                pattern: pattern.clone(),
-                variant_index: None,
-                false_target,
-            }),
+            // Struct/tuple/array patterns: SSA needs to extract bindings recursively.
+            // variant_index is None — they aren't union variants.
+            TypedPattern::Struct { .. } | TypedPattern::Tuple(_) | TypedPattern::Array(_) => {
+                Some(PatternCheckInfo {
+                    scrutinee: scrutinee.clone(),
+                    pattern: pattern.clone(),
+                    variant_index: None,
+                    false_target,
+                })
+            }
 
             // Wildcards and simple bindings don't need checks
             TypedPattern::Wildcard => None,

@@ -1627,6 +1627,14 @@ impl<'g> GrammarInterpreter<'g> {
                     fields: field_patterns,
                 }
             }
+            "Array" => {
+                let elements = self.get_field_as_pattern_list("elements", fields, state)?;
+                TypedPattern::Array(elements)
+            }
+            "Rest" => TypedPattern::Rest {
+                name: None,
+                mutability: Mutability::Immutable,
+            },
             _ => return Err(format!("unknown TypedPattern variant: {}", variant)),
         };
 
