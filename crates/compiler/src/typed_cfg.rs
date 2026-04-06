@@ -1469,6 +1469,67 @@ impl TypedCfgBuilder {
                 ))
             }
 
+            // Struct pattern: AND together each field's pattern check
+            // `Point { x: 0, y: 0 }` becomes `scrutinee.x == 0 && scrutinee.y == 0`
+            // Field bindings (`x` shorthand) don't generate checks — they always match.
+            TypedPattern::Struct {
+                fields: field_patterns,
+                ..
+            } => {
+                use zyntax_typed_ast::typed_ast::{TypedFieldAccess, TypedPattern};
+
+                let mut checks: Vec<TypedNode<TypedExpression>> = Vec::new();
+
+                for field_pat in field_patterns {
+                    // If the field pattern is a binding (Identifier) or wildcard,
+                    // it always matches — skip the check.
+                    match &field_pat.pattern.node {
+                        TypedPattern::Identifier { .. } | TypedPattern::Wildcard => continue,
+                        _ => {}
+                    }
+
+                    // Build scrutinee.field_name expression
+                    let field_access = typed_node(
+                        TypedExpression::Field(TypedFieldAccess {
+                            object: Box::new(scrutinee.clone()),
+                            field: field_pat.name,
+                        }),
+                        Type::Unknown,
+                        field_pat.pattern.span,
+                    );
+
+                    // Recursively generate the check for this field's pattern
+                    if let Some(check) = self.generate_pattern_check(
+                        &field_access,
+                        &field_pat.pattern,
+                        field_pat.pattern.span,
+                    ) {
+                        checks.push(check);
+                    }
+                }
+
+                if checks.is_empty() {
+                    // No checks needed (all bindings) — pattern always matches
+                    return None;
+                }
+
+                // AND all checks together via BitAnd (no short-circuit needed —
+                // each check is a simple field comparison and they all get evaluated)
+                let mut combined = checks[0].clone();
+                for check in &checks[1..] {
+                    combined = typed_node(
+                        TypedExpression::Binary(TypedBinary {
+                            op: BinaryOp::BitAnd,
+                            left: Box::new(combined),
+                            right: Box::new(check.clone()),
+                        }),
+                        Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool),
+                        span,
+                    );
+                }
+                Some(combined)
+            }
+
             // Other patterns not yet implemented
             _ => None,
         }
@@ -1497,6 +1558,15 @@ impl TypedCfgBuilder {
                     false_target,
                 })
             }
+
+            // Struct patterns: SSA needs to extract field bindings.
+            // variant_index is None — struct patterns aren't union variants.
+            TypedPattern::Struct { .. } => Some(PatternCheckInfo {
+                scrutinee: scrutinee.clone(),
+                pattern: pattern.clone(),
+                variant_index: None,
+                false_target,
+            }),
 
             // Wildcards and simple bindings don't need checks
             TypedPattern::Wildcard => None,

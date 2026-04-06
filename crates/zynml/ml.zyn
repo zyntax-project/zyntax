@@ -2158,6 +2158,7 @@ match_arm = { "case" ~ pat:pattern ~ body:block }
 // Pattern: literal, constructor, identifier (binding), or wildcard (_)
 pattern = {
     pat:pattern_tuple_two |
+    pat:pattern_struct |
     pat:pattern_constructor_with_field |
     pat:pattern_constructor_unit |
     pat:pattern_literal |
@@ -2170,6 +2171,35 @@ pattern = {
 pattern_tuple_two = { "(" ~ p1:pattern ~ "," ~ p2:pattern ~ ")" }
   -> TypedPattern::Tuple {
       elements: [p1, p2],
+  }
+
+// Struct pattern for destructuring: Point { x, y } or Point { x: a, y: b }
+pattern_struct = { name:identifier ~ "{" ~ fields:pattern_struct_fields ~ "}" }
+  -> TypedPattern::Struct {
+      name: intern(name),
+      fields: fields,
+  }
+
+pattern_struct_field_comma = { "," ~ f:pattern_struct_field }
+  -> f
+
+pattern_struct_fields = { first:pattern_struct_field ~ rest:pattern_struct_field_comma* ~ ","? }
+  -> prepend_list(first, rest)
+
+// Field pattern: `x` (binds to field x) or `x: pat` (binds field x to pat)
+pattern_struct_field = { f:pattern_struct_field_named | f:pattern_struct_field_short }
+  -> f
+
+pattern_struct_field_named = { name:identifier ~ ":" ~ inner:pattern }
+  -> TypedFieldPattern {
+      name: intern(name),
+      pattern: inner,
+  }
+
+pattern_struct_field_short = { name:identifier }
+  -> TypedFieldPattern {
+      name: intern(name),
+      pattern: TypedPattern::Identifier { name: intern(name) },
   }
 
 // Constructor pattern with field: Some(x), Ok(v), Err(e)

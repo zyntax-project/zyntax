@@ -673,17 +673,15 @@ impl SsaBuilder {
                     self.seal_block(block_id);
                 }
 
-                // Extract pattern bindings if this is a match arm body
+                // Extract pattern bindings if this is a match arm body.
+                // variant_index is Some for enum patterns, None for struct patterns.
                 if let Some(pattern_info) = &typed_block.pattern_check {
-                    if let Some(variant_index) = pattern_info.variant_index {
-                        if let Err(e) = self.extract_pattern_bindings(
-                            block_id,
-                            &pattern_info.pattern,
-                            variant_index,
-                        ) {
-                            *first_error.borrow_mut() = Some(e);
-                            return false;
-                        }
+                    let variant_idx = pattern_info.variant_index.unwrap_or(0);
+                    if let Err(e) =
+                        self.extract_pattern_bindings(block_id, &pattern_info.pattern, variant_idx)
+                    {
+                        *first_error.borrow_mut() = Some(e);
+                        return false;
                     }
                 }
 
@@ -740,13 +738,12 @@ impl SsaBuilder {
 
                     // Extract pattern bindings if this is a match arm body
                     if let Some(pattern_info) = &typed_block.pattern_check {
-                        if let Some(variant_index) = pattern_info.variant_index {
-                            self.extract_pattern_bindings(
-                                block_id,
-                                &pattern_info.pattern,
-                                variant_index,
-                            )?;
-                        }
+                        let variant_idx = pattern_info.variant_index.unwrap_or(0);
+                        self.extract_pattern_bindings(
+                            block_id,
+                            &pattern_info.pattern,
+                            variant_idx,
+                        )?;
                     }
 
                     // Track current block - try expressions may create continuation blocks
@@ -1045,7 +1042,7 @@ impl SsaBuilder {
     }
 
     /// Extract pattern bindings for a match arm body
-    /// Generates ExtractUnionValue instructions for pattern variables
+    /// Generates ExtractUnionValue or ExtractValue instructions for pattern variables
     fn extract_pattern_bindings(
         &mut self,
         block_id: HirId,
@@ -1060,6 +1057,74 @@ impl SsaBuilder {
         } else {
             return Ok(()); // No match context, nothing to extract
         };
+
+        // Handle struct patterns first — they don't need union_type
+        if let TypedPattern::Struct {
+            name: struct_name,
+            fields: field_patterns,
+        } = &pattern.node
+        {
+            // Snapshot field info from the type registry to avoid borrow conflict
+            let field_info: Vec<(InternedString, usize, Type)> = {
+                let type_def = self
+                    .type_registry
+                    .get_type_by_name(*struct_name)
+                    .ok_or_else(|| {
+                        crate::CompilerError::Analysis(format!(
+                            "Struct type {:?} not in registry",
+                            struct_name
+                        ))
+                    })?;
+                type_def
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, f)| (f.name, idx, f.ty.clone()))
+                    .collect()
+            };
+            let num_fields = field_info.len();
+
+            for fp in field_patterns {
+                if let TypedPattern::Identifier {
+                    name: bind_name, ..
+                } = &fp.pattern.node
+                {
+                    let (_, field_idx, field_ty_ast) = field_info
+                        .iter()
+                        .find(|(name, _, _)| *name == fp.name)
+                        .ok_or_else(|| {
+                            crate::CompilerError::Analysis(format!(
+                                "Field {:?} not found in struct {:?}",
+                                fp.name, struct_name
+                            ))
+                        })?
+                        .clone();
+                    let field_ty = self.convert_type(&field_ty_ast);
+
+                    // Single-field structs are flattened by Cranelift's ABI —
+                    // the struct value IS the field value
+                    if num_fields == 1 && field_idx == 0 {
+                        self.write_variable(*bind_name, block_id, scrutinee_val);
+                        continue;
+                    }
+
+                    // Generate ExtractValue
+                    let extracted_id =
+                        self.create_value(field_ty.clone(), crate::hir::HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::ExtractValue {
+                            result: extracted_id,
+                            ty: field_ty,
+                            aggregate: scrutinee_val,
+                            indices: vec![field_idx as u32],
+                        },
+                    );
+                    self.write_variable(*bind_name, block_id, extracted_id);
+                }
+            }
+            return Ok(());
+        }
 
         let union_type = match union_type {
             Some(ty) => ty,

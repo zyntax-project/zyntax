@@ -23,8 +23,8 @@ use zyntax_typed_ast::{
     },
     typed_node, ParameterKind, Span, TypedAnnotation, TypedAnnotationArg, TypedAnnotationValue,
     TypedBlock, TypedCall, TypedDeclaration, TypedExpression, TypedExtern, TypedExternStruct,
-    TypedFieldAccess, TypedFieldInit, TypedFor, TypedFunction, TypedIf, TypedImportItem,
-    TypedImportModifier, TypedIndex, TypedInterface, TypedLambda, TypedLambdaBody,
+    TypedFieldAccess, TypedFieldInit, TypedFieldPattern, TypedFor, TypedFunction, TypedIf,
+    TypedImportItem, TypedImportModifier, TypedIndex, TypedInterface, TypedLambda, TypedLambdaBody,
     TypedLambdaParam, TypedLet, TypedLetPattern, TypedLiteral, TypedLiteralPattern, TypedMatch,
     TypedMatchArm, TypedMethodCall, TypedNode, TypedParameter, TypedPath, TypedPattern,
     TypedProgram, TypedRange, TypedStatement, TypedStructLiteral, TypedTypeAlias, TypedTypeParam,
@@ -300,6 +300,7 @@ impl<'g> GrammarInterpreter<'g> {
             ["TypedVariant"] => self.construct_variant(fields, state, span),
             ["TypedParameter"] => self.construct_parameter(fields, state, span),
             ["TypedFieldInit"] => self.construct_field_init(fields, state, span),
+            ["TypedFieldPattern"] => self.construct_field_pattern(fields, state, span),
             ["TypedMatchArm"] => self.construct_match_arm(fields, state, span),
             ["TypedCatch"] => self.construct_catch(fields, state, span),
             ["TypedPattern", variant] => self.construct_pattern(variant, fields, state, span),
@@ -1464,6 +1465,23 @@ impl<'g> GrammarInterpreter<'g> {
         })
     }
 
+    /// Construct a TypedFieldPattern (struct pattern field).
+    /// Reuses FieldInit variant with a Pattern value (instead of Expression).
+    fn construct_field_pattern<'a>(
+        &self,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        _span: Span,
+    ) -> Result<ParsedValue, String> {
+        let name = self.get_field_as_interned("name", fields, state)?;
+        let pattern = self.get_field_as_pattern("pattern", fields, state)?;
+
+        Ok(ParsedValue::FieldInit {
+            name,
+            value: Box::new(ParsedValue::Pattern(Box::new(pattern))),
+        })
+    }
+
     /// Construct a TypedMatchArm (match arm with pattern and body)
     fn construct_match_arm<'a>(
         &self,
@@ -1598,6 +1616,15 @@ impl<'g> GrammarInterpreter<'g> {
                 TypedPattern::Constructor {
                     constructor: constructor_type,
                     pattern: Box::new(inner_pattern),
+                }
+            }
+            "Struct" => {
+                let name = self.get_field_as_interned("name", fields, state)?;
+                let field_patterns =
+                    self.get_field_as_field_pattern_list("fields", fields, state)?;
+                TypedPattern::Struct {
+                    name,
+                    fields: field_patterns,
                 }
             }
             _ => return Err(format!("unknown TypedPattern variant: {}", variant)),
@@ -3128,6 +3155,50 @@ impl<'g> GrammarInterpreter<'g> {
                 Ok(vec![p])
             }
         }
+    }
+
+    /// Get a list of TypedFieldPatterns from a field. Used for struct patterns.
+    /// Each item in the list is a `ParsedValue::FieldInit { name, value: Pattern }`.
+    fn get_field_as_field_pattern_list<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Vec<TypedFieldPattern>, String> {
+        let expr = self
+            .get_field(name, fields)
+            .ok_or_else(|| format!("missing field: {}", name))?;
+        let val = self.eval_expr(expr, state)?;
+
+        let items: Vec<ParsedValue> = match val {
+            ParsedValue::List(items) => items,
+            ParsedValue::None | ParsedValue::Optional(None) => vec![],
+            ParsedValue::Optional(Some(inner)) => match *inner {
+                ParsedValue::List(items) => items,
+                other => vec![other],
+            },
+            other => vec![other],
+        };
+
+        let mut result = Vec::new();
+        for item in items {
+            match item {
+                ParsedValue::FieldInit { name, value } => {
+                    let pattern = self.parsed_value_to_pattern(*value, state)?;
+                    result.push(TypedFieldPattern {
+                        name,
+                        pattern: Box::new(pattern),
+                    });
+                }
+                _ => {
+                    return Err(format!(
+                        "expected FieldInit in struct pattern, got {:?}",
+                        item
+                    ))
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn get_field_as_field_init_list<'a>(
