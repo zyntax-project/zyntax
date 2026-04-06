@@ -1585,10 +1585,107 @@ impl ZyntaxRuntime {
                     }
                 }
             }
+            TypedStatement::Match(match_stmt) => {
+                Self::resolve_in_expr(&mut match_stmt.scrutinee, type_registry, function_returns);
+                for arm in &mut match_stmt.arms {
+                    // Convert enum variant patterns to integer literal patterns
+                    Self::resolve_pattern(&mut arm.pattern, type_registry);
+                    if let Some(guard) = &mut arm.guard {
+                        Self::resolve_in_expr(guard, type_registry, function_returns);
+                    }
+                    Self::resolve_in_expr(&mut arm.body, type_registry, function_returns);
+                }
+            }
             _ => {
                 // Other statement types
             }
         }
+    }
+
+    /// Walk a pattern and resolve enum variant patterns to literal integer patterns.
+    /// Both `case Color::Red` (TypedPattern::Enum) and `case Red()` (TypedPattern::Constructor)
+    /// are converted to literal integer patterns matching the discriminant.
+    fn resolve_pattern(
+        pattern: &mut zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedPattern>,
+        type_registry: &zyntax_typed_ast::TypeRegistry,
+    ) {
+        use zyntax_typed_ast::type_registry::Type;
+        use zyntax_typed_ast::typed_ast::{TypedLiteralPattern, TypedPattern};
+
+        // Try TypedPattern::Enum (full path: Color::Red)
+        if let TypedPattern::Enum {
+            name,
+            variant,
+            fields,
+        } = &pattern.node
+        {
+            if fields.is_empty() {
+                let enum_name = *name;
+                let variant_name = *variant;
+                if let Some(disc) =
+                    Self::lookup_variant_discriminant(type_registry, enum_name, variant_name)
+                {
+                    pattern.node = TypedPattern::Literal(TypedLiteralPattern::Integer(disc));
+                    return;
+                }
+            }
+            return;
+        }
+
+        // Try TypedPattern::Constructor (bare name: Red() or Red)
+        // Search ALL registered enums for one with this variant name
+        if let TypedPattern::Constructor {
+            constructor,
+            pattern: inner,
+        } = &pattern.node
+        {
+            // Only handle unit constructors (wildcard inner pattern)
+            if !matches!(inner.node, TypedPattern::Wildcard) {
+                return;
+            }
+            let variant_name = if let Type::Unresolved(name) = constructor {
+                *name
+            } else {
+                return;
+            };
+
+            // Search all enum types for a variant with this name
+            for type_def in type_registry.get_all_types() {
+                if let zyntax_typed_ast::type_registry::TypeKind::Enum { variants } = &type_def.kind
+                {
+                    for v in variants {
+                        if v.name == variant_name {
+                            let disc = v.discriminant.unwrap_or(0);
+                            pattern.node =
+                                TypedPattern::Literal(TypedLiteralPattern::Integer(disc as i128));
+                            log::debug!(
+                                "[RESOLVE_TYPES] Resolved Constructor pattern {} to discriminant {}",
+                                variant_name.resolve_global().unwrap_or_default(),
+                                disc
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up an enum variant's discriminant value by enum name and variant name.
+    fn lookup_variant_discriminant(
+        type_registry: &zyntax_typed_ast::TypeRegistry,
+        enum_name: zyntax_typed_ast::InternedString,
+        variant_name: zyntax_typed_ast::InternedString,
+    ) -> Option<i128> {
+        let type_def = type_registry.get_type_by_name(enum_name)?;
+        if let zyntax_typed_ast::type_registry::TypeKind::Enum { variants } = &type_def.kind {
+            for v in variants {
+                if v.name == variant_name {
+                    return Some(v.discriminant.unwrap_or(0) as i128);
+                }
+            }
+        }
+        None
     }
 
     fn resolve_in_expr(
@@ -1799,6 +1896,38 @@ impl ZyntaxRuntime {
             TypedExpression::Struct(struct_lit) => {
                 for field in &mut struct_lit.fields {
                     Self::resolve_in_expr(&mut field.value, type_registry, function_returns);
+                }
+            }
+            TypedExpression::Path(path) => {
+                // Resolve enum unit variant paths like `Color::Green` to integer literals.
+                // Path { segments: [enum_name, variant_name] } → IntLiteral(discriminant)
+                if path.segments.len() == 2 {
+                    let enum_name = path.segments[0];
+                    let variant_name = path.segments[1];
+                    if let Some(type_def) = type_registry.get_type_by_name(enum_name) {
+                        if let zyntax_typed_ast::type_registry::TypeKind::Enum { variants } =
+                            &type_def.kind
+                        {
+                            for v in variants {
+                                if v.name == variant_name {
+                                    let disc = v.discriminant.unwrap_or(0);
+                                    expr.node = TypedExpression::Literal(
+                                        zyntax_typed_ast::typed_ast::TypedLiteral::Integer(
+                                            disc as i128,
+                                        ),
+                                    );
+                                    expr.ty = Type::Primitive(zyntax_typed_ast::PrimitiveType::I64);
+                                    log::debug!(
+                                        "[RESOLVE_TYPES] Resolved enum variant {}::{} to discriminant {}",
+                                        enum_name.resolve_global().unwrap_or_default(),
+                                        variant_name.resolve_global().unwrap_or_default(),
+                                        disc
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => {

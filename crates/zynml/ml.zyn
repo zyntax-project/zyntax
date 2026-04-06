@@ -995,8 +995,11 @@ enum_def_simple = { "enum" ~ name:identifier ~ "{" ~ variants:enum_variants ~ "}
   }
 
 // Enum variants list
-enum_variants = { variant:enum_variant ~ ("," ~ variant:enum_variant)* ~ ","? }
-  -> variant
+enum_variant_comma = { "," ~ v:enum_variant }
+  -> v
+
+enum_variants = { first:enum_variant ~ rest:enum_variant_comma* ~ ","? }
+  -> prepend_list(first, rest)
 
 // Enum variant: Name or Name(T1, T2, ...)
 // Split into tuple variant and unit variant

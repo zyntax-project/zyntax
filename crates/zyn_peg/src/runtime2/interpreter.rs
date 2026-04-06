@@ -825,6 +825,9 @@ impl<'g> GrammarInterpreter<'g> {
             TypedExpression::Call(_) => Type::Any,
             TypedExpression::Variable(_) => Type::Any,
             TypedExpression::Compute(_) => Type::Any,
+            // Path expressions (Type::method, Enum::Variant) — use Any so the
+            // resolver can infer the type from context
+            TypedExpression::Path(_) => Type::Any,
             // Struct literal gets its type from the struct name - use Unresolved for compiler to resolve
             TypedExpression::Struct(lit) => Type::Unresolved(lit.name),
             // Unary operations (negation, not) have the same type as their operand
