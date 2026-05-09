@@ -60,6 +60,7 @@ mod convert;
 mod error;
 mod grammar;
 mod grammar2;
+mod import_chain;
 pub mod iterator;
 mod runtime;
 mod string;

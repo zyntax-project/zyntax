@@ -181,17 +181,19 @@ impl ZynML {
             ),
         };
 
-        // Register stdlib import resolver in classic runtime mode.
-        if let RuntimeEngine::Classic(rt) = &mut runtime {
-            rt.add_import_resolver(Box::new(|module_name| match module_name {
+        // Register stdlib import resolver. Both engines need this so
+        // `import prelude` / `import tensor` resolve to embedded source —
+        // without it, tensor methods compile to unresolved calls and
+        // segfault at runtime.
+        let stdlib_resolver: zyntax_embed::ImportResolverCallback =
+            Box::new(|module_name| match module_name {
                 "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
                 "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
-                _ => Ok(None), // Not a stdlib module
-            }));
-        } else if config.verbose {
-            log::info!(
-                "Tiered runtime profile selected; stdlib import resolvers are not enabled in this mode"
-            );
+                _ => Ok(None),
+            });
+        match &mut runtime {
+            RuntimeEngine::Classic(rt) => rt.add_import_resolver(stdlib_resolver),
+            RuntimeEngine::Tiered(rt) => rt.add_import_resolver(stdlib_resolver),
         }
 
         // Load required plugins BEFORE registering grammar
