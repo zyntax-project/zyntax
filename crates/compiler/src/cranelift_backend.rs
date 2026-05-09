@@ -4223,6 +4223,102 @@ impl CraneliftBackend {
                             }
                         }
 
+                        // Phase E3: async state-machine slot ops.
+                        // Frame is a future-struct pointer; each slot is an
+                        // 8-byte cell at offset (slot * 8). Saves bit-cast
+                        // the value through i64; Loads bit-cast back. The
+                        // slot 0 reserved for the state-id is just an i64
+                        // store/load with no bit-cast needed.
+                        HirInstruction::AsyncSaveSlot {
+                            frame,
+                            slot,
+                            value,
+                        } => {
+                            if let (Some(&frame_val), Some(&store_val)) =
+                                (self.value_map.get(frame), self.value_map.get(value))
+                            {
+                                let actual_ty = builder.func.dfg.value_type(store_val);
+                                // Bit-cast through i64 so every slot is
+                                // uniformly 8 bytes. For ints smaller than
+                                // i64, zero-extend; for floats, bitcast;
+                                // for pointers/i64 use as-is.
+                                let i64_val = if actual_ty == types::I64 {
+                                    store_val
+                                } else if actual_ty.is_int() {
+                                    builder.ins().uextend(types::I64, store_val)
+                                } else if actual_ty == types::F32 {
+                                    let as_i32 = builder.ins().bitcast(
+                                        types::I32,
+                                        MemFlags::new(),
+                                        store_val,
+                                    );
+                                    builder.ins().uextend(types::I64, as_i32)
+                                } else if actual_ty == types::F64 {
+                                    builder.ins().bitcast(
+                                        types::I64,
+                                        MemFlags::new(),
+                                        store_val,
+                                    )
+                                } else {
+                                    builder.ins().bitcast(
+                                        types::I64,
+                                        MemFlags::new(),
+                                        store_val,
+                                    )
+                                };
+                                let flags = MemFlags::new().with_notrap();
+                                builder.ins().store(
+                                    flags,
+                                    i64_val,
+                                    frame_val,
+                                    (*slot as i32) * 8,
+                                );
+                            }
+                        }
+                        HirInstruction::AsyncLoadSlot {
+                            result,
+                            ty,
+                            frame,
+                            slot,
+                        } => {
+                            if let Some(&frame_val) = self.value_map.get(frame) {
+                                let target_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
+                                let flags = MemFlags::new().with_notrap();
+                                let raw = builder.ins().load(
+                                    types::I64,
+                                    flags,
+                                    frame_val,
+                                    (*slot as i32) * 8,
+                                );
+                                // Inverse of save's bit-cast.
+                                let typed = if target_ty == types::I64 {
+                                    raw
+                                } else if target_ty.is_int() {
+                                    builder.ins().ireduce(target_ty, raw)
+                                } else if target_ty == types::F32 {
+                                    let low = builder.ins().ireduce(types::I32, raw);
+                                    builder.ins().bitcast(
+                                        types::F32,
+                                        MemFlags::new(),
+                                        low,
+                                    )
+                                } else if target_ty == types::F64 {
+                                    builder.ins().bitcast(
+                                        types::F64,
+                                        MemFlags::new(),
+                                        raw,
+                                    )
+                                } else {
+                                    builder.ins().bitcast(
+                                        target_ty,
+                                        MemFlags::new(),
+                                        raw,
+                                    )
+                                };
+                                self.value_map.insert(*result, typed);
+                            }
+                        }
+
                         _ => {
                             // Other instructions not yet implemented
                             // This will cause values to be unmapped, leading to verifier errors

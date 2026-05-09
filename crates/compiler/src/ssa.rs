@@ -8667,6 +8667,10 @@ impl HirInstruction {
             | HirInstruction::VectorLoad { result, .. } => Some(*result),
             // VectorStore writes to memory, no result value
             HirInstruction::VectorStore { .. } => None,
+
+            // Async state-machine slot ops (Phase E1)
+            HirInstruction::AsyncLoadSlot { result, .. } => Some(*result),
+            HirInstruction::AsyncSaveSlot { .. } => None,
         }
     }
 }

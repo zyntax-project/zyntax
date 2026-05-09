@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 
 use krio_async::{AsyncHooks, FnId as KrioFnId, LivenessMap, SuspendingFns, SuspensionSite};
 use krio_stackless::CoroCfg;
+
+pub mod emit;
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
@@ -139,6 +141,20 @@ impl<'f> HirCoroCfg<'f> {
     /// for blocks not in the function (defensive).
     pub fn hir_to_block_id(&self, hir: HirId) -> Option<HirBlockId> {
         self.block_hir_to_seq.get(&hir).copied().map(HirBlockId)
+    }
+
+    /// Read-only access to the wrapped `HirFunction`. Useful for
+    /// tests + downstream consumers that need to inspect the
+    /// post-transform shape.
+    pub fn function(&self) -> &HirFunction {
+        self.function
+    }
+
+    /// Mutable access to the wrapped `HirFunction`. Phase E's save/load
+    /// emission needs this to insert HIR instructions adjacent to the
+    /// blocks krio's transform produced.
+    pub fn function_mut(&mut self) -> &mut HirFunction {
+        self.function
     }
 
     // ── Internal helpers ─────────────────────────────────────────────

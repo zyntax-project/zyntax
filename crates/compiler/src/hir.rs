@@ -690,6 +690,33 @@ pub enum HirInstruction {
         ptr: HirId,
         align: u32,
     },
+
+    /// Save an SSA value into the async state machine's frame at a
+    /// fixed slot index. Emitted by `krio_adapter` before a yielding
+    /// `Return` so the value can be reloaded on resume.
+    ///
+    /// `frame` is the future-struct pointer (the poll fn's `self`
+    /// argument). `slot` is the slot index krio's transform allocates
+    /// — one slot per unique live-across-suspension SSA value, sized
+    /// for an i64 (values are bit-cast through i64; matches the OSR
+    /// helper ABI).
+    AsyncSaveSlot {
+        frame: HirId,
+        slot: u32,
+        value: HirId,
+    },
+
+    /// Reload an SSA value from the async state machine's frame at a
+    /// fixed slot index. Emitted at the start of each resume entry
+    /// block. `result` is a fresh SSA value of `ty`; the krio_adapter
+    /// rewrites downstream uses of the original (saved) value to use
+    /// `result` after the load.
+    AsyncLoadSlot {
+        result: HirId,
+        ty: HirType,
+        frame: HirId,
+        slot: u32,
+    },
 }
 
 /// Block terminator instructions
@@ -930,6 +957,13 @@ impl HirInstruction {
                 replace(value, replacements);
                 replace(ptr, replacements);
             }
+            HirInstruction::AsyncSaveSlot { frame, value, .. } => {
+                replace(frame, replacements);
+                replace(value, replacements);
+            }
+            HirInstruction::AsyncLoadSlot { frame, .. } => {
+                replace(frame, replacements);
+            }
         }
     }
 
@@ -1106,6 +1140,13 @@ impl HirInstruction {
             HirInstruction::VectorStore { value, ptr, .. } => {
                 ops.push(*value);
                 ops.push(*ptr);
+            }
+            HirInstruction::AsyncSaveSlot { frame, value, .. } => {
+                ops.push(*frame);
+                ops.push(*value);
+            }
+            HirInstruction::AsyncLoadSlot { frame, .. } => {
+                ops.push(*frame);
             }
         }
         ops

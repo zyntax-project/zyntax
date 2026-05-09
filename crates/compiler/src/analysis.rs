@@ -487,6 +487,10 @@ impl AnalysisRunner {
             | HirInstruction::VectorLoad { result, .. } => Some(*result),
             // VectorStore only writes to memory, no result
             HirInstruction::VectorStore { .. } => None,
+
+            // Async state-machine slot ops: Load produces a result; Save is a side-effect.
+            HirInstruction::AsyncLoadSlot { result, .. } => Some(*result),
+            HirInstruction::AsyncSaveSlot { .. } => None,
         }
     }
 

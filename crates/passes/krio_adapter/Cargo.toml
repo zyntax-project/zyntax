@@ -17,6 +17,8 @@ krio-stackless = { path = "../../../../krio/crates/krio-stackless" }
 krio-core      = { path = "../../../../krio/crates/krio-core" }
 
 log = "0.4"
+indexmap = "2"
+smallvec = "1.13"
 
 [dev-dependencies]
 indexmap = "2"
