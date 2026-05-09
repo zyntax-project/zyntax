@@ -77,7 +77,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
 
     fn compile(
         &self,
-        _bead: &std::sync::Arc<Bead>,
+        bead: &std::sync::Arc<Bead>,
         def: Self::FunctionDef,
     ) -> Result<*mut (), Self::Error> {
         let tier = def.tier;
@@ -90,7 +90,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
                 .map_err(|e| {
                     CompileError::new(format!("cranelift compile_function failed: {e}"))
                 })?;
-            backend
+            let entry = backend
                 .get_function_ptr(def.id)
                 .map(|p| p as *mut ())
                 .ok_or_else(|| {
@@ -98,7 +98,23 @@ impl JitBackend for ZyntaxCraneliftBackend {
                         "cranelift produced no fn ptr for {:?}",
                         def.id
                     ))
-                })
+                })?;
+
+            // Tier ≥ 1 may have produced OSR helpers — install them
+            // alongside the new entry pointer atomically. Returning the
+            // null sentinel suppresses the broker's own swap_compiled
+            // call so the OSR-aware swap is the only one that runs.
+            let osr_pairs = backend.take_pending_osr_helpers();
+            if !osr_pairs.is_empty() {
+                let osr_entries: Vec<beadie::OsrEntry> = osr_pairs
+                    .into_iter()
+                    .map(|(site, code)| beadie::OsrEntry { site, code })
+                    .collect();
+                bead.swap_compiled_with_osr(entry, osr_entries);
+                Ok(std::ptr::null_mut())
+            } else {
+                Ok(entry)
+            }
         })
     }
 }
