@@ -304,6 +304,14 @@ impl CraneliftBackend {
         // Create JIT module and register runtime functions
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
+        // OSR runtime symbols are always available — tier-0 codegen emits
+        // probe call sites unconditionally for any loop header. In paths
+        // that don't use beadie (Classic runtime), the probe returns null
+        // harmlessly because no beads are registered.
+        for (name, ptr) in crate::osr::osr_runtime_symbols() {
+            builder.symbol(name, ptr);
+        }
+
         // Register all runtime symbols (both stdlib and frontend-specific)
         // All symbols are now provided via the plugin system
         if let Some(symbols) = additional_symbols {
@@ -968,6 +976,22 @@ impl CraneliftBackend {
 
             // Phase 1: Analyze function structure
             let block_order = self.compute_block_order(function);
+
+            // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
+            // emits OSR helpers (future increment) and skips probes.
+            let osr_loop_headers: std::collections::HashSet<HirId> = if self.compile_tier == 0 {
+                crate::osr::find_loop_headers(function).into_iter().collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+            // Stable per-function block index (matches `osr::block_index_of`).
+            let osr_block_index: HashMap<HirId, u64> = function
+                .blocks
+                .keys()
+                .enumerate()
+                .map(|(i, id)| (*id, i as u64))
+                .collect();
+            let osr_bead_id = self.compile_bead_id;
             log::debug!("[Cranelift] Compiling function: {:?}", function.name);
             log::debug!("[Cranelift] Block order: {:?} blocks", block_order.len());
             log::debug!("[Cranelift] Entry block: {:?}", function.entry_block);
@@ -1267,6 +1291,22 @@ impl CraneliftBackend {
                     if let Some(&param_val) = block_params.get(i) {
                         self.value_map.insert(phi.result, param_val);
                     }
+                }
+
+                // Tier-0 OSR back-edge probe: at every loop header, emit a
+                // sample-and-call sequence that asks the runtime whether
+                // a tier-1 OSR helper is available. For increment 3 the
+                // result is discarded — increments 5/6 will dispatch on it.
+                if osr_loop_headers.contains(hir_block_id) {
+                    let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
+                    // live_in_count = 0 for now (no tier-1 helper yet).
+                    let site_key = crate::osr::encode_osr_site(block_index, 0);
+                    emit_osr_back_edge_probe(
+                        &mut builder,
+                        &mut self.module,
+                        osr_bead_id,
+                        site_key,
+                    );
                 }
 
                 // Process all instructions in this block
@@ -6999,6 +7039,11 @@ impl CraneliftBackend {
 
         // Create new JIT module with all symbols
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // OSR runtime symbols must be re-registered on every module rebuild —
+        // tier-0 codegen emits probe call sites unconditionally for any loop.
+        for (name, ptr) in crate::osr::osr_runtime_symbols() {
+            builder.symbol(name, ptr);
+        }
         for (name, ptr) in &all_symbols {
             builder.symbol(*name, *ptr);
         }
@@ -7053,6 +7098,90 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
         HirTerminator::Unreachable => vec![],
         _ => vec![], // Handle other terminators as needed
     }
+}
+
+/// Emit a tier-0 OSR back-edge probe at the start of a loop header block.
+///
+/// Layout — three blocks added; control flow through the header becomes:
+///
+/// ```text
+///   <existing header content above>
+///   v_tick = call __zyntax_osr_sample_tick()
+///   brif v_tick, b_post_probe, b_call_probe       ;; v_tick == 0 ⇒ sample fired
+///
+/// b_call_probe:
+///   v_helper = call __zyntax_osr_probe(bead_id, site_key)
+///   ;; result discarded — increments 5/6 will dispatch on it
+///   jump b_post_probe
+///
+/// b_post_probe:
+///   <continues with the original header instructions, terminator, etc>
+/// ```
+///
+/// On exit the builder is positioned in `b_post_probe`, so subsequent
+/// instruction/terminator emission lands there. Both new blocks are
+/// sealed immediately because we know all their predecessors.
+fn emit_osr_back_edge_probe(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    bead_id: u64,
+    site_key: u64,
+) {
+    use cranelift_codegen::ir::condcodes::IntCC;
+
+    // Sample-tick signature: () -> i64
+    let mut tick_sig = module.make_signature();
+    tick_sig.returns.push(AbiParam::new(types::I64));
+    let tick_id = match module.declare_function(
+        crate::osr::OSR_SAMPLE_TICK_SYMBOL,
+        Linkage::Import,
+        &tick_sig,
+    ) {
+        Ok(id) => id,
+        Err(_) => return, // skip OSR probe on declaration failure
+    };
+    let tick_func = module.declare_func_in_func(tick_id, builder.func);
+
+    // Probe signature: (i64, i64) -> i64
+    let mut probe_sig = module.make_signature();
+    probe_sig.params.push(AbiParam::new(types::I64));
+    probe_sig.params.push(AbiParam::new(types::I64));
+    probe_sig.returns.push(AbiParam::new(types::I64));
+    let probe_id = match module.declare_function(
+        crate::osr::OSR_PROBE_SYMBOL,
+        Linkage::Import,
+        &probe_sig,
+    ) {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+    let probe_func = module.declare_func_in_func(probe_id, builder.func);
+
+    // Sample tick.
+    let tick_call = builder.ins().call(tick_func, &[]);
+    let tick_val = builder.inst_results(tick_call)[0];
+    let tick_is_zero = builder.ins().icmp_imm(IntCC::Equal, tick_val, 0);
+
+    // Three-way: header → (call_probe | post_probe), then both → post_probe.
+    let call_probe_block = builder.create_block();
+    let post_probe_block = builder.create_block();
+
+    // brif: if tick_is_zero (sample fired) take call_probe; else post_probe.
+    builder
+        .ins()
+        .brif(tick_is_zero, call_probe_block, &[], post_probe_block, &[]);
+
+    // call_probe block: invoke probe with constant args, discard result.
+    builder.switch_to_block(call_probe_block);
+    builder.seal_block(call_probe_block);
+    let bead_id_v = builder.ins().iconst(types::I64, bead_id as i64);
+    let site_v = builder.ins().iconst(types::I64, site_key as i64);
+    let _probe_call = builder.ins().call(probe_func, &[bead_id_v, site_v]);
+    builder.ins().jump(post_probe_block, &[]);
+
+    // post_probe block: the rest of the header runs here.
+    builder.switch_to_block(post_probe_block);
+    builder.seal_block(post_probe_block);
 }
 
 impl CraneliftBackend {

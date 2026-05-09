@@ -223,10 +223,9 @@ pub struct TieredBackend {
 impl TieredBackend {
     /// Build the tiered backend.
     pub fn new(config: TieredConfig) -> CompilerResult<Self> {
-        // Wire the OSR probe so JIT'd back-edge code can resolve it.
-        let (probe_name, probe_ptr) = osr::osr_probe_symbol();
-        let cranelift_inner =
-            CraneliftBackend::with_runtime_symbols(&[(probe_name, probe_ptr)])?;
+        // Wire OSR runtime symbols so JIT'd back-edge code resolves them.
+        let osr_syms = osr::osr_runtime_symbols();
+        let cranelift_inner = CraneliftBackend::with_runtime_symbols(&osr_syms)?;
         let cranelift = Arc::new(ZyntaxCraneliftBackend::new(cranelift_inner));
 
         #[cfg(feature = "llvm-backend")]

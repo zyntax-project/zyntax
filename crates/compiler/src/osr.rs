@@ -148,6 +148,9 @@ pub fn next_bead_id() -> u64 {
 /// stale one (the latter returns null cleanly).
 #[no_mangle]
 pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
+    if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+        eprintln!("[osr_probe] bead_id={} site=0x{:x}", bead_id, site);
+    }
     let registry = bead_registry().read().unwrap();
     match registry.get(&bead_id) {
         Some(bead) => bead.osr_entry(site).unwrap_or(std::ptr::null_mut()),
@@ -159,9 +162,37 @@ pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
 /// Cranelift backend's symbol table at construction.
 pub const OSR_PROBE_SYMBOL: &str = "__zyntax_osr_probe";
 
-/// `(name, function_pointer)` pair to feed
+/// Symbol name for [`osr_sample_tick`].
+pub const OSR_SAMPLE_TICK_SYMBOL: &str = "__zyntax_osr_sample_tick";
+
+/// Sampling tick called at every back-edge probe site. Returns 0 when the
+/// caller should run the (more expensive) probe lookup, non-zero
+/// otherwise. Sampling rate is 1/64.
+///
+/// Encapsulating the counter inside an extern function keeps the JIT IR
+/// short — no globals to declare, no atomic ops to emit inline. The
+/// function-call overhead is acceptable in tier 0 (which exists to be
+/// replaced); tier ≥ 1 doesn't emit this.
+///
+/// `Ordering::Relaxed` is sufficient: we only need rough sampling, not
+/// strict ordering.
+#[no_mangle]
+pub extern "C" fn osr_sample_tick() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed) & 63
+}
+
+/// `(name, function_pointer)` pairs to feed
 /// `CraneliftBackend::with_runtime_symbols` so JIT'd code can resolve
-/// `__zyntax_osr_probe` at link time.
+/// the OSR runtime functions at link time.
+pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 2] {
+    [
+        (OSR_PROBE_SYMBOL, osr_probe as *const u8),
+        (OSR_SAMPLE_TICK_SYMBOL, osr_sample_tick as *const u8),
+    ]
+}
+
+/// Backwards-compatible alias for callers that only care about the probe.
 pub fn osr_probe_symbol() -> (&'static str, *const u8) {
     (OSR_PROBE_SYMBOL, osr_probe as *const u8)
 }
