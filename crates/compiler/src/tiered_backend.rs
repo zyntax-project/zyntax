@@ -31,6 +31,7 @@ use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, Ti
 use crate::beadie_adapter::{ZyntaxCraneliftBackend, ZyntaxFunctionDef};
 use crate::cranelift_backend::CraneliftBackend;
 use crate::hir::{HirFunction, HirId, HirModule};
+use crate::osr;
 use crate::profiling::{ProfileConfig, ProfileData};
 use crate::{CompilerError, CompilerResult};
 
@@ -172,6 +173,9 @@ struct FunctionEntry {
     bound: TieredBound,
     /// Pre-cloned HIR function, captured by promotion closures.
     function: Arc<HirFunction>,
+    /// OSR registry id for this function. Embedded as a constant in
+    /// tier-0 probe call sites so JIT'd code can find the bead.
+    bead_id: u64,
 }
 
 /// Runtime symbol entry for FFI registration.
@@ -219,7 +223,11 @@ pub struct TieredBackend {
 impl TieredBackend {
     /// Build the tiered backend.
     pub fn new(config: TieredConfig) -> CompilerResult<Self> {
-        let cranelift = Arc::new(ZyntaxCraneliftBackend::new(CraneliftBackend::new()?));
+        // Wire the OSR probe so JIT'd back-edge code can resolve it.
+        let (probe_name, probe_ptr) = osr::osr_probe_symbol();
+        let cranelift_inner =
+            CraneliftBackend::with_runtime_symbols(&[(probe_name, probe_ptr)])?;
+        let cranelift = Arc::new(ZyntaxCraneliftBackend::new(cranelift_inner));
 
         #[cfg(feature = "llvm-backend")]
         let (_llvm_context, llvm) = if matches!(config.tier2_backend, Tier2Backend::LLVM) {
@@ -273,11 +281,17 @@ impl TieredBackend {
                 bound.bead().eager_install(p as *mut ());
             }
 
+            // Allocate a stable id and publish the bead in the OSR
+            // registry so JIT'd probes can find it.
+            let bead_id = osr::next_bead_id();
+            osr::register_bead(bead_id, Arc::clone(bound.bead()));
+
             self.functions.insert(
                 *func_id,
                 FunctionEntry {
                     bound,
                     function: Arc::new(function.clone()),
+                    bead_id,
                 },
             );
         }
@@ -319,6 +333,7 @@ impl TieredBackend {
 
         // Build a closure beadie can call from any tier broker thread.
         let func_arc = Arc::clone(&entry.function);
+        let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
         #[cfg(feature = "llvm-backend")]
         let llvm = self.llvm.as_ref().map(Arc::clone);
@@ -330,6 +345,7 @@ impl TieredBackend {
                 tier_idx,
                 bead,
                 func_id,
+                bead_id,
                 &func_arc,
                 &cranelift,
                 #[cfg(feature = "llvm-backend")]
@@ -357,6 +373,7 @@ impl TieredBackend {
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?;
 
         let func_arc = Arc::clone(&entry.function);
+        let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
         #[cfg(feature = "llvm-backend")]
         let llvm = self.llvm.as_ref().map(Arc::clone);
@@ -369,6 +386,7 @@ impl TieredBackend {
                 tier_idx,
                 bead,
                 func_id,
+                bead_id,
                 &func_arc,
                 &cranelift,
                 #[cfg(feature = "llvm-backend")]
@@ -417,8 +435,14 @@ impl TieredBackend {
         }
     }
 
-    /// No-op under beadie: broker threads exit on adapter `Drop`.
-    pub fn shutdown(&mut self) {}
+    /// Releases bead registrations on shutdown so a long-lived process
+    /// reusing `TieredBackend` instances doesn't leak entries.
+    pub fn shutdown(&mut self) {
+        for entry in self.functions.values() {
+            osr::unregister_bead(entry.bead_id);
+        }
+        self.functions.clear();
+    }
 
     /// Register an FFI symbol (used when reloading modules to make ZRTL
     /// plugin pointers visible to fresh Cranelift compiles).
@@ -484,6 +508,7 @@ fn compile_at_tier(
     tier_idx: usize,
     bead: &Arc<Bead>,
     func_id: HirId,
+    bead_id: u64,
     func_arc: &Arc<HirFunction>,
     cranelift: &Arc<ZyntaxCraneliftBackend>,
     #[cfg(feature = "llvm-backend")] llvm: Option<&Arc<ZyntaxLlvmBackend>>,
@@ -494,6 +519,7 @@ fn compile_at_tier(
         id: func_id,
         function: (**func_arc).clone(),
         tier: tier_idx,
+        bead_id,
     };
 
     if verbosity >= 1 {

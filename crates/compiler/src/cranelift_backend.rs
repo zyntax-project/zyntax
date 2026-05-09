@@ -228,6 +228,17 @@ pub struct CraneliftBackend {
     inferred_extern_sigs: HashMap<HirId, (Vec<HirType>, Option<HirType>)>,
     /// Effect codegen context for algebraic effects
     effect_context: EffectCodegenContext,
+    /// Tier the next `compile_function` call should target. 0 = baseline,
+    /// 1+ = optimized. Used by OSR codegen to decide whether to emit
+    /// back-edge probes (tier 0 only) and OSR helpers (tier ≥ 1 only).
+    /// Defaults to 0; set via [`Self::set_compile_tier`] before each
+    /// `compile_function` call from the tiered runtime.
+    compile_tier: usize,
+    /// Bead id this function is registered under in the OSR registry.
+    /// Embedded as a constant into probe call sites so the runtime can
+    /// look up the bead without a global function-pointer table.
+    /// Set via [`Self::set_compile_bead_id`].
+    compile_bead_id: u64,
 }
 
 /// Hot-reload state management
@@ -329,7 +340,32 @@ impl CraneliftBackend {
             external_link_names: HashMap::new(),
             inferred_extern_sigs: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
+            compile_tier: 0,
+            compile_bead_id: 0,
         })
+    }
+
+    /// Set the tier for subsequent `compile_function` calls. Read by OSR
+    /// codegen to decide whether to emit back-edge probes / helpers.
+    pub fn set_compile_tier(&mut self, tier: usize) {
+        self.compile_tier = tier;
+    }
+
+    /// Set the bead id for subsequent `compile_function` calls. Embedded
+    /// as a constant in tier-0 probe call sites so [`crate::osr::osr_probe`]
+    /// can find the bead in the registry.
+    pub fn set_compile_bead_id(&mut self, bead_id: u64) {
+        self.compile_bead_id = bead_id;
+    }
+
+    /// Tier currently configured for compilation.
+    pub fn compile_tier(&self) -> usize {
+        self.compile_tier
+    }
+
+    /// Bead id currently configured for compilation.
+    pub fn compile_bead_id(&self) -> u64 {
+        self.compile_bead_id
     }
 
     /// Register symbol signatures for auto-boxing support

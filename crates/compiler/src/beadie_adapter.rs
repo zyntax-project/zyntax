@@ -26,13 +26,14 @@ use crate::hir::{HirFunction, HirId};
 
 /// IR container handed to the JIT backend per-compile.
 ///
-/// `tier` is informational — backends that care about per-tier optimization
-/// settings can branch on it. The current Cranelift integration ignores it
-/// and always uses the same opt level (matches pre-beadie behavior).
+/// `tier` drives OSR codegen: tier 0 emits back-edge probes; tier ≥ 1
+/// emits OSR helpers and skips probes. `bead_id` is the OSR registry key
+/// embedded as a constant into tier-0 probe call sites.
 pub struct ZyntaxFunctionDef {
     pub id: HirId,
     pub function: HirFunction,
     pub tier: usize,
+    pub bead_id: u64,
 }
 
 /// Convert a beadie [`beadie::CompileError`]-bearing closure error into our
@@ -79,7 +80,11 @@ impl JitBackend for ZyntaxCraneliftBackend {
         _bead: &std::sync::Arc<Bead>,
         def: Self::FunctionDef,
     ) -> Result<*mut (), Self::Error> {
+        let tier = def.tier;
+        let bead_id = def.bead_id;
         self.with_lock(|backend| {
+            backend.set_compile_tier(tier);
+            backend.set_compile_bead_id(bead_id);
             backend
                 .compile_function(def.id, &def.function)
                 .map_err(|e| {
@@ -142,6 +147,10 @@ mod llvm_impl {
             _bead: &std::sync::Arc<Bead>,
             def: Self::FunctionDef,
         ) -> Result<*mut (), Self::Error> {
+            // LLVM tier-2 ignores `tier` / `bead_id` for now — OSR is wired
+            // through the Cranelift path (tiers 0/1) only. Once LLVM gains
+            // an OSR-aware codegen path these would propagate similarly to
+            // the Cranelift wrapper above.
             self.with_lock(|backend| {
                 backend
                     .compile_function(def.id, &def.function)
