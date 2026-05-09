@@ -1146,7 +1146,7 @@ impl CraneliftBackend {
             let block_order = self.compute_block_order(function);
 
             // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
-            // emits OSR helpers (future increment) and skips probes.
+            // emits OSR helpers (separate functions) and skips probes.
             let osr_loop_headers: std::collections::HashSet<HirId> = if self.compile_tier == 0 {
                 crate::osr::find_loop_headers(function).into_iter().collect()
             } else {
@@ -1160,6 +1160,25 @@ impl CraneliftBackend {
                 .map(|(i, id)| (*id, i as u64))
                 .collect();
             let osr_bead_id = self.compile_bead_id;
+            // Pre-resolve per-header layouts and the function's return
+            // Cranelift type. Doing this before the FunctionBuilder is
+            // created avoids re-borrowing `self` during emission.
+            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> = if self.compile_tier == 0 {
+                osr_loop_headers
+                    .iter()
+                    .filter_map(|h| {
+                        crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            let osr_return_clir: Option<cranelift_codegen::ir::Type> =
+                match function.signature.returns.as_slice() {
+                    [] => None,
+                    [ty] if !matches!(ty, HirType::Void) => self.translate_type(ty).ok(),
+                    _ => None,
+                };
             log::debug!("[Cranelift] Compiling function: {:?}", function.name);
             log::debug!("[Cranelift] Block order: {:?} blocks", block_order.len());
             log::debug!("[Cranelift] Entry block: {:?}", function.entry_block);
@@ -1463,17 +1482,48 @@ impl CraneliftBackend {
 
                 // Tier-0 OSR back-edge probe: at every loop header, emit a
                 // sample-and-call sequence that asks the runtime whether
-                // a tier-1 OSR helper is available. For increment 3 the
-                // result is discarded — increments 5/6 will dispatch on it.
+                // a tier-1 OSR helper is available. When a layout is
+                // representable, also emit the dispatch path: marshal
+                // phi results into i64 args, call_indirect the helper,
+                // return its result.
                 if osr_loop_headers.contains(hir_block_id) {
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
-                    // live_in_count = 0 for now (no tier-1 helper yet).
-                    let site_key = crate::osr::encode_osr_site(block_index, 0);
+
+                    let (site_key, live_in_clir, return_clir) =
+                        if let Some(layout) = osr_layouts.get(hir_block_id) {
+                            // Marshal phi-result Cranelift values for live-ins.
+                            let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
+                            for hir_id in &layout.live_ins {
+                                if let Some(&v) = self.value_map.get(hir_id) {
+                                    clir_vals.push(v);
+                                }
+                            }
+                            let live_ins_ok = clir_vals.len() == layout.live_ins.len();
+                            if live_ins_ok {
+                                (layout.site_key(), clir_vals, osr_return_clir)
+                            } else {
+                                (
+                                    crate::osr::encode_osr_site(block_index, 0),
+                                    Vec::new(),
+                                    None,
+                                )
+                            }
+                        } else {
+                            // Layout rejected → probe only, no dispatch.
+                            (
+                                crate::osr::encode_osr_site(block_index, 0),
+                                Vec::new(),
+                                None,
+                            )
+                        };
+
                     emit_osr_back_edge_probe(
                         &mut builder,
                         &mut self.module,
                         osr_bead_id,
                         site_key,
+                        &live_in_clir,
+                        return_clir,
                     );
                 }
 
@@ -7270,7 +7320,7 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
 
 /// Emit a tier-0 OSR back-edge probe at the start of a loop header block.
 ///
-/// Layout — three blocks added; control flow through the header becomes:
+/// Layout — control flow through the header becomes:
 ///
 /// ```text
 ///   <existing header content above>
@@ -7279,21 +7329,32 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
 ///
 /// b_call_probe:
 ///   v_helper = call __zyntax_osr_probe(bead_id, site_key)
-///   ;; result discarded — increments 5/6 will dispatch on it
-///   jump b_post_probe
+///   brif v_helper, b_dispatch, b_post_probe       ;; helper non-null ⇒ dispatch
+///
+/// b_dispatch:                                     (only when live_ins is Some)
+///   ;; marshal live-ins → 4 i64 args (pad with zero), call_indirect helper,
+///   ;; return its result
 ///
 /// b_post_probe:
 ///   <continues with the original header instructions, terminator, etc>
 /// ```
 ///
-/// On exit the builder is positioned in `b_post_probe`, so subsequent
-/// instruction/terminator emission lands there. Both new blocks are
-/// sealed immediately because we know all their predecessors.
+/// When `live_ins` is empty (layout rejected, or zero phi results), the
+/// dispatch block is skipped — the probe call is still emitted (cheap)
+/// but the result is unconditionally discarded. This keeps the probe
+/// instruction shape stable across loops with different layouts and
+/// makes the symbol-resolution path uniform.
+///
+/// On exit the builder is positioned in `b_post_probe` so subsequent
+/// instruction/terminator emission lands there.
+#[allow(clippy::too_many_arguments)]
 fn emit_osr_back_edge_probe(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     bead_id: u64,
     site_key: u64,
+    live_ins: &[cranelift_codegen::ir::Value],
+    return_clir: Option<cranelift_codegen::ir::Type>,
 ) {
     use cranelift_codegen::ir::condcodes::IntCC;
 
@@ -7306,7 +7367,7 @@ fn emit_osr_back_edge_probe(
         &tick_sig,
     ) {
         Ok(id) => id,
-        Err(_) => return, // skip OSR probe on declaration failure
+        Err(_) => return,
     };
     let tick_func = module.declare_func_in_func(tick_id, builder.func);
 
@@ -7325,31 +7386,115 @@ fn emit_osr_back_edge_probe(
     };
     let probe_func = module.declare_func_in_func(probe_id, builder.func);
 
+    // Helper signature for indirect call: (i64,i64,i64,i64) -> return_clir.
+    // Built only if dispatch is possible.
+    let dispatch_enabled = !live_ins.is_empty() || return_clir.is_some();
+    let helper_sig_ref = if dispatch_enabled {
+        let mut hs = module.make_signature();
+        for _ in 0..crate::osr::OSR_MAX_LIVE_INS {
+            hs.params.push(AbiParam::new(types::I64));
+        }
+        if let Some(rt) = return_clir {
+            hs.returns.push(AbiParam::new(rt));
+        }
+        Some(builder.import_signature(hs))
+    } else {
+        None
+    };
+
     // Sample tick.
     let tick_call = builder.ins().call(tick_func, &[]);
     let tick_val = builder.inst_results(tick_call)[0];
     let tick_is_zero = builder.ins().icmp_imm(IntCC::Equal, tick_val, 0);
 
-    // Three-way: header → (call_probe | post_probe), then both → post_probe.
     let call_probe_block = builder.create_block();
     let post_probe_block = builder.create_block();
+    let dispatch_block = if helper_sig_ref.is_some() {
+        Some(builder.create_block())
+    } else {
+        None
+    };
 
-    // brif: if tick_is_zero (sample fired) take call_probe; else post_probe.
     builder
         .ins()
         .brif(tick_is_zero, call_probe_block, &[], post_probe_block, &[]);
 
-    // call_probe block: invoke probe with constant args, discard result.
+    // call_probe block: ask the runtime for a helper.
     builder.switch_to_block(call_probe_block);
     builder.seal_block(call_probe_block);
     let bead_id_v = builder.ins().iconst(types::I64, bead_id as i64);
     let site_v = builder.ins().iconst(types::I64, site_key as i64);
-    let _probe_call = builder.ins().call(probe_func, &[bead_id_v, site_v]);
-    builder.ins().jump(post_probe_block, &[]);
+    let probe_call = builder.ins().call(probe_func, &[bead_id_v, site_v]);
+    let helper_ptr = builder.inst_results(probe_call)[0];
 
-    // post_probe block: the rest of the header runs here.
+    if let (Some(disp), Some(sig_ref)) = (dispatch_block, helper_sig_ref) {
+        // helper_ptr non-zero ⇒ dispatch; zero ⇒ continue.
+        builder
+            .ins()
+            .brif(helper_ptr, disp, &[], post_probe_block, &[]);
+
+        // dispatch block: marshal live-ins to 4 i64s, call_indirect, return.
+        builder.switch_to_block(disp);
+        builder.seal_block(disp);
+
+        let mut args: [cranelift_codegen::ir::Value; 4] = [
+            builder.ins().iconst(types::I64, 0),
+            builder.ins().iconst(types::I64, 0),
+            builder.ins().iconst(types::I64, 0),
+            builder.ins().iconst(types::I64, 0),
+        ];
+        for (i, &v) in live_ins.iter().take(4).enumerate() {
+            args[i] = marshal_to_i64(builder, v);
+        }
+        let dispatch_call = builder.ins().call_indirect(sig_ref, helper_ptr, &args);
+        let results: smallvec::SmallVec<[cranelift_codegen::ir::Value; 1]> = builder
+            .inst_results(dispatch_call)
+            .iter()
+            .copied()
+            .collect();
+        builder.ins().return_(&results);
+    } else {
+        // No dispatch — discard the probe result and fall through.
+        builder.ins().jump(post_probe_block, &[]);
+    }
+
     builder.switch_to_block(post_probe_block);
     builder.seal_block(post_probe_block);
+}
+
+/// Bit-cast / zero-extend a Cranelift value to i64 for the OSR helper ABI.
+fn marshal_to_i64(
+    builder: &mut FunctionBuilder<'_>,
+    v: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let ty = builder.func.dfg.value_type(v);
+    if ty == types::I64 {
+        v
+    } else if ty.is_int() {
+        // Smaller int → zero-extend.
+        builder.ins().uextend(types::I64, v)
+    } else if ty == types::F32 {
+        // F32 → reinterpret as i32 → zero-extend.
+        let as_i32 = builder.ins().bitcast(
+            types::I32,
+            cranelift_codegen::ir::MemFlags::new(),
+            v,
+        );
+        builder.ins().uextend(types::I64, as_i32)
+    } else if ty == types::F64 {
+        builder.ins().bitcast(
+            types::I64,
+            cranelift_codegen::ir::MemFlags::new(),
+            v,
+        )
+    } else {
+        // Pointers / other 64-bit values: reinterpret directly.
+        builder.ins().bitcast(
+            types::I64,
+            cranelift_codegen::ir::MemFlags::new(),
+            v,
+        )
+    }
 }
 
 impl CraneliftBackend {
