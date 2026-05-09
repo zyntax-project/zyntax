@@ -744,3 +744,303 @@ at the back-edge. The OSR helper just receives them as ordinary
 function arguments. No "reconstruct interpreter state into JIT shape"
 glue — that whole class of bug (the `param_regs` filtering and bounds
 checks in wren_lift's `try_enter_loop_osr`) doesn't exist for us.
+
+---
+
+## Implementation Plan: Increments 3-6
+
+**Status as of 2026-05-09:** Increments 1-2 (foundation) are committed.
+`crates/compiler/src/osr.rs` exposes `bead_registry`, `register_bead`,
+`osr_probe`, `next_bead_id`, `find_loop_headers`. `TieredBackend` registers
+each function's bead and threads `bead_id` through the compile closure.
+`CraneliftBackend` has `set_compile_tier` / `set_compile_bead_id` setters.
+
+What follows is the concrete plan for the remaining increments.
+
+### Increment 3 — tier-0 back-edge probe emission
+
+**Goal:** when `self.compile_tier == 0`, emit a sample-and-call probe at
+every loop header. Result is discarded for now (tier-1 emits no helpers
+yet, so the registry's `osr_entry` always returns null). This proves the
+bead_id constant and probe symbol resolution are correct without
+committing to the helper-call ABI.
+
+**Where to hook in `cranelift_backend.rs`:**
+
+The block emission loop runs at lines 1227-1241 (`for hir_block_id in &block_order { ... switch_to_block ... }`).
+The phi mapping at lines 1259-1270 happens immediately after `switch_to_block`.
+Inject probe emission between the phi mapping (line 1270) and the
+instruction loop (line 1273).
+
+**Pre-pass at function entry:** before the block emission loop, compute
+`let loop_headers: HashSet<HirId> = osr::find_loop_headers(function).into_iter().collect();`
+once. Store on `self` or pass into the block loop.
+
+**Probe code shape per loop header (Cranelift IR):**
+
+```cranelift
+;; --- Pre-existing: phi result mapping done above ---
+
+;; Emit at start of every loop-header block when compile_tier == 0.
+;; Block layout: split off three new blocks BEFORE processing the
+;; original block's instructions. The instructions then continue in
+;; the post_probe block.
+
+  v_counter = atomic_load.i64 [acquire]   notrap, sample_counter_addr
+  v_next    = iadd_imm v_counter, 1
+              atomic_store.i64 [release] notrap, v_next, sample_counter_addr
+  v_mask    = band_imm v_next, 63
+              brif v_mask, b_post_probe, b_call_probe   ;; brif: nonzero → take
+
+b_call_probe:
+  v_bead_id = iconst.i64 <bead_id>
+  v_site    = iconst.i64 <site_key>
+  ;; Result discarded for now — increment 5 will dispatch on it.
+              call __zyntax_osr_probe(v_bead_id, v_site)
+              jump b_post_probe
+
+b_post_probe:
+  ;; Original instructions of the loop header continue here.
+```
+
+**Sample counter:** declare `pub static OSR_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);`
+in `osr.rs`. Register the *address of the counter* as a runtime symbol
+named `__zyntax_osr_sample_counter` (similar to how `__zyntax_osr_probe`
+is registered). Cranelift emits an `atomic_load` / `atomic_store`
+against this symbol's address. `Ordering::Relaxed` is sufficient — we
+need rough sampling, not strict ordering. Memory contention on a global
+counter is acceptable in tier 0 (which exists to be replaced).
+
+**Site key:** for increment 3, encode `live_in_count = 0` because
+helpers haven't been emitted yet. Increment 4-5 will compute the
+correct count and re-emit at the same site key.
+
+**Verification:** run `hello_simple.zynml`, `compute_simd.zynml`, and
+`test_08_while_loop.zynml`. All loops should run identically — the
+probe call has no observable effect.
+
+**Risk:** block insertion in Cranelift is sensitive to seal-tracker
+state (lines 1215-1224, 1244-1248). The new blocks `b_call_probe` and
+`b_post_probe` need to be sealed correctly. Easiest path: seal both
+immediately after creation (single predecessor, no phis).
+
+---
+
+### Increment 4 — OSR layout analysis
+
+**Goal:** for each loop header, compute the OSR layout (live-ins +
+return type fitness) and reject layouts that can't be helpered.
+
+**Function signature:**
+
+```rust
+pub struct OsrLayout {
+    pub header: HirId,
+    pub live_ins: Vec<HirId>,           // ≤ OSR_MAX_LIVE_INS (4)
+    pub live_in_types: Vec<HirType>,    // for arg bit-cast at helper entry
+    pub return_type: HirType,           // must fit in i64
+}
+
+pub fn osr_layout(function: &HirFunction, header: HirId) -> Option<OsrLayout>;
+```
+
+**Live-in computation:**
+
+A value `v` is a live-in at `header` iff:
+1. `v` is *used* by some instruction reachable from `header` (i.e. in
+   the loop's strongly-connected component or any block dominated by
+   the header).
+2. `v` is *defined* outside that reachable region — either in the
+   function entry block, in a block that dominates the header, or in a
+   block on the function's prologue path.
+
+`HirFunction` already runs SSA construction; reuse the existing
+liveness analysis (`crate::analysis::LivenessAnalysis::live_in`) — at
+each header, `live_in[header]` minus the loop's pre-loop defs is the
+live-in set we need.
+
+**Layout rejection rules** (return `None`):
+
+- Live-in count > `OSR_MAX_LIVE_INS` (currently 4).
+- Any live-in's `HirType` doesn't fit in i64 (structs, large tensors).
+  Specifically: reject anything that isn't a primitive scalar or
+  pointer.
+- The function's return type doesn't fit in i64 (helpers all return
+  i64; we bit-cast at the call site in tier 0).
+- The header has no back-edge in the HIR (defensive — `find_loop_headers`
+  shouldn't emit such headers, but assert anyway).
+
+**Test cases:**
+
+- `for i in 0..10 { sum += i }` — two live-ins (`i`, `sum`) — accept.
+- `for x in tensor.iter() { ... }` — live-in includes a tensor pointer
+  — accept (pointers fit in i64).
+- Loop with 5 mutated locals — reject (>4 live-ins).
+- Function returning a struct — reject (return type doesn't fit i64).
+
+---
+
+### Increment 5 — tier-1 OSR helper emission
+
+**Goal:** when `self.compile_tier >= 1`, for each accepted layout, emit
+a separate Cranelift function alongside the main entry. Helper signature:
+`fn __osr_<func_id>_<header_idx>(i64, i64, i64, i64) -> i64`. Args are
+the live-ins (bit-cast as the layout dictates); the helper jumps to the
+loop header in tier-1 code.
+
+**Helper body shape:**
+
+```cranelift
+function osr_helper(arg0: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
+b_entry:
+    ;; Bit-cast args to live-in types per layout.
+    v_live_in_0 = ireduce.i32 arg0  ;; example: i64 → i32
+    v_live_in_1 = bitcast.f64 arg1
+    ;; ... etc
+
+    ;; Run the function's prologue (any pre-loop instructions that
+    ;; define values used inside the loop body but are NOT live-ins —
+    ;; e.g. constants, allocations). These are "rematerializable" and
+    ;; must be re-executed inside the helper.
+    ;; (Increment 5a: only support layouts with no rematerializable
+    ;;  prologue values, i.e. all loop-body live-ins are pure live-ins.
+    ;;  Layouts needing prologue replay get rejected by `osr_layout`.)
+
+    jump b_loop_header(v_live_in_0, v_live_in_1, ...)
+
+b_loop_header:
+    ;; The loop body, identical to the main entry's tier-1 emission.
+    ;; ...
+}
+```
+
+**Implementation strategy:** the helper compiles the *same* HIR
+function, but starting from `header` instead of `function.entry_block`.
+Add a `compile_entry_override: Option<HirId>` field on
+`CraneliftBackend` (mirroring `compile_tier`). When set, the block
+emission loop uses that as the starting block; phi mapping at the
+header maps phi results to *function args* instead of incoming branches.
+
+The helper is registered via `module.declare_function(&name, Linkage::Local, &sig)`
+with `name = format!("__zyntax_osr_{}_{}", bead_id, block_index)`. The
+resulting code pointer is collected and returned from `compile_function`
+via a side channel (a new field on `CraneliftBackend` —
+`pending_osr_entries: Vec<beadie::OsrEntry>`).
+
+**Atomic install (increment 6):** after `compile_function` returns,
+the wrapper in `beadie_adapter.rs` calls
+`bead.swap_compiled_with_osr(entry_ptr, osr_entries)` instead of just
+returning the entry pointer. This publishes the OSR table atomically
+under a new generation. The TieredAdapter's `swap_compiled` path is
+bypassed for tier-1+ when there's an OSR table; the closure returns
+null and does its own swap.
+
+---
+
+### Increment 6 — atomic install + tier-0 helper dispatch
+
+**Goal:** finish the OSR loop. Tier-0 code, at probe sites, dispatches
+to the helper when present. Tier-1 promotion installs both the entry
+pointer and the OSR table atomically.
+
+**Tier-0 dispatch (extends increment 3's code shape):**
+
+```cranelift
+b_call_probe:
+  v_bead_id = iconst.i64 <bead_id>
+  v_site    = iconst.i64 <site_key>     ;; live_in_count from layout
+  v_helper  = call __zyntax_osr_probe(v_bead_id, v_site)
+  v_is_null = icmp_imm.eq v_helper, 0
+              brif v_is_null, b_post_probe, b_dispatch
+
+b_dispatch:
+  ;; Marshal live-ins into i64 args (bit-cast as needed).
+  v_arg0 = bitcast.i64 <live_in_0>
+  v_arg1 = bitcast.i64 <live_in_1>
+  v_arg2 = bitcast.i64 <live_in_2>
+  v_arg3 = bitcast.i64 <live_in_3>
+  ;; Tail-call equivalent: regular call + return.
+  v_result = call_indirect helper_sig, v_helper(v_arg0, v_arg1, v_arg2, v_arg3)
+  ;; Bit-cast result to function's return type, then return.
+  v_typed = bitcast.<return_type> v_result
+              return v_typed
+
+b_post_probe:
+  ;; Continue with original instructions.
+```
+
+**Atomic install in `beadie_adapter.rs`:**
+
+```rust
+fn compile(&self, bead: &Arc<Bead>, def: ZyntaxFunctionDef) -> Result<*mut (), CompileError> {
+    self.with_lock(|backend| {
+        backend.set_compile_tier(def.tier);
+        backend.set_compile_bead_id(def.bead_id);
+        backend.compile_function(def.id, &def.function)?;
+        let entry = backend.get_function_ptr(def.id).ok_or(...)?;
+        let osr_entries = backend.take_pending_osr_entries();  // new method
+
+        if !osr_entries.is_empty() && def.tier >= 1 {
+            // Direct atomic install. Returning null suppresses the
+            // PromotionBroker's own swap_compiled call.
+            bead.swap_compiled_with_osr(entry as *mut (), osr_entries);
+            Ok(std::ptr::null_mut())
+        } else {
+            Ok(entry as *mut ())
+        }
+    })
+}
+```
+
+The `swap_compiled_with_osr` path requires the bead to already be in
+`Compiled` state. That's true for tier 1+ (tier 0 eager-installed at
+module load).
+
+**Verification:**
+
+1. Write a ZynML test program with a long-running loop:
+
+   ```zynml
+   fn slow_sum(n: i64) -> i64 {
+       let mut acc = 0;
+       for i in 0..n { acc += i; }
+       acc
+   }
+   ```
+
+   Force `slow_sum(100_000_000)`. Tier-1 promotion fires after warm
+   threshold; the probe returns the helper; the running tier-0 frame
+   transfers into tier-1 code. Verify `slow_sum` returns the correct
+   value (5 * (n*(n-1)/2 = 4_999_999_950_000_000 for n=10^8 — fits in
+   i64).
+
+2. Add a `WLIFT_OSR_TRACE`-equivalent env var (e.g. `ZYNML_OSR_TRACE=1`)
+   that prints when probes hit, helpers compile, and OSR transfers
+   succeed. Useful for diagnosing why a loop didn't OSR (rejected
+   layout, threshold not crossed, etc).
+
+---
+
+## Open questions for next session
+
+1. **Sample counter granularity.** Global atomic vs thread-local?
+   Global is simpler but contended. For ML training loops typically
+   single-threaded, it's fine.
+
+2. **Helper return type.** Currently planned as i64 for all helpers.
+   Functions that return non-i64-fitting types skip OSR entirely. Is
+   that acceptable for ZynML's tensor functions? (`tensor.sum() -> f32`
+   fits in i64 via bit-cast; `tensor.shape()` returns a struct — skip.)
+
+3. **Live-in stability across tiers.** Tier 0 and tier 1 must compute
+   identical live-in sets at each header, because tier 0 marshals what
+   tier 1 expects. The HIR is the same input; SSA construction is
+   deterministic; liveness is a fixed-point over a deterministic CFG.
+   This should hold but write an assertion/test.
+
+4. **Deopt boundary (Phase 4).** When tier-1 OSR'd code hits a
+   speculation guard failure, where does it bail out to? Options:
+   (a) deoptimize to tier 0 of the same function, restart — but tier-0
+   doesn't know about the partial state. (b) Continue in tier-1
+   non-speculated code via a slow path. wren_lift uses (b). Likely
+   the right answer here too.
