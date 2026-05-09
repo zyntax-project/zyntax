@@ -494,6 +494,19 @@ impl TieredBackend {
         self.cranelift
             .with_lock(|be| be.rebuild_with_accumulated_symbols())
     }
+
+    /// Forward plugin symbol signatures to the inner Cranelift backend.
+    /// Required for auto-boxing: without these, the backend doesn't
+    /// know plugin functions like `$IO$println_dynamic` expect a
+    /// `DynamicBox` and emits raw-i64 calls that the callee mis-reads
+    /// as fat-pointer bytes.
+    pub fn register_symbol_signatures(
+        &mut self,
+        symbols: &[crate::zrtl::RuntimeSymbolInfo],
+    ) {
+        self.cranelift
+            .with_lock(|be| be.register_symbol_signatures(symbols));
+    }
 }
 
 impl Drop for TieredBackend {

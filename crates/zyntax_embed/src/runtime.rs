@@ -3536,6 +3536,14 @@ impl TieredRuntime {
             }
         }
 
+        // Register symbol signatures for auto-boxing in the Cranelift
+        // backend. Without this the backend doesn't know plugin functions
+        // like `$IO$println_dynamic` expect a `DynamicBox`, so it passes
+        // raw values through and the callee mis-reads them as fat-pointer
+        // bytes. Mirrors `ZyntaxRuntime::load_plugin`.
+        self.backend
+            .register_symbol_signatures(plugin.symbols_with_signatures());
+
         // Push the new symbols into the live JIT module so finalization
         // can resolve them. Mirrors `ZyntaxRuntime::load_plugin`.
         self.backend
@@ -3574,6 +3582,10 @@ impl TieredRuntime {
                     .insert(symbol_info.name.to_string(), sig);
             }
         }
+
+        // Register signatures for auto-boxing in the Cranelift backend.
+        let symbols_with_sigs = registry.collect_symbols_with_signatures();
+        self.backend.register_symbol_signatures(&symbols_with_sigs);
 
         // Push the new symbols into the live JIT module so finalization
         // can resolve them. Mirrors `ZyntaxRuntime::load_plugins_from_directory`.
