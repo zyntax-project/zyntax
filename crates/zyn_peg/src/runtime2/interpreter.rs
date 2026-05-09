@@ -807,6 +807,17 @@ impl<'g> GrammarInterpreter<'g> {
                 let elements = self.get_field_as_expr_list("elements", fields, state)?;
                 TypedExpression::Tuple(elements)
             }
+            "Await" => {
+                // `await expr` — wraps the operand in TypedExpression::Await.
+                // Surfaces in the test grammar (`await c()`) and in ml.zyn's
+                // `await_expr` rule. Without this case, parse fails because
+                // the action returns "unknown TypedExpression variant" and
+                // the rule fails to match. `get_field_as_expr` already
+                // returns a `TypedNode<TypedExpression>`, so we wrap it
+                // directly with `Box::new`.
+                let operand = self.get_field_as_expr("operand", fields, state)?;
+                TypedExpression::Await(Box::new(operand))
+            }
             _ => return Err(format!("unknown TypedExpression variant: {}", variant)),
         };
 
