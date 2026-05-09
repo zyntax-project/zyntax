@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use krio_async::{AsyncHooks, FnId as KrioFnId, SuspendingFns, SuspensionSite};
 use krio_stackless::CoroCfg;
 use zyntax_compiler::hir::{
-    BinaryOp, HirBlock, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
-    HirType, HirValue, HirValueKind,
+    BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
+    HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -541,17 +541,68 @@ impl<'f> CoroCfg for HirCoroCfg<'f> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Set of HIR function ids that may yield directly or transitively.
+///
+/// In ZynML the only suspension primitive is the `Intrinsic::Await`
+/// call, not a host function — so `is_yield_primitive` always returns
+/// `false` and the suspending set is purely the seed of `is_async`
+/// functions plus their transitive callers.
 pub struct HirSuspendingFns {
-    pub suspending: std::collections::HashSet<HirFnId>,
-    pub yield_primitive: HirFnId,
+    pub suspending: HashSet<HirFnId>,
 }
 
 impl HirSuspendingFns {
     /// Compute the suspending set by tainting from `is_async` over the
-    /// call graph. Filled in during Phase C.
-    pub fn from_module(_module: &HirModule, _yield_primitive: HirFnId) -> Self {
-        unimplemented!("HirSuspendingFns::from_module — Phase C")
+    /// call graph.
+    ///
+    /// Algorithm: seed = `{ id | function(id).is_async }`; iterate to
+    /// fixed point — a function becomes suspending if it Calls any
+    /// suspending function (HirCallable::Function variant only;
+    /// Indirect/Intrinsic calls don't taint).
+    ///
+    /// `Intrinsic::Await` is the suspension primitive but it isn't a
+    /// `HirCallable::Function`, so it doesn't enter the fixpoint —
+    /// `classify` recognises it directly.
+    pub fn from_module(module: &HirModule) -> Self {
+        let mut suspending: HashSet<HirFnId> = module
+            .functions
+            .values()
+            .filter(|f| f.signature.is_async)
+            .map(|f| f.id)
+            .collect();
+
+        loop {
+            let mut changed = false;
+            for func in module.functions.values() {
+                if suspending.contains(&func.id) {
+                    continue;
+                }
+                if function_calls_any(func, &suspending) {
+                    suspending.insert(func.id);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        Self { suspending }
     }
+}
+
+fn function_calls_any(func: &HirFunction, suspending: &HashSet<HirFnId>) -> bool {
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Call { callee, .. } = inst {
+                if let HirCallable::Function(callee_id) = callee {
+                    if suspending.contains(callee_id) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 impl SuspendingFns for HirSuspendingFns {
@@ -561,8 +612,11 @@ impl SuspendingFns for HirSuspendingFns {
         self.suspending.contains(&fn_id)
     }
 
-    fn is_yield_primitive(&self, fn_id: Self::FnId) -> bool {
-        fn_id == self.yield_primitive
+    fn is_yield_primitive(&self, _fn_id: Self::FnId) -> bool {
+        // ZynML's only yield primitive is the Intrinsic::Await call,
+        // which isn't a HirCallable::Function — so no host function
+        // ever counts as a yield primitive.
+        false
     }
 }
 
@@ -592,11 +646,38 @@ impl<'a> AsyncHooks for HirAsyncHooks<'a> {
 
     fn classify(
         &self,
-        _cfg: &Self::Cfg,
-        _bb: <Self::Cfg as CoroCfg>::BlockId,
-        _idx: usize,
+        cfg: &Self::Cfg,
+        bb: <Self::Cfg as CoroCfg>::BlockId,
+        idx: usize,
     ) -> Option<SuspensionSite<Self::FnId, <Self::Cfg as CoroCfg>::LocalId>> {
-        unimplemented!("HirAsyncHooks::classify — Phase C")
+        let hir = cfg.block_seq_to_hir.get(bb.0 as usize)?;
+        let block = cfg.function.blocks.get(hir)?;
+        let inst = block.instructions.get(idx)?;
+
+        // Pattern 1: `Call { callee: Intrinsic(Await), .. }` — the
+        // `await foo(x)` lowering's actual suspension point. Returns
+        // DirectYield with no value field — krio uses the value only
+        // as informational data the host can later look up; we drive
+        // captures lift through `LivenessMap` instead.
+        if let HirInstruction::Call {
+            callee: HirCallable::Intrinsic(Intrinsic::Await),
+            ..
+        } = inst
+        {
+            return Some(SuspensionSite::DirectYield { value: None });
+        }
+
+        // Pattern 2 (future work): direct cross-fn call to an async
+        // function without going through Intrinsic::Await. Today's
+        // ZynML lowering always interposes Intrinsic::Await, so this
+        // never fires; reserve the shape for an optimised path later.
+        // if let HirInstruction::Call { callee: HirCallable::Function(fid), args, result, .. } = inst {
+        //     if self.suspending.is_suspending(*fid) {
+        //         return Some(SuspensionSite::CrossFnCall { ... });
+        //     }
+        // }
+
+        None
     }
 }
 
@@ -743,6 +824,129 @@ mod tests {
             new_block.terminator,
             HirTerminator::Branch { target } if target == other_id
         ));
+    }
+
+    #[test]
+    fn suspending_fns_taints_transitively() {
+        // module shape:
+        //   async fn a() i32 { return 1; }
+        //   fn b() i32 { return a() + 1; }   ← becomes suspending via taint
+        //   fn c() i32 { return 2; }         ← stays sync
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        let mk_sig = |is_async: bool| HirFunctionSignature {
+            params: vec![],
+            returns: vec![HirType::I32],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async,
+            effects: vec![],
+            is_pure: false,
+        };
+        let a_fn = HirFunction::new(InternedString::new_global("a"), mk_sig(true));
+        let a_id = a_fn.id;
+        let mut b_fn = HirFunction::new(InternedString::new_global("b"), mk_sig(false));
+        let b_id = b_fn.id;
+        let c_fn = HirFunction::new(InternedString::new_global("c"), mk_sig(false));
+        let c_id = c_fn.id;
+
+        // b has a single block with `Call a()` — that's enough to taint it.
+        let bb_id = HirId::new();
+        let mut bb = HirBlock {
+            id: bb_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Unreachable,
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+        bb.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Function(a_id),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        let mut blocks = IndexMap::new();
+        blocks.insert(bb_id, bb);
+        b_fn.blocks = blocks;
+        b_fn.entry_block = bb_id;
+
+        module.functions.insert(a_id, a_fn);
+        module.functions.insert(b_id, b_fn);
+        module.functions.insert(c_id, c_fn);
+
+        let s = HirSuspendingFns::from_module(&module);
+        assert!(s.is_suspending(a_id), "a is async → suspending");
+        assert!(s.is_suspending(b_id), "b calls a → suspending via taint");
+        assert!(!s.is_suspending(c_id), "c is sync and calls nothing async");
+        assert!(!s.is_yield_primitive(a_id));
+    }
+
+    #[test]
+    fn classify_returns_direct_yield_for_intrinsic_await() {
+        let mut f = empty_function("test");
+        let entry = f.entry_block;
+        // Plant a Call to Intrinsic::Await on the entry block.
+        let result_id = HirId::new();
+        f.values.insert(
+            result_id,
+            HirValue {
+                id: result_id,
+                ty: HirType::I32,
+                kind: HirValueKind::Instruction,
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let entry_block = f.blocks.get_mut(&entry).unwrap();
+        entry_block.instructions.push(HirInstruction::Call {
+            result: Some(result_id),
+            callee: HirCallable::Intrinsic(Intrinsic::Await),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+
+        let cfg = HirCoroCfg::new(&mut f);
+        let suspending = HirSuspendingFns {
+            suspending: HashSet::new(),
+        };
+        let hooks = HirAsyncHooks {
+            suspending: &suspending,
+        };
+        let site = hooks.classify(&cfg, HirBlockId(0), 0);
+        assert!(matches!(site, Some(SuspensionSite::DirectYield { .. })));
+    }
+
+    #[test]
+    fn classify_returns_none_for_regular_call() {
+        let mut f = empty_function("test");
+        let entry = f.entry_block;
+        let entry_block = f.blocks.get_mut(&entry).unwrap();
+        // A regular Call to some user function — not a suspension site.
+        entry_block.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Function(HirId::new()),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+
+        let cfg = HirCoroCfg::new(&mut f);
+        let suspending = HirSuspendingFns {
+            suspending: HashSet::new(),
+        };
+        let hooks = HirAsyncHooks {
+            suspending: &suspending,
+        };
+        assert!(hooks.classify(&cfg, HirBlockId(0), 0).is_none());
     }
 
     #[test]
