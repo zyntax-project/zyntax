@@ -247,6 +247,22 @@ pub struct CraneliftBackend {
     /// Stored as `(site_key, FuncId)` pre-finalize; the FuncId is
     /// resolved to a code pointer after `finalize_definitions`.
     pending_osr_helpers: Vec<(u64, FuncId)>,
+    /// When `Some`, `compile_function_body` is compiling an OSR helper —
+    /// not the function itself. The body builds:
+    ///   1. A synthetic Cranelift prologue block with sig
+    ///      `(i64,i64,i64,i64) -> ReturnType`.
+    ///   2. Bit-casts the first `phi_count` args to phi types and uses
+    ///      them as block params on the jump to `layout.header`.
+    ///   3. Bit-casts the remaining args to non-phi-live-in types and
+    ///      stores them in `value_map` under their HirIds.
+    ///   4. Iterates only blocks reachable from `layout.header`; the
+    ///      original function entry and pre-loop blocks are skipped.
+    /// Set by `compile_osr_helpers`, cleared after each helper compile.
+    compile_osr_layout: Option<crate::osr::OsrLayout>,
+    /// FuncId the helper is being compiled into. Set alongside
+    /// `compile_osr_layout`; consumed by `compile_function_body` in
+    /// place of the usual `function_map` lookup.
+    compile_osr_func_id: Option<FuncId>,
 }
 
 /// Hot-reload state management
@@ -359,6 +375,8 @@ impl CraneliftBackend {
             compile_tier: 0,
             compile_bead_id: 0,
             pending_osr_helpers: Vec::new(),
+            compile_osr_layout: None,
+            compile_osr_func_id: None,
         })
     }
 
@@ -369,18 +387,8 @@ impl CraneliftBackend {
     /// Must be called after `finalize_definitions` — the FuncIds
     /// recorded during compilation are resolved to native code pointers
     /// here.
-    ///
-    /// **Stub gate**: until increment 5b emits real loop bodies, helpers
-    /// are stubs that return zero immediately. Installing them would
-    /// corrupt any TieredRuntime user's tier-1-promoted function. The
-    /// returned list is empty unless `ZYNML_OSR_HELPERS=1`. The helpers
-    /// are still emitted into the JIT module (dead code, fine for
-    /// inspection) — only the install path is gated.
     pub fn take_pending_osr_helpers(&mut self) -> Vec<(u64, *mut ())> {
         let pending = std::mem::take(&mut self.pending_osr_helpers);
-        if std::env::var_os("ZYNML_OSR_HELPERS").is_none() {
-            return Vec::new();
-        }
         pending
             .into_iter()
             .map(|(site, fid)| {
@@ -841,19 +849,14 @@ impl CraneliftBackend {
     /// Emit OSR helpers for tier-≥1 compilation of `function`. For each
     /// loop header with an acceptable [`crate::osr::OsrLayout`], declare a
     /// fresh Cranelift function with signature
-    /// `(i64,i64,i64,i64) -> <return_type>` and a stub body that returns
-    /// a default value. Stores `(site_key, FuncId)` pairs in
+    /// `(i64,i64,i64,i64) -> <return_type>` and drive
+    /// [`Self::compile_function_body`] to emit the loop body, entered at
+    /// the header. Stores `(site_key, FuncId)` pairs in
     /// `pending_osr_helpers` for the caller to drain after
     /// `finalize_definitions`.
-    ///
-    /// **Stub-only** in this increment: the body discards args and returns
-    /// a default (0 / null / void) instead of running the loop. Increment
-    /// 5b will emit the actual loop body. Tier-0 dispatch (increment 6) is
-    /// gated behind an env var so the stub semantics don't break programs
-    /// in normal use.
     fn compile_osr_helpers(
         &mut self,
-        _id: HirId,
+        id: HirId,
         function: &HirFunction,
     ) -> CompilerResult<()> {
         let headers = crate::osr::find_loop_headers(function);
@@ -862,12 +865,13 @@ impl CraneliftBackend {
         }
 
         let bead_id = self.compile_bead_id;
+        let trace = std::env::var_os("ZYNML_OSR_TRACE").is_some();
 
         for header in headers {
             let layout = match crate::osr::osr_layout(function, header) {
                 Ok(l) => l,
                 Err(reason) => {
-                    if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+                    if trace {
                         eprintln!(
                             "[osr] reject helper for bead={} header_idx={}: {:?}",
                             bead_id,
@@ -879,33 +883,53 @@ impl CraneliftBackend {
                 }
             };
 
-            self.emit_osr_stub_helper(bead_id, &layout)?;
+            // Compile the helper as a separate Cranelift function. If the
+            // body emission fails (e.g. an instruction case the lowering
+            // doesn't yet handle in helper mode), log and skip this layout
+            // — the main function still works, we just don't OSR for this
+            // header.
+            if let Err(e) = self.emit_osr_helper_via_body(id, function, &layout) {
+                if trace {
+                    eprintln!(
+                        "[osr] helper emission failed for bead={} header_idx={}: {}",
+                        bead_id, layout.block_index, e
+                    );
+                }
+                // Reset OSR-helper state in case it was partially set.
+                self.compile_osr_layout = None;
+                self.compile_osr_func_id = None;
+                self.codegen_context.clear();
+                self.value_map.clear();
+                self.block_map.clear();
+                continue;
+            }
         }
 
         Ok(())
     }
 
-    /// Build a single stub OSR helper. Sig: `(i64,i64,i64,i64) -> ReturnType`
-    /// where ReturnType is the function's HIR return type translated to a
-    /// Cranelift type. The body takes the four params, immediately returns
-    /// a zero/default value of that type. This proves helper registration
-    /// works ahead of full body emission (increment 5b).
-    fn emit_osr_stub_helper(
+    /// Compile a single OSR helper by reusing
+    /// [`Self::compile_function_body`] under helper mode. Saves and
+    /// restores any auxiliary state that mode mutates so the caller's
+    /// view of the backend is unchanged on success.
+    fn emit_osr_helper_via_body(
         &mut self,
-        bead_id: u64,
+        id: HirId,
+        function: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<()> {
+        // Build the helper signature.
         let mut sig = self.module.make_signature();
         for _ in 0..crate::osr::OSR_MAX_LIVE_INS {
             sig.params.push(AbiParam::new(types::I64));
         }
-        let ret_clir = self.translate_type(&layout.return_type)?;
-        let returns_void = matches!(layout.return_type, HirType::Void);
-        if !returns_void {
+        if !matches!(layout.return_type, HirType::Void) {
+            let ret_clir = self.translate_type(&layout.return_type)?;
             sig.returns.push(AbiParam::new(ret_clir));
         }
 
-        let helper_name = format!("__zyntax_osr_{}_{}", bead_id, layout.block_index);
+        let helper_name =
+            format!("__zyntax_osr_{}_{}", self.compile_bead_id, layout.block_index);
         let func_id = self
             .module
             .declare_function(&helper_name, Linkage::Local, &sig)
@@ -913,51 +937,22 @@ impl CraneliftBackend {
                 CompilerError::Backend(format!("declare OSR helper {}: {}", helper_name, e))
             })?;
 
-        // Build the helper's body in a fresh codegen context.
-        let mut ctx = codegen::Context::new();
-        ctx.func.signature = sig.clone();
-        ctx.func.name = cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32());
+        // Drive compile_function_body in helper mode.
+        let prev_layout = self.compile_osr_layout.take();
+        let prev_func_id = self.compile_osr_func_id.take();
+        self.compile_osr_layout = Some(layout.clone());
+        self.compile_osr_func_id = Some(func_id);
 
-        let mut fb_ctx = FunctionBuilderContext::new();
-        {
-            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            builder.seal_block(entry);
+        // Empty hir_module — helpers don't need cross-module info; the
+        // main function compile already populated trait dispatch state.
+        let empty_module =
+            HirModule::new(zyntax_typed_ast::InternedString::new_global("__osr__"));
+        let result = self.compile_function_body(id, function, &empty_module);
 
-            if returns_void {
-                builder.ins().return_(&[]);
-            } else if ret_clir.is_int() {
-                let zero = builder.ins().iconst(ret_clir, 0);
-                builder.ins().return_(&[zero]);
-            } else if ret_clir == types::F32 {
-                let zero = builder.ins().f32const(0.0);
-                builder.ins().return_(&[zero]);
-            } else if ret_clir == types::F64 {
-                let zero = builder.ins().f64const(0.0);
-                builder.ins().return_(&[zero]);
-            } else {
-                // Fallback: int zero of the right width via bitcast. For
-                // unknown types, just emit a zero of the same Cranelift
-                // type interpreted as int. Should not be reached given
-                // `osr_layout` already filtered to fits-in-i64 returns.
-                let zero = builder.ins().iconst(types::I64, 0);
-                let casted = builder.ins().bitcast(
-                    ret_clir,
-                    cranelift_codegen::ir::MemFlags::new(),
-                    zero,
-                );
-                builder.ins().return_(&[casted]);
-            }
-            builder.finalize();
-        }
+        self.compile_osr_layout = prev_layout;
+        self.compile_osr_func_id = prev_func_id;
 
-        self.module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                CompilerError::Backend(format!("define OSR helper {}: {}", helper_name, e))
-            })?;
+        result?;
 
         self.pending_osr_helpers.push((layout.site_key(), func_id));
 
@@ -972,6 +967,9 @@ impl CraneliftBackend {
         Ok(())
     }
 
+    /// Build a single stub OSR helper. Sig: `(i64,i64,i64,i64) -> ReturnType`
+    /// where ReturnType is the function's HIR return type translated to a
+    /// Cranelift type. The body takes the four params, immediately returns
     /// Compile just the body of a function (assumes signature already declared)
     fn compile_function_body(
         &mut self,
@@ -979,22 +977,53 @@ impl CraneliftBackend {
         function: &HirFunction,
         hir_module: &HirModule,
     ) -> CompilerResult<()> {
-        // Get the already-declared function ID
-        let func_id = *self
-            .function_map
-            .get(&id)
-            .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not declared", id)))?;
+        // Get the already-declared function ID. In OSR-helper mode the
+        // FuncId comes from `compile_osr_func_id` (set by the helper
+        // emission code) since the helper isn't in `function_map`.
+        let func_id = if self.compile_osr_layout.is_some() {
+            self.compile_osr_func_id.ok_or_else(|| {
+                CompilerError::Backend(
+                    "OSR helper compile started without compile_osr_func_id set".into(),
+                )
+            })?
+        } else {
+            *self
+                .function_map
+                .get(&id)
+                .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not declared", id)))?
+        };
 
-        let sig = self.translate_signature(function)?;
+        // OSR-helper compile mode: signature, params, and block iteration
+        // are all overridden. Captured up-front so later borrows of `self`
+        // don't conflict with `self.compile_osr_layout`.
+        let osr_helper = self.compile_osr_layout.clone();
+
+        let sig = if let Some(layout) = &osr_helper {
+            let mut s = self.module.make_signature();
+            for _ in 0..crate::osr::OSR_MAX_LIVE_INS {
+                s.params.push(AbiParam::new(types::I64));
+            }
+            if !matches!(layout.return_type, HirType::Void) {
+                let ret_ty = self.translate_type(&layout.return_type)?;
+                s.returns.push(AbiParam::new(ret_ty));
+            }
+            s
+        } else {
+            self.translate_signature(function)?
+        };
 
         // Pre-calculate parameter types before creating builder
-        let param_types: Result<Vec<_>, _> = function
-            .signature
-            .params
-            .iter()
-            .map(|param| self.translate_type(&param.ty))
-            .collect();
-        let param_types = param_types?;
+        let param_types: Vec<_> = if osr_helper.is_some() {
+            vec![types::I64; crate::osr::OSR_MAX_LIVE_INS]
+        } else {
+            let pt: Result<Vec<_>, _> = function
+                .signature
+                .params
+                .iter()
+                .map(|param| self.translate_type(&param.ty))
+                .collect();
+            pt?
+        };
 
         // Pre-translate ALL types used in the function to avoid borrow checker issues
         // Build a cache of HirType -> cranelift::Type mappings
@@ -1154,6 +1183,28 @@ impl CraneliftBackend {
 
             // Phase 1: Analyze function structure
             let block_order = self.compute_block_order(function);
+            // In OSR-helper mode, restrict to blocks reachable from the
+            // header — the function entry and pre-loop blocks are dead
+            // code in the helper and would reference HirIds (function
+            // params, etc.) that we don't put in `value_map`.
+            let block_order: Vec<HirId> = if let Some(layout) = &osr_helper {
+                let reachable: std::collections::HashSet<HirId> = {
+                    let mut visited = std::collections::HashSet::new();
+                    let mut stack = vec![layout.header];
+                    while let Some(id) = stack.pop() {
+                        if !visited.insert(id) {
+                            continue;
+                        }
+                        if let Some(b) = function.blocks.get(&id) {
+                            stack.extend(get_successors(&b.terminator));
+                        }
+                    }
+                    visited
+                };
+                block_order.into_iter().filter(|b| reachable.contains(b)).collect()
+            } else {
+                block_order
+            };
 
             // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
             // emits OSR helpers (separate functions) and skips probes.
@@ -1305,39 +1356,91 @@ impl CraneliftBackend {
                 }
             }
 
-            // Phase 3: Setup entry block with function parameters
-            let entry_block = block_map[&function.entry_block];
+            // Phase 3: Setup entry block. Helper mode uses a synthetic
+            // prologue that bit-casts the helper's i64 args to live-in
+            // types and jumps to `layout.header`. Main mode appends the
+            // function's params to the original entry block.
+            let entry_block = if let Some(layout) = &osr_helper {
+                // Synthetic prologue — fresh Cranelift block, NOT in block_map.
+                let prologue = builder.create_block();
+                for cranelift_type in &param_types {
+                    builder.append_block_param(prologue, *cranelift_type);
+                }
+                prologue
+            } else {
+                block_map[&function.entry_block]
+            };
 
-            // Add function parameters to entry block (in addition to any phi params)
-            let entry_param_start = builder.block_params(entry_block).len();
-            for cranelift_type in &param_types {
-                builder.append_block_param(entry_block, *cranelift_type);
+            let entry_param_start = if osr_helper.is_some() {
+                0
+            } else {
+                builder.block_params(entry_block).len()
+            };
+            if osr_helper.is_none() {
+                // Add function parameters to entry block (in addition to any phi params)
+                for cranelift_type in &param_types {
+                    builder.append_block_param(entry_block, *cranelift_type);
+                }
             }
 
             // Switch to entry block for parameter and constant setup
             // We need an active block to create constant instructions
             builder.switch_to_block(entry_block);
+            if osr_helper.is_some() {
+                // Synthetic prologue has only one predecessor (none) — seal
+                // immediately so we can emit instructions without warnings.
+                builder.seal_block(entry_block);
+            }
 
             // Store block map for use in helper methods
             self.block_map = block_map.clone();
 
-            // Map HIR function parameters to Cranelift values
-            let entry_params = builder.block_params(entry_block);
-            let function_params = &entry_params[entry_param_start..];
-
-            // Get HIR parameter value IDs sorted by parameter index
-            let mut param_value_ids = Vec::new();
-            for value in function.values.values() {
-                if let HirValueKind::Parameter(param_index) = value.kind {
-                    param_value_ids.push((param_index, value.id));
+            // Map HIR function parameters / helper live-ins to Cranelift values.
+            // In helper mode, capture the phi-typed casts here so we can
+            // pass them as block-params on the prologue → header jump
+            // emitted at the end of Phase 3.
+            let mut osr_phi_jump_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
+            if let Some(layout) = &osr_helper {
+                let entry_params = builder.block_params(entry_block).to_vec();
+                // Bit-cast each helper arg from i64 to its live-in type.
+                // First `phi_count` are loop-carried values used as block
+                // params on the jump to header; the rest are stored in
+                // value_map under their HirIds for the body to consume.
+                for (i, hir_id) in layout.live_ins.iter().enumerate() {
+                    if i >= crate::osr::OSR_MAX_LIVE_INS {
+                        break;
+                    }
+                    let raw = entry_params[i]; // i64
+                    let target = type_cache
+                        .get(&layout.live_in_types[i])
+                        .copied()
+                        .unwrap_or(types::I64);
+                    let casted = bitcast_from_i64(&mut builder, raw, target);
+                    if i < layout.phi_count {
+                        osr_phi_jump_args.push(casted);
+                    } else {
+                        // Non-phi live-in — value_map for body consumption.
+                        self.value_map.insert(*hir_id, casted);
+                    }
                 }
-            }
-            param_value_ids.sort_by_key(|(index, _)| *index);
+            } else {
+                let entry_params = builder.block_params(entry_block);
+                let function_params = &entry_params[entry_param_start..];
 
-            // Map HIR params to Cranelift values
-            for (i, (_, hir_value_id)) in param_value_ids.iter().enumerate() {
-                if let Some(&cranelift_val) = function_params.get(i) {
-                    self.value_map.insert(*hir_value_id, cranelift_val);
+                // Get HIR parameter value IDs sorted by parameter index
+                let mut param_value_ids = Vec::new();
+                for value in function.values.values() {
+                    if let HirValueKind::Parameter(param_index) = value.kind {
+                        param_value_ids.push((param_index, value.id));
+                    }
+                }
+                param_value_ids.sort_by_key(|(index, _)| *index);
+
+                // Map HIR params to Cranelift values
+                for (i, (_, hir_value_id)) in param_value_ids.iter().enumerate() {
+                    if let Some(&cranelift_val) = function_params.get(i) {
+                        self.value_map.insert(*hir_value_id, cranelift_val);
+                    }
                 }
             }
 
@@ -1432,6 +1535,15 @@ impl CraneliftBackend {
                 }
             }
 
+            // Helper mode — close out the synthetic prologue with a jump to
+            // the loop header carrying the phi-typed live-ins as block
+            // params. The header's existing block params (set up in Phase 2
+            // for its phis) consume these directly.
+            if let Some(layout) = &osr_helper {
+                let header_block = block_map[&layout.header];
+                builder.ins().jump(header_block, &osr_phi_jump_args);
+            }
+
             // Track which blocks can be sealed and which are already sealed
             let mut seal_tracker: HashMap<HirId, usize> = HashMap::new();
             let mut sealed_blocks: std::collections::HashSet<HirId> =
@@ -1456,8 +1568,11 @@ impl CraneliftBackend {
                     }
                 };
 
-                // Switch to this block (entry block is already active from Phase 3)
-                if *hir_block_id != function.entry_block {
+                // Switch to this block. In helper mode, entry_block is the
+                // synthetic prologue (NOT in block_order), so every block
+                // here needs an explicit switch. In main mode, the function
+                // entry block is already active from Phase 3.
+                if osr_helper.is_some() || *hir_block_id != function.entry_block {
                     builder.switch_to_block(cranelift_block);
                 }
 
@@ -4477,15 +4592,19 @@ impl CraneliftBackend {
                 CompilerError::Backend(format!("Failed to compile function: {}", e))
             })?;
 
-        // Store compiled function info - will get actual pointer after finalization
-        let compiled_func = CompiledFunction {
-            function_id: func_id,
-            version: 1,
-            code_ptr: std::ptr::null(),
-            size: 0, // Will be updated after finalization
-            signature: sig,
-        };
-        self.compiled_functions.insert(id, compiled_func);
+        // Store compiled function info - will get actual pointer after finalization.
+        // OSR helpers don't share id-space with HIR functions; we track their
+        // FuncIds in pending_osr_helpers instead, so skip this insert.
+        if osr_helper.is_none() {
+            let compiled_func = CompiledFunction {
+                function_id: func_id,
+                version: 1,
+                code_ptr: std::ptr::null(),
+                size: 0, // Will be updated after finalization
+                signature: sig,
+            };
+            self.compiled_functions.insert(id, compiled_func);
+        }
 
         // Clear context for next function
         self.codegen_context.clear();
@@ -7470,6 +7589,43 @@ fn emit_osr_back_edge_probe(
 
     builder.switch_to_block(post_probe_block);
     builder.seal_block(post_probe_block);
+}
+
+/// Reverse of [`marshal_to_i64`]: take an i64 helper arg and bit-cast /
+/// reduce it to `target`. Used in the OSR helper's synthetic prologue to
+/// recover the original-typed live-in values.
+fn bitcast_from_i64(
+    builder: &mut FunctionBuilder<'_>,
+    v: cranelift_codegen::ir::Value,
+    target: cranelift_codegen::ir::Type,
+) -> cranelift_codegen::ir::Value {
+    if target == types::I64 {
+        v
+    } else if target.is_int() {
+        // Smaller int — truncate from i64.
+        builder.ins().ireduce(target, v)
+    } else if target == types::F32 {
+        // i64 → i32 (low 32 bits) → bitcast f32.
+        let low = builder.ins().ireduce(types::I32, v);
+        builder.ins().bitcast(
+            types::F32,
+            cranelift_codegen::ir::MemFlags::new(),
+            low,
+        )
+    } else if target == types::F64 {
+        builder.ins().bitcast(
+            types::F64,
+            cranelift_codegen::ir::MemFlags::new(),
+            v,
+        )
+    } else {
+        // Pointers / other 64-bit values — reinterpret directly.
+        builder.ins().bitcast(
+            target,
+            cranelift_codegen::ir::MemFlags::new(),
+            v,
+        )
+    }
 }
 
 /// Bit-cast / zero-extend a Cranelift value to i64 for the OSR helper ABI.

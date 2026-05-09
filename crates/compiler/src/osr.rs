@@ -317,25 +317,28 @@ fn successors_of(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
 
 /// What an OSR helper at a given header needs from the running tier-0 frame.
 ///
-/// `live_ins` are the SSA values the helper expects as i64-typed function
-/// args (in order); `live_in_types` records the original HIR type of each
-/// for bit-cast at helper entry. `return_type` is the function's return
-/// type — the helper returns it via i64 bit-cast and the caller reverses
-/// the cast at the dispatch site.
+/// `live_ins` are the SSA values the helper expects as function args. The
+/// **first `phi_count`** entries are the phi results at the header (loop-
+/// carried values, used as block params on the helper's jump to the
+/// header); the rest are non-phi values defined outside the reachable
+/// region but used inside it (e.g. function params or pre-loop locals).
+/// All live-ins are received as i64s and bit-cast at helper entry per
+/// `live_in_types`.
 ///
-/// Initial-cut policy (this increment): live-ins are the **phi results at
-/// the loop header**. Loops with no phis have an empty live-in list (still
-/// a valid layout — the helper takes zero args and runs the loop). Loops
-/// whose body uses values defined outside the loop but not phi-merged at
-/// the header are **not** representable yet; the helper would need to
-/// re-execute the function prologue to materialize them, deferred to a
-/// future increment.
+/// `return_type` is the function's return type — the helper returns it
+/// directly (no bit-cast at the dispatch site since both sides share the
+/// same Cranelift signature for the return).
 #[derive(Debug, Clone)]
 pub struct OsrLayout {
     pub header: HirId,
     pub block_index: u64,
     pub live_ins: Vec<HirId>,
     pub live_in_types: Vec<HirType>,
+    /// Number of leading entries in `live_ins` that are phi results at
+    /// `header`. `live_ins[..phi_count]` are passed to the header as
+    /// block params; `live_ins[phi_count..]` are stored under their
+    /// HirIds in the helper's value_map for the body to consume.
+    pub phi_count: usize,
     pub return_type: HirType,
 }
 
@@ -358,16 +361,34 @@ pub enum OsrReject {
     ReturnDoesntFit,
     /// Header doesn't exist in the function.
     NoSuchHeader,
+    /// The reachable region contains an instruction whose uses our
+    /// conservative analysis can't enumerate (effects, atomics, trait
+    /// method calls, etc.). Helper compile would mishandle it.
+    UnsupportedInstruction,
 }
 
 /// Compute an [`OsrLayout`] for `header`, or report why it's rejected.
+///
+/// Live-ins are computed in two passes:
+///
+/// 1. **Phi live-ins** — the phi results at `header`, in HIR order.
+///    These are the loop-carried values; the helper's jump to the header
+///    passes them as block params.
+/// 2. **Non-phi live-ins** — values used by any instruction or
+///    terminator in the region reachable from `header`, that are *not*
+///    defined within that region and *not* HIR constants/globals
+///    (which are rematerialized in the helper's prologue alongside the
+///    main entry's prologue). These are typically function params or
+///    pre-loop locals.
+///
+/// The combined live-in count must be ≤ [`OSR_MAX_LIVE_INS`].
 pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, OsrReject> {
     let block = function
         .blocks
         .get(&header)
         .ok_or(OsrReject::NoSuchHeader)?;
 
-    // Multi-value return functions can't go through the i64 helper ABI.
+    // Multi-value return functions can't go through the helper ABI.
     let return_type = match function.signature.returns.as_slice() {
         [] => HirType::Void,
         [ty] => ty.clone(),
@@ -377,8 +398,53 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
         return Err(OsrReject::ReturnDoesntFit);
     }
 
-    let live_ins: Vec<HirId> = block.phis.iter().map(|p| p.result).collect();
-    let live_in_types: Vec<HirType> = block.phis.iter().map(|p| p.ty.clone()).collect();
+    // Phi live-ins.
+    let mut live_ins: Vec<HirId> = block.phis.iter().map(|p| p.result).collect();
+    let mut live_in_types: Vec<HirType> = block.phis.iter().map(|p| p.ty.clone()).collect();
+    let phi_count = live_ins.len();
+
+    // Non-phi live-ins. Walk reachable blocks, collect uses minus
+    // locally-defined-or-rematerializable values.
+    let reachable = reachable_from(function, header);
+    let local_defs = locally_defined_in(function, &reachable);
+
+    let mut seen_extra: std::collections::HashSet<HirId> =
+        live_ins.iter().copied().collect();
+
+    for &block_id in &reachable {
+        let block = match function.blocks.get(&block_id) {
+            Some(b) => b,
+            None => continue,
+        };
+        for inst in &block.instructions {
+            let uses = match instruction_uses(inst) {
+                Ok(u) => u,
+                // Instruction outside the supported subset — reject
+                // the layout. The helper compile would mishandle it.
+                Err(()) => return Err(OsrReject::UnsupportedInstruction),
+            };
+            for used in uses {
+                consider_live_in(
+                    function,
+                    used,
+                    &local_defs,
+                    &mut seen_extra,
+                    &mut live_ins,
+                    &mut live_in_types,
+                );
+            }
+        }
+        for used in terminator_uses(&block.terminator) {
+            consider_live_in(
+                function,
+                used,
+                &local_defs,
+                &mut seen_extra,
+                &mut live_ins,
+                &mut live_in_types,
+            );
+        }
+    }
 
     if live_ins.len() > OSR_MAX_LIVE_INS {
         return Err(OsrReject::TooManyLiveIns(live_ins.len()));
@@ -394,8 +460,171 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
         block_index,
         live_ins,
         live_in_types,
+        phi_count,
         return_type,
     })
+}
+
+/// Add `used` to the live-ins list iff it's used in the loop body but
+/// not locally defined and not a constant/undef/global (those are
+/// rematerialized in the helper's prologue, not passed as args).
+fn consider_live_in(
+    function: &HirFunction,
+    used: HirId,
+    local_defs: &std::collections::HashSet<HirId>,
+    seen: &mut std::collections::HashSet<HirId>,
+    live_ins: &mut Vec<HirId>,
+    live_in_types: &mut Vec<HirType>,
+) {
+    if !seen.insert(used) {
+        return;
+    }
+    if local_defs.contains(&used) {
+        return;
+    }
+    if let Some(value) = function.values.get(&used) {
+        match &value.kind {
+            crate::hir::HirValueKind::Constant(_)
+            | crate::hir::HirValueKind::Undef
+            | crate::hir::HirValueKind::Global(_) => return,
+            _ => {
+                live_ins.push(used);
+                live_in_types.push(value.ty.clone());
+            }
+        }
+    }
+    // Unknown HirId — silently drop. The helper compile will fail later
+    // if this turns out to be a real reference; the caller's error
+    // reporting catches it.
+}
+
+fn reachable_from(function: &HirFunction, start: HirId) -> Vec<HirId> {
+    let mut order = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        order.push(id);
+        if let Some(block) = function.blocks.get(&id) {
+            for succ in successors_of(&block.terminator) {
+                if !visited.contains(&succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+    }
+    order
+}
+
+fn locally_defined_in(
+    function: &HirFunction,
+    blocks: &[HirId],
+) -> std::collections::HashSet<HirId> {
+    let mut defs = std::collections::HashSet::new();
+    for &id in blocks {
+        let block = match function.blocks.get(&id) {
+            Some(b) => b,
+            None => continue,
+        };
+        for phi in &block.phis {
+            defs.insert(phi.result);
+        }
+        for inst in &block.instructions {
+            if let Some(result) = instruction_result(inst) {
+                defs.insert(result);
+            }
+        }
+    }
+    defs
+}
+
+fn instruction_result(inst: &crate::hir::HirInstruction) -> Option<HirId> {
+    use crate::hir::HirInstruction as I;
+    match inst {
+        I::Binary { result, .. }
+        | I::Unary { result, .. }
+        | I::Alloca { result, .. }
+        | I::Load { result, .. }
+        | I::Cast { result, .. }
+        | I::GetElementPtr { result, .. }
+        | I::Select { result, .. }
+        | I::ExtractValue { result, .. }
+        | I::InsertValue { result, .. } => Some(*result),
+        I::Call { result, .. }
+        | I::IndirectCall { result, .. }
+        | I::CallClosure { result, .. }
+        | I::TraitMethodCall { result, .. } => *result,
+        _ => None,
+    }
+}
+
+/// Conservatively enumerate the HirIds an instruction reads. This must
+/// over-approximate (missing a use is unsafe — the helper compile would
+/// later fail with an unmapped HirId), so we err on the side of
+/// rejecting layouts that contain instructions we don't fully understand.
+///
+/// `Ok(uses)` — confidently enumerated uses.
+/// `Err(())` — the instruction is outside our supported subset; the
+/// caller should reject the layout.
+fn instruction_uses(inst: &crate::hir::HirInstruction) -> Result<Vec<HirId>, ()> {
+    use crate::hir::HirInstruction as I;
+    let mut uses = Vec::new();
+    match inst {
+        I::Binary { left, right, .. } => {
+            uses.push(*left);
+            uses.push(*right);
+        }
+        I::Unary { operand, .. } => uses.push(*operand),
+        I::Alloca { count, .. } => {
+            if let Some(c) = count {
+                uses.push(*c);
+            }
+        }
+        I::Load { ptr, .. } => uses.push(*ptr),
+        I::Store { value, ptr, .. } => {
+            uses.push(*value);
+            uses.push(*ptr);
+        }
+        I::GetElementPtr { ptr, indices, .. } => {
+            uses.push(*ptr);
+            uses.extend(indices.iter().copied());
+        }
+        I::Cast { operand, .. } => uses.push(*operand),
+        I::Select { condition, true_val, false_val, .. } => {
+            uses.push(*condition);
+            uses.push(*true_val);
+            uses.push(*false_val);
+        }
+        I::ExtractValue { aggregate, .. } => uses.push(*aggregate),
+        I::InsertValue { aggregate, value, .. } => {
+            uses.push(*aggregate);
+            uses.push(*value);
+        }
+        I::Call { args, .. } | I::CallClosure { args, .. } => {
+            uses.extend(args.iter().copied());
+        }
+        // Anything else (effects, atomics, trait method calls, closures
+        // with captures, fences, …) — outside our supported subset for
+        // OSR helper bodies. Reject the layout rather than silently
+        // miss a use.
+        _ => return Err(()),
+    }
+    Ok(uses)
+}
+
+fn terminator_uses(term: &HirTerminator) -> Vec<HirId> {
+    let mut uses = Vec::new();
+    match term {
+        HirTerminator::Return { values } => uses.extend(values.iter().copied()),
+        HirTerminator::CondBranch { condition, .. } => uses.push(*condition),
+        HirTerminator::Switch { value, .. } => uses.push(*value),
+        HirTerminator::Invoke { args, .. } => uses.extend(args.iter().copied()),
+        HirTerminator::PatternMatch { value, .. } => uses.push(*value),
+        _ => {}
+    }
+    uses
 }
 
 /// Whether `ty` can round-trip through an i64 (the OSR helper ABI).
