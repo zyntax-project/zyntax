@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use krio_async::{AsyncHooks, FnId as KrioFnId, SuspendingFns, SuspensionSite};
+use krio_async::{AsyncHooks, FnId as KrioFnId, LivenessMap, SuspendingFns, SuspensionSite};
 use krio_stackless::CoroCfg;
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
@@ -147,6 +147,21 @@ impl<'f> HirCoroCfg<'f> {
         let id = HirLocalId(self.next_local_seq);
         self.next_local_seq += 1;
         self.locals.insert(id, kind);
+        id
+    }
+
+    /// Mint a `HirLocalId` for use as a liveness tag — krio's
+    /// `LivenessMap` needs a per-value handle, but these aren't
+    /// mutable state-machine locals (they round-trip to existing SSA
+    /// values via [`HirLiveness::local_to_hir`]). They share the
+    /// counter with state-machine locals to keep the LocalId space
+    /// globally unique within the function.
+    pub(crate) fn fresh_liveness_local_id(&mut self) -> HirLocalId {
+        let id = HirLocalId(self.next_local_seq);
+        self.next_local_seq += 1;
+        // Intentionally NOT inserted into `self.locals` — calling
+        // `alloca_for` on a liveness-tag id would panic, which is the
+        // intended trap for accidental reuse.
         id
     }
 
@@ -682,6 +697,114 @@ impl<'a> AsyncHooks for HirAsyncHooks<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HirLiveness — krio's `LivenessMap` populated from zyntax's existing
+// per-block liveness analysis (`zyntax_compiler::analysis::LivenessAnalysis`).
+//
+// krio expects liveness keyed by `(block_id, statement_idx)` for each
+// suspension site, with values as krio `LocalId`s. We map SSA `HirId`s
+// to "naked" liveness `HirLocalId`s and persist the round-trip mapping
+// so Phase E's save/load emission can recover the SSA value to spill.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Live-across-suspension data for a single async function, in the
+/// shape krio-async's `transform_to_state_machine` consumes.
+pub struct HirLiveness {
+    /// SSA `HirId` → krio `HirLocalId`. Same SSA value shares the
+    /// same LocalId at every suspension site it crosses, which lets
+    /// krio's slot allocator assign a single slot for the value's
+    /// entire live range.
+    pub hir_to_local: HashMap<HirId, HirLocalId>,
+    /// Reverse map. Used by Phase E during save/load emission to
+    /// recover the SSA `HirId` from the LocalId krio reports back.
+    pub local_to_hir: HashMap<HirLocalId, HirId>,
+    /// The actual `LivenessMap` to feed into the transform.
+    pub map: LivenessMap<HirBlockId, HirLocalId>,
+}
+
+impl HirLiveness {
+    /// Build a `LivenessMap` covering every `Intrinsic::Await`
+    /// suspension site in `cfg.function`.
+    ///
+    /// **Conservative approximation**: at each suspension site we
+    /// record `live_out` of the containing block as the live-across
+    /// set. This over-saves — values defined later in the same block
+    /// (post-suspension) that flow out are also recorded — but
+    /// over-saving is correctness-preserving, just slightly larger
+    /// future structs. Tighter intra-block liveness (e.g. backward
+    /// walking from `live_out` and removing post-idx defs) can be a
+    /// follow-up if profiling shows it matters.
+    ///
+    /// `live_out_per_block` is the host's per-block `live_out` map,
+    /// typically obtained from
+    /// `zyntax_compiler::analysis::LivenessAnalysis::live_out`.
+    pub fn build(
+        cfg: &mut HirCoroCfg<'_>,
+        live_out_per_block: &HashMap<HirId, HashSet<HirId>>,
+    ) -> Self {
+        let mut hir_to_local: HashMap<HirId, HirLocalId> = HashMap::new();
+        let mut local_to_hir: HashMap<HirLocalId, HirId> = HashMap::new();
+        let mut map = LivenessMap::new();
+
+        // Snapshot the suspension sites first — we need `&mut cfg` for
+        // minting LocalIds, but iterating `cfg.function.blocks` and
+        // mutating cfg simultaneously would alias.
+        let mut sites: Vec<(HirBlockId, usize, HashSet<HirId>)> = Vec::new();
+        for (seq, hir_block_id) in cfg.block_seq_to_hir.iter().enumerate() {
+            let block = match cfg.function.blocks.get(hir_block_id) {
+                Some(b) => b,
+                None => continue,
+            };
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                if let HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Await),
+                    ..
+                } = inst
+                {
+                    let live = live_out_per_block
+                        .get(hir_block_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    sites.push((HirBlockId(seq as u32), idx, live));
+                }
+            }
+        }
+
+        for (bb, idx, live_set) in sites {
+            // Convert live SSA HirIds → LocalIds, keeping the bijection.
+            let mut locals_at_site: Vec<HirLocalId> = Vec::with_capacity(live_set.len());
+            // Iterate in deterministic order (by HirId hash via sort)
+            // so the LocalId allocation is stable across runs — krio's
+            // slot allocator uses BTreeMap, but our LocalId minting is
+            // sequential, so insertion order matters for which slot
+            // a given SSA value gets. Stable order = stable test output.
+            let mut ordered: Vec<HirId> = live_set.into_iter().collect();
+            // HirId has no Ord; we sort by its Debug repr as a stable
+            // surrogate. This sort is only for testability — the
+            // transform doesn't depend on it.
+            ordered.sort_by_key(|id| format!("{:?}", id));
+            for hir_id in ordered {
+                let local = if let Some(&existing) = hir_to_local.get(&hir_id) {
+                    existing
+                } else {
+                    let new_local = cfg.fresh_liveness_local_id();
+                    hir_to_local.insert(hir_id, new_local);
+                    local_to_hir.insert(new_local, hir_id);
+                    new_local
+                };
+                locals_at_site.push(local);
+            }
+            map.record(bb, idx, locals_at_site);
+        }
+
+        Self {
+            hir_to_local,
+            local_to_hir,
+            map,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -922,6 +1045,71 @@ mod tests {
         };
         let site = hooks.classify(&cfg, HirBlockId(0), 0);
         assert!(matches!(site, Some(SuspensionSite::DirectYield { .. })));
+    }
+
+    #[test]
+    fn liveness_map_records_every_await_site_with_live_out_values() {
+        // Function with two Await sites in entry block, no actual
+        // control-flow complexity. live_out is fed in directly.
+        let mut f = empty_function("test");
+        let entry = f.entry_block;
+        let live_a = HirId::new();
+        let live_b = HirId::new();
+        // Plant two Intrinsic::Await calls and one regular Call between them.
+        let entry_block = f.blocks.get_mut(&entry).unwrap();
+        entry_block.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Intrinsic(Intrinsic::Await),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry_block.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Function(HirId::new()),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry_block.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Intrinsic(Intrinsic::Await),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+
+        // live_out = {live_a, live_b}
+        let mut live_out = HashMap::new();
+        let mut set = HashSet::new();
+        set.insert(live_a);
+        set.insert(live_b);
+        live_out.insert(entry, set);
+
+        let mut cfg = HirCoroCfg::new(&mut f);
+        let liveness = HirLiveness::build(&mut cfg, &live_out);
+
+        // Two await sites recorded, both at block 0.
+        assert_eq!(liveness.map.at_site.len(), 2);
+        assert_eq!(liveness.map.at_site[0].0, (HirBlockId(0), 0));
+        assert_eq!(liveness.map.at_site[1].0, (HirBlockId(0), 2));
+
+        // Each site has 2 live LocalIds (one per SSA HirId).
+        assert_eq!(liveness.map.at_site[0].1.len(), 2);
+        assert_eq!(liveness.map.at_site[1].1.len(), 2);
+
+        // Same SSA HirIds → same LocalIds at both sites (stable mapping).
+        assert_eq!(liveness.map.at_site[0].1, liveness.map.at_site[1].1);
+
+        // Round-trip: each LocalId resolves back to one of the
+        // original HirIds.
+        for local in &liveness.map.at_site[0].1 {
+            let hir = liveness.local_to_hir[local];
+            assert!(hir == live_a || hir == live_b);
+        }
     }
 
     #[test]
