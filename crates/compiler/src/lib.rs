@@ -56,6 +56,7 @@ pub mod llvm_jit_backend; // LLVM MCJIT for hot-path optimization
 
 pub mod plugin; // Plugin system for frontend runtime registration
 pub mod profiling; // Runtime profiling for tiered compilation
+pub mod beadie_adapter; // beadie::JitBackend wrappers for our backends
 pub mod tiered_backend; // Tiered JIT/AOT compilation system
 pub mod zpack;
 pub mod zrtl; // ZRTL (Zyntax Runtime Library) dynamic plugin format // ZPack package format for distributing modules + runtimes

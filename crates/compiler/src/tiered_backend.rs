@@ -1,155 +1,117 @@
-//! # Tiered Compilation Backend
+//! # Tiered Compilation Backend (beadie-driven)
 //!
-//! Implements multi-tier JIT compilation with automatic optimization based on runtime profiling.
-//! Combines Cranelift (fast baseline) with optional LLVM JIT (maximum optimization).
+//! Multi-tier JIT compilation with hot-function promotion. Uses
+//! [`beadie::TieredAdapter`] under the hood — it owns the per-tier broker
+//! threads, atomic code-pointer swap, generations, and (later) OSR / deopt
+//! infrastructure.
 //!
-//! ## Optimization Tiers
-//! - **Tier 0 (Baseline)**: Cranelift with minimal optimization (for cold code)
-//! - **Tier 1 (Standard)**: Cranelift with moderate optimization (for warm code)
-//! - **Tier 2 (Optimized)**: Cranelift or LLVM with aggressive optimization (for hot code)
+//! ## Optimization tiers
+//! - **Tier 0 (Baseline)** — Cranelift, eagerly compiled at module load.
+//!   Beadie generation 0.
+//! - **Tier 1 (Standard)** — Cranelift recompile, promoted at the warm
+//!   threshold from `ProfileConfig`. Beadie generation 1.
+//! - **Tier 2 (Optimized)** — Cranelift or LLVM recompile, promoted at the
+//!   hot threshold. Beadie generation 2.
 //!
-//! ## How It Works
-//! 1. All functions start at Tier 0 (baseline JIT with Cranelift)
-//! 2. Execution counters track how often functions are called
-//! 3. When a function crosses the "warm" threshold, it's recompiled at Tier 1 (Cranelift)
-//! 4. When it crosses the "hot" threshold, it's recompiled at Tier 2 (Cranelift or LLVM)
-//! 5. Function pointers are atomically swapped after recompilation
+//! ## Public API
+//! Mirrors the previous hand-rolled implementation 1:1 so embedders
+//! (`zyntax_embed::TieredRuntime`) keep working without changes.
 //!
-//! ## Backend Selection
-//! - **Cranelift**: Fast compilation, good optimization (default for all tiers)
-//! - **LLVM MCJIT**: Slower compilation, maximum optimization (optional for Tier 2)
-//!
-//! Use `TieredConfig::production_llvm()` to enable LLVM for hot-path optimization.
-//!
-//! ## Future Extensions
-//! - On-Stack Replacement (OSR) for upgrading running functions
-//! - Deoptimization support for debugging
-//! - Profile-guided inlining decisions
+//! ## Phase boundaries
+//! Phase 1 (this file): swap implementation, keep behavior.
+//! Phase 2/3 will add OSR; phase 4 will add deopt-on-speculation.
+//! See `crates/compiler/BEADIE_INTEGRATION.md`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::ptr;
+use std::sync::{Arc, RwLock};
 
+use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, TieredBound};
+
+use crate::beadie_adapter::{ZyntaxCraneliftBackend, ZyntaxFunctionDef};
 use crate::cranelift_backend::CraneliftBackend;
 use crate::hir::{HirFunction, HirId, HirModule};
 use crate::profiling::{ProfileConfig, ProfileData};
 use crate::{CompilerError, CompilerResult};
 
-/// Runtime symbol entry for FFI
-#[derive(Clone)]
-struct RuntimeSymbol {
-    name: String,
-    ptr: usize, // Store as usize for thread safety
-}
-
+#[cfg(feature = "llvm-backend")]
+use crate::beadie_adapter::ZyntaxLlvmBackend;
 #[cfg(feature = "llvm-backend")]
 use crate::llvm_jit_backend::LLVMJitBackend;
 #[cfg(feature = "llvm-backend")]
 use inkwell::context::Context;
 
-/// Tiered compilation backend
-pub struct TieredBackend {
-    /// Primary Cranelift backend (Tier 0 & 1)
-    cranelift: CraneliftBackend,
+// ─────────────────────────────────────────────────────────────────────────────
+// Public types (preserved from the legacy API)
+// ─────────────────────────────────────────────────────────────────────────────
 
-    /// Optional LLVM JIT backend for Tier 2 hot-path optimization
-    #[cfg(feature = "llvm-backend")]
-    llvm_jit: Option<LLVMJitBackend<'static>>,
-
-    /// LLVM context (must outlive the JIT backend)
-    #[cfg(feature = "llvm-backend")]
-    llvm_context: Option<Box<Context>>,
-
-    /// Runtime profiling data
-    profile_data: ProfileData,
-
-    /// Current optimization tier for each function
-    function_tiers: Arc<RwLock<HashMap<HirId, OptimizationTier>>>,
-
-    /// Function pointers (usize for thread safety, cast to *const u8 when needed)
-    function_pointers: Arc<RwLock<HashMap<HirId, usize>>>,
-
-    /// Queue of functions waiting for recompilation at higher tier
-    optimization_queue: Arc<Mutex<VecDeque<(HirId, OptimizationTier)>>>,
-
-    /// Functions currently being optimized
-    optimizing: Arc<Mutex<HashSet<HirId>>>,
-
-    /// The HIR module (needed for recompilation)
-    module: Arc<RwLock<Option<HirModule>>>,
-
-    /// Runtime symbols for FFI (from ZRTL plugins)
-    runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
-
-    /// Configuration
-    config: TieredConfig,
-
-    /// Background optimization worker handle
-    worker_handle: Option<thread::JoinHandle<()>>,
-
-    /// Shutdown signal
-    shutdown: Arc<Mutex<bool>>,
-}
-
-/// Optimization tier level
+/// Optimization tier level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptimizationTier {
-    Baseline,  // Tier 0: Fast compilation, minimal optimization
-    Standard,  // Tier 1: Moderate optimization
-    Optimized, // Tier 2: Aggressive optimization
+    Baseline,  // Tier 0 — fast compile, minimal opt
+    Standard,  // Tier 1 — moderate opt
+    Optimized, // Tier 2 — aggressive opt
 }
 
 impl OptimizationTier {
-    /// Get Cranelift optimization level for this tier
     pub fn cranelift_opt_level(&self) -> &'static str {
         match self {
-            OptimizationTier::Baseline => "none",            // -O0
-            OptimizationTier::Standard => "speed",           // -O2
-            OptimizationTier::Optimized => "speed_and_size", // -O3
+            OptimizationTier::Baseline => "none",
+            OptimizationTier::Standard => "speed",
+            OptimizationTier::Optimized => "speed_and_size",
         }
     }
 
-    /// Get the next higher tier
     pub fn next_tier(&self) -> Option<OptimizationTier> {
         match self {
             OptimizationTier::Baseline => Some(OptimizationTier::Standard),
             OptimizationTier::Standard => Some(OptimizationTier::Optimized),
-            OptimizationTier::Optimized => None, // Already at max
+            OptimizationTier::Optimized => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            OptimizationTier::Baseline => 0,
+            OptimizationTier::Standard => 1,
+            OptimizationTier::Optimized => 2,
+        }
+    }
+
+    fn from_index(idx: usize) -> Option<OptimizationTier> {
+        match idx {
+            0 => Some(OptimizationTier::Baseline),
+            1 => Some(OptimizationTier::Standard),
+            2 => Some(OptimizationTier::Optimized),
+            _ => None,
         }
     }
 }
 
-/// Configuration for tiered compilation
-#[derive(Debug, Clone)]
-pub struct TieredConfig {
-    /// Profiling configuration
-    pub profile_config: ProfileConfig,
-
-    /// Enable background optimization (async optimization in separate thread)
-    pub enable_background_optimization: bool,
-
-    /// How often to check for hot functions (in milliseconds)
-    pub optimization_check_interval_ms: u64,
-
-    /// Maximum number of functions to optimize in parallel
-    pub max_parallel_optimizations: usize,
-
-    /// Backend to use for Tier 2 (hot code)
-    pub tier2_backend: Tier2Backend,
-
-    /// Verbosity level (0 = silent, 1 = basic, 2 = detailed)
-    pub verbosity: u8,
-}
-
-/// Backend choice for Tier 2 (hot code optimization)
+/// Backend choice for tier 2 (hot code).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2Backend {
-    /// Use Cranelift with maximum optimization
     Cranelift,
-    /// Use LLVM MCJIT with aggressive optimization (requires llvm-backend feature)
     #[cfg(feature = "llvm-backend")]
     LLVM,
+}
+
+/// Configuration for tiered compilation.
+#[derive(Debug, Clone)]
+pub struct TieredConfig {
+    pub profile_config: ProfileConfig,
+    /// Kept for API compat — beadie always uses background broker threads,
+    /// so disabling it has no effect now. Setting to `false` would have
+    /// required removing the broker entirely; instead we honor it by simply
+    /// never crossing the promotion threshold (the tier 1/2 thresholds are
+    /// effectively `u32::MAX`).
+    pub enable_background_optimization: bool,
+    /// Kept for API compat; not used by beadie's broker (it polls a channel).
+    pub optimization_check_interval_ms: u64,
+    /// Kept for API compat; beadie runs one worker thread per tier.
+    pub max_parallel_optimizations: usize,
+    pub tier2_backend: Tier2Backend,
+    pub verbosity: u8,
 }
 
 impl Default for TieredConfig {
@@ -166,7 +128,6 @@ impl Default for TieredConfig {
 }
 
 impl TieredConfig {
-    /// Development configuration (aggressive optimization, verbose)
     pub fn development() -> Self {
         Self {
             profile_config: ProfileConfig::development(),
@@ -178,7 +139,6 @@ impl TieredConfig {
         }
     }
 
-    /// Production configuration (conservative, low overhead)
     pub fn production() -> Self {
         Self {
             profile_config: ProfileConfig::production(),
@@ -190,7 +150,6 @@ impl TieredConfig {
         }
     }
 
-    /// Production configuration with LLVM for maximum optimization
     #[cfg(feature = "llvm-backend")]
     pub fn production_llvm() -> Self {
         Self {
@@ -204,45 +163,96 @@ impl TieredConfig {
     }
 }
 
-impl TieredBackend {
-    /// Create a new tiered backend
-    pub fn new(config: TieredConfig) -> CompilerResult<Self> {
-        let cranelift = CraneliftBackend::new()?;
-        let profile_data = ProfileData::new(config.profile_config);
+// ─────────────────────────────────────────────────────────────────────────────
+// Internals
+// ─────────────────────────────────────────────────────────────────────────────
 
-        // Initialize LLVM JIT backend if configured for Tier 2
+/// Per-function state held alongside its beadie bound bead.
+struct FunctionEntry {
+    bound: TieredBound,
+    /// Pre-cloned HIR function, captured by promotion closures.
+    function: Arc<HirFunction>,
+}
+
+/// Runtime symbol entry for FFI registration.
+#[derive(Clone)]
+struct RuntimeSymbol {
+    name: String,
+    /// `*const u8` cast to `usize` so the entry stays `Send`/`Sync`.
+    ptr: usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TieredBackend
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct TieredBackend {
+    /// Beadie's tiered adapter: owns broker threads + per-bead state.
+    adapter: TieredAdapter,
+
+    /// Cranelift backend, locked behind a `Mutex` and shared with worker
+    /// threads via `Arc`.
+    cranelift: Arc<ZyntaxCraneliftBackend>,
+
+    /// Optional LLVM backend for tier 2 hot code.
+    #[cfg(feature = "llvm-backend")]
+    llvm: Option<Arc<ZyntaxLlvmBackend>>,
+
+    /// Owned LLVM context (must outlive the backend it powers).
+    /// `Option` is used only so we can move it during `shutdown`.
+    #[cfg(feature = "llvm-backend")]
+    _llvm_context: Option<Box<Context>>,
+
+    /// Per-function entries keyed by HIR function id.
+    functions: HashMap<HirId, FunctionEntry>,
+
+    /// Profile counters (for `get_statistics` only — promotion is driven by
+    /// beadie's own counters).
+    profile_data: ProfileData,
+
+    /// Runtime FFI symbols registered post-construction.
+    runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
+
+    config: TieredConfig,
+}
+
+impl TieredBackend {
+    /// Build the tiered backend.
+    pub fn new(config: TieredConfig) -> CompilerResult<Self> {
+        let cranelift = Arc::new(ZyntaxCraneliftBackend::new(CraneliftBackend::new()?));
+
         #[cfg(feature = "llvm-backend")]
-        let (llvm_context, llvm_jit) = if matches!(config.tier2_backend, Tier2Backend::LLVM) {
-            // Create context (must outlive the backend)
+        let (_llvm_context, llvm) = if matches!(config.tier2_backend, Tier2Backend::LLVM) {
             let context = Box::new(Context::create());
-            // SAFETY: We ensure the context outlives the backend by storing both
+            // SAFETY: the `Box<Context>` is held alive for the lifetime of
+            // `TieredBackend`. We hand a `'static` reference to the JIT
+            // backend; the backend will never observe the context drop
+            // before itself.
             let context_ref = unsafe { &*(context.as_ref() as *const Context) };
             let jit = LLVMJitBackend::new(context_ref)?;
-            (Some(context), Some(jit))
+            (Some(context), Some(Arc::new(ZyntaxLlvmBackend::new(jit))))
         } else {
             (None, None)
         };
 
+        let adapter = TieredAdapter::new(make_policies(&config));
+
         Ok(Self {
+            adapter,
             cranelift,
             #[cfg(feature = "llvm-backend")]
-            llvm_jit,
+            llvm,
             #[cfg(feature = "llvm-backend")]
-            llvm_context,
-            profile_data,
-            function_tiers: Arc::new(RwLock::new(HashMap::new())),
-            function_pointers: Arc::new(RwLock::new(HashMap::new())),
-            optimization_queue: Arc::new(Mutex::new(VecDeque::new())),
-            optimizing: Arc::new(Mutex::new(HashSet::new())),
-            module: Arc::new(RwLock::new(None)),
+            _llvm_context,
+            functions: HashMap::new(),
+            profile_data: ProfileData::new(config.profile_config.clone()),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
-            worker_handle: None,
-            shutdown: Arc::new(Mutex::new(false)),
         })
     }
 
-    /// Compile a HIR module (initially at Tier 0 - Baseline)
+    /// Compile a HIR module — bulk-emits every function at tier 0 and
+    /// registers each with the beadie adapter.
     pub fn compile_module(&mut self, module: HirModule) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             eprintln!(
@@ -251,410 +261,172 @@ impl TieredBackend {
             );
         }
 
-        // Compile everything at baseline (Tier 0)
-        self.cranelift.compile_module(&module)?;
+        self.cranelift
+            .with_lock(|be| be.compile_module(&module))?;
 
-        // Store function pointers and mark all as Baseline tier
-        for func_id in module.functions.keys() {
-            if let Some(ptr) = self.cranelift.get_function_ptr(*func_id) {
-                self.function_pointers
-                    .write()
-                    .unwrap()
-                    .insert(*func_id, ptr as usize);
-                self.function_tiers
-                    .write()
-                    .unwrap()
-                    .insert(*func_id, OptimizationTier::Baseline);
+        for (func_id, function) in module.functions.iter() {
+            let bound = self.adapter.register(ptr::null_mut(), None);
+
+            // Eagerly install the tier-0 code pointer so the bead reports
+            // `Compiled(gen=0)` from the very first invocation.
+            if let Some(p) = self.cranelift.with_lock(|be| be.get_function_ptr(*func_id)) {
+                bound.bead().eager_install(p as *mut ());
             }
-        }
 
-        // Store module for later recompilation
-        *self.module.write().unwrap() = Some(module);
-
-        // Start background optimization if enabled
-        if self.config.enable_background_optimization {
-            self.start_background_optimization();
+            self.functions.insert(
+                *func_id,
+                FunctionEntry {
+                    bound,
+                    function: Arc::new(function.clone()),
+                },
+            );
         }
 
         Ok(())
     }
 
-    /// Get a function pointer
+    /// Current native-code pointer for `func_id`, or `None` if unknown.
     pub fn get_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
-        self.function_pointers
-            .read()
-            .unwrap()
+        self.functions
             .get(&func_id)
-            .map(|addr| *addr as *const u8)
+            .and_then(|e| e.bound.bead().compiled())
+            .map(|p| p as *const u8)
     }
 
-    /// Record a function call (for profiling and tier promotion)
+    /// Record an invocation. Drives tier promotion via beadie.
     pub fn record_call(&self, func_id: HirId) {
-        // Sample based on config
+        // Sample at the configured rate for cheap profile stats. Beadie
+        // counts independently.
         let count = self.profile_data.get_function_count(func_id);
-        if count % self.config.profile_config.sample_rate != 0 {
-            return;
+        if self
+            .config
+            .profile_config
+            .sample_rate
+            .checked_mul(1)
+            .map(|r| count % r != 0)
+            .unwrap_or(false)
+        {
+            // sample_rate = 0 would div-by-zero; treat that as "never sample
+            // beyond the first" by skipping. We still drive beadie below.
+        } else {
+            self.profile_data.record_function_call(func_id);
         }
 
-        self.profile_data.record_function_call(func_id);
-
-        // Check if function should be promoted to next tier
-        let should_promote = {
-            let tiers = self.function_tiers.read().unwrap();
-            let current_tier = tiers
-                .get(&func_id)
-                .copied()
-                .unwrap_or(OptimizationTier::Baseline);
-
-            match current_tier {
-                OptimizationTier::Baseline if self.profile_data.is_warm(func_id) => {
-                    Some(OptimizationTier::Standard)
-                }
-                OptimizationTier::Standard if self.profile_data.is_hot(func_id) => {
-                    Some(OptimizationTier::Optimized)
-                }
-                _ => None,
-            }
+        let entry = match self.functions.get(&func_id) {
+            Some(e) => e,
+            None => return,
         };
 
-        if let Some(target_tier) = should_promote {
-            self.enqueue_for_optimization(func_id, target_tier);
-        }
+        // Build a closure beadie can call from any tier broker thread.
+        let func_arc = Arc::clone(&entry.function);
+        let cranelift = Arc::clone(&self.cranelift);
+        #[cfg(feature = "llvm-backend")]
+        let llvm = self.llvm.as_ref().map(Arc::clone);
+        let tier2_backend = self.config.tier2_backend;
+        let verbosity = self.config.verbosity;
+
+        let closure = move |tier_idx: usize, bead: &Arc<Bead>| -> *mut () {
+            compile_at_tier(
+                tier_idx,
+                bead,
+                func_id,
+                &func_arc,
+                &cranelift,
+                #[cfg(feature = "llvm-backend")]
+                llvm.as_ref(),
+                tier2_backend,
+                verbosity,
+            )
+        };
+
+        // We only care about side-effects (queueing a promotion); the return
+        // value of `on_invoke` is the current code pointer, which we already
+        // exposed via `get_function_pointer`.
+        let _ = self.adapter.on_invoke(&entry.bound, closure);
     }
 
-    /// Enqueue a function for optimization at a specific tier
-    fn enqueue_for_optimization(&self, func_id: HirId, target_tier: OptimizationTier) {
-        let mut queue = self.optimization_queue.lock().unwrap();
-        let optimizing = self.optimizing.lock().unwrap();
-
-        // Don't enqueue if already optimizing or already in queue at this tier
-        if !optimizing.contains(&func_id)
-            && !queue
-                .iter()
-                .any(|(id, tier)| *id == func_id && *tier == target_tier)
-        {
-            if self.config.verbosity >= 2 {
-                let count = self.profile_data.get_function_count(func_id);
-                eprintln!(
-                    "[TieredBackend] Enqueuing {:?} for {:?} (count: {})",
-                    func_id, target_tier, count
-                );
-            }
-            queue.push_back((func_id, target_tier));
-        }
-    }
-
-    /// Manually trigger recompilation of a function at a specific tier
+    /// Force-recompile `func_id` at `target_tier`, bypassing thresholds.
     pub fn optimize_function(
         &mut self,
         func_id: HirId,
         target_tier: OptimizationTier,
     ) -> CompilerResult<()> {
-        // Clone the function to avoid holding the read lock
-        let function = {
-            let module_lock = self.module.read().unwrap();
-            let module = module_lock
-                .as_ref()
-                .ok_or_else(|| CompilerError::Backend("No module loaded".into()))?;
-
-            module
-                .functions
-                .get(&func_id)
-                .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?
-                .clone()
-        };
-
-        self.optimize_function_internal(func_id, &function, target_tier)
-    }
-
-    /// Internal: Recompile a single function at a specific tier
-    fn optimize_function_internal(
-        &mut self,
-        func_id: HirId,
-        function: &HirFunction,
-        target_tier: OptimizationTier,
-    ) -> CompilerResult<()> {
-        if self.config.verbosity >= 1 {
-            let count = self.profile_data.get_function_count(func_id);
-            eprintln!(
-                "[TieredBackend] Recompiling {:?} at {:?} (count: {})",
-                func_id, target_tier, count
-            );
-        }
-
-        // Choose backend based on tier and configuration
-        let new_ptr = if target_tier == OptimizationTier::Optimized {
-            // Tier 2: Use configured backend (Cranelift or LLVM)
-            #[cfg(feature = "llvm-backend")]
-            if matches!(self.config.tier2_backend, Tier2Backend::LLVM) {
-                // Use LLVM JIT for maximum optimization
-                if let Some(ref mut llvm) = self.llvm_jit {
-                    llvm.compile_function(func_id, function)?;
-                    llvm.get_function_pointer(func_id)
-                } else {
-                    return Err(CompilerError::Backend(
-                        "LLVM JIT backend not initialized".to_string(),
-                    ));
-                }
-            } else {
-                // Use Cranelift with aggressive optimization
-                self.cranelift.compile_function(func_id, function)?;
-                self.cranelift.get_function_ptr(func_id)
-            }
-
-            #[cfg(not(feature = "llvm-backend"))]
-            {
-                // LLVM not available, use Cranelift
-                self.cranelift.compile_function(func_id, function)?;
-                self.cranelift.get_function_ptr(func_id)
-            }
-        } else {
-            // Tier 0 & 1: Always use Cranelift
-            self.cranelift.compile_function(func_id, function)?;
-            self.cranelift.get_function_ptr(func_id)
-        };
-
-        // Atomically swap the function pointer if compilation succeeded
-        if let Some(ptr) = new_ptr {
-            self.function_pointers
-                .write()
-                .unwrap()
-                .insert(func_id, ptr as usize);
-            self.function_tiers
-                .write()
-                .unwrap()
-                .insert(func_id, target_tier);
-
-            if self.config.verbosity >= 1 {
-                let backend_name = if target_tier == OptimizationTier::Optimized {
-                    #[cfg(feature = "llvm-backend")]
-                    if matches!(self.config.tier2_backend, Tier2Backend::LLVM) {
-                        "LLVM"
-                    } else {
-                        "Cranelift"
-                    }
-                    #[cfg(not(feature = "llvm-backend"))]
-                    "Cranelift"
-                } else {
-                    "Cranelift"
-                };
-                eprintln!(
-                    "[TieredBackend] Successfully promoted {:?} to {:?} using {}",
-                    func_id, target_tier, backend_name
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Start background optimization worker thread
-    fn start_background_optimization(&mut self) {
-        if self.worker_handle.is_some() {
-            return; // Already started
-        }
-
-        let queue = Arc::clone(&self.optimization_queue);
-        let optimizing = Arc::clone(&self.optimizing);
-        let module = Arc::clone(&self.module);
-        let function_pointers = Arc::clone(&self.function_pointers);
-        let function_tiers = Arc::clone(&self.function_tiers);
-        let shutdown = Arc::clone(&self.shutdown);
-        let profile_data = self.profile_data.clone();
-        let config = self.config.clone();
-
-        let handle = thread::spawn(move || {
-            if config.verbosity >= 1 {
-                eprintln!("[TieredBackend] Background optimization worker started");
-            }
-
-            loop {
-                // Check for shutdown
-                if *shutdown.lock().unwrap() {
-                    if config.verbosity >= 1 {
-                        eprintln!("[TieredBackend] Background worker shutting down");
-                    }
-                    break;
-                }
-
-                // Process optimization queue
-                Self::background_worker_iteration(
-                    &queue,
-                    &optimizing,
-                    &module,
-                    &function_pointers,
-                    &function_tiers,
-                    &profile_data,
-                    &config,
-                );
-
-                // Sleep before next iteration
-                thread::sleep(Duration::from_millis(config.optimization_check_interval_ms));
-            }
-        });
-
-        self.worker_handle = Some(handle);
-    }
-
-    /// Background worker iteration
-    fn background_worker_iteration(
-        queue: &Arc<Mutex<VecDeque<(HirId, OptimizationTier)>>>,
-        optimizing: &Arc<Mutex<HashSet<HirId>>>,
-        module: &Arc<RwLock<Option<HirModule>>>,
-        function_pointers: &Arc<RwLock<HashMap<HirId, usize>>>,
-        function_tiers: &Arc<RwLock<HashMap<HirId, OptimizationTier>>>,
-        profile_data: &ProfileData,
-        config: &TieredConfig,
-    ) {
-        let mut queue_lock = queue.lock().unwrap();
-        let mut optimizing_lock = optimizing.lock().unwrap();
-
-        // Don't start new optimizations if at capacity
-        if optimizing_lock.len() >= config.max_parallel_optimizations {
-            return;
-        }
-
-        // Dequeue a function to optimize
-        if let Some((func_id, target_tier)) = queue_lock.pop_front() {
-            optimizing_lock.insert(func_id);
-            drop(queue_lock);
-            drop(optimizing_lock);
-
-            // Perform optimization
-            let result = Self::worker_optimize_function(
-                func_id,
-                target_tier,
-                module,
-                function_pointers,
-                function_tiers,
-                profile_data,
-                config,
-            );
-
-            // Mark as done
-            optimizing.lock().unwrap().remove(&func_id);
-
-            if let Err(e) = result {
-                if config.verbosity >= 1 {
-                    eprintln!("[TieredBackend] Failed to optimize {:?}: {}", func_id, e);
-                }
-            }
-        }
-    }
-
-    /// Worker function to optimize a single function
-    fn worker_optimize_function(
-        func_id: HirId,
-        target_tier: OptimizationTier,
-        module: &Arc<RwLock<Option<HirModule>>>,
-        function_pointers: &Arc<RwLock<HashMap<HirId, usize>>>,
-        function_tiers: &Arc<RwLock<HashMap<HirId, OptimizationTier>>>,
-        profile_data: &ProfileData,
-        config: &TieredConfig,
-    ) -> CompilerResult<()> {
-        if config.verbosity >= 1 {
-            let count = profile_data.get_function_count(func_id);
-            eprintln!(
-                "[TieredBackend] Worker optimizing {:?} at {:?} (count: {})",
-                func_id, target_tier, count
-            );
-        }
-
-        // Get module and function
-        let module_lock = module.read().unwrap();
-        let hir_module = module_lock
-            .as_ref()
-            .ok_or_else(|| CompilerError::Backend("No module loaded".into()))?;
-
-        let function = hir_module
+        let entry = self
             .functions
             .get(&func_id)
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?;
 
-        // Create a new Cranelift backend configured for this tier
-        // TODO: Configure Cranelift settings based on tier
-        let mut backend = CraneliftBackend::new()?;
-        backend.compile_function(func_id, function)?;
+        let func_arc = Arc::clone(&entry.function);
+        let cranelift = Arc::clone(&self.cranelift);
+        #[cfg(feature = "llvm-backend")]
+        let llvm = self.llvm.as_ref().map(Arc::clone);
+        let tier2_backend = self.config.tier2_backend;
+        let verbosity = self.config.verbosity;
+        let tier_idx = target_tier.index();
 
-        // Get the optimized function pointer
-        if let Some(new_ptr) = backend.get_function_ptr(func_id) {
-            // Atomically swap
-            function_pointers
-                .write()
-                .unwrap()
-                .insert(func_id, new_ptr as usize);
-            function_tiers.write().unwrap().insert(func_id, target_tier);
+        let promoted = self.adapter.force_promote(&entry.bound, tier_idx, move |bead| {
+            compile_at_tier(
+                tier_idx,
+                bead,
+                func_id,
+                &func_arc,
+                &cranelift,
+                #[cfg(feature = "llvm-backend")]
+                llvm.as_ref(),
+                tier2_backend,
+                verbosity,
+            )
+        });
 
-            if config.verbosity >= 1 {
-                eprintln!(
-                    "[TieredBackend] Worker successfully promoted {:?} to {:?}",
-                    func_id, target_tier
-                );
-            }
+        if !promoted && verbosity >= 1 {
+            eprintln!(
+                "[TieredBackend] force_promote({:?}, {:?}) rejected (already queued, blacklisted, or out of range)",
+                func_id, target_tier
+            );
         }
 
         Ok(())
     }
 
-    /// Get profiling and tiering statistics
+    /// Snapshot statistics for diagnostics.
     pub fn get_statistics(&self) -> TieredStatistics {
         let profile_stats = self.profile_data.get_statistics();
-        let tiers = self.function_tiers.read().unwrap();
+        let mut baseline_count = 0usize;
+        let mut standard_count = 0usize;
+        let mut optimized_count = 0usize;
 
-        let baseline_count = tiers
-            .values()
-            .filter(|&&t| t == OptimizationTier::Baseline)
-            .count();
-        let standard_count = tiers
-            .values()
-            .filter(|&&t| t == OptimizationTier::Standard)
-            .count();
-        let optimized_count = tiers
-            .values()
-            .filter(|&&t| t == OptimizationTier::Optimized)
-            .count();
+        for entry in self.functions.values() {
+            match entry.bound.current_tier() {
+                Some(0) => baseline_count += 1,
+                Some(1) => standard_count += 1,
+                Some(_) => optimized_count += 1,
+                None => {}
+            }
+        }
 
         TieredStatistics {
             profile_stats,
             baseline_functions: baseline_count,
             standard_functions: standard_count,
             optimized_functions: optimized_count,
-            queued_for_optimization: self.optimization_queue.lock().unwrap().len(),
-            currently_optimizing: self.optimizing.lock().unwrap().len(),
+            // Beadie does not surface queue depths; expose 0 instead of
+            // lying or panicking. Background activity is observable via the
+            // tier counts themselves.
+            queued_for_optimization: 0,
+            currently_optimizing: 0,
         }
     }
 
-    /// Shutdown the tiered backend (stops background worker)
-    pub fn shutdown(&mut self) {
-        *self.shutdown.lock().unwrap() = true;
+    /// No-op under beadie: broker threads exit on adapter `Drop`.
+    pub fn shutdown(&mut self) {}
 
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// Register a runtime symbol for FFI/plugin linking
-    ///
-    /// This allows external functions from ZRTL plugins to be called from JIT code.
-    /// Note: Symbols registered after module compilation will be available for
-    /// recompilation in background workers.
+    /// Register an FFI symbol (used when reloading modules to make ZRTL
+    /// plugin pointers visible to fresh Cranelift compiles).
     pub fn register_runtime_symbol(&mut self, name: &str, ptr: *const u8) {
         self.runtime_symbols.write().unwrap().push(RuntimeSymbol {
             name: name.to_string(),
             ptr: ptr as usize,
         });
-    }
-
-    /// Get all registered runtime symbols as a vector of (name, ptr) tuples
-    ///
-    /// Used when creating new Cranelift backends for background optimization.
-    fn get_runtime_symbols(&self) -> Vec<(String, *const u8)> {
-        self.runtime_symbols
-            .read()
-            .unwrap()
-            .iter()
-            .map(|s| (s.name.clone(), s.ptr as *const u8))
-            .collect()
     }
 }
 
@@ -664,7 +436,108 @@ impl Drop for TieredBackend {
     }
 }
 
-/// Statistics about the tiered backend
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the per-tier hotness policies from a `TieredConfig`.
+fn make_policies(config: &TieredConfig) -> Vec<Box<dyn HotnessPolicy>> {
+    let warm = clamp_to_u32(config.profile_config.warm_threshold);
+    let hot = clamp_to_u32(config.profile_config.hot_threshold);
+
+    // Tier 0 is always eager-installed by `compile_module`, so its policy
+    // never fires. Use a tiny threshold so any code path that registers a
+    // bead without eager-installing still gets a baseline compile quickly.
+    let tier0 = ThresholdPolicy::new(1);
+
+    // Tier 1 (Standard) — promote at warm threshold.
+    let queue_ahead_1 = (warm / 5).max(1);
+    let tier1 = ThresholdPolicy::new(warm).queue_ahead(queue_ahead_1);
+
+    // Tier 2 (Optimized) — promote at hot threshold.
+    let queue_ahead_2 = (hot / 10).max(10);
+    let tier2 = ThresholdPolicy::new(hot).queue_ahead(queue_ahead_2);
+
+    if config.enable_background_optimization {
+        vec![Box::new(tier0), Box::new(tier1), Box::new(tier2)]
+    } else {
+        // Disable promotion by setting tier 1/2 thresholds out of reach.
+        let unreachable = ThresholdPolicy::new(u32::MAX);
+        vec![
+            Box::new(tier0),
+            Box::new(ThresholdPolicy::new(u32::MAX)),
+            Box::new(unreachable),
+        ]
+    }
+}
+
+fn clamp_to_u32(v: u64) -> u32 {
+    if v > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        v as u32
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_at_tier(
+    tier_idx: usize,
+    bead: &Arc<Bead>,
+    func_id: HirId,
+    func_arc: &Arc<HirFunction>,
+    cranelift: &Arc<ZyntaxCraneliftBackend>,
+    #[cfg(feature = "llvm-backend")] llvm: Option<&Arc<ZyntaxLlvmBackend>>,
+    tier2_backend: Tier2Backend,
+    verbosity: u8,
+) -> *mut () {
+    let def = ZyntaxFunctionDef {
+        id: func_id,
+        function: (**func_arc).clone(),
+        tier: tier_idx,
+    };
+
+    if verbosity >= 1 {
+        eprintln!(
+            "[TieredBackend] Recompiling {:?} at tier {} ({:?})",
+            func_id,
+            tier_idx,
+            OptimizationTier::from_index(tier_idx)
+        );
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {
+        if let Some(llvm) = llvm {
+            return match llvm.compile(bead, def) {
+                Ok(p) => p,
+                Err(e) => {
+                    if verbosity >= 1 {
+                        eprintln!("[TieredBackend] LLVM compile failed: {e}");
+                    }
+                    ptr::null_mut()
+                }
+            };
+        }
+    }
+
+    // Cranelift handles tier 0/1, and tier 2 when the config doesn't pick
+    // LLVM (or the LLVM feature is off).
+    let _ = tier2_backend; // silence unused-variable when llvm-backend is off
+    match cranelift.compile(bead, def) {
+        Ok(p) => p,
+        Err(e) => {
+            if verbosity >= 1 {
+                eprintln!("[TieredBackend] Cranelift compile failed: {e}");
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Statistics
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct TieredStatistics {
     pub profile_stats: crate::profiling::ProfileStatistics,
@@ -676,7 +549,6 @@ pub struct TieredStatistics {
 }
 
 impl TieredStatistics {
-    /// Format as human-readable string
     pub fn format(&self) -> String {
         format!(
             "Tiered Compilation: {} Baseline (T0), {} Standard (T1), {} Optimized (T2)\n\

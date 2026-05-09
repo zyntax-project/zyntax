@@ -53,6 +53,9 @@ once_cell = "1.19"
 # Archive format for ZPack
 zip = "2.2"
 
+# Hot-function promotion broker for interpreter-to-JIT tiering
+beadie = "0.3"
+
 # Optional features for backend support
 cranelift = { version = "0.106", optional = true }
 cranelift-codegen = { version = "0.106", optional = true }
