@@ -872,6 +872,15 @@ impl<'g> GrammarInterpreter<'g> {
                 let body = self.get_field_optional_block("body", fields, state)?;
                 let annotations =
                     self.get_field_as_annotation_list("annotations", fields, state)?;
+                // Optional fields: grammar rules for `async def`, `async fn`,
+                // and `extern fn` set these explicitly. Default false when
+                // absent (regular sync function).
+                let is_async = self
+                    .get_field_optional_bool("is_async", fields, state)?
+                    .unwrap_or(false);
+                let is_external = self
+                    .get_field_optional_bool("is_external", fields, state)?
+                    .unwrap_or(false);
 
                 TypedDeclaration::Function(TypedFunction {
                     name,
@@ -882,9 +891,9 @@ impl<'g> GrammarInterpreter<'g> {
                     return_type,
                     body,
                     visibility: Visibility::Public,
-                    is_async: false,
+                    is_async,
                     is_pure: false,
-                    is_external: false,
+                    is_external,
                     calling_convention: CallingConvention::Default,
                     link_name: None,
                 })
@@ -2951,6 +2960,24 @@ impl<'g> GrammarInterpreter<'g> {
         match val {
             ParsedValue::Bool(b) => Ok(b),
             _ => Err(format!("field '{}' is not a boolean", name)),
+        }
+    }
+
+    fn get_field_optional_bool<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<Option<bool>, String> {
+        match self.get_field(name, fields) {
+            Some(expr) => {
+                let val = self.eval_expr(expr, state)?;
+                match val {
+                    ParsedValue::Bool(b) => Ok(Some(b)),
+                    _ => Err(format!("field '{}' is not a boolean", name)),
+                }
+            }
+            None => Ok(None),
         }
     }
 

@@ -1218,7 +1218,7 @@ fn add(a: i32, b: i32) i32 {
 
         // Catch panics from Cranelift compilation issues
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1278,7 +1278,7 @@ async fn get_value() i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1332,7 +1332,7 @@ async fn compute(x: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1342,22 +1342,22 @@ async fn compute(x: i32) i32 {
 
                 // Verify async functions with new Promise-based ABI:
                 // - `double` and `compute` are entry functions returning Promise<T>
-                // - `__double_poll` and `__compute_poll` are internal poll functions
+                // - `double$poll` and `compute$poll` are internal poll functions
                 assert!(
                     functions.contains(&"double".to_string()),
                     "double (entry function) should be generated"
                 );
                 assert!(
-                    functions.contains(&"__double_poll".to_string()),
-                    "__double_poll (internal poll) should be generated"
+                    functions.contains(&"double$poll".to_string()),
+                    "double$poll (internal poll) should be generated"
                 );
                 assert!(
                     functions.contains(&"compute".to_string()),
                     "compute (entry function) should be generated"
                 );
                 assert!(
-                    functions.contains(&"__compute_poll".to_string()),
-                    "__compute_poll (internal poll) should be generated"
+                    functions.contains(&"compute$poll".to_string()),
+                    "compute$poll (internal poll) should be generated"
                 );
 
                 // Now actually EXECUTE the async function via call_async
@@ -1428,7 +1428,7 @@ async fn sum_to_ten() i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1436,14 +1436,14 @@ async fn sum_to_ten() i32 {
                 println!("Compiled async sum function: {:?}", functions);
                 // With the new Promise-based async ABI:
                 // - `sum_to_ten` is the entry function that returns Promise<i32>
-                // - `__sum_to_ten_poll` is the internal poll function
+                // - `sum_to_ten$poll` is the internal poll function
                 assert!(
                     functions.contains(&"sum_to_ten".to_string()),
                     "sum_to_ten (entry function) should be generated"
                 );
                 assert!(
-                    functions.contains(&"__sum_to_ten_poll".to_string()),
-                    "__sum_to_ten_poll (internal poll) should be generated"
+                    functions.contains(&"sum_to_ten$poll".to_string()),
+                    "sum_to_ten$poll (internal poll) should be generated"
                 );
                 println!("Async function compilation successful!");
             }
@@ -1481,7 +1481,7 @@ async fn sum_range(n: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1492,8 +1492,8 @@ async fn sum_range(n: i32) i32 {
                     "sum_range (entry function) should be generated"
                 );
                 assert!(
-                    functions.contains(&"__sum_range_poll".to_string()),
-                    "__sum_range_poll (internal poll) should be generated"
+                    functions.contains(&"sum_range$poll".to_string()),
+                    "sum_range$poll (internal poll) should be generated"
                 );
 
                 // Execute: sum_range(100) should return 1+2+3+...+100 = 5050
@@ -1568,7 +1568,7 @@ async fn sum_doubled(n: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1586,12 +1586,12 @@ async fn sum_doubled(n: i32) i32 {
                     "sum_doubled should be generated"
                 );
                 assert!(
-                    functions.contains(&"__double_poll".to_string()),
-                    "__double_poll should be generated"
+                    functions.contains(&"double$poll".to_string()),
+                    "double$poll should be generated"
                 );
                 assert!(
-                    functions.contains(&"__sum_doubled_poll".to_string()),
-                    "__sum_doubled_poll should be generated"
+                    functions.contains(&"sum_doubled$poll".to_string()),
+                    "sum_doubled$poll should be generated"
                 );
 
                 // Execute: sum_doubled(5) should compute:
@@ -1668,7 +1668,7 @@ async fn step3(x: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1748,7 +1748,7 @@ async fn count_up(n: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1759,8 +1759,8 @@ async fn count_up(n: i32) i32 {
                     "count_up (entry function) should be generated"
                 );
                 assert!(
-                    functions.contains(&"__count_up_poll".to_string()),
-                    "__count_up_poll (internal poll) should be generated"
+                    functions.contains(&"count_up$poll".to_string()),
+                    "count_up$poll (internal poll) should be generated"
                 );
 
                 // Test count_up: count_up(n) returns n
@@ -1836,7 +1836,7 @@ async fn sum_with_multiplier(start: i32, end: i32, multiplier: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1846,7 +1846,7 @@ async fn sum_with_multiplier(start: i32, end: i32, multiplier: i32) i32 {
                     functions
                 );
                 assert!(functions.contains(&"sum_with_multiplier".to_string()));
-                assert!(functions.contains(&"__sum_with_multiplier_poll".to_string()));
+                assert!(functions.contains(&"sum_with_multiplier$poll".to_string()));
 
                 // sum_with_multiplier(1, 5, 2) = (1*2) + (2*2) + (3*2) + (4*2) + (5*2) = 2+4+6+8+10 = 30
                 let promise = runtime.call_async(
@@ -1940,7 +1940,7 @@ async fn add_to_sum(n: i32) i32 {
 
         // Catch panics from Cranelift
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.load_module("zig", source)
+            runtime.load_module("async_test", source)
         }));
 
         match result {
@@ -1958,12 +1958,12 @@ async fn add_to_sum(n: i32) i32 {
                     "add_to_sum should be generated"
                 );
                 assert!(
-                    functions.contains(&"__long_sum_poll".to_string()),
-                    "__long_sum_poll should be generated"
+                    functions.contains(&"long_sum$poll".to_string()),
+                    "long_sum$poll should be generated"
                 );
                 assert!(
-                    functions.contains(&"__add_to_sum_poll".to_string()),
-                    "__add_to_sum_poll should be generated"
+                    functions.contains(&"add_to_sum$poll".to_string()),
+                    "add_to_sum$poll should be generated"
                 );
 
                 // Test 1: long_sum(100) = 1+2+...+100 = 5050
