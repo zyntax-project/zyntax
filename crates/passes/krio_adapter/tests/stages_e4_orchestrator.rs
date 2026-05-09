@@ -46,8 +46,9 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
     let module = module_of(function.clone());
     let live_out = live_out_for_entry_only(&function, live_across);
 
-    let result = orchestrator::lower_async_function(&mut function, &module, frame, 16, &live_out)
-        .expect("orchestrator must succeed");
+    let result =
+        orchestrator::lower_async_function_in_module(&mut function, &module, frame, 16, &live_out)
+            .expect("orchestrator must succeed");
 
     // ── Dispatcher present at function entry ──
     let entry = &function.blocks[&function.entry_block];
@@ -184,7 +185,7 @@ fn e4_orchestrator_no_op_for_non_async_function() {
 
     let original_entry = function.entry_block;
     let mut function_owned = function;
-    let result = orchestrator::lower_async_function(
+    let result = orchestrator::lower_async_function_in_module(
         &mut function_owned,
         &module,
         frame,

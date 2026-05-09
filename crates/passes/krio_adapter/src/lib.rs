@@ -714,6 +714,132 @@ impl<'a> AsyncHooks for HirAsyncHooks<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-instruction def/use helpers used by the captures-lift liveness pass.
+// These cover the HIR variants the canonical async pipeline produces;
+// any case that's neither matched nor a side-effecting non-result inst
+// returns conservatively (no result / no uses listed). That's safe for
+// captures-lift: missing a use under-saves and would crash; missing a
+// def over-saves, which is correct.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
+    use HirInstruction as I;
+    match inst {
+        I::Binary { result, .. }
+        | I::Unary { result, .. }
+        | I::Alloca { result, .. }
+        | I::Load { result, .. }
+        | I::Cast { result, .. }
+        | I::GetElementPtr { result, .. }
+        | I::Select { result, .. }
+        | I::ExtractValue { result, .. }
+        | I::InsertValue { result, .. }
+        | I::Atomic { result, .. }
+        | I::CreateUnion { result, .. }
+        | I::GetUnionDiscriminant { result, .. }
+        | I::ExtractUnionValue { result, .. }
+        | I::CreateClosure { result, .. }
+        | I::CreateTraitObject { result, .. }
+        | I::UpcastTraitObject { result, .. }
+        | I::AsyncLoadSlot { result, .. } => Some(*result),
+
+        I::Call { result, .. }
+        | I::IndirectCall { result, .. }
+        | I::CallClosure { result, .. }
+        | I::TraitMethodCall { result, .. } => *result,
+
+        _ => None,
+    }
+}
+
+fn instruction_uses(inst: &HirInstruction) -> smallvec::SmallVec<[HirId; 4]> {
+    use HirInstruction as I;
+    let mut uses = smallvec::SmallVec::new();
+    match inst {
+        I::Binary { left, right, .. } => {
+            uses.push(*left);
+            uses.push(*right);
+        }
+        I::Unary { operand, .. } | I::Cast { operand, .. } => uses.push(*operand),
+        I::Alloca { count, .. } => {
+            if let Some(c) = count {
+                uses.push(*c);
+            }
+        }
+        I::Load { ptr, .. } => uses.push(*ptr),
+        I::Store { value, ptr, .. } => {
+            uses.push(*value);
+            uses.push(*ptr);
+        }
+        I::GetElementPtr { ptr, indices, .. } => {
+            uses.push(*ptr);
+            for v in indices {
+                uses.push(*v);
+            }
+        }
+        I::Select {
+            condition,
+            true_val,
+            false_val,
+            ..
+        } => {
+            uses.push(*condition);
+            uses.push(*true_val);
+            uses.push(*false_val);
+        }
+        I::ExtractValue { aggregate, .. } => uses.push(*aggregate),
+        I::InsertValue {
+            aggregate, value, ..
+        } => {
+            uses.push(*aggregate);
+            uses.push(*value);
+        }
+        I::Call { args, .. } | I::IndirectCall { args, .. } | I::CallClosure { args, .. } => {
+            for a in args {
+                uses.push(*a);
+            }
+        }
+        I::TraitMethodCall {
+            trait_object, args, ..
+        } => {
+            uses.push(*trait_object);
+            for a in args {
+                uses.push(*a);
+            }
+        }
+        I::AsyncSaveSlot { frame, value, .. } => {
+            uses.push(*frame);
+            uses.push(*value);
+        }
+        I::AsyncLoadSlot { frame, .. } => uses.push(*frame),
+        _ => {}
+    }
+    uses
+}
+
+fn terminator_uses(term: &zyntax_compiler::hir::HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
+    use zyntax_compiler::hir::HirTerminator as T;
+    let mut uses = smallvec::SmallVec::new();
+    match term {
+        T::Return { values } => {
+            for v in values {
+                uses.push(*v);
+            }
+        }
+        T::CondBranch { condition, .. } => uses.push(*condition),
+        T::Switch { value, .. } => uses.push(*value),
+        T::Invoke { args, .. } => {
+            for a in args {
+                uses.push(*a);
+            }
+        }
+        T::PatternMatch { value, .. } => uses.push(*value),
+        T::Branch { .. } | T::Unreachable => {}
+    }
+    uses
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HirLiveness — krio's `LivenessMap` populated from zyntax's existing
 // per-block liveness analysis (`zyntax_compiler::analysis::LivenessAnalysis`).
 //
@@ -742,17 +868,30 @@ impl HirLiveness {
     /// Build a `LivenessMap` covering every `Intrinsic::Await`
     /// suspension site in `cfg.function`.
     ///
-    /// **Conservative approximation**: at each suspension site we
-    /// record `live_out` of the containing block as the live-across
-    /// set. This over-saves — values defined later in the same block
-    /// (post-suspension) that flow out are also recorded — but
-    /// over-saving is correctness-preserving, just slightly larger
-    /// future structs. Tighter intra-block liveness (e.g. backward
-    /// walking from `live_out` and removing post-idx defs) can be a
-    /// follow-up if profiling shows it matters.
+    /// At each suspension site `(bb, idx)` the live-across set is:
     ///
-    /// `live_out_per_block` is the host's per-block `live_out` map,
-    /// typically obtained from
+    /// ```text
+    ///   { v defined before inst[idx] } ∩ { v used at or after inst[idx+1] }
+    /// ```
+    ///
+    /// — exactly what krio-async's contract requires (see
+    /// `LivenessMap` doc lines 257-269: "defined before the suspension
+    /// and used after it"). Values defined AT the suspension (e.g.
+    /// the `await_result` SSA value, written by the runtime on
+    /// resume) are intentionally excluded — they're set fresh on
+    /// resume, not captured.
+    ///
+    /// Algorithm per suspension:
+    ///   1. Forward pass over `inst[0..idx]` and the function entry
+    ///      params: collect the "defined before" set.
+    ///   2. Backward pass starting from `live_out[bb]` ∪ terminator
+    ///      uses, walking instructions in reverse from `len-1` down
+    ///      to `idx+1`, applying `live = use(k) ∪ (live - def(k))`
+    ///      at each step. Result is "values entering inst[idx+1]"
+    ///      which equals the post-suspension live set.
+    ///   3. Intersect; that's the captures-lift set for this site.
+    ///
+    /// `live_out_per_block` should come from
     /// `zyntax_compiler::analysis::LivenessAnalysis::live_out`.
     pub fn build(
         cfg: &mut HirCoroCfg<'_>,
@@ -762,27 +901,115 @@ impl HirLiveness {
         let mut local_to_hir: HashMap<HirLocalId, HirId> = HashMap::new();
         let mut map = LivenessMap::new();
 
-        // Snapshot the suspension sites first — we need `&mut cfg` for
-        // minting LocalIds, but iterating `cfg.function.blocks` and
-        // mutating cfg simultaneously would alias.
+        // Snapshot the suspension sites and their live-across sets
+        // first — we need `&mut cfg` for minting LocalIds later, but
+        // iterating `cfg.function` and mutating it simultaneously
+        // would alias.
         let mut sites: Vec<(HirBlockId, usize, HashSet<HirId>)> = Vec::new();
         for (seq, hir_block_id) in cfg.block_seq_to_hir.iter().enumerate() {
             let block = match cfg.function.blocks.get(hir_block_id) {
                 Some(b) => b,
                 None => continue,
             };
-            for (idx, inst) in block.instructions.iter().enumerate() {
-                if let HirInstruction::Call {
-                    callee: HirCallable::Intrinsic(Intrinsic::Await),
-                    ..
-                } = inst
-                {
-                    let live = live_out_per_block
-                        .get(hir_block_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    sites.push((HirBlockId(seq as u32), idx, live));
+            // Find every Intrinsic::Await suspension index in this block.
+            let suspension_indices: Vec<usize> = block
+                .instructions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, inst)| {
+                    if matches!(
+                        inst,
+                        HirInstruction::Call {
+                            callee: HirCallable::Intrinsic(Intrinsic::Await),
+                            ..
+                        }
+                    ) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if suspension_indices.is_empty() {
+                continue;
+            }
+
+            // Compute "defined before idx" for every suspension idx
+            // in one forward pass: incrementally accumulate defs.
+            // `defined_at_or_before[i]` = set of values defined by
+            // inst[0..=i] plus function params.
+            let mut defined_at_or_before: Vec<HashSet<HirId>> =
+                Vec::with_capacity(block.instructions.len());
+            let mut acc: HashSet<HirId> = cfg
+                .function
+                .signature
+                .params
+                .iter()
+                .map(|p| p.id)
+                .collect();
+            for inst in &block.instructions {
+                if let Some(def) = instruction_result(inst) {
+                    acc.insert(def);
                 }
+                defined_at_or_before.push(acc.clone());
+            }
+
+            // Backward pass: live-after each instruction. live_after[k]
+            // = values live just AFTER inst[k] = live_before(inst[k+1]).
+            // Seed: live_after[len-1] = live_out[bb] ∪ uses(terminator).
+            let mut live_after: Vec<HashSet<HirId>> =
+                vec![HashSet::new(); block.instructions.len()];
+            let block_live_out = live_out_per_block
+                .get(hir_block_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut working: HashSet<HirId> = block_live_out.clone();
+            for v in terminator_uses(&block.terminator) {
+                working.insert(v);
+            }
+            // Walk from last instruction back to first.
+            for k in (0..block.instructions.len()).rev() {
+                // live_after[k] = working state before applying inst[k]'s effects
+                live_after[k] = working.clone();
+                let inst = &block.instructions[k];
+                if let Some(def) = instruction_result(inst) {
+                    working.remove(&def);
+                }
+                for u in instruction_uses(inst) {
+                    working.insert(u);
+                }
+                // After this loop iteration, `working` is live BEFORE
+                // inst[k] = live_after[k-1] when k > 0.
+            }
+
+            for idx in suspension_indices {
+                // live_at_suspension = "live entering inst[idx+1]"
+                // = live_after[idx] when idx+1 < len, or
+                //   block_live_out + terminator_uses when idx is last.
+                let live_post = if idx + 1 < live_after.len() {
+                    live_after[idx].clone()
+                } else {
+                    let mut s = block_live_out.clone();
+                    for v in terminator_uses(&block.terminator) {
+                        s.insert(v);
+                    }
+                    s
+                };
+                let defined_pre = if idx == 0 {
+                    // Only function params are "defined before" the
+                    // first instruction.
+                    cfg.function
+                        .signature
+                        .params
+                        .iter()
+                        .map(|p| p.id)
+                        .collect()
+                } else {
+                    defined_at_or_before[idx - 1].clone()
+                };
+                let live: HashSet<HirId> =
+                    live_post.intersection(&defined_pre).copied().collect();
+                sites.push((HirBlockId(seq as u32), idx, live));
             }
         }
 
@@ -1073,17 +1300,26 @@ mod tests {
         // the entry block at the await, and one yield_block recorded.
         let mut f = empty_function("aw");
         let entry = f.entry_block;
-        let live = HirId::new(); // a single SSA value live across the await
+        // Make `live` a function parameter — params are "defined
+        // before everything", so the intra-block captures-lift will
+        // correctly identify it as crossing the await.
+        let live = HirId::new();
         f.values.insert(
             live,
             HirValue {
                 id: live,
                 ty: HirType::I32,
-                kind: HirValueKind::Instruction,
+                kind: HirValueKind::Parameter(0),
                 uses: HashSet::new(),
                 span: None,
             },
         );
+        f.signature.params.push(zyntax_compiler::hir::HirParam {
+            id: live,
+            name: InternedString::new_global("live"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        });
         let entry_block = f.blocks.get_mut(&entry).unwrap();
         // Plant an await call followed by a Return — krio splits at the await.
         entry_block.instructions.push(HirInstruction::Call {
@@ -1159,10 +1395,33 @@ mod tests {
     fn liveness_map_records_every_await_site_with_live_out_values() {
         // Function with two Await sites in entry block, no actual
         // control-flow complexity. live_out is fed in directly.
+        // `live_a` and `live_b` are function params so the intra-block
+        // captures-lift sees them as defined-before-suspension.
         let mut f = empty_function("test");
         let entry = f.entry_block;
         let live_a = HirId::new();
         let live_b = HirId::new();
+        for (i, (id, name)) in [(live_a, "live_a"), (live_b, "live_b")]
+            .into_iter()
+            .enumerate()
+        {
+            f.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: HirType::I32,
+                    kind: HirValueKind::Parameter(i as u32),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+            f.signature.params.push(zyntax_compiler::hir::HirParam {
+                id,
+                name: InternedString::new_global(name),
+                ty: HirType::I32,
+                attributes: ParamAttributes::default(),
+            });
+        }
         // Plant two Intrinsic::Await calls and one regular Call between them.
         let entry_block = f.blocks.get_mut(&entry).unwrap();
         entry_block.instructions.push(HirInstruction::Call {

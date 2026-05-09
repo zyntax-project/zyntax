@@ -129,6 +129,7 @@ pub use zyntax_compiler::zrtl::{
     DynamicValue,
     GenericTypeArgs,
     GenericValue,
+    RuntimeSymbolInfo,
     TypeCategory,
     TypeFlags,
     TypeId,
@@ -141,7 +142,9 @@ pub use zyntax_compiler::zrtl::{
     // ZRTL plugin loading
     ZrtlPlugin,
     ZrtlRegistry,
+    ZrtlSigFlags,
     ZrtlSymbol,
+    ZrtlSymbolSig,
     ZRTL_VERSION,
 };
 

@@ -832,21 +832,27 @@ fn apply_krio_async_lowering(
         use zyntax_compiler::hir::HirId;
 
         // Build live-out for every async fn via the existing analyzer.
-        // For now we collect an empty map and rely on krio to over-save
-        // when the analysis isn't readily available — see comment below.
+        // `ModuleAnalysis::functions[fn_id].liveness.live_out` is
+        // exactly the per-block `HirId -> HashSet<HirId>` shape krio
+        // wants — copy it across.
         let mut live_out: HashMap<HirId, HashMap<HirId, HashSet<HirId>>> = HashMap::new();
         let mut analyzer = AnalysisRunner::new(_module.clone());
-        // Best-effort: skip analysis errors silently. AnalysisRunner's
-        // public output (`ModuleAnalysis`) isn't currently shaped to
-        // hand back per-function `live_out` maps in the right form;
-        // rather than block the integration on an analysis API
-        // refactor, we feed empty live-outs into the orchestrator
-        // (krio produces a layout with no captures-lift in that case).
-        // Phase F's first pass will reveal whether real liveness is
-        // needed before captures-lift can do its job for a given
-        // failing test.
-        let _ = analyzer.run_all();
-        let _ = &mut live_out; // silence unused-mut
+        match analyzer.run_all() {
+            Ok(analysis) => {
+                for (fn_id, fn_analysis) in &analysis.functions {
+                    live_out.insert(*fn_id, fn_analysis.liveness.live_out.clone());
+                }
+            }
+            Err(e) => {
+                // Analysis failure isn't a hard error — krio still
+                // produces a valid layout with no captures-lift. Log
+                // so it shows up in the trace.
+                log::warn!(
+                    "[krio-async] AnalysisRunner failed; krio path will run with empty liveness: {:?}",
+                    e
+                );
+            }
+        }
 
         let lowered = krio_adapter::orchestrator::lower_async_module(
             _module,
@@ -1612,6 +1618,68 @@ impl ZyntaxRuntime {
         );
         // Also register with the backend so Cranelift can resolve the symbol during JIT linking
         self.backend.register_runtime_symbol(name, ptr);
+    }
+
+    /// Register an external function together with a typed signature.
+    ///
+    /// Same as [`Self::register_function`] for the runtime symbol
+    /// table, plus stores the signature on:
+    ///
+    /// - `plugin_signatures`, so [`Grammar2::parse_with_signatures`]
+    ///   can use it for `@builtin` extern injection if the host opts
+    ///   into that path.
+    /// - The backend's `symbol_signatures` table, so call-site
+    ///   lowering at codegen time uses the typed signature instead of
+    ///   guessing `I64` returns and platform-default calling
+    ///   conventions. Without this, statically-registered functions
+    ///   collide with Zyntax-injected extern declarations on
+    ///   `IncompatibleSignature` because the call site and the extern
+    ///   decl describe the symbol differently.
+    ///
+    /// This is the static-registration equivalent of what
+    /// [`Self::load_plugin`] does for `.zrtl` symbols. Hosts that
+    /// statically link their builtins (e.g. an embedded UI DSL whose
+    /// `$Foo$widget` functions live in the same binary) should prefer
+    /// this over the un-typed [`Self::register_function`] so type
+    /// inference and codegen agree on the symbol's shape.
+    ///
+    /// As with [`Self::register_function`], call
+    /// [`Self::finalize_runtime_symbols`] after the last
+    /// registration and before the first compile.
+    pub fn register_function_typed(
+        &mut self,
+        name: &'static str,
+        ptr: *const u8,
+        sig: zyntax_compiler::zrtl::ZrtlSymbolSig,
+    ) {
+        self.external_functions.insert(
+            name.to_string(),
+            ExternalFunction {
+                name: name.to_string(),
+                ptr,
+                arg_count: sig.param_count as usize,
+            },
+        );
+        self.backend.register_runtime_symbol(name, ptr);
+
+        // Mirror what `load_plugin` does for ZRTL symbol metadata.
+        self.plugin_signatures.insert(name.to_string(), sig);
+
+        // The backend's `symbol_signatures` table is what the
+        // Cranelift call-site lowering reads when emitting calls to a
+        // registered symbol — see
+        // `crates/compiler/src/cranelift_backend.rs:2719`.
+        // `register_symbol_signatures` takes
+        // `&[RuntimeSymbolInfo]`, whose `name` field is `&'static str`
+        // (copied to an owned `String` internally). Requiring
+        // `&'static str` from the caller matches the underlying type
+        // and avoids any lifetime extension trickery.
+        let info = zyntax_compiler::zrtl::RuntimeSymbolInfo {
+            name,
+            ptr,
+            sig: Some(sig),
+        };
+        self.backend.register_symbol_signatures(&[info]);
     }
 
     /// Rebuild the JIT module so symbols registered via

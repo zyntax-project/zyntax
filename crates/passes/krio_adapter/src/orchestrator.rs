@@ -85,28 +85,26 @@ impl std::error::Error for LowerError {}
 ///
 /// `live_out_per_block` is the host's existing per-block liveness
 /// data (produced by `zyntax_compiler::analysis::LivenessAnalysis`).
+///
+/// `suspending` MUST contain `function.id` — caller computes it once
+/// per module so that `lower_async_module`-style iteration that
+/// temporarily takes the function out of the module doesn't break
+/// the call-graph view. See [`HirSuspendingFns::from_module`].
 pub fn lower_async_function(
     function: &mut HirFunction,
-    module: &HirModule,
+    suspending: &HirSuspendingFns,
     frame_ptr: HirId,
     state_slot: u32,
     live_out_per_block: &HashMap<HirId, HashSet<HirId>>,
 ) -> Result<LowerResult, LowerError> {
     let fn_id = function.id;
-    let suspending = HirSuspendingFns::from_module(module);
 
     let mut cfg = HirCoroCfg::new(function);
     let liveness = HirLiveness::build(&mut cfg, live_out_per_block);
-    let hooks = HirAsyncHooks {
-        suspending: &suspending,
-    };
+    let hooks = HirAsyncHooks { suspending };
 
     let layout = krio_async::transform_to_state_machine(
-        &mut cfg,
-        fn_id,
-        &suspending,
-        &hooks,
-        &liveness.map,
+        &mut cfg, fn_id, suspending, &hooks, &liveness.map,
     )
     .map_err(|_| LowerError::Transform)?;
 
@@ -118,6 +116,20 @@ pub fn lower_async_function(
         liveness,
         rewrites,
     })
+}
+
+/// Convenience wrapper that computes `suspending` from the module
+/// internally. Use when the function being lowered is still in the
+/// module — i.e. NOT in `lower_async_module`'s swap-remove loop.
+pub fn lower_async_function_in_module(
+    function: &mut HirFunction,
+    module: &HirModule,
+    frame_ptr: HirId,
+    state_slot: u32,
+    live_out_per_block: &HashMap<HirId, HashSet<HirId>>,
+) -> Result<LowerResult, LowerError> {
+    let suspending = HirSuspendingFns::from_module(module);
+    lower_async_function(function, &suspending, frame_ptr, state_slot, live_out_per_block)
 }
 
 /// Lower every `is_async` function in `module`. Convenience wrapper
@@ -137,6 +149,14 @@ pub fn lower_async_module<F>(
 where
     F: FnMut(&HirFunction) -> HirId,
 {
+    // Compute the suspending-fn taint set ONCE up front, before any
+    // swap_remove churn. Krio's `transform_to_state_machine` early-
+    // exits when `is_suspending(fn_id)` returns false, so the call-
+    // graph view must be intact while each function is lowered —
+    // which it isn't if we recompute it after pulling the function
+    // out of the module.
+    let suspending = HirSuspendingFns::from_module(module);
+
     let async_fn_ids: Vec<HirId> = module
         .functions
         .values()
@@ -157,7 +177,8 @@ where
             .get(&fn_id)
             .cloned()
             .unwrap_or_default();
-        let result = lower_async_function(&mut function, module, frame, state_slot, &live_out)?;
+        let result =
+            lower_async_function(&mut function, &suspending, frame, state_slot, &live_out)?;
         module.functions.insert(fn_id, function);
         results.insert(fn_id, result);
     }
