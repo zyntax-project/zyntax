@@ -369,8 +369,18 @@ impl CraneliftBackend {
     /// Must be called after `finalize_definitions` — the FuncIds
     /// recorded during compilation are resolved to native code pointers
     /// here.
+    ///
+    /// **Stub gate**: until increment 5b emits real loop bodies, helpers
+    /// are stubs that return zero immediately. Installing them would
+    /// corrupt any TieredRuntime user's tier-1-promoted function. The
+    /// returned list is empty unless `ZYNML_OSR_HELPERS=1`. The helpers
+    /// are still emitted into the JIT module (dead code, fine for
+    /// inspection) — only the install path is gated.
     pub fn take_pending_osr_helpers(&mut self) -> Vec<(u64, *mut ())> {
         let pending = std::mem::take(&mut self.pending_osr_helpers);
+        if std::env::var_os("ZYNML_OSR_HELPERS").is_none() {
+            return Vec::new();
+        }
         pending
             .into_iter()
             .map(|(site, fid)| {

@@ -1044,3 +1044,116 @@ module load).
    doesn't know about the partial state. (b) Continue in tier-1
    non-speculated code via a slow path. wren_lift uses (b). Likely
    the right answer here too.
+
+---
+
+## Implementation status (end of 2026-05-09 session)
+
+| Increment | Status | Commit |
+|---|---|---|
+| Phase 1 — beadie wired, TieredAdapter rewrite | ✅ landed | 76c91cb |
+| 1-2 — bead registry, osr_probe, tier threading | ✅ landed | 3243878 |
+| 3-6 design doc | ✅ landed | d423a87 |
+| 3 — tier-0 probe emission | ✅ landed | 8527481 |
+| 4 — OSR layout analysis | ✅ landed | aebc0bb |
+| 5a — stub helper emission | ✅ landed | b2489f6 |
+| 6 — tier-0 dispatch + atomic install | ✅ landed | ba96d26 |
+| **5b — real loop-body emission** | ⏳ **deferred** | — |
+
+The end-to-end OSR pipeline is wired. Running `ZYNML_OSR_TRACE=1` shows
+probes fire at every loop header, the runtime probe is queried, helpers
+are declared with the correct `(i64,i64,i64,i64) -> ReturnType`
+signature and registered as `OsrEntry`s on the bead.
+
+**What's not yet functional**: the helper bodies are stubs that return
+zero immediately. Calling one would corrupt any tier-1-promoted
+function's result. The install path is gated behind `ZYNML_OSR_HELPERS=1`
+to keep this latent bug from biting any real user — until 5b lands,
+helpers are dead code in the JIT module.
+
+### What 5b needs
+
+Replacing each stub with a real loop body. The helper, on entry, must:
+
+1. Take 4 i64 args, bit-cast the first N to the live-in HIR types per
+   the layout (rest unused).
+2. Re-execute the function's pre-loop prologue (so any function-scope
+   defs not in the live-in set are materialized).
+3. Jump to a copy of the loop header with the live-ins as block params.
+4. Run the rest of the loop body to completion, returning the function's
+   return value.
+
+This is a separate Cranelift `Function` that compiles the same HIR as
+the main entry, but starting from a different block. The bulk of the
+work is sharing the per-instruction lowering with `compile_function_body`.
+
+Two reasonable shapes:
+
+- **Refactor `compile_function_body`** to accept an optional `entry_override`
+  and emit a synthetic prologue. Reuses every instruction-lowering
+  case but must be careful with the value_map ownership (it lives on
+  `self`, so two compiles can't run concurrently — that's already how
+  `Mutex<CraneliftBackend>` serializes things).
+- **Duplicate the lowering** as a `compile_osr_helper_body` method.
+  Simpler diff but ~3000 lines of duplication. Drift is a risk.
+
+Refactor is the right call. Concrete steps:
+
+1. Change `compile_function_body` to take an `entry_override: Option<HirId>`
+   parameter. When `Some`, the synthetic Cranelift entry block has the
+   helper sig, runs the bit-cast prologue, then jumps to the override
+   block (which is itself the loop header — Cranelift uses its existing
+   block params for phis).
+2. The block-emission loop becomes "all blocks reachable from the
+   override (or function.entry_block if `None`)". Use the existing
+   `find_loop_headers` infrastructure or equivalent reachable-set
+   computation.
+3. Replace `emit_osr_stub_helper` with one that constructs the helper's
+   sig, drives `compile_function_body` with the override, and records
+   the FuncId.
+4. Drop the `ZYNML_OSR_HELPERS` gate from `take_pending_osr_helpers`.
+5. Verify with a synthetic ZynML test: a long-running loop in a
+   function called many times. With `TieredDevelopment` profile (warm
+   threshold = 10), the function gets tier-1-promoted; the probe finds
+   the helper; the running tier-0 frame transfers into tier-1 mid-loop.
+   Add a `ZYNML_OSR_TRACE=1` check that an OSR transfer actually
+   occurred (helper call appears in the trace).
+
+### Open issue: prologue rematerialization
+
+If the function has prologue work (constant table setup, allocations,
+type-tag computation) before the loop, that work produces values used
+inside the loop body but **not** phi-merged at the header. Today's
+`osr_layout` accepts these layouts (it only looks at phis), but the
+helper would dereference garbage when it tries to use those values.
+
+Options for 5b:
+
+- **Conservative**: re-run the prologue inside the helper. Cheap if
+  prologue is small; for large prologues it's a perf hit but always
+  correct.
+- **Strict**: tighten `osr_layout` to reject layouts whose body uses
+  any value defined outside the SCC reachable from the header. Simpler
+  helper, fewer eligible loops.
+- **Hybrid**: classify prologue values into "rematerializable" (pure
+  computation from constants and live-ins) vs "side-effecting"
+  (allocations, I/O). Re-run rematerializable; reject if any
+  side-effecting value is used.
+
+Hybrid matches wren_lift's approach and is probably the right call
+once it matters. For first-cut 5b, conservative (re-run all prologue)
+is the safest.
+
+### Testing strategy for 5b
+
+- Add a ZynML example `crates/zynml/examples/osr_loop.zynml` with a
+  long counted loop (`for i in 0..10_000_000 { sum += i }`). Expected
+  return value: `49999995000000`.
+- Add a `tests/osr_e2e.rs` integration test that:
+  1. Runs the example with `ZYNML_RUNTIME_PROFILE=TieredDevelopment`
+     and `ZYNML_OSR_TRACE=1`, captures stderr.
+  2. Asserts the trace contains `[osr] declared helper ...` and
+     `[osr_probe] ...` lines.
+  3. Asserts the program output is the correct sum.
+- Run with `ZYNML_OSR_HELPERS=1` (or after dropping the gate) to
+  exercise the install + dispatch paths.
