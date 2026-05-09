@@ -3536,6 +3536,12 @@ impl TieredRuntime {
             }
         }
 
+        // Push the new symbols into the live JIT module so finalization
+        // can resolve them. Mirrors `ZyntaxRuntime::load_plugin`.
+        self.backend
+            .rebuild_with_accumulated_symbols()
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
         Ok(())
     }
 
@@ -3568,6 +3574,12 @@ impl TieredRuntime {
                     .insert(symbol_info.name.to_string(), sig);
             }
         }
+
+        // Push the new symbols into the live JIT module so finalization
+        // can resolve them. Mirrors `ZyntaxRuntime::load_plugins_from_directory`.
+        self.backend
+            .rebuild_with_accumulated_symbols()
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
 
         Ok(count)
     }
@@ -3712,11 +3724,15 @@ impl TieredRuntime {
             .collect();
         let hir_module = self.lower_typed_program(typed_program, builtins)?;
 
-        // Collect function names before compilation
+        // Collect function names before compilation. `f.name.to_string()`
+        // returns the debug repr of InternedString (e.g.
+        // "InternedString(SymbolU32 { value: 4 })") — `resolve_global()`
+        // returns the actual symbol text. Mirrors `ZyntaxRuntime::load_module`.
         let function_names: Vec<String> = hir_module
             .functions
             .values()
-            .map(|f| f.name.to_string())
+            .filter(|f| !f.is_external)
+            .filter_map(|f| f.name.resolve_global())
             .collect();
 
         // Compile the module

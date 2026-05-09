@@ -123,11 +123,20 @@ fn run_program(
         println!("Loading program: {}", file.display());
     }
 
+    let runtime_profile = match std::env::var("ZYNML_RUNTIME_PROFILE")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("tiered-dev") | Ok("tiered_dev") => zynml::ZynMLRuntimeProfile::TieredDevelopment,
+        Ok("tiered-prod") | Ok("tiered_prod") => zynml::ZynMLRuntimeProfile::TieredProduction,
+        _ => zynml::ZynMLRuntimeProfile::Classic,
+    };
+
     let config = ZynMLConfig {
         plugins_dir: plugins_dir.to_string_lossy().to_string(),
         load_optional: all_plugins,
         verbose,
-        runtime_profile: zynml::ZynMLRuntimeProfile::Classic,
+        runtime_profile,
     };
 
     let mut zynml = ZynML::with_config(config)?;

@@ -268,6 +268,19 @@ impl TieredBackend {
             );
         }
 
+        // If extern declarations in this module reference symbols that
+        // got registered after the JIT module was constructed (typically
+        // from `load_plugin`), rebuild the JIT module with the accumulated
+        // symbol set before compilation. Mirrors
+        // `ZyntaxRuntime::compile_module` in zyntax_embed.
+        self.cranelift.with_lock(|be| {
+            if be.needs_rebuild_for_module(&module) {
+                be.rebuild_with_accumulated_symbols()
+            } else {
+                Ok(())
+            }
+        })?;
+
         self.cranelift
             .with_lock(|be| be.compile_module(&module))?;
 
@@ -445,11 +458,41 @@ impl TieredBackend {
 
     /// Register an FFI symbol (used when reloading modules to make ZRTL
     /// plugin pointers visible to fresh Cranelift compiles).
+    ///
+    /// The symbol is recorded in two places:
+    ///   1. `TieredBackend.runtime_symbols` — bookkeeping for any later
+    ///      JIT-module rebuild we drive from this layer.
+    ///   2. The inner Cranelift backend's runtime-symbol list — so the
+    ///      next `rebuild_with_accumulated_symbols` re-attaches it to
+    ///      the live JIT module's symbol table.
+    ///
+    /// Note: this method does **not** rebuild the JIT module on its own.
+    /// Plugin loaders should call [`Self::rebuild_with_accumulated_symbols`]
+    /// once after batching all symbol registrations for a plugin (or
+    /// directory of plugins) to push them into the live JIT module.
     pub fn register_runtime_symbol(&mut self, name: &str, ptr: *const u8) {
         self.runtime_symbols.write().unwrap().push(RuntimeSymbol {
             name: name.to_string(),
             ptr: ptr as usize,
         });
+        self.cranelift
+            .with_lock(|be| be.register_runtime_symbol(name, ptr));
+    }
+
+    /// Rebuild the inner Cranelift JIT module with all accumulated runtime
+    /// symbols. Call after a plugin (or batch of plugins) has had its
+    /// symbols registered via [`Self::register_runtime_symbol`] so the
+    /// next `compile_module` can resolve them at finalization.
+    ///
+    /// Safe to call before any function has been compiled at tier 0
+    /// (the typical "load plugins, then compile module" flow). Calling
+    /// it after tier-0 compiles would invalidate previously-issued code
+    /// pointers — beads would still hold them, and `swap_compiled` from
+    /// later tiers would fail. The current ZynML driver only loads
+    /// plugins at startup, so the unsafe ordering doesn't arise.
+    pub fn rebuild_with_accumulated_symbols(&mut self) -> CompilerResult<()> {
+        self.cranelift
+            .with_lock(|be| be.rebuild_with_accumulated_symbols())
     }
 }
 
