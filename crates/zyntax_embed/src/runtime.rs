@@ -1537,6 +1537,31 @@ impl ZyntaxRuntime {
         self.backend.register_runtime_symbol(name, ptr);
     }
 
+    /// Rebuild the JIT module so symbols registered via
+    /// [`Self::register_function`] become resolvable from
+    /// subsequently-compiled modules.
+    ///
+    /// `register_function` records the symbol on the backend's
+    /// accumulator, but the underlying Cranelift JITModule was
+    /// constructed at [`Self::new`] time and only knows about the
+    /// symbols that existed then. Plugin loaders
+    /// ([`Self::load_plugin`], [`Self::load_plugins_from_directory`])
+    /// call `rebuild_with_accumulated_symbols` internally to bridge
+    /// this gap. Hosts that statically register their builtins
+    /// (without going through `.zrtl` discovery) need an equivalent
+    /// hook.
+    ///
+    /// Call once after batch-registering all builtins, before the
+    /// first [`Self::compile_typed_program`] / [`Self::compile_module`] /
+    /// [`Self::call`] invocation. Cheap; idempotent. Subsequent
+    /// symbol registrations require another call.
+    pub fn finalize_runtime_symbols(&mut self) -> RuntimeResult<()> {
+        self.backend
+            .rebuild_with_accumulated_symbols()
+            .map_err(|e| RuntimeError::Execution(format!("rebuild_jit: {e}")))?;
+        Ok(())
+    }
+
     /// Hot-reload a function with new code
     pub fn hot_reload(
         &mut self,
