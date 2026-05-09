@@ -1048,6 +1048,97 @@ mod tests {
     }
 
     #[test]
+    fn transform_to_state_machine_smoke_test() {
+        // Smallest possible end-to-end: an async fn with a single
+        // Intrinsic::Await in the entry block. Verifies the trait
+        // impls compose correctly with krio_async::transform_to_state_machine
+        // — the layout should have a resume_entry created by splitting
+        // the entry block at the await, and one yield_block recorded.
+        let mut f = empty_function("aw");
+        let entry = f.entry_block;
+        let live = HirId::new(); // a single SSA value live across the await
+        f.values.insert(
+            live,
+            HirValue {
+                id: live,
+                ty: HirType::I32,
+                kind: HirValueKind::Instruction,
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let entry_block = f.blocks.get_mut(&entry).unwrap();
+        // Plant an await call followed by a Return — krio splits at the await.
+        entry_block.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Intrinsic(Intrinsic::Await),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry_block.terminator = HirTerminator::Return { values: vec![live] };
+        // Mark the function async so SuspendingFns picks it up.
+        f.signature.is_async = true;
+        let fn_id = f.id;
+
+        // Build a one-fn module so SuspendingFns has something to taint over.
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(fn_id, f);
+        let suspending = HirSuspendingFns::from_module(&module);
+        assert!(suspending.is_suspending(fn_id));
+
+        // Get the function back out for mutation. (Module owns it; pull
+        // out, transform, put back — keeps lifetimes clean.)
+        let mut f = module.functions.swap_remove(&fn_id).unwrap();
+        let mut live_out = HashMap::new();
+        let mut s = HashSet::new();
+        s.insert(live);
+        live_out.insert(entry, s);
+
+        let mut cfg = HirCoroCfg::new(&mut f);
+        let liveness = HirLiveness::build(&mut cfg, &live_out);
+        assert_eq!(liveness.map.at_site.len(), 1, "one await site");
+        let hooks = HirAsyncHooks {
+            suspending: &suspending,
+        };
+
+        let layout = krio_async::transform_to_state_machine(
+            &mut cfg, fn_id, &suspending, &hooks, &liveness.map,
+        )
+        .expect("transform should succeed");
+
+        // resume_entries[0] is always the original entry block.
+        assert!(!layout.resume_entries.is_empty());
+        assert_eq!(layout.resume_entries[0], HirBlockId(0));
+        // We had one DirectYield; expect one resume entry beyond the
+        // original (state 1) and one yield block.
+        assert_eq!(layout.resume_entries.len(), 2);
+        assert_eq!(layout.yield_blocks.len(), 1);
+        // The yield block is the original entry (split at the await).
+        assert_eq!(layout.yield_blocks[0].0, HirBlockId(0));
+        // next_state for the yield is 1 (resumes at resume_entries[1]).
+        assert_eq!(layout.yield_blocks[0].1, 1);
+        // Block kind should be DirectYield.
+        assert!(matches!(
+            layout.block_kinds[0].1,
+            krio_async::BlockKind::DirectYield
+        ));
+
+        // Captures lift: the live SSA value should produce one save
+        // (at the yield block) and one load (at the resume entry).
+        assert_eq!(layout.yield_saves.len(), 1);
+        assert_eq!(layout.resume_loads.len(), 1);
+        assert_eq!(layout.yield_saves[0].0, HirBlockId(0));
+        // Load lives at resume_entries[1].
+        assert_eq!(layout.resume_loads[0].0, layout.resume_entries[1]);
+        // One slot, holding our `live` SSA value (via its LocalId mapping).
+        assert_eq!(layout.yield_saves[0].1.len(), 1);
+        let saved_local = layout.yield_saves[0].1[0].1;
+        assert_eq!(liveness.local_to_hir[&saved_local], live);
+    }
+
+    #[test]
     fn liveness_map_records_every_await_site_with_live_out_values() {
         // Function with two Await sites in entry block, no actual
         // control-flow complexity. live_out is fed in directly.
