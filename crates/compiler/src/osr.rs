@@ -51,7 +51,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use beadie::Bead;
 
-use crate::hir::{HirFunction, HirId, HirTerminator};
+use crate::hir::{HirFunction, HirId, HirTerminator, HirType};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Site-key encoding
@@ -312,6 +312,118 @@ fn successors_of(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OSR layout analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What an OSR helper at a given header needs from the running tier-0 frame.
+///
+/// `live_ins` are the SSA values the helper expects as i64-typed function
+/// args (in order); `live_in_types` records the original HIR type of each
+/// for bit-cast at helper entry. `return_type` is the function's return
+/// type — the helper returns it via i64 bit-cast and the caller reverses
+/// the cast at the dispatch site.
+///
+/// Initial-cut policy (this increment): live-ins are the **phi results at
+/// the loop header**. Loops with no phis have an empty live-in list (still
+/// a valid layout — the helper takes zero args and runs the loop). Loops
+/// whose body uses values defined outside the loop but not phi-merged at
+/// the header are **not** representable yet; the helper would need to
+/// re-execute the function prologue to materialize them, deferred to a
+/// future increment.
+#[derive(Debug, Clone)]
+pub struct OsrLayout {
+    pub header: HirId,
+    pub block_index: u64,
+    pub live_ins: Vec<HirId>,
+    pub live_in_types: Vec<HirType>,
+    pub return_type: HirType,
+}
+
+impl OsrLayout {
+    /// Encoded site key for this layout — see [`encode_osr_site`].
+    pub fn site_key(&self) -> u64 {
+        encode_osr_site(self.block_index, self.live_ins.len() as u16)
+    }
+}
+
+/// Reasons a layout is not representable as an OSR helper. Lets callers
+/// log a useful diagnostic when `osr_layout` returns `None`.
+#[derive(Debug, Clone, Copy)]
+pub enum OsrReject {
+    /// More than [`OSR_MAX_LIVE_INS`] live-ins.
+    TooManyLiveIns(usize),
+    /// A live-in's HIR type doesn't fit in i64.
+    LiveInDoesntFit,
+    /// Function return type doesn't fit in i64.
+    ReturnDoesntFit,
+    /// Header doesn't exist in the function.
+    NoSuchHeader,
+}
+
+/// Compute an [`OsrLayout`] for `header`, or report why it's rejected.
+pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, OsrReject> {
+    let block = function
+        .blocks
+        .get(&header)
+        .ok_or(OsrReject::NoSuchHeader)?;
+
+    // Multi-value return functions can't go through the i64 helper ABI.
+    let return_type = match function.signature.returns.as_slice() {
+        [] => HirType::Void,
+        [ty] => ty.clone(),
+        _ => return Err(OsrReject::ReturnDoesntFit),
+    };
+    if !type_fits_i64(&return_type) {
+        return Err(OsrReject::ReturnDoesntFit);
+    }
+
+    let live_ins: Vec<HirId> = block.phis.iter().map(|p| p.result).collect();
+    let live_in_types: Vec<HirType> = block.phis.iter().map(|p| p.ty.clone()).collect();
+
+    if live_ins.len() > OSR_MAX_LIVE_INS {
+        return Err(OsrReject::TooManyLiveIns(live_ins.len()));
+    }
+    if !live_in_types.iter().all(type_fits_i64) {
+        return Err(OsrReject::LiveInDoesntFit);
+    }
+
+    let block_index = block_index_of(function, header).unwrap_or(u64::MAX);
+
+    Ok(OsrLayout {
+        header,
+        block_index,
+        live_ins,
+        live_in_types,
+        return_type,
+    })
+}
+
+/// Whether `ty` can round-trip through an i64 (the OSR helper ABI).
+///
+/// Scalars ≤ 64 bits and pointers always fit. Structs / arrays / unions
+/// / vectors don't — they need stack passing. Void fits (no value to
+/// transfer).
+pub fn type_fits_i64(ty: &HirType) -> bool {
+    matches!(
+        ty,
+        HirType::Void
+            | HirType::Bool
+            | HirType::I8
+            | HirType::I16
+            | HirType::I32
+            | HirType::I64
+            | HirType::U8
+            | HirType::U16
+            | HirType::U32
+            | HirType::U64
+            | HirType::F32
+            | HirType::F64
+            | HirType::Ptr(_)
+            | HirType::Ref { .. }
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -355,5 +467,29 @@ mod tests {
         unregister_bead(id);
         // Probe must return null when no bead is registered.
         assert!(osr_probe(id, 0).is_null());
+    }
+
+    #[test]
+    fn type_fits_i64_accepts_scalars_and_pointers() {
+        assert!(type_fits_i64(&HirType::Void));
+        assert!(type_fits_i64(&HirType::Bool));
+        assert!(type_fits_i64(&HirType::I32));
+        assert!(type_fits_i64(&HirType::I64));
+        assert!(type_fits_i64(&HirType::F64));
+        assert!(type_fits_i64(&HirType::Ptr(Box::new(HirType::I8))));
+    }
+
+    #[test]
+    fn type_fits_i64_rejects_aggregates_and_wide() {
+        assert!(!type_fits_i64(&HirType::I128));
+        assert!(!type_fits_i64(&HirType::U128));
+        assert!(!type_fits_i64(&HirType::Array(Box::new(HirType::I32), 4)));
+        assert!(!type_fits_i64(&HirType::Struct(
+            crate::hir::HirStructType {
+                name: Some(zyntax_typed_ast::InternedString::new_global("Empty")),
+                fields: vec![],
+                packed: false,
+            }
+        )));
     }
 }
