@@ -18,5 +18,8 @@ krio-core      = { path = "../../../../krio/crates/krio-core" }
 
 log = "0.4"
 
+[dev-dependencies]
+indexmap = "2"
+
 [lints]
 workspace = true
