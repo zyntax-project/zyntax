@@ -22,6 +22,7 @@ use krio_async::{AsyncHooks, FnId as KrioFnId, LivenessMap, SuspendingFns, Suspe
 use krio_stackless::CoroCfg;
 
 pub mod emit;
+pub mod orchestrator;
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,

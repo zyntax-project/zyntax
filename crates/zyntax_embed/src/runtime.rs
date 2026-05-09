@@ -802,6 +802,77 @@ pub use zyntax_compiler::{
 /// let result: i32 = runtime.call("add", &[42.into(), 8.into()])?;
 /// assert_eq!(result, 50);
 /// ```
+
+/// Hook point for the krio-async state-machine lowering. With the
+/// `krio-async-backend` feature on, this runs `krio_adapter`'s
+/// orchestrator over every async fn in the module before the legacy
+/// `async_support::AsyncCompiler` path executes inside
+/// `backend::compile_module`. With the feature off, this is a no-op
+/// — leaves the existing async pipeline as-is so behavior is
+/// identical to pre-krio builds.
+///
+/// Run BEFORE compile_module so the backend sees a module whose
+/// async functions have already been converted to state machines via
+/// the krio path (and the legacy AsyncCompiler will be a no-op since
+/// `is_async` is still set; once Phase F lands, the legacy path is
+/// gated off when this fires).
+fn apply_krio_async_lowering(
+    _module: &mut zyntax_compiler::HirModule,
+) -> RuntimeResult<()> {
+    #[cfg(feature = "krio-async-backend")]
+    {
+        // Conservative call shape: feed every async fn through the
+        // orchestrator. Frame ptr is the function's first param (we
+        // assume the existing async lowering uses a `(self, ...)`
+        // convention; if not, this returns a no-op layout for that
+        // fn). Live-out per block comes from the existing analysis
+        // pass; we run it on demand.
+        use std::collections::{HashMap, HashSet};
+        use zyntax_compiler::analysis::AnalysisRunner;
+        use zyntax_compiler::hir::HirId;
+
+        // Build live-out for every async fn via the existing analyzer.
+        // For now we collect an empty map and rely on krio to over-save
+        // when the analysis isn't readily available — see comment below.
+        let mut live_out: HashMap<HirId, HashMap<HirId, HashSet<HirId>>> = HashMap::new();
+        let mut analyzer = AnalysisRunner::new(_module.clone());
+        // Best-effort: skip analysis errors silently. AnalysisRunner's
+        // public output (`ModuleAnalysis`) isn't currently shaped to
+        // hand back per-function `live_out` maps in the right form;
+        // rather than block the integration on an analysis API
+        // refactor, we feed empty live-outs into the orchestrator
+        // (krio produces a layout with no captures-lift in that case).
+        // Phase F's first pass will reveal whether real liveness is
+        // needed before captures-lift can do its job for a given
+        // failing test.
+        let _ = analyzer.run_all();
+        let _ = &mut live_out; // silence unused-mut
+
+        let lowered = krio_adapter::orchestrator::lower_async_module(
+            _module,
+            /* state_slot = */ 0,
+            // For each async fn, take its first param's id as the
+            // frame pointer. Functions with no params get a dummy
+            // HirId::new() — the orchestrator no-ops for non-suspending
+            // fns anyway, so a phantom frame is harmless.
+            |func| {
+                func.signature
+                    .params
+                    .first()
+                    .map(|p| p.id)
+                    .unwrap_or_else(HirId::new)
+            },
+            &live_out,
+        )
+        .map_err(|e| RuntimeError::Execution(format!("krio-async lowering failed: {e}")))?;
+        log::debug!(
+            "[krio-async] lowered {} async fns via krio adapter",
+            lowered.len()
+        );
+    }
+    Ok(())
+}
+
 pub struct ZyntaxRuntime {
     /// The Cranelift JIT backend
     backend: CraneliftBackend,
@@ -981,7 +1052,13 @@ impl ZyntaxRuntime {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let hir_module = self.lower_typed_program(typed_program, builtins)?;
+        let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
+
+        // Run the krio-driven async state-machine transform when the
+        // `krio-async-backend` feature is on. No-op otherwise — the
+        // legacy `compiler::async_support::AsyncCompiler` inside
+        // `compile_module` continues to handle the lowering.
+        apply_krio_async_lowering(&mut hir_module)?;
 
         // Compile the module
         self.compile_module(&hir_module)
@@ -1982,7 +2059,8 @@ impl ZyntaxRuntime {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let hir_module = self.lower_typed_program(typed_program, builtins)?;
+        let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
+        apply_krio_async_lowering(&mut hir_module)?;
 
         // Collect function names before compilation
         // Use resolve_global() to get the actual string from InternedString
@@ -2147,7 +2225,8 @@ impl ZyntaxRuntime {
             self.event_sink.as_ref(),
         );
         // Lower to HIR (no builtins available when compiling directly)
-        let hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        apply_krio_async_lowering(&mut hir_module)?;
 
         // Collect function names before compilation
         let function_names: Vec<String> = hir_module
@@ -2949,7 +3028,8 @@ impl TieredRuntime {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let hir_module = self.lower_typed_program(typed_program, builtins)?;
+        let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
+        apply_krio_async_lowering(&mut hir_module)?;
 
         // Collect function names before compilation. `f.name.to_string()`
         // returns the debug repr of InternedString (e.g.

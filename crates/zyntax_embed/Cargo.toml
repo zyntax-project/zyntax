@@ -16,6 +16,7 @@ pattern_engine = { path = "../pattern_engine" }
 normalization_pass = { path = "../passes/normalization" }
 algebraic_effects_pass = { path = "../passes/algebraic_effects" }
 async_ir_pass = { path = "../passes/async_ir" }
+krio_adapter = { path = "../passes/krio_adapter", optional = true }
 thiserror = "1.0"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -33,6 +34,11 @@ pest_vm = "2.8"
 default = []
 llvm-backend = ["zyntax_compiler/llvm-backend"]
 all-backends = ["zyntax_compiler/all-backends", "llvm-backend"]
+# Use krio-async's captures-lift state-machine transform instead of
+# the legacy async_support.rs path. Off by default while we shake
+# down the integration; eventually becomes the default once the 14
+# captures-lift-bug tests pass through it.
+krio-async-backend = ["dep:krio_adapter"]
 
 [lints]
 workspace = true
