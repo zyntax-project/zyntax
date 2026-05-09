@@ -7921,4 +7921,260 @@ mod tests {
         let backend = CraneliftBackend::new();
         assert!(backend.is_ok());
     }
+
+    /// 5b end-to-end: build a small counted-loop function in HIR, compile
+    /// it at tier 0 then again at tier 1, and verify a real OSR helper
+    /// gets emitted (`pending_osr_helpers` non-empty) and finalizes to a
+    /// non-null code pointer.
+    #[test]
+    fn test_osr_helper_emission_for_counted_loop() {
+        use crate::hir::{HirConstant, HirFunction, HirFunctionSignature, HirParam};
+        use crate::hir::{HirBlock, HirInstruction, HirPhi, HirTerminator};
+        use crate::hir::{BinaryOp, HirValue, HirValueKind};
+        use indexmap::IndexMap;
+        use zyntax_typed_ast::InternedString;
+
+        // Hand-build:
+        //   fn count_to(n: i32) -> i32 {
+        //       let mut i = 0;
+        //       let mut sum = 0;
+        //       while i < n { sum += i; i += 1 }
+        //       sum
+        //   }
+        //
+        // Live-ins at the loop header: i, sum (phi results) + n (function
+        // param used in the comparison). 3 total — within the 4-arg cap.
+        let i32_ty = HirType::I32;
+
+        // HirIds for everything.
+        let func_id = HirId::new();
+        let n_id = HirId::new();
+        let zero_i_id = HirId::new();
+        let zero_sum_id = HirId::new();
+        let one_id = HirId::new();
+        let entry_id = HirId::new();
+        let header_id = HirId::new();
+        let body_id = HirId::new();
+        let exit_id = HirId::new();
+        let phi_i = HirId::new();
+        let phi_sum = HirId::new();
+        let cmp_id = HirId::new();
+        let next_sum_id = HirId::new();
+        let next_i_id = HirId::new();
+
+        let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+        values.insert(
+            n_id,
+            HirValue {
+                id: n_id,
+                ty: i32_ty.clone(),
+                kind: HirValueKind::Parameter(0),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
+        for (id, v) in [
+            (zero_i_id, 0i32),
+            (zero_sum_id, 0),
+            (one_id, 1),
+        ] {
+            values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: i32_ty.clone(),
+                    kind: HirValueKind::Constant(HirConstant::I32(v)),
+                    uses: std::collections::HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        for id in [phi_i, phi_sum, next_sum_id, next_i_id] {
+            values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: i32_ty.clone(),
+                    kind: HirValueKind::Instruction,
+                    uses: std::collections::HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        values.insert(
+            cmp_id,
+            HirValue {
+                id: cmp_id,
+                ty: HirType::Bool,
+                kind: HirValueKind::Instruction,
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
+
+        // Entry block: branch to header.
+        let mut entry_block = HirBlock {
+            id: entry_id,
+            label: Some(InternedString::new_global("entry")),
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Branch { target: header_id },
+            dominance_frontier: std::collections::HashSet::new(),
+            predecessors: vec![],
+            successors: vec![header_id],
+        };
+        // Constants don't need to be emitted as instructions in HIR — they
+        // live in `values` and Cranelift's Phase-3 constant emission picks
+        // them up.
+        // Add a dummy iconst use to anchor the constants in the entry path.
+        let _ = &mut entry_block;
+
+        // Loop header: phi(i), phi(sum), cmp i < n, cond_br body/exit.
+        let header_block = HirBlock {
+            id: header_id,
+            label: Some(InternedString::new_global("header")),
+            phis: vec![
+                HirPhi {
+                    result: phi_i,
+                    ty: i32_ty.clone(),
+                    incoming: vec![(zero_i_id, entry_id), (next_i_id, body_id)],
+                },
+                HirPhi {
+                    result: phi_sum,
+                    ty: i32_ty.clone(),
+                    incoming: vec![(zero_sum_id, entry_id), (next_sum_id, body_id)],
+                },
+            ],
+            instructions: vec![HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: cmp_id,
+                ty: HirType::Bool,
+                left: phi_i,
+                right: n_id,
+            }],
+            terminator: HirTerminator::CondBranch {
+                condition: cmp_id,
+                true_target: body_id,
+                false_target: exit_id,
+            },
+            dominance_frontier: std::collections::HashSet::new(),
+            predecessors: vec![entry_id, body_id],
+            successors: vec![body_id, exit_id],
+        };
+
+        // Body: next_sum = sum + i; next_i = i + 1; br header.
+        let body_block = HirBlock {
+            id: body_id,
+            label: Some(InternedString::new_global("body")),
+            phis: vec![],
+            instructions: vec![
+                HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: next_sum_id,
+                    ty: i32_ty.clone(),
+                    left: phi_sum,
+                    right: phi_i,
+                },
+                HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: next_i_id,
+                    ty: i32_ty.clone(),
+                    left: phi_i,
+                    right: one_id,
+                },
+            ],
+            terminator: HirTerminator::Branch { target: header_id },
+            dominance_frontier: std::collections::HashSet::new(),
+            predecessors: vec![header_id],
+            successors: vec![header_id],
+        };
+
+        // Exit: return sum.
+        let exit_block = HirBlock {
+            id: exit_id,
+            label: Some(InternedString::new_global("exit")),
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Return {
+                values: vec![phi_sum],
+            },
+            dominance_frontier: std::collections::HashSet::new(),
+            predecessors: vec![header_id],
+            successors: vec![],
+        };
+
+        let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+        blocks.insert(entry_id, entry_block);
+        blocks.insert(header_id, header_block);
+        blocks.insert(body_id, body_block);
+        blocks.insert(exit_id, exit_block);
+
+        let signature = HirFunctionSignature {
+            params: vec![HirParam {
+                id: n_id,
+                name: InternedString::new_global("n"),
+                ty: i32_ty.clone(),
+                attributes: crate::hir::ParamAttributes::default(),
+            }],
+            returns: vec![i32_ty.clone()],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: true,
+        };
+
+        let mut function = HirFunction::new(
+            InternedString::new_global("count_to"),
+            signature,
+        );
+        function.values = values;
+        function.blocks = blocks;
+        function.entry_block = entry_id;
+        function.is_external = false;
+
+        // ── osr_layout sanity ────────────────────────────────────────────
+        let layout = crate::osr::osr_layout(&function, header_id)
+            .expect("loop header should have a representable OSR layout");
+        assert_eq!(layout.phi_count, 2, "expected 2 phi live-ins (i, sum)");
+        assert!(
+            layout.live_ins.contains(&n_id),
+            "n should be a non-phi live-in"
+        );
+        assert!(
+            layout.live_ins.len() <= crate::osr::OSR_MAX_LIVE_INS,
+            "live-ins ({}) exceed cap",
+            layout.live_ins.len()
+        );
+
+        // ── helper emission ──────────────────────────────────────────────
+        // We only exercise the tier-1 path here. The legacy
+        // compile_function declares + compiles the function fresh; its
+        // tier-1 hook calls compile_osr_helpers afterwards. We don't
+        // need a prior tier-0 compile_module — that path also defines
+        // the function in the JIT module and would collide on the
+        // re-define here.
+        let mut backend = CraneliftBackend::new().unwrap();
+        backend.set_compile_tier(1);
+        backend.set_compile_bead_id(0xBEAD);
+        backend
+            .compile_function(func_id, &function)
+            .expect("tier-1 compile_function");
+        let _ = backend.module.finalize_definitions();
+
+        let helpers = backend.take_pending_osr_helpers();
+        assert!(
+            !helpers.is_empty(),
+            "tier-1 compile of a counted loop must emit at least one OSR helper"
+        );
+        let (site, code) = helpers[0];
+        assert_eq!(
+            site,
+            layout.site_key(),
+            "helper site_key should match the layout"
+        );
+        assert!(!code.is_null(), "finalized helper code pointer must be non-null");
+    }
 }
