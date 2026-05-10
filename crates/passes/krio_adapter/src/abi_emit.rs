@@ -776,6 +776,228 @@ pub fn lower_await_calls(
     next_slot
 }
 
+/// Replace each `PerformEffect` site in a yield block with the
+/// algebraic-effect handler-dispatch state machine. Mirrors
+/// [`lower_await_calls`] structurally, with these differences:
+///
+///   * one slot per perform (the result) — no inner-promise
+///     persistence, the handler dispatch isn't re-entrant the way an
+///     await is.
+///   * the `PerformEffect` instruction stays in the yield block (the
+///     Cranelift backend's `lower_perform_effect` knows how to
+///     dispatch it). Its result is renumbered to a fresh SSA value
+///     that's saved to the slot; the original result HirId is reserved
+///     for the `AsyncLoadSlot` defining it in the resume entry, so SSA
+///     stays single-def.
+///
+/// CFG after this transform per yield_block containing PerformEffect:
+///
+///   yield_block:
+///     [original pre-perform instructions]
+///     PerformEffect → perform_result_temp   (renumbered, dispatched by backend)
+///     [captures-lift saves emitted by emit_save_load]
+///     branch ready_block
+///
+///   ready_block:
+///     AsyncSaveSlot result_slot ← perform_result_temp
+///     AsyncSaveSlot state_slot ← next_state
+///     Return 0     (pending sentinel — runtime re-polls; dispatcher
+///                   then routes to resume_entry which loads result)
+///
+///   resume_entry (already exists):
+///     result_id = AsyncLoadSlot(result_slot)   (PREPENDED here)
+///     [original post-perform instructions]
+///
+/// `state_slot` is the same slot the dispatcher reads/writes for the
+/// state-id. `frame` is the SSA value used in AsyncSaveSlot/AsyncLoadSlot
+/// — `reshape_to_poll_abi` rewrites these later.
+///
+/// `start_slot` is the first free slot after captures+state+params (and
+/// after any await-allocated slots if `lower_await_calls` ran first).
+/// Returns the next free slot (= start_slot + num_perform_sites).
+///
+/// Yield blocks containing `Intrinsic::Await` are skipped — they're
+/// handled by [`lower_await_calls`].
+pub fn lower_perform_effect_calls(
+    function: &mut HirFunction,
+    layout: &StateMachineLayout<HirBlockId, HirLocalId, HirFnId>,
+    frame: HirId,
+    state_slot: u32,
+    start_slot: u32,
+) -> u32 {
+    let mut next_slot = start_slot;
+
+    let block_seq_to_hir: Vec<HirId> = function.blocks.keys().copied().collect();
+    let resolve_seq =
+        |bb: HirBlockId| -> Option<HirId> { block_seq_to_hir.get(bb.0 as usize).copied() };
+
+    let yield_blocks_snapshot: Vec<(HirBlockId, u32)> = layout.yield_blocks.clone();
+    for (yield_seq, next_state) in yield_blocks_snapshot {
+        let yield_hir = match resolve_seq(yield_seq) {
+            Some(h) => h,
+            None => continue,
+        };
+        let resume_seq = match layout.resume_entries.get(next_state as usize) {
+            Some(r) => *r,
+            None => continue,
+        };
+        let resume_hir = match resolve_seq(resume_seq) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Find the PerformEffect in this yield block. If we find an
+        // Intrinsic::Await first, skip — it belongs to lower_await_calls.
+        let yield_block = function
+            .blocks
+            .get(&yield_hir)
+            .expect("yield block exists");
+        let mut perform_idx: Option<usize> = None;
+        let mut perform_meta: Option<(HirId, InternedString, Vec<HirId>, HirType, Option<HirId>)> =
+            None;
+        for (i, inst) in yield_block.instructions.iter().enumerate() {
+            match inst {
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Await),
+                    ..
+                } => {
+                    // Await before perform → not our site.
+                    perform_idx = None;
+                    perform_meta = None;
+                    break;
+                }
+                HirInstruction::PerformEffect {
+                    effect_id,
+                    op_name,
+                    args,
+                    return_ty,
+                    result,
+                } => {
+                    perform_idx = Some(i);
+                    perform_meta = Some((
+                        *effect_id,
+                        *op_name,
+                        args.clone(),
+                        return_ty.clone(),
+                        *result,
+                    ));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let perform_idx = match perform_idx {
+            Some(i) => i,
+            None => continue,
+        };
+        let (effect_id, op_name, args, return_ty, original_result) = perform_meta.unwrap();
+
+        // Slot type: void/unit ops still take a slot (8 bytes) but the
+        // value is unused; coerce to I64.
+        let slot_ty = if matches!(return_ty, HirType::Void) {
+            HirType::I64
+        } else {
+            return_ty.clone()
+        };
+
+        // Allocate one slot for the perform's result.
+        let result_slot = next_slot;
+        next_slot += 1;
+
+        // Mint a fresh HirId for the in-yield-block PerformEffect's
+        // result. The original result_id (if Some) stays reserved for
+        // the AsyncLoadSlot in resume_entry — keeping SSA single-def.
+        let perform_result_temp = mint_value(
+            &mut function.values,
+            slot_ty.clone(),
+            HirValueKind::Instruction,
+        );
+
+        // Build ready_block.
+        let next_state_const = mint_const_i64(&mut function.values, next_state as i64);
+        let zero_const = mint_const_i64(&mut function.values, 0);
+        let ready_block_id = HirId::new();
+        let ready_block = HirBlock {
+            id: ready_block_id,
+            label: Some(InternedString::new_global("perform_ready")),
+            phis: vec![],
+            instructions: vec![
+                HirInstruction::AsyncSaveSlot {
+                    frame,
+                    slot: result_slot,
+                    value: perform_result_temp,
+                },
+                HirInstruction::AsyncSaveSlot {
+                    frame,
+                    slot: state_slot,
+                    value: next_state_const,
+                },
+            ],
+            terminator: HirTerminator::Return {
+                values: vec![zero_const],
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+
+        // Splice the yield block: keep pre-perform instructions, insert
+        // the renumbered PerformEffect, append nothing else (post-perform
+        // code lives in resume_entry).
+        let yield_block = function
+            .blocks
+            .get_mut(&yield_hir)
+            .expect("yield block exists");
+        let kept_pre: Vec<HirInstruction> = yield_block.instructions[..perform_idx].to_vec();
+        // Drop kept_post — those instructions reference perform's
+        // original result_id and live in resume_entry now (krio split
+        // already moved them).
+        let mut new_yield_insts = kept_pre;
+        new_yield_insts.push(HirInstruction::PerformEffect {
+            result: Some(perform_result_temp),
+            effect_id,
+            op_name,
+            args,
+            return_ty: slot_ty.clone(),
+        });
+        yield_block.instructions = new_yield_insts;
+        yield_block.terminator = HirTerminator::Branch {
+            target: ready_block_id,
+        };
+
+        function.blocks.insert(ready_block_id, ready_block);
+
+        // Resume entry: prepend AsyncLoadSlot defining original_result
+        // (if the perform produced a value). For Void perform sites
+        // (e.g. effect Log.info), there's no consumer of the result, so
+        // we skip the load.
+        if let Some(result_id) = original_result {
+            // Update the value's type so downstream consumers see slot_ty
+            // (Void → I64 promotion).
+            if let Some(v) = function.values.get_mut(&result_id) {
+                if matches!(v.ty, HirType::Void) {
+                    v.ty = slot_ty.clone();
+                }
+            }
+            let load_inst = HirInstruction::AsyncLoadSlot {
+                result: result_id,
+                ty: slot_ty,
+                frame,
+                slot: result_slot,
+            };
+            let resume_block = function
+                .blocks
+                .get_mut(&resume_hir)
+                .expect("resume block exists");
+            let mut new_insts = vec![load_inst];
+            new_insts.extend(resume_block.instructions.drain(..));
+            resume_block.instructions = new_insts;
+        }
+    }
+
+    next_slot
+}
+
 /// Reshape a krio-transformed function into the runtime poll ABI.
 ///
 /// Pre: `function` was mutated by `lower_async_function` — it has the

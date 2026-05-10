@@ -203,7 +203,18 @@ pub fn lower_async_function(
         state_slot,
         after_params_slot,
     );
-    let num_slots: u32 = after_awaits_slot;
+    // Phase H, M4: replace `PerformEffect` sites with the algebraic
+    // effect handler-dispatch state machine. Allocates 1 slot per
+    // perform (result) starting after award slots. Yield blocks that
+    // contain Intrinsic::Await are skipped (handled above).
+    let after_performs_slot = crate::abi_emit::lower_perform_effect_calls(
+        cfg_function,
+        &layout,
+        frame_ptr,
+        state_slot,
+        after_awaits_slot,
+    );
+    let num_slots: u32 = after_performs_slot;
 
     // F.2 follow-up: the await lowering creates new resume blocks
     // that may now be predecessors of phi blocks (e.g. loop headers
@@ -276,10 +287,14 @@ where
     // out of the module.
     let suspending = HirSuspendingFns::from_module(module);
 
+    // M4 / Phase H: include effect-annotated functions alongside async
+    // functions. A function is krio-eligible if `is_async` is set OR
+    // if it declares any algebraic effects — both shapes need
+    // captures-lift across suspension points.
     let async_fn_ids: Vec<HirId> = module
         .functions
         .values()
-        .filter(|f| f.signature.is_async)
+        .filter(|f| f.signature.is_async || !f.signature.effects.is_empty())
         .map(|f| f.id)
         .collect();
 
