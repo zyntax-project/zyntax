@@ -1421,6 +1421,7 @@ pub fn compile_to_hir(
         strict_mode: false, // Default to non-strict
         import_resolver: config.import_resolver.clone(),
         builtins: indexmap::IndexMap::new(), // Empty - callers with grammar should use runtime directly
+        use_krio_async: false,
     };
 
     // Create arena for string interning (needed for async transformation)

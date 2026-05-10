@@ -1335,6 +1335,7 @@ impl ZyntaxRuntime {
         // Create LoweringConfig with builtins for extern call resolution
         let lowering_config = LoweringConfig {
             builtins,
+            use_krio_async: cfg!(feature = "krio-async-backend"),
             ..LoweringConfig::default()
         };
 
@@ -3260,6 +3261,7 @@ impl TieredRuntime {
         // Create LoweringConfig with builtins for extern call resolution
         let lowering_config = LoweringConfig {
             builtins,
+            use_krio_async: cfg!(feature = "krio-async-backend"),
             ..LoweringConfig::default()
         };
 

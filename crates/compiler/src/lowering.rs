@@ -322,6 +322,11 @@ pub struct LoweringConfig {
     /// Builtin function mappings (e.g., "tensor_sum_f32" -> "$Tensor$sum_f32")
     /// These are added to extern_link_names for resolving extern calls
     pub builtins: indexmap::IndexMap<String, String>,
+    /// Skip the legacy `AsyncCompiler` path inside `transform_async_function`.
+    /// Async functions remain marked `is_async = true` after lowering, leaving
+    /// them in shape for `krio_adapter` to transform via a post-lowering pass.
+    /// Set by `zyntax_embed` when its `krio-async-backend` feature is on.
+    pub use_krio_async: bool,
 }
 
 impl std::fmt::Debug for LoweringConfig {
@@ -350,6 +355,7 @@ impl Default for LoweringConfig {
             strict_mode: false,
             import_resolver: None,
             builtins: indexmap::IndexMap::new(),
+            use_krio_async: false,
         }
     }
 }
@@ -2011,8 +2017,12 @@ impl LoweringContext {
             self.module.add_function(closure_func);
         }
 
-        // Gap 6 Phase 2: Transform async functions to state machines
-        if func.is_async {
+        // Gap 6 Phase 2: Transform async functions to state machines.
+        // When `use_krio_async` is set, the legacy AsyncCompiler path is
+        // skipped so a downstream `krio_adapter` pass can do the captures-
+        // lift transform. The function stays `is_async = true` so the
+        // krio post-pass can find it.
+        if func.is_async && !self.config.use_krio_async {
             log::trace!(
                 "[LOWERING] Before transform_async_function: {:?} with {} values, {} blocks",
                 hir_func.name,
