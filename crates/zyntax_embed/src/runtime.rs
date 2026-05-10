@@ -875,6 +875,20 @@ fn apply_krio_async_lowering(
             "[krio-async] lowered {} async fns via krio adapter",
             lowered.len()
         );
+        // NOTE Phase F.1 blocker: by this point the legacy
+        // `transform_async_function` (in compiler/src/lowering.rs)
+        // has already run inside `lower_program`, replacing each
+        // is_async=true function with the legacy entry+poll pair —
+        // so `lowered` is always 0 here under the current pipeline.
+        // The fix requires either:
+        //   a) gating `transform_async_function` behind a
+        //      `LoweringConfig::use_krio_async` flag, or
+        //   b) running krio's transform inside `transform_async_function`
+        //      itself (replacing the buggy `compile_async_function` call).
+        // Approach (b) is cleaner because the runtime ABI scaffolding
+        // (state-machine struct alloc, Promise entry generation) stays
+        // intact — krio just supplies the captures-lift answers.
+        // Tracked in memory/krio_adoption_plan.md.
     }
     Ok(())
 }
