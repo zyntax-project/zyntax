@@ -9,7 +9,10 @@
 
 use std::sync::Arc;
 
-use zyntax_compiler::{compile_to_hir, hir::HirInstruction, CompilationConfig};
+use zyntax_compiler::{
+    compile_to_hir, effect_analysis::analyze_effects,
+    effect_handler_resolution::resolve_handlers, hir::HirInstruction, CompilationConfig,
+};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
@@ -195,6 +198,50 @@ fn effect_op_call_lowers_to_perform_effect() {
     assert_eq!(
         plain_calls_to_info, 0,
         "the info() call should have been lowered as PerformEffect, not Call"
+    );
+}
+
+#[test]
+fn emitted_perform_effect_passes_analysis_and_resolution() {
+    // M2.2: end-to-end pipeline check. Build TypedAST → lower to HIR
+    // → run analyze_effects and resolve_handlers against the resulting
+    // module. The analysis must:
+    //   * find the Log effect declaration
+    //   * find the Console handler
+    //   * register exactly 1 perform-site for `info`
+    //   * mark Console as inlinable (simple, non-resumable)
+    let mut program = build_effect_program();
+    let registry = Arc::new(TypeRegistry::new());
+    let module = compile_to_hir(&mut program, registry, CompilationConfig::default())
+        .expect("compile_to_hir must succeed");
+
+    // Effect analysis. The module has 1 effect declaration, 1 handler,
+    // and 1 PerformEffect emitted by M1.3.
+    let effect_analysis =
+        analyze_effects(&module).expect("analyze_effects must succeed on emitted HIR");
+    assert_eq!(
+        effect_analysis.defined_effects.len(),
+        1,
+        "Log effect should appear in the analysis"
+    );
+    assert_eq!(
+        effect_analysis.defined_handlers.len(),
+        1,
+        "Console handler should appear in the analysis"
+    );
+
+    // Handler resolution. Should find exactly 1 perform-site (the
+    // `info(42)` call) and mark the Console handler as inlinable.
+    let handler_resolution =
+        resolve_handlers(&module).expect("resolve_handlers must succeed");
+    assert_eq!(
+        handler_resolution.stats.total_perform_sites, 1,
+        "M1.3's PerformEffect should register as exactly 1 perform-site"
+    );
+    assert_eq!(
+        handler_resolution.inlinable_handlers.len(),
+        1,
+        "Console (simple, non-resumable) should be inlinable"
     );
 }
 
