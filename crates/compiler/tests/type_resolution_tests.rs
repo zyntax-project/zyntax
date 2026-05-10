@@ -85,6 +85,7 @@ fn test_struct_type_resolution() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -200,6 +201,7 @@ fn test_enum_type_resolution() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -313,6 +315,7 @@ fn test_type_alias_resolution() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -437,6 +440,7 @@ fn test_nested_struct_resolution() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -599,6 +603,7 @@ fn test_multiple_struct_types() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -624,6 +629,7 @@ fn test_multiple_struct_types() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 

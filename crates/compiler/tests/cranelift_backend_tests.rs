@@ -3439,7 +3439,10 @@ fn create_effect_module() -> HirModule {
     // Also create the handler function with mangled name for PerformEffect to call
     // This is what the Tier 1 effect codegen generates calls to
     // NOTE: For simplified testing, we create a no-arg handler
-    let handler_func_name = create_test_string("ConsoleLogger$effect$log");
+    // M5 reconciliation: handler functions are named `{Handler}${op}`
+    // (the convention `algebraic_effects_pass::dispatch::handler_decl_to_impl`
+    // emits when lowering `handler X for Effect { def op... }`).
+    let handler_func_name = create_test_string("ConsoleLogger$log");
     let handler_func_sig = HirFunctionSignature {
         params: vec![], // No params for simplified test
         returns: vec![],

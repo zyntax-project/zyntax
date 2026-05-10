@@ -465,11 +465,19 @@ pub fn analyze_handle_effect(
     })
 }
 
-/// Generate mangled name for a handler operation
+/// Generate mangled name for a handler operation.
+///
+/// Format: `{HandlerName}${op_name}` — e.g. `Console$info`. This must
+/// match the name `algebraic_effects_pass::dispatch::handler_decl_to_impl`
+/// generates when it lowers `handler Console for Log { def info(...) }`
+/// into a standalone function declaration. M5 reconciliation: previously
+/// this used `{Handler}$effect${op}` (e.g. `Console$effect$info`) which
+/// didn't match the lowered function names — the cranelift backend's
+/// PerformEffect dispatch couldn't find any handler.
 pub fn mangle_handler_op_name(handler_name: InternedString, op_name: InternedString) -> String {
     let handler_str = handler_name.resolve_global().unwrap_or_default();
     let op_str = op_name.resolve_global().unwrap_or_default();
-    format!("{}$effect${}", handler_str, op_str)
+    format!("{}${}", handler_str, op_str)
 }
 
 /// Generate mangled name for handler state type
@@ -530,7 +538,10 @@ mod tests {
         let handler = InternedString::new_global("StateHandler");
         let op = InternedString::new_global("get");
         let mangled = mangle_handler_op_name(handler, op);
-        assert_eq!(mangled, "StateHandler$effect$get");
+        // Must match `algebraic_effects_pass::dispatch::handler_decl_to_impl`
+        // which lowers `handler StateHandler for State { def get(...) }`
+        // into a standalone function named `StateHandler$get`.
+        assert_eq!(mangled, "StateHandler$get");
     }
 
     #[test]

@@ -44,6 +44,7 @@ fn create_extern_function(
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     }
 }

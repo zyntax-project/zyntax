@@ -74,6 +74,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -109,6 +110,7 @@ fn create_bool_test_program(
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -490,6 +492,7 @@ fn test_matmul_dispatch_uses_named_type_function() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -550,6 +553,7 @@ fn test_matmul_dispatch_uses_named_type_function() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -794,6 +798,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -819,6 +824,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -868,6 +874,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -1077,6 +1084,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -1094,6 +1102,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -1181,6 +1190,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 

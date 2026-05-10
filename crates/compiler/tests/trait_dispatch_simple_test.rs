@@ -118,6 +118,7 @@ fn test_vtable_generation_simple() {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 

@@ -43,6 +43,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -714,6 +715,7 @@ fn test_compilation_pipeline_with_async_function() -> CompilerResult<()> {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -798,6 +800,7 @@ fn test_compilation_pipeline_without_async_runtime() -> CompilerResult<()> {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -885,6 +888,7 @@ fn test_compilation_pipeline_mixed_sync_async() -> CompilerResult<()> {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 
@@ -919,6 +923,7 @@ fn test_compilation_pipeline_mixed_sync_async() -> CompilerResult<()> {
         link_name: None,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         is_pure: false,
     };
 

@@ -355,7 +355,10 @@ fn test_effect_codegen_mangle_name() {
     let handler = InternedString::new_global("StateHandler");
     let op = InternedString::new_global("get");
     let mangled = mangle_handler_op_name(handler, op);
-    assert_eq!(mangled, "StateHandler$effect$get");
+    // M5 reconciliation: matches the name `algebraic_effects_pass`
+    // generates when lowering `handler StateHandler for State { def get... }`
+    // into a standalone function (StateHandler$get).
+    assert_eq!(mangled, "StateHandler$get");
 }
 
 #[test]
@@ -365,8 +368,8 @@ fn test_effect_codegen_handler_ops_info() {
 
     let ops_info = get_handler_ops_info(&handler);
     assert_eq!(ops_info.len(), 2);
-    assert_eq!(ops_info[0].function_name, "TestHandler$effect$op1");
-    assert_eq!(ops_info[1].function_name, "TestHandler$effect$op2");
+    assert_eq!(ops_info[0].function_name, "TestHandler$op1");
+    assert_eq!(ops_info[1].function_name, "TestHandler$op2");
     assert!(!ops_info[0].uses_continuation);
     assert!(!ops_info[1].uses_continuation);
 }
