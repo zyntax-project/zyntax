@@ -10,6 +10,7 @@
 //! After the complete rewrites fire, the program contains no Effect or EffectHandler
 //! declarations — they've been expanded into classes and functions.
 
+mod annotations;
 mod continuation;
 mod dispatch;
 mod vtable;
@@ -32,6 +33,11 @@ impl PatternPass for Pass {
     }
 
     fn register(&self, engine: &mut PatternEngine) {
+        // Phase H, M1 step 1: normalize @effect(...) annotations into
+        // the structured `TypedFunction.effects` field BEFORE any
+        // semantic rewrites fire — downstream passes (and eventually
+        // the SSA builder) consume this normalized form.
+        engine.register_decl_rewrite(annotations::extract_effect_annotations());
         engine.register_decl_rewrite(vtable::effect_decl_to_vtable());
         engine.register_decl_rewrite(dispatch::handler_decl_to_impl());
         engine.register_expr_rewrite(continuation::effect_op_to_dispatch());
