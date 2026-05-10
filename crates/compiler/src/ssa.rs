@@ -103,6 +103,19 @@ pub struct SsaBuilder {
     /// Return types for user-defined functions.
     /// Maps function name -> Type (for resolving call expression types when parser sets Unit).
     function_return_types: IndexMap<InternedString, Type>,
+    /// Phase H, M1.3: effect-operation index for the enclosing
+    /// function. If `self.function.signature.effects` is non-empty,
+    /// the caller (LoweringContext) builds this map from the
+    /// `@effect(E)` declarations' operations and passes it in via
+    /// `with_effect_op_map`. The SSA builder consults it when
+    /// translating `TypedExpression::Call`: a call to a name in this
+    /// map becomes `HirInstruction::PerformEffect` rather than a
+    /// regular `HirInstruction::Call`.
+    ///
+    /// Key: operation name (e.g. `"get"`).
+    /// Value: `(effect_id, return_type)` from the corresponding
+    /// `HirEffectOp`.
+    effect_op_map: IndexMap<InternedString, (HirId, HirType)>,
 }
 
 /// Context for pattern matching
@@ -352,6 +365,7 @@ impl SsaBuilder {
             simd_continue_block: None,
             function_default_params: IndexMap::new(),
             function_return_types: IndexMap::new(),
+            effect_op_map: IndexMap::new(),
         }
     }
 
@@ -390,6 +404,7 @@ impl SsaBuilder {
             simd_continue_block: None,
             function_default_params: IndexMap::new(),
             function_return_types: IndexMap::new(),
+            effect_op_map: IndexMap::new(),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -453,6 +468,18 @@ impl SsaBuilder {
         return_types: IndexMap<InternedString, Type>,
     ) -> Self {
         self.function_return_types = return_types;
+        self
+    }
+
+    /// Phase H, M1.3: set the effect-operation index for the enclosing
+    /// function. When non-empty, `TypedExpression::Call` whose callee
+    /// matches an entry will lower to `HirInstruction::PerformEffect`
+    /// instead of `HirInstruction::Call`.
+    pub fn with_effect_op_map(
+        mut self,
+        map: IndexMap<InternedString, (HirId, HirType)>,
+    ) -> Self {
+        self.effect_op_map = map;
         self
     }
 
@@ -3167,6 +3194,46 @@ impl SsaBuilder {
                                     return Ok(self.create_undef(HirType::Void));
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Phase H, M1.3: detect calls to effect operations.
+                // If the enclosing function has `@effect(E)` and the
+                // callee name matches an op of E, emit
+                // `HirInstruction::PerformEffect` and short-circuit
+                // the rest of Call handling. The lookup is a single
+                // IndexMap probe — zero overhead for fns without
+                // effects (empty map).
+                if !self.effect_op_map.is_empty() {
+                    if let TypedExpression::Variable(func_name) = &callee.node {
+                        if let Some((effect_id, return_ty)) =
+                            self.effect_op_map.get(func_name).cloned()
+                        {
+                            // Lower args.
+                            let mut arg_vals = Vec::with_capacity(call.positional_args.len());
+                            for arg in &call.positional_args {
+                                arg_vals.push(self.translate_expression(block_id, arg)?);
+                            }
+                            // For Void-returning ops, emit no result; otherwise
+                            // mint a fresh SSA value of the op's return type.
+                            let result = if matches!(return_ty, HirType::Void) {
+                                None
+                            } else {
+                                Some(self.create_value(
+                                    return_ty.clone(),
+                                    HirValueKind::Instruction,
+                                ))
+                            };
+                            let inst = HirInstruction::PerformEffect {
+                                result,
+                                effect_id,
+                                op_name: *func_name,
+                                args: arg_vals,
+                                return_ty: return_ty.clone(),
+                            };
+                            self.add_instruction(block_id, inst);
+                            return Ok(result.unwrap_or_else(|| self.create_undef(HirType::Void)));
                         }
                     }
                 }

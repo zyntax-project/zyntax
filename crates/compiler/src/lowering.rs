@@ -1953,6 +1953,33 @@ impl LoweringContext {
             typed_cfg.graph.edge_count()
         );
 
+        // Phase H, M1.3: build the per-function effect-operation index.
+        // For each effect this fn declares (`@effect(E)` → `func.effects`),
+        // resolve E to its `HirEffect` in `self.module.effects` and
+        // collect all its operations into a name → (effect_id, return_ty)
+        // map. The SSA builder consults this to emit `PerformEffect`
+        // instead of `Call` for effect-op call sites.
+        let mut effect_op_map: indexmap::IndexMap<InternedString, (crate::hir::HirId, crate::hir::HirType)> =
+            indexmap::IndexMap::new();
+        for effect_name in &func.effects {
+            if let Some(hir_effect) = self
+                .module
+                .effects
+                .values()
+                .find(|e| e.name == *effect_name)
+            {
+                for op in &hir_effect.operations {
+                    effect_op_map
+                        .insert(op.name, (hir_effect.id, op.return_type.clone()));
+                }
+            } else {
+                log::warn!(
+                    "[LOWERING] @effect({}) referenced but no matching effect declaration found",
+                    effect_name.resolve_global().unwrap_or_default()
+                );
+            }
+        }
+
         // Convert to SSA form, processing TypedStatements to emit HIR instructions
         let ssa_builder = SsaBuilder::new(
             hir_func,
@@ -1963,7 +1990,8 @@ impl LoweringContext {
         .with_return_type(func.return_type.clone())
         .with_extern_link_names(self.symbols.extern_link_names.clone())
         .with_function_default_params(self.symbols.function_default_params.clone())
-        .with_function_return_types(self.symbols.function_return_types.clone());
+        .with_function_return_types(self.symbols.function_return_types.clone())
+        .with_effect_op_map(effect_op_map);
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
         // Debug: check SSA result
