@@ -322,7 +322,6 @@ pub enum ExprIR {
     /// Default value for a type
     Default(String),
 
-
     /// Block expression — sequence of let-bindings followed by a
     /// final expression. The block evaluates the bindings in order
     /// (each adds to the local scope), then the final expression

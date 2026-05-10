@@ -854,11 +854,7 @@ impl CraneliftBackend {
     /// the header. Stores `(site_key, FuncId)` pairs in
     /// `pending_osr_helpers` for the caller to drain after
     /// `finalize_definitions`.
-    fn compile_osr_helpers(
-        &mut self,
-        id: HirId,
-        function: &HirFunction,
-    ) -> CompilerResult<()> {
+    fn compile_osr_helpers(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         let headers = crate::osr::find_loop_headers(function);
         if headers.is_empty() {
             return Ok(());
@@ -928,8 +924,10 @@ impl CraneliftBackend {
             sig.returns.push(AbiParam::new(ret_clir));
         }
 
-        let helper_name =
-            format!("__zyntax_osr_{}_{}", self.compile_bead_id, layout.block_index);
+        let helper_name = format!(
+            "__zyntax_osr_{}_{}",
+            self.compile_bead_id, layout.block_index
+        );
         let func_id = self
             .module
             .declare_function(&helper_name, Linkage::Local, &sig)
@@ -945,8 +943,7 @@ impl CraneliftBackend {
 
         // Empty hir_module — helpers don't need cross-module info; the
         // main function compile already populated trait dispatch state.
-        let empty_module =
-            HirModule::new(zyntax_typed_ast::InternedString::new_global("__osr__"));
+        let empty_module = HirModule::new(zyntax_typed_ast::InternedString::new_global("__osr__"));
         let result = self.compile_function_body(id, function, &empty_module);
 
         self.compile_osr_layout = prev_layout;
@@ -1201,7 +1198,10 @@ impl CraneliftBackend {
                     }
                     visited
                 };
-                block_order.into_iter().filter(|b| reachable.contains(b)).collect()
+                block_order
+                    .into_iter()
+                    .filter(|b| reachable.contains(b))
+                    .collect()
             } else {
                 block_order
             };
@@ -1209,7 +1209,9 @@ impl CraneliftBackend {
             // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
             // emits OSR helpers (separate functions) and skips probes.
             let osr_loop_headers: std::collections::HashSet<HirId> = if self.compile_tier == 0 {
-                crate::osr::find_loop_headers(function).into_iter().collect()
+                crate::osr::find_loop_headers(function)
+                    .into_iter()
+                    .collect()
             } else {
                 std::collections::HashSet::new()
             };
@@ -1227,9 +1229,7 @@ impl CraneliftBackend {
             let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> = if self.compile_tier == 0 {
                 osr_loop_headers
                     .iter()
-                    .filter_map(|h| {
-                        crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l))
-                    })
+                    .filter_map(|h| crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l)))
                     .collect()
             } else {
                 HashMap::new()
@@ -4239,11 +4239,7 @@ impl CraneliftBackend {
                         // the value through i64; Loads bit-cast back. The
                         // slot 0 reserved for the state-id is just an i64
                         // store/load with no bit-cast needed.
-                        HirInstruction::AsyncSaveSlot {
-                            frame,
-                            slot,
-                            value,
-                        } => {
+                        HirInstruction::AsyncSaveSlot { frame, slot, value } => {
                             if let (Some(&frame_val), Some(&store_val)) =
                                 (self.value_map.get(frame), self.value_map.get(value))
                             {
@@ -4264,25 +4260,18 @@ impl CraneliftBackend {
                                     );
                                     builder.ins().uextend(types::I64, as_i32)
                                 } else if actual_ty == types::F64 {
-                                    builder.ins().bitcast(
-                                        types::I64,
-                                        MemFlags::new(),
-                                        store_val,
-                                    )
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I64, MemFlags::new(), store_val)
                                 } else {
-                                    builder.ins().bitcast(
-                                        types::I64,
-                                        MemFlags::new(),
-                                        store_val,
-                                    )
+                                    builder
+                                        .ins()
+                                        .bitcast(types::I64, MemFlags::new(), store_val)
                                 };
                                 let flags = MemFlags::new().with_notrap();
-                                builder.ins().store(
-                                    flags,
-                                    i64_val,
-                                    frame_val,
-                                    (*slot as i32) * 8,
-                                );
+                                builder
+                                    .ins()
+                                    .store(flags, i64_val, frame_val, (*slot as i32) * 8);
                             }
                         }
                         HirInstruction::AsyncLoadSlot {
@@ -4307,23 +4296,11 @@ impl CraneliftBackend {
                                     builder.ins().ireduce(target_ty, raw)
                                 } else if target_ty == types::F32 {
                                     let low = builder.ins().ireduce(types::I32, raw);
-                                    builder.ins().bitcast(
-                                        types::F32,
-                                        MemFlags::new(),
-                                        low,
-                                    )
+                                    builder.ins().bitcast(types::F32, MemFlags::new(), low)
                                 } else if target_ty == types::F64 {
-                                    builder.ins().bitcast(
-                                        types::F64,
-                                        MemFlags::new(),
-                                        raw,
-                                    )
+                                    builder.ins().bitcast(types::F64, MemFlags::new(), raw)
                                 } else {
-                                    builder.ins().bitcast(
-                                        target_ty,
-                                        MemFlags::new(),
-                                        raw,
-                                    )
+                                    builder.ins().bitcast(target_ty, MemFlags::new(), raw)
                                 };
                                 self.value_map.insert(*result, typed);
                             }
@@ -7611,14 +7588,11 @@ fn emit_osr_back_edge_probe(
     probe_sig.params.push(AbiParam::new(types::I64));
     probe_sig.params.push(AbiParam::new(types::I64));
     probe_sig.returns.push(AbiParam::new(types::I64));
-    let probe_id = match module.declare_function(
-        crate::osr::OSR_PROBE_SYMBOL,
-        Linkage::Import,
-        &probe_sig,
-    ) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
+    let probe_id =
+        match module.declare_function(crate::osr::OSR_PROBE_SYMBOL, Linkage::Import, &probe_sig) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
     let probe_func = module.declare_func_in_func(probe_id, builder.func);
 
     // Helper signature for indirect call: (i64,i64,i64,i64) -> return_clir.
@@ -7713,24 +7687,18 @@ fn bitcast_from_i64(
     } else if target == types::F32 {
         // i64 → i32 (low 32 bits) → bitcast f32.
         let low = builder.ins().ireduce(types::I32, v);
-        builder.ins().bitcast(
-            types::F32,
-            cranelift_codegen::ir::MemFlags::new(),
-            low,
-        )
+        builder
+            .ins()
+            .bitcast(types::F32, cranelift_codegen::ir::MemFlags::new(), low)
     } else if target == types::F64 {
-        builder.ins().bitcast(
-            types::F64,
-            cranelift_codegen::ir::MemFlags::new(),
-            v,
-        )
+        builder
+            .ins()
+            .bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), v)
     } else {
         // Pointers / other 64-bit values — reinterpret directly.
-        builder.ins().bitcast(
-            target,
-            cranelift_codegen::ir::MemFlags::new(),
-            v,
-        )
+        builder
+            .ins()
+            .bitcast(target, cranelift_codegen::ir::MemFlags::new(), v)
     }
 }
 
@@ -7747,25 +7715,19 @@ fn marshal_to_i64(
         builder.ins().uextend(types::I64, v)
     } else if ty == types::F32 {
         // F32 → reinterpret as i32 → zero-extend.
-        let as_i32 = builder.ins().bitcast(
-            types::I32,
-            cranelift_codegen::ir::MemFlags::new(),
-            v,
-        );
+        let as_i32 = builder
+            .ins()
+            .bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), v);
         builder.ins().uextend(types::I64, as_i32)
     } else if ty == types::F64 {
-        builder.ins().bitcast(
-            types::I64,
-            cranelift_codegen::ir::MemFlags::new(),
-            v,
-        )
+        builder
+            .ins()
+            .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), v)
     } else {
         // Pointers / other 64-bit values: reinterpret directly.
-        builder.ins().bitcast(
-            types::I64,
-            cranelift_codegen::ir::MemFlags::new(),
-            v,
-        )
+        builder
+            .ins()
+            .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), v)
     }
 }
 
@@ -8034,9 +7996,9 @@ mod tests {
     /// non-null code pointer.
     #[test]
     fn test_osr_helper_emission_for_counted_loop() {
-        use crate::hir::{HirConstant, HirFunction, HirFunctionSignature, HirParam};
-        use crate::hir::{HirBlock, HirInstruction, HirPhi, HirTerminator};
         use crate::hir::{BinaryOp, HirValue, HirValueKind};
+        use crate::hir::{HirBlock, HirInstruction, HirPhi, HirTerminator};
+        use crate::hir::{HirConstant, HirFunction, HirFunctionSignature, HirParam};
         use indexmap::IndexMap;
         use zyntax_typed_ast::InternedString;
 
@@ -8079,11 +8041,7 @@ mod tests {
                 span: None,
             },
         );
-        for (id, v) in [
-            (zero_i_id, 0i32),
-            (zero_sum_id, 0),
-            (one_id, 1),
-        ] {
+        for (id, v) in [(zero_i_id, 0i32), (zero_sum_id, 0), (one_id, 1)] {
             values.insert(
                 id,
                 HirValue {
@@ -8232,10 +8190,7 @@ mod tests {
             is_pure: true,
         };
 
-        let mut function = HirFunction::new(
-            InternedString::new_global("count_to"),
-            signature,
-        );
+        let mut function = HirFunction::new(InternedString::new_global("count_to"), signature);
         function.values = values;
         function.blocks = blocks;
         function.entry_block = entry_id;
@@ -8281,6 +8236,9 @@ mod tests {
             layout.site_key(),
             "helper site_key should match the layout"
         );
-        assert!(!code.is_null(), "finalized helper code pointer must be non-null");
+        assert!(
+            !code.is_null(),
+            "finalized helper code pointer must be non-null"
+        );
     }
 }

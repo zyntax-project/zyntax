@@ -493,12 +493,7 @@ impl<'f> CoroCfg for HirCoroCfg<'f> {
         };
     }
 
-    fn redirect_targets(
-        &mut self,
-        bb: Self::BlockId,
-        from: Self::BlockId,
-        to: Self::BlockId,
-    ) {
+    fn redirect_targets(&mut self, bb: Self::BlockId, from: Self::BlockId, to: Self::BlockId) {
         let from_hir = self.block_id_to_hir(from);
         let to_hir = self.block_id_to_hir(to);
         let block = self.block_mut(bb);
@@ -948,13 +943,8 @@ impl HirLiveness {
             // resume side reads undefined values.
             let mut defined_at_or_before: Vec<HashSet<HirId>> =
                 Vec::with_capacity(block.instructions.len());
-            let mut acc: HashSet<HirId> = cfg
-                .function
-                .signature
-                .params
-                .iter()
-                .map(|p| p.id)
-                .collect();
+            let mut acc: HashSet<HirId> =
+                cfg.function.signature.params.iter().map(|p| p.id).collect();
             // Add all phi results across the function (cross-block
             // SSA values).
             for other_block in cfg.function.blocks.values() {
@@ -1014,13 +1004,8 @@ impl HirLiveness {
                     // Function params + all phi results (defined at
                     // top of their blocks, conservatively assumed to
                     // dominate this site via SSA).
-                    let mut s: HashSet<HirId> = cfg
-                        .function
-                        .signature
-                        .params
-                        .iter()
-                        .map(|p| p.id)
-                        .collect();
+                    let mut s: HashSet<HirId> =
+                        cfg.function.signature.params.iter().map(|p| p.id).collect();
                     for other_block in cfg.function.blocks.values() {
                         for phi in &other_block.phis {
                             s.insert(phi.result);
@@ -1030,8 +1015,7 @@ impl HirLiveness {
                 } else {
                     defined_at_or_before[idx - 1].clone()
                 };
-                let live: HashSet<HirId> =
-                    live_post.intersection(&defined_pre).copied().collect();
+                let live: HashSet<HirId> = live_post.intersection(&defined_pre).copied().collect();
                 sites.push((HirBlockId(seq as u32), idx, live));
             }
         }
@@ -1153,8 +1137,14 @@ mod tests {
         let entry_block = &cfg.function.blocks[&entry];
         // Expect: [Alloca, Store]. Const value lives in function.values, not in the block.
         assert_eq!(entry_block.instructions.len(), 2);
-        assert!(matches!(entry_block.instructions[0], HirInstruction::Alloca { .. }));
-        assert!(matches!(entry_block.instructions[1], HirInstruction::Store { .. }));
+        assert!(matches!(
+            entry_block.instructions[0],
+            HirInstruction::Alloca { .. }
+        ));
+        assert!(matches!(
+            entry_block.instructions[1],
+            HirInstruction::Store { .. }
+        ));
 
         // Second emit reuses the alloca, just appends another Store.
         cfg.emit_assign_i64(HirBlockId(0), l, 100);
@@ -1380,7 +1370,11 @@ mod tests {
         };
 
         let layout = krio_async::transform_to_state_machine(
-            &mut cfg, fn_id, &suspending, &hooks, &liveness.map,
+            &mut cfg,
+            fn_id,
+            &suspending,
+            &hooks,
+            &liveness.map,
         )
         .expect("transform should succeed");
 
@@ -1549,8 +1543,7 @@ mod tests {
                 },
             );
         }
-        f.blocks.get_mut(&entry).unwrap().terminator =
-            HirTerminator::Branch { target: from_id };
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Branch { target: from_id };
 
         let mut cfg = HirCoroCfg::new(&mut f);
         let from_bb = cfg.hir_to_block_id(from_id).unwrap();

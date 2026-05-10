@@ -61,8 +61,7 @@ pub(crate) fn process_imports_for_traits(
     // Process each import
     for module_name in imports_to_process {
         // Skip if already processed (circular import detection)
-        let already_processed =
-            PROCESSED_IMPORTS.with(|set| set.borrow().contains(&module_name));
+        let already_processed = PROCESSED_IMPORTS.with(|set| set.borrow().contains(&module_name));
         if already_processed {
             log::debug!("Skipping already processed import: {}", module_name);
             continue;
@@ -78,11 +77,7 @@ pub(crate) fn process_imports_for_traits(
             // Pass plugin signatures to ensure proper extern function declarations
             let mut parsed_program = None;
             for (_lang_name, grammar) in grammars.iter() {
-                match grammar.parse_with_signatures(
-                    &source,
-                    &module_name,
-                    &plugin_signatures,
-                ) {
+                match grammar.parse_with_signatures(&source, &module_name, &plugin_signatures) {
                     Ok(imported_program) => {
                         parsed_program = Some(imported_program);
                         break;
@@ -95,7 +90,13 @@ pub(crate) fn process_imports_for_traits(
                 // IMPORTANT: Recursively process imports from the imported module FIRST
                 // This ensures transitive dependencies (e.g., tensor -> prelude) are loaded
                 // before we process the imported module's declarations
-                process_imports_for_traits(grammars, plugin_signatures, import_resolvers, &mut imported_program, type_registry)?;
+                process_imports_for_traits(
+                    grammars,
+                    plugin_signatures,
+                    import_resolvers,
+                    &mut imported_program,
+                    type_registry,
+                )?;
 
                 // First, merge the TypeRegistry from the imported module
                 // This includes struct definitions, trait definitions, etc.
@@ -103,9 +104,7 @@ pub(crate) fn process_imports_for_traits(
 
                 // Register struct types from Class declarations in the imported module
                 // This ensures structs are available before impl block processing
-                if let Err(e) =
-                    register_struct_declarations(&imported_program, type_registry)
-                {
+                if let Err(e) = register_struct_declarations(&imported_program, type_registry) {
                     log::warn!(
                         "Failed to register struct declarations from '{}': {}",
                         module_name,
@@ -115,9 +114,7 @@ pub(crate) fn process_imports_for_traits(
 
                 // Process extern declarations from the imported module
                 // to register opaque types in the type registry
-                if let Err(e) =
-                    process_extern_declarations_mut(&imported_program, type_registry)
-                {
+                if let Err(e) = process_extern_declarations_mut(&imported_program, type_registry) {
                     log::warn!(
                         "Failed to process extern declarations from '{}': {}",
                         module_name,
@@ -282,9 +279,7 @@ pub(crate) fn resolve_in_block(
 }
 
 pub(crate) fn resolve_in_stmt(
-    stmt: &mut zyntax_typed_ast::typed_ast::TypedNode<
-        zyntax_typed_ast::typed_ast::TypedStatement,
-    >,
+    stmt: &mut zyntax_typed_ast::typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedStatement>,
     type_registry: &zyntax_typed_ast::TypeRegistry,
     function_returns: &std::collections::HashMap<
         zyntax_typed_ast::InternedString,
@@ -362,8 +357,7 @@ pub(crate) fn resolve_pattern(
         if fields.is_empty() {
             let enum_name = *name;
             let variant_name = *variant;
-            if let Some(disc) =
-                lookup_variant_discriminant(type_registry, enum_name, variant_name)
+            if let Some(disc) = lookup_variant_discriminant(type_registry, enum_name, variant_name)
             {
                 pattern.node = TypedPattern::Literal(TypedLiteralPattern::Integer(disc));
                 return;
@@ -391,8 +385,7 @@ pub(crate) fn resolve_pattern(
 
         // Search all enum types for a variant with this name
         for type_def in type_registry.get_all_types() {
-            if let zyntax_typed_ast::type_registry::TypeKind::Enum { variants } = &type_def.kind
-            {
+            if let zyntax_typed_ast::type_registry::TypeKind::Enum { variants } = &type_def.kind {
                 for v in variants {
                     if v.name == variant_name {
                         let disc = v.discriminant.unwrap_or(0);
@@ -429,9 +422,7 @@ pub(crate) fn lookup_variant_discriminant(
 }
 
 pub(crate) fn resolve_in_expr(
-    expr: &mut zyntax_typed_ast::typed_ast::TypedNode<
-        zyntax_typed_ast::typed_ast::TypedExpression,
-    >,
+    expr: &mut zyntax_typed_ast::typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     type_registry: &zyntax_typed_ast::TypeRegistry,
     function_returns: &std::collections::HashMap<
         zyntax_typed_ast::InternedString,
@@ -471,8 +462,7 @@ pub(crate) fn resolve_in_expr(
                     .filter_map(|s| s.resolve_global())
                     .collect();
                 let mangled_name = segments.join("$"); // "Tensor$arange"
-                let mangled_interned =
-                    zyntax_typed_ast::InternedString::new_global(&mangled_name);
+                let mangled_interned = zyntax_typed_ast::InternedString::new_global(&mangled_name);
 
                 log::debug!(
                     "[RESOLVE_TYPES] Converting Path {:?} to Variable '{}'",
@@ -544,10 +534,12 @@ pub(crate) fn resolve_in_expr(
                             // If return type needs resolution, do it
                             resolve_in_type(&mut return_type, type_registry);
                             expr.ty = return_type;
-                            log::debug!("[RESOLVE_TYPES] Resolved static method {}::{} return type to {:?}",
+                            log::debug!(
+                                "[RESOLVE_TYPES] Resolved static method {}::{} return type to {:?}",
                                 type_name.resolve_global().unwrap_or_default(),
                                 method_name.resolve_global().unwrap_or_default(),
-                                expr.ty);
+                                expr.ty
+                            );
                             break;
                         }
                     }

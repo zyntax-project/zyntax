@@ -42,9 +42,8 @@ fn analysis_runner_output_drives_krio_captures_lift() {
     let fn_id = function.id;
 
     // Build a one-fn module so AnalysisRunner has somewhere to walk.
-    let mut module = zyntax_compiler::hir::HirModule::new(
-        zyntax_typed_ast::InternedString::new_global("test"),
-    );
+    let mut module =
+        zyntax_compiler::hir::HirModule::new(zyntax_typed_ast::InternedString::new_global("test"));
     module.functions.insert(fn_id, function);
 
     // Run the existing analyzer.
@@ -91,10 +90,22 @@ fn analysis_runner_output_drives_krio_captures_lift() {
         orchestrator::lower_async_function(&mut function, &suspending, frame, 16, &live_out)
             .expect("orchestrator must succeed");
 
-    eprintln!("[DEBUG] liveness.map.at_site = {:?}", result.liveness.map.at_site);
-    eprintln!("[DEBUG] layout.yield_saves = {:?}", result.layout.yield_saves);
-    eprintln!("[DEBUG] layout.yield_blocks = {:?}", result.layout.yield_blocks);
-    eprintln!("[DEBUG] layout.resume_loads = {:?}", result.layout.resume_loads);
+    eprintln!(
+        "[DEBUG] liveness.map.at_site = {:?}",
+        result.liveness.map.at_site
+    );
+    eprintln!(
+        "[DEBUG] layout.yield_saves = {:?}",
+        result.layout.yield_saves
+    );
+    eprintln!(
+        "[DEBUG] layout.yield_blocks = {:?}",
+        result.layout.yield_blocks
+    );
+    eprintln!(
+        "[DEBUG] layout.resume_loads = {:?}",
+        result.layout.resume_loads
+    );
     eprintln!("[DEBUG] live_across = {:?}", live_across);
     eprintln!("[DEBUG] hir_to_local = {:?}", result.liveness.hir_to_local);
 
@@ -119,8 +130,7 @@ fn analysis_runner_output_drives_krio_captures_lift() {
     // The saved LocalId must round-trip back to live_across.
     let saved_local = result.layout.yield_saves[0].1[0].1;
     assert_eq!(
-        result.liveness.local_to_hir[&saved_local],
-        live_across,
+        result.liveness.local_to_hir[&saved_local], live_across,
         "captures-lift correctly identified live_across as the captured value"
     );
 
@@ -159,9 +169,8 @@ fn analysis_runner_output_drives_krio_captures_lift() {
 fn analysis_runner_handles_canonical_fixture_without_error() {
     let AsyncFnFixture { function, .. } = make_async_function_with_one_await();
     let fn_id = function.id;
-    let mut module = zyntax_compiler::hir::HirModule::new(
-        zyntax_typed_ast::InternedString::new_global("test"),
-    );
+    let mut module =
+        zyntax_compiler::hir::HirModule::new(zyntax_typed_ast::InternedString::new_global("test"));
     module.functions.insert(fn_id, function);
     let mut analyzer = AnalysisRunner::new(module);
     let analysis = analyzer.run_all().expect("analyzer must not error");

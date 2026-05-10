@@ -19,7 +19,9 @@ use zyntax_compiler::hir::{
     HirCallable, HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
 };
 
-use common::{live_out_for_entry_only, make_async_function_with_one_await, module_of, AsyncFnFixture};
+use common::{
+    live_out_for_entry_only, make_async_function_with_one_await, module_of, AsyncFnFixture,
+};
 
 #[test]
 fn e4_full_pipeline_produces_dispatcher_save_load() {
@@ -80,7 +82,10 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
     // re-entry check (LoadSlot + Eq + CondBranch). All saves moved
     // to first_call_block (captures-lift + promise persist) and
     // ready_block (result + state). Yield block itself has 0 saves.
-    assert_eq!(save_count, 0, "yield block now contains only the re-entry check");
+    assert_eq!(
+        save_count, 0,
+        "yield block now contains only the re-entry check"
+    );
     // Total saves across the function should be 4: captures-lift +
     // promise (in first_call_block), result + state (in ready_block).
     let total_saves = function

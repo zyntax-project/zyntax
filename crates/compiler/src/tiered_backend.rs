@@ -281,8 +281,7 @@ impl TieredBackend {
             }
         })?;
 
-        self.cranelift
-            .with_lock(|be| be.compile_module(&module))?;
+        self.cranelift.with_lock(|be| be.compile_module(&module))?;
 
         for (func_id, function) in module.functions.iter() {
             let bound = self.adapter.register(ptr::null_mut(), None);
@@ -393,20 +392,22 @@ impl TieredBackend {
         let verbosity = self.config.verbosity;
         let tier_idx = target_tier.index();
 
-        let promoted = self.adapter.force_promote(&entry.bound, tier_idx, move |bead| {
-            compile_at_tier(
-                tier_idx,
-                bead,
-                func_id,
-                bead_id,
-                &func_arc,
-                &cranelift,
-                #[cfg(feature = "llvm-backend")]
-                llvm.as_ref(),
-                tier2_backend,
-                verbosity,
-            )
-        });
+        let promoted = self
+            .adapter
+            .force_promote(&entry.bound, tier_idx, move |bead| {
+                compile_at_tier(
+                    tier_idx,
+                    bead,
+                    func_id,
+                    bead_id,
+                    &func_arc,
+                    &cranelift,
+                    #[cfg(feature = "llvm-backend")]
+                    llvm.as_ref(),
+                    tier2_backend,
+                    verbosity,
+                )
+            });
 
         if !promoted && verbosity >= 1 {
             eprintln!(
@@ -500,10 +501,7 @@ impl TieredBackend {
     /// know plugin functions like `$IO$println_dynamic` expect a
     /// `DynamicBox` and emits raw-i64 calls that the callee mis-reads
     /// as fat-pointer bytes.
-    pub fn register_symbol_signatures(
-        &mut self,
-        symbols: &[crate::zrtl::RuntimeSymbolInfo],
-    ) {
+    pub fn register_symbol_signatures(&mut self, symbols: &[crate::zrtl::RuntimeSymbolInfo]) {
         self.cranelift
             .with_lock(|be| be.register_symbol_signatures(symbols));
     }

@@ -65,9 +65,9 @@ pub fn make_async_function_with_one_await() -> AsyncFnFixture {
     let input = HirId::new();
     let const_one = HirId::new();
     let live_across = HirId::new(); // x = input + 1
-    let foo_result = HirId::new();  // result of foo()
+    let foo_result = HirId::new(); // result of foo()
     let await_result = HirId::new(); // result of await
-    let return_val = HirId::new();   // x + r
+    let return_val = HirId::new(); // x + r
 
     let foo_id = HirId::new(); // a sync function "foo" — we don't need its body
 
@@ -170,7 +170,10 @@ pub fn module_of(function: HirFunction) -> HirModule {
 /// `live_out` map containing just `live_across` for the function's
 /// entry block. Mirrors what zyntax's existing per-block liveness
 /// analysis would produce for the canonical fixture.
-pub fn live_out_for_entry_only(function: &HirFunction, live_id: HirId) -> HashMap<HirId, HashSet<HirId>> {
+pub fn live_out_for_entry_only(
+    function: &HirFunction,
+    live_id: HirId,
+) -> HashMap<HirId, HashSet<HirId>> {
     let mut map = HashMap::new();
     let mut set = HashSet::new();
     set.insert(live_id);

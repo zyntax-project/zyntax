@@ -226,7 +226,13 @@ pub fn find_loop_headers(function: &HirFunction) -> Vec<HirId> {
     let mut headers = Vec::new();
     let mut headers_seen = std::collections::HashSet::new();
 
-    dfs_find_back_edges(function, entry, &mut visited, &mut headers, &mut headers_seen);
+    dfs_find_back_edges(
+        function,
+        entry,
+        &mut visited,
+        &mut headers,
+        &mut headers_seen,
+    );
 
     headers
 }
@@ -299,7 +305,9 @@ fn successors_of(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
             out.push(*normal);
             out.push(*unwind);
         }
-        HirTerminator::PatternMatch { patterns, default, .. } => {
+        HirTerminator::PatternMatch {
+            patterns, default, ..
+        } => {
             for p in patterns {
                 out.push(p.target);
             }
@@ -408,8 +416,7 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
     let reachable = reachable_from(function, header);
     let local_defs = locally_defined_in(function, &reachable);
 
-    let mut seen_extra: std::collections::HashSet<HirId> =
-        live_ins.iter().copied().collect();
+    let mut seen_extra: std::collections::HashSet<HirId> = live_ins.iter().copied().collect();
 
     for &block_id in &reachable {
         let block = match function.blocks.get(&block_id) {
@@ -592,13 +599,20 @@ fn instruction_uses(inst: &crate::hir::HirInstruction) -> Result<Vec<HirId>, ()>
             uses.extend(indices.iter().copied());
         }
         I::Cast { operand, .. } => uses.push(*operand),
-        I::Select { condition, true_val, false_val, .. } => {
+        I::Select {
+            condition,
+            true_val,
+            false_val,
+            ..
+        } => {
             uses.push(*condition);
             uses.push(*true_val);
             uses.push(*false_val);
         }
         I::ExtractValue { aggregate, .. } => uses.push(*aggregate),
-        I::InsertValue { aggregate, value, .. } => {
+        I::InsertValue {
+            aggregate, value, ..
+        } => {
             uses.push(*aggregate);
             uses.push(*value);
         }

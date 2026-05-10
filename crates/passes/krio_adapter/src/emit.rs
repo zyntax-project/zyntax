@@ -217,8 +217,7 @@ fn rewrite_uses_in_reachable(
         // re-defined by a phi in THIS block. This block uses the phi
         // result (canonical), and downstream blocks reachable only
         // through this phi should also see the canonical value.
-        let block_phi_results: HashSet<HirId> =
-            block.phis.iter().map(|p| p.result).collect();
+        let block_phi_results: HashSet<HirId> = block.phis.iter().map(|p| p.result).collect();
         let mut active_map = active_map_into;
         active_map.retain(|orig, _| !block_phi_results.contains(orig));
 

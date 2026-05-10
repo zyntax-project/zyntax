@@ -111,11 +111,18 @@ fn effective_cranelift_type(
         for inst in &block.instructions {
             match inst {
                 HirInstruction::Binary {
-                    result, op, left, right, ..
+                    result,
+                    op,
+                    left,
+                    right,
+                    ..
                 } if *result == value => {
                     use zyntax_compiler::hir::BinaryOp::*;
                     // Comparisons → i8 (Bool)
-                    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | FEq | FNe | FLt | FLe | FGt | FGe) {
+                    if matches!(
+                        op,
+                        Eq | Ne | Lt | Le | Gt | Ge | FEq | FNe | FLt | FLe | FGt | FGe
+                    ) {
                         return Some(HirType::Bool);
                     }
                     // Arithmetic / bitwise: result type = max-width of
@@ -171,8 +178,10 @@ pub fn insert_phi_coercions(function: &mut HirFunction) {
         // new_value_to_use). Apply at the end after we've collected
         // all updates.
         // updates[phi_idx][incoming_idx] = Some(new_val) if changed
-        let mut all_updates: Vec<Vec<Option<HirId>>> =
-            phis_snapshot.iter().map(|(_, _, inc)| vec![None; inc.len()]).collect();
+        let mut all_updates: Vec<Vec<Option<HirId>>> = phis_snapshot
+            .iter()
+            .map(|(_, _, inc)| vec![None; inc.len()])
+            .collect();
 
         for (phi_idx, (_phi_result, phi_ty, incoming)) in phis_snapshot.iter().enumerate() {
             for (inc_idx, (val, pred)) in incoming.iter().enumerate() {
@@ -267,7 +276,7 @@ fn int_bits(ty: &HirType) -> Option<u32> {
         I16 | U16 => 16,
         I32 | U32 => 32,
         I64 | U64 => 64,
-        Void => 8, // translated to i8 by translate_type
+        Void => 8,                              // translated to i8 by translate_type
         Ptr(_) | Opaque(_) | Function(_) => 64, // 64-bit pointer
         _ => return None,
     })
@@ -343,14 +352,17 @@ pub fn repair_phi_predecessors(function: &mut HirFunction) {
         // Determine stale vs missing preds for THIS block (uniform
         // across all its phis — they all share the same predecessor
         // list).
-        let phi_preds: HashSet<HirId> =
-            block.phis[0].incoming.iter().map(|(_, p)| *p).collect();
+        let phi_preds: HashSet<HirId> = block.phis[0].incoming.iter().map(|(_, p)| *p).collect();
         let stale: Vec<HirId> = phi_preds
             .iter()
             .copied()
             .filter(|p| !actual_set.contains(p))
             .collect();
-        let new: Vec<HirId> = actual.iter().copied().filter(|p| !phi_preds.contains(p)).collect();
+        let new: Vec<HirId> = actual
+            .iter()
+            .copied()
+            .filter(|p| !phi_preds.contains(p))
+            .collect();
         if stale.len() != new.len() {
             // Heuristic gives up — log and continue. This means the
             // CFG transform did something more complex than 1:1
@@ -364,7 +376,11 @@ pub fn repair_phi_predecessors(function: &mut HirFunction) {
             continue;
         }
         // Positional swap: stale[i] → new[i] in every phi's incoming.
-        let swap_map: HashMap<HirId, HirId> = stale.iter().zip(new.iter()).map(|(s, n)| (*s, *n)).collect();
+        let swap_map: HashMap<HirId, HirId> = stale
+            .iter()
+            .zip(new.iter())
+            .map(|(s, n)| (*s, *n))
+            .collect();
         for phi in &mut block.phis {
             for (_, pred) in &mut phi.incoming {
                 if let Some(&new_pred) = swap_map.get(pred) {
@@ -391,9 +407,8 @@ pub fn lower_await_calls(
     // to shift mid-loop.
     let block_seq_to_hir: Vec<HirId> = function.blocks.keys().copied().collect();
 
-    let resolve_seq = |bb: HirBlockId| -> Option<HirId> {
-        block_seq_to_hir.get(bb.0 as usize).copied()
-    };
+    let resolve_seq =
+        |bb: HirBlockId| -> Option<HirId> { block_seq_to_hir.get(bb.0 as usize).copied() };
 
     // Iterate yield blocks. `layout.yield_blocks[i] = (block_id, next_state)`.
     // The corresponding resume entry is `layout.resume_entries[next_state]`.
@@ -565,11 +580,17 @@ pub fn lower_await_calls(
             poll_fn_ty.clone(),
             HirValueKind::Instruction,
         );
-        let poll_result_id =
-            mint_value(&mut function.values, HirType::I64, HirValueKind::Instruction);
+        let poll_result_id = mint_value(
+            &mut function.values,
+            HirType::I64,
+            HirValueKind::Instruction,
+        );
         let zero_const_pb = mint_const_i64(&mut function.values, 0);
-        let is_pending_id =
-            mint_value(&mut function.values, HirType::Bool, HirValueKind::Instruction);
+        let is_pending_id = mint_value(
+            &mut function.values,
+            HirType::Bool,
+            HirValueKind::Instruction,
+        );
         let poll_block = HirBlock {
             id: poll_block_id,
             label: Some(InternedString::new_global("await_poll")),
@@ -664,8 +685,7 @@ pub fn lower_await_calls(
             .blocks
             .get_mut(&yield_hir)
             .expect("yield block exists");
-        let kept_pre: Vec<HirInstruction> =
-            yield_block.instructions[..await_idx].to_vec();
+        let kept_pre: Vec<HirInstruction> = yield_block.instructions[..await_idx].to_vec();
         let kept_post: Vec<HirInstruction> = yield_block
             .instructions
             .iter()
@@ -700,8 +720,11 @@ pub fn lower_await_calls(
             HirValueKind::Instruction,
         );
         let zero_check_const = mint_const_i64(&mut function.values, 0);
-        let is_first_call_id =
-            mint_value(&mut function.values, HirType::Bool, HirValueKind::Instruction);
+        let is_first_call_id = mint_value(
+            &mut function.values,
+            HirType::Bool,
+            HirValueKind::Instruction,
+        );
         yield_block.instructions = vec![
             HirInstruction::AsyncLoadSlot {
                 result: existing_promise_id,
@@ -724,7 +747,9 @@ pub fn lower_await_calls(
         };
 
         // Insert all new blocks into the function.
-        function.blocks.insert(first_call_block_id, first_call_block);
+        function
+            .blocks
+            .insert(first_call_block_id, first_call_block);
         function.blocks.insert(poll_block_id, poll_block);
         function.blocks.insert(pending_block_id, pending_block);
         function.blocks.insert(ready_block_id, ready_block);
@@ -1257,7 +1282,11 @@ pub fn generate_promise_entry(
         lifetime_params: vec![],
         is_variadic: false,
     }));
-    let poll_fn_ptr_id = mint_value(&mut entry.values, poll_fn_ty.clone(), HirValueKind::Instruction);
+    let poll_fn_ptr_id = mint_value(
+        &mut entry.values,
+        poll_fn_ty.clone(),
+        HirValueKind::Instruction,
+    );
     instructions.push(HirInstruction::CreateClosure {
         result: poll_fn_ptr_id,
         closure_ty: poll_fn_ty,
@@ -1267,7 +1296,11 @@ pub fn generate_promise_entry(
 
     // Allocate the 16-byte Promise struct.
     let promise_size_id = mint_const_i64(&mut entry.values, 16);
-    let promise_ptr_id = mint_value(&mut entry.values, promise_ptr_ty.clone(), HirValueKind::Instruction);
+    let promise_ptr_id = mint_value(
+        &mut entry.values,
+        promise_ptr_ty.clone(),
+        HirValueKind::Instruction,
+    );
     instructions.push(HirInstruction::Call {
         result: Some(promise_ptr_id),
         callee: HirCallable::Intrinsic(Intrinsic::Malloc),
@@ -1321,11 +1354,7 @@ pub fn generate_promise_entry(
     entry
 }
 
-fn mint_value(
-    values: &mut IndexMap<HirId, HirValue>,
-    ty: HirType,
-    kind: HirValueKind,
-) -> HirId {
+fn mint_value(values: &mut IndexMap<HirId, HirValue>, ty: HirType, kind: HirValueKind) -> HirId {
     let id = HirId::new();
     values.insert(
         id,

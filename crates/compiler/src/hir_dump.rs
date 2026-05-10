@@ -996,7 +996,12 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
             let v = mapper.value(value);
             format!("async_save {}, slot {}, {}", f, slot, v)
         }
-        HirInstruction::AsyncLoadSlot { result, ty, frame, slot } => {
+        HirInstruction::AsyncLoadSlot {
+            result,
+            ty,
+            frame,
+            slot,
+        } => {
             let r = mapper.value(result);
             let f = mapper.value(frame);
             format!("{}: {} = async_load {}, slot {}", r, fmt_type(ty), f, slot)

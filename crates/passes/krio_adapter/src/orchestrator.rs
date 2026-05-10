@@ -242,7 +242,13 @@ pub fn lower_async_function_in_module(
     live_out_per_block: &HashMap<HirId, HashSet<HirId>>,
 ) -> Result<LowerResult, LowerError> {
     let suspending = HirSuspendingFns::from_module(module);
-    lower_async_function(function, &suspending, frame_ptr, state_slot, live_out_per_block)
+    lower_async_function(
+        function,
+        &suspending,
+        frame_ptr,
+        state_slot,
+        live_out_per_block,
+    )
 }
 
 /// Lower every `is_async` function in `module`. Convenience wrapper
@@ -286,10 +292,7 @@ where
             .swap_remove(&fn_id)
             .expect("async fn id from module");
         let frame = frame_ptr_for(&function);
-        let live_out = live_out_per_block
-            .get(&fn_id)
-            .cloned()
-            .unwrap_or_default();
+        let live_out = live_out_per_block.get(&fn_id).cloned().unwrap_or_default();
         let result =
             lower_async_function(&mut function, &suspending, frame, state_slot, &live_out)?;
         module.functions.insert(fn_id, function);

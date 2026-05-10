@@ -8,9 +8,7 @@
 
 mod common;
 
-use krio_adapter::{
-    HirAsyncHooks, HirBlockId, HirCoroCfg, HirLiveness, HirSuspendingFns,
-};
+use krio_adapter::{HirAsyncHooks, HirBlockId, HirCoroCfg, HirLiveness, HirSuspendingFns};
 use krio_async::{AsyncHooks, SuspendingFns, SuspensionSite};
 use krio_stackless::CoroCfg;
 use zyntax_compiler::hir::{HirCallable, HirInstruction, Intrinsic};
@@ -170,10 +168,9 @@ fn stage_transform_produces_state_machine_layout() {
         suspending: &suspending,
     };
 
-    let layout = krio_async::transform_to_state_machine(
-        &mut cfg, fn_id, &suspending, &hooks, &liveness.map,
-    )
-    .expect("transform must succeed for canonical fixture");
+    let layout =
+        krio_async::transform_to_state_machine(&mut cfg, fn_id, &suspending, &hooks, &liveness.map)
+            .expect("transform must succeed for canonical fixture");
 
     // Original entry + one resume entry = 2 states.
     assert_eq!(layout.resume_entries.len(), 2);
@@ -212,10 +209,9 @@ fn stage_pre_e1_function_still_has_intrinsic_await() {
     let hooks = HirAsyncHooks {
         suspending: &suspending,
     };
-    let _ = krio_async::transform_to_state_machine(
-        &mut cfg, fn_id, &suspending, &hooks, &liveness.map,
-    )
-    .unwrap();
+    let _ =
+        krio_async::transform_to_state_machine(&mut cfg, fn_id, &suspending, &hooks, &liveness.map)
+            .unwrap();
 
     // After the transform, the Intrinsic::Await call is still in some
     // block (krio splits around it but doesn't replace it). Phase E1's

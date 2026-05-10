@@ -9,9 +9,7 @@ mod common;
 
 use std::collections::HashSet;
 
-use krio_adapter::{
-    emit, HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns,
-};
+use krio_adapter::{emit, HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns};
 use zyntax_compiler::hir::{
     HirCallable, HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
 };
@@ -39,11 +37,7 @@ struct StagedRun {
     await_result: HirId,
 }
 
-fn run_through_e2(
-    state_slot: u32,
-    captures_slot_base: u32,
-    emit_dispatcher: bool,
-) -> StagedRun {
+fn run_through_e2(state_slot: u32, captures_slot_base: u32, emit_dispatcher: bool) -> StagedRun {
     let _ = captures_slot_base; // krio's slot allocator picks slots; reserved for future use
     let AsyncFnFixture {
         mut function,
@@ -77,10 +71,9 @@ fn run_through_e2(
     let hooks = HirAsyncHooks {
         suspending: &suspending,
     };
-    let layout = krio_async::transform_to_state_machine(
-        &mut cfg, fn_id, &suspending, &hooks, &liveness.map,
-    )
-    .expect("transform must succeed");
+    let layout =
+        krio_async::transform_to_state_machine(&mut cfg, fn_id, &suspending, &hooks, &liveness.map)
+            .expect("transform must succeed");
 
     let rewrites = emit::emit_save_load(&mut cfg, &layout, &liveness, frame);
     if emit_dispatcher {

@@ -94,10 +94,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
                 .get_function_ptr(def.id)
                 .map(|p| p as *mut ())
                 .ok_or_else(|| {
-                    CompileError::new(format!(
-                        "cranelift produced no fn ptr for {:?}",
-                        def.id
-                    ))
+                    CompileError::new(format!("cranelift produced no fn ptr for {:?}", def.id))
                 })?;
 
             // Tier ≥ 1 may have produced OSR helpers — install them
@@ -170,9 +167,7 @@ mod llvm_impl {
             self.with_lock(|backend| {
                 backend
                     .compile_function(def.id, &def.function)
-                    .map_err(|e| {
-                        CompileError::new(format!("llvm compile_function failed: {e}"))
-                    })?;
+                    .map_err(|e| CompileError::new(format!("llvm compile_function failed: {e}")))?;
                 backend
                     .get_function_pointer(def.id)
                     .map(|p| p as *mut ())

@@ -816,9 +816,7 @@ pub use zyntax_compiler::{
 /// the krio path (and the legacy AsyncCompiler will be a no-op since
 /// `is_async` is still set; once Phase F lands, the legacy path is
 /// gated off when this fires).
-fn apply_krio_async_lowering(
-    _module: &mut zyntax_compiler::HirModule,
-) -> RuntimeResult<()> {
+fn apply_krio_async_lowering(_module: &mut zyntax_compiler::HirModule) -> RuntimeResult<()> {
     #[cfg(feature = "krio-async-backend")]
     {
         // Conservative call shape: feed every async fn through the
