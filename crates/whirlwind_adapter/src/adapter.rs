@@ -428,6 +428,7 @@ impl WhirlwindAdapter {
                 link_name: None,
                 annotations: vec![],
                 effects: vec![],
+                with_handlers: vec![],
                 is_pure: false,
             }),
             return_type,

@@ -344,6 +344,8 @@ pub struct TypedFunction {
     #[serde(default)]
     pub effects: Vec<InternedString>, // Effect names from @effect(Probabilistic, IO)
     #[serde(default)]
+    pub with_handlers: Vec<InternedString>, // Handler names from @with(HandlerA, HandlerB) — wraps the body in HandleEffect at HIR lowering
+    #[serde(default)]
     pub type_params: Vec<TypedTypeParam>, // Generic type parameters
     #[serde(default)]
     pub params: Vec<TypedParameter>,

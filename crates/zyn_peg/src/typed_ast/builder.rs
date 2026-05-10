@@ -288,6 +288,7 @@ pub fn function_decl(
         name,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         params,
         return_type,
         body,

@@ -886,6 +886,7 @@ impl<'g> GrammarInterpreter<'g> {
                     name,
                     annotations,
                     effects: vec![],
+                    with_handlers: vec![],
                     type_params: vec![],
                     params,
                     return_type,

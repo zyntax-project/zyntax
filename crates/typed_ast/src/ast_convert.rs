@@ -315,6 +315,7 @@ impl<'a> TypedAstBuilder<'a> {
             name,
             annotations: vec![],
             effects: vec![],
+            with_handlers: vec![],
             type_params: vec![],
             params,
             return_type: return_type.clone(),

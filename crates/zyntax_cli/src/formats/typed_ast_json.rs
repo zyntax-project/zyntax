@@ -157,6 +157,7 @@ fn add_runtime_function_declarations(program: &mut TypedProgram, arena: &mut Ast
             link_name: None,
             annotations: vec![],
             effects: vec![],
+            with_handlers: vec![],
             is_pure: false,
         };
 

@@ -54,10 +54,10 @@ pub mod llvm_backend;
 #[cfg(feature = "llvm-backend")]
 pub mod llvm_jit_backend; // LLVM MCJIT for hot-path optimization
 
-pub mod plugin; // Plugin system for frontend runtime registration
-pub mod profiling; // Runtime profiling for tiered compilation
 pub mod beadie_adapter; // beadie::JitBackend wrappers for our backends
 pub mod osr; // On-stack replacement infrastructure (probe, registry, layout)
+pub mod plugin; // Plugin system for frontend runtime registration
+pub mod profiling; // Runtime profiling for tiered compilation
 pub mod tiered_backend; // Tiered JIT/AOT compilation system
 pub mod zpack;
 pub mod zrtl; // ZRTL (Zyntax Runtime Library) dynamic plugin format // ZPack package format for distributing modules + runtimes
@@ -850,6 +850,7 @@ fn generate_binary_trait_impl(
         name: mangled_name_interned,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         type_params: vec![],
         params: vec![
             TypedParameter {
@@ -1086,6 +1087,7 @@ fn generate_comparison_trait_impl(
             name: mangled_name_interned,
             annotations: vec![],
             effects: vec![],
+            with_handlers: vec![],
             type_params: vec![],
             params: vec![
                 TypedParameter {
@@ -1325,6 +1327,7 @@ fn generate_unary_trait_impl(
         name: mangled_name_interned,
         annotations: vec![],
         effects: vec![],
+        with_handlers: vec![],
         type_params: vec![],
         params: vec![TypedParameter {
             name: self_param,

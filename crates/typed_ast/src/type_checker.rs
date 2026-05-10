@@ -1122,6 +1122,7 @@ impl TypeChecker {
                 name: method.name,
                 annotations: vec![],
                 effects: vec![],
+                with_handlers: vec![],
                 type_params: vec![],
                 params,
                 return_type: resolved_return_type,
