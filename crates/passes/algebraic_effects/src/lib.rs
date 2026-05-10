@@ -40,7 +40,13 @@ impl PatternPass for Pass {
         engine.register_decl_rewrite(annotations::extract_effect_annotations());
         engine.register_decl_rewrite(vtable::effect_decl_to_vtable());
         engine.register_decl_rewrite(dispatch::handler_decl_to_impl());
-        engine.register_expr_rewrite(continuation::effect_op_to_dispatch());
+        // M1.3 superseded the old `effect_op_to_dispatch` rewrite (which
+        // renamed `info()` → `info_fn()`). The SSA builder now emits
+        // `HirInstruction::PerformEffect` directly via `effect_op_map`,
+        // so renaming the callee would break the lookup. The
+        // `continuation` module is retained for its tests / future use
+        // (e.g. a different lowering strategy) but its rewrite is no
+        // longer registered.
     }
 }
 
@@ -102,13 +108,15 @@ mod tests {
         let result = engine.run(&mut program, &registry);
         assert!(result.changed);
 
-        // The Effect declaration should be gone, replaced by a Class
+        // The Effect declaration STAYS (M1: needed by HIR lowering to
+        // build the `HirEffect` in `module.effects`). The Class(OpTable)
+        // is ADDED alongside.
         assert!(
-            !program
+            program
                 .declarations
                 .iter()
                 .any(|d| matches!(&d.node, TypedDeclaration::Effect(_))),
-            "Effect declaration should be removed"
+            "Effect declaration should be preserved (M1: needed by HIR lowering)"
         );
         assert!(
             program
@@ -181,13 +189,15 @@ mod tests {
         let result = engine.run(&mut program, &registry);
         assert!(result.changed);
 
-        // EffectHandler should be gone
+        // EffectHandler STAYS (M1: needed by HIR lowering to build the
+        // `HirEffectHandler` in `module.handlers`). The standalone
+        // `Handler$op` fns are ADDED alongside.
         assert!(
-            !program
+            program
                 .declarations
                 .iter()
                 .any(|d| matches!(&d.node, TypedDeclaration::EffectHandler(_))),
-            "EffectHandler should be removed"
+            "EffectHandler should be preserved (M1: needed by HIR lowering)"
         );
 
         // Two functions should be added

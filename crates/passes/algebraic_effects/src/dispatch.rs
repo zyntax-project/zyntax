@@ -15,9 +15,15 @@ pub fn handler_decl_to_impl() -> DeclRewrite {
         |matched, _bindings, _builder| {
             if let TypedDeclaration::EffectHandler(handler) = &matched.node {
                 let declarations = build_handler_declarations(handler);
+                // Phase H, M1: KEEP the EffectHandler declaration so
+                // `LoweringContext::lower_effect_handler` can build
+                // the `HirEffectHandler` entry in `module.handlers`.
+                // Without it, `module.handlers` is empty after
+                // lowering and `PerformEffect`'s handler-lookup at
+                // `cranelift_backend.rs:3796` fails for all effects.
                 RewriteOutput::Expand {
                     declarations,
-                    replacement: None, // remove the EffectHandler declaration
+                    replacement: Some(matched.clone()),
                 }
             } else {
                 RewriteOutput::Unchanged

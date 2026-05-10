@@ -16,9 +16,18 @@ pub fn effect_decl_to_vtable() -> DeclRewrite {
         |matched, _bindings, _builder| {
             if let TypedDeclaration::Effect(effect) = &matched.node {
                 let op_table = build_op_table(effect);
+                // Phase H, M1: KEEP the Effect declaration alongside
+                // the generated Class$OpTable. Downstream lowering
+                // (`LoweringContext::lower_effect_decl`) needs the
+                // Effect to build the `HirEffect` entry in
+                // `module.effects` — which the SSA builder's
+                // `effect_op_map` reads to detect effect-op calls.
+                // Previously this rewrite removed Effect, leaving
+                // `module.effects` empty and silently disabling
+                // PerformEffect emission for ALL source-level effects.
                 RewriteOutput::Expand {
                     declarations: vec![op_table],
-                    replacement: None, // remove the Effect declaration
+                    replacement: Some(matched.clone()),
                 }
             } else {
                 RewriteOutput::Unchanged

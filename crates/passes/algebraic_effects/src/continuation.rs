@@ -143,10 +143,16 @@ mod tests {
         engine.finalize().unwrap();
 
         let result = engine.run(&mut program, &registry);
-        assert!(result.changed);
+        // The pass may report no change (the rename rewrite is no
+        // longer registered — see lib.rs M1.3 commentary) or report
+        // change from the OpTable expansion. Either is fine.
+        let _ = result;
 
-        // Find the rewritten call — should reference "get_fn" not "get"
-        let has_dispatch = program.declarations.iter().any(|d| {
+        // M1.3: the `op()` call must NOT be renamed to `op_fn()`.
+        // The SSA builder consumes the original name via
+        // `effect_op_map` and emits `HirInstruction::PerformEffect`
+        // directly. Verify the callee remains `get` here.
+        let has_unrenamed_get = program.declarations.iter().any(|d| {
             if let TypedDeclaration::Function(f) = &d.node {
                 if let Some(body) = &f.body {
                     return body.statements.iter().any(|s| {
@@ -154,8 +160,7 @@ mod tests {
                             if let Some(init) = &let_stmt.initializer {
                                 if let TypedExpression::Call(call) = &init.node {
                                     if let TypedExpression::Variable(name) = &call.callee.node {
-                                        return name.resolve_global().unwrap_or_default()
-                                            == "get_fn";
+                                        return name.resolve_global().unwrap_or_default() == "get";
                                     }
                                 }
                             }
@@ -167,17 +172,18 @@ mod tests {
             false
         });
         assert!(
-            has_dispatch,
-            "Call to 'get' should be rewritten to 'get_fn'"
+            has_unrenamed_get,
+            "Call to 'get' should stay as 'get' — the SSA builder emits PerformEffect"
         );
 
-        // Effect declaration should be removed (effect_decl_to_vtable fired)
+        // Effect declaration is now PRESERVED (M1: HIR lowering needs
+        // it to build `HirEffect`). The OpTable Class is added too.
         assert!(
-            !program
+            program
                 .declarations
                 .iter()
                 .any(|d| matches!(&d.node, TypedDeclaration::Effect(_))),
-            "Effect declarations should be removed"
+            "Effect declaration should be preserved (M1: needed by HIR lowering)"
         );
     }
 }
