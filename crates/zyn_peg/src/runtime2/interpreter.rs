@@ -2848,6 +2848,13 @@ impl<'g> GrammarInterpreter<'g> {
                     _ => Err(format!("unsupported binary operation: {}", op)),
                 }
             }
+            ExprIR::Block { bindings, result } => {
+                for (name, expr) in bindings {
+                    let val = self.eval_expr(expr, state)?;
+                    state.set_binding(name, val);
+                }
+                self.eval_expr(result, state)
+            }
         }
     }
 
@@ -3372,8 +3379,13 @@ impl<'g> GrammarInterpreter<'g> {
         match val {
             ParsedValue::List(items) => items
                 .into_iter()
+                .flat_map(|item| match item {
+                    ParsedValue::List(nested) => nested,
+                    other => vec![other],
+                })
                 .map(|item| self.parsed_value_to_decl(item))
                 .collect(),
+
             ParsedValue::Declaration(decl) => Ok(vec![*decl]),
             _ => Err(format!("field '{}' is not a declaration list", name)),
         }

@@ -220,6 +220,14 @@ impl ActionGenerator {
                     format!("{}::default()", type_name)
                 }
             }
+            ExprIR::Block { bindings, result } => {
+                let bindings_code: Vec<String> = bindings
+                    .iter()
+                    .map(|(name, expr)| format!("let {} = {};", name, self.generate_expr(expr)))
+                    .collect();
+                let result_code = self.generate_expr(result);
+                format!("{{ {} {} }}", bindings_code.join(" "), result_code)
+            }
         }
     }
 

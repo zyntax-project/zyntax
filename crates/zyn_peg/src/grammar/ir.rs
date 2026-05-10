@@ -321,6 +321,29 @@ pub enum ExprIR {
 
     /// Default value for a type
     Default(String),
+
+
+    /// Block expression — sequence of let-bindings followed by a
+    /// final expression. The block evaluates the bindings in order
+    /// (each adds to the local scope), then the final expression
+    /// becomes the block's value.
+    ///
+    /// Lets the action build multiple intermediate values and
+    /// reference them in the final result. Notably, this is what
+    /// makes a single grammar rule emit multiple AST nodes
+    /// (e.g. a `component` block lowering to both a Class and an
+    /// Impl declaration in one action — return them as a list
+    /// from the final expression).
+    ///
+    /// Replaces the v1 (`runtime.rs`) JSON-shaped command chaining
+    /// at `RuleCommands { commands: Vec<AstCommand> }` with a
+    /// Rust-native shape that fits the rest of v2's TypedAST-based
+    /// dispatch. Calc.zyn's `program` rule (examples/zpeg_test/calc.zyn:14-21)
+    /// is the historical reference for the use case.
+    Block {
+        bindings: Vec<(String, ExprIR)>,
+        result: Box<ExprIR>,
+    },
 }
 
 impl GrammarIR {
