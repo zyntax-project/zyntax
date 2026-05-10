@@ -14,7 +14,6 @@ members = [
     "crates/pattern_engine",
     "crates/passes/normalization",
     "crates/passes/algebraic_effects",
-    "crates/passes/async_ir",
     "crates/passes/krio_adapter",
     "sdk/zrtl",
     "sdk/zrtl_macros",

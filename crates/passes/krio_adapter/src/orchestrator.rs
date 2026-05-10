@@ -51,6 +51,20 @@ pub struct LowerResult {
     /// Saved-SSA-HirId → freshly-loaded SSA HirId, returned by
     /// `emit_save_load`.
     pub rewrites: HashMap<HirId, HirId>,
+    /// (param SSA HirId, slot index) for each function parameter,
+    /// allocated AFTER krio's captures-lift slots so they don't
+    /// collide. The runtime ABI entry function uses these to know
+    /// where to store args in the state-machine struct; the poll
+    /// function's param-load prologue uses them to know where to
+    /// load from.
+    pub param_slots: Vec<(HirId, u32)>,
+    /// Slot reserved for the state-id u32 (used by the dispatcher).
+    /// Allocated above all captures-lift slots and param slots.
+    pub state_slot: u32,
+    /// Total number of 8-byte slots the state-machine struct needs.
+    /// Used by the entry function to size the malloc. Computed as
+    /// `max(captures_slot, state_slot, param_slots) + 1`.
+    pub num_slots: u32,
 }
 
 /// Errors the orchestrator may surface.
@@ -94,10 +108,30 @@ pub fn lower_async_function(
     function: &mut HirFunction,
     suspending: &HirSuspendingFns,
     frame_ptr: HirId,
-    state_slot: u32,
+    _state_slot_hint: u32,
     live_out_per_block: &HashMap<HirId, HashSet<HirId>>,
 ) -> Result<LowerResult, LowerError> {
     let fn_id = function.id;
+
+    // Snapshot param SSA HirIds before any mutation. The SSA builder
+    // creates separate HirIds for body-facing param values (with
+    // `HirValueKind::Parameter(idx)`) — these are what the body
+    // references. They differ from `function.signature.params[i].id`
+    // (matching the convention in async_support.rs:285-293). Look up
+    // the SSA HirId per param-index; fall back to signature.params[i].id
+    // if no Parameter(idx) value exists (rare — happens for fns
+    // built entirely synthetically).
+    let num_params = function.signature.params.len();
+    let param_hir_ids: Vec<HirId> = (0..num_params)
+        .map(|idx| {
+            function
+                .values
+                .iter()
+                .find(|(_, v)| matches!(&v.kind, zyntax_compiler::hir::HirValueKind::Parameter(i) if *i as usize == idx))
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| function.signature.params[idx].id)
+        })
+        .collect();
 
     let mut cfg = HirCoroCfg::new(function);
     let liveness = HirLiveness::build(&mut cfg, live_out_per_block);
@@ -108,6 +142,30 @@ pub fn lower_async_function(
     )
     .map_err(|_| LowerError::Transform)?;
 
+    // Compute the highest slot index krio's captures-lift used. krio's
+    // allocator (krio-async/src/lib.rs:538) starts at 0 and increments
+    // per unique LocalId. We allocate state_slot + param_slots STRICTLY
+    // ABOVE this max so they can't collide.
+    let max_capture_slot: i64 = layout
+        .yield_saves
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().map(|(slot, _)| *slot as i64))
+        .chain(
+            layout
+                .resume_loads
+                .iter()
+                .flat_map(|(_, entries)| entries.iter().map(|(slot, _)| *slot as i64)),
+        )
+        .max()
+        .unwrap_or(-1);
+    let state_slot: u32 = (max_capture_slot + 1) as u32;
+    let param_slots: Vec<(HirId, u32)> = param_hir_ids
+        .iter()
+        .enumerate()
+        .map(|(i, hir)| (*hir, state_slot + 1 + i as u32))
+        .collect();
+    let num_slots: u32 = state_slot + 1 + param_slots.len() as u32;
+
     let rewrites = emit::emit_save_load(&mut cfg, &layout, &liveness, frame_ptr);
     emit::emit_dispatcher(&mut cfg, &layout, frame_ptr, state_slot);
 
@@ -115,6 +173,9 @@ pub fn lower_async_function(
         layout,
         liveness,
         rewrites,
+        param_slots,
+        state_slot,
+        num_slots,
     })
 }
 

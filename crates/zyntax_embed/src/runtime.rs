@@ -854,41 +854,103 @@ fn apply_krio_async_lowering(
             }
         }
 
-        let lowered = krio_adapter::orchestrator::lower_async_module(
-            _module,
-            /* state_slot = */ 0,
-            // For each async fn, take its first param's id as the
-            // frame pointer. Functions with no params get a dummy
-            // HirId::new() — the orchestrator no-ops for non-suspending
-            // fns anyway, so a phantom frame is harmless.
-            |func| {
-                func.signature
-                    .params
-                    .first()
-                    .map(|p| p.id)
-                    .unwrap_or_else(HirId::new)
-            },
-            &live_out,
-        )
-        .map_err(|e| RuntimeError::Execution(format!("krio-async lowering failed: {e}")))?;
+        // Compute the suspending-fn taint set once over the live module.
+        let suspending = krio_adapter::HirSuspendingFns::from_module(_module);
+
+        // Snapshot async fn IDs before iteration (we'll swap_remove).
+        let async_fn_ids: Vec<HirId> = _module
+            .functions
+            .values()
+            .filter(|f| f.signature.is_async)
+            .map(|f| f.id)
+            .collect();
+
+        let mut lowered_count = 0_usize;
+        for fn_id in async_fn_ids {
+            // Pull the function out so we can mutate it while still
+            // having &Module available for the suspending-set view.
+            let mut function = _module
+                .functions
+                .swap_remove(&fn_id)
+                .expect("async fn id was just enumerated from this module");
+
+            // Snapshot the original signature BEFORE any reshape — the
+            // entry function rebuilds its signature from this.
+            let original_signature = function.signature.clone();
+            let original_name = function.name;
+
+            // The frame ptr we hand to krio is arbitrary: reshape will
+            // rewrite every `frame: X` reference to point at the new
+            // state_machine param. Use the first param's id if any (a
+            // valid SSA value already in the function), else mint a
+            // dummy.
+            let frame_ptr = function
+                .signature
+                .params
+                .first()
+                .map(|p| p.id)
+                .unwrap_or_else(HirId::new);
+
+            let live_out_for_fn = live_out.get(&fn_id).cloned().unwrap_or_default();
+
+            // Phase 1: krio captures-lift transform (in place).
+            let lower_result = krio_adapter::orchestrator::lower_async_function(
+                &mut function,
+                &suspending,
+                frame_ptr,
+                /* state_slot_hint */ 0, // ignored — orchestrator computes its own
+                &live_out_for_fn,
+            )
+            .map_err(|e| RuntimeError::Execution(format!("krio-async lowering failed: {e}")))?;
+
+            // Phase 2: reshape into the runtime poll ABI. After this
+            // call, `function` has signature `(*mut u8) -> i64` and
+            // name `{original}$poll`.
+            let poll_fn_name = krio_adapter::abi_emit::reshape_to_poll_abi(
+                &mut function,
+                &lower_result.layout,
+                &lower_result.param_slots,
+            );
+
+            // Phase 3: generate the Promise-returning entry. Uses the
+            // ORIGINAL signature (snapshot above) so the runtime's
+            // user-facing API is unchanged.
+            let entry_fn = krio_adapter::abi_emit::generate_promise_entry(
+                original_name,
+                &original_signature,
+                /* poll_fn_id = */ function.id,
+                lower_result.num_slots,
+                &lower_result.param_slots,
+                lower_result.state_slot,
+            );
+
+            log::debug!(
+                "[krio-async] {}: state_slot={} num_slots={} param_slots={} captures={}",
+                original_name.resolve_global().unwrap_or_default(),
+                lower_result.state_slot,
+                lower_result.num_slots,
+                lower_result.param_slots.len(),
+                lower_result
+                    .layout
+                    .yield_saves
+                    .iter()
+                    .map(|(_, e)| e.len())
+                    .sum::<usize>(),
+            );
+
+            // Reinsert poll fn (mutated in place; new name + new sig)
+            // and the fresh entry fn. The runtime's `from_async_call`
+            // looks up the entry fn by the original async name.
+            let _ = poll_fn_name;
+            _module.functions.insert(function.id, function);
+            _module.functions.insert(entry_fn.id, entry_fn);
+            lowered_count += 1;
+        }
+
         log::debug!(
             "[krio-async] lowered {} async fns via krio adapter",
-            lowered.len()
+            lowered_count
         );
-        // NOTE Phase F.1 blocker: by this point the legacy
-        // `transform_async_function` (in compiler/src/lowering.rs)
-        // has already run inside `lower_program`, replacing each
-        // is_async=true function with the legacy entry+poll pair —
-        // so `lowered` is always 0 here under the current pipeline.
-        // The fix requires either:
-        //   a) gating `transform_async_function` behind a
-        //      `LoweringConfig::use_krio_async` flag, or
-        //   b) running krio's transform inside `transform_async_function`
-        //      itself (replacing the buggy `compile_async_function` call).
-        // Approach (b) is cleaner because the runtime ABI scaffolding
-        // (state-machine struct alloc, Promise entry generation) stays
-        // intact — krio just supplies the captures-lift answers.
-        // Tracked in memory/krio_adoption_plan.md.
     }
     Ok(())
 }
@@ -1349,7 +1411,6 @@ impl ZyntaxRuntime {
             });
             engine.register_pass(normalization_pass::Pass);
             engine.register_pass(algebraic_effects_pass::Pass);
-            engine.register_pass(async_ir_pass::Pass);
             engine.finalize().map_err(|e| {
                 RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
             })?;
@@ -3275,7 +3336,6 @@ impl TieredRuntime {
             });
             engine.register_pass(normalization_pass::Pass);
             engine.register_pass(algebraic_effects_pass::Pass);
-            engine.register_pass(async_ir_pass::Pass);
             engine.finalize().map_err(|e| {
                 RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
             })?;

@@ -15,7 +15,6 @@ zyntax_typed_ast = { path = "../typed_ast" }
 pattern_engine = { path = "../pattern_engine" }
 normalization_pass = { path = "../passes/normalization" }
 algebraic_effects_pass = { path = "../passes/algebraic_effects" }
-async_ir_pass = { path = "../passes/async_ir" }
 krio_adapter = { path = "../passes/krio_adapter", optional = true }
 thiserror = "1.0"
 log = "0.4"

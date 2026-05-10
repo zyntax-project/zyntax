@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use krio_async::{AsyncHooks, FnId as KrioFnId, LivenessMap, SuspendingFns, SuspensionSite};
 use krio_stackless::CoroCfg;
 
+pub mod abi_emit;
 pub mod emit;
 pub mod orchestrator;
 use zyntax_compiler::hir::{

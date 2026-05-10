@@ -1440,7 +1440,6 @@ pub fn compile_to_hir(
         });
         engine.register_pass(normalization_pass::Pass);
         engine.register_pass(algebraic_effects_pass::Pass);
-        engine.register_pass(async_ir_pass::Pass);
         engine.finalize().map_err(|e| {
             CompilerError::Analysis(format!("Pattern engine finalize error: {}", e))
         })?;

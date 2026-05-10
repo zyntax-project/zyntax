@@ -1449,9 +1449,17 @@ async fn sum_to_ten() i32 {
                     functions.contains(&"sum_to_ten".to_string()),
                     "sum_to_ten (entry function) should be generated"
                 );
+                // Poll function naming differs by backend:
+                //   * krio_adapter: `{name}$poll`
+                //   * legacy AsyncCompiler: `__{name}_poll`
+                // Accept either since this is a compilation-only smoke
+                // test; we just want the poll companion to exist.
+                let has_poll = functions.contains(&"sum_to_ten$poll".to_string())
+                    || functions.contains(&"__sum_to_ten_poll".to_string());
                 assert!(
-                    functions.contains(&"sum_to_ten$poll".to_string()),
-                    "sum_to_ten$poll (internal poll) should be generated"
+                    has_poll,
+                    "internal poll function should be generated (got: {:?})",
+                    functions
                 );
                 println!("Async function compilation successful!");
             }
@@ -1473,7 +1481,10 @@ async fn sum_to_ten() i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(
+        not(feature = "krio-async-backend"),
+        ignore = "requires krio-async-backend feature; legacy async_support.rs path has the captures-lift bug"
+    )]
     #[test]
     fn test_execute_long_running_async_loop() {
         // Test async function with a long-running loop (sum 1 to 100)
