@@ -9,12 +9,13 @@ description = "Adapter wiring zyntax HIR into krio-async's CFG-shaped CoroCfg / 
 zyntax_typed_ast = { path = "../../typed_ast" }
 zyntax_compiler  = { path = "../../compiler" }
 
-# Local path to the sibling krio workspace. Pinned to absolute path
-# while we iterate; once the integration is stable we'll either
-# vendor it or pull from a published release.
-krio-async     = { path = "../../../../krio/crates/krio-async" }
-krio-stackless = { path = "../../../../krio/crates/krio-stackless" }
-krio-core      = { path = "../../../../krio/crates/krio-core" }
+# Pinned to a specific commit on the upstream krio repo. Phase G
+# improvements (TransformOptions::reserved_slots, validate_layout,
+# host-gotcha docs) ship in commit fe0177c. Bump the rev when newer
+# krio fixes / features land.
+krio-async     = { git = "https://github.com/darmie/krio.git", package = "krio-async",     rev = "fe0177c" }
+krio-stackless = { git = "https://github.com/darmie/krio.git", package = "krio-stackless", rev = "fe0177c" }
+krio-core      = { git = "https://github.com/darmie/krio.git", package = "krio-core",      rev = "fe0177c" }
 
 log = "0.4"
 indexmap = "2"
