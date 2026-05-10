@@ -213,6 +213,14 @@ pub fn lower_async_function(
     // valid SSA.
     crate::abi_emit::repair_phi_predecessors(cfg_function);
 
+    // Then coerce phi-incoming types: when an await result was Void-
+    // typed in the SSA and gets reloaded as i64 by F.2, downstream
+    // Binary ops widen to i64 too. Phi nodes at loop headers were
+    // declared with the original (smaller) types, so the i64 incoming
+    // values cause Cranelift verification failures. Insert Trunc/SExt/
+    // Bitcast at phi edges as needed.
+    crate::abi_emit::insert_phi_coercions(cfg_function);
+
     Ok(LowerResult {
         layout,
         liveness,

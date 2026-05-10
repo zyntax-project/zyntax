@@ -89,7 +89,12 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
         .flat_map(|b| b.instructions.iter())
         .filter(|i| matches!(i, HirInstruction::AsyncSaveSlot { .. }))
         .count();
-    assert_eq!(total_saves, 4, "total saves: 1 captures + 1 promise + 1 result + 1 state");
+    // Total saves = 1 captures-lift + 1 promise persist (first_call_block)
+    //              + 1 result + 1 promise-clear + 1 state-bump (ready_block) = 5
+    assert_eq!(
+        total_saves, 5,
+        "total saves: 1 captures + 1 promise + 1 result + 1 promise-clear + 1 state"
+    );
 
     // ── Load in the resume entry, downstream uses rewritten ──
     let resume_id = result.layout.resume_entries[1];

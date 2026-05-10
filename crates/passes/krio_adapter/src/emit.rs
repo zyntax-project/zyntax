@@ -182,10 +182,29 @@ fn rewrite_uses_in_reachable(
     let mut visited: HashSet<HirId> = HashSet::new();
     let mut stack: Vec<HirId> = vec![start_hir];
 
-    let replacement: indexmap::IndexMap<HirId, HirId> =
+    let full_replacement: indexmap::IndexMap<HirId, HirId> =
         mapping.iter().map(|(k, v)| (*k, *v)).collect();
 
-    while let Some(bb) = stack.pop() {
+    // The walk carries the ACTIVE replacement map per-path. A phi
+    // node is a "rewrite barrier": once execution passes through a
+    // phi block whose result HirId is in our replacement keys, that
+    // entry must drop OUT of the active map for downstream blocks.
+    // Reason: the phi re-introduces the canonical name at the join,
+    // so all uses past the phi should resolve to the phi.result, not
+    // to the fresh id from the back-edge. Without this propagation,
+    // emit_save_load's rewrites bleed into post-loop code (the
+    // function exit, etc.), causing Cranelift dominance failures.
+    //
+    // Reachability is approximated by visited (we revisit a block
+    // only if a more-restrictive map arrives — but to keep
+    // complexity bounded we just visit each block once with the
+    // first map that reaches it; the loop pattern is the only place
+    // multiple maps could differ, and that's exactly what the phi
+    // barrier handles).
+    type ReplMap = indexmap::IndexMap<HirId, HirId>;
+    let mut path_stack: Vec<(HirId, ReplMap)> = vec![(start_hir, full_replacement)];
+
+    while let Some((bb, active_map_into)) = path_stack.pop() {
         if !visited.insert(bb) {
             continue;
         }
@@ -193,22 +212,32 @@ fn rewrite_uses_in_reachable(
             Some(b) => b,
             None => continue,
         };
-        for inst in &mut block.instructions {
-            // AsyncLoadSlot's own result must not be remapped — it IS
-            // the fresh id. Its `frame` operand is also independent
-            // of saved values. Skip safely by NOT including these in
-            // the replacement targets — which is already true because
-            // mapping keys are saved-value HirIds, and AsyncLoadSlot
-            // doesn't reference them.
-            inst.replace_uses(&replacement);
+
+        // Shrink the active map: drop entries whose original HirId is
+        // re-defined by a phi in THIS block. This block uses the phi
+        // result (canonical), and downstream blocks reachable only
+        // through this phi should also see the canonical value.
+        let block_phi_results: HashSet<HirId> =
+            block.phis.iter().map(|p| p.result).collect();
+        let mut active_map = active_map_into;
+        active_map.retain(|orig, _| !block_phi_results.contains(orig));
+
+        if active_map.is_empty() {
+            // Nothing to rewrite past here; still walk successors so
+            // they're marked visited (and stop), but no instr edits.
+            for succ in successors_of(&block.terminator) {
+                path_stack.push((succ, ReplMap::new()));
+            }
+            continue;
         }
-        // Terminator operand rewriting (Return values, branch
-        // conditions, etc.) — HirTerminator has no replace_uses method,
-        // so handle inline.
-        rewrite_terminator_uses(&mut block.terminator, &replacement);
+
+        for inst in &mut block.instructions {
+            inst.replace_uses(&active_map);
+        }
+        rewrite_terminator_uses(&mut block.terminator, &active_map);
         for succ in successors_of(&block.terminator) {
             if !visited.contains(&succ) {
-                stack.push(succ);
+                path_stack.push((succ, active_map.clone()));
             }
         }
     }

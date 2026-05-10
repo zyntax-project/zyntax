@@ -63,6 +63,216 @@ pub struct AwaitSlots {
 /// `start_slot` is the first free slot after captures+state+params;
 /// each await consumes 2 slots. Returns the next free slot
 /// (= start_slot + 2 * num_awaits).
+/// Insert type-coercing Casts at phi-incoming edges where the
+/// incoming value's type doesn't match the phi's declared type.
+///
+/// Why this is needed: the SSA builder sometimes types
+/// `Intrinsic::Await` results as `Void` (the inner future type
+/// isn't propagated through the await call). The captures-lift
+/// transform stores those values to i64 slots and reloads them as
+/// i64; downstream Binary ops then widen to i64. If the phi node at
+/// a loop header was originally typed for the unwidened value (i32,
+/// i8, etc.), Cranelift IR verification fails with:
+///
+///   ```text
+///   jump block4(v26, v27, v20): arg 0 (v26) has type i64, expected i32
+///   ```
+///
+/// This pass walks every phi block, compares each phi-incoming
+/// value's type against the phi's declared type, and inserts a
+/// `Cast` instruction (Trunc, ZExt/SExt, or Bitcast) in the
+/// predecessor block — right before its terminator — whenever the
+/// types diverge. The phi.incoming entry is updated to reference
+/// the cast result.
+///
+/// Run AFTER `repair_phi_predecessors` (so phi.incoming preds are
+/// up-to-date) and AFTER `lower_await_calls` (so await result types
+/// have been finalized).
+/// Compute the effective Cranelift type of a value by simulating
+/// Cranelift's operand-widening rules. The HIR's `Binary { ty }`
+/// field is unreliable: the SSA builder may declare `ty: I64` even
+/// though both operands are i32 — Cranelift produces i32 (no
+/// widening when operands match). Phi-coercion needs the *actual*
+/// type Cranelift will see at the jump site, not the HIR claim.
+///
+/// Returns `None` for unsupported types (records, arrays, etc.) so
+/// the caller can skip coercion gracefully.
+fn effective_cranelift_type(
+    function: &HirFunction,
+    value: HirId,
+    visited: &mut HashSet<HirId>,
+) -> Option<HirType> {
+    if !visited.insert(value) {
+        // cycle (shouldn't happen in SSA but guard anyway)
+        return function.values.get(&value).map(|v| v.ty.clone());
+    }
+    // Find the defining instruction (if any).
+    for block in function.blocks.values() {
+        for inst in &block.instructions {
+            match inst {
+                HirInstruction::Binary {
+                    result, op, left, right, ..
+                } if *result == value => {
+                    use zyntax_compiler::hir::BinaryOp::*;
+                    // Comparisons → i8 (Bool)
+                    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | FEq | FNe | FLt | FLe | FGt | FGe) {
+                        return Some(HirType::Bool);
+                    }
+                    // Arithmetic / bitwise: result type = max-width of
+                    // operand effective types.
+                    let lty = effective_cranelift_type(function, *left, visited)?;
+                    let rty = effective_cranelift_type(function, *right, visited)?;
+                    return Some(if int_bits(&lty)? >= int_bits(&rty)? {
+                        lty
+                    } else {
+                        rty
+                    });
+                }
+                HirInstruction::Cast { result, ty, .. } if *result == value => {
+                    return Some(ty.clone());
+                }
+                HirInstruction::AsyncLoadSlot { result, ty, .. } if *result == value => {
+                    return Some(ty.clone());
+                }
+                HirInstruction::Load { result, ty, .. } if *result == value => {
+                    return Some(ty.clone());
+                }
+                _ => {}
+            }
+        }
+        for phi in &block.phis {
+            if phi.result == value {
+                return Some(phi.ty.clone());
+            }
+        }
+    }
+    // No defining instruction — fall back to declared type.
+    function.values.get(&value).map(|v| v.ty.clone())
+}
+
+pub fn insert_phi_coercions(function: &mut HirFunction) {
+    let block_ids: Vec<HirId> = function.blocks.keys().copied().collect();
+
+    for block_id in block_ids {
+        // Snapshot phis so we can mutate function.values + block
+        // instructions without borrow conflicts.
+        let phis_snapshot: Vec<(HirId, HirType, Vec<(HirId, HirId)>)> = function
+            .blocks
+            .get(&block_id)
+            .map(|b| {
+                b.phis
+                    .iter()
+                    .map(|p| (p.result, p.ty.clone(), p.incoming.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // For each phi.incoming entry, compute (cast_inserted_in_pred,
+        // new_value_to_use). Apply at the end after we've collected
+        // all updates.
+        // updates[phi_idx][incoming_idx] = Some(new_val) if changed
+        let mut all_updates: Vec<Vec<Option<HirId>>> =
+            phis_snapshot.iter().map(|(_, _, inc)| vec![None; inc.len()]).collect();
+
+        for (phi_idx, (_phi_result, phi_ty, incoming)) in phis_snapshot.iter().enumerate() {
+            for (inc_idx, (val, pred)) in incoming.iter().enumerate() {
+                // Use the EFFECTIVE Cranelift type, not function.values'
+                // declared type — the HIR ty on Binary may be I64 even
+                // when both operands are i32 (Cranelift produces i32).
+                let mut visited = HashSet::new();
+                let val_ty = match effective_cranelift_type(function, *val, &mut visited) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if types_compatible(&val_ty, phi_ty) {
+                    continue;
+                }
+                let cast_op = match pick_coerce_cast_op(&val_ty, phi_ty) {
+                    Some(op) => op,
+                    None => continue, // unsupported coercion — skip
+                };
+
+                // Mint the cast result, register in function.values.
+                let cast_result = mint_value(
+                    &mut function.values,
+                    phi_ty.clone(),
+                    HirValueKind::Instruction,
+                );
+
+                // Insert Cast in pred block before its terminator.
+                if let Some(pred_block) = function.blocks.get_mut(pred) {
+                    pred_block.instructions.push(HirInstruction::Cast {
+                        op: cast_op,
+                        result: cast_result,
+                        ty: phi_ty.clone(),
+                        operand: *val,
+                    });
+                }
+
+                all_updates[phi_idx][inc_idx] = Some(cast_result);
+            }
+        }
+
+        // Apply updates back into the phi nodes.
+        if let Some(block) = function.blocks.get_mut(&block_id) {
+            for (phi_idx, phi) in block.phis.iter_mut().enumerate() {
+                if phi_idx >= all_updates.len() {
+                    continue;
+                }
+                for (inc_idx, update) in all_updates[phi_idx].iter().enumerate() {
+                    if let Some(new_val) = update {
+                        if inc_idx < phi.incoming.len() {
+                            phi.incoming[inc_idx].0 = *new_val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn types_compatible(a: &HirType, b: &HirType) -> bool {
+    // Treat Void as compatible with i8 (Cranelift translates Void to
+    // i8 anyway), and compatible with itself.
+    match (a, b) {
+        (HirType::Void, HirType::Void) => true,
+        (HirType::Void, HirType::I8) | (HirType::I8, HirType::Void) => true,
+        _ => a == b,
+    }
+}
+
+fn pick_coerce_cast_op(from: &HirType, to: &HirType) -> Option<CastOp> {
+    use HirType::*;
+    let from_bits = int_bits(from)?;
+    let to_bits = int_bits(to)?;
+    if from_bits > to_bits {
+        Some(CastOp::Trunc)
+    } else if from_bits < to_bits {
+        // Default to ZExt for unsigned / Bool / Void widening,
+        // SExt for signed.
+        match from {
+            I8 | I16 | I32 | I64 => Some(CastOp::SExt),
+            _ => Some(CastOp::ZExt),
+        }
+    } else {
+        Some(CastOp::Bitcast)
+    }
+}
+
+fn int_bits(ty: &HirType) -> Option<u32> {
+    use HirType::*;
+    Some(match ty {
+        Bool => 8, // Cranelift represents Bool as i8
+        I8 | U8 => 8,
+        I16 | U16 => 16,
+        I32 | U32 => 32,
+        I64 | U64 => 64,
+        Void => 8, // translated to i8 by translate_type
+        Ptr(_) | Opaque(_) | Function(_) => 64, // 64-bit pointer
+        _ => return None,
+    })
+}
+
 /// After F.2's CFG restructuring (await-call lowering + reshape +
 /// dispatcher), some phi nodes have stale predecessor references.
 /// Specifically: when a loop body contains an await, krio splits at
@@ -418,19 +628,25 @@ pub fn lower_await_calls(
 
         // Now wire ready_block's body. Saving poll_result_id (defined
         // in poll_block which dominates ready_block) is fine SSA.
-        // We finalize ready_block's instructions after poll_block exists
-        // so we can reference poll_result_id.
-        // (Block was created above with empty instructions — set them now.)
-        // We'll insert into function.blocks BEFORE filling ready_block,
-        // since ready_block is created standalone here.
-        // Actually we still own `ready_block` as a local var (haven't
-        // inserted yet), so just push instructions.
+        // We also CLEAR the promise slot to 0 so a re-entry through
+        // the same yield block (e.g. inside a loop) sees null and
+        // creates a fresh inner promise — without this, awaiting in
+        // a loop reuses the completed promise from the previous
+        // iteration and never advances. Mirrors legacy
+        // `build_state_dispatch`'s "clear future_slot" pattern in
+        // async_support.rs:2729-2745.
+        let null_promise_const = mint_const_i64(&mut function.values, 0);
         let mut ready_block = ready_block;
         ready_block.instructions = vec![
             HirInstruction::AsyncSaveSlot {
                 frame,
                 slot: result_slot,
                 value: poll_result_id,
+            },
+            HirInstruction::AsyncSaveSlot {
+                frame,
+                slot: promise_slot,
+                value: null_promise_const,
             },
             HirInstruction::AsyncSaveSlot {
                 frame,
