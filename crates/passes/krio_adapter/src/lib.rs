@@ -582,21 +582,32 @@ impl HirSuspendingFns {
     /// Compute the suspending set by tainting from `is_async` over the
     /// call graph.
     ///
-    /// Algorithm: seed = `{ id | function(id).is_async }`; iterate to
-    /// fixed point — a function becomes suspending if it Calls any
-    /// suspending function (HirCallable::Function variant only;
-    /// Indirect/Intrinsic calls don't taint).
+    /// Seeds:
+    ///   * direct: `signature.is_async` set on the function.
+    ///   * effectful: `signature.effects` is non-empty — the function
+    ///     performs at least one algebraic effect, which we treat as a
+    ///     suspension point (the handler may resume out-of-line).
+    ///   * (M3) any function whose body contains a `PerformEffect` is
+    ///     also seeded — even if the `effects` annotation was lost
+    ///     (defensive) the perform-site still demands captures-lift.
     ///
-    /// `Intrinsic::Await` is the suspension primitive but it isn't a
-    /// `HirCallable::Function`, so it doesn't enter the fixpoint —
-    /// `classify` recognises it directly.
+    /// Then iterate to a fixed point: a function becomes suspending if
+    /// it Calls any suspending function (`HirCallable::Function`
+    /// variant only; Indirect / Intrinsic calls don't taint).
+    ///
+    /// `Intrinsic::Await` and `PerformEffect` are suspension primitives
+    /// but they aren't `HirCallable::Function`, so they don't enter the
+    /// call-graph fixpoint — `classify` recognises them directly.
     pub fn from_module(module: &HirModule) -> Self {
-        let mut suspending: HashSet<HirFnId> = module
-            .functions
-            .values()
-            .filter(|f| f.signature.is_async)
-            .map(|f| f.id)
-            .collect();
+        let mut suspending: HashSet<HirFnId> = HashSet::new();
+        for func in module.functions.values() {
+            if func.signature.is_async
+                || !func.signature.effects.is_empty()
+                || function_performs_any_effect(func)
+            {
+                suspending.insert(func.id);
+            }
+        }
 
         loop {
             let mut changed = false;
@@ -631,6 +642,15 @@ fn function_calls_any(func: &HirFunction, suspending: &HashSet<HirFnId>) -> bool
         }
     }
     false
+}
+
+/// Returns true if `func` contains any `HirInstruction::PerformEffect`.
+fn function_performs_any_effect(func: &HirFunction) -> bool {
+    func.blocks.values().any(|b| {
+        b.instructions
+            .iter()
+            .any(|i| matches!(i, HirInstruction::PerformEffect { .. }))
+    })
 }
 
 impl SuspendingFns for HirSuspendingFns {
@@ -695,7 +715,20 @@ impl<'a> AsyncHooks for HirAsyncHooks<'a> {
             return Some(SuspensionSite::DirectYield { value: None });
         }
 
-        // Pattern 2 (future work): direct cross-fn call to an async
+        // Pattern 2 (M3, Phase H): `PerformEffect { effect_id, op_name, .. }`
+        // — a call to an algebraic effect operation. From krio's
+        // perspective this is structurally identical to await: control
+        // transfers to the active handler, which may resume out-of-line
+        // (resumable handler) or abort (exception-like). Either way,
+        // values live across this site need to be saved into the state
+        // machine's frame slots. Captures-lift is driven by the
+        // `LivenessMap` populated below in `HirLiveness::build`, so
+        // returning `DirectYield` here suffices to register the site.
+        if let HirInstruction::PerformEffect { .. } = inst {
+            return Some(SuspensionSite::DirectYield { value: None });
+        }
+
+        // Pattern 3 (future work): direct cross-fn call to an async
         // function without going through Intrinsic::Await. Today's
         // ZynML lowering always interposes Intrinsic::Await, so this
         // never fires; reserve the shape for an optimised path later.
@@ -742,7 +775,9 @@ fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
         I::Call { result, .. }
         | I::IndirectCall { result, .. }
         | I::CallClosure { result, .. }
-        | I::TraitMethodCall { result, .. } => *result,
+        | I::TraitMethodCall { result, .. }
+        | I::PerformEffect { result, .. }
+        | I::HandleEffect { result, .. } => *result,
 
         _ => None,
     }
@@ -808,6 +843,11 @@ fn instruction_uses(inst: &HirInstruction) -> smallvec::SmallVec<[HirId; 4]> {
             uses.push(*value);
         }
         I::AsyncLoadSlot { frame, .. } => uses.push(*frame),
+        I::PerformEffect { args, .. } => {
+            for a in args {
+                uses.push(*a);
+            }
+        }
         _ => {}
     }
     uses
@@ -907,19 +947,23 @@ impl HirLiveness {
                 Some(b) => b,
                 None => continue,
             };
-            // Find every Intrinsic::Await suspension index in this block.
+            // Find every suspension index in this block. Two flavors:
+            //   * `Intrinsic::Await` — the `await foo(x)` lowering
+            //   * `PerformEffect` — a call to an algebraic effect op
+            //     (M3, Phase H — handler may resume out-of-line)
             let suspension_indices: Vec<usize> = block
                 .instructions
                 .iter()
                 .enumerate()
                 .filter_map(|(i, inst)| {
-                    if matches!(
+                    let is_suspension = matches!(
                         inst,
                         HirInstruction::Call {
                             callee: HirCallable::Intrinsic(Intrinsic::Await),
                             ..
                         }
-                    ) {
+                    ) || matches!(inst, HirInstruction::PerformEffect { .. });
+                    if is_suspension {
                         Some(i)
                     } else {
                         None
@@ -1519,6 +1563,166 @@ mod tests {
             suspending: &suspending,
         };
         assert!(hooks.classify(&cfg, HirBlockId(0), 0).is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // M3: PerformEffect-as-suspension-site tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_returns_direct_yield_for_perform_effect() {
+        // M3: a PerformEffect instruction is a suspension site, just
+        // like Intrinsic::Await. Captures-lift needs to fire for live
+        // values across the perform-site so resumable handlers see a
+        // valid frame on resume.
+        let mut f = empty_function("test");
+        let entry = f.entry_block;
+        let entry_block = f.blocks.get_mut(&entry).unwrap();
+        entry_block.instructions.push(HirInstruction::PerformEffect {
+            result: None,
+            effect_id: HirId::new(),
+            op_name: InternedString::new_global("op"),
+            args: vec![],
+            return_ty: HirType::Void,
+        });
+
+        let cfg = HirCoroCfg::new(&mut f);
+        let suspending = HirSuspendingFns {
+            suspending: HashSet::new(),
+        };
+        let hooks = HirAsyncHooks {
+            suspending: &suspending,
+        };
+        let site = hooks.classify(&cfg, HirBlockId(0), 0);
+        assert!(
+            matches!(site, Some(SuspensionSite::DirectYield { .. })),
+            "PerformEffect should classify as DirectYield"
+        );
+    }
+
+    #[test]
+    fn suspending_fns_seeds_effect_annotated_function() {
+        // M3: a function with a non-empty `signature.effects` list (set
+        // by M1.1's annotation extraction → HIR lowering) is a
+        // suspending function in its own right — even with no body
+        // calls. The handler may suspend the computation.
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        let sig_effectful = HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![InternedString::new_global("Log")],
+            is_pure: false,
+        };
+        let f = HirFunction::new(InternedString::new_global("perform_log"), sig_effectful);
+        let f_id = f.id;
+        module.functions.insert(f_id, f);
+
+        let s = HirSuspendingFns::from_module(&module);
+        assert!(
+            s.is_suspending(f_id),
+            "function with effects = [Log] should be seeded suspending"
+        );
+    }
+
+    #[test]
+    fn suspending_fns_seeds_function_with_perform_effect_inst() {
+        // M3 defensive seed: even if the `effects` annotation is empty
+        // (lost or stripped), the presence of a `PerformEffect` in the
+        // body should make the function suspending — the perform-site
+        // demands captures-lift regardless.
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        let sig_plain = HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut f = HirFunction::new(InternedString::new_global("performs"), sig_plain);
+        // Plant a PerformEffect on the entry block.
+        let entry_id = f.entry_block;
+        let entry = f.blocks.get_mut(&entry_id).unwrap();
+        entry.instructions.push(HirInstruction::PerformEffect {
+            result: None,
+            effect_id: HirId::new(),
+            op_name: InternedString::new_global("op"),
+            args: vec![],
+            return_ty: HirType::Void,
+        });
+        let f_id = f.id;
+        module.functions.insert(f_id, f);
+
+        let s = HirSuspendingFns::from_module(&module);
+        assert!(
+            s.is_suspending(f_id),
+            "function containing PerformEffect should be seeded suspending"
+        );
+    }
+
+    #[test]
+    fn liveness_map_records_perform_effect_site() {
+        // M3: HirLiveness::build must enumerate PerformEffect alongside
+        // Intrinsic::Await. Live SSA values across a perform-site get
+        // mapped to LocalIds and recorded in the LivenessMap.
+        let mut f = empty_function("test");
+        let entry = f.entry_block;
+        let live = HirId::new();
+        f.values.insert(
+            live,
+            HirValue {
+                id: live,
+                ty: HirType::I32,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        f.signature.params.push(zyntax_compiler::hir::HirParam {
+            id: live,
+            name: InternedString::new_global("live"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        });
+        let entry_block = f.blocks.get_mut(&entry).unwrap();
+        entry_block.instructions.push(HirInstruction::PerformEffect {
+            result: None,
+            effect_id: HirId::new(),
+            op_name: InternedString::new_global("get"),
+            args: vec![],
+            return_ty: HirType::I32,
+        });
+
+        // live_out makes `live` cross the perform-site.
+        let mut live_out = HashMap::new();
+        let mut set = HashSet::new();
+        set.insert(live);
+        live_out.insert(entry, set);
+
+        let mut cfg = HirCoroCfg::new(&mut f);
+        let liveness = HirLiveness::build(&mut cfg, &live_out);
+
+        assert_eq!(
+            liveness.map.at_site.len(),
+            1,
+            "one PerformEffect site recorded"
+        );
+        assert_eq!(liveness.map.at_site[0].0, (HirBlockId(0), 0));
+        assert_eq!(
+            liveness.map.at_site[0].1.len(),
+            1,
+            "the live `live` param is captured"
+        );
+        let saved_local = liveness.map.at_site[0].1[0];
+        assert_eq!(liveness.local_to_hir[&saved_local], live);
     }
 
     #[test]
