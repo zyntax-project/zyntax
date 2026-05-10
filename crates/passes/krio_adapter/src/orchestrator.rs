@@ -137,15 +137,32 @@ pub fn lower_async_function(
     let liveness = HirLiveness::build(&mut cfg, live_out_per_block);
     let hooks = HirAsyncHooks { suspending };
 
-    let layout = krio_async::transform_to_state_machine(
-        &mut cfg, fn_id, suspending, &hooks, &liveness.map,
+    // Slot layout (using krio's TransformOptions::reserved_slots so
+    // krio's captures-lift allocator skips our reserved range):
+    //   0                : state-id (read by dispatcher's Switch)
+    //   1..=N            : param slots (N = num params)
+    //   N+1..captures_max: krio's captures-lift (one per live SSA value)
+    //   captures_max+1.. : per-await promise+result slots (added by lower_await_calls)
+    let state_slot: u32 = 0;
+    let param_slots: Vec<(HirId, u32)> = param_hir_ids
+        .iter()
+        .enumerate()
+        .map(|(i, hir)| (*hir, 1 + i as u32))
+        .collect();
+    let reserved_slots: u32 = 1 + param_slots.len() as u32;
+
+    let layout = krio_async::transform_to_state_machine_with_options(
+        &mut cfg,
+        fn_id,
+        suspending,
+        &hooks,
+        &liveness.map,
+        krio_async::TransformOptions { reserved_slots },
     )
     .map_err(|_| LowerError::Transform)?;
 
-    // Compute the highest slot index krio's captures-lift used. krio's
-    // allocator (krio-async/src/lib.rs:538) starts at 0 and increments
-    // per unique LocalId. We allocate state_slot + param_slots STRICTLY
-    // ABOVE this max so they can't collide.
+    // Compute the highest slot index krio's captures-lift used (it
+    // started at `reserved_slots`). per-await slots start above this.
     let max_capture_slot: i64 = layout
         .yield_saves
         .iter()
@@ -157,14 +174,20 @@ pub fn lower_async_function(
                 .flat_map(|(_, entries)| entries.iter().map(|(slot, _)| *slot as i64)),
         )
         .max()
-        .unwrap_or(-1);
-    let state_slot: u32 = (max_capture_slot + 1) as u32;
-    let param_slots: Vec<(HirId, u32)> = param_hir_ids
-        .iter()
-        .enumerate()
-        .map(|(i, hir)| (*hir, state_slot + 1 + i as u32))
-        .collect();
-    let after_params_slot: u32 = state_slot + 1 + param_slots.len() as u32;
+        .unwrap_or(reserved_slots as i64 - 1);
+    let after_captures_slot: u32 = (max_capture_slot + 1) as u32;
+    let after_params_slot: u32 = after_captures_slot;
+
+    // Debug-only validation of krio's layout. Catches regressions in
+    // krio's transform OR in our liveness computation (e.g. a slot
+    // saved at a yield with no matching load = host's liveness over-
+    // reports). Compiled out in release.
+    #[cfg(debug_assertions)]
+    {
+        if let Err(e) = krio_async::validate_layout(&layout, after_captures_slot) {
+            log::warn!("[krio-adapter] StateMachineLayout validation: {}", e);
+        }
+    }
 
     let rewrites = emit::emit_save_load(&mut cfg, &layout, &liveness, frame_ptr);
     emit::emit_dispatcher(&mut cfg, &layout, frame_ptr, state_slot);
