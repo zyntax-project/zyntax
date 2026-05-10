@@ -912,17 +912,32 @@ fn apply_krio_async_lowering(
                 &lower_result.param_slots,
             );
 
+            // CRITICAL: swap HirIds so the entry function INHERITS the
+            // original async function's id, and the poll function gets
+            // a fresh id. This preserves any Call(callee: Function(id),
+            // args) sites in OTHER functions that referenced the
+            // original async by id — those should now call the entry
+            // (Promise-returning) function, not the renamed $poll
+            // function. Without this swap, `compute` calling
+            // `await double(x)` ends up calling `double$poll(x)`
+            // directly, which has the wrong signature → SEGV.
+            let new_poll_id = HirId::new();
+            function.id = new_poll_id;
+
             // Phase 3: generate the Promise-returning entry. Uses the
             // ORIGINAL signature (snapshot above) so the runtime's
-            // user-facing API is unchanged.
-            let entry_fn = krio_adapter::abi_emit::generate_promise_entry(
+            // user-facing API is unchanged. Critically, set entry.id
+            // to the ORIGINAL fn_id so callers using the original
+            // HirId reach the entry.
+            let mut entry_fn = krio_adapter::abi_emit::generate_promise_entry(
                 original_name,
                 &original_signature,
-                /* poll_fn_id = */ function.id,
+                /* poll_fn_id = */ new_poll_id,
                 lower_result.num_slots,
                 &lower_result.param_slots,
                 lower_result.state_slot,
             );
+            entry_fn.id = fn_id;
 
             log::debug!(
                 "[krio-async] {}: state_slot={} num_slots={} param_slots={} captures={}",

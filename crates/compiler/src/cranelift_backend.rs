@@ -2841,8 +2841,18 @@ impl CraneliftBackend {
                                 .filter_map(|arg_id| self.value_map.get(arg_id).copied())
                                 .collect();
 
-                            // Create signature for the indirect call
+                            // Create signature for the indirect call.
+                            // IMPORTANT: must use CallConv::Fast to match
+                            // how regular functions are declared via
+                            // `translate_signature` (which maps HIR's
+                            // default `CallingConvention::Fast` →
+                            // `CallConv::Fast`). `make_signature()` returns
+                            // the module-default convention which on some
+                            // platforms (e.g. AppleAarch64, SystemV) is
+                            // different — the mismatch corrupts arg/return
+                            // register layout and segfaults on the call.
                             let mut sig = self.module.make_signature();
+                            sig.call_conv = CallConv::Fast;
 
                             // Add parameters
                             for _ in &arg_values {
