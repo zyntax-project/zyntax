@@ -140,9 +140,17 @@ fn analysis_runner_output_drives_krio_captures_lift() {
         .flat_map(|b| b.instructions.iter())
         .filter(|i| matches!(i, HirInstruction::AsyncLoadSlot { .. }))
         .count();
-    assert_eq!(save_count, 1, "exactly 1 AsyncSaveSlot in HIR");
-    // 2 = one for the captures-lift slot + one for the dispatcher's state-id load
-    assert_eq!(load_count, 2, "AsyncLoadSlot: 1 captures + 1 dispatcher state");
+    // After F.2, await lowering replaces `Intrinsic::Await` with the
+    // poll-the-inner-promise state machine, adding 3 more saves
+    // (promise persistence, ready-result, ready-state-bump) on top
+    // of the 1 captures-lift save = 4 total.
+    assert_eq!(save_count, 4, "1 captures-lift + 3 await-lowering saves");
+    // After F.2, loads are: 1 captures-lift + 1 dispatcher state +
+    // 1 await-result load (in resume block) = 3 total.
+    assert_eq!(
+        load_count, 3,
+        "AsyncLoadSlot: 1 captures + 1 dispatcher state + 1 await result"
+    );
 }
 
 /// Smoke-check: AnalysisRunner runs cleanly on the canonical fixture

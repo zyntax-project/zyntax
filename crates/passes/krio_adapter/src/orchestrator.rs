@@ -164,10 +164,23 @@ pub fn lower_async_function(
         .enumerate()
         .map(|(i, hir)| (*hir, state_slot + 1 + i as u32))
         .collect();
-    let num_slots: u32 = state_slot + 1 + param_slots.len() as u32;
+    let after_params_slot: u32 = state_slot + 1 + param_slots.len() as u32;
 
     let rewrites = emit::emit_save_load(&mut cfg, &layout, &liveness, frame_ptr);
     emit::emit_dispatcher(&mut cfg, &layout, frame_ptr, state_slot);
+
+    // Phase F.2: replace `Intrinsic::Await` calls with the
+    // poll-the-inner-promise state machine. Allocates two slots per
+    // await (promise + result) starting after param_slots.
+    let cfg_function = cfg.function_mut();
+    let after_awaits_slot = crate::abi_emit::lower_await_calls(
+        cfg_function,
+        &layout,
+        frame_ptr,
+        state_slot,
+        after_params_slot,
+    );
+    let num_slots: u32 = after_awaits_slot;
 
     Ok(LowerResult {
         layout,

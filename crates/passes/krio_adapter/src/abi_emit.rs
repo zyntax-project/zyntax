@@ -33,6 +33,301 @@ use zyntax_typed_ast::InternedString;
 
 use crate::{HirBlockId, HirFnId, HirLocalId};
 
+/// Per-await slot pair allocated by [`lower_await_calls`].
+#[derive(Debug, Clone, Copy)]
+pub struct AwaitSlots {
+    /// Slot holding the inner Promise pointer (for cross-poll persistence).
+    pub promise_slot: u32,
+    /// Slot holding the i64-encoded ready value.
+    pub result_slot: u32,
+}
+
+/// Replace each `Intrinsic::Await` call site with the runtime's
+/// poll-the-inner-promise state machine. After this pass:
+///
+///   * The yield block's body has the original Promise-producing
+///     instructions, then the poll prologue (load promise.poll_fn,
+///     IndirectCall it with promise.state_machine, branch on result).
+///   * Two new blocks per await: `pending` (returns 0) and `ready`
+///     (saves result + bumps state to next, returns 0).
+///   * The corresponding resume block gains an `AsyncLoadSlot` at the
+///     top so the original `r = await foo()` binding still resolves.
+///
+/// `state_slot` is the slot the dispatcher reads/writes for the
+/// current state-id. `frame` is the current SSA value used in
+/// AsyncSaveSlot/AsyncLoadSlot ops; `reshape_to_poll_abi` will
+/// rewrite all such ops later to point at the new state_machine
+/// param, so any HirId here is fine as long as it's the same one
+/// krio used.
+///
+/// `start_slot` is the first free slot after captures+state+params;
+/// each await consumes 2 slots. Returns the next free slot
+/// (= start_slot + 2 * num_awaits).
+pub fn lower_await_calls(
+    function: &mut HirFunction,
+    layout: &StateMachineLayout<HirBlockId, HirLocalId, HirFnId>,
+    frame: HirId,
+    state_slot: u32,
+    start_slot: u32,
+) -> u32 {
+    let mut next_slot = start_slot;
+
+    // Snapshot the block-iteration order from the time krio ran.
+    // krio's HirBlockId values index this list. We need the snapshot
+    // because we'll be mutating `function.blocks` (adding pending +
+    // ready blocks per await) and don't want our seq → HirId mapping
+    // to shift mid-loop.
+    let block_seq_to_hir: Vec<HirId> = function.blocks.keys().copied().collect();
+
+    let resolve_seq = |bb: HirBlockId| -> Option<HirId> {
+        block_seq_to_hir.get(bb.0 as usize).copied()
+    };
+
+    // Iterate yield blocks. `layout.yield_blocks[i] = (block_id, next_state)`.
+    // The corresponding resume entry is `layout.resume_entries[next_state]`.
+    let yield_blocks_snapshot: Vec<(HirBlockId, u32)> = layout.yield_blocks.clone();
+    for (yield_seq, next_state) in yield_blocks_snapshot {
+        let yield_hir = match resolve_seq(yield_seq) {
+            Some(h) => h,
+            None => continue,
+        };
+        let resume_seq = match layout.resume_entries.get(next_state as usize) {
+            Some(r) => *r,
+            None => continue,
+        };
+        let resume_hir = match resolve_seq(resume_seq) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Find the Call(Intrinsic::Await) instruction in the yield block.
+        let yield_block = function.blocks.get(&yield_hir).expect("yield block exists");
+        let mut await_idx: Option<usize> = None;
+        let mut await_promise: Option<HirId> = None;
+        let mut await_result: Option<HirId> = None;
+        for (i, inst) in yield_block.instructions.iter().enumerate() {
+            if let HirInstruction::Call {
+                callee: HirCallable::Intrinsic(Intrinsic::Await),
+                args,
+                result,
+                ..
+            } = inst
+            {
+                await_idx = Some(i);
+                await_promise = args.first().copied();
+                await_result = *result;
+                break;
+            }
+        }
+        let (await_idx, promise_ptr, result_id) = match (await_idx, await_promise, await_result) {
+            (Some(i), Some(p), Some(r)) => (i, p, r),
+            // No actual await call: krio still considered this a
+            // suspension site (e.g. a yield expression). Skip — the
+            // simple captures-lift transform from F.1 handles it.
+            _ => continue,
+        };
+        let result_ty = function
+            .values
+            .get(&result_id)
+            .map(|v| v.ty.clone())
+            .unwrap_or(HirType::I64);
+
+        // Allocate two slots for this await.
+        let promise_slot = next_slot;
+        next_slot += 1;
+        let result_slot = next_slot;
+        next_slot += 1;
+
+        // Build the new instructions to splice into the yield block:
+        //   1. Save the promise pointer to its slot (so it persists if
+        //      we suspend before getting Ready — also a no-op store
+        //      that's harmless if we never re-enter this state).
+        //   2. Load promise.state_machine_ptr (offset 0 of Promise).
+        //   3. GEP/Load promise.poll_fn (offset 8 of Promise).
+        //   4. IndirectCall poll_fn(state_machine_ptr) -> i64.
+        //   5. Eq-check against 0 to decide Pending vs Ready.
+        let save_promise = HirInstruction::AsyncSaveSlot {
+            frame,
+            slot: promise_slot,
+            value: promise_ptr,
+        };
+
+        // Load nested state_machine_ptr from promise[0].
+        let nested_sm_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let load_nested_sm = HirInstruction::Load {
+            result: nested_sm_id,
+            ty: HirType::Ptr(Box::new(HirType::U8)),
+            ptr: promise_ptr,
+            align: 8,
+            volatile: false,
+        };
+
+        // Compute promise + 8 to get poll_fn slot address.
+        let const_8 = mint_const_i64(&mut function.values, 8);
+        let poll_fn_slot_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let poll_fn_slot_gep = HirInstruction::Binary {
+            result: poll_fn_slot_id,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: promise_ptr,
+            right: const_8,
+        };
+
+        // Load poll_fn pointer.
+        let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
+            params: vec![HirType::Ptr(Box::new(HirType::U8))],
+            returns: vec![HirType::I64],
+            lifetime_params: vec![],
+            is_variadic: false,
+        }));
+        let poll_fn_ptr_id =
+            mint_value(&mut function.values, poll_fn_ty.clone(), HirValueKind::Instruction);
+        let load_poll_fn = HirInstruction::Load {
+            result: poll_fn_ptr_id,
+            ty: poll_fn_ty,
+            ptr: poll_fn_slot_id,
+            align: 8,
+            volatile: false,
+        };
+
+        // IndirectCall poll_fn(state_machine_ptr).
+        let poll_result_id = mint_value(&mut function.values, HirType::I64, HirValueKind::Instruction);
+        let indirect_poll = HirInstruction::IndirectCall {
+            result: Some(poll_result_id),
+            func_ptr: poll_fn_ptr_id,
+            args: vec![nested_sm_id],
+            return_ty: HirType::I64,
+        };
+
+        // Compare poll_result == 0 to decide Pending vs Ready.
+        let zero_const = mint_const_i64(&mut function.values, 0);
+        let is_pending_id = mint_value(&mut function.values, HirType::Bool, HirValueKind::Instruction);
+        let is_pending_eq = HirInstruction::Binary {
+            result: is_pending_id,
+            op: BinaryOp::Eq,
+            ty: HirType::I64,
+            left: poll_result_id,
+            right: zero_const,
+        };
+
+        // Pending block: just return 0 (state stays unchanged so the
+        // next poll re-enters this yield block and re-polls).
+        let pending_zero = mint_const_i64(&mut function.values, 0);
+        let pending_block_id = HirId::new();
+        let pending_block = HirBlock {
+            id: pending_block_id,
+            label: Some(InternedString::new_global("await_pending")),
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Return {
+                values: vec![pending_zero],
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+
+        // Ready block: save the i64 result + bump state to next_state, return 0.
+        let next_state_const = mint_const_i64(&mut function.values, next_state as i64);
+        let ready_zero = mint_const_i64(&mut function.values, 0);
+        let ready_block_id = HirId::new();
+        let ready_block = HirBlock {
+            id: ready_block_id,
+            label: Some(InternedString::new_global("await_ready")),
+            phis: vec![],
+            instructions: vec![
+                HirInstruction::AsyncSaveSlot {
+                    frame,
+                    slot: result_slot,
+                    value: poll_result_id,
+                },
+                HirInstruction::AsyncSaveSlot {
+                    frame,
+                    slot: state_slot,
+                    value: next_state_const,
+                },
+            ],
+            terminator: HirTerminator::Return {
+                values: vec![ready_zero],
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+
+        // Splice all the new instructions into the yield block. The
+        // surrounding instructions break down as:
+        //   * [0..await_idx]  : pre-await code (e.g. the call producing
+        //     the promise). Keep as-is.
+        //   * await_idx       : the Call(Intrinsic::Await). Remove.
+        //   * [await_idx+1..] : post-await code in the SAME block. This
+        //     is typically the AsyncSaveSlot ops that `emit_save_load`
+        //     appended for the captures-lift. They must run before we
+        //     suspend (so the saved values are visible on resume), so
+        //     we keep them and place them BEFORE the poll prologue.
+        let yield_block = function
+            .blocks
+            .get_mut(&yield_hir)
+            .expect("yield block exists");
+        let kept_pre: Vec<HirInstruction> =
+            yield_block.instructions[..await_idx].to_vec();
+        let kept_post: Vec<HirInstruction> = yield_block
+            .instructions
+            .iter()
+            .skip(await_idx + 1)
+            .cloned()
+            .collect();
+        let mut new_insts = kept_pre;
+        new_insts.extend(kept_post); // captures-lift saves go here
+        new_insts.extend(vec![
+            save_promise,
+            load_nested_sm,
+            poll_fn_slot_gep,
+            load_poll_fn,
+            indirect_poll,
+            is_pending_eq,
+        ]);
+        yield_block.instructions = new_insts;
+        yield_block.terminator = HirTerminator::CondBranch {
+            condition: is_pending_id,
+            true_target: pending_block_id,
+            false_target: ready_block_id,
+        };
+
+        // Insert the new pending + ready blocks into the function.
+        function.blocks.insert(pending_block_id, pending_block);
+        function.blocks.insert(ready_block_id, ready_block);
+
+        // At the resume block, prepend an AsyncLoadSlot that defines
+        // `result_id` (the original `r` HirId from the await call).
+        // The original Call(Intrinsic::Await) defining r is gone now,
+        // so r is no longer multiply-defined.
+        let load_result_inst = HirInstruction::AsyncLoadSlot {
+            result: result_id,
+            ty: result_ty,
+            frame,
+            slot: result_slot,
+        };
+        let resume_block = function
+            .blocks
+            .get_mut(&resume_hir)
+            .expect("resume block exists");
+        let mut new_insts = vec![load_result_inst];
+        new_insts.extend(resume_block.instructions.drain(..));
+        resume_block.instructions = new_insts;
+    }
+
+    next_slot
+}
+
 /// Reshape a krio-transformed function into the runtime poll ABI.
 ///
 /// Pre: `function` was mutated by `lower_async_function` — it has the

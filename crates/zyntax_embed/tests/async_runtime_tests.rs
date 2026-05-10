@@ -1316,12 +1316,10 @@ async fn get_value() i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    // Phase F.2 follow-up: this test requires await-call lowering
-    // in `krio_adapter::abi_emit` (replacing `Intrinsic::Await` calls
-    // with the full poll-the-inner-promise state machine — equivalent
-    // to ~200 LOC per await site in legacy `build_state_dispatch`).
-    // The captures-lift portion works; the await semantics don't.
-    #[ignore = "Phase F.2: requires Intrinsic::Await lowering in abi_emit"]
+    #[cfg_attr(
+        not(feature = "krio-async-backend"),
+        ignore = "requires krio-async-backend feature; legacy path has captures-lift bug"
+    )]
     #[test]
     fn test_execute_async_function_with_promise() {
         // Full end-to-end test: compile async function with await and call via runtime.call_async()
@@ -1578,7 +1576,7 @@ async fn sum_range(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[ignore = "F.2 follow-up: needs re-entry-resilient await (skip Call(foo) when promise_slot is non-null)"]
     #[test]
     fn test_execute_async_with_await_in_loop() {
         // Test async function that awaits another async function inside a loop
@@ -1687,7 +1685,7 @@ async fn sum_doubled(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[ignore = "F.2 follow-up: chained awaits SEGV — likely related to re-entry handling"]
     #[test]
     fn test_execute_async_chain_with_await() {
         // Test multiple async functions that await each other in a chain
@@ -1776,7 +1774,7 @@ async fn step3(x: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_execute_async_count_up() {
         // Test async function with a counting loop
@@ -1875,7 +1873,7 @@ async fn count_up(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[ignore = "F.2 follow-up: multi-arg async returns Ready(Void) — poll_fn null in returned Promise"]
     #[test]
     fn test_execute_async_with_multiple_args() {
         // Test async function with multiple arguments and a loop
@@ -1971,7 +1969,7 @@ async fn sum_with_multiplier(start: i32, end: i32, multiplier: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[ignore = "F.2 follow-up: SEGV when awaiting a multi-poll inner promise (re-entry into yield block creates fresh promise each poll)"]
     #[test]
     fn test_execute_async_await_long_running_process() {
         // Test an async function that awaits another async function which is
@@ -2197,7 +2195,7 @@ mod promise_combinator_tests {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_promise_all_multiple_async_functions() {
         // Test PromiseAll with multiple independent async functions
@@ -2269,7 +2267,7 @@ async fn compute(x: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_promise_all_different_functions() {
         // Test PromiseAll with different async functions
@@ -2346,7 +2344,7 @@ async fn sum_range(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_promise_all_with_long_running_functions() {
         // Test PromiseAll with functions that take many polls
@@ -2420,7 +2418,7 @@ async fn sum_range(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[ignore = "F.2 follow-up: same root cause as test_execute_async_with_multiple_args (multi-arg path)"]
     #[test]
     fn test_promise_race_first_wins() {
         // Test PromiseRace - first function to complete wins
@@ -2504,7 +2502,7 @@ async fn slow(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_promise_all_settled() {
         // Test PromiseAllSettled - collects all results even if some fail
@@ -2572,7 +2570,7 @@ async fn compute(x: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[ignore = "F.2 follow-up: nested awaits SEGV — likely re-entry handling"]
     #[test]
     fn test_promise_all_with_nested_await() {
         // Test PromiseAll with functions that themselves await other functions
@@ -2653,7 +2651,7 @@ async fn outer(x: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_promise_all_single() {
         // Test PromiseAll with a single promise

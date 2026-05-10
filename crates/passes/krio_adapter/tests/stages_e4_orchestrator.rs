@@ -76,7 +76,14 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
         .iter()
         .filter(|i| matches!(i, HirInstruction::AsyncSaveSlot { .. }))
         .count();
-    assert_eq!(save_count, 1, "exactly one save for the live_across value");
+    // After F.2, the yield block has 2 saves: the captures-lift save
+    // (live_across) plus the await-lowering's promise-persistence save.
+    // The ready-block (separate block) has 2 more saves (result +
+    // state). Total across the function is 4.
+    assert_eq!(
+        save_count, 2,
+        "yield block: 1 captures-lift + 1 await-lowering promise save"
+    );
 
     // ── Load in the resume entry, downstream uses rewritten ──
     let resume_id = result.layout.resume_entries[1];
@@ -107,10 +114,10 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
     }
     assert!(found_rewritten_use, "rewritten use should appear somewhere");
 
-    // The Intrinsic::Await call is still in the IR — krio doesn't
-    // erase it; the runtime's poll dispatch is responsible for the
-    // actual suspend/resume. (await_result is defined locally on the
-    // resume side.)
+    // Phase F.2: `Intrinsic::Await` is now REPLACED by the
+    // poll-the-inner-promise state machine emitted by `abi_emit::
+    // lower_await_calls`. Verify it's been erased — finding one would
+    // be a regression in the await lowering.
     let mut found_await = false;
     for block in function.blocks.values() {
         for inst in &block.instructions {
@@ -125,7 +132,10 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
             }
         }
     }
-    assert!(found_await, "Intrinsic::Await still present after lowering");
+    assert!(
+        !found_await,
+        "Intrinsic::Await should have been replaced by lower_await_calls"
+    );
 
     let _ = await_result;
 }
