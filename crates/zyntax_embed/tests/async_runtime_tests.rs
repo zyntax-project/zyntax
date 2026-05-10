@@ -1316,7 +1316,12 @@ async fn get_value() i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "async captures-lift bug — see comment"]
+    // Phase F.2 follow-up: this test requires await-call lowering
+    // in `krio_adapter::abi_emit` (replacing `Intrinsic::Await` calls
+    // with the full poll-the-inner-promise state machine — equivalent
+    // to ~200 LOC per await site in legacy `build_state_dispatch`).
+    // The captures-lift portion works; the await semantics don't.
+    #[ignore = "Phase F.2: requires Intrinsic::Await lowering in abi_emit"]
     #[test]
     fn test_execute_async_function_with_promise() {
         // Full end-to-end test: compile async function with await and call via runtime.call_async()
