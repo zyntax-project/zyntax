@@ -1576,7 +1576,7 @@ async fn sum_range(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: compile-time 'Binary op operand not in value_map' — likely missing rewrite for await-in-loop pattern"]
+    #[ignore = "F.2 follow-up: phi-repair fixes pred count, but values flowing into phi blocks have type mismatches (i64 vs i32). SSA type propagation through await result feeds wrong types into downstream Binary ops; needs Cast insertion at phi boundaries."]
     #[test]
     fn test_execute_async_with_await_in_loop() {
         // Test async function that awaits another async function inside a loop
@@ -1685,7 +1685,7 @@ async fn sum_doubled(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: 3-level await chain hits re-entry — yield_block re-creates inner promise each poll, making no forward progress"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_execute_async_chain_with_await() {
         // Test multiple async functions that await each other in a chain

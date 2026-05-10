@@ -76,14 +76,20 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
         .iter()
         .filter(|i| matches!(i, HirInstruction::AsyncSaveSlot { .. }))
         .count();
-    // After F.2, the yield block has 2 saves: the captures-lift save
-    // (live_across) plus the await-lowering's promise-persistence save.
-    // The ready-block (separate block) has 2 more saves (result +
-    // state). Total across the function is 4.
-    assert_eq!(
-        save_count, 2,
-        "yield block: 1 captures-lift + 1 await-lowering promise save"
-    );
+    // After F.2 with re-entry handling, the yield block is a thin
+    // re-entry check (LoadSlot + Eq + CondBranch). All saves moved
+    // to first_call_block (captures-lift + promise persist) and
+    // ready_block (result + state). Yield block itself has 0 saves.
+    assert_eq!(save_count, 0, "yield block now contains only the re-entry check");
+    // Total saves across the function should be 4: captures-lift +
+    // promise (in first_call_block), result + state (in ready_block).
+    let total_saves = function
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter(|i| matches!(i, HirInstruction::AsyncSaveSlot { .. }))
+        .count();
+    assert_eq!(total_saves, 4, "total saves: 1 captures + 1 promise + 1 result + 1 state");
 
     // ── Load in the resume entry, downstream uses rewritten ──
     let resume_id = result.layout.resume_entries[1];

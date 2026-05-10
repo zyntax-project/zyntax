@@ -63,6 +63,108 @@ pub struct AwaitSlots {
 /// `start_slot` is the first free slot after captures+state+params;
 /// each await consumes 2 slots. Returns the next free slot
 /// (= start_slot + 2 * num_awaits).
+/// After F.2's CFG restructuring (await-call lowering + reshape +
+/// dispatcher), some phi nodes have stale predecessor references.
+/// Specifically: when a loop body contains an await, krio splits at
+/// the suspension and the post-suspension code lives in a new resume
+/// block that branches back to the loop header. The loop header's
+/// phi nodes still reference the OLD predecessor (the original loop
+/// body block), but that block no longer branches to the loop header
+/// (it now CondBranches to await_pending/ready).
+///
+/// This repair pass:
+/// 1. Computes actual predecessors per block from the current CFG.
+/// 2. For each phi, identifies entries whose predecessor no longer
+///    targets this block, and swaps them positionally with new
+///    predecessors that aren't in the phi yet.
+///
+/// Without this, Cranelift IR verification fails:
+///   "jump block4: got 0, expected 3"
+/// (because the new predecessor's Branch terminator doesn't supply
+/// phi args matching the block's parameter count).
+pub fn repair_phi_predecessors(function: &mut HirFunction) {
+    use HirTerminator as T;
+    fn successors(t: &T) -> Vec<HirId> {
+        match t {
+            T::Return { .. } | T::Unreachable => vec![],
+            T::Branch { target } => vec![*target],
+            T::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => vec![*true_target, *false_target],
+            T::Switch { default, cases, .. } => {
+                let mut s = vec![*default];
+                s.extend(cases.iter().map(|(_, t)| *t));
+                s
+            }
+            T::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+            T::PatternMatch {
+                patterns, default, ..
+            } => {
+                let mut s: Vec<HirId> = patterns.iter().map(|p| p.target).collect();
+                if let Some(d) = default {
+                    s.push(*d);
+                }
+                s
+            }
+        }
+    }
+
+    // Build actual predecessor map.
+    let mut actual_preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (id, block) in &function.blocks {
+        for succ in successors(&block.terminator) {
+            actual_preds.entry(succ).or_default().push(*id);
+        }
+    }
+
+    let block_ids: Vec<HirId> = function.blocks.keys().copied().collect();
+    for block_id in block_ids {
+        let actual = actual_preds.get(&block_id).cloned().unwrap_or_default();
+        let actual_set: HashSet<HirId> = actual.iter().copied().collect();
+        let block = match function.blocks.get_mut(&block_id) {
+            Some(b) => b,
+            None => continue,
+        };
+        if block.phis.is_empty() {
+            continue;
+        }
+        // Determine stale vs missing preds for THIS block (uniform
+        // across all its phis — they all share the same predecessor
+        // list).
+        let phi_preds: HashSet<HirId> =
+            block.phis[0].incoming.iter().map(|(_, p)| *p).collect();
+        let stale: Vec<HirId> = phi_preds
+            .iter()
+            .copied()
+            .filter(|p| !actual_set.contains(p))
+            .collect();
+        let new: Vec<HirId> = actual.iter().copied().filter(|p| !phi_preds.contains(p)).collect();
+        if stale.len() != new.len() {
+            // Heuristic gives up — log and continue. This means the
+            // CFG transform did something more complex than 1:1
+            // pred replacement.
+            log::debug!(
+                "[phi-repair] block {:?}: {} stale preds vs {} new preds — skipping",
+                block_id,
+                stale.len(),
+                new.len()
+            );
+            continue;
+        }
+        // Positional swap: stale[i] → new[i] in every phi's incoming.
+        let swap_map: HashMap<HirId, HirId> = stale.iter().zip(new.iter()).map(|(s, n)| (*s, *n)).collect();
+        for phi in &mut block.phis {
+            for (_, pred) in &mut phi.incoming {
+                if let Some(&new_pred) = swap_map.get(pred) {
+                    *pred = new_pred;
+                }
+            }
+        }
+    }
+}
+
 pub fn lower_await_calls(
     function: &mut HirFunction,
     layout: &StateMachineLayout<HirBlockId, HirLocalId, HirFnId>,
@@ -154,88 +256,44 @@ pub fn lower_await_calls(
         let result_slot = next_slot;
         next_slot += 1;
 
-        // Build the new instructions to splice into the yield block:
-        //   1. Save the promise pointer to its slot (so it persists if
-        //      we suspend before getting Ready — also a no-op store
-        //      that's harmless if we never re-enter this state).
-        //   2. Load promise.state_machine_ptr (offset 0 of Promise).
-        //   3. GEP/Load promise.poll_fn (offset 8 of Promise).
-        //   4. IndirectCall poll_fn(state_machine_ptr) -> i64.
-        //   5. Eq-check against 0 to decide Pending vs Ready.
-        let save_promise = HirInstruction::AsyncSaveSlot {
-            frame,
-            slot: promise_slot,
-            value: promise_ptr,
-        };
+        // === Re-entrant await design ===
+        // The naive approach (always run Call(inner) on every entry to
+        // the yield block) breaks chains: the outer fn polls the inner,
+        // gets 0 (Pending sentinel), returns 0 to runtime, runtime polls
+        // outer again — outer state is still 0 so it re-enters yield and
+        // creates a FRESH inner promise, throwing away progress.
+        //
+        // Fix: stash the inner promise in `promise_slot` on first entry;
+        // on subsequent entries to this yield block, skip the Call and
+        // re-poll the existing promise. The entry function zero-inits
+        // every slot, so `promise_slot == 0` is a reliable "not called
+        // yet" sentinel.
+        //
+        // CFG after this transform:
+        //
+        //   yield_block:
+        //     existing = AsyncLoadSlot(promise_slot)
+        //     is_first = (existing == 0)
+        //     branch is_first, first_call_block, poll_block
+        //
+        //   first_call_block:
+        //     [original pre-await code: Call(inner_fn, args) → promise]
+        //     [captures-lift saves from emit_save_load]
+        //     AsyncSaveSlot promise_slot ← promise
+        //     branch poll_block
+        //
+        //   poll_block:
+        //     current = AsyncLoadSlot(promise_slot)
+        //     nested_sm = Load(current[0])
+        //     poll_fn = Load(current[8])
+        //     poll_result = IndirectCall poll_fn(nested_sm)
+        //     is_pending = (poll_result == 0)
+        //     branch is_pending, pending_block, ready_block
+        //
+        //   pending_block: return 0
+        //   ready_block: save result, save next_state, return 0
 
-        // Load nested state_machine_ptr from promise[0].
-        let nested_sm_id = mint_value(
-            &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
-            HirValueKind::Instruction,
-        );
-        let load_nested_sm = HirInstruction::Load {
-            result: nested_sm_id,
-            ty: HirType::Ptr(Box::new(HirType::U8)),
-            ptr: promise_ptr,
-            align: 8,
-            volatile: false,
-        };
-
-        // Compute promise + 8 to get poll_fn slot address.
-        let const_8 = mint_const_i64(&mut function.values, 8);
-        let poll_fn_slot_id = mint_value(
-            &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
-            HirValueKind::Instruction,
-        );
-        let poll_fn_slot_gep = HirInstruction::Binary {
-            result: poll_fn_slot_id,
-            op: BinaryOp::Add,
-            ty: HirType::I64,
-            left: promise_ptr,
-            right: const_8,
-        };
-
-        // Load poll_fn pointer.
-        let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-            params: vec![HirType::Ptr(Box::new(HirType::U8))],
-            returns: vec![HirType::I64],
-            lifetime_params: vec![],
-            is_variadic: false,
-        }));
-        let poll_fn_ptr_id =
-            mint_value(&mut function.values, poll_fn_ty.clone(), HirValueKind::Instruction);
-        let load_poll_fn = HirInstruction::Load {
-            result: poll_fn_ptr_id,
-            ty: poll_fn_ty,
-            ptr: poll_fn_slot_id,
-            align: 8,
-            volatile: false,
-        };
-
-        // IndirectCall poll_fn(state_machine_ptr).
-        let poll_result_id = mint_value(&mut function.values, HirType::I64, HirValueKind::Instruction);
-        let indirect_poll = HirInstruction::IndirectCall {
-            result: Some(poll_result_id),
-            func_ptr: poll_fn_ptr_id,
-            args: vec![nested_sm_id],
-            return_ty: HirType::I64,
-        };
-
-        // Compare poll_result == 0 to decide Pending vs Ready.
-        let zero_const = mint_const_i64(&mut function.values, 0);
-        let is_pending_id = mint_value(&mut function.values, HirType::Bool, HirValueKind::Instruction);
-        let is_pending_eq = HirInstruction::Binary {
-            result: is_pending_id,
-            op: BinaryOp::Eq,
-            ty: HirType::I64,
-            left: poll_result_id,
-            right: zero_const,
-        };
-
-        // Pending block: just return 0 (state stays unchanged so the
-        // next poll re-enters this yield block and re-polls).
+        // Pending and ready blocks (constants for them are simple).
         let pending_zero = mint_const_i64(&mut function.values, 0);
         let pending_block_id = HirId::new();
         let pending_block = HirBlock {
@@ -251,7 +309,6 @@ pub fn lower_await_calls(
             successors: vec![],
         };
 
-        // Ready block: save the i64 result + bump state to next_state, return 0.
         let next_state_const = mint_const_i64(&mut function.values, next_state as i64);
         let ready_zero = mint_const_i64(&mut function.values, 0);
         let ready_block_id = HirId::new();
@@ -259,18 +316,7 @@ pub fn lower_await_calls(
             id: ready_block_id,
             label: Some(InternedString::new_global("await_ready")),
             phis: vec![],
-            instructions: vec![
-                HirInstruction::AsyncSaveSlot {
-                    frame,
-                    slot: result_slot,
-                    value: poll_result_id,
-                },
-                HirInstruction::AsyncSaveSlot {
-                    frame,
-                    slot: state_slot,
-                    value: next_state_const,
-                },
-            ],
+            instructions: vec![],
             terminator: HirTerminator::Return {
                 values: vec![ready_zero],
             },
@@ -279,16 +325,125 @@ pub fn lower_await_calls(
             successors: vec![],
         };
 
-        // Splice all the new instructions into the yield block. The
-        // surrounding instructions break down as:
-        //   * [0..await_idx]  : pre-await code (e.g. the call producing
-        //     the promise). Keep as-is.
-        //   * await_idx       : the Call(Intrinsic::Await). Remove.
-        //   * [await_idx+1..] : post-await code in the SAME block. This
-        //     is typically the AsyncSaveSlot ops that `emit_save_load`
-        //     appended for the captures-lift. They must run before we
-        //     suspend (so the saved values are visible on resume), so
-        //     we keep them and place them BEFORE the poll prologue.
+        // Build poll_block (loads current promise from slot every time
+        // → handles both first-call and re-entry uniformly).
+        let poll_block_id = HirId::new();
+        let current_promise_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let nested_sm_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let const_8_pb = mint_const_i64(&mut function.values, 8);
+        let poll_fn_slot_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
+            params: vec![HirType::Ptr(Box::new(HirType::U8))],
+            returns: vec![HirType::I64],
+            lifetime_params: vec![],
+            is_variadic: false,
+        }));
+        let poll_fn_ptr_id = mint_value(
+            &mut function.values,
+            poll_fn_ty.clone(),
+            HirValueKind::Instruction,
+        );
+        let poll_result_id =
+            mint_value(&mut function.values, HirType::I64, HirValueKind::Instruction);
+        let zero_const_pb = mint_const_i64(&mut function.values, 0);
+        let is_pending_id =
+            mint_value(&mut function.values, HirType::Bool, HirValueKind::Instruction);
+        let poll_block = HirBlock {
+            id: poll_block_id,
+            label: Some(InternedString::new_global("await_poll")),
+            phis: vec![],
+            instructions: vec![
+                HirInstruction::AsyncLoadSlot {
+                    result: current_promise_id,
+                    ty: HirType::Ptr(Box::new(HirType::U8)),
+                    frame,
+                    slot: promise_slot,
+                },
+                HirInstruction::Load {
+                    result: nested_sm_id,
+                    ty: HirType::Ptr(Box::new(HirType::U8)),
+                    ptr: current_promise_id,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::Binary {
+                    result: poll_fn_slot_id,
+                    op: BinaryOp::Add,
+                    ty: HirType::I64,
+                    left: current_promise_id,
+                    right: const_8_pb,
+                },
+                HirInstruction::Load {
+                    result: poll_fn_ptr_id,
+                    ty: poll_fn_ty,
+                    ptr: poll_fn_slot_id,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::IndirectCall {
+                    result: Some(poll_result_id),
+                    func_ptr: poll_fn_ptr_id,
+                    args: vec![nested_sm_id],
+                    return_ty: HirType::I64,
+                },
+                HirInstruction::Binary {
+                    result: is_pending_id,
+                    op: BinaryOp::Eq,
+                    ty: HirType::I64,
+                    left: poll_result_id,
+                    right: zero_const_pb,
+                },
+            ],
+            terminator: HirTerminator::CondBranch {
+                condition: is_pending_id,
+                true_target: pending_block_id,
+                false_target: ready_block_id,
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+
+        // Now wire ready_block's body. Saving poll_result_id (defined
+        // in poll_block which dominates ready_block) is fine SSA.
+        // We finalize ready_block's instructions after poll_block exists
+        // so we can reference poll_result_id.
+        // (Block was created above with empty instructions — set them now.)
+        // We'll insert into function.blocks BEFORE filling ready_block,
+        // since ready_block is created standalone here.
+        // Actually we still own `ready_block` as a local var (haven't
+        // inserted yet), so just push instructions.
+        let mut ready_block = ready_block;
+        ready_block.instructions = vec![
+            HirInstruction::AsyncSaveSlot {
+                frame,
+                slot: result_slot,
+                value: poll_result_id,
+            },
+            HirInstruction::AsyncSaveSlot {
+                frame,
+                slot: state_slot,
+                value: next_state_const,
+            },
+        ];
+
+        // Build first_call_block: contains the original pre-await
+        // instructions (the Call to the inner fn) + captures-lift saves
+        // + the AsyncSaveSlot to stash the new promise. Then branches
+        // to poll_block.
+        let first_call_block_id = HirId::new();
         let yield_block = function
             .blocks
             .get_mut(&yield_hir)
@@ -301,24 +456,60 @@ pub fn lower_await_calls(
             .skip(await_idx + 1)
             .cloned()
             .collect();
-        let mut new_insts = kept_pre;
-        new_insts.extend(kept_post); // captures-lift saves go here
-        new_insts.extend(vec![
-            save_promise,
-            load_nested_sm,
-            poll_fn_slot_gep,
-            load_poll_fn,
-            indirect_poll,
-            is_pending_eq,
-        ]);
-        yield_block.instructions = new_insts;
-        yield_block.terminator = HirTerminator::CondBranch {
-            condition: is_pending_id,
-            true_target: pending_block_id,
-            false_target: ready_block_id,
+
+        let mut first_call_insts = kept_pre;
+        first_call_insts.extend(kept_post);
+        first_call_insts.push(HirInstruction::AsyncSaveSlot {
+            frame,
+            slot: promise_slot,
+            value: promise_ptr,
+        });
+        let first_call_block = HirBlock {
+            id: first_call_block_id,
+            label: Some(InternedString::new_global("await_first_call")),
+            phis: vec![],
+            instructions: first_call_insts,
+            terminator: HirTerminator::Branch {
+                target: poll_block_id,
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
         };
 
-        // Insert the new pending + ready blocks into the function.
+        // Now the yield_block becomes a thin re-entry check.
+        let existing_promise_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let zero_check_const = mint_const_i64(&mut function.values, 0);
+        let is_first_call_id =
+            mint_value(&mut function.values, HirType::Bool, HirValueKind::Instruction);
+        yield_block.instructions = vec![
+            HirInstruction::AsyncLoadSlot {
+                result: existing_promise_id,
+                ty: HirType::Ptr(Box::new(HirType::U8)),
+                frame,
+                slot: promise_slot,
+            },
+            HirInstruction::Binary {
+                result: is_first_call_id,
+                op: BinaryOp::Eq,
+                ty: HirType::I64,
+                left: existing_promise_id,
+                right: zero_check_const,
+            },
+        ];
+        yield_block.terminator = HirTerminator::CondBranch {
+            condition: is_first_call_id,
+            true_target: first_call_block_id,
+            false_target: poll_block_id,
+        };
+
+        // Insert all new blocks into the function.
+        function.blocks.insert(first_call_block_id, first_call_block);
+        function.blocks.insert(poll_block_id, poll_block);
         function.blocks.insert(pending_block_id, pending_block);
         function.blocks.insert(ready_block_id, ready_block);
 
@@ -746,6 +937,34 @@ pub fn generate_promise_entry(
         const_args: vec![],
         is_tail: false,
     });
+
+    // Zero-initialize EVERY slot. Some await re-entry checks rely on
+    // promise_slot == 0 as the "not yet called" sentinel. malloc
+    // doesn't zero memory, so we must explicitly write 0 to every
+    // slot here. (State and param slots get overwritten below; doing
+    // a uniform pass keeps the logic simple.)
+    let zero_init_const = mint_const_i64(&mut entry.values, 0);
+    for slot_idx in 0..num_slots {
+        let offset_const = mint_const_i64(&mut entry.values, slot_idx as i64 * 8);
+        let slot_ptr = mint_value(
+            &mut entry.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        instructions.push(HirInstruction::Binary {
+            result: slot_ptr,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: sm_ptr_id,
+            right: offset_const,
+        });
+        instructions.push(HirInstruction::Store {
+            ptr: slot_ptr,
+            value: zero_init_const,
+            align: 8,
+            volatile: false,
+        });
+    }
 
     // Initialize state_id slot to 0 (as i64, matching uniform 8-byte
     // slot layout — the dispatcher reads i64 from the slot).

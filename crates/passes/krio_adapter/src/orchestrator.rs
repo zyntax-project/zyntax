@@ -182,6 +182,14 @@ pub fn lower_async_function(
     );
     let num_slots: u32 = after_awaits_slot;
 
+    // F.2 follow-up: the await lowering creates new resume blocks
+    // that may now be predecessors of phi blocks (e.g. loop headers
+    // when the loop body contains an await). The original phi.incoming
+    // entries reference the OLD loop body block which no longer
+    // branches to the phi. Repair the predecessors so Cranelift sees
+    // valid SSA.
+    crate::abi_emit::repair_phi_predecessors(cfg_function);
+
     Ok(LowerResult {
         layout,
         liveness,

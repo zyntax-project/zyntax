@@ -140,16 +140,15 @@ fn analysis_runner_output_drives_krio_captures_lift() {
         .flat_map(|b| b.instructions.iter())
         .filter(|i| matches!(i, HirInstruction::AsyncLoadSlot { .. }))
         .count();
-    // After F.2, await lowering replaces `Intrinsic::Await` with the
-    // poll-the-inner-promise state machine, adding 3 more saves
-    // (promise persistence, ready-result, ready-state-bump) on top
-    // of the 1 captures-lift save = 4 total.
+    // After F.2 with re-entry handling, await lowering produces:
+    //  saves: 1 captures-lift + 1 promise persist (first_call_block)
+    //         + 1 result + 1 state-bump (ready_block) = 4
+    //  loads: 1 captures-lift + 1 dispatcher state + 1 await result
+    //         + 1 yield-block re-entry check + 1 poll_block reload = 5
     assert_eq!(save_count, 4, "1 captures-lift + 3 await-lowering saves");
-    // After F.2, loads are: 1 captures-lift + 1 dispatcher state +
-    // 1 await-result load (in resume block) = 3 total.
     assert_eq!(
-        load_count, 3,
-        "AsyncLoadSlot: 1 captures + 1 dispatcher state + 1 await result"
+        load_count, 5,
+        "AsyncLoadSlot: 1 captures + 1 dispatcher state + 1 await result + 1 yield re-entry check + 1 poll reload"
     );
 }
 

@@ -938,7 +938,14 @@ impl HirLiveness {
             // Compute "defined before idx" for every suspension idx
             // in one forward pass: incrementally accumulate defs.
             // `defined_at_or_before[i]` = set of values defined by
-            // inst[0..=i] plus function params.
+            // inst[0..=i] plus function params plus all phi results
+            // (defined at the top of their respective blocks; we
+            // approximate dominance conservatively by including ALL
+            // phi results in the function — captures-lift will then
+            // intersect with `live_post` to actually decide what to
+            // save). Without phi inclusion, await-in-loop patterns
+            // miss the loop counter / accumulator phis and the
+            // resume side reads undefined values.
             let mut defined_at_or_before: Vec<HashSet<HirId>> =
                 Vec::with_capacity(block.instructions.len());
             let mut acc: HashSet<HirId> = cfg
@@ -948,6 +955,13 @@ impl HirLiveness {
                 .iter()
                 .map(|p| p.id)
                 .collect();
+            // Add all phi results across the function (cross-block
+            // SSA values).
+            for other_block in cfg.function.blocks.values() {
+                for phi in &other_block.phis {
+                    acc.insert(phi.result);
+                }
+            }
             for inst in &block.instructions {
                 if let Some(def) = instruction_result(inst) {
                     acc.insert(def);
@@ -997,14 +1011,22 @@ impl HirLiveness {
                     s
                 };
                 let defined_pre = if idx == 0 {
-                    // Only function params are "defined before" the
-                    // first instruction.
-                    cfg.function
+                    // Function params + all phi results (defined at
+                    // top of their blocks, conservatively assumed to
+                    // dominate this site via SSA).
+                    let mut s: HashSet<HirId> = cfg
+                        .function
                         .signature
                         .params
                         .iter()
                         .map(|p| p.id)
-                        .collect()
+                        .collect();
+                    for other_block in cfg.function.blocks.values() {
+                        for phi in &other_block.phis {
+                            s.insert(phi.result);
+                        }
+                    }
+                    s
                 } else {
                     defined_at_or_before[idx - 1].clone()
                 };
