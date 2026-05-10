@@ -126,11 +126,27 @@ pub fn lower_await_calls(
             // simple captures-lift transform from F.1 handles it.
             _ => continue,
         };
+        // The SSA builder sometimes leaves Intrinsic::Await's result
+        // typed as Void (the future's inner type isn't propagated
+        // through the call). Fall back to I64 in that case — the slot
+        // holds a 64-bit value anyway, and downstream Binary ops in
+        // the resume block typically operate at I64.
         let result_ty = function
             .values
             .get(&result_id)
             .map(|v| v.ty.clone())
             .unwrap_or(HirType::I64);
+        let result_ty = if matches!(result_ty, HirType::Void) {
+            HirType::I64
+        } else {
+            result_ty
+        };
+        // Also update function.values so downstream code reading the
+        // type sees the same fallback (e.g., the Cranelift backend's
+        // type_cache, Binary op type checks).
+        if let Some(v) = function.values.get_mut(&result_id) {
+            v.ty = result_ty.clone();
+        }
 
         // Allocate two slots for this await.
         let promise_slot = next_slot;
@@ -434,10 +450,21 @@ pub fn reshape_to_poll_abi(
         rewrites.insert(*orig_param_id, load_id);
     }
 
-    // Apply rewrites across all instructions and terminators. This
-    // re-points the body from the original param HirIds to the new
-    // load results.
+    // Apply rewrites across all instructions, terminators, AND phi
+    // node incoming values. Phis reference SSA values directly via
+    // `incoming: Vec<(value_hir_id, predecessor_block_id)>`, so they
+    // can hold stale references to original param HirIds (e.g. an
+    // initial loop-counter value flowing into a phi from the entry
+    // block). Without rewriting these, Cranelift sees an undefined
+    // operand and rejects the jump argument count.
     for block in function.blocks.values_mut() {
+        for phi in &mut block.phis {
+            for (value, _pred) in &mut phi.incoming {
+                if let Some(&new_id) = rewrites.get(value) {
+                    *value = new_id;
+                }
+            }
+        }
         for inst in &mut block.instructions {
             inst.replace_uses(&rewrites);
         }

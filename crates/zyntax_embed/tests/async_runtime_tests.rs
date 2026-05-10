@@ -1576,7 +1576,7 @@ async fn sum_range(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: needs re-entry-resilient await (skip Call(foo) when promise_slot is non-null)"]
+    #[ignore = "F.2 follow-up: SEGV on inner-promise IndirectCall — likely calling convention mismatch or memory layout"]
     #[test]
     fn test_execute_async_with_await_in_loop() {
         // Test async function that awaits another async function inside a loop
@@ -1685,7 +1685,7 @@ async fn sum_doubled(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: chained awaits SEGV — likely related to re-entry handling"]
+    #[ignore = "F.2 follow-up: SEGV when chaining awaits — same root cause as test_execute_async_with_await_in_loop"]
     #[test]
     fn test_execute_async_chain_with_await() {
         // Test multiple async functions that await each other in a chain
@@ -1873,7 +1873,7 @@ async fn count_up(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: multi-arg async returns Ready(Void) — poll_fn null in returned Promise"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_execute_async_with_multiple_args() {
         // Test async function with multiple arguments and a loop
@@ -1969,7 +1969,7 @@ async fn sum_with_multiplier(start: i32, end: i32, multiplier: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: SEGV when awaiting a multi-poll inner promise (re-entry into yield block creates fresh promise each poll)"]
+    #[ignore = "F.2 follow-up: SEGV at IndirectCall to inner promise's poll fn (when awaited inner has multi-block body)"]
     #[test]
     fn test_execute_async_await_long_running_process() {
         // Test an async function that awaits another async function which is
@@ -2418,7 +2418,7 @@ async fn sum_range(n: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: same root cause as test_execute_async_with_multiple_args (multi-arg path)"]
+    #[cfg_attr(not(feature = "krio-async-backend"), ignore = "requires krio-async-backend feature")]
     #[test]
     fn test_promise_race_first_wins() {
         // Test PromiseRace - first function to complete wins
@@ -2570,7 +2570,7 @@ async fn compute(x: i32) i32 {
     // The proper fix is in the async lowering pipeline (or via
     // adopting krio-async's captures lift); see
     // memory/krio_concurrency_survey.md.
-    #[ignore = "F.2 follow-up: nested awaits SEGV — likely re-entry handling"]
+    #[ignore = "F.2 follow-up: SEGV nested awaits — same root cause as test_execute_async_with_await_in_loop"]
     #[test]
     fn test_promise_all_with_nested_await() {
         // Test PromiseAll with functions that themselves await other functions
