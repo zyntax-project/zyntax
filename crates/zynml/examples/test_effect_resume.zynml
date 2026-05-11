@@ -1,0 +1,31 @@
+// Phase K e2e example: real ZynML source exercising algebraic
+// effects with `Resume<T>` from the prelude.
+//
+// The handler `H.op` invokes its continuation `k(21)`, which re-enters
+// the caller's continuation (`return x * 2`), returns 42 back into
+// the handler, which adds 1000 and returns 1042. The caller's
+// post-perform code does NOT run a second time.
+//
+// Expected output:
+//   result = 1042
+
+effect E {
+    def op(): i64
+}
+
+handler H for E {
+    def op(k: Resume<i64>): i64 {
+        return k(21) + 1000
+    }
+}
+
+@effect(E)
+def run(): i64 {
+    let x = op()
+    return x * 2
+}
+
+def main() {
+    let result = run()
+    println(f"result = {result}")
+}

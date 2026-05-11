@@ -305,6 +305,37 @@ impl<T> IntoIterator for List<T> {
 // extern struct HashSet<T>
 
 // ============================================================================
+// Resume<T> — algebraic effect continuation (Phase H–J)
+// ============================================================================
+//
+// Resume<T> is a reified continuation passed to a resumable effect
+// handler's op. Calling `k(v)` (where `k: Resume<T>`) inside the
+// handler body lowers to `__zyntax_effect_resume(k, v)`, which:
+//   1. Stores v into the caller's state-machine result slot.
+//   2. Advances the caller's state to the post-perform dispatcher
+//      entry.
+//   3. Re-polls the caller's poll fn synchronously until Ready, and
+//      returns the result so the handler can compose with it.
+//
+// Compiler convention: a handler op param whose TypeRegistry
+// definition has name "Resume" triggers two things:
+//   - `is_resumable` flag set on the HirEffectHandlerImpl
+//     (lowering.rs's `convert_handler_impl`).
+//   - SSA `Variable(k)(...)` calls rewritten to
+//     `Call(Symbol("__zyntax_effect_resume"), [k, value])`.
+//
+// Calling `abort(v)` inside a resumable handler body lowers to
+// `Call(Symbol("__zyntax_effect_abort"), [value])` — exception-like
+// early-return that skips the caller's post-perform code.
+//
+// At HIR level Resume<T> is `HirType::Ptr(U8)` (an opaque pointer);
+// the runtime symbol reinterprets it as `&Resume` with the 32-byte
+// `repr(C)` layout in `effect_runtime.rs`. The type param `<T>` is
+// informational at the source level — the runtime ABI is i64-only
+// for now (Phase I placeholder).
+extern struct Resume<T>
+
+// ============================================================================
 // Option Methods
 // ============================================================================
 
