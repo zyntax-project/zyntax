@@ -30,9 +30,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use krio_async::{BlockKind, StateMachineLayout};
+use krio_async::StateMachineLayout;
 use zyntax_compiler::hir::{
-    HirBlock, HirConstant, HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind,
+    HirConstant, HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind,
 };
 
 use crate::{HirBlockId, HirCoroCfg, HirFnId, HirLiveness};
@@ -174,13 +174,11 @@ fn rewrite_uses_in_reachable(
     start_bb: HirBlockId,
     mapping: &HashMap<HirId, HirId>,
 ) {
-    use indexmap::IndexMap as _;
     let start_hir = cfg.block_id_to_hir(start_bb);
     let func = cfg.function_mut();
 
     // Reachability over the post-transform CFG.
     let mut visited: HashSet<HirId> = HashSet::new();
-    let mut stack: Vec<HirId> = vec![start_hir];
 
     let full_replacement: indexmap::IndexMap<HirId, HirId> =
         mapping.iter().map(|(k, v)| (*k, *v)).collect();

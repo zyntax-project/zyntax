@@ -6,11 +6,15 @@
 //! The vtable field name is derived from the effect and operation names.
 
 use pattern_engine::{Bindings, ExprRewrite, Pattern, Priority, RewriteOutput};
-use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::Type;
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
 
+// M1.3 superseded this rewrite — the SSA builder now emits
+// `HirInstruction::PerformEffect` directly via `effect_op_map`, so
+// renaming the callee would break the lookup. Kept for reference /
+// future use (alternative lowering strategies); not registered.
+#[allow(dead_code)]
 pub fn effect_op_to_dispatch() -> ExprRewrite {
     ExprRewrite::new(
         "effect_op_to_dispatch",
@@ -19,7 +23,7 @@ pub fn effect_op_to_dispatch() -> ExprRewrite {
             if let TypedExpression::Call(call) = &node.node {
                 if let TypedExpression::Variable(name) = &call.callee.node {
                     let name_str = name.resolve_global().unwrap_or_default();
-                    if let Some(effect_name) = ctx.effect_ops.resolve(&name_str) {
+                    if ctx.effect_ops.resolve(&name_str).is_some() {
                         let mut bindings = Bindings::new();
                         bindings.bind_type("effect", Type::Any); // placeholder
                         bindings.bind_span("span", node.span);
@@ -64,6 +68,7 @@ pub fn effect_op_to_dispatch() -> ExprRewrite {
 mod tests {
     use super::*;
     use pattern_engine::{EngineConfig, PatternEngine};
+    use zyntax_typed_ast::source::Span;
     use zyntax_typed_ast::type_registry::PrimitiveType;
 
     #[test]

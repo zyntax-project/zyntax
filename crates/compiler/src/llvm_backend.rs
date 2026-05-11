@@ -2585,6 +2585,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Return a dummy value (void functions don't return anything meaningful)
                 Ok(self.context.i32_type().const_zero().into())
             }
+            HirCallable::FuncRef(_) => Err(CompilerError::CodeGen(
+                "HirCallable::FuncRef is not callable directly — \
+                 use it only as a value (function address); for calls go \
+                 through Indirect".to_string(),
+            )),
         }
     }
 

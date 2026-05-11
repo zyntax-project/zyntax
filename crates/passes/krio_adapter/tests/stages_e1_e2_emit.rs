@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use krio_adapter::{emit, HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns};
 use zyntax_compiler::hir::{
-    HirCallable, HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
+    HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind,
 };
 
 use common::{

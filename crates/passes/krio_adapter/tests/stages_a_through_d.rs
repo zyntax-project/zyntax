@@ -88,7 +88,7 @@ fn stage_c_suspending_set_includes_async_fn() {
 
 #[test]
 fn stage_c_classify_finds_intrinsic_await_only() {
-    let AsyncFnFixture { mut function, .. } = make_async_function_with_one_await();
+    let AsyncFnFixture { function, .. } = make_async_function_with_one_await();
     let entry_hir = function.entry_block;
     let module = module_of(function);
     let suspending = HirSuspendingFns::from_module(&module);

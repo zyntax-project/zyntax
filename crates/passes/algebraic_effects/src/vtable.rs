@@ -1,7 +1,6 @@
 //! Rewrite: TypedDeclaration::Effect → Class(OpTable)
 
 use pattern_engine::{Bindings, DeclRewrite, Pattern, Priority, RewriteOutput};
-use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{Mutability, PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
@@ -82,6 +81,7 @@ fn build_op_table(effect: &TypedEffect) -> TypedNode<TypedDeclaration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zyntax_typed_ast::source::Span;
 
     #[test]
     fn test_build_op_table() {

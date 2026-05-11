@@ -9,7 +9,6 @@ use pattern_engine::{
     Bindings, DeclRewrite, ExprRewrite, Pattern, PatternEngine, PatternPass, Priority,
     RewriteOutput, StmtRewrite,
 };
-use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
@@ -88,10 +87,10 @@ fn unit_return_explicit() -> DeclRewrite {
                 // If the function body is a single bare expression, it's an
                 // implicit return — do NOT append Return(None).
                 // The CFG builder will wrap it as Return(Some(expr)).
-                if body.statements.len() == 1 {
-                    if matches!(&last.node, TypedStatement::Expression(_)) {
-                        return None; // implicit return, not void
-                    }
+                if body.statements.len() == 1
+                    && matches!(&last.node, TypedStatement::Expression(_))
+                {
+                    return None; // implicit return, not void
                 }
                 Some(Bindings::new())
             } else {
@@ -238,6 +237,7 @@ fn fstring_to_concat() -> ExprRewrite {
 mod tests {
     use super::*;
     use pattern_engine::{EngineConfig, PatternEngine};
+    use zyntax_typed_ast::source::Span;
     use zyntax_typed_ast::InternedString;
 
     fn span() -> Span {
@@ -301,7 +301,7 @@ mod tests {
         assert!(result.changed);
 
         // The nested block should be flattened AND unit_return_explicit fires
-        assert!(result.rewrites_fired.len() >= 1);
+        assert!(!result.rewrites_fired.is_empty());
     }
 
     #[test]

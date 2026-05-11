@@ -2,7 +2,6 @@ use pattern_engine::*;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 use zyntax_typed_ast::typed_ast::*;
-use zyntax_typed_ast::TypedASTBuilder;
 
 fn make_span() -> Span {
     Span::new(0, 0)
