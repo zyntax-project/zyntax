@@ -1959,8 +1959,10 @@ impl LoweringContext {
         // collect all its operations into a name → (effect_id, return_ty)
         // map. The SSA builder consults this to emit `PerformEffect`
         // instead of `Call` for effect-op call sites.
-        let mut effect_op_map: indexmap::IndexMap<InternedString, (crate::hir::HirId, crate::hir::HirType)> =
-            indexmap::IndexMap::new();
+        let mut effect_op_map: indexmap::IndexMap<
+            InternedString,
+            (crate::hir::HirId, crate::hir::HirType),
+        > = indexmap::IndexMap::new();
         for effect_name in &func.effects {
             if let Some(hir_effect) = self
                 .module
@@ -1969,8 +1971,7 @@ impl LoweringContext {
                 .find(|e| e.name == *effect_name)
             {
                 for op in &hir_effect.operations {
-                    effect_op_map
-                        .insert(op.name, (hir_effect.id, op.return_type.clone()));
+                    effect_op_map.insert(op.name, (hir_effect.id, op.return_type.clone()));
                 }
             } else {
                 log::warn!(

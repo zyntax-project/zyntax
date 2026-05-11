@@ -1578,13 +1578,15 @@ mod tests {
         let mut f = empty_function("test");
         let entry = f.entry_block;
         let entry_block = f.blocks.get_mut(&entry).unwrap();
-        entry_block.instructions.push(HirInstruction::PerformEffect {
-            result: None,
-            effect_id: HirId::new(),
-            op_name: InternedString::new_global("op"),
-            args: vec![],
-            return_ty: HirType::Void,
-        });
+        entry_block
+            .instructions
+            .push(HirInstruction::PerformEffect {
+                result: None,
+                effect_id: HirId::new(),
+                op_name: InternedString::new_global("op"),
+                args: vec![],
+                return_ty: HirType::Void,
+            });
 
         let cfg = HirCoroCfg::new(&mut f);
         let suspending = HirSuspendingFns {
@@ -1693,13 +1695,15 @@ mod tests {
             attributes: ParamAttributes::default(),
         });
         let entry_block = f.blocks.get_mut(&entry).unwrap();
-        entry_block.instructions.push(HirInstruction::PerformEffect {
-            result: None,
-            effect_id: HirId::new(),
-            op_name: InternedString::new_global("get"),
-            args: vec![],
-            return_ty: HirType::I32,
-        });
+        entry_block
+            .instructions
+            .push(HirInstruction::PerformEffect {
+                result: None,
+                effect_id: HirId::new(),
+                op_name: InternedString::new_global("get"),
+                args: vec![],
+                return_ty: HirType::I32,
+            });
 
         // live_out makes `live` cross the perform-site.
         let mut live_out = HashMap::new();

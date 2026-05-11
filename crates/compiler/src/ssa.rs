@@ -475,10 +475,7 @@ impl SsaBuilder {
     /// function. When non-empty, `TypedExpression::Call` whose callee
     /// matches an entry will lower to `HirInstruction::PerformEffect`
     /// instead of `HirInstruction::Call`.
-    pub fn with_effect_op_map(
-        mut self,
-        map: IndexMap<InternedString, (HirId, HirType)>,
-    ) -> Self {
+    pub fn with_effect_op_map(mut self, map: IndexMap<InternedString, (HirId, HirType)>) -> Self {
         self.effect_op_map = map;
         self
     }
@@ -3220,10 +3217,9 @@ impl SsaBuilder {
                             let result = if matches!(return_ty, HirType::Void) {
                                 None
                             } else {
-                                Some(self.create_value(
-                                    return_ty.clone(),
-                                    HirValueKind::Instruction,
-                                ))
+                                Some(
+                                    self.create_value(return_ty.clone(), HirValueKind::Instruction),
+                                )
                             };
                             let inst = HirInstruction::PerformEffect {
                                 result,

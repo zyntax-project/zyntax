@@ -175,13 +175,9 @@ fn h4_lower_async_module_includes_effectful_functions() {
     // No real liveness — empty map. krio will produce an empty layout
     // for the function, but the filter must still admit it.
     let live_out_per_block = std::collections::HashMap::new();
-    let results = orchestrator::lower_async_module(
-        &mut module,
-        16,
-        &mut frame_minter,
-        &live_out_per_block,
-    )
-    .expect("lower_async_module must succeed for effectful fn");
+    let results =
+        orchestrator::lower_async_module(&mut module, 16, &mut frame_minter, &live_out_per_block)
+            .expect("lower_async_module must succeed for effectful fn");
 
     assert_eq!(
         results.len(),

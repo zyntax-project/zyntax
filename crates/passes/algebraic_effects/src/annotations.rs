@@ -221,7 +221,10 @@ mod tests {
             ..Default::default()
         };
         let func = run_pass_on(func);
-        assert!(func.effects.is_empty(), "@inline-only fn should have no effects");
+        assert!(
+            func.effects.is_empty(),
+            "@inline-only fn should have no effects"
+        );
         assert!(
             func.with_handlers.is_empty(),
             "@inline-only fn should have no handlers"

@@ -848,10 +848,7 @@ pub fn lower_perform_effect_calls(
 
         // Find the PerformEffect in this yield block. If we find an
         // Intrinsic::Await first, skip — it belongs to lower_await_calls.
-        let yield_block = function
-            .blocks
-            .get(&yield_hir)
-            .expect("yield block exists");
+        let yield_block = function.blocks.get(&yield_hir).expect("yield block exists");
         let mut perform_idx: Option<usize> = None;
         let mut perform_meta: Option<(HirId, InternedString, Vec<HirId>, HirType, Option<HirId>)> =
             None;

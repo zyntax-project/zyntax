@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use zyntax_compiler::{
-    compile_to_hir, effect_analysis::analyze_effects,
-    effect_handler_resolution::resolve_handlers, hir::HirInstruction, CompilationConfig,
+    compile_to_hir, effect_analysis::analyze_effects, effect_handler_resolution::resolve_handlers,
+    hir::HirInstruction, CompilationConfig,
 };
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
@@ -232,8 +232,7 @@ fn emitted_perform_effect_passes_analysis_and_resolution() {
 
     // Handler resolution. Should find exactly 1 perform-site (the
     // `info(42)` call) and mark the Console handler as inlinable.
-    let handler_resolution =
-        resolve_handlers(&module).expect("resolve_handlers must succeed");
+    let handler_resolution = resolve_handlers(&module).expect("resolve_handlers must succeed");
     assert_eq!(
         handler_resolution.stats.total_perform_sites, 1,
         "M1.3's PerformEffect should register as exactly 1 perform-site"
