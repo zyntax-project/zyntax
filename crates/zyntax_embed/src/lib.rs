@@ -71,7 +71,10 @@ mod value;
 // Hosts that build a ZyntaxRuntime through the front-door
 // `ZyntaxRuntime::new()` get them registered automatically; this is
 // the seam for hosts that want to register them manually.
-pub use effect_runtime::register_effect_runtime_symbols;
+pub use effect_runtime::{
+    __zyntax_effect_abort, __zyntax_effect_lookup_handler, __zyntax_effect_pop_handler,
+    __zyntax_effect_push_handler, __zyntax_effect_resume, register_effect_runtime_symbols,
+};
 
 pub use array::ZyntaxArray;
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};

@@ -1075,6 +1075,302 @@ fn phase_j2_abort_skips_post_perform_code() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Phase J.3: async-out-of-line resume
+// ─────────────────────────────────────────────────────────────────────
+
+/// Test-side stash for the Resume<T> pointer. The handler calls
+/// `__test_stash_resume(k)` which writes `k` here; the test then
+/// invokes `__zyntax_effect_resume` directly with the stashed
+/// pointer to drive the continuation out-of-line.
+///
+/// Concurrency: the test is single-threaded so a `static mut`
+/// would be technically sound, but we use `std::sync::Mutex` to
+/// keep the API tidy and ready for future multi-threaded tests.
+static STASHED_RESUME: std::sync::OnceLock<std::sync::Mutex<usize>> = std::sync::OnceLock::new();
+
+fn stashed_resume_slot() -> &'static std::sync::Mutex<usize> {
+    STASHED_RESUME.get_or_init(|| std::sync::Mutex::new(0))
+}
+
+/// Sentinel value the stash routine returns to the @effect fn,
+/// indicating "suspension stashed externally — return this and let
+/// the host drive the resume later". Non-zero because the entry
+/// wrapper's poll loop uses 0 as the Pending sentinel.
+const STASH_SENTINEL: i64 = -1;
+
+/// Handler-callable stash routine. Compiled ZynML invokes this via
+/// the `$Test$stash_resume` symbol; we register it on the runtime
+/// before compilation. Returns `STASH_SENTINEL` (non-zero) so the
+/// poll loop breaks on Ready — the entry wrapper treats 0 as
+/// Pending and would otherwise spin forever.
+#[no_mangle]
+extern "C" fn test_stash_resume(k: *mut u8) -> i64 {
+    let mut slot = stashed_resume_slot().lock().unwrap();
+    *slot = k as usize;
+    STASH_SENTINEL
+}
+
+/// Phase J.3 program shape:
+///
+///   effect E { def op(): i64 }
+///   handler H for E {
+///       def op(k: Resume<i64>): i64 {
+///           return $Test$stash_resume(k)   // stash + return 0
+///       }
+///   }
+///   @effect(E) def run(): i64 {
+///       let x = op()
+///       return x * 2
+///   }
+///
+/// Synchronous run() returns 0 (handler returned 0). The Resume<T>
+/// pointer is now in STASHED_RESUME. The test then invokes
+/// __zyntax_effect_resume(stashed, 100) directly from Rust, which
+/// re-polls the @effect fn's state machine with 100 as the perform
+/// result. The post-perform code (`x * 2`) runs → returns 200. The
+/// runtime symbol's return value is 200.
+fn build_async_out_of_line_program() -> TypedProgram {
+    let mut registry = TypeRegistry::new();
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![Type::Primitive(PrimitiveType::I64)],
+        const_args: vec![],
+        variance: vec![],
+        nullability: NullabilityKind::NonNull,
+    };
+
+    let e_effect = TypedEffect {
+        name: InternedString::new_global("E"),
+        type_params: vec![],
+        operations: vec![TypedEffectOp {
+            name: InternedString::new_global("op"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::I64),
+            span: span(),
+        }],
+        span: span(),
+    };
+
+    // Handler body: return $Test$stash_resume(k)
+    // The `$`-prefixed name short-circuits the SSA Call handler to
+    // `HirCallable::Symbol` directly (see ssa.rs ~line 3270).
+    let stash_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("$Test$stash_resume")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("k")),
+                resume_ty.clone(),
+                span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let handler_body = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(stash_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let handler = TypedEffectHandler {
+        name: InternedString::new_global("H"),
+        effect_name: InternedString::new_global("E"),
+        type_params: vec![],
+        fields: vec![],
+        handlers: vec![TypedEffectHandlerImpl {
+            op_name: InternedString::new_global("op"),
+            return_type: Type::Primitive(PrimitiveType::I64),
+            params: vec![TypedParameter {
+                name: InternedString::new_global("k"),
+                ty: resume_ty,
+                ..Default::default()
+            }],
+            body: Some(TypedBlock {
+                statements: vec![handler_body],
+                span: span(),
+            }),
+            ..Default::default()
+        }],
+        span: span(),
+    };
+
+    // run() body: let x = op(); return x * 2
+    let op_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("op")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let let_x_eq_op = TypedNode::new(
+        TypedStatement::Let(TypedLet {
+            name: InternedString::new_global("x"),
+            ty: Type::Primitive(PrimitiveType::I64),
+            initializer: Some(Box::new(op_call)),
+            mutability: zyntax_typed_ast::type_registry::Mutability::Immutable,
+            span: span(),
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+    let x_var = TypedNode::new(
+        TypedExpression::Variable(InternedString::new_global("x")),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let x_times_2 = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Mul,
+            left: Box::new(x_var),
+            right: Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(2)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let return_x2 = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(x_times_2))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let run_fn = TypedFunction {
+        name: InternedString::new_global("run"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        body: Some(TypedBlock {
+            statements: vec![let_x_eq_op, return_x2],
+            span: span(),
+        }),
+        annotations: vec![TypedAnnotation {
+            name: InternedString::new_global("effect"),
+            args: vec![ident_arg("E")],
+            span: span(),
+        }],
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(
+                TypedDeclaration::Effect(e_effect),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::EffectHandler(handler),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::Function(run_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        type_registry: registry,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn phase_j3_async_out_of_line_resume() {
+    use zyntax_compiler::zrtl::{
+        PrimitiveSize, TypeCategory, TypeFlags, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
+    };
+
+    // Clear any leftover stash from a previous test invocation.
+    *stashed_resume_slot().lock().unwrap() = 0;
+
+    let program = build_async_out_of_line_program();
+    let mut runtime = ZyntaxRuntime::new().expect("runtime must construct");
+
+    // Register the test stash fn. Signature: (ptr) -> i64.
+    let mut params: [TypeTag; MAX_PARAMS] = [TypeTag::VOID; MAX_PARAMS];
+    params[0] = TypeTag::new(TypeCategory::Pointer, 0, TypeFlags::NONE);
+    runtime.register_function_typed(
+        "$Test$stash_resume",
+        test_stash_resume as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::new(
+                TypeCategory::Int,
+                PrimitiveSize::Bits64 as u16,
+                TypeFlags::NONE,
+            ),
+            params,
+        },
+    );
+    // Cranelift's JITModule was constructed at runtime-creation time —
+    // bind the freshly-registered symbol into it before any compile
+    // call. Without this, the JIT can't resolve $Test$stash_resume at
+    // link time.
+    runtime
+        .finalize_runtime_symbols()
+        .expect("finalize_runtime_symbols should succeed");
+
+    runtime
+        .compile_typed_program(program)
+        .expect("compile_typed_program must succeed for async-out-of-line");
+
+    // First call: run() invokes handler, which stashes k and returns
+    // the STASH_SENTINEL (non-zero — 0 is the poll-loop's Pending
+    // sentinel so a 0 return would hang the loop).
+    let sig = NativeSignature::new(&[], NativeType::I64);
+    let result = runtime
+        .call_function("run", &[], &sig)
+        .expect("runtime.call_function(\"run\") should execute synchronously");
+    assert_eq!(
+        result.as_i64(),
+        Some(STASH_SENTINEL),
+        "Handler stashed k and returned the STASH_SENTINEL; run() propagates it. Got {:?}",
+        result
+    );
+
+    // The stash slot must now hold a non-null Resume<T> pointer.
+    let stashed = *stashed_resume_slot().lock().unwrap();
+    assert_ne!(stashed, 0, "Handler should have stashed a non-null Resume pointer");
+
+    // Drive the continuation out-of-line: invoke __zyntax_effect_resume
+    // directly with value=100. The runtime symbol re-polls the @effect
+    // fn's state machine starting at next_state (resume_entry), which
+    // runs `let x = 100; return x * 2` → 200.
+    // The runtime symbol is `extern "C"` and the stashed pointer
+    // originated from a still-live state machine — no actual unsafety
+    // beyond what `extern "C"` already exposes.
+    let out_of_line_result =
+        zyntax_embed::__zyntax_effect_resume(stashed as *mut u8, 100);
+    assert_eq!(
+        out_of_line_result, 200,
+        "Out-of-line resume with value=100 should run post-perform `x * 2` → 200. Got {}",
+        out_of_line_result
+    );
+}
+
 #[test]
 fn effect_runtime_symbols_are_registered_at_runtime_construction() {
     // Phase H Tier 3 foundation: `ZyntaxRuntime::new()` automatically
