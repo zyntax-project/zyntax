@@ -161,14 +161,70 @@ fn h4_orchestrator_lowers_perform_effect_to_state_machine() {
 
 #[test]
 fn h4_lower_async_module_includes_effectful_functions() {
-    // Verifies the orchestrator's bulk path now picks up effect-
-    // annotated functions, not just `is_async = true` ones.
+    // Verifies the orchestrator's bulk path picks up effect-annotated
+    // functions whose effects have a resumable handler. Per the
+    // Phase-H followup, Tier 1 (non-resumable) effects skip krio in
+    // favor of the Cranelift backend's direct PerformEffect dispatch;
+    // Tier 3 (resumable) effects need krio's captures-lift. The
+    // bulk filter looks up handler resumability in `module.handlers`.
+    use indexmap::IndexMap;
+    use zyntax_compiler::hir::{
+        HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirTerminator,
+    };
+    use zyntax_typed_ast::InternedString;
+
     let EffectfulFnFixture { function, .. } = make_effectful_function_with_one_perform();
     let mut module = module_of(function);
 
+    // Add a State effect declaration to the module so the filter can
+    // resolve `effects = [State]` on the function to a HirId.
+    let state_effect = HirEffect {
+        id: HirId::new(),
+        name: InternedString::new_global("State"),
+        type_params: vec![],
+        operations: vec![],
+    };
+    let state_effect_id = state_effect.id;
+    module.effects.insert(state_effect.id, state_effect);
+
+    // Add a RESUMABLE handler for State. The single-impl handler's
+    // `is_resumable = true` marker is what `function_has_resumable_effect`
+    // uses to admit the fn to krio.
+    let handler_entry_id = HirId::new();
+    let mut handler_blocks: IndexMap<HirId, zyntax_compiler::hir::HirBlock> = IndexMap::new();
+    handler_blocks.insert(
+        handler_entry_id,
+        zyntax_compiler::hir::HirBlock {
+            id: handler_entry_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Unreachable,
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        },
+    );
+    let handler = HirEffectHandler {
+        id: HirId::new(),
+        name: InternedString::new_global("StateHandler"),
+        effect_id: state_effect_id,
+        type_params: vec![],
+        state_fields: vec![],
+        implementations: vec![HirEffectHandlerImpl {
+            op_name: InternedString::new_global("get"),
+            type_params: vec![],
+            params: vec![],
+            return_type: zyntax_compiler::hir::HirType::I32,
+            entry_block: handler_entry_id,
+            blocks: handler_blocks,
+            is_resumable: true,
+        }],
+    };
+    module.handlers.insert(handler.id, handler);
+
     // Plant a frame pointer per function (the closure must mint one).
     let mut frame_minter = |_func: &zyntax_compiler::hir::HirFunction| -> HirId {
-        // Simple constant-id minting — real pipeline uses param[0].
         HirId::new()
     };
 
@@ -182,6 +238,82 @@ fn h4_lower_async_module_includes_effectful_functions() {
     assert_eq!(
         results.len(),
         1,
-        "the effect-annotated fn should have been lowered (1 entry in results)"
+        "the @effect(State) fn with a resumable State handler should be lowered (1 entry); got {}",
+        results.len()
+    );
+}
+
+#[test]
+fn h4_lower_async_module_skips_non_resumable_effects() {
+    // The complement: an @effect-annotated fn whose effect's handler
+    // is NOT resumable (Tier 1) skips krio entirely. The Cranelift
+    // backend's direct PerformEffect dispatch handles it.
+    use indexmap::IndexMap;
+    use zyntax_compiler::hir::{
+        HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirTerminator,
+    };
+    use zyntax_typed_ast::InternedString;
+
+    let EffectfulFnFixture { function, .. } = make_effectful_function_with_one_perform();
+    let mut module = module_of(function);
+
+    let state_effect = HirEffect {
+        id: HirId::new(),
+        name: InternedString::new_global("State"),
+        type_params: vec![],
+        operations: vec![],
+    };
+    let state_effect_id = state_effect.id;
+    module.effects.insert(state_effect.id, state_effect);
+
+    // Handler with `is_resumable = false` — the Tier 1 case.
+    let handler_entry_id = HirId::new();
+    let mut handler_blocks: IndexMap<HirId, zyntax_compiler::hir::HirBlock> = IndexMap::new();
+    handler_blocks.insert(
+        handler_entry_id,
+        zyntax_compiler::hir::HirBlock {
+            id: handler_entry_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Unreachable,
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        },
+    );
+    let handler = HirEffectHandler {
+        id: HirId::new(),
+        name: InternedString::new_global("StateHandler"),
+        effect_id: state_effect_id,
+        type_params: vec![],
+        state_fields: vec![],
+        implementations: vec![HirEffectHandlerImpl {
+            op_name: InternedString::new_global("get"),
+            type_params: vec![],
+            params: vec![],
+            return_type: zyntax_compiler::hir::HirType::I32,
+            entry_block: handler_entry_id,
+            blocks: handler_blocks,
+            is_resumable: false,
+        }],
+    };
+    module.handlers.insert(handler.id, handler);
+
+    let mut frame_minter = |_func: &zyntax_compiler::hir::HirFunction| -> HirId {
+        HirId::new()
+    };
+
+    let live_out_per_block = std::collections::HashMap::new();
+    let results =
+        orchestrator::lower_async_module(&mut module, 16, &mut frame_minter, &live_out_per_block)
+            .expect("lower_async_module must succeed (no-op)");
+
+    assert_eq!(
+        results.len(),
+        0,
+        "the @effect(State) fn with a non-resumable handler should NOT \
+         be lowered through krio (Tier 1 direct-dispatch path); got {}",
+        results.len()
     );
 }

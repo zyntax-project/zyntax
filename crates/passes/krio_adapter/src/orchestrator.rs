@@ -38,6 +38,37 @@ use std::collections::{HashMap, HashSet};
 use krio_async::StateMachineLayout;
 use zyntax_compiler::hir::{HirFunction, HirId, HirModule};
 
+/// Returns true if any of `func`'s declared algebraic effects has at
+/// least one handler whose implementations are resumable (i.e. call
+/// `resume(v)` inside their body). Used by `lower_async_module` to
+/// decide whether to route the function through krio's captures-lift
+/// transform: Tier 1 (non-resumable) effects are dispatched directly
+/// by the Cranelift backend, so they skip krio.
+fn function_has_resumable_effect(func: &HirFunction, module: &HirModule) -> bool {
+    for effect_name in &func.signature.effects {
+        // Find the effect declaration matching this name.
+        let effect_id = match module
+            .effects
+            .values()
+            .find(|e| e.name == *effect_name)
+            .map(|e| e.id)
+        {
+            Some(id) => id,
+            None => continue,
+        };
+        // Any handler bound to this effect with a resumable impl?
+        if module
+            .handlers
+            .values()
+            .filter(|h| h.effect_id == effect_id)
+            .any(|h| h.implementations.iter().any(|i| i.is_resumable))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 use crate::{
     emit, HirAsyncHooks, HirBlockId, HirCoroCfg, HirFnId, HirLiveness, HirLocalId, HirSuspendingFns,
 };
@@ -288,13 +319,20 @@ where
     let suspending = HirSuspendingFns::from_module(module);
 
     // M4 / Phase H: include effect-annotated functions alongside async
-    // functions. A function is krio-eligible if `is_async` is set OR
-    // if it declares any algebraic effects — both shapes need
-    // captures-lift across suspension points.
+    // functions — BUT only when at least one of their effects has a
+    // resumable handler. Tier 1 (non-resumable, sync-handler) effects
+    // are dispatched directly by the Cranelift backend's existing
+    // `PerformEffect` lowering (cranelift_backend.rs:3796); putting
+    // them through krio would replace the direct call with a poll-fn
+    // ABI the caller can't easily drive. Tier 3 (resumable) effects
+    // genuinely need captures-lift + state-machine transform.
     let async_fn_ids: Vec<HirId> = module
         .functions
         .values()
-        .filter(|f| f.signature.is_async || !f.signature.effects.is_empty())
+        .filter(|f| {
+            f.signature.is_async
+                || function_has_resumable_effect(f, module)
+        })
         .map(|f| f.id)
         .collect();
 
