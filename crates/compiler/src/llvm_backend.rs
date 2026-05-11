@@ -78,6 +78,23 @@ pub struct LLVMBackend<'ctx> {
 
     /// Symbol signatures for auto-boxing (symbol name → signature)
     symbol_signatures: std::collections::HashMap<String, crate::zrtl::ZrtlSymbolSig>,
+
+    /// Phase H: effect-handler lookup index, populated at the top of
+    /// `compile_module` from `hir_module.handlers`. Keyed by
+    /// `(effect_id, op_name)` so a `PerformEffect` lowering can map
+    /// directly to `(handler_fn_hir_id, is_resumable)` without
+    /// re-walking `hir_module.handlers` on every emit. Mirrors the
+    /// runtime-side handler-stack lookup at
+    /// `effect_runtime::__zyntax_effect_lookup_handler` but at
+    /// compile time — Tier 1 path is single-handler-per-effect, so a
+    /// static map suffices.
+    ///
+    /// The `HirId` value is the *function* id of the standalone
+    /// handler-op function (mangled `{Handler}${op}`) the
+    /// algebraic_effects pass emitted — not the handler/effect id.
+    /// `self.functions[hir_id]` produces the LLVM `FunctionValue`.
+    effect_handler_index:
+        std::collections::HashMap<(HirId, zyntax_typed_ast::InternedString), (HirId, bool)>,
 }
 
 impl<'ctx> LLVMBackend<'ctx> {
@@ -102,6 +119,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             current_function: None,
             globals_map: IndexMap::new(),
             symbol_signatures: std::collections::HashMap::new(),
+            effect_handler_index: std::collections::HashMap::new(),
         }
     }
 
@@ -131,6 +149,38 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// 3. Compiles function bodies
     /// 4. Returns the compiled LLVM module
     pub fn compile_module(&mut self, hir_module: &HirModule) -> CompilerResult<String> {
+        // Phase H: build the effect-handler lookup index up front so
+        // each PerformEffect emission is an O(1) map probe.  Keyed by
+        // (effect_id, op_name) → (handler-fn HirId, is_resumable).
+        // See the `effect_handler_index` field docstring for rationale.
+        self.effect_handler_index.clear();
+        for handler in hir_module.handlers.values() {
+            for impl_ in &handler.implementations {
+                let mangled =
+                    crate::effect_codegen::mangle_handler_op_name(handler.name, impl_.op_name);
+                // Resolve the standalone fn the algebraic_effects pass
+                // emitted (named `{Handler}${op}`) to its HirId so
+                // `self.functions[hir_id]` finds the LLVM FunctionValue.
+                let fn_hir_id = hir_module
+                    .functions
+                    .iter()
+                    .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
+                    .map(|(id, _)| *id);
+                if let Some(fn_hir_id) = fn_hir_id {
+                    self.effect_handler_index.insert(
+                        (handler.effect_id, impl_.op_name),
+                        (fn_hir_id, impl_.is_resumable),
+                    );
+                } else {
+                    log::warn!(
+                        "[LLVM] effect handler op '{}' has no matching function in module — \
+                         PerformEffect calls to it will produce a dummy zero",
+                        mangled
+                    );
+                }
+            }
+        }
+
         // Phase 1: Process globals first (including vtables) in deterministic sorted order
         let mut global_ids: Vec<_> = hir_module.globals.keys().cloned().collect();
         global_ids.sort_by_key(|id| format!("{:?}", id));
@@ -1911,6 +1961,146 @@ impl<'ctx> LLVMBackend<'ctx> {
                         self.value_map.insert(*result_id, return_val);
                     }
                 }
+            }
+
+            // ========== Algebraic Effects (Phase H) ==========
+            //
+            // Mirrors `cranelift_backend.rs`'s Tier 1 / Tier 3
+            // placeholder implementations so the LLVM backend doesn't
+            // diverge from Cranelift on effect semantics. See
+            // `effect_codegen.rs` for the design notes; in short:
+            //
+            //   * `PerformEffect` is lowered as a direct call to the
+            //     mangled handler op fn (`{Handler}${op}`), with an
+            //     extra i64 Resume<T> sentinel padded onto the args
+            //     when the matched impl has `is_resumable = true`.
+            //   * `HandleEffect`/`Resume`/`AbortEffect`/`CaptureContinuation`
+            //     are no-ops at the LLVM level for now — Tier 3 full
+            //     ABI is still placeholder. They produce a dummy
+            //     result (i64 0) so downstream uses don't trap.
+            HirInstruction::PerformEffect {
+                result,
+                effect_id,
+                op_name,
+                args,
+                return_ty,
+            } => {
+                let (handler_fn_id, is_resumable) = match self
+                    .effect_handler_index
+                    .get(&(*effect_id, *op_name))
+                    .copied()
+                {
+                    Some(entry) => entry,
+                    None => {
+                        // No handler — stash a dummy result so downstream
+                        // uses link. Cranelift traps in this case; we
+                        // could too, but the LLVM IR verifier is happier
+                        // with a value than an unreachable.
+                        if let Some(res_id) = result {
+                            self.value_map
+                                .insert(*res_id, self.context.i64_type().const_zero().into());
+                        }
+                        return Ok(());
+                    }
+                };
+
+                let llvm_fn = self.functions.get(&handler_fn_id).copied().ok_or_else(|| {
+                    CompilerError::CodeGen(format!(
+                        "PerformEffect: handler fn HirId {:?} not in self.functions",
+                        handler_fn_id
+                    ))
+                })?;
+
+                let mut arg_values: Vec<inkwell::values::BasicMetadataValueEnum> = args
+                    .iter()
+                    .map(|arg_id| self.get_value(*arg_id).map(|v| v.into()))
+                    .collect::<CompilerResult<Vec<_>>>()?;
+                if is_resumable {
+                    arg_values.push(self.context.i64_type().const_zero().into());
+                }
+
+                let call_site =
+                    self.builder
+                        .build_call(llvm_fn, &arg_values, "perform_effect")?;
+                if let Some(res_id) = result {
+                    if let ValueKind::Basic(ret_val) = call_site.try_as_basic_value() {
+                        self.value_map.insert(*res_id, ret_val);
+                    } else if matches!(return_ty, HirType::Void) {
+                        self.value_map
+                            .insert(*res_id, self.context.i64_type().const_zero().into());
+                    }
+                }
+            }
+
+            HirInstruction::HandleEffect {
+                result,
+                handler_id: _,
+                handler_state: _,
+                body_block: _,
+                continuation_block: _,
+                return_ty: _,
+            } => {
+                // Placeholder: HandleEffect is currently structural
+                // information only (the Cranelift backend doesn't yet
+                // push/pop a handler-stack frame around the body —
+                // see `effect_runtime.rs` for the runtime side).
+                // Materialise a dummy result so downstream uses link.
+                if let Some(res_id) = result {
+                    self.value_map
+                        .insert(*res_id, self.context.i64_type().const_zero().into());
+                }
+            }
+
+            HirInstruction::Resume {
+                value,
+                continuation: _,
+            } => {
+                // Placeholder: in the Tier 3 placeholder ABI, the SSA
+                // builder has already rewritten `k(v)` inside handler
+                // bodies into Call(Symbol("__zyntax_effect_resume"),
+                // ...) — so by the time the LLVM backend runs this
+                // shape, the rewrite has already happened. The direct
+                // `HirInstruction::Resume` arm exists for handcrafted
+                // HIR (tests) and the future full ABI work; for now
+                // it just plumbs the value through the
+                // __zyntax_effect_resume runtime symbol.
+                let resume_struct = self.context.i64_type().const_zero();
+                let value_arg = self.get_value(*value)?;
+                let resume_fn =
+                    self.module
+                        .get_function("__zyntax_effect_resume")
+                        .ok_or_else(|| {
+                            CompilerError::CodeGen(
+                                "Resume: __zyntax_effect_resume not registered (build runtime via \
+                                 register_effect_runtime_symbols)"
+                                    .to_string(),
+                            )
+                        })?;
+                let _ = self.builder.build_call(
+                    resume_fn,
+                    &[resume_struct.into(), value_arg.into()],
+                    "resume",
+                )?;
+            }
+
+            HirInstruction::AbortEffect {
+                value,
+                handler_scope: _,
+            } => {
+                // Placeholder: drop `value` and continue. The full
+                // Tier 3 ABI will route through __zyntax_effect_abort
+                // to unwind the caller's state machine.
+                let _ = self.get_value(*value)?;
+            }
+
+            HirInstruction::CaptureContinuation {
+                result,
+                resume_ty: _,
+            } => {
+                // Placeholder: produces a zero i64 sentinel. Real
+                // continuation capture is a future Tier 3 milestone.
+                self.value_map
+                    .insert(*result, self.context.i64_type().const_zero().into());
             }
 
             _ => {
