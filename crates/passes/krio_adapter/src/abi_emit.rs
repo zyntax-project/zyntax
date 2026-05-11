@@ -1615,6 +1615,313 @@ pub fn generate_promise_entry(
     entry
 }
 
+/// Phase I.3 helper: generate a *synchronous* entry wrapper for an
+/// effect-annotated function that's been put through the krio
+/// pipeline. Unlike [`generate_promise_entry`] — which returns a
+/// `*Promise<T>` and exposes the poll function to async machinery —
+/// this entry drives the poll loop inline and returns the final
+/// value with the original signature intact.
+///
+/// Shape:
+///
+///   entry(p0, ..., pN) -> T {
+///       sm = malloc(num_slots * 8)
+///       zero-init slots
+///       store params at their slots
+///       store state_id = 0
+///       loop {
+///           rc = poll_fn(sm)
+///           if rc != 0 { return cast_i64_to_T(rc) }
+///       }
+///   }
+///
+/// This assumes synchronous handlers — i.e. each `__zyntax_effect_resume`
+/// call runs to completion before returning to the caller, so poll_fn
+/// eventually returns a non-zero (Ready) value. Async-out-of-line
+/// handlers (Phase J.3) would loop forever here; the existing
+/// `generate_promise_entry` is what those should use instead.
+///
+/// `num_slots`, `param_slots`, `state_slot` follow the same conventions
+/// as [`generate_promise_entry`].
+pub fn generate_sync_entry(
+    original_name: InternedString,
+    original_signature: &HirFunctionSignature,
+    poll_fn_id: HirId,
+    num_slots: u32,
+    param_slots: &[(HirId, u32)],
+    state_slot: u32,
+) -> HirFunction {
+    // Entry sig: same params + same returns as the original.
+    let entry_sig = HirFunctionSignature {
+        params: original_signature.params.clone(),
+        returns: original_signature.returns.clone(),
+        type_params: original_signature.type_params.clone(),
+        const_params: original_signature.const_params.clone(),
+        lifetime_params: original_signature.lifetime_params.clone(),
+        is_variadic: false,
+        is_async: false,
+        effects: original_signature.effects.clone(),
+        is_pure: false,
+    };
+
+    let mut entry = HirFunction::new(original_name, entry_sig);
+
+    // Re-mint params for this function.
+    for (i, p) in original_signature.params.iter().enumerate() {
+        entry.values.insert(
+            p.id,
+            HirValue {
+                id: p.id,
+                ty: p.ty.clone(),
+                kind: HirValueKind::Parameter(i as u32),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+    }
+
+    let entry_block_id = entry.entry_block;
+    let mut entry_instructions: Vec<HirInstruction> = Vec::new();
+
+    // sm_size = num_slots * 8
+    let sm_size_id = mint_const_i64(&mut entry.values, num_slots as i64 * 8);
+
+    // sm = malloc(sm_size)
+    let sm_ptr_id = mint_value(
+        &mut entry.values,
+        HirType::Ptr(Box::new(HirType::U8)),
+        HirValueKind::Instruction,
+    );
+    entry_instructions.push(HirInstruction::Call {
+        result: Some(sm_ptr_id),
+        callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+        args: vec![sm_size_id],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+
+    // Zero-init every slot.
+    let zero_init_const = mint_const_i64(&mut entry.values, 0);
+    for slot_idx in 0..num_slots {
+        let offset_const = mint_const_i64(&mut entry.values, slot_idx as i64 * 8);
+        let slot_ptr = mint_value(
+            &mut entry.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        entry_instructions.push(HirInstruction::Binary {
+            result: slot_ptr,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: sm_ptr_id,
+            right: offset_const,
+        });
+        entry_instructions.push(HirInstruction::Store {
+            ptr: slot_ptr,
+            value: zero_init_const,
+            align: 8,
+            volatile: false,
+        });
+    }
+
+    // Initialize state_id slot to 0.
+    let state_init_id = mint_const_i64(&mut entry.values, 0);
+    let state_slot_offset_id = mint_const_i64(&mut entry.values, state_slot as i64 * 8);
+    let state_field_ptr_id = mint_value(
+        &mut entry.values,
+        HirType::Ptr(Box::new(HirType::I64)),
+        HirValueKind::Instruction,
+    );
+    entry_instructions.push(HirInstruction::Binary {
+        result: state_field_ptr_id,
+        op: BinaryOp::Add,
+        ty: HirType::I64,
+        left: sm_ptr_id,
+        right: state_slot_offset_id,
+    });
+    entry_instructions.push(HirInstruction::Store {
+        ptr: state_field_ptr_id,
+        value: state_init_id,
+        align: 8,
+        volatile: false,
+    });
+
+    // Store each param at its slot (cast to i64 first).
+    debug_assert_eq!(
+        param_slots.len(),
+        original_signature.params.len(),
+        "param_slots count must match signature.params count"
+    );
+    for (i, p) in original_signature.params.iter().enumerate() {
+        let slot = param_slots[i].1;
+        let cast_id = mint_value(&mut entry.values, HirType::I64, HirValueKind::Instruction);
+        let cast_op = pick_param_to_i64_cast(&p.ty);
+        entry_instructions.push(HirInstruction::Cast {
+            op: cast_op,
+            result: cast_id,
+            ty: HirType::I64,
+            operand: p.id,
+        });
+        let slot_offset_id = mint_const_i64(&mut entry.values, slot as i64 * 8);
+        let field_ptr_id = mint_value(
+            &mut entry.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        entry_instructions.push(HirInstruction::Binary {
+            result: field_ptr_id,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: sm_ptr_id,
+            right: slot_offset_id,
+        });
+        entry_instructions.push(HirInstruction::Store {
+            ptr: field_ptr_id,
+            value: cast_id,
+            align: 8,
+            volatile: false,
+        });
+    }
+
+    // Get the poll fn pointer via CreateClosure.
+    let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
+        params: vec![HirType::Ptr(Box::new(HirType::U8))],
+        returns: vec![HirType::I64],
+        lifetime_params: vec![],
+        is_variadic: false,
+    }));
+    let poll_fn_ptr_id = mint_value(
+        &mut entry.values,
+        poll_fn_ty.clone(),
+        HirValueKind::Instruction,
+    );
+    entry_instructions.push(HirInstruction::CreateClosure {
+        result: poll_fn_ptr_id,
+        closure_ty: poll_fn_ty.clone(),
+        function: poll_fn_id,
+        captures: vec![],
+    });
+
+    // Build the poll loop. Two blocks: poll_block (call + branch) and
+    // return_block (cast i64 → original return type, return).
+    let poll_block_id = HirId::new();
+    let return_block_id = HirId::new();
+
+    // Entry block terminates with branch to poll_block.
+    let entry_block = entry
+        .blocks
+        .get_mut(&entry_block_id)
+        .expect("HirFunction::new always creates an entry block");
+    entry_block.instructions = entry_instructions;
+    entry_block.terminator = HirTerminator::Branch {
+        target: poll_block_id,
+    };
+
+    // poll_block: rc = call poll_fn(sm); is_pending = (rc == 0);
+    //   branch is_pending, poll_block, return_block
+    let rc_id = mint_value(&mut entry.values, HirType::I64, HirValueKind::Instruction);
+    let zero_for_cmp = mint_const_i64(&mut entry.values, 0);
+    let is_pending_id = mint_value(&mut entry.values, HirType::Bool, HirValueKind::Instruction);
+    let poll_block = HirBlock {
+        id: poll_block_id,
+        label: Some(InternedString::new_global("sync_entry_poll")),
+        phis: vec![],
+        instructions: vec![
+            HirInstruction::IndirectCall {
+                result: Some(rc_id),
+                func_ptr: poll_fn_ptr_id,
+                args: vec![sm_ptr_id],
+                return_ty: HirType::I64,
+            },
+            HirInstruction::Binary {
+                result: is_pending_id,
+                op: BinaryOp::Eq,
+                ty: HirType::I64,
+                left: rc_id,
+                right: zero_for_cmp,
+            },
+        ],
+        terminator: HirTerminator::CondBranch {
+            condition: is_pending_id,
+            true_target: poll_block_id,
+            false_target: return_block_id,
+        },
+        dominance_frontier: HashSet::new(),
+        predecessors: vec![],
+        successors: vec![],
+    };
+
+    // return_block: cast i64 → return type, return.
+    let return_value = if original_signature.returns.is_empty() {
+        // Void return — just return.
+        None
+    } else {
+        let ret_ty = &original_signature.returns[0];
+        if matches!(ret_ty, HirType::I64) {
+            // No cast needed.
+            Some(rc_id)
+        } else {
+            // Cast i64 → ret_ty.
+            let cast_id =
+                mint_value(&mut entry.values, ret_ty.clone(), HirValueKind::Instruction);
+            // For non-i64 returns we'd need a cast op; for now keep it
+            // simple and only handle i64 returns. Fall back to bitcast
+            // for other primitives. Phase J can extend.
+            let cast_op = pick_i64_to_ret_cast(ret_ty);
+            let return_block = HirBlock {
+                id: return_block_id,
+                label: Some(InternedString::new_global("sync_entry_return")),
+                phis: vec![],
+                instructions: vec![HirInstruction::Cast {
+                    op: cast_op,
+                    result: cast_id,
+                    ty: ret_ty.clone(),
+                    operand: rc_id,
+                }],
+                terminator: HirTerminator::Return {
+                    values: vec![cast_id],
+                },
+                dominance_frontier: HashSet::new(),
+                predecessors: vec![],
+                successors: vec![],
+            };
+            entry.blocks.insert(return_block_id, return_block);
+            entry.blocks.insert(poll_block_id, poll_block);
+            return entry;
+        }
+    };
+    let return_block = HirBlock {
+        id: return_block_id,
+        label: Some(InternedString::new_global("sync_entry_return")),
+        phis: vec![],
+        instructions: vec![],
+        terminator: HirTerminator::Return {
+            values: return_value.map(|v| vec![v]).unwrap_or_default(),
+        },
+        dominance_frontier: HashSet::new(),
+        predecessors: vec![],
+        successors: vec![],
+    };
+
+    entry.blocks.insert(poll_block_id, poll_block);
+    entry.blocks.insert(return_block_id, return_block);
+
+    entry
+}
+
+/// Pick the right cast op to widen an i64 (poll-fn return) back to the
+/// caller's expected return type. Used by `generate_sync_entry`.
+fn pick_i64_to_ret_cast(ret_ty: &HirType) -> CastOp {
+    match ret_ty {
+        HirType::I8 | HirType::I16 | HirType::I32 => CastOp::Trunc,
+        HirType::U8 | HirType::U16 | HirType::U32 => CastOp::Trunc,
+        HirType::F32 | HirType::F64 => CastOp::Bitcast,
+        HirType::Ptr(_) => CastOp::IntToPtr,
+        _ => CastOp::Bitcast,
+    }
+}
+
 fn mint_value(values: &mut IndexMap<HirId, HirValue>, ty: HirType, kind: HirValueKind) -> HirId {
     let id = HirId::new();
     values.insert(

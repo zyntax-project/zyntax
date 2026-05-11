@@ -230,3 +230,91 @@ fn e4_orchestrator_no_op_for_non_async_function() {
         "non-async fn entry block must be untouched"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase I.3: generate_sync_entry — sync entry wrapper that drives the
+// poll loop inline and returns the value with the original signature
+// (instead of a *Promise). Companion to generate_promise_entry.
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn generate_sync_entry_produces_poll_loop_with_original_signature() {
+    use indexmap::IndexMap;
+    use krio_adapter::abi_emit::generate_sync_entry;
+    use zyntax_compiler::hir::{HirFunctionSignature, HirParam, ParamAttributes};
+    use zyntax_typed_ast::InternedString;
+
+    let sig = HirFunctionSignature {
+        params: vec![HirParam {
+            id: HirId::new(),
+            name: InternedString::new_global("p0"),
+            ty: HirType::I32,
+            attributes: ParamAttributes::default(),
+        }],
+        returns: vec![HirType::I64],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let poll_fn_id = HirId::new();
+    let num_slots = 3;
+    let param_slots = vec![(sig.params[0].id, 1u32)];
+    let state_slot = 0;
+
+    let entry = generate_sync_entry(
+        InternedString::new_global("my_effect_fn"),
+        &sig,
+        poll_fn_id,
+        num_slots,
+        &param_slots,
+        state_slot,
+    );
+
+    // Signature preserved: (i32) -> i64
+    assert_eq!(entry.signature.params.len(), 1);
+    assert!(matches!(entry.signature.params[0].ty, HirType::I32));
+    assert_eq!(entry.signature.returns.len(), 1);
+    assert!(matches!(entry.signature.returns[0], HirType::I64));
+
+    // is_async cleared — the entry is the synchronous public face.
+    assert!(!entry.signature.is_async);
+
+    // Three blocks: entry, poll_block, return_block.
+    assert_eq!(entry.blocks.len(), 3);
+
+    // Find the poll block by label.
+    let poll_block = entry
+        .blocks
+        .values()
+        .find(|b| {
+            b.label
+                .map(|l| l.resolve_global().as_deref() == Some("sync_entry_poll"))
+                .unwrap_or(false)
+        })
+        .expect("sync_entry_poll block exists");
+
+    // poll_block contains exactly: IndirectCall + Binary(Eq).
+    assert!(matches!(
+        poll_block.instructions[0],
+        zyntax_compiler::hir::HirInstruction::IndirectCall { .. }
+    ));
+    assert!(matches!(
+        poll_block.instructions[1],
+        zyntax_compiler::hir::HirInstruction::Binary { .. }
+    ));
+
+    // Terminator: CondBranch back to self on Pending, forward on Ready.
+    assert!(matches!(
+        poll_block.terminator,
+        zyntax_compiler::hir::HirTerminator::CondBranch {
+            true_target,
+            ..
+        } if true_target == poll_block.id
+    ));
+
+    let _ = IndexMap::<HirId, u32>::new(); // suppress unused-import
+}
