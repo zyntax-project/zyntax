@@ -1022,7 +1022,7 @@ impl ZyntaxRuntime {
     pub fn with_config(config: CompilationConfig) -> RuntimeResult<Self> {
         let backend = CraneliftBackend::new()?;
 
-        Ok(Self {
+        let mut runtime = Self {
             backend,
             function_ids: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -1035,7 +1035,13 @@ impl ZyntaxRuntime {
             plugin_signatures: HashMap::new(),
             runtime_events: Vec::new(),
             event_sink: None,
-        })
+        };
+        // Register the algebraic-effects runtime symbols
+        // (`__zyntax_effect_*`) up front so any module compiled later
+        // that references them links cleanly. No-op for modules that
+        // don't (the JIT only resolves symbols the IR actually calls).
+        crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        Ok(runtime)
     }
 
     /// Create a new runtime with additional runtime symbols for FFI
@@ -1044,7 +1050,7 @@ impl ZyntaxRuntime {
     pub fn with_symbols(symbols: &[(&str, *const u8)]) -> RuntimeResult<Self> {
         let backend = CraneliftBackend::with_runtime_symbols(symbols)?;
 
-        Ok(Self {
+        let mut runtime = Self {
             backend,
             function_ids: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -1057,7 +1063,9 @@ impl ZyntaxRuntime {
             plugin_signatures: HashMap::new(),
             runtime_events: Vec::new(),
             event_sink: None,
-        })
+        };
+        crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        Ok(runtime)
     }
 
     /// Compile a HIR module into the runtime

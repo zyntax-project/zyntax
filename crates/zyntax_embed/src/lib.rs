@@ -57,6 +57,7 @@
 
 mod array;
 mod convert;
+mod effect_runtime;
 mod error;
 mod grammar;
 mod grammar2;
@@ -65,6 +66,12 @@ pub mod iterator;
 mod runtime;
 mod string;
 mod value;
+
+// Re-export the algebraic-effects runtime symbols + registration helper.
+// Hosts that build a ZyntaxRuntime through the front-door
+// `ZyntaxRuntime::new()` get them registered automatically; this is
+// the seam for hosts that want to register them manually.
+pub use effect_runtime::register_effect_runtime_symbols;
 
 pub use array::ZyntaxArray;
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};
