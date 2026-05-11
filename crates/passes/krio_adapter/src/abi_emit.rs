@@ -816,6 +816,48 @@ pub fn lower_await_calls(
 /// after any await-allocated slots if `lower_await_calls` ran first).
 /// Returns the next free slot (= start_slot + num_perform_sites).
 ///
+/// ## Tier 3 (resumable) integration path — open work
+///
+/// Today this pass keeps the `PerformEffect` instruction in place and
+/// relies on the Cranelift backend's direct-call dispatch
+/// (`cranelift_backend.rs:3796`). For Tier 3 effects (handler param
+/// of type `Resume<T>` → `is_resumable = true`), the lowering needs
+/// to:
+///
+///   1. At the perform site, build a `Resume<T>` struct on the
+///      caller's state machine. Layout (8-byte fields, repr(C)):
+///        - `poll_fn_ptr: *u8`     — the caller's own poll function
+///        - `state_machine: *u8`   — the caller's frame pointer
+///        - `result_slot_offset`   — byte offset of `result_slot`
+///        - `next_state: u32`      — the resume state-id
+///      Stash this in a slot or pass by-reference into the handler.
+///
+///   2. Replace the `PerformEffect` IR with:
+///        - `lookup_handler = call __zyntax_effect_lookup_handler(effect_id)`
+///        - `op_fn = Load(lookup_handler + op_offset)`
+///        - `IndirectCall op_fn(handler_state, args..., resume_struct)`
+///      The `__zyntax_effect_*` symbols are registered by
+///      `zyntax_embed::register_effect_runtime_symbols`; the
+///      handler-stack push/pop happens in `HandleEffect` lowering
+///      (currently deferred — see M1.4 in the Phase H plan).
+///
+///   3. After the handler call returns, the resume_entry block loads
+///      the value via `__zyntax_effect_resume`'s side effect — the
+///      handler called `resume(v)` which wrote v at result_slot and
+///      advanced state. The compiled `resume(v)` call is a rewrite of
+///      `Resume<T>` method dispatch: handler body's `k(v)` → call to
+///      `__zyntax_effect_resume(k_ptr, v)`. That rewrite belongs in
+///      the SSA builder (`crates/compiler/src/ssa.rs`), keyed on the
+///      param's Resume<T> type.
+///
+/// The runtime symbols (`__zyntax_effect_*`) and per-thread handler
+/// stack already exist (`zyntax_embed::effect_runtime`); what's
+/// missing is (1) Resume<T> in the prelude as an opaque struct, and
+/// (2) the four lowering pieces above. Until then, this pass is a
+/// no-op for Tier 1 effects (skipped by the resumable-handler filter
+/// in `orchestrator::lower_async_module`) and structurally-ready for
+/// Tier 3 when the resume infrastructure lands.
+///
 /// Yield blocks containing `Intrinsic::Await` are skipped — they're
 /// handled by [`lower_await_calls`].
 pub fn lower_perform_effect_calls(
