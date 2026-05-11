@@ -631,6 +631,450 @@ fn phase_i5_breakthrough_real_resume_continuation() {
     );
 }
 
+/// Phase J.1 candidate: multi-shot resumption. Handler calls `k(v)`
+/// three times with different values and sums the results. If the
+/// caller's continuation re-enters cleanly each time, the result is
+/// `k(10) + k(20) + k(30) = 20 + 40 + 60 = 120`. If state leaks
+/// between resumes, the result diverges.
+///
+///   effect E { def op(): i64 }
+///   handler H for E {
+///       def op(k: Resume<i64>): i64 {
+///           return k(10) + k(20) + k(30)
+///       }
+///   }
+///   @effect(E) def run(): i64 {
+///       return op() * 2     // caller continuation: multiply by 2
+///   }
+///
+/// Multi-shot in the simplest case (no captures-lift slots mutated
+/// by post-perform code) works under Phase I without explicit state
+/// machine cloning — each `__zyntax_effect_resume` call resets the
+/// result_slot + state_slot, re-polls the same state machine, and
+/// returns the result. Whether this generalises to more complex
+/// post-perform code with mutable captures is Phase J.1's larger
+/// question; this test is the lower-bound check.
+fn build_multi_shot_program() -> TypedProgram {
+    let mut registry = TypeRegistry::new();
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![Type::Primitive(PrimitiveType::I64)],
+        const_args: vec![],
+        variance: vec![],
+        nullability: NullabilityKind::NonNull,
+    };
+
+    let e_effect = TypedEffect {
+        name: InternedString::new_global("E"),
+        type_params: vec![],
+        operations: vec![TypedEffectOp {
+            name: InternedString::new_global("op"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::I64),
+            span: span(),
+        }],
+        span: span(),
+    };
+
+    // Build `k(N)` expression as a call to the k param with N.
+    let make_k_call = |n: i128| -> TypedNode<TypedExpression> {
+        let k_var = TypedNode::new(
+            TypedExpression::Variable(InternedString::new_global("k")),
+            resume_ty.clone(),
+            span(),
+        );
+        TypedNode::new(
+            TypedExpression::Call(TypedCall {
+                callee: Box::new(k_var),
+                positional_args: vec![TypedNode::new(
+                    TypedExpression::Literal(TypedLiteral::Integer(n)),
+                    Type::Primitive(PrimitiveType::I64),
+                    span(),
+                )],
+                named_args: vec![],
+                type_args: vec![],
+            }),
+            Type::Primitive(PrimitiveType::I64),
+            span(),
+        )
+    };
+
+    // Handler body: return k(10) + k(20) + k(30)
+    let k10 = make_k_call(10);
+    let k20 = make_k_call(20);
+    let k30 = make_k_call(30);
+    let k10_plus_k20 = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Add,
+            left: Box::new(k10),
+            right: Box::new(k20),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let sum_all = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Add,
+            left: Box::new(k10_plus_k20),
+            right: Box::new(k30),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let handler_body = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(sum_all))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let handler = TypedEffectHandler {
+        name: InternedString::new_global("H"),
+        effect_name: InternedString::new_global("E"),
+        type_params: vec![],
+        fields: vec![],
+        handlers: vec![TypedEffectHandlerImpl {
+            op_name: InternedString::new_global("op"),
+            return_type: Type::Primitive(PrimitiveType::I64),
+            params: vec![TypedParameter {
+                name: InternedString::new_global("k"),
+                ty: resume_ty,
+                ..Default::default()
+            }],
+            body: Some(TypedBlock {
+                statements: vec![handler_body],
+                span: span(),
+            }),
+            ..Default::default()
+        }],
+        span: span(),
+    };
+
+    // run() body: return op() * 2
+    let op_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("op")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let op_times_2 = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Mul,
+            left: Box::new(op_call),
+            right: Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(2)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let return_op2 = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(op_times_2))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let run_fn = TypedFunction {
+        name: InternedString::new_global("run"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        body: Some(TypedBlock {
+            statements: vec![return_op2],
+            span: span(),
+        }),
+        annotations: vec![TypedAnnotation {
+            name: InternedString::new_global("effect"),
+            args: vec![ident_arg("E")],
+            span: span(),
+        }],
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(
+                TypedDeclaration::Effect(e_effect),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::EffectHandler(handler),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::Function(run_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        type_registry: registry,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn phase_j1_multi_shot_resumption_simple_case() {
+    // Multi-shot resume: handler calls k(10), k(20), k(30) and sums.
+    // Each k(N) re-enters the caller's continuation `op() * 2`, so:
+    //   k(10) = 20, k(20) = 40, k(30) = 60
+    //   sum = 120
+    // The handler returns 120 to run(), which returns 120.
+    //
+    // This test exists as a lower-bound check: in the no-captures-lift
+    // case Phase I's single-shot path generalises trivially because
+    // each `__zyntax_effect_resume` call independently sets
+    // result_slot + state_slot and re-polls. If/when post-perform code
+    // mutates captures-lift state across resumes, state machine
+    // cloning becomes necessary (the Phase J.1 work proper).
+    let program = build_multi_shot_program();
+    let mut runtime = ZyntaxRuntime::new().expect("runtime must construct");
+    runtime
+        .compile_typed_program(program)
+        .expect("compile_typed_program must succeed for multi-shot");
+
+    let sig = NativeSignature::new(&[], NativeType::I64);
+    let result = runtime
+        .call_function("run", &[], &sig)
+        .expect("runtime.call_function(\"run\") should execute multi-shot");
+    assert_eq!(
+        result.as_i64(),
+        Some(120),
+        "Multi-shot: handler k(10)+k(20)+k(30) = 20+40+60 = 120. \
+         Got {:?}. If 60 (or any single-resume value), only the last k(N) \
+         actually ran. If something else, state leaked between resumes.",
+        result
+    );
+}
+
+/// Phase J.2: build an abort-pattern program that has POST-PERFORM
+/// code. The handler aborts; that code MUST NOT run.
+///
+///   effect E { def op(): i64 }
+///   handler H for E {
+///       def op(k: Resume<i64>): i64 {
+///           return abort(99)        // skip caller's continuation
+///       }
+///   }
+///   @effect(E) def run(): i64 {
+///       let x = op()
+///       return x * 2                // ← MUST NOT run on abort
+///   }
+///
+/// Expected: `run() = 99` (handler returned 99 directly).
+/// If abort got treated like resume (placeholder bug), the
+/// post-perform `x * 2` would run with x=99 → 198.
+fn build_abort_with_post_perform_program() -> TypedProgram {
+    let mut registry = TypeRegistry::new();
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![Type::Primitive(PrimitiveType::I64)],
+        const_args: vec![],
+        variance: vec![],
+        nullability: NullabilityKind::NonNull,
+    };
+
+    let e_effect = TypedEffect {
+        name: InternedString::new_global("E"),
+        type_params: vec![],
+        operations: vec![TypedEffectOp {
+            name: InternedString::new_global("op"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::I64),
+            span: span(),
+        }],
+        span: span(),
+    };
+
+    // Handler body: return abort(99)
+    let abort_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("abort")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(99)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let handler_body = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(abort_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let handler = TypedEffectHandler {
+        name: InternedString::new_global("H"),
+        effect_name: InternedString::new_global("E"),
+        type_params: vec![],
+        fields: vec![],
+        handlers: vec![TypedEffectHandlerImpl {
+            op_name: InternedString::new_global("op"),
+            return_type: Type::Primitive(PrimitiveType::I64),
+            params: vec![TypedParameter {
+                name: InternedString::new_global("k"),
+                ty: resume_ty,
+                ..Default::default()
+            }],
+            body: Some(TypedBlock {
+                statements: vec![handler_body],
+                span: span(),
+            }),
+            ..Default::default()
+        }],
+        span: span(),
+    };
+
+    // run() body: let x = op(); return x * 2
+    let op_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("op")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let let_x_eq_op = TypedNode::new(
+        TypedStatement::Let(TypedLet {
+            name: InternedString::new_global("x"),
+            ty: Type::Primitive(PrimitiveType::I64),
+            initializer: Some(Box::new(op_call)),
+            mutability: zyntax_typed_ast::type_registry::Mutability::Immutable,
+            span: span(),
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+    let x_var = TypedNode::new(
+        TypedExpression::Variable(InternedString::new_global("x")),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let x_times_2 = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Mul,
+            left: Box::new(x_var),
+            right: Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(2)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let return_x2 = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(x_times_2))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let run_fn = TypedFunction {
+        name: InternedString::new_global("run"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        body: Some(TypedBlock {
+            statements: vec![let_x_eq_op, return_x2],
+            span: span(),
+        }),
+        annotations: vec![TypedAnnotation {
+            name: InternedString::new_global("effect"),
+            args: vec![ident_arg("E")],
+            span: span(),
+        }],
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(
+                TypedDeclaration::Effect(e_effect),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::EffectHandler(handler),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::Function(run_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        type_registry: registry,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn phase_j2_abort_skips_post_perform_code() {
+    // Distinguishing abort from resume requires showing that the
+    // caller's post-perform code DOESN'T run on abort. Handler returns
+    // 99 via `abort(99)`; the caller has `let x = op(); return x * 2`.
+    // With correct abort semantics: run() returns 99 (post-perform
+    // skipped). With abort-treated-as-resume: 198 (post-perform ran
+    // with x=99).
+    //
+    // The Phase I.2 refinement (yield_block returns the handler's
+    // value directly instead of bumping state and re-polling) gives
+    // this for free: the handler returns 99 → yield_block returns 99
+    // → entry wrapper's poll loop sees Ready(99) → run() returns 99.
+    let program = build_abort_with_post_perform_program();
+    let mut runtime = ZyntaxRuntime::new().expect("runtime must construct");
+    runtime
+        .compile_typed_program(program)
+        .expect("compile_typed_program must succeed for abort-with-post-perform");
+
+    let sig = NativeSignature::new(&[], NativeType::I64);
+    let result = runtime
+        .call_function("run", &[], &sig)
+        .expect("runtime.call_function(\"run\") should execute the abort test");
+    assert_eq!(
+        result.as_i64(),
+        Some(99),
+        "abort(99): handler should return 99 directly, post-perform `x * 2` MUST NOT run. \
+         Got {:?}. If 198, abort was treated like resume and post-perform ran with x=99.",
+        result
+    );
+}
+
 #[test]
 fn effect_runtime_symbols_are_registered_at_runtime_construction() {
     // Phase H Tier 3 foundation: `ZyntaxRuntime::new()` automatically
