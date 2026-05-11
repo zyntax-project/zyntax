@@ -3785,8 +3785,18 @@ impl SsaBuilder {
                 // Calculate field index
                 let field_index = self.get_field_index(&object_type, field)?;
 
-                // Single-field structs are flattened by Cranelift's ABI — the struct
-                // value IS the field value. ExtractValue on a bare scalar is invalid.
+                // Single-field structs MAY be flattened by Cranelift's ABI at
+                // call/return boundaries (the struct value IS the field value,
+                // so an ExtractValue on the bare scalar is invalid). But inside
+                // a function body — particularly for `self` in an impl method,
+                // or for struct literals constructed locally — the SSA value
+                // still has `HirType::Struct{...}` and ExtractValue is the
+                // right thing.
+                //
+                // Decide based on the SSA value's actual HirType, not a count.
+                // If the value already lacks fields (i.e. Cranelift's ABI has
+                // flattened the struct away), return as-is; otherwise do
+                // ExtractValue.
                 let num_fields = if let Type::Named { id, .. } = &object_type {
                     self.type_registry
                         .get_type_by_id(*id)
@@ -3797,8 +3807,55 @@ impl SsaBuilder {
                 };
 
                 if num_fields == 1 && field_index == 0 {
-                    // Single-field struct: the object value IS the field
-                    return Ok(object_val);
+                    // Cranelift's ABI flattens single-field structs at
+                    // function-arg/return boundaries — the param's actual
+                    // Cranelift value is the bare scalar even though the
+                    // SSA `HirType` still says `Struct{[I32]}`. The
+                    // original shortcut (`return object_val as-is`) is
+                    // correct for the Cranelift VALUE (it IS the field),
+                    // but the consumer reading `object_val`'s HirType saw
+                    // `Struct{...}` and fell into wrong codegen paths —
+                    // notably `print_dynamic`'s boxing taking the
+                    // "Unhandled type" fallback that prints the field as
+                    // an opaque pointer-tag instead of the i32 value.
+                    //
+                    // Fix: rebind the value with the field's actual type
+                    // so downstream type-driven dispatch (boxing,
+                    // arithmetic widening, etc.) sees the right HirType.
+                    // The Cranelift value stays the same — we just emit a
+                    // Bitcast which Cranelift will lower to a no-op when
+                    // the IR types match (both i32 here).
+                    let field_ty = if let Type::Named { id, .. } = &object_type {
+                        self.type_registry
+                            .get_type_by_id(*id)
+                            .and_then(|td| td.fields.first().map(|f| self.convert_type(&f.ty)))
+                    } else {
+                        None
+                    };
+                    if let Some(field_hir_ty) = field_ty {
+                        let object_hir_ty =
+                            self.function.values.get(&object_val).map(|v| v.ty.clone());
+                        if object_hir_ty.as_ref() != Some(&field_hir_ty) {
+                            // Rebind with the field's HirType via Bitcast.
+                            let rebind = self
+                                .create_value(field_hir_ty.clone(), HirValueKind::Instruction);
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Cast {
+                                    result: rebind,
+                                    ty: field_hir_ty,
+                                    op: crate::hir::CastOp::Bitcast,
+                                    operand: object_val,
+                                },
+                            );
+                            self.add_use(object_val, rebind);
+                            return Ok(rebind);
+                        }
+                        // Types already match — no rebind needed.
+                        return Ok(object_val);
+                    }
+                    // Fall through to ExtractValue when we couldn't resolve
+                    // the field type.
                 }
 
                 // Resolve the field's actual type from the struct definition.
