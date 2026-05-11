@@ -22,6 +22,33 @@ use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
 
+#[test]
+fn effect_runtime_symbols_are_registered_at_runtime_construction() {
+    // Phase H Tier 3 foundation: `ZyntaxRuntime::new()` automatically
+    // wires the 5 `__zyntax_effect_*` runtime symbols via
+    // `register_effect_runtime_symbols`. Verify each appears in the
+    // runtime's `plugin_signatures` map with the expected param count
+    // (the call-site lowering reads param_count to size args).
+    let runtime = ZyntaxRuntime::new().expect("runtime construction must succeed");
+    let sigs = runtime.plugin_signatures();
+
+    for (name, expected_params) in [
+        ("__zyntax_effect_push_handler", 3),
+        ("__zyntax_effect_pop_handler", 1),
+        ("__zyntax_effect_lookup_handler", 1),
+        ("__zyntax_effect_resume", 2),
+        ("__zyntax_effect_abort", 1),
+    ] {
+        let sig = sigs
+            .get(name)
+            .unwrap_or_else(|| panic!("runtime symbol {name} should be registered"));
+        assert_eq!(
+            sig.param_count, expected_params,
+            "{name}: param_count mismatch",
+        );
+    }
+}
+
 fn span() -> Span {
     Span::new(0, 0)
 }
