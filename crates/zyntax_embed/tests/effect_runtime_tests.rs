@@ -1353,7 +1353,10 @@ fn phase_j3_async_out_of_line_resume() {
 
     // The stash slot must now hold a non-null Resume<T> pointer.
     let stashed = *stashed_resume_slot().lock().unwrap();
-    assert_ne!(stashed, 0, "Handler should have stashed a non-null Resume pointer");
+    assert_ne!(
+        stashed, 0,
+        "Handler should have stashed a non-null Resume pointer"
+    );
 
     // Drive the continuation out-of-line: invoke __zyntax_effect_resume
     // directly with value=100. The runtime symbol re-polls the @effect
@@ -1362,8 +1365,7 @@ fn phase_j3_async_out_of_line_resume() {
     // The runtime symbol is `extern "C"` and the stashed pointer
     // originated from a still-live state machine — no actual unsafety
     // beyond what `extern "C"` already exposes.
-    let out_of_line_result =
-        zyntax_embed::__zyntax_effect_resume(stashed as *mut u8, 100);
+    let out_of_line_result = zyntax_embed::__zyntax_effect_resume(stashed as *mut u8, 100);
     assert_eq!(
         out_of_line_result, 200,
         "Out-of-line resume with value=100 should run post-perform `x * 2` → 200. Got {}",
