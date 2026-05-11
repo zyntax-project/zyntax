@@ -220,6 +220,180 @@ fn tier3_resumable_effect_executes_through_runtime() {
     );
 }
 
+/// Build a TypedProgram with an *abort-pattern* (exception-like)
+/// resumable handler:
+///
+///   effect E { def op(): i64 }
+///   handler H for E { def op(k: Resume<i64>): i64 { return abort(-7) } }
+///   @effect(E) def run(): i64 { return op() }
+///
+/// The handler chooses to *abort* rather than resume: `abort(-7)`
+/// returns -7 through the placeholder runtime symbol. Under the
+/// current placeholder ABI both `resume(v)` and `abort(v)` produce
+/// the same observable effect (handler returns v, caller gets v).
+/// The full Tier 3 ABI distinguishes them by unwinding the caller's
+/// state machine on abort. This test verifies the abort *rewrite*
+/// fires: `abort(-7)` inside a resumable handler body becomes
+/// `Call(Symbol("__zyntax_effect_abort"), [-7])`.
+fn build_abort_pattern_program() -> TypedProgram {
+    let mut registry = TypeRegistry::new();
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![Type::Primitive(PrimitiveType::I64)],
+        const_args: vec![],
+        variance: vec![],
+        nullability: NullabilityKind::NonNull,
+    };
+
+    let e_effect = TypedEffect {
+        name: InternedString::new_global("E"),
+        type_params: vec![],
+        operations: vec![TypedEffectOp {
+            name: InternedString::new_global("op"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::I64),
+            span: span(),
+        }],
+        span: span(),
+    };
+
+    // Body: return abort(-7)
+    let abort_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("abort")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(-7)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let handler_body = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(abort_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let handler = TypedEffectHandler {
+        name: InternedString::new_global("H"),
+        effect_name: InternedString::new_global("E"),
+        type_params: vec![],
+        fields: vec![],
+        handlers: vec![TypedEffectHandlerImpl {
+            op_name: InternedString::new_global("op"),
+            return_type: Type::Primitive(PrimitiveType::I64),
+            params: vec![TypedParameter {
+                name: InternedString::new_global("k"),
+                ty: resume_ty,
+                ..Default::default()
+            }],
+            body: Some(TypedBlock {
+                statements: vec![handler_body],
+                span: span(),
+            }),
+            ..Default::default()
+        }],
+        span: span(),
+    };
+
+    let op_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("op")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let return_op = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(op_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let run_fn = TypedFunction {
+        name: InternedString::new_global("run"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        body: Some(TypedBlock {
+            statements: vec![return_op],
+            span: span(),
+        }),
+        annotations: vec![TypedAnnotation {
+            name: InternedString::new_global("effect"),
+            args: vec![ident_arg("E")],
+            span: span(),
+        }],
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(
+                TypedDeclaration::Effect(e_effect),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::EffectHandler(handler),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::Function(run_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        type_registry: registry,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn tier3_abort_pattern_executes_through_runtime() {
+    // Phase H Tier 3 abort pattern: the handler chooses NOT to resume
+    // — it calls `abort(-7)` instead, which the SSA builder rewrites
+    // to `Call(Symbol("__zyntax_effect_abort"), [-7])`. The runtime
+    // symbol returns -7 (placeholder ABI), the handler returns -7,
+    // and run() receives -7 as the perform's result.
+    let program = build_abort_pattern_program();
+    let mut runtime = ZyntaxRuntime::new().expect("runtime must construct");
+    runtime
+        .compile_typed_program(program)
+        .expect("compile_typed_program must succeed for abort-pattern handler");
+
+    let sig = NativeSignature::new(&[], NativeType::I64);
+    let result = runtime
+        .call_function("run", &[], &sig)
+        .expect("runtime.call_function(\"run\") should execute the abort-pattern handler");
+    assert_eq!(
+        result.as_i64(),
+        Some(-7),
+        "abort pattern: run() → perform(op) → H.op(k) → abort(-7) → __zyntax_effect_abort → -7; got {:?}",
+        result
+    );
+}
+
 #[test]
 fn effect_runtime_symbols_are_registered_at_runtime_construction() {
     // Phase H Tier 3 foundation: `ZyntaxRuntime::new()` automatically

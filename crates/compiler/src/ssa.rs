@@ -3266,6 +3266,37 @@ impl SsaBuilder {
                             self.add_instruction(block_id, inst);
                             return Ok(result);
                         }
+                        // Phase H Tier 3: `abort(v)` inside a resumable
+                        // handler body lowers to a call to
+                        // `__zyntax_effect_abort` — the exception-like
+                        // pattern where the handler returns to its
+                        // caller WITHOUT resuming the continuation.
+                        // Gated on resumable-handler context so a
+                        // user-defined `abort` outside handlers doesn't
+                        // accidentally get hijacked.
+                        if name.resolve_global().as_deref() == Some("abort") {
+                            let value_arg = if let Some(arg) = call.positional_args.first() {
+                                self.translate_expression(block_id, arg)?
+                            } else {
+                                self.create_value(
+                                    HirType::I64,
+                                    HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+                                )
+                            };
+                            let result = self.create_value(HirType::I64, HirValueKind::Instruction);
+                            let inst = HirInstruction::Call {
+                                result: Some(result),
+                                callee: crate::hir::HirCallable::Symbol(
+                                    "__zyntax_effect_abort".to_string(),
+                                ),
+                                args: vec![value_arg],
+                                type_args: vec![],
+                                const_args: vec![],
+                                is_tail: false,
+                            };
+                            self.add_instruction(block_id, inst);
+                            return Ok(result);
+                        }
                     }
                 }
 
