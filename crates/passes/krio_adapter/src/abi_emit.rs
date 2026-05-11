@@ -1129,9 +1129,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
                 return_ty,
             } = inst
             {
-                if let Some(&handler_fn_id) =
-                    handler_resolution.get(&(*effect_id, *op_name))
-                {
+                if let Some(&handler_fn_id) = handler_resolution.get(&(*effect_id, *op_name)) {
                     sites.push(PerformSite {
                         block_id: *block_id,
                         inst_idx: i,
@@ -1159,12 +1157,14 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // Extract result_slot (matches perform_result_temp) and
         // next_state (constant stored to the other slot) from
         // ready_block's AsyncSaveSlots.
-        let (result_slot, next_state) =
-            match extract_result_and_state_slots(function, ready_block_id, site.perform_result_temp)
-            {
-                Some(t) => t,
-                None => continue,
-            };
+        let (result_slot, next_state) = match extract_result_and_state_slots(
+            function,
+            ready_block_id,
+            site.perform_result_temp,
+        ) {
+            Some(t) => t,
+            None => continue,
+        };
 
         // Mint values + build the new instruction sequence.
         let mut new_insts: Vec<HirInstruction> = Vec::new();
@@ -1214,8 +1214,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
         let off8 = mint_const_i64(&mut function.values, 8);
         let off16 = mint_const_i64(&mut function.values, 16);
         let off24 = mint_const_i64(&mut function.values, 24);
-        let result_offset_const =
-            mint_const_i64(&mut function.values, (result_slot * 8) as i64);
+        let result_offset_const = mint_const_i64(&mut function.values, (result_slot * 8) as i64);
         let next_state_const_id = mint_const_i64(&mut function.values, next_state as i64);
         let fp0 = mint_value(
             &mut function.values,
@@ -2203,8 +2202,7 @@ pub fn generate_sync_entry(
             Some(rc_id)
         } else {
             // Cast i64 → ret_ty.
-            let cast_id =
-                mint_value(&mut entry.values, ret_ty.clone(), HirValueKind::Instruction);
+            let cast_id = mint_value(&mut entry.values, ret_ty.clone(), HirValueKind::Instruction);
             // For non-i64 returns we'd need a cast op; for now keep it
             // simple and only handle i64 returns. Fall back to bitcast
             // for other primitives. Phase J can extend.

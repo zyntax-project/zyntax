@@ -3837,8 +3837,8 @@ impl SsaBuilder {
                             self.function.values.get(&object_val).map(|v| v.ty.clone());
                         if object_hir_ty.as_ref() != Some(&field_hir_ty) {
                             // Rebind with the field's HirType via Bitcast.
-                            let rebind = self
-                                .create_value(field_hir_ty.clone(), HirValueKind::Instruction);
+                            let rebind =
+                                self.create_value(field_hir_ty.clone(), HirValueKind::Instruction);
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Cast {

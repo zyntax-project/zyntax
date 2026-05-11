@@ -882,8 +882,7 @@ fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> Runtim
             if !impl_.is_resumable {
                 continue;
             }
-            let mangled =
-                zyntax_compiler::mangle_handler_op_name(handler.name, impl_.op_name);
+            let mangled = zyntax_compiler::mangle_handler_op_name(handler.name, impl_.op_name);
             if let Some(handler_fn_id) = module
                 .functions
                 .iter()

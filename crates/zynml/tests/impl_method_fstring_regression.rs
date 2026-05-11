@@ -87,9 +87,9 @@ fn impl_method_fstring_single_field_struct_does_not_print_opaque_tag() {
             "single-field struct impl method with f-string should run cleanly; got {}",
             e
         ),
-        Err(_) => panic!(
-            "single-field struct impl method with f-string caused a runtime panic / SIGSEGV"
-        ),
+        Err(_) => {
+            panic!("single-field struct impl method with f-string caused a runtime panic / SIGSEGV")
+        }
     }
 }
 
@@ -120,7 +120,10 @@ fn impl_method_fstring_two_field_struct_still_works() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zynml.run(source)));
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("multi-field struct impl method should still work; got {}", e),
+        Ok(Err(e)) => panic!(
+            "multi-field struct impl method should still work; got {}",
+            e
+        ),
         Err(_) => panic!("multi-field struct impl method caused a runtime panic"),
     }
 }
@@ -150,7 +153,10 @@ fn free_fn_fstring_with_single_field_struct_param_works() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| zynml.run(source)));
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("free fn with 1-field struct param should run cleanly; got {}", e),
+        Ok(Err(e)) => panic!(
+            "free fn with 1-field struct param should run cleanly; got {}",
+            e
+        ),
         Err(_) => panic!("free fn with 1-field struct param caused a panic"),
     }
 }
