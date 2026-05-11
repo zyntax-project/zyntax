@@ -61,8 +61,14 @@ mod effect_runtime;
 mod error;
 mod grammar;
 mod grammar2;
+#[cfg(feature = "native")]
 mod import_chain;
 pub mod iterator;
+// `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
+// loader, async executor). Disabled in `parse-only` builds — the
+// browser path (Phase B+) will introduce a separate interpreter-
+// backed runtime module.
+#[cfg(feature = "native")]
 mod runtime;
 mod string;
 mod value;
@@ -71,9 +77,11 @@ mod value;
 // Hosts that build a ZyntaxRuntime through the front-door
 // `ZyntaxRuntime::new()` get them registered automatically; this is
 // the seam for hosts that want to register them manually.
+#[cfg(feature = "native")]
+pub use effect_runtime::register_effect_runtime_symbols;
 pub use effect_runtime::{
     __zyntax_effect_abort, __zyntax_effect_lookup_handler, __zyntax_effect_pop_handler,
-    __zyntax_effect_push_handler, __zyntax_effect_resume, register_effect_runtime_symbols,
+    __zyntax_effect_push_handler, __zyntax_effect_resume,
 };
 
 pub use array::ZyntaxArray;
@@ -86,6 +94,7 @@ pub use iterator::{
     ZrtlIteratorExt, ZrtlRangeIterator, ZyntaxArrayIterator, ZyntaxStringBytesIterator,
     ZyntaxStringCharsIterator, ZyntaxValueIterator,
 };
+#[cfg(feature = "native")]
 pub use runtime::{
     // Async ABI types
     AsyncPollResult,
@@ -132,6 +141,7 @@ pub use zyn_peg::runtime::{
 pub use zyntax_typed_ast::TypedProgram;
 
 // Re-export tiered compilation types
+#[cfg(feature = "native")]
 pub use zyntax_compiler::tiered_backend::{OptimizationTier, TieredConfig, TieredStatistics};
 
 // Re-export core types from zyntax_compiler for convenience
@@ -160,6 +170,7 @@ pub use zyntax_compiler::zrtl::{
 
 // Re-export compiler types needed for module compilation
 pub use zyntax_compiler::{
-    compile_to_hir, compile_to_jit, CompilationConfig, CompilerError, CompilerResult, HirFunction,
-    HirModule,
+    compile_to_hir, CompilationConfig, CompilerError, CompilerResult, HirModule,
 };
+#[cfg(feature = "native")]
+pub use zyntax_compiler::{compile_to_jit, HirFunction};

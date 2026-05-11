@@ -46,6 +46,7 @@ pub mod trait_lowering; // Trait/interface lowering to HIR
 pub mod typed_cfg; // New: TypedAST-aware CFG builder
 pub mod vtable_registry; // Vtable management and caching // Async runtime (executor, task, waker)
 
+#[cfg(feature = "cranelift-backend")]
 pub mod cranelift_backend;
 
 #[cfg(feature = "llvm-backend")]
@@ -54,10 +55,12 @@ pub mod llvm_backend;
 #[cfg(feature = "llvm-backend")]
 pub mod llvm_jit_backend; // LLVM MCJIT for hot-path optimization
 
+#[cfg(feature = "cranelift-backend")]
 pub mod beadie_adapter; // beadie::JitBackend wrappers for our backends
 pub mod osr; // On-stack replacement infrastructure (probe, registry, layout)
 pub mod plugin; // Plugin system for frontend runtime registration
 pub mod profiling; // Runtime profiling for tiered compilation
+#[cfg(feature = "cranelift-backend")]
 pub mod tiered_backend; // Tiered JIT/AOT compilation system
 pub mod zpack;
 pub mod zrtl; // ZRTL (Zyntax Runtime Library) dynamic plugin format // ZPack package format for distributing modules + runtimes
@@ -73,6 +76,7 @@ pub use borrow_check::{
 };
 pub use cfg::{BasicBlock, CfgEdge, ControlFlowGraph};
 pub use const_eval::{ConstEvalContext, ConstEvaluator};
+#[cfg(feature = "cranelift-backend")]
 pub use cranelift_backend::{
     cranelift_skipped_function_count, reset_cranelift_skipped_function_count,
 };

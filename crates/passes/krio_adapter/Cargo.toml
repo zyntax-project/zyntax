@@ -7,7 +7,11 @@ description = "Adapter wiring zyntax HIR into krio-async's CFG-shaped CoroCfg / 
 
 [dependencies]
 zyntax_typed_ast = { path = "../../typed_ast" }
-zyntax_compiler  = { path = "../../compiler" }
+# default-features=false so krio_adapter doesn't force the cranelift
+# / dynamic-plugins features on downstream crates that use it from a
+# `parse-only` build. Backend features are activated by the consumer
+# (zyntax_embed's `native` feature).
+zyntax_compiler  = { path = "../../compiler", default-features = false }
 
 # Pinned to a specific commit on the upstream krio repo. Phase G
 # improvements (TransformOptions::reserved_slots, validate_layout,

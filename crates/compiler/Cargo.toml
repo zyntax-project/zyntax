@@ -43,14 +43,17 @@ tempfile = { workspace = true }
 rayon = { workspace = true }
 fnv = "1.0.7"  # Fast hash function
 
-# Dynamic library loading for ZRTL plugins
-libloading = "0.8"
+# Dynamic library loading for ZRTL plugins (native targets only).
+# Optional so the crate can build for wasm32, which has no dlopen.
+libloading = { version = "0.8", optional = true }
 
 # Lazy initialization for global state
 once_cell = "1.19"
 
-# Archive format for ZPack
-zip = "2.2"
+# Archive format for ZPack. default-features=false drops bzip2/lzma
+# native build-deps that don't compile for wasm32; only `deflate` is
+# actually used by zpack archives.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Hot-function promotion broker for interpreter-to-JIT tiering
 beadie = "0.3"
@@ -73,10 +76,14 @@ name = "simd_vectorization"
 harness = false
 
 [features]
-default = ["cranelift-backend"]
+default = ["cranelift-backend", "dynamic-plugins"]
 cranelift-backend = ["cranelift", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 llvm-backend = ["inkwell"]
 all-backends = ["cranelift-backend", "llvm-backend"]
+# `dynamic-plugins` enables runtime loading of ZRTL plugins from `.zrtl`
+# files via libloading (dlopen). Off for wasm32 targets — see the
+# wasm-build plan at /Users/amaterasu/.claude/plans/effervescent-pondering-sutton.md
+dynamic-plugins = ["libloading"]
 
 [lints]
 workspace = true

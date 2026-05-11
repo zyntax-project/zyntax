@@ -237,8 +237,16 @@ impl ZPack {
         // Read bytecode modules
         let modules = Self::read_modules(&mut archive)?;
 
-        // Extract and load runtime for current platform (JIT mode)
+        // Extract and load runtime for current platform (JIT mode).
+        // `dynamic-plugins`-gated: without it (wasm32), runtime is None
+        // and the embedder must register plugins statically (Phase C).
+        #[cfg(feature = "dynamic-plugins")]
         let (runtime, runtime_temp_dir) = Self::load_runtime(&mut archive)?;
+        #[cfg(not(feature = "dynamic-plugins"))]
+        let (runtime, runtime_temp_dir): (Option<ZrtlPlugin>, Option<tempfile::TempDir>) =
+            (None, None);
+        // `archive` is unused on the wasm path beyond this point.
+        let _ = archive;
 
         Ok(Self {
             manifest,
@@ -304,7 +312,11 @@ impl ZPack {
         Ok(modules)
     }
 
-    /// Extract and load runtime library for current platform
+    /// Extract and load runtime library for current platform.
+    /// Gated on `dynamic-plugins` — loading a runtime requires
+    /// `libloading` (`dlopen`), which is unavailable on wasm32. wasm
+    /// builds use statically-linked plugins (Phase C).
+    #[cfg(feature = "dynamic-plugins")]
     fn load_runtime<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
     ) -> Result<(Option<ZrtlPlugin>, Option<tempfile::TempDir>), ZPackError> {

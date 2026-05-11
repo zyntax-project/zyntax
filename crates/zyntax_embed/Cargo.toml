@@ -9,7 +9,10 @@ keywords = ["compiler", "jit", "runtime", "embedding", "interop"]
 categories = ["compilers", "development-tools"]
 
 [dependencies]
-zyntax_compiler = { path = "../compiler" }
+# default-features=false so that zyntax_embed's `parse-only` feature
+# can build without Cranelift / libloading. The `native` feature re-
+# enables `cranelift-backend` and `dynamic-plugins` transitively.
+zyntax_compiler = { path = "../compiler", default-features = false }
 zyn_peg = { path = "../zyn_peg" }
 zyntax_typed_ast = { path = "../typed_ast" }
 pattern_engine = { path = "../pattern_engine" }
@@ -30,7 +33,30 @@ pest_vm = "2.8"
 [dev-dependencies]
 
 [features]
-default = []
+# Default: native build with Cranelift JIT + libloading-backed ZRTL
+# plugins. Existing native callers do not need to change anything.
+default = ["native"]
+
+# `native` activates the full native runtime: Cranelift JIT, dynamic
+# `.zrtl` plugin loading via `dlopen`, and the cranelift-backend code
+# paths in zyntax_compiler.
+native = [
+    "zyntax_compiler/cranelift-backend",
+    "zyntax_compiler/dynamic-plugins",
+    "dynamic-plugins",
+]
+
+# `parse-only` builds zyntax_embed without any native backend or
+# plugin loading — parser + TypedAST + transformation passes only.
+# Intended for environments that can't host a JIT (wasm32 target,
+# tooling integrations, IDE servers).
+parse-only = []
+
+# `dynamic-plugins` enables runtime `.zrtl` plugin loading via
+# libloading. Implied by `native`. Disabled on wasm32 since dlopen
+# isn't available; wasm builds register plugins statically (Phase C).
+dynamic-plugins = []
+
 llvm-backend = ["zyntax_compiler/llvm-backend"]
 all-backends = ["zyntax_compiler/all-backends", "llvm-backend"]
 # Use krio-async's captures-lift state-machine transform instead of

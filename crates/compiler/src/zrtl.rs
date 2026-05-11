@@ -962,8 +962,16 @@ unsafe impl Sync for RuntimeSymbolInfo {}
 unsafe impl Send for RuntimeSymbolInfo {}
 
 /// A loaded ZRTL plugin
+///
+/// The `library` field exists only when `dynamic-plugins` is enabled
+/// (i.e. on native targets that support `dlopen`). On wasm32, the
+/// struct still exists for API consistency but plugins are statically
+/// registered (Phase C of the wasm-target plan), and `library` is
+/// absent.
 pub struct ZrtlPlugin {
-    /// The loaded dynamic library (kept alive to prevent unloading)
+    /// The loaded dynamic library (kept alive to prevent unloading).
+    /// Only present when the crate was built with `dynamic-plugins`.
+    #[cfg(feature = "dynamic-plugins")]
     #[allow(dead_code)]
     library: libloading::Library,
     /// Plugin name
@@ -979,6 +987,7 @@ impl ZrtlPlugin {
     ///
     /// # Safety
     /// The plugin library must be valid and not modified while loaded.
+    #[cfg(feature = "dynamic-plugins")]
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ZrtlError> {
         let path = path.as_ref();
 
@@ -1224,6 +1233,7 @@ impl ZrtlRegistry {
     }
 
     /// Load and register a ZRTL plugin from a file path
+    #[cfg(feature = "dynamic-plugins")]
     pub fn load_plugin<P: AsRef<Path>>(&mut self, path: P) -> Result<(), ZrtlError> {
         let plugin = ZrtlPlugin::load(path)?;
         self.plugins.push(plugin);
@@ -1231,6 +1241,7 @@ impl ZrtlRegistry {
     }
 
     /// Load all ZRTL plugins from a directory
+    #[cfg(feature = "dynamic-plugins")]
     pub fn load_directory<P: AsRef<Path>>(&mut self, dir: P) -> Result<usize, ZrtlError> {
         let dir = dir.as_ref();
         let mut count = 0;

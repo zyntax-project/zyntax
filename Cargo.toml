@@ -33,7 +33,9 @@ tempfile = "3.16.0"
 colored = "3.0.0"
 lazy_static = "1.5.0"
 regex = "1.11.1"
-uuid = { version = "1.10.0", features = ["v4", "serde"] }
+# `js` enables web-sys-backed randomness on wasm32-unknown-unknown.
+# It's a no-op on native targets; safe to set unconditionally.
+uuid = { version = "1.10.0", features = ["v4", "serde", "js"] }
 miette = "7.2.0"
 typed-arena = "2.0.2"
 string-interner = "0.17.0"

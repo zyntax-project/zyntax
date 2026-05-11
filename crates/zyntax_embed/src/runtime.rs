@@ -2004,6 +2004,13 @@ impl ZyntaxRuntime {
     /// ```ignore
     /// runtime.load_plugin("./my_runtime.zrtl")?;
     /// ```
+    ///
+    /// Requires the `dynamic-plugins` feature of `zyntax_compiler`
+    /// (transitively enabled by zyntax_embed's default `native`
+    /// feature). On wasm32 builds plugins must instead be registered
+    /// statically via `register_static_plugin` (Phase C of the
+    /// wasm-target plan).
+    #[cfg(feature = "dynamic-plugins")]
     pub fn load_plugin<P: AsRef<std::path::Path>>(&mut self, path: P) -> RuntimeResult<()> {
         use zyntax_compiler::zrtl::{ZrtlError, ZrtlPlugin};
 
