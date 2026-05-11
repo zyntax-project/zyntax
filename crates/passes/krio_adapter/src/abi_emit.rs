@@ -1051,6 +1051,313 @@ pub fn lower_perform_effect_calls(
 /// param. Yield-block returns produce `0_i64` (pending sentinel).
 /// Non-yield returns wrap their value in a cast to i64.
 ///
+/// Phase I.2: replace every `PerformEffect` site whose handler is
+/// resumable with explicit Resume<T> struct construction + a direct
+/// call to the handler op fn.
+///
+/// Before this pass (post-lower_perform_effect_calls, post-reshape):
+///
+///   yield_block:
+///     [pre-perform code]
+///     PerformEffect → perform_result_temp
+///     [captures-lift saves]
+///     branch ready_block
+///   ready_block:
+///     AsyncSaveSlot result_slot ← perform_result_temp
+///     AsyncSaveSlot state_slot ← next_state_const
+///     Return 0
+///
+/// After this pass:
+///
+///   yield_block:
+///     [pre-perform code]
+///     r_ptr = Alloca(i64 x 4)                       // 32-byte Resume<T>
+///     r_poll_fn_ptr = CreateClosure(poll_fn_id)     // self-reference
+///     Store r_ptr+0  ← r_poll_fn_ptr                // poll_fn_ptr
+///     Store r_ptr+8  ← frame_ptr                    // state_machine_ptr
+///     Store r_ptr+16 ← (result_slot * 8) as i64     // result_slot_offset (bytes)
+///     Store r_ptr+24 ← next_state as i64            // next_state
+///     perform_result_temp = Call handler_fn_id(args..., r_ptr)
+///     [captures-lift saves]
+///     branch ready_block
+///   ready_block: (unchanged)
+///   ...
+///
+/// Notes:
+/// * Result-slot and next-state are recovered by scanning the
+///   yield_block's successor (ready_block) for AsyncSaveSlots — the
+///   slot storing perform_result_temp is the result_slot, the other
+///   is the state_slot whose stored value (a constant) is next_state.
+/// * Skipped (left as PerformEffect for the Cranelift backend's
+///   Tier 1 fallback) when:
+///     - The handler isn't in `handler_resolution` (non-resumable).
+///     - The successor isn't a single branch (defensive).
+///     - The AsyncSaveSlot pattern doesn't match expectations.
+///
+/// `handler_resolution` is `(effect_id, op_name) → handler-fn HirId`,
+/// built once by the caller from `module.handlers`.
+pub fn upgrade_resume_struct_at_perform_sites(
+    function: &mut HirFunction,
+    handler_resolution: &std::collections::HashMap<(HirId, InternedString), HirId>,
+    poll_fn_id: HirId,
+    frame_ptr: HirId,
+) {
+    // First pass: collect (block_id, inst_idx, metadata) without
+    // mutating to avoid borrow conflicts.
+    #[derive(Clone)]
+    struct PerformSite {
+        block_id: HirId,
+        inst_idx: usize,
+        perform_result_temp: HirId,
+        handler_fn_id: HirId,
+        args: Vec<HirId>,
+        return_ty: HirType,
+    }
+    let mut sites: Vec<PerformSite> = Vec::new();
+    let block_ids: Vec<HirId> = function.blocks.keys().copied().collect();
+    for block_id in &block_ids {
+        let block = match function.blocks.get(block_id) {
+            Some(b) => b,
+            None => continue,
+        };
+        for (i, inst) in block.instructions.iter().enumerate() {
+            if let HirInstruction::PerformEffect {
+                result: Some(perform_result_temp),
+                effect_id,
+                op_name,
+                args,
+                return_ty,
+            } = inst
+            {
+                if let Some(&handler_fn_id) =
+                    handler_resolution.get(&(*effect_id, *op_name))
+                {
+                    sites.push(PerformSite {
+                        block_id: *block_id,
+                        inst_idx: i,
+                        perform_result_temp: *perform_result_temp,
+                        handler_fn_id,
+                        args: args.clone(),
+                        return_ty: return_ty.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Second pass: process each perform site.
+    for site in sites {
+        // Find ready_block via the yield_block's terminator.
+        let ready_block_id = match function.blocks.get(&site.block_id) {
+            Some(b) => match &b.terminator {
+                HirTerminator::Branch { target } => *target,
+                _ => continue,
+            },
+            None => continue,
+        };
+
+        // Extract result_slot (matches perform_result_temp) and
+        // next_state (constant stored to the other slot) from
+        // ready_block's AsyncSaveSlots.
+        let (result_slot, next_state) =
+            match extract_result_and_state_slots(function, ready_block_id, site.perform_result_temp)
+            {
+                Some(t) => t,
+                None => continue,
+            };
+
+        // Mint values + build the new instruction sequence.
+        let mut new_insts: Vec<HirInstruction> = Vec::new();
+
+        // r_ptr = Alloca(i64 x 4) — 32-byte stack slot.
+        let r_ptr_id = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let alloca_count_id = mint_value(
+            &mut function.values,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(4)),
+        );
+        new_insts.push(HirInstruction::Alloca {
+            result: r_ptr_id,
+            ty: HirType::I64,
+            count: Some(alloca_count_id),
+            align: 8,
+        });
+
+        // r_poll_fn_ptr = CreateClosure(poll_fn_id) (self-reference).
+        let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
+            params: vec![HirType::Ptr(Box::new(HirType::U8))],
+            returns: vec![HirType::I64],
+            lifetime_params: vec![],
+            is_variadic: false,
+        }));
+        let r_poll_fn_ptr_id = mint_value(
+            &mut function.values,
+            poll_fn_ty.clone(),
+            HirValueKind::Instruction,
+        );
+        new_insts.push(HirInstruction::CreateClosure {
+            result: r_poll_fn_ptr_id,
+            closure_ty: poll_fn_ty,
+            function: poll_fn_id,
+            captures: vec![],
+        });
+
+        // Stores at field offsets: 0=poll_fn_ptr, 8=state_machine_ptr,
+        // 16=result_slot_offset, 24=next_state. Each store is
+        // (Binary Add base+offset → field_ptr) + (Store value at field_ptr).
+        // Pre-mint all needed values up front (closure-capture-free).
+        let off0 = mint_const_i64(&mut function.values, 0);
+        let off8 = mint_const_i64(&mut function.values, 8);
+        let off16 = mint_const_i64(&mut function.values, 16);
+        let off24 = mint_const_i64(&mut function.values, 24);
+        let result_offset_const =
+            mint_const_i64(&mut function.values, (result_slot * 8) as i64);
+        let next_state_const_id = mint_const_i64(&mut function.values, next_state as i64);
+        let fp0 = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        let fp8 = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        let fp16 = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        let fp24 = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+
+        // Field 0: poll_fn_ptr
+        new_insts.push(HirInstruction::Binary {
+            result: fp0,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: r_ptr_id,
+            right: off0,
+        });
+        new_insts.push(HirInstruction::Store {
+            ptr: fp0,
+            value: r_poll_fn_ptr_id,
+            align: 8,
+            volatile: false,
+        });
+        // Field 8: state_machine_ptr
+        new_insts.push(HirInstruction::Binary {
+            result: fp8,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: r_ptr_id,
+            right: off8,
+        });
+        new_insts.push(HirInstruction::Store {
+            ptr: fp8,
+            value: frame_ptr,
+            align: 8,
+            volatile: false,
+        });
+        // Field 16: result_slot_offset
+        new_insts.push(HirInstruction::Binary {
+            result: fp16,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: r_ptr_id,
+            right: off16,
+        });
+        new_insts.push(HirInstruction::Store {
+            ptr: fp16,
+            value: result_offset_const,
+            align: 8,
+            volatile: false,
+        });
+        // Field 24: next_state
+        new_insts.push(HirInstruction::Binary {
+            result: fp24,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: r_ptr_id,
+            right: off24,
+        });
+        new_insts.push(HirInstruction::Store {
+            ptr: fp24,
+            value: next_state_const_id,
+            align: 8,
+            volatile: false,
+        });
+
+        // Direct Call to the handler: result = handler_fn(args..., r_ptr).
+        let mut handler_args = site.args.clone();
+        handler_args.push(r_ptr_id);
+        new_insts.push(HirInstruction::Call {
+            result: Some(site.perform_result_temp),
+            callee: HirCallable::Function(site.handler_fn_id),
+            args: handler_args,
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+
+        // Splice the new instructions in place of the PerformEffect.
+        let block = function
+            .blocks
+            .get_mut(&site.block_id)
+            .expect("block exists");
+        block
+            .instructions
+            .splice(site.inst_idx..=site.inst_idx, new_insts);
+
+        let _ = site.return_ty; // currently unused — informational
+    }
+}
+
+/// Helper for `upgrade_resume_struct_at_perform_sites`: scans
+/// `ready_block`'s AsyncSaveSlots to find the slot indices for the
+/// perform's result and the state-bump.
+///
+/// Expected pattern (built by `lower_perform_effect_calls`):
+///   AsyncSaveSlot result_slot ← perform_result_temp
+///   AsyncSaveSlot state_slot ← next_state_const
+///
+/// Returns `(result_slot, next_state_value)` or None if the pattern
+/// doesn't match.
+fn extract_result_and_state_slots(
+    function: &HirFunction,
+    ready_block_id: HirId,
+    perform_result_temp: HirId,
+) -> Option<(u32, u32)> {
+    let block = function.blocks.get(&ready_block_id)?;
+    let mut result_slot: Option<u32> = None;
+    let mut next_state: Option<u32> = None;
+    for inst in &block.instructions {
+        if let HirInstruction::AsyncSaveSlot { slot, value, .. } = inst {
+            if *value == perform_result_temp {
+                result_slot = Some(*slot);
+            } else {
+                // The other AsyncSaveSlot stores next_state as a constant.
+                if let Some(v) = function.values.get(value) {
+                    if let HirValueKind::Constant(HirConstant::I64(n)) = v.kind {
+                        next_state = Some(n as u32);
+                    }
+                }
+            }
+        }
+    }
+    match (result_slot, next_state) {
+        (Some(r), Some(s)) => Some((r, s)),
+        _ => None,
+    }
+}
+
 /// The function is renamed `{name}$poll` and `is_async` is cleared.
 /// Returns the new poll fn name.
 pub fn reshape_to_poll_abi(

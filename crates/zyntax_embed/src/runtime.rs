@@ -871,6 +871,30 @@ fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> Runtim
 
     let suspending = krio_adapter::HirSuspendingFns::from_module(module);
 
+    // Phase I.2 prep: build `(effect_id, op_name) → handler-fn HirId`
+    // map for the resume-struct construction step.
+    let mut handler_resolution: std::collections::HashMap<
+        (HirId, zyntax_typed_ast::InternedString),
+        HirId,
+    > = std::collections::HashMap::new();
+    for handler in module.handlers.values() {
+        for impl_ in &handler.implementations {
+            if !impl_.is_resumable {
+                continue;
+            }
+            let mangled =
+                zyntax_compiler::mangle_handler_op_name(handler.name, impl_.op_name);
+            if let Some(handler_fn_id) = module
+                .functions
+                .iter()
+                .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
+                .map(|(id, _)| *id)
+            {
+                handler_resolution.insert((handler.effect_id, impl_.op_name), handler_fn_id);
+            }
+        }
+    }
+
     for fn_id in resumable_fn_ids {
         let mut function = match module.functions.swap_remove(&fn_id) {
             Some(f) => f,
@@ -909,6 +933,28 @@ fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> Runtim
         // entry), poll fn gets a fresh id.
         let new_poll_id = HirId::new();
         function.id = new_poll_id;
+
+        // Phase I.2: replace each resumable PerformEffect site with
+        // explicit Resume<T> struct construction + a direct Call to
+        // the mangled handler fn. After this pass runs, those sites
+        // no longer have a `PerformEffect` instruction — the
+        // Cranelift backend's PerformEffect arm becomes Tier 1-only
+        // (handles non-resumable effects via direct dispatch).
+        // The state_machine_ptr stored into Resume<T> is the
+        // function's post-reshape first param (the *mut u8 state
+        // machine).
+        let post_reshape_frame_ptr = function
+            .signature
+            .params
+            .first()
+            .map(|p| p.id)
+            .unwrap_or(frame_ptr);
+        krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites(
+            &mut function,
+            &handler_resolution,
+            new_poll_id,
+            post_reshape_frame_ptr,
+        );
 
         // Phase 3: SYNC entry wrapper (returns T, not *Promise<T>).
         let mut entry_fn = krio_adapter::abi_emit::generate_sync_entry(
