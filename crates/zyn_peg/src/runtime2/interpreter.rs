@@ -356,6 +356,18 @@ impl<'g> GrammarInterpreter<'g> {
             match val {
                 ParsedValue::List(items) => items
                     .into_iter()
+                    // Single-level flatten: a rule like `slot <name>
+                    // { ... }` synthesises [open, body..., close] as
+                    // a List<Statement> from one statement-position
+                    // alternate. Without flattening here, the inner
+                    // List<Statement> hits parsed_value_to_stmt
+                    // verbatim and fails ("cannot convert value to
+                    // statement"). Mirrors the same flatten applied
+                    // to decl lists in get_field_as_decl_list.
+                    .flat_map(|item| match item {
+                        ParsedValue::List(nested) => nested,
+                        other => vec![other],
+                    })
                     .map(|item| self.parsed_value_to_stmt(item))
                     .collect::<Result<Vec<_>, _>>()?,
                 ParsedValue::Statement(s) => vec![*s],
@@ -817,6 +829,17 @@ impl<'g> GrammarInterpreter<'g> {
                 // directly with `Box::new`.
                 let operand = self.get_field_as_expr("operand", fields, state)?;
                 TypedExpression::Await(Box::new(operand))
+            }
+            "Block" => {
+                let block = self.construct_block(fields, state, span)?;
+                if let ParsedValue::Block(b) = block {
+                    TypedExpression::Block(b)
+                } else {
+                    return Err(
+                        "TypedExpression::Block: construct_block returned non-Block value"
+                            .to_string(),
+                    );
+                }
             }
             _ => return Err(format!("unknown TypedExpression variant: {}", variant)),
         };
@@ -3798,8 +3821,15 @@ impl<'g> GrammarInterpreter<'g> {
         match val {
             ParsedValue::Block(b) => Ok(b),
             ParsedValue::List(items) => {
+                // Single-level flatten — see construct_block above
+                // for the rationale. Keeps both stmt-list collection
+                // paths in sync.
                 let stmts: Result<Vec<_>, _> = items
                     .into_iter()
+                    .flat_map(|item| match item {
+                        ParsedValue::List(nested) => nested,
+                        other => vec![other],
+                    })
                     .map(|item| self.parsed_value_to_stmt(item))
                     .collect();
                 Ok(TypedBlock {
