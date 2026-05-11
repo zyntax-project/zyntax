@@ -1307,6 +1307,36 @@ pub fn upgrade_resume_struct_at_perform_sites(
             is_tail: false,
         });
 
+        // Phase I.2 refinement: for resumable perform sites the
+        // handler's return value IS the perform's result. If the
+        // handler called `k(v)`, the runtime symbol re-polled the
+        // caller's state machine and the post-perform code already
+        // ran (via the resume_entry block); the handler then did
+        // whatever post-resume work it does and returned the final
+        // value. If the handler aborted, that's its return.
+        //
+        // So this yield_block should NOT branch to ready_block
+        // (which would re-poll and double-run the post-perform
+        // code). Instead it RETURNS the handler's value directly,
+        // cast to i64 (the poll-fn ABI's return type).
+        let return_value_id = if matches!(site.return_ty, HirType::I64) {
+            site.perform_result_temp
+        } else {
+            // Cast non-i64 returns to i64 for the poll ABI.
+            let cast_id = mint_value(
+                &mut function.values,
+                HirType::I64,
+                HirValueKind::Instruction,
+            );
+            new_insts.push(HirInstruction::Cast {
+                op: pick_param_to_i64_cast(&site.return_ty),
+                result: cast_id,
+                ty: HirType::I64,
+                operand: site.perform_result_temp,
+            });
+            cast_id
+        };
+
         // Splice the new instructions in place of the PerformEffect.
         let block = function
             .blocks
@@ -1315,8 +1345,11 @@ pub fn upgrade_resume_struct_at_perform_sites(
         block
             .instructions
             .splice(site.inst_idx..=site.inst_idx, new_insts);
-
-        let _ = site.return_ty; // currently unused — informational
+        // Replace the yield_block's terminator (originally
+        // Branch(ready_block)) with a direct Return.
+        block.terminator = HirTerminator::Return {
+            values: vec![return_value_id],
+        };
     }
 }
 

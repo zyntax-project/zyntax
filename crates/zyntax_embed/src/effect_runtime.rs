@@ -159,24 +159,69 @@ pub extern "C" fn __zyntax_effect_lookup_handler(effect_id: u64) -> *mut u8 {
     })
 }
 
+/// Layout of the Resume<T> struct, as compiled code constructs it at
+/// each perform site (see
+/// `krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites`).
+/// 32 bytes, 4 i64-sized fields, `#[repr(C)]` so the field offsets
+/// match what the HIR `Store` instructions emit (0, 8, 16, 24).
+///
+/// `result_slot_offset` is in bytes (already pre-multiplied by 8 in
+/// the compiled code), so we can use it directly as a byte offset
+/// into `state_machine_ptr`. `next_state` is the dispatcher state-id
+/// the caller's Switch routes to on the next poll — `Switch` reads
+/// a `u32` from offset 0, so we store the low 32 bits there.
+#[repr(C)]
+struct Resume {
+    poll_fn_ptr: *const u8,
+    state_machine_ptr: *mut u8,
+    result_slot_offset: i64,
+    next_state: i64,
+}
+
 /// Resume the suspended caller with `value`.
 ///
-/// In the full Tier 3 design, this would:
-///   1. Decode `resume_struct` to find the caller's state machine,
-///      next-state, and result-slot offsets.
-///   2. Store `value` at the result slot.
-///   3. Set the state slot to next-state.
-///   4. Return to the caller's poll loop.
+/// Walks the Resume<T> struct passed by the handler:
+///   1. Stores `value` at `state_machine_ptr + result_slot_offset`
+///      — this is the slot the caller's resume_entry block will
+///      `AsyncLoadSlot` from.
+///   2. Writes `next_state` (as u32) to the state slot at offset 0
+///      — the dispatcher Switch reads this on the next poll.
+///   3. Repeatedly calls `poll_fn(state_machine_ptr)` until it
+///      returns non-zero (Ready). That non-zero is the value the
+///      caller's @effect fn produces — the handler's `k(v)`
+///      "returns" this back to the handler body. Synchronous-resume
+///      only: an async-out-of-line handler would loop forever here
+///      (the case Phase J.3 addresses with a different ABI).
 ///
-/// For the initial runtime-symbols milestone, `resume_struct` is
-/// opaque and this is a passthrough that returns the value — the
-/// Cranelift backend's M4 lowering keeps the PerformEffect direct
-/// dispatch path for now. Wired up in a future iteration when
-/// `lower_perform_effect_calls` emits real Resume<T> structs.
+/// Returns whatever the recursive poll produces — for single-shot
+/// synchronous resume this is the caller's full computation result.
 #[no_mangle]
 pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> i64 {
-    let _ = resume_struct;
-    value
+    if resume_struct.is_null() {
+        // Defensive: null resume struct means placeholder-ABI Tier 1
+        // call still in the codepath. Preserve the old passthrough
+        // semantics so any non-resumable handler that happens to call
+        // through this symbol gets its value back.
+        return value;
+    }
+    unsafe {
+        let r = &*(resume_struct as *const Resume);
+        // Store `value` at result_slot_offset within the state machine.
+        let result_slot = r.state_machine_ptr.add(r.result_slot_offset as usize) as *mut i64;
+        *result_slot = value;
+        // Set the dispatcher state slot (offset 0, u32-wide) to
+        // next_state. The upper 4 bytes of the 8-byte slot are
+        // unused — the Switch dispatcher reads a u32.
+        *(r.state_machine_ptr as *mut u32) = r.next_state as u32;
+        // Re-poll the caller's poll fn synchronously until Ready.
+        let poll_fn: extern "C" fn(*mut u8) -> i64 = core::mem::transmute(r.poll_fn_ptr);
+        loop {
+            let rc = poll_fn(r.state_machine_ptr);
+            if rc != 0 {
+                return rc;
+            }
+        }
+    }
 }
 
 /// Abort the current handler without resuming. The handler's caller

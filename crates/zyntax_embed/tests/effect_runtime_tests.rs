@@ -394,6 +394,243 @@ fn tier3_abort_pattern_executes_through_runtime() {
     );
 }
 
+/// Build a TypedProgram that exercises the *real* Resume<T> ABI:
+/// the handler invokes its continuation `k(v)` and then does
+/// post-resume computation, whose result is what the caller sees.
+///
+///   effect E { def op(): i64 }
+///   handler H for E {
+///       def op(k: Resume<i64>): i64 {
+///           return k(21) + 1000
+///       }
+///   }
+///   @effect(E) def run(): i64 {
+///       let x = op()      // suspends here; resumes with v
+///       return x * 2      // ← post-resume code; runs INSIDE k(21)
+///   }
+///
+/// Under the placeholder ABI (Phase H): handler returns whatever
+/// `__zyntax_effect_resume` passed through (21), plus 1000 = 1021.
+/// Then caller's post-perform code runs with x = 1021, returning 2042.
+///
+/// Under the REAL ABI (Phase I.4 active): `k(21)` re-enters the
+/// caller's continuation, which runs `return 21 * 2 = 42`. The
+/// runtime symbol returns 42 to the handler. Handler adds 1000 →
+/// returns 1042. The caller's post-perform code does NOT re-run
+/// (the I.2 refinement makes the yield_block return the handler's
+/// value directly), so the final result is 1042.
+fn build_breakthrough_program() -> TypedProgram {
+    let mut registry = TypeRegistry::new();
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![Type::Primitive(PrimitiveType::I64)],
+        const_args: vec![],
+        variance: vec![],
+        nullability: NullabilityKind::NonNull,
+    };
+
+    // effect E { def op(): i64 }
+    let e_effect = TypedEffect {
+        name: InternedString::new_global("E"),
+        type_params: vec![],
+        operations: vec![TypedEffectOp {
+            name: InternedString::new_global("op"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::I64),
+            span: span(),
+        }],
+        span: span(),
+    };
+
+    // Handler body: return k(21) + 1000
+    let k_var = TypedNode::new(
+        TypedExpression::Variable(InternedString::new_global("k")),
+        resume_ty.clone(),
+        span(),
+    );
+    let k_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(k_var),
+            positional_args: vec![TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(21)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let k_plus_1000 = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Add,
+            left: Box::new(k_call),
+            right: Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(1000)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let handler_body = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(k_plus_1000))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let handler = TypedEffectHandler {
+        name: InternedString::new_global("H"),
+        effect_name: InternedString::new_global("E"),
+        type_params: vec![],
+        fields: vec![],
+        handlers: vec![TypedEffectHandlerImpl {
+            op_name: InternedString::new_global("op"),
+            return_type: Type::Primitive(PrimitiveType::I64),
+            params: vec![TypedParameter {
+                name: InternedString::new_global("k"),
+                ty: resume_ty,
+                ..Default::default()
+            }],
+            body: Some(TypedBlock {
+                statements: vec![handler_body],
+                span: span(),
+            }),
+            ..Default::default()
+        }],
+        span: span(),
+    };
+
+    // run() body: let x = op(); return x * 2
+    let op_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("op")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let let_x_eq_op = TypedNode::new(
+        TypedStatement::Let(TypedLet {
+            name: InternedString::new_global("x"),
+            ty: Type::Primitive(PrimitiveType::I64),
+            initializer: Some(Box::new(op_call)),
+            mutability: zyntax_typed_ast::type_registry::Mutability::Immutable,
+            span: span(),
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+    let x_var = TypedNode::new(
+        TypedExpression::Variable(InternedString::new_global("x")),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let x_times_2 = TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: zyntax_typed_ast::typed_ast::BinaryOp::Mul,
+            left: Box::new(x_var),
+            right: Box::new(TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(2)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let return_x2 = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(x_times_2))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let run_fn = TypedFunction {
+        name: InternedString::new_global("run"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        body: Some(TypedBlock {
+            statements: vec![let_x_eq_op, return_x2],
+            span: span(),
+        }),
+        annotations: vec![TypedAnnotation {
+            name: InternedString::new_global("effect"),
+            args: vec![ident_arg("E")],
+            span: span(),
+        }],
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(
+                TypedDeclaration::Effect(e_effect),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::EffectHandler(handler),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::Function(run_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        type_registry: registry,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn phase_i5_breakthrough_real_resume_continuation() {
+    // Phase I.5 — the breakthrough: the caller's post-perform code
+    // (`return x * 2`) executes INSIDE the handler's `k(21)` call.
+    // The handler adds 1000 to whatever `k(21)` returned (= 42) and
+    // returns 1042. The caller's poll loop sees Ready(1042) and
+    // terminates without re-running the post-perform code.
+    //
+    // This is the single test that demonstrably distinguishes the
+    // real Resume<T> ABI from the placeholder. Under the placeholder,
+    // this test would return 2042 (placeholder passes 21 through,
+    // handler returns 1021, post-perform runs on 1021, returns 2042).
+    let program = build_breakthrough_program();
+    let mut runtime = ZyntaxRuntime::new().expect("runtime must construct");
+    runtime
+        .compile_typed_program(program)
+        .expect("compile_typed_program must succeed for breakthrough test");
+
+    let sig = NativeSignature::new(&[], NativeType::I64);
+    let result = runtime
+        .call_function("run", &[], &sig)
+        .expect("runtime.call_function(\"run\") should execute the breakthrough test");
+    assert_eq!(
+        result.as_i64(),
+        Some(1042),
+        "BREAKTHROUGH: k(21) re-entered the caller's continuation (x * 2 = 42), \
+         handler added 1000 → 1042. Got {:?} — if 2042, the post-perform code \
+         ran a second time (Phase I.2 refinement regression). \
+         If 1021, the runtime symbol is back to placeholder pass-through.",
+        result
+    );
+}
+
 #[test]
 fn effect_runtime_symbols_are_registered_at_runtime_construction() {
     // Phase H Tier 3 foundation: `ZyntaxRuntime::new()` automatically
