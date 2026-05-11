@@ -5915,6 +5915,13 @@ impl SsaBuilder {
                     use crate::hir::HirStructType;
                     use zyntax_typed_ast::type_registry::TypeKind;
 
+                    // Phase H Tier 3: Resume<T> is the reified continuation
+                    // passed to resumable effect handlers. In the placeholder
+                    // ABI it's an i64 sentinel; see `effect_runtime.rs`.
+                    if type_def.name.resolve_global().as_deref() == Some("Resume") {
+                        return HirType::I64;
+                    }
+
                     // Extern/opaque types (ZRTL-backed like Tensor) → Ptr(Opaque)
                     if let Some(zyntax_typed_ast::type_registry::Type::Extern {
                         name: extern_name,

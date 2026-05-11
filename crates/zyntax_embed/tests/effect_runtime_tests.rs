@@ -18,9 +18,207 @@
 
 use zyntax_embed::{NativeSignature, NativeType, ZyntaxRuntime};
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
+use zyntax_typed_ast::type_registry::{
+    NullabilityKind, PrimitiveType, Type, TypeMetadata, Visibility,
+};
 use zyntax_typed_ast::typed_ast::*;
-use zyntax_typed_ast::InternedString;
+use zyntax_typed_ast::{InternedString, TypeRegistry};
+
+/// Build a TypedProgram with a *resumable* handler:
+///
+///   effect State { def get(): i64 }
+///   handler StateHandler for State { def get(k: Resume<i64>): i64 { return k(42) } }
+///   @effect(State) def run(): i64 { return get() }
+///
+/// Tier 3 chain end-to-end:
+///   1. SSA detects `k(42)` (k is Resume<T>-typed param) → rewrites to
+///      Call(Symbol("__zyntax_effect_resume"), [k, 42]).
+///   2. The runtime symbol returns 42 (placeholder pass-through).
+///   3. Handler returns 42.
+///   4. Cranelift's PerformEffect dispatch sees `impl_.is_resumable = true`,
+///      pads handler args with a Resume sentinel.
+///   5. `run()` returns 42.
+fn build_resumable_effect_program() -> TypedProgram {
+    // Register Resume<T> in the program's type_registry so the
+    // lowering context can detect its name.
+    let mut registry = TypeRegistry::new();
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![Type::Primitive(PrimitiveType::I64)],
+        const_args: vec![],
+        variance: vec![],
+        nullability: NullabilityKind::NonNull,
+    };
+
+    // effect State { def get(): i64 }
+    let state_effect = TypedEffect {
+        name: InternedString::new_global("State"),
+        type_params: vec![],
+        operations: vec![TypedEffectOp {
+            name: InternedString::new_global("get"),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Primitive(PrimitiveType::I64),
+            span: span(),
+        }],
+        span: span(),
+    };
+
+    // handler StateHandler for State { def get(k: Resume<i64>): i64 { return k(42) } }
+    // Body: return k(42)
+    let k_var = TypedNode::new(
+        TypedExpression::Variable(InternedString::new_global("k")),
+        resume_ty.clone(),
+        span(),
+    );
+    let resume_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(k_var),
+            positional_args: vec![TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(42)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let handler_body = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(resume_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let handler = TypedEffectHandler {
+        name: InternedString::new_global("StateHandler"),
+        effect_name: InternedString::new_global("State"),
+        type_params: vec![],
+        fields: vec![],
+        handlers: vec![TypedEffectHandlerImpl {
+            op_name: InternedString::new_global("get"),
+            return_type: Type::Primitive(PrimitiveType::I64),
+            params: vec![TypedParameter {
+                name: InternedString::new_global("k"),
+                ty: resume_ty,
+                ..Default::default()
+            }],
+            body: Some(TypedBlock {
+                statements: vec![handler_body],
+                span: span(),
+            }),
+            ..Default::default()
+        }],
+        span: span(),
+    };
+
+    // @effect(State) def run(): i64 { return get() }
+    let get_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(TypedNode::new(
+                TypedExpression::Variable(InternedString::new_global("get")),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    let return_get = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(get_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let run_fn = TypedFunction {
+        name: InternedString::new_global("run"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        body: Some(TypedBlock {
+            statements: vec![return_get],
+            span: span(),
+        }),
+        annotations: vec![TypedAnnotation {
+            name: InternedString::new_global("effect"),
+            args: vec![ident_arg("State")],
+            span: span(),
+        }],
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(
+                TypedDeclaration::Effect(state_effect),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::EffectHandler(handler),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            TypedNode::new(
+                TypedDeclaration::Function(run_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        type_registry: registry,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn tier3_resumable_effect_executes_through_runtime() {
+    // Phase H Tier 3 e2e (placeholder Resume<T> ABI): a fn calling
+    // a resumable handler runs end-to-end through the JIT and
+    // produces the resumed value.
+    //
+    // Flow:
+    //   - run()'s PerformEffect(get) lowers to Call(StateHandler$get, [sentinel])
+    //     (Cranelift backend pads the resumable handler's args with an i64
+    //     Resume<T> sentinel)
+    //   - StateHandler$get(k) body is `return k(42)`, which the SSA
+    //     builder rewrote to Call(Symbol("__zyntax_effect_resume"), [k, 42])
+    //   - The runtime symbol returns 42 (placeholder pass-through)
+    //   - Handler returns 42, run() returns 42
+    let program = build_resumable_effect_program();
+    let mut runtime = ZyntaxRuntime::new().expect("runtime must construct");
+    let exported = runtime
+        .compile_typed_program(program)
+        .expect("compile_typed_program must succeed for resumable effect");
+    assert!(
+        exported.iter().any(|n| n == "run"),
+        "run should be exported; got {:?}",
+        exported
+    );
+    assert!(
+        exported.iter().any(|n| n == "StateHandler$get"),
+        "StateHandler$get (resumable) should be exported; got {:?}",
+        exported
+    );
+
+    let sig = NativeSignature::new(&[], NativeType::I64);
+    let result = runtime
+        .call_function("run", &[], &sig)
+        .expect("runtime.call_function(\"run\") should execute the resumable Tier 3 effect");
+    assert_eq!(
+        result.as_i64(),
+        Some(42),
+        "Tier 3: run() → perform(get) → StateHandler.get(k) → k(42) → __zyntax_effect_resume → 42; got {:?}",
+        result
+    );
+}
 
 #[test]
 fn effect_runtime_symbols_are_registered_at_runtime_construction() {

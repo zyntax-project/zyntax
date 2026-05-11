@@ -3808,19 +3808,30 @@ impl CraneliftBackend {
                             // TODO: Use analyze_perform_effect() to determine optimal strategy
                             // For now, we use a simple implementation that calls a mangled function.
 
-                            // Look up the handler for this effect in the module
-                            let handler_func_name = if let Some(handler) = hir_module
-                                .handlers
-                                .values()
-                                .find(|h| h.effect_id == *effect_id)
+                            // Look up the handler for this effect in the module.
+                            // Capture `is_resumable` per the matched impl so we
+                            // can pad the call args with a Resume<T> sentinel
+                            // (Phase H Tier 3: resumable handlers receive an
+                            // extra Resume<T> = i64 placeholder as the last
+                            // arg; the SSA builder already rewrote `k(v)` in
+                            // the handler body to `__zyntax_effect_resume(k, v)`,
+                            // so the sentinel value itself is irrelevant —
+                            // only the arity matters today).
+                            let (handler_func_name, is_resumable) = if let Some(handler) =
+                                hir_module
+                                    .handlers
+                                    .values()
+                                    .find(|h| h.effect_id == *effect_id)
                             {
-                                // Find the operation implementation
                                 if let Some(impl_) = handler
                                     .implementations
                                     .iter()
                                     .find(|i| i.op_name == *op_name)
                                 {
-                                    mangle_handler_op_name(handler.name, impl_.op_name)
+                                    (
+                                        mangle_handler_op_name(handler.name, impl_.op_name),
+                                        impl_.is_resumable,
+                                    )
                                 } else {
                                     warn!(
                                         "[Effect] No implementation for operation {:?} in handler",
@@ -3866,10 +3877,16 @@ impl CraneliftBackend {
                                     // Direct call to compiled handler
                                     let local_callee =
                                         self.module.declare_func_in_func(func_id, builder.func);
-                                    let arg_values: Vec<Value> = args
+                                    let mut arg_values: Vec<Value> = args
                                         .iter()
                                         .filter_map(|a| self.value_map.get(a).copied())
                                         .collect();
+                                    // Phase H Tier 3: resumable handler takes
+                                    // an extra Resume<T> = i64 sentinel. Pad
+                                    // arity to match the handler's signature.
+                                    if is_resumable {
+                                        arg_values.push(builder.ins().iconst(types::I64, 0));
+                                    }
                                     let call = builder.ins().call(local_callee, &arg_values);
                                     if let Some(result_id) = result {
                                         if let Some(&ret_val) = builder.inst_results(call).first() {
@@ -3898,8 +3915,13 @@ impl CraneliftBackend {
                                     _ => types::I64, // Default for complex types
                                 };
                                 let mut sig = self.module.make_signature();
-                                for arg_id in args {
+                                for _arg_id in args {
                                     // Get arg type from value_map (simplified - assume i64)
+                                    sig.params.push(AbiParam::new(types::I64));
+                                }
+                                // Phase H Tier 3: resumable handler takes an
+                                // extra Resume<T> = i64 sentinel param.
+                                if is_resumable {
                                     sig.params.push(AbiParam::new(types::I64));
                                 }
                                 if !matches!(return_ty, HirType::Void) {
@@ -3915,10 +3937,13 @@ impl CraneliftBackend {
                                         let local_callee = self
                                             .module
                                             .declare_func_in_func(extern_func_id, builder.func);
-                                        let arg_values: Vec<Value> = args
+                                        let mut arg_values: Vec<Value> = args
                                             .iter()
                                             .filter_map(|a| self.value_map.get(a).copied())
                                             .collect();
+                                        if is_resumable {
+                                            arg_values.push(builder.ins().iconst(types::I64, 0));
+                                        }
                                         let call = builder.ins().call(local_callee, &arg_values);
                                         if let Some(result_id) = result {
                                             if let Some(&ret_val) =

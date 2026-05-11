@@ -2566,6 +2566,16 @@ impl LoweringContext {
             Type::Named { id, .. } => {
                 // Look up type definition in registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
+                    // Phase H Tier 3: Resume<T> is the reified continuation
+                    // passed to resumable effect handlers. In the placeholder
+                    // implementation the runtime treats it as an i64 sentinel
+                    // (see `effect_runtime.rs::__zyntax_effect_resume`); the
+                    // full Resume<T> ABI (poll_fn_ptr / state_machine_ptr /
+                    // result_slot_offset / next_state struct) is a follow-up.
+                    if type_def.name.resolve_global().as_deref() == Some("Resume") {
+                        return HirType::I64;
+                    }
+
                     match &type_def.kind {
                         zyntax_typed_ast::TypeKind::Struct { fields, .. } => {
                             // Convert struct fields
