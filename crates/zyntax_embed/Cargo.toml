@@ -15,7 +15,7 @@ zyntax_typed_ast = { path = "../typed_ast" }
 pattern_engine = { path = "../pattern_engine" }
 normalization_pass = { path = "../passes/normalization" }
 algebraic_effects_pass = { path = "../passes/algebraic_effects" }
-krio_adapter = { path = "../passes/krio_adapter", optional = true }
+krio_adapter = { path = "../passes/krio_adapter" }
 thiserror = "1.0"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -37,7 +37,12 @@ all-backends = ["zyntax_compiler/all-backends", "llvm-backend"]
 # the legacy async_support.rs path. Off by default while we shake
 # down the integration; eventually becomes the default once the 14
 # captures-lift-bug tests pass through it.
-krio-async-backend = ["dep:krio_adapter"]
+# krio_adapter is now an unconditional dep (needed by Phase I's
+# `apply_krio_effect_lowering` for resumable-effect fns regardless of
+# this feature). The feature now only controls which path async
+# functions take: with it set, async fns also go through krio's
+# captures-lift; without, the legacy `async_support` path handles them.
+krio-async-backend = []
 
 [lints]
 workspace = true

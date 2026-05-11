@@ -816,6 +816,125 @@ pub use zyntax_compiler::{
 /// the krio path (and the legacy AsyncCompiler will be a no-op since
 /// `is_async` is still set; once Phase F lands, the legacy path is
 /// gated off when this fires).
+/// Phase I.3b: route resumable-effect fns through krio's captures-lift
+/// + poll-fn transform. Unlike `apply_krio_async_lowering` (which is
+/// cfg-gated and wraps async fns in a Promise-returning entry), this
+/// path:
+///
+///   * Runs unconditionally (no feature gate) — Tier 3 resumable
+///     effects need this regardless of how async fns are routed.
+///   * Generates a *synchronous* entry wrapper via `generate_sync_entry`
+///     so the user-visible signature `(args...) -> T` is preserved.
+///     The wrapper drives the poll loop inline until Ready.
+///
+/// No-op when the module has no fns with resumable handlers.
+fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> RuntimeResult<()> {
+    use std::collections::{HashMap, HashSet};
+    use zyntax_compiler::analysis::AnalysisRunner;
+    use zyntax_compiler::hir::HirId;
+
+    // Identify fns to admit: non-async, effect-annotated, at least
+    // one of those effects has a resumable handler.
+    let resumable_fn_ids: Vec<HirId> = module
+        .functions
+        .values()
+        .filter(|f| {
+            !f.signature.is_async
+                && !f.signature.effects.is_empty()
+                && f.signature.effects.iter().any(|effect_name| {
+                    if let Some(effect) = module.effects.values().find(|e| e.name == *effect_name) {
+                        module
+                            .handlers
+                            .values()
+                            .filter(|h| h.effect_id == effect.id)
+                            .any(|h| h.implementations.iter().any(|i| i.is_resumable))
+                    } else {
+                        false
+                    }
+                })
+        })
+        .map(|f| f.id)
+        .collect();
+
+    if resumable_fn_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Live-out per fn via the existing analyzer.
+    let mut live_out: HashMap<HirId, HashMap<HirId, HashSet<HirId>>> = HashMap::new();
+    let mut analyzer = AnalysisRunner::new(module.clone());
+    if let Ok(analysis) = analyzer.run_all() {
+        for (fn_id, fn_analysis) in &analysis.functions {
+            live_out.insert(*fn_id, fn_analysis.liveness.live_out.clone());
+        }
+    }
+
+    let suspending = krio_adapter::HirSuspendingFns::from_module(module);
+
+    for fn_id in resumable_fn_ids {
+        let mut function = match module.functions.swap_remove(&fn_id) {
+            Some(f) => f,
+            None => continue,
+        };
+        let original_signature = function.signature.clone();
+        let original_name = function.name;
+
+        let frame_ptr = function
+            .signature
+            .params
+            .first()
+            .map(|p| p.id)
+            .unwrap_or_else(HirId::new);
+        let live_out_for_fn = live_out.get(&fn_id).cloned().unwrap_or_default();
+
+        // Phase 1: krio captures-lift transform.
+        let lower_result = krio_adapter::orchestrator::lower_async_function(
+            &mut function,
+            &suspending,
+            frame_ptr,
+            0,
+            &live_out_for_fn,
+        )
+        .map_err(|e| RuntimeError::Execution(format!("krio-effect lowering failed: {e}")))?;
+
+        // Phase 2: reshape into poll ABI.
+        let _ = krio_adapter::abi_emit::reshape_to_poll_abi(
+            &mut function,
+            &lower_result.layout,
+            &lower_result.param_slots,
+        );
+
+        // Swap HirIds: entry inherits original id (so Call sites that
+        // reference the original by id keep reaching the user-visible
+        // entry), poll fn gets a fresh id.
+        let new_poll_id = HirId::new();
+        function.id = new_poll_id;
+
+        // Phase 3: SYNC entry wrapper (returns T, not *Promise<T>).
+        let mut entry_fn = krio_adapter::abi_emit::generate_sync_entry(
+            original_name,
+            &original_signature,
+            new_poll_id,
+            lower_result.num_slots,
+            &lower_result.param_slots,
+            lower_result.state_slot,
+        );
+        entry_fn.id = fn_id;
+
+        log::debug!(
+            "[krio-effect] {}: state_slot={} num_slots={}",
+            original_name.resolve_global().unwrap_or_default(),
+            lower_result.state_slot,
+            lower_result.num_slots,
+        );
+
+        module.functions.insert(function.id, function);
+        module.functions.insert(entry_fn.id, entry_fn);
+    }
+
+    Ok(())
+}
+
 fn apply_krio_async_lowering(_module: &mut zyntax_compiler::HirModule) -> RuntimeResult<()> {
     #[cfg(feature = "krio-async-backend")]
     {
@@ -1162,6 +1281,7 @@ impl ZyntaxRuntime {
         // legacy `compiler::async_support::AsyncCompiler` inside
         // `compile_module` continues to handle the lowering.
         apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
 
         // Compile the module
         self.compile_module(&hir_module)
@@ -2226,6 +2346,7 @@ impl ZyntaxRuntime {
             .collect();
         let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
 
         // Collect function names before compilation
         // Use resolve_global() to get the actual string from InternedString
@@ -2392,6 +2513,7 @@ impl ZyntaxRuntime {
         // Lower to HIR (no builtins available when compiling directly)
         let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
         apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
 
         // Collect function names before compilation
         let function_names: Vec<String> = hir_module
@@ -3195,6 +3317,7 @@ impl TieredRuntime {
             .collect();
         let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
 
         // Collect function names before compilation. `f.name.to_string()`
         // returns the debug repr of InternedString (e.g.
