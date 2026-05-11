@@ -245,6 +245,140 @@ fn emitted_perform_effect_passes_analysis_and_resolution() {
 }
 
 #[test]
+fn handler_body_calling_resume_param_emits_runtime_symbol_call() {
+    // Phase H Tier 3: a handler whose op takes a `Resume<T>` parameter
+    // and calls `k(value)` in its body must lower to a Call instruction
+    // whose callee is `HirCallable::Symbol("__zyntax_effect_resume")`.
+    // The SSA builder detects the Resume<T> param HirId (planted by
+    // `LoweringContext::convert_function` from a `Type::Named` whose
+    // registered TypeDefinition has `name = "Resume"`) and rewrites
+    // the call.
+    //
+    // Without this rewrite, `k(value)` would lower to a regular
+    // `HirCallable::Indirect(k)` — which would crash at JIT link time
+    // because k is a struct value, not a function pointer.
+    use zyntax_typed_ast::type_registry::TypeMetadata;
+    use zyntax_typed_ast::TypeRegistry;
+
+    let mut registry = TypeRegistry::new();
+    // Pre-register a "Resume" type so the lookup at
+    // `lowering.rs::convert_function`'s Resume-detection path
+    // succeeds.
+    let resume_type_id = registry.register_atomic_type(
+        InternedString::new_global("Resume"),
+        TypeMetadata::default(),
+        span(),
+    );
+    let resume_ty = Type::Named {
+        id: resume_type_id,
+        type_args: vec![],
+        const_args: vec![],
+        variance: vec![],
+        nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+    };
+
+    // Handler body: `k(42)`.  Both `k` and the result of the call have
+    // type i64 — the resume's return type matches the rewrite's
+    // emitted shape.
+    let k_var = TypedNode::new(
+        TypedExpression::Variable(InternedString::new_global("k")),
+        resume_ty.clone(),
+        span(),
+    );
+    let k_call = TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(k_var),
+            positional_args: vec![TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(42)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+    // Body wraps the call in a Return so the function actually
+    // produces something.
+    let body_stmt = TypedNode::new(
+        TypedStatement::Return(Some(Box::new(k_call))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    // Standalone handler-op-style function: `def handle_get(k: Resume<i64>): i64`
+    // — exactly the shape `algebraic_effects_pass::dispatch::handler_decl_to_impl`
+    // emits, but built directly so we don't depend on the pass for
+    // this isolated check.
+    let handle_get = TypedFunction {
+        name: InternedString::new_global("StateHandler$get"),
+        return_type: Type::Primitive(PrimitiveType::I64),
+        params: vec![TypedParameter {
+            name: InternedString::new_global("k"),
+            ty: resume_ty,
+            ..Default::default()
+        }],
+        body: Some(TypedBlock {
+            statements: vec![body_stmt],
+            span: span(),
+        }),
+        visibility: Visibility::Public,
+        ..Default::default()
+    };
+
+    let mut program = TypedProgram {
+        declarations: vec![TypedNode::new(
+            TypedDeclaration::Function(handle_get),
+            Type::Primitive(PrimitiveType::Unit),
+            span(),
+        )],
+        ..Default::default()
+    };
+
+    let registry = Arc::new(registry);
+    let module = compile_to_hir(&mut program, registry, CompilationConfig::default())
+        .expect("compile_to_hir must succeed for resumable handler");
+
+    let func = module
+        .functions
+        .values()
+        .find(|f| f.name.resolve_global().as_deref() == Some("StateHandler$get"))
+        .expect("handler op function should be lowered");
+
+    // Walk the function's instructions and count calls to
+    // `__zyntax_effect_resume`. Exactly one must be present (the
+    // body's single `k(42)` invocation).
+    let mut resume_call_count = 0;
+    let mut other_indirect_call_count = 0;
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Call { callee, .. } = inst {
+                match callee {
+                    zyntax_compiler::hir::HirCallable::Symbol(name)
+                        if name == "__zyntax_effect_resume" =>
+                    {
+                        resume_call_count += 1;
+                    }
+                    zyntax_compiler::hir::HirCallable::Indirect(_) => {
+                        other_indirect_call_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        resume_call_count, 1,
+        "expected exactly one Call(Symbol(\"__zyntax_effect_resume\")) for the `k(42)` rewrite"
+    );
+    assert_eq!(
+        other_indirect_call_count, 0,
+        "no fallback IndirectCall — the rewrite must REPLACE, not duplicate, the original call shape"
+    );
+}
+
+#[test]
 fn fn_without_effect_annotation_does_not_emit_perform_effect() {
     // Same Effect declaration, but the function is NOT @effect-annotated.
     // The call to `info(42)` should NOT lower to PerformEffect — without

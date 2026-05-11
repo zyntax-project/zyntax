@@ -116,6 +116,26 @@ pub struct SsaBuilder {
     /// Value: `(effect_id, return_type)` from the corresponding
     /// `HirEffectOp`.
     effect_op_map: IndexMap<InternedString, (HirId, HirType)>,
+    /// Phase H Tier 3: the set of parameter NAMES that have type
+    /// `Resume<T>` in the enclosing function. When the SSA builder
+    /// translates a call whose callee is `TypedExpression::Variable(name)`
+    /// and `name` is in this set, the call is rewritten to
+    /// `HirCallable::Symbol("__zyntax_effect_resume")` taking
+    /// `(callee_value, supplied_arg)`. The runtime symbol then walks
+    /// the Resume<T> struct to advance the caller's state machine.
+    ///
+    /// Names rather than HirIds because the SSA builder mints fresh
+    /// per-param HirIds at `build_from_typed_cfg` time (see
+    /// `Parameter(idx)` value-kind path) — those don't match the
+    /// `hir_func.signature.params[i].id` the lowering context sees.
+    /// Name-based lookup is unambiguous since we already match on
+    /// `Variable(name)` for the call.
+    ///
+    /// Populated by `LoweringContext::convert_function` for handler
+    /// functions whose source-level declaration includes a Resume<T>
+    /// parameter — matching the `is_resumable` detection at
+    /// `lowering.rs:2962`.
+    resume_param_names: HashSet<InternedString>,
 }
 
 /// Context for pattern matching
@@ -366,6 +386,7 @@ impl SsaBuilder {
             function_default_params: IndexMap::new(),
             function_return_types: IndexMap::new(),
             effect_op_map: IndexMap::new(),
+            resume_param_names: HashSet::new(),
         }
     }
 
@@ -405,6 +426,7 @@ impl SsaBuilder {
             function_default_params: IndexMap::new(),
             function_return_types: IndexMap::new(),
             effect_op_map: IndexMap::new(),
+            resume_param_names: HashSet::new(),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -477,6 +499,16 @@ impl SsaBuilder {
     /// instead of `HirInstruction::Call`.
     pub fn with_effect_op_map(mut self, map: IndexMap<InternedString, (HirId, HirType)>) -> Self {
         self.effect_op_map = map;
+        self
+    }
+
+    /// Phase H Tier 3: provide the set of `Resume<T>` parameter names
+    /// for the enclosing function. A `k(value)` call inside a handler
+    /// body, where `k` is one of these names, lowers to a call to the
+    /// runtime symbol `__zyntax_effect_resume`. See the
+    /// `resume_param_names` field doc for details.
+    pub fn with_resume_param_names(mut self, names: HashSet<InternedString>) -> Self {
+        self.resume_param_names = names;
         self
     }
 
@@ -3191,6 +3223,49 @@ impl SsaBuilder {
                                     return Ok(self.create_undef(HirType::Void));
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Phase H Tier 3: detect calls to a Resume<T>-typed
+                // parameter — i.e. the handler body invoking its
+                // continuation via `k(value)`. If the callee is a
+                // `Variable(name)` and `name` is in our resume-params
+                // set, translate the callee value (the Resume<T>
+                // struct pointer) and the arg, then emit a Call to
+                // `__zyntax_effect_resume(k, value)` instead of an
+                // indirect call. The runtime symbol decodes the
+                // Resume<T> struct (poll fn, state machine, result
+                // slot, next state) and advances the caller's state
+                // machine. Single-arg call is the only shape ZynML
+                // supports for Resume<T> — multi-arg or named would
+                // need a tuple/struct param anyway.
+                if !self.resume_param_names.is_empty() {
+                    if let TypedExpression::Variable(name) = &callee.node {
+                        if self.resume_param_names.contains(name) {
+                            let candidate_id = self.translate_expression(block_id, callee)?;
+                            let value_arg = if let Some(arg) = call.positional_args.first() {
+                                self.translate_expression(block_id, arg)?
+                            } else {
+                                self.create_value(
+                                    HirType::I64,
+                                    HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+                                )
+                            };
+                            let result =
+                                self.create_value(HirType::I64, HirValueKind::Instruction);
+                            let inst = HirInstruction::Call {
+                                result: Some(result),
+                                callee: crate::hir::HirCallable::Symbol(
+                                    "__zyntax_effect_resume".to_string(),
+                                ),
+                                args: vec![candidate_id, value_arg],
+                                type_args: vec![],
+                                const_args: vec![],
+                                is_tail: false,
+                            };
+                            self.add_instruction(block_id, inst);
+                            return Ok(result);
                         }
                     }
                 }

@@ -1981,6 +1981,28 @@ impl LoweringContext {
             }
         }
 
+        // Phase H Tier 3: detect Resume<T>-typed parameters in this
+        // function — the handler body uses these as continuations
+        // (`k(value)` calls). Mirrors the resumability detection at
+        // `convert_handler_impl` (this file, ~line 2962). Collect
+        // their parameter NAMES — the SSA builder mints fresh HirIds
+        // per param at `build_from_typed_cfg` time, so HirId-based
+        // identification doesn't survive; name-based does, since the
+        // SSA Call handler already matches on `Variable(name)`.
+        let mut resume_param_names: std::collections::HashSet<InternedString> =
+            std::collections::HashSet::new();
+        for p in &func.params {
+            let is_resume = matches!(&p.ty, Type::Named { id, .. } if {
+                self.type_registry
+                    .get_type_by_id(*id)
+                    .map(|def| def.name.resolve_global().as_deref() == Some("Resume"))
+                    .unwrap_or(false)
+            });
+            if is_resume {
+                resume_param_names.insert(p.name);
+            }
+        }
+
         // Convert to SSA form, processing TypedStatements to emit HIR instructions
         let ssa_builder = SsaBuilder::new(
             hir_func,
@@ -1992,7 +2014,8 @@ impl LoweringContext {
         .with_extern_link_names(self.symbols.extern_link_names.clone())
         .with_function_default_params(self.symbols.function_default_params.clone())
         .with_function_return_types(self.symbols.function_return_types.clone())
-        .with_effect_op_map(effect_op_map);
+        .with_effect_op_map(effect_op_map)
+        .with_resume_param_names(resume_param_names);
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
         // Debug: check SSA result
