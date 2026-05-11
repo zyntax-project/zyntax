@@ -87,8 +87,7 @@ fn unit_return_explicit() -> DeclRewrite {
                 // If the function body is a single bare expression, it's an
                 // implicit return — do NOT append Return(None).
                 // The CFG builder will wrap it as Return(Some(expr)).
-                if body.statements.len() == 1
-                    && matches!(&last.node, TypedStatement::Expression(_))
+                if body.statements.len() == 1 && matches!(&last.node, TypedStatement::Expression(_))
                 {
                     return None; // implicit return, not void
                 }

@@ -329,10 +329,7 @@ where
     let async_fn_ids: Vec<HirId> = module
         .functions
         .values()
-        .filter(|f| {
-            f.signature.is_async
-                || function_has_resumable_effect(f, module)
-        })
+        .filter(|f| f.signature.is_async || function_has_resumable_effect(f, module))
         .map(|f| f.id)
         .collect();
 

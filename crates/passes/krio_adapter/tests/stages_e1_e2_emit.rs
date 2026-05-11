@@ -10,9 +10,7 @@ mod common;
 use std::collections::HashSet;
 
 use krio_adapter::{emit, HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns};
-use zyntax_compiler::hir::{
-    HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind,
-};
+use zyntax_compiler::hir::{HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind};
 
 use common::{
     live_out_for_entry_only, make_async_function_with_one_await, module_of, AsyncFnFixture,

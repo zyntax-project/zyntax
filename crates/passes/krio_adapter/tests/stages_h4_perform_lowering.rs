@@ -168,9 +168,7 @@ fn h4_lower_async_module_includes_effectful_functions() {
     // Tier 3 (resumable) effects need krio's captures-lift. The
     // bulk filter looks up handler resumability in `module.handlers`.
     use indexmap::IndexMap;
-    use zyntax_compiler::hir::{
-        HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirTerminator,
-    };
+    use zyntax_compiler::hir::{HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirTerminator};
     use zyntax_typed_ast::InternedString;
 
     let EffectfulFnFixture { function, .. } = make_effectful_function_with_one_perform();
@@ -224,9 +222,7 @@ fn h4_lower_async_module_includes_effectful_functions() {
     module.handlers.insert(handler.id, handler);
 
     // Plant a frame pointer per function (the closure must mint one).
-    let mut frame_minter = |_func: &zyntax_compiler::hir::HirFunction| -> HirId {
-        HirId::new()
-    };
+    let mut frame_minter = |_func: &zyntax_compiler::hir::HirFunction| -> HirId { HirId::new() };
 
     // No real liveness — empty map. krio will produce an empty layout
     // for the function, but the filter must still admit it.
@@ -249,9 +245,7 @@ fn h4_lower_async_module_skips_non_resumable_effects() {
     // is NOT resumable (Tier 1) skips krio entirely. The Cranelift
     // backend's direct PerformEffect dispatch handles it.
     use indexmap::IndexMap;
-    use zyntax_compiler::hir::{
-        HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirTerminator,
-    };
+    use zyntax_compiler::hir::{HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirTerminator};
     use zyntax_typed_ast::InternedString;
 
     let EffectfulFnFixture { function, .. } = make_effectful_function_with_one_perform();
@@ -300,9 +294,7 @@ fn h4_lower_async_module_skips_non_resumable_effects() {
     };
     module.handlers.insert(handler.id, handler);
 
-    let mut frame_minter = |_func: &zyntax_compiler::hir::HirFunction| -> HirId {
-        HirId::new()
-    };
+    let mut frame_minter = |_func: &zyntax_compiler::hir::HirFunction| -> HirId { HirId::new() };
 
     let live_out_per_block = std::collections::HashMap::new();
     let results =

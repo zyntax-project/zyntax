@@ -2019,9 +2019,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                     arg_values.push(self.context.i64_type().const_zero().into());
                 }
 
-                let call_site =
-                    self.builder
-                        .build_call(llvm_fn, &arg_values, "perform_effect")?;
+                let call_site = self
+                    .builder
+                    .build_call(llvm_fn, &arg_values, "perform_effect")?;
                 if let Some(res_id) = result {
                     if let ValueKind::Basic(ret_val) = call_site.try_as_basic_value() {
                         self.value_map.insert(*res_id, ret_val);
@@ -2066,16 +2066,16 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // __zyntax_effect_resume runtime symbol.
                 let resume_struct = self.context.i64_type().const_zero();
                 let value_arg = self.get_value(*value)?;
-                let resume_fn =
-                    self.module
-                        .get_function("__zyntax_effect_resume")
-                        .ok_or_else(|| {
-                            CompilerError::CodeGen(
-                                "Resume: __zyntax_effect_resume not registered (build runtime via \
+                let resume_fn = self
+                    .module
+                    .get_function("__zyntax_effect_resume")
+                    .ok_or_else(|| {
+                        CompilerError::CodeGen(
+                            "Resume: __zyntax_effect_resume not registered (build runtime via \
                                  register_effect_runtime_symbols)"
-                                    .to_string(),
-                            )
-                        })?;
+                                .to_string(),
+                        )
+                    })?;
                 let _ = self.builder.build_call(
                     resume_fn,
                     &[resume_struct.into(), value_arg.into()],
@@ -2778,7 +2778,8 @@ impl<'ctx> LLVMBackend<'ctx> {
             HirCallable::FuncRef(_) => Err(CompilerError::CodeGen(
                 "HirCallable::FuncRef is not callable directly — \
                  use it only as a value (function address); for calls go \
-                 through Indirect".to_string(),
+                 through Indirect"
+                    .to_string(),
             )),
         }
     }

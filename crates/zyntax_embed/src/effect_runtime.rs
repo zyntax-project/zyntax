@@ -238,9 +238,7 @@ const fn params3(a: TypeTag, b: TypeTag, c: TypeTag) -> [TypeTag; MAX_PARAMS] {
 /// `compile_typed_program` for a module that uses resumable effects).
 /// Idempotent — registering the same name twice is a no-op on the
 /// underlying `register_runtime_symbol`.
-pub fn register_effect_runtime_symbols(
-    runtime: &mut crate::runtime::ZyntaxRuntime,
-) {
+pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
     // push_handler(effect_id: u64, handler_state: *u8, op_table: *u8) -> u64
     runtime.register_function_typed(
         "__zyntax_effect_push_handler",

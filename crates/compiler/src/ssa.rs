@@ -3252,8 +3252,7 @@ impl SsaBuilder {
                                     HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
                                 )
                             };
-                            let result =
-                                self.create_value(HirType::I64, HirValueKind::Instruction);
+                            let result = self.create_value(HirType::I64, HirValueKind::Instruction);
                             let inst = HirInstruction::Call {
                                 result: Some(result),
                                 callee: crate::hir::HirCallable::Symbol(
