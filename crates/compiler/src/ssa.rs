@@ -5945,11 +5945,12 @@ impl SsaBuilder {
                     use crate::hir::HirStructType;
                     use zyntax_typed_ast::type_registry::TypeKind;
 
-                    // Phase H Tier 3: Resume<T> is the reified continuation
-                    // passed to resumable effect handlers. In the placeholder
-                    // ABI it's an i64 sentinel; see `effect_runtime.rs`.
+                    // Phase I.1: Resume<T> is `Ptr(U8)` in HIR — an
+                    // opaque pointer the runtime symbol reinterprets
+                    // as `&Resume`. See `lowering.rs::convert_type`
+                    // for the design note.
                     if type_def.name.resolve_global().as_deref() == Some("Resume") {
-                        return HirType::I64;
+                        return HirType::Ptr(Box::new(HirType::U8));
                     }
 
                     // Extern/opaque types (ZRTL-backed like Tensor) → Ptr(Opaque)

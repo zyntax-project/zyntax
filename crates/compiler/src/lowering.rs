@@ -2566,14 +2566,20 @@ impl LoweringContext {
             Type::Named { id, .. } => {
                 // Look up type definition in registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
-                    // Phase H Tier 3: Resume<T> is the reified continuation
-                    // passed to resumable effect handlers. In the placeholder
-                    // implementation the runtime treats it as an i64 sentinel
-                    // (see `effect_runtime.rs::__zyntax_effect_resume`); the
-                    // full Resume<T> ABI (poll_fn_ptr / state_machine_ptr /
-                    // result_slot_offset / next_state struct) is a follow-up.
+                    // Phase I.1: Resume<T> is the reified continuation
+                    // passed to resumable effect handlers. Represented in HIR
+                    // as `Ptr(U8)` — opaque pointer to a `Resume` struct
+                    // (defined in `effect_runtime.rs::Resume`, layout
+                    // `{poll_fn_ptr, state_machine_ptr, result_slot_offset,
+                    // next_state}`). The struct itself stays opaque at the
+                    // HIR/Cranelift level; the runtime symbol
+                    // `__zyntax_effect_resume` reinterprets the pointer.
+                    // Under the placeholder ABI (Phase H), the pointer is
+                    // always null and the runtime symbol just returns the
+                    // value — Phase I.2 will replace the perform-site
+                    // padding with real struct allocation.
                     if type_def.name.resolve_global().as_deref() == Some("Resume") {
-                        return HirType::I64;
+                        return HirType::Ptr(Box::new(HirType::U8));
                     }
 
                     match &type_def.kind {
