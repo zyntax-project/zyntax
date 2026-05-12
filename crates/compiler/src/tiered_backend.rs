@@ -6,12 +6,22 @@
 //! infrastructure.
 //!
 //! ## Optimization tiers
-//! - **Tier 0 (Baseline)** — Cranelift, eagerly compiled at module load.
-//!   Beadie generation 0.
-//! - **Tier 1 (Standard)** — Cranelift recompile, promoted at the warm
+//! - **Tier 0 (Interpreter)** — HIR bytecode interpreter, the cold-start
+//!   path before any JIT touches a function. Lives in `hir_interp`; not
+//!   driven by beadie. Promotes to Baseline on the first hotness sample.
+//! - **Tier 1 (Baseline)** — Cranelift, eagerly compiled at module load
+//!   on native or wasm-emitted on wasm targets. Beadie generation 0.
+//! - **Tier 2 (Standard)** — Cranelift recompile, promoted at the warm
 //!   threshold from `ProfileConfig`. Beadie generation 1.
-//! - **Tier 2 (Optimized)** — Cranelift or LLVM recompile, promoted at the
-//!   hot threshold. Beadie generation 2.
+//! - **Tier 3 (Optimized)** — Cranelift or LLVM recompile, promoted at
+//!   the hot threshold. Beadie generation 2.
+//!
+//! Note: the variants below are the JIT-tier ladder only — they're
+//! what beadie's broker schedules. The `Interpreter` tier is OUTSIDE
+//! this enum because the JIT broker never schedules into it (it's the
+//! starting point). Callers ask `function_tier()` and get back one of
+//! the JIT tiers once a function has been baselined; before that, the
+//! function is implicitly in the `Interpreter` tier.
 //!
 //! ## Public API
 //! Mirrors the previous hand-rolled implementation 1:1 so embedders
@@ -518,7 +528,10 @@ impl Drop for TieredBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build the per-tier hotness policies from a `TieredConfig`.
-fn make_policies(config: &TieredConfig) -> Vec<Box<dyn HotnessPolicy>> {
+///
+/// Public so `zyntax_embed`'s interpreter-backed runtime can build the
+/// same `TieredAdapter` policy stack used by the native `TieredBackend`.
+pub fn make_policies(config: &TieredConfig) -> Vec<Box<dyn HotnessPolicy>> {
     let warm = clamp_to_u32(config.profile_config.warm_threshold);
     let hot = clamp_to_u32(config.profile_config.hot_threshold);
 
@@ -556,8 +569,16 @@ fn clamp_to_u32(v: u64) -> u32 {
     }
 }
 
+/// Dispatch the correct JIT backend for a tier index.
+///
+/// - `tier_idx == 0` / `tier_idx == 1` → Cranelift (baseline / opt).
+/// - `tier_idx == 2` → Cranelift or LLVM, based on `tier2_backend`.
+///
+/// Public so `zyntax_embed::InterpRuntime` can reuse the same per-tier
+/// dispatch as the native `TieredBackend`. Returns `*mut ()` (the
+/// compiled fn ptr) or `ptr::null_mut()` on failure.
 #[allow(clippy::too_many_arguments)]
-fn compile_at_tier(
+pub fn compile_at_tier(
     tier_idx: usize,
     bead: &Arc<Bead>,
     func_id: HirId,

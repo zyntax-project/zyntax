@@ -551,7 +551,7 @@ impl StackPromotionPass {
         func: &mut HirFunction,
         escape_info: &HashMap<HirId, EscapeInfo>,
     ) -> CompilerResult<()> {
-        eprintln!(
+        log::debug!(
             "[STACK_PROMOTION] Analyzing function '{}'",
             func.name
                 .resolve_global()
@@ -593,7 +593,7 @@ impl StackPromotionPass {
             }
         }
 
-        eprintln!(
+        log::debug!(
             "[STACK_PROMOTION] Found {} promotable allocations, {} not promotable",
             allocations_to_promote.len(),
             self.not_promoted.len()
@@ -628,7 +628,7 @@ impl StackPromotionPass {
                 {
                     if *result == result_id {
                         // Replace with alloca
-                        eprintln!(
+                        log::debug!(
                             "[STACK_PROMOTION] Promoting allocation {:?} to stack",
                             result_id
                         );

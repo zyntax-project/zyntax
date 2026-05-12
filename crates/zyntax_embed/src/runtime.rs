@@ -299,7 +299,13 @@ fn value_to_native(value: &ZyntaxValue, ty: NativeType) -> RuntimeResult<i64> {
     }
 }
 
-/// Convert a native i64 result back to ZyntaxValue
+// `ZyntaxValue` ↔ `InterpValue` conversion is now expressed via
+// `From` impls living in [`zyntax_compiler::hir_interp`] (where
+// `InterpValue` is defined). The lossy table that used to live here
+// is gone — both directions are lossless for primitives and use
+// `Tuple` for aggregates; richer host marshalling (strings/maps/
+// named structs) is the natural next extension.
+
 fn native_to_value(raw: i64, ty: NativeType) -> RuntimeResult<ZyntaxValue> {
     Ok(match ty {
         NativeType::I32 => ZyntaxValue::Int(raw as i32 as i64),
@@ -1158,6 +1164,14 @@ pub struct ZyntaxRuntime {
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
     event_sink: Option<Arc<dyn Fn(&RuntimeEvent) + Send + Sync>>,
+    /// The single BC interpreter that owns execution dispatch. Tier-up
+    /// to Cranelift / LLVM happens inside it via beadie's
+    /// `TieredAdapter` — there is no parallel beadie loop on the
+    /// `ZyntaxRuntime` side. `compile_module` installs the same HIR
+    /// here that the legacy JIT receives; `call_function` delegates
+    /// to it. Wrapped in `Mutex` so `&self` methods can mutate the
+    /// interp's per-call state.
+    interp: std::sync::Mutex<crate::interp_runtime::InterpRuntime>,
 }
 
 /// An external function that can be called from Zyntax code
@@ -1199,6 +1213,7 @@ impl ZyntaxRuntime {
             plugin_signatures: HashMap::new(),
             runtime_events: Vec::new(),
             event_sink: None,
+            interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
         };
         // Register the algebraic-effects runtime symbols
         // (`__zyntax_effect_*`) up front so any module compiled later
@@ -1227,6 +1242,7 @@ impl ZyntaxRuntime {
             plugin_signatures: HashMap::new(),
             runtime_events: Vec::new(),
             event_sink: None,
+            interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
         };
         crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
         Ok(runtime)
@@ -1277,6 +1293,14 @@ impl ZyntaxRuntime {
 
         // Finalize definitions to get function pointers
         self.backend.finalize_definitions()?;
+
+        // Install the same module in the internal BC interpreter.
+        // The interp owns execution dispatch — `call_function`
+        // delegates here; beadie's `TieredAdapter` inside the interp
+        // drives the single tier-up loop.
+        if let Ok(mut interp) = self.interp.lock() {
+            interp.compile_module(module.clone());
+        }
 
         Ok(())
     }
@@ -1332,11 +1356,22 @@ impl ZyntaxRuntime {
         self.compile_module(&hir_module)
     }
 
-    /// Lower a TypedProgram to HirModule
+    /// Lower a TypedProgram to HirModule.
     ///
-    /// This performs the lowering pass to convert the TypedAST to HIR,
-    /// which can then be compiled to machine code.
-    fn lower_typed_program(
+    /// Runs the full lowering pipeline — struct/enum decl
+    /// registration, import-trait/impl resolution, extern-decl
+    /// registration, unresolved-type fixup, impl-block registration,
+    /// abstract-trait synthesis, pattern engine, HIR lowering, async
+    /// transform (when configured), monomorphization.
+    ///
+    /// Returns the lowered HIR ready for either the native JIT (via
+    /// [`Self::compile_module`]) or the BC interpreter (via
+    /// [`crate::InterpRuntime::compile_module`]).
+    ///
+    /// `builtins` is a name-keyed hint map for the SSA builder's
+    /// `@builtin` extern resolution; pass an empty `IndexMap` when in
+    /// doubt.
+    pub fn lower_typed_program(
         &self,
         mut program: zyntax_typed_ast::TypedProgram,
         builtins: indexmap::IndexMap<String, String>,
@@ -1763,11 +1798,7 @@ impl ZyntaxRuntime {
         args: &[ZyntaxValue],
         signature: &NativeSignature,
     ) -> RuntimeResult<ZyntaxValue> {
-        let ptr = self
-            .get_function_ptr(name)
-            .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
-
-        // Validate argument count
+        // Validate argument count.
         if args.len() != signature.params.len() {
             return Err(RuntimeError::Execution(format!(
                 "Function '{}' expects {} arguments, got {}",
@@ -1777,8 +1808,145 @@ impl ZyntaxRuntime {
             )));
         }
 
-        // SAFETY: We trust the caller has provided the correct signature
-        unsafe { call_native_with_signature(ptr, args, signature) }
+        // Prefer the BC interpreter — it owns the single beadie
+        // tier-up loop, so cold calls run bytecode and hot functions
+        // tier up to Cranelift / LLVM. Fall back to the legacy native
+        // Cranelift dispatch when the interpreter can't yet handle the
+        // call (unsupported instruction such as an algebraic-effect
+        // intrinsic, or the function isn't in the interp's HIR
+        // module — e.g. registered as a foreign symbol).
+        let interp_result = {
+            let mut interp = self
+                .interp
+                .lock()
+                .map_err(|e| RuntimeError::Execution(format!("interp lock poisoned: {e}")))?;
+            interp.call_function(name, args.to_vec())
+        };
+        match interp_result {
+            Ok(v) => Ok(v),
+            Err(
+                zyntax_compiler::hir_interp::InterpError::UnsupportedInstruction(_)
+                | zyntax_compiler::hir_interp::InterpError::UnknownFunction(_),
+            ) => {
+                // Native dispatch via the underlying Cranelift JIT.
+                let ptr = self
+                    .get_function_ptr(name)
+                    .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
+                // SAFETY: caller-supplied signature must match the
+                // JIT-compiled function. Same contract as the original
+                // `call_function` before the interpreter took over the
+                // primary path.
+                unsafe { call_native_with_signature(ptr, args, signature) }
+            }
+            Err(e) => Err(RuntimeError::Execution(format!(
+                "interp dispatch failed: {e}"
+            ))),
+        }
+    }
+
+    // ── Execution-side forwarders (BC interp + beadie tier-up) ──
+    //
+    // These methods delegate to the internal interpreter state. The
+    // user-facing API treats `ZyntaxRuntime` as the single runtime;
+    // the interp is an implementation detail.
+
+    /// Call a function directly with `ZyntaxValue` args, returning a
+    /// `ZyntaxValue` result. No signature parameter — the interpreter
+    /// dispatches by the function's HIR signature.
+    pub fn call_function_raw(
+        &self,
+        name: &str,
+        args: Vec<ZyntaxValue>,
+    ) -> Result<ZyntaxValue, RuntimeError> {
+        let mut interp = self
+            .interp
+            .lock()
+            .map_err(|e| RuntimeError::Execution(format!("interp lock poisoned: {e}")))?;
+        interp
+            .call_function(name, args)
+            .map_err(|e| RuntimeError::Execution(format!("interp dispatch failed: {e}")))
+    }
+
+    /// Register an extern "C" symbol callable from the BC interpreter
+    /// (i64-funneled ABI). Mirrors `register_function` but on the
+    /// interp side; use this when you're driving execution through
+    /// the interp rather than the legacy JIT path.
+    pub fn register_interp_symbol(&self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
+        if let Ok(mut interp) = self.interp.lock() {
+            interp.register_symbol(name, ptr, param_count);
+        }
+    }
+
+    /// Forward a slice of ZRTL plugin symbols (the shape
+    /// `ZrtlPlugin::symbols_with_signatures()` returns) into the BC
+    /// interpreter's FFI table.
+    pub fn register_zrtl_symbols(&self, symbols: &[zyntax_compiler::zrtl::RuntimeSymbolInfo]) {
+        if let Ok(mut interp) = self.interp.lock() {
+            interp.register_zrtl_symbols(symbols);
+        }
+    }
+
+    /// Install the BC interp → Cranelift opt [→ LLVM] tier ladder for
+    /// hot-function promotion. Beadie's `TieredAdapter` (inside the
+    /// interp) is the single tier-up orchestrator.
+    pub fn install_interp_jit(&self) -> Result<(), CompilerError> {
+        let mut interp = self
+            .interp
+            .lock()
+            .map_err(|e| CompilerError::Backend(format!("interp lock poisoned: {e}")))?;
+        interp.install_jit()
+    }
+
+    /// Install the tier ladder with a custom `TieredConfig`
+    /// (promotion thresholds + tier-2 backend selection). See
+    /// [`Self::install_interp_jit`].
+    pub fn install_interp_jit_with(
+        &self,
+        config: zyntax_compiler::tiered_backend::TieredConfig,
+    ) -> Result<(), CompilerError> {
+        let mut interp = self
+            .interp
+            .lock()
+            .map_err(|e| CompilerError::Backend(format!("interp lock poisoned: {e}")))?;
+        interp.install_jit_with(config)
+    }
+
+    /// Diagnostic: profile counters for a function in the BC interp.
+    pub fn interp_profile_for(&self, func_id: HirId) -> zyntax_compiler::hir_interp::ProfileSample {
+        self.interp
+            .lock()
+            .map(|i| i.profile_for(func_id))
+            .unwrap_or_default()
+    }
+
+    /// Diagnostic: every HirId that has a registered tier-up bound on
+    /// the BC interp side. Used by tests to walk per-function state.
+    pub fn interp_registered_function_ids(&self) -> Vec<HirId> {
+        self.interp
+            .lock()
+            .map(|i| i.registered_function_ids().collect())
+            .unwrap_or_default()
+    }
+
+    /// Diagnostic: snapshot of a function's beadie state — `Some` if
+    /// the bead reports `compiled()`, else `None`.
+    pub fn interp_function_compiled(&self, func_id: HirId) -> bool {
+        self.interp
+            .lock()
+            .map(|i| i.bead_for(func_id).and_then(|b| b.compiled()).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Diagnostic: current beadie generation for a function — 0 means
+    /// uncompiled (BC interp only), 1 means promoted to the first JIT
+    /// tier (Cranelift opt), 2 means promoted to the second tier
+    /// (LLVM, when the `llvm-backend` feature is on). Tests use this
+    /// to assert tier-up actually crossed each rung.
+    pub fn interp_function_generation(&self, func_id: HirId) -> u64 {
+        self.interp
+            .lock()
+            .map(|i| i.bead_for(func_id).map(|b| b.generation()).unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Call an async function, returning a Promise

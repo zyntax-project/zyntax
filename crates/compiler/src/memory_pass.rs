@@ -87,7 +87,7 @@ impl MemoryManagementPass {
         // Log stack promotion summary
         let summary = self.stack_promotion.get_summary();
         if !summary.is_empty() {
-            eprintln!("[MEMORY_PASS] {}", summary);
+            log::debug!("[MEMORY_PASS] {}", summary);
         }
 
         Ok(())

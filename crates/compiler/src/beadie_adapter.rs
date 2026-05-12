@@ -121,7 +121,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "llvm-backend")]
-pub use llvm_impl::ZyntaxLlvmBackend;
+pub use llvm_impl::{build_llvm_backend, LlvmContextKeepAlive, ZyntaxLlvmBackend};
 
 #[cfg(feature = "llvm-backend")]
 mod llvm_impl {
@@ -129,8 +129,15 @@ mod llvm_impl {
     use crate::llvm_jit_backend::LLVMJitBackend;
 
     /// `JitBackend` wrapper around [`LLVMJitBackend`].
+    ///
+    /// Drop order matters: the inkwell `ExecutionEngine` inside `inner`
+    /// borrows from the `Context` boxed in `_keepalive`. Rust drops
+    /// fields in declaration order, so `inner` (the backend +
+    /// ExecutionEngine) drops first, then `_keepalive` (the Context).
+    /// Reversing these fields would crash on drop.
     pub struct ZyntaxLlvmBackend {
         inner: Mutex<LLVMJitBackend<'static>>,
+        _keepalive: Option<std::sync::Arc<LlvmContextKeepAlive>>,
     }
 
     // SAFETY: same justification as `ZyntaxCraneliftBackend` — the `Mutex`
@@ -142,6 +149,7 @@ mod llvm_impl {
         pub fn new(backend: LLVMJitBackend<'static>) -> Self {
             Self {
                 inner: Mutex::new(backend),
+                _keepalive: None,
             }
         }
 
@@ -176,5 +184,67 @@ mod llvm_impl {
                     })
             })
         }
+    }
+
+    /// Opaque keep-alive handle for the inkwell `Context` that
+    /// `ZyntaxLlvmBackend` borrows from. Stored alongside the backend
+    /// in the runtime; dropped only after every consumer is dropped.
+    ///
+    /// `Send + Sync` are unsafely implemented because the inner
+    /// `Context` is only touched through the `ZyntaxLlvmBackend`'s
+    /// own `Mutex`-serialised access — the keep-alive itself never
+    /// hands out direct references.
+    pub struct LlvmContextKeepAlive {
+        // Boxed so the heap address is stable; the LLVMJitBackend
+        // borrows from this address for its lifetime.
+        _context: Box<inkwell::context::Context>,
+    }
+    // SAFETY: the wrapped `Context` is only ever accessed through the
+    // sibling `ZyntaxLlvmBackend`'s `Mutex`. This handle exists only
+    // to keep the address alive; it never exposes the inner reference.
+    unsafe impl Send for LlvmContextKeepAlive {}
+    unsafe impl Sync for LlvmContextKeepAlive {}
+
+    /// Build an `Arc<ZyntaxLlvmBackend>` along with the
+    /// `inkwell::Context` keep-alive that owns its lifetime.
+    ///
+    /// `LLVMJitBackend` borrows from a `Context` that must outlive
+    /// every JIT'd module. This helper self-pins the `Context` in a
+    /// boxed keep-alive and hands a `'static` reference to the
+    /// backend; callers hold the returned `Arc<LlvmContextKeepAlive>`
+    /// to keep the storage alive for the runtime's lifetime.
+    ///
+    /// Encapsulated here so callers (`zyntax_embed::ZyntaxRuntime`)
+    /// never need to depend on `inkwell` directly.
+    ///
+    /// # Safety
+    /// The reference inside `ZyntaxLlvmBackend` is logically bound to
+    /// the lifetime of the returned `Arc<LlvmContextKeepAlive>`. Drop
+    /// the keep-alive only after dropping every consumer of the
+    /// backend.
+    pub fn build_llvm_backend() -> Result<
+        (
+            std::sync::Arc<ZyntaxLlvmBackend>,
+            std::sync::Arc<LlvmContextKeepAlive>,
+        ),
+        crate::CompilerError,
+    > {
+        use inkwell::context::Context;
+
+        let context: Box<Context> = Box::new(Context::create());
+        // SAFETY: `context` is moved into the `LlvmContextKeepAlive`
+        // which the caller stores in an `Arc` for the runtime's
+        // lifetime. The `'static` reference we hand to
+        // `LLVMJitBackend` therefore points to storage that outlives
+        // every consumer.
+        let context_ref: &'static Context = unsafe { &*(context.as_ref() as *const Context) };
+        let inner = LLVMJitBackend::new(context_ref)
+            .map_err(|e| crate::CompilerError::Backend(format!("llvm init failed: {e}")))?;
+        let keepalive = std::sync::Arc::new(LlvmContextKeepAlive { _context: context });
+        let backend = ZyntaxLlvmBackend {
+            inner: Mutex::new(inner),
+            _keepalive: Some(std::sync::Arc::clone(&keepalive)),
+        };
+        Ok((std::sync::Arc::new(backend), keepalive))
     }
 }

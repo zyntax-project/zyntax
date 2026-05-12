@@ -32,7 +32,7 @@ pub mod effect_handler_resolution; // Handler resolution for effect dispatch
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
-pub mod hir_interp; // HIR tree-walking interpreter (Tier 0; always available)
+pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always available)
 pub mod lowering;
 pub mod memory_management;
 pub mod memory_optimization; // Memory-aware optimizations
@@ -45,6 +45,7 @@ pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
 pub mod trait_lowering; // Trait/interface lowering to HIR
 pub mod typed_cfg; // New: TypedAST-aware CFG builder
+pub mod value; // Unified runtime value type (used by interp + embed)
 pub mod vtable_registry; // Vtable management and caching // Async runtime (executor, task, waker)
 
 #[cfg(feature = "cranelift-backend")]

@@ -889,3 +889,95 @@ pub(crate) fn register_struct_declarations(
 
     Ok(())
 }
+
+/// Register enum types from `TypedDeclaration::Enum` declarations.
+/// Symmetric to [`register_struct_declarations`].
+///
+/// Only registers an enum if the registry doesn't already contain a
+/// type under that name (so pre-registered placeholders from the
+/// parser aren't clobbered).
+pub(crate) fn register_enum_declarations(
+    program: &zyntax_typed_ast::TypedProgram,
+    type_registry: &mut zyntax_typed_ast::TypeRegistry,
+) -> RuntimeResult<()> {
+    use zyntax_typed_ast::type_registry::{
+        FieldDef, TypeDefinition, TypeKind, TypeMetadata, VariantDef, VariantFields, Visibility,
+    };
+    use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedVariantFields};
+    use zyntax_typed_ast::TypeId;
+
+    for decl in &program.declarations {
+        if let TypedDeclaration::Enum(enum_decl) = &decl.node {
+            if type_registry.get_type_by_name(enum_decl.name).is_some() {
+                continue;
+            }
+            let type_id = if let zyntax_typed_ast::Type::Named { id, .. } = &decl.ty {
+                *id
+            } else {
+                TypeId::next()
+            };
+
+            let variants: Vec<VariantDef> = enum_decl
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let fields = match &v.fields {
+                        TypedVariantFields::Unit => VariantFields::Unit,
+                        TypedVariantFields::Tuple(types) => VariantFields::Tuple(types.clone()),
+                        TypedVariantFields::Named(fields) => VariantFields::Named(
+                            fields
+                                .iter()
+                                .map(|f| FieldDef {
+                                    name: f.name,
+                                    ty: f.ty.clone(),
+                                    visibility: Visibility::Public,
+                                    mutability: f.mutability.clone(),
+                                    is_static: false,
+                                    span: f.span,
+                                    getter: None,
+                                    setter: None,
+                                    is_synthetic: false,
+                                })
+                                .collect(),
+                        ),
+                    };
+                    VariantDef {
+                        name: v.name,
+                        fields,
+                        discriminant: Some(i as i64),
+                        span: v.span,
+                    }
+                })
+                .collect();
+
+            let type_def = TypeDefinition {
+                id: type_id,
+                name: enum_decl.name,
+                kind: TypeKind::Enum { variants },
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![],
+                methods: vec![],
+                constructors: vec![],
+                metadata: TypeMetadata::default(),
+                span: decl.span,
+            };
+            type_registry.register_type(type_def);
+        }
+    }
+    Ok(())
+}
+
+/// Run the full struct + enum decl-type registration pass.
+/// Convenience over the individual `register_struct_declarations` /
+/// `register_enum_declarations` calls; matches what
+/// `ZyntaxRuntime::lower_typed_program` does inline.
+pub(crate) fn register_decl_types(
+    program: &zyntax_typed_ast::TypedProgram,
+    type_registry: &mut zyntax_typed_ast::TypeRegistry,
+) -> RuntimeResult<()> {
+    register_struct_declarations(program, type_registry)?;
+    register_enum_declarations(program, type_registry)?;
+    Ok(())
+}

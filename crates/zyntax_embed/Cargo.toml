@@ -30,6 +30,11 @@ pest = "2.7"
 pest_meta = "2.8"
 pest_vm = "2.8"
 
+# Hot-function promotion broker (interp→JIT tier-up). Default features
+# off so no cranelift/llvm is dragged in on wasm targets; we only use
+# the core orchestrator API (Beadie, Bead, ThresholdPolicy, on_invoke).
+beadie = { version = "0.3", default-features = false }
+
 [dev-dependencies]
 
 [features]

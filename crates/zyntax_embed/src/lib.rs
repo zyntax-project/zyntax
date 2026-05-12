@@ -63,6 +63,11 @@ mod grammar;
 mod grammar2;
 #[cfg(feature = "native")]
 mod import_chain;
+/// BC-interpreter-backed execution engine — internal scaffolding for
+/// [`runtime::ZyntaxRuntime`]. Holds the `HirInterpreter`, beadie's
+/// `TieredAdapter`, and the FFI symbol table. Not part of the public
+/// API; callers go through `ZyntaxRuntime`'s execution methods.
+pub(crate) mod interp_runtime;
 pub mod iterator;
 // `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
 // loader, async executor). Disabled in `parse-only` builds — the
@@ -85,6 +90,8 @@ pub use effect_runtime::{
 };
 
 pub use array::ZyntaxArray;
+// Re-export the BC interpreter so embedders that want a bare
+// HirInterpreter without the beadie wrapper can grab it directly.
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};
 pub use error::{ConversionError, ZyntaxError};
 pub use grammar::{GrammarError, GrammarResult, LanguageGrammar};
@@ -130,6 +137,7 @@ pub use runtime::{
 };
 pub use string::ZyntaxString;
 pub use value::ZyntaxValue;
+pub use zyntax_compiler::hir_interp::{HirInterpreter, InterpError, JitDispatch, ProfileSample};
 
 // Re-export zyn_peg types for custom AST builders and advanced grammar use
 pub use zyn_peg::runtime::{

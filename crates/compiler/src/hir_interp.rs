@@ -1,146 +1,1106 @@
-//! HIR tree-walking interpreter (Tier 0 of the wasm-target plan).
+//! HIR bytecode interpreter — universal Tier 0 cold-start execution.
 //!
-//! Walks `HirModule` instruction-by-instruction so a program can
-//! execute without any code-generation backend. Always-on (works on
-//! native + wasm32) — when zyntax_embed is built for `wasm32-unknown-
-//! unknown`, this is the only execution path.
+//! Compiles each `HirFunction` once into a compact, register-based
+//! bytecode and runs it in a tight dispatch loop. Used as the cold-
+//! start tier across every Zyntax target. On native, hot functions
+//! tier up to the Cranelift baseline JIT (Tier 1); on wasm targets,
+//! hot functions tier up to a wasm-emitting backend (also Tier 1 —
+//! same rung in the ladder, different code generator).
 //!
-//! ## Scope of this initial cut
+//! ## Design
 //!
-//! This is the skeleton + the first slice of coverage. Covered today:
+//! * **Register VM**, not stack VM. HIR is already in SSA form — each
+//!   `HirId` maps to one register slot, so lowering is a 1:1 walk
+//!   with no stack-shuffling overhead. Modern dynamic-language VMs
+//!   (Lua 5+, V8 Ignition, Hermes) all use register VMs for the same
+//!   reason.
+//! * **Out-of-SSA at lowering time**: phi nodes are resolved during
+//!   compilation by emitting `Move` ops at each branch site (the
+//!   classic "exit SSA" rewrite). The interpreter itself never sees
+//!   phi nodes.
+//! * **Constant / type / args / switch-table pools** are owned by the
+//!   `CompiledFunction` and indexed by `u32`. Keeping these out of the
+//!   `Op` enum keeps each opcode small (≤16 bytes) so the bytecode
+//!   stream stays cache-friendly.
+//! * **Tagged values on the bus**. `InterpValue` carries width and
+//!   signedness so we don't lose precision crossing call boundaries,
+//!   load/store layouts, or extern symbol invocations. Integer ops
+//!   funnel through `i64`; the result is re-tagged from operand width.
 //!
-//! * Arithmetic / logic: `Binary` (Add/Sub/Mul/Div/Mod, integer + float;
-//!   Eq/Ne/Lt/Le/Gt/Ge; And/Or; BitAnd/BitOr/BitXor/Shl/Shr).
-//! * `Unary` (Neg, Not).
-//! * `Cast` (Trunc, ZExt, SExt, FpExt, FpTrunc, IntToPtr, PtrToInt,
-//!   Bitcast, FpToSi/Ui, SiToFp/UiToFp).
-//! * Memory: `Alloca`, `Load`, `Store`, `GetElementPtr`. Backed by an
-//!   in-interpreter byte-slab allocator (`Memory`).
-//! * Control flow: `Branch`, `CondBranch`, `Return`, `Switch`,
-//!   `Unreachable`. Phi nodes resolved on incoming-edge.
-//! * Direct + indirect function calls: `Call(Function(_))`,
-//!   `Call(Indirect(_))`, `Call(Symbol(_))` (transmute to extern "C"
-//!   pointer; signature inferred from the call's args + return type).
-//! * `ExtractValue` / `InsertValue` on `InterpValue::Struct`.
+//! ## Coverage in this initial slice
 //!
-//! Not yet covered (Phase B.2 follow-up):
+//! Covered: `Binary` / `Unary` / `Cast`; `Alloca` / `Load` / `Store`;
+//! `Branch` / `CondBranch` / `Switch` / `Return` / `Unreachable`; phis;
+//! direct calls (`HirCallable::Function`); FFI calls (`HirCallable::
+//! Symbol`); `ExtractValue` / `InsertValue`.
 //!
-//! * Algebraic effects (`PerformEffect`, `AsyncSaveSlot`,
-//!   `AsyncLoadSlot`, intercepted `__zyntax_effect_resume`).
-//! * `CreateClosure` / `CallClosure` / `TraitMethodCall` /
-//!   `CreateTraitObject` / `UpcastTraitObject`.
-//! * Atomics, fences, vector / SIMD ops.
-//! * Profile-counter feedback to Tier 1 (Phase E hookup).
-//!
-//! Once Phase B.2 lands the algebraic-effects path, the 10 existing
-//! `effect_runtime_tests` will be rerunnable via the interpreter for
-//! parity verification.
+//! Phase B.2 will add: algebraic effects (`PerformEffect`,
+//! `AsyncSaveSlot` / `AsyncLoadSlot`, intercepted `__zyntax_effect_
+//! resume`), closures, trait-object dispatch, atomics, SIMD.
 
 use std::collections::HashMap;
 
 use crate::hir::{
-    BinaryOp, CastOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction,
-    HirModule, HirTerminator, HirType, HirValueKind, UnaryOp,
+    BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
+    HirTerminator, HirType, HirValueKind, UnaryOp,
 };
+use crate::value::ZyntaxValue;
 
-/// Tagged runtime value carried by the interpreter.
-///
-/// `Struct` is recursive so nested aggregates (struct of struct) work
-/// without flattening. `Ptr` carries the raw byte pointer + the
-/// allocation it belongs to, so `Load` / `Store` can be range-checked
-/// against the source allocation in debug builds.
+// ─────────────────────────────────────────────────────────────────────────────
+// Value model
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The interpreter uses [`crate::value::ZyntaxValue`] directly. No
+// separate `InterpValue` type. Width info comes from the `HirType`
+// stored per-register in [`CompiledFunction::reg_types`] (and on
+// each HIR instruction); the interpreter masks integer arithmetic
+// results to fit that width on output.
+
+/// Coerce a `ZyntaxValue` to `i64` for the interpreter's i64-funneled
+/// integer bus. Accepts every integer-shaped variant (generic +
+/// width-precise siblings).
+pub fn value_to_i64(v: &ZyntaxValue) -> Option<i64> {
+    match v {
+        ZyntaxValue::Bool(b) => Some(*b as i64),
+        ZyntaxValue::Int(x) => Some(*x),
+        ZyntaxValue::UInt(x) => Some(*x as i64),
+        ZyntaxValue::I8(x) => Some(*x as i64),
+        ZyntaxValue::I16(x) => Some(*x as i64),
+        ZyntaxValue::I32(x) => Some(*x as i64),
+        ZyntaxValue::U8(x) => Some(*x as i64),
+        ZyntaxValue::U16(x) => Some(*x as i64),
+        ZyntaxValue::U32(x) => Some(*x as i64),
+        ZyntaxValue::Float(x) => Some(*x as i64),
+        ZyntaxValue::F32(x) => Some(*x as i64),
+        ZyntaxValue::Pointer(p) => Some(*p as i64),
+        _ => None,
+    }
+}
+
+/// Coerce a `ZyntaxValue` to `f64` for the interpreter's f64-funneled
+/// float bus.
+pub fn value_to_f64(v: &ZyntaxValue) -> Option<f64> {
+    match v {
+        ZyntaxValue::Float(x) => Some(*x),
+        ZyntaxValue::F32(x) => Some(*x as f64),
+        _ => value_to_i64(v).map(|n| n as f64),
+    }
+}
+
+/// Construct a `ZyntaxValue` from a raw `i64`, tagging with the
+/// width-precise variant that matches `ty`. Narrow widths produce
+/// `I8`/`I16`/`I32`/`U8`/`U16`/`U32`; i64/u64/f64 reuse the generic
+/// `Int`/`UInt`/`Float` variants (no separate I64/U64/F64 siblings).
+pub fn value_from_i64_as(ty: &HirType, raw: i64) -> ZyntaxValue {
+    match ty {
+        HirType::Void => ZyntaxValue::Void,
+        HirType::Bool => ZyntaxValue::Bool(raw != 0),
+        HirType::I8 => ZyntaxValue::I8(raw as i8),
+        HirType::I16 => ZyntaxValue::I16(raw as i16),
+        HirType::I32 => ZyntaxValue::I32(raw as i32),
+        HirType::I64 => ZyntaxValue::Int(raw),
+        HirType::U8 => ZyntaxValue::U8(raw as u8),
+        HirType::U16 => ZyntaxValue::U16(raw as u16),
+        HirType::U32 => ZyntaxValue::U32(raw as u32),
+        HirType::U64 => ZyntaxValue::UInt(raw as u64),
+        HirType::F32 => ZyntaxValue::F32(f32::from_bits(raw as u32)),
+        HirType::F64 => ZyntaxValue::Float(f64::from_bits(raw as u64)),
+        HirType::Ptr(_) => ZyntaxValue::Pointer(raw as *mut u8),
+        _ => ZyntaxValue::Int(raw),
+    }
+}
+
+fn const_to_zyntax(c: &HirConstant) -> ZyntaxValue {
+    match c {
+        HirConstant::Bool(b) => ZyntaxValue::Bool(*b),
+        HirConstant::I8(x) => ZyntaxValue::I8(*x),
+        HirConstant::I16(x) => ZyntaxValue::I16(*x),
+        HirConstant::I32(x) => ZyntaxValue::I32(*x),
+        HirConstant::I64(x) => ZyntaxValue::Int(*x),
+        HirConstant::U8(x) => ZyntaxValue::U8(*x),
+        HirConstant::U16(x) => ZyntaxValue::U16(*x),
+        HirConstant::U32(x) => ZyntaxValue::U32(*x),
+        HirConstant::U64(x) => ZyntaxValue::UInt(*x),
+        HirConstant::F32(x) => ZyntaxValue::F32(*x),
+        HirConstant::F64(x) => ZyntaxValue::Float(*x),
+        HirConstant::Null(_) => ZyntaxValue::Pointer(core::ptr::null_mut()),
+        _ => ZyntaxValue::Undef,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bytecode IR
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Register slot index. One per HirId in a function's value table; all
+/// SSA values fit in `u16::MAX` slots in practice (largest modules
+/// today have < 5k SSA values per fn).
+pub type Reg = u16;
+
+/// Program-counter index into a `CompiledFunction::code` vector.
+pub type Pc = u32;
+
+/// Compact, register-based opcode set. Every variant is ≤ 16 bytes on
+/// 64-bit; the most common variants (3-reg arithmetic) are 8 bytes,
+/// keeping the bytecode stream cache-friendly.
 #[derive(Debug, Clone)]
-pub enum InterpValue {
-    Void,
-    Bool(bool),
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    F32(f32),
-    F64(f64),
-    /// Raw byte pointer. Backing storage is owned by `Memory`; the
-    /// pointer is an opaque handle that's valid for the interpreter's
-    /// lifetime.
-    Ptr(*mut u8),
-    /// Aggregate (struct / array). Field types stay open since the
-    /// HIR carries them; the interpreter only manipulates the values.
-    Struct(Vec<InterpValue>),
-    /// SSA-defined-but-not-yet-set sentinel (e.g. result of a
-    /// `Void`-returning call that has a `Some(result)` slot).
-    Undef,
+pub enum Op {
+    /// `dst = const_pool[c]`
+    LoadConst {
+        dst: Reg,
+        c: u32,
+    },
+    /// `dst = src`. Emitted at branch sites for out-of-SSA phi copies.
+    Move {
+        dst: Reg,
+        src: Reg,
+    },
+
+    // ── integer arithmetic (operands flow through i64 on the bus) ──
+    IAdd {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    ISub {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IMul {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IDiv {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IRem {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IAnd {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IOr {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IXor {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IShl {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    IShr {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    INeg {
+        dst: Reg,
+        src: Reg,
+    },
+    BNot {
+        dst: Reg,
+        src: Reg,
+    },
+
+    // ── float arithmetic ──
+    FAdd {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FSub {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FMul {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FDiv {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FNeg {
+        dst: Reg,
+        src: Reg,
+    },
+
+    // ── comparisons (result is Bool) ──
+    ICmpEq {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    ICmpNe {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    ICmpLt {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    ICmpLe {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    ICmpGt {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    ICmpGe {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FCmpEq {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FCmpNe {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FCmpLt {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FCmpLe {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FCmpGt {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    FCmpGe {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+
+    /// Cast `dst = (ty_pool[ty]) src` with kind `op`.
+    Cast {
+        dst: Reg,
+        src: Reg,
+        op: CastOp,
+        ty: u32,
+    },
+
+    // ── memory ──
+    /// `dst = alloca(size_bytes)` — bytes are interpreter-allocated;
+    /// `size_bytes` already accounts for any count multiplier.
+    Alloca {
+        dst: Reg,
+        size_bytes: u32,
+    },
+    /// `dst = *(ptr_pool[ty]*) regs[ptr]`
+    Load {
+        dst: Reg,
+        ptr: Reg,
+        ty: u32,
+    },
+    /// `*(ptr_pool[ty]*) regs[ptr] = regs[val]`
+    Store {
+        ptr: Reg,
+        val: Reg,
+        ty: u32,
+    },
+
+    // ── aggregates ──
+    /// Walk into `regs[src]` using `indices_pool[idx]`, write the leaf
+    /// to `dst`.
+    ExtractValue {
+        dst: Reg,
+        src: Reg,
+        idx: u32,
+    },
+    /// Clone `regs[agg]`, walk to `indices_pool[idx]`, install
+    /// `regs[val]` there, write the new aggregate to `dst`.
+    InsertValue {
+        dst: Reg,
+        agg: Reg,
+        val: Reg,
+        idx: u32,
+    },
+
+    // ── control flow ──
+    Jump {
+        target: Pc,
+    },
+    JumpIf {
+        cond: Reg,
+        t: Pc,
+        f: Pc,
+    },
+    /// Linear scan of `switch_pool[table]` against `regs[scrut]`;
+    /// fall through to `default` on miss.
+    Switch {
+        scrut: Reg,
+        table: u32,
+        default: Pc,
+    },
+    /// Return `regs[src]` to the caller.
+    Ret {
+        src: Reg,
+    },
+    RetVoid,
+    Unreachable,
+
+    /// Direct call into another HIR function.
+    /// `has_dst` controls whether the return value is bound to `dst`.
+    CallFn {
+        dst: Reg,
+        has_dst: bool,
+        fn_id: HirId,
+        args: u32,
+    },
+    /// FFI call by symbol name (resolved through the interpreter's
+    /// symbol table). `ret_ty` indexes the type pool — used to retag
+    /// the i64 return into a width-correct `InterpValue`.
+    CallSym {
+        dst: Reg,
+        has_dst: bool,
+        sym: u32,
+        args: u32,
+        ret_ty: u32,
+    },
 }
 
-impl InterpValue {
-    /// Coerce to i64 for ABI boundaries (println dispatch, return-
-    /// value flattening for the poll-fn ABI, etc.). Best-effort:
-    /// numeric types cast losslessly; ptrs flatten via `as`.
-    pub fn to_i64(&self) -> Option<i64> {
-        match self {
-            InterpValue::Bool(b) => Some(*b as i64),
-            InterpValue::I8(x) => Some(*x as i64),
-            InterpValue::I16(x) => Some(*x as i64),
-            InterpValue::I32(x) => Some(*x as i64),
-            InterpValue::I64(x) => Some(*x),
-            InterpValue::U8(x) => Some(*x as i64),
-            InterpValue::U16(x) => Some(*x as i64),
-            InterpValue::U32(x) => Some(*x as i64),
-            InterpValue::U64(x) => Some(*x as i64),
-            InterpValue::F32(x) => Some(*x as i64),
-            InterpValue::F64(x) => Some(*x as i64),
-            InterpValue::Ptr(p) => Some(*p as i64),
-            _ => None,
+/// One compiled function: bytecode stream + side pools.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledFunction {
+    pub code: Vec<Op>,
+    pub const_pool: Vec<ZyntaxValue>,
+    pub type_pool: Vec<HirType>,
+    pub args_pool: Vec<Vec<Reg>>,
+    /// Each entry is a switch table: list of `(case_i64, target_pc)`.
+    pub switch_pool: Vec<Vec<(i64, Pc)>>,
+    /// Each entry is the index path for `ExtractValue` / `InsertValue`.
+    pub indices_pool: Vec<Vec<u32>>,
+    /// Symbol-name pool for FFI calls; we hold names (not raw fn ptrs)
+    /// at compile time because symbols are registered at the
+    /// interpreter level, not the compiler level.
+    pub symbol_pool: Vec<String>,
+    /// Per-register hint of the SSA value's HirType. Used to size
+    /// extern-call returns and width-correct integer ops.
+    pub reg_types: Vec<HirType>,
+    /// Total number of registers (== `reg_types.len()`).
+    pub n_regs: u32,
+    /// Number of parameters in the original signature; arg-binding
+    /// fills regs[0..n_params].
+    pub n_params: u16,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lowering: HIR → bytecode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compile a single `HirFunction` to bytecode. Performed once per
+/// function on first call; the result is cached in the interpreter.
+pub fn compile_function(func: &HirFunction) -> Result<CompiledFunction, InterpError> {
+    let mut cf = CompiledFunction::default();
+    let mut reg_of: HashMap<HirId, Reg> = HashMap::new();
+
+    // Assign a register to every SSA value. Parameters first so
+    // `regs[0..n_params]` lines up with the call ABI.
+    let mut next_reg: Reg = 0;
+    let mut alloc = |id: HirId,
+                     ty: &HirType,
+                     reg_of: &mut HashMap<HirId, Reg>,
+                     reg_types: &mut Vec<HirType>,
+                     next: &mut Reg|
+     -> Reg {
+        if let Some(r) = reg_of.get(&id).copied() {
+            return r;
+        }
+        let r = *next;
+        *next = next.checked_add(1).expect("register overflow");
+        reg_of.insert(id, r);
+        reg_types.push(ty.clone());
+        r
+    };
+
+    // Bind parameter regs (index 0..n_params) using both the
+    // signature.params[i].id and any matching Parameter(i) HirValue.
+    for (i, param) in func.signature.params.iter().enumerate() {
+        let r = alloc(
+            param.id,
+            &param.ty,
+            &mut reg_of,
+            &mut cf.reg_types,
+            &mut next_reg,
+        );
+        for (val_id, val_def) in func.values.iter() {
+            if matches!(val_def.kind, HirValueKind::Parameter(idx) if idx as usize == i) {
+                reg_of.insert(*val_id, r);
+            }
+        }
+    }
+    cf.n_params = func.signature.params.len() as u16;
+
+    // Allocate regs for every remaining value (constants, instruction
+    // results, phi results). For constants, also push to const_pool.
+    let mut const_idx_for: HashMap<HirId, u32> = HashMap::new();
+    for (val_id, val_def) in func.values.iter() {
+        if reg_of.contains_key(val_id) {
+            continue;
+        }
+        let _ = alloc(
+            *val_id,
+            &val_def.ty,
+            &mut reg_of,
+            &mut cf.reg_types,
+            &mut next_reg,
+        );
+        if let HirValueKind::Constant(c) = &val_def.kind {
+            let idx = cf.const_pool.len() as u32;
+            cf.const_pool.push(const_to_zyntax(c));
+            const_idx_for.insert(*val_id, idx);
+        }
+    }
+    // Phi result regs.
+    for block in func.blocks.values() {
+        for phi in &block.phis {
+            let _ = alloc(
+                phi.result,
+                &phi.ty,
+                &mut reg_of,
+                &mut cf.reg_types,
+                &mut next_reg,
+            );
+        }
+    }
+    // Instruction result regs (in case a value isn't in `func.values`).
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let Some(r) = inst_result(inst) {
+                let ty = inst_result_ty(inst).unwrap_or(HirType::I64);
+                let _ = alloc(r, &ty, &mut reg_of, &mut cf.reg_types, &mut next_reg);
+            }
+        }
+    }
+    cf.n_regs = next_reg as u32;
+
+    // ── Code emission ──
+    // First pass: emit ops; record block-id → start PC; track every
+    // jump-target site so we can backpatch after pass 1.
+    let mut block_pcs: HashMap<HirId, Pc> = HashMap::new();
+    // Patch entry: (op_index, slot) — slot 0..N selects which Pc field
+    // in the op to overwrite.
+    let mut patches: Vec<(usize, u8, HirId)> = Vec::new();
+    // Per-switch-case patches: (table_idx, case_idx, target_block).
+    let mut switch_case_patches: Vec<(u32, usize, HirId)> = Vec::new();
+
+    // Emit the entry block first, then the rest in iteration order.
+    let mut order: Vec<HirId> = Vec::new();
+    order.push(func.entry_block);
+    for bid in func.blocks.keys() {
+        if *bid != func.entry_block {
+            order.push(*bid);
         }
     }
 
-    /// Construct an InterpValue from an i64 + target HirType. Used
-    /// when reading a `Load` result or unboxing a Symbol-call return.
-    pub fn from_i64_as(ty: &HirType, raw: i64) -> InterpValue {
-        match ty {
-            HirType::Void => InterpValue::Void,
-            HirType::Bool => InterpValue::Bool(raw != 0),
-            HirType::I8 => InterpValue::I8(raw as i8),
-            HirType::I16 => InterpValue::I16(raw as i16),
-            HirType::I32 => InterpValue::I32(raw as i32),
-            HirType::I64 => InterpValue::I64(raw),
-            HirType::U8 => InterpValue::U8(raw as u8),
-            HirType::U16 => InterpValue::U16(raw as u16),
-            HirType::U32 => InterpValue::U32(raw as u32),
-            HirType::U64 => InterpValue::U64(raw as u64),
-            HirType::F32 => InterpValue::F32(f32::from_bits(raw as u32)),
-            HirType::F64 => InterpValue::F64(f64::from_bits(raw as u64)),
-            HirType::Ptr(_) => InterpValue::Ptr(raw as *mut u8),
-            // Aggregates can't round-trip through i64; caller must
-            // unbox manually.
-            _ => InterpValue::I64(raw),
+    for bid in &order {
+        let pc = cf.code.len() as Pc;
+        block_pcs.insert(*bid, pc);
+        let block = func
+            .blocks
+            .get(bid)
+            .ok_or_else(|| InterpError::Host(format!("missing block {:?}", bid)))?;
+
+        // Constants used in this block get their LoadConst emitted at
+        // the block entry. Simplest correct strategy; refinement is to
+        // hoist to entry block. (Constants from `func.values` only —
+        // they're function-scoped, not block-scoped, in SSA, so a
+        // single load at the block prefix is fine since each block
+        // dominates its uses for constants.)
+
+        // Lower each instruction.
+        for inst in &block.instructions {
+            lower_inst(inst, &mut cf, &reg_of, &const_idx_for, &mut patches)?;
         }
+
+        // Lower terminator (phi-copy preamble for branch targets is
+        // emitted by lower_terminator).
+        lower_terminator(
+            &block.terminator,
+            *bid,
+            func,
+            &mut cf,
+            &reg_of,
+            &mut patches,
+            &mut switch_case_patches,
+        )?;
+    }
+
+    // Backpatch jump targets.
+    for (op_idx, slot, target_bid) in patches {
+        let target_pc = *block_pcs
+            .get(&target_bid)
+            .ok_or_else(|| InterpError::Host(format!("unresolved block {:?}", target_bid)))?;
+        match (&mut cf.code[op_idx], slot) {
+            (Op::Jump { target }, 0) => *target = target_pc,
+            (Op::JumpIf { t, .. }, 0) => *t = target_pc,
+            (Op::JumpIf { f, .. }, 1) => *f = target_pc,
+            (Op::Switch { default, .. }, 0) => *default = target_pc,
+            _ => {}
+        }
+    }
+    // Backpatch switch-case PCs.
+    for (table_idx, case_idx, target_bid) in switch_case_patches {
+        let target_pc = *block_pcs.get(&target_bid).ok_or_else(|| {
+            InterpError::Host(format!("unresolved switch block {:?}", target_bid))
+        })?;
+        cf.switch_pool[table_idx as usize][case_idx].1 = target_pc;
+    }
+
+    // Hoist constant LoadConst ops to the entry-block prefix in
+    // source order. This is the simplest correct approach: re-emit the
+    // entry block's prefix by shifting `code[entry_pc..]` right by N
+    // ops where N = number of constants used.
+    // Skipped for now — instead, when the dispatcher hits a register
+    // that's never been written, it falls through to consulting the
+    // function's const_pool by examining `const_idx_for` via a
+    // side-channel. To keep things simple, we instead emit one
+    // `LoadConst` per constant at the top of the entry block.
+    inject_const_loads_at_entry(func, &mut cf, &reg_of, &const_idx_for, &block_pcs)?;
+
+    Ok(cf)
+}
+
+/// Insert `LoadConst` ops at the start of the entry block (which is
+/// always at PC 0) for every constant in the function. Patches all
+/// recorded backpatch sites + block_pcs to account for the shift.
+fn inject_const_loads_at_entry(
+    _func: &HirFunction,
+    cf: &mut CompiledFunction,
+    _reg_of: &HashMap<HirId, Reg>,
+    const_idx_for: &HashMap<HirId, u32>,
+    _block_pcs: &HashMap<HirId, Pc>,
+) -> Result<(), InterpError> {
+    if const_idx_for.is_empty() {
+        return Ok(());
+    }
+    // Build prefix ops.
+    let mut prefix: Vec<Op> = Vec::with_capacity(const_idx_for.len());
+    let mut entries: Vec<(HirId, u32)> =
+        const_idx_for.iter().map(|(id, idx)| (*id, *idx)).collect();
+    entries.sort_by_key(|(_, idx)| *idx);
+    for (id, idx) in entries {
+        let r = _reg_of[&id];
+        prefix.push(Op::LoadConst { dst: r, c: idx });
+    }
+    let shift = prefix.len() as Pc;
+
+    // Shift every Pc inside existing ops by `shift`.
+    for op in cf.code.iter_mut() {
+        match op {
+            Op::Jump { target } => *target += shift,
+            Op::JumpIf { t, f, .. } => {
+                *t += shift;
+                *f += shift;
+            }
+            Op::Switch { default, .. } => *default += shift,
+            _ => {}
+        }
+    }
+    // Shift switch-pool case targets too.
+    for table in cf.switch_pool.iter_mut() {
+        for (_, pc) in table.iter_mut() {
+            *pc += shift;
+        }
+    }
+
+    // Splice prefix into the front of code.
+    let mut new_code = Vec::with_capacity(prefix.len() + cf.code.len());
+    new_code.extend(prefix);
+    new_code.extend(cf.code.drain(..));
+    cf.code = new_code;
+    Ok(())
+}
+
+fn inst_result(inst: &HirInstruction) -> Option<HirId> {
+    match inst {
+        HirInstruction::Binary { result, .. }
+        | HirInstruction::Unary { result, .. }
+        | HirInstruction::Cast { result, .. }
+        | HirInstruction::Alloca { result, .. }
+        | HirInstruction::Load { result, .. }
+        | HirInstruction::ExtractValue { result, .. }
+        | HirInstruction::InsertValue { result, .. } => Some(*result),
+        HirInstruction::Call { result, .. } => *result,
+        _ => None,
     }
 }
 
-/// Per-function profiling sample for Tier 1 promotion. Populated by
-/// the interpreter on every `call` entry; Phase E will read these
-/// counters and trigger wasm-emission once thresholds are crossed.
+fn inst_result_ty(inst: &HirInstruction) -> Option<HirType> {
+    match inst {
+        HirInstruction::Binary { ty, .. }
+        | HirInstruction::Unary { ty, .. }
+        | HirInstruction::Cast { ty, .. }
+        | HirInstruction::Alloca { ty, .. }
+        | HirInstruction::Load { ty, .. } => Some(ty.clone()),
+        // Calls return whatever the signature says — left as I64 for
+        // now and re-tagged in the dispatcher on the way back.
+        HirInstruction::Call { .. } => Some(HirType::I64),
+        // ExtractValue/InsertValue: caller's responsibility to type.
+        HirInstruction::ExtractValue { .. } | HirInstruction::InsertValue { .. } => {
+            Some(HirType::I64)
+        }
+        _ => None,
+    }
+}
+
+fn lower_inst(
+    inst: &HirInstruction,
+    cf: &mut CompiledFunction,
+    reg_of: &HashMap<HirId, Reg>,
+    _const_idx_for: &HashMap<HirId, u32>,
+    _patches: &mut Vec<(usize, u8, HirId)>,
+) -> Result<(), InterpError> {
+    let reg = |id: HirId| -> Result<Reg, InterpError> {
+        reg_of
+            .get(&id)
+            .copied()
+            .ok_or(InterpError::UndefinedSsaValue(id))
+    };
+
+    let type_idx = |cf: &mut CompiledFunction, ty: &HirType| -> u32 {
+        let idx = cf.type_pool.len() as u32;
+        cf.type_pool.push(ty.clone());
+        idx
+    };
+
+    match inst {
+        HirInstruction::Binary {
+            result,
+            op,
+            left,
+            right,
+            ty,
+        } => {
+            let dst = reg(*result)?;
+            let lhs = reg(*left)?;
+            let rhs = reg(*right)?;
+            // Float vs integer selected by HirType.
+            let is_float = matches!(ty, HirType::F32 | HirType::F64);
+            let op = if is_float {
+                match op {
+                    BinaryOp::Add | BinaryOp::FAdd => Op::FAdd { dst, lhs, rhs },
+                    BinaryOp::Sub | BinaryOp::FSub => Op::FSub { dst, lhs, rhs },
+                    BinaryOp::Mul | BinaryOp::FMul => Op::FMul { dst, lhs, rhs },
+                    BinaryOp::Div | BinaryOp::FDiv => Op::FDiv { dst, lhs, rhs },
+                    BinaryOp::Eq | BinaryOp::FEq => Op::FCmpEq { dst, lhs, rhs },
+                    BinaryOp::Ne | BinaryOp::FNe => Op::FCmpNe { dst, lhs, rhs },
+                    BinaryOp::Lt | BinaryOp::FLt => Op::FCmpLt { dst, lhs, rhs },
+                    BinaryOp::Le | BinaryOp::FLe => Op::FCmpLe { dst, lhs, rhs },
+                    BinaryOp::Gt | BinaryOp::FGt => Op::FCmpGt { dst, lhs, rhs },
+                    BinaryOp::Ge | BinaryOp::FGe => Op::FCmpGe { dst, lhs, rhs },
+                    other => {
+                        return Err(InterpError::UnsupportedInstruction(format!(
+                            "float binary op {:?}",
+                            other
+                        )))
+                    }
+                }
+            } else {
+                match op {
+                    BinaryOp::Add => Op::IAdd { dst, lhs, rhs },
+                    BinaryOp::Sub => Op::ISub { dst, lhs, rhs },
+                    BinaryOp::Mul => Op::IMul { dst, lhs, rhs },
+                    BinaryOp::Div => Op::IDiv { dst, lhs, rhs },
+                    BinaryOp::Rem => Op::IRem { dst, lhs, rhs },
+                    BinaryOp::And => Op::IAnd { dst, lhs, rhs },
+                    BinaryOp::Or => Op::IOr { dst, lhs, rhs },
+                    BinaryOp::Xor => Op::IXor { dst, lhs, rhs },
+                    BinaryOp::Shl => Op::IShl { dst, lhs, rhs },
+                    BinaryOp::Shr => Op::IShr { dst, lhs, rhs },
+                    BinaryOp::Eq => Op::ICmpEq { dst, lhs, rhs },
+                    BinaryOp::Ne => Op::ICmpNe { dst, lhs, rhs },
+                    BinaryOp::Lt => Op::ICmpLt { dst, lhs, rhs },
+                    BinaryOp::Le => Op::ICmpLe { dst, lhs, rhs },
+                    BinaryOp::Gt => Op::ICmpGt { dst, lhs, rhs },
+                    BinaryOp::Ge => Op::ICmpGe { dst, lhs, rhs },
+                    // Float opcodes on integer type fall back to int.
+                    BinaryOp::FAdd => Op::IAdd { dst, lhs, rhs },
+                    BinaryOp::FSub => Op::ISub { dst, lhs, rhs },
+                    BinaryOp::FMul => Op::IMul { dst, lhs, rhs },
+                    BinaryOp::FDiv => Op::IDiv { dst, lhs, rhs },
+                    BinaryOp::FRem => Op::IRem { dst, lhs, rhs },
+                    BinaryOp::FEq => Op::ICmpEq { dst, lhs, rhs },
+                    BinaryOp::FNe => Op::ICmpNe { dst, lhs, rhs },
+                    BinaryOp::FLt => Op::ICmpLt { dst, lhs, rhs },
+                    BinaryOp::FLe => Op::ICmpLe { dst, lhs, rhs },
+                    BinaryOp::FGt => Op::ICmpGt { dst, lhs, rhs },
+                    BinaryOp::FGe => Op::ICmpGe { dst, lhs, rhs },
+                }
+            };
+            cf.code.push(op);
+        }
+        HirInstruction::Unary {
+            result,
+            op,
+            operand,
+            ty,
+        } => {
+            let dst = reg(*result)?;
+            let src = reg(*operand)?;
+            let is_float = matches!(ty, HirType::F32 | HirType::F64);
+            let op = match (op, is_float) {
+                (UnaryOp::Neg, true) | (UnaryOp::FNeg, _) => Op::FNeg { dst, src },
+                (UnaryOp::Neg, false) => Op::INeg { dst, src },
+                (UnaryOp::Not, _) => Op::BNot { dst, src },
+            };
+            cf.code.push(op);
+        }
+        HirInstruction::Cast {
+            result,
+            ty,
+            op,
+            operand,
+        } => {
+            let dst = reg(*result)?;
+            let src = reg(*operand)?;
+            let ty_idx = type_idx(cf, ty);
+            cf.code.push(Op::Cast {
+                dst,
+                src,
+                op: *op,
+                ty: ty_idx,
+            });
+        }
+        HirInstruction::Alloca {
+            result, ty, count, ..
+        } => {
+            let dst = reg(*result)?;
+            let elem_bytes = size_of_hir_ty(ty) as u32;
+            // Count is dynamic if it's an SSA value — for now, take 1
+            // as a static fallback. (Most Allocas in current code have
+            // count = None.)
+            let n = match count {
+                Some(_) => 1,
+                None => 1,
+            };
+            cf.code.push(Op::Alloca {
+                dst,
+                size_bytes: elem_bytes.saturating_mul(n).max(1),
+            });
+        }
+        HirInstruction::Load {
+            result, ty, ptr, ..
+        } => {
+            let dst = reg(*result)?;
+            let p = reg(*ptr)?;
+            let ty_idx = type_idx(cf, ty);
+            cf.code.push(Op::Load {
+                dst,
+                ptr: p,
+                ty: ty_idx,
+            });
+        }
+        HirInstruction::Store { value, ptr, .. } => {
+            let v = reg(*value)?;
+            let p = reg(*ptr)?;
+            // Store has no inline type — pull it from the value's reg
+            // type so Load/Store agree on width.
+            let val_ty = cf
+                .reg_types
+                .get(v as usize)
+                .cloned()
+                .unwrap_or(HirType::I64);
+            let ty_idx = type_idx(cf, &val_ty);
+            cf.code.push(Op::Store {
+                ptr: p,
+                val: v,
+                ty: ty_idx,
+            });
+        }
+        HirInstruction::ExtractValue {
+            result,
+            aggregate,
+            indices,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let src = reg(*aggregate)?;
+            let idx = cf.indices_pool.len() as u32;
+            cf.indices_pool.push(indices.clone());
+            cf.code.push(Op::ExtractValue { dst, src, idx });
+        }
+        HirInstruction::InsertValue {
+            result,
+            aggregate,
+            value,
+            indices,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let agg = reg(*aggregate)?;
+            let val = reg(*value)?;
+            let idx = cf.indices_pool.len() as u32;
+            cf.indices_pool.push(indices.clone());
+            cf.code.push(Op::InsertValue { dst, agg, val, idx });
+        }
+        HirInstruction::Call {
+            result,
+            callee,
+            args,
+            ..
+        } => {
+            let arg_regs: Result<Vec<Reg>, InterpError> = args.iter().map(|a| reg(*a)).collect();
+            let arg_regs = arg_regs?;
+            let args_idx = cf.args_pool.len() as u32;
+            cf.args_pool.push(arg_regs);
+            let (dst, has_dst) = match result {
+                Some(r) => (reg(*r)?, true),
+                None => (0, false),
+            };
+            match callee {
+                HirCallable::Function(fn_id) => cf.code.push(Op::CallFn {
+                    dst,
+                    has_dst,
+                    fn_id: *fn_id,
+                    args: args_idx,
+                }),
+                HirCallable::Symbol(name) => {
+                    let sym_idx = cf.symbol_pool.len() as u32;
+                    cf.symbol_pool.push(name.clone());
+                    // Return type defaults to I64 unless we have a
+                    // result HirId whose type lives in cf.reg_types.
+                    let ret_ty_idx = {
+                        let ty = result
+                            .and_then(|r| reg_of.get(&r).copied())
+                            .and_then(|r| cf.reg_types.get(r as usize).cloned())
+                            .unwrap_or(HirType::I64);
+                        let idx = cf.type_pool.len() as u32;
+                        cf.type_pool.push(ty);
+                        idx
+                    };
+                    cf.code.push(Op::CallSym {
+                        dst,
+                        has_dst,
+                        sym: sym_idx,
+                        args: args_idx,
+                        ret_ty: ret_ty_idx,
+                    });
+                }
+                HirCallable::Indirect(_) => {
+                    return Err(InterpError::UnsupportedInstruction(
+                        "indirect call".to_string(),
+                    ))
+                }
+                HirCallable::Intrinsic(_) => {
+                    return Err(InterpError::UnsupportedInstruction(
+                        "intrinsic call".to_string(),
+                    ))
+                }
+                HirCallable::FuncRef(_) => {
+                    return Err(InterpError::UnsupportedInstruction(
+                        "FuncRef in call position".to_string(),
+                    ))
+                }
+            }
+        }
+        other => {
+            return Err(InterpError::UnsupportedInstruction(format!(
+                "{:?}",
+                std::mem::discriminant(other)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn lower_terminator(
+    term: &HirTerminator,
+    src_block: HirId,
+    func: &HirFunction,
+    cf: &mut CompiledFunction,
+    reg_of: &HashMap<HirId, Reg>,
+    patches: &mut Vec<(usize, u8, HirId)>,
+    switch_case_patches: &mut Vec<(u32, usize, HirId)>,
+) -> Result<(), InterpError> {
+    let reg = |id: HirId| -> Result<Reg, InterpError> {
+        reg_of
+            .get(&id)
+            .copied()
+            .ok_or(InterpError::UndefinedSsaValue(id))
+    };
+
+    // Helper: emit phi-copy preamble for any phis in `target` whose
+    // incoming edge originates at `src_block`. Standard out-of-SSA.
+    let mut emit_phi_copies =
+        |cf: &mut CompiledFunction, target: HirId| -> Result<(), InterpError> {
+            if let Some(blk) = func.blocks.get(&target) {
+                for phi in &blk.phis {
+                    let dst = reg(phi.result)?;
+                    for (val_id, pred) in &phi.incoming {
+                        if *pred == src_block {
+                            let src = reg(*val_id)?;
+                            if dst != src {
+                                cf.code.push(Op::Move { dst, src });
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+
+    match term {
+        HirTerminator::Return { values } => {
+            if values.is_empty() {
+                cf.code.push(Op::RetVoid);
+            } else {
+                let r = reg(values[0])?;
+                cf.code.push(Op::Ret { src: r });
+            }
+        }
+        HirTerminator::Branch { target } => {
+            emit_phi_copies(cf, *target)?;
+            let op_idx = cf.code.len();
+            cf.code.push(Op::Jump { target: 0 });
+            patches.push((op_idx, 0, *target));
+        }
+        HirTerminator::CondBranch {
+            condition,
+            true_target,
+            false_target,
+        } => {
+            // Phi copies need to run on the taken edge only; emit them
+            // inside small "thunk" blocks. Simplest correct lowering:
+            // emit two jumps after the conditional, each with its
+            // phi-copy preamble. Hot-path optimisation can fold this
+            // later.
+            let cond = reg(*condition)?;
+            // Reserve thunk PCs.
+            let cond_op_idx = cf.code.len();
+            cf.code.push(Op::JumpIf { cond, t: 0, f: 0 });
+
+            // True-edge thunk.
+            let true_thunk_pc = cf.code.len() as Pc;
+            emit_phi_copies(cf, *true_target)?;
+            let true_jump_idx = cf.code.len();
+            cf.code.push(Op::Jump { target: 0 });
+            patches.push((true_jump_idx, 0, *true_target));
+
+            // False-edge thunk.
+            let false_thunk_pc = cf.code.len() as Pc;
+            emit_phi_copies(cf, *false_target)?;
+            let false_jump_idx = cf.code.len();
+            cf.code.push(Op::Jump { target: 0 });
+            patches.push((false_jump_idx, 0, *false_target));
+
+            // Backpatch the JumpIf's PCs to point at the thunks.
+            if let Op::JumpIf { t, f, .. } = &mut cf.code[cond_op_idx] {
+                *t = true_thunk_pc;
+                *f = false_thunk_pc;
+            }
+        }
+        HirTerminator::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            let scrut = reg(*value)?;
+            let table_idx = cf.switch_pool.len() as u32;
+            // Build table now; we patch case targets afterwards.
+            let mut table: Vec<(i64, Pc)> = Vec::with_capacity(cases.len());
+            for (c, _target_bid) in cases {
+                let k = match c {
+                    HirConstant::I32(n) => *n as i64,
+                    HirConstant::I64(n) => *n,
+                    HirConstant::U32(n) => *n as i64,
+                    HirConstant::U64(n) => *n as i64,
+                    HirConstant::Bool(b) => *b as i64,
+                    other => {
+                        return Err(InterpError::UnsupportedInstruction(format!(
+                            "switch case const {:?}",
+                            other
+                        )))
+                    }
+                };
+                table.push((k, 0));
+            }
+            cf.switch_pool.push(table);
+            let switch_op_idx = cf.code.len();
+            cf.code.push(Op::Switch {
+                scrut,
+                table: table_idx,
+                default: 0,
+            });
+            patches.push((switch_op_idx, 0, *default));
+            for (i, (_, target_bid)) in cases.iter().enumerate() {
+                switch_case_patches.push((table_idx, i, *target_bid));
+            }
+        }
+        HirTerminator::Unreachable => {
+            cf.code.push(Op::Unreachable);
+        }
+        HirTerminator::Invoke { .. } => {
+            return Err(InterpError::UnsupportedInstruction(
+                "Invoke (unwinding) not yet implemented".to_string(),
+            ));
+        }
+        HirTerminator::PatternMatch { .. } => {
+            return Err(InterpError::UnsupportedInstruction(
+                "PatternMatch raw terminator — should be lowered before BC compilation".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn size_of_hir_ty(ty: &HirType) -> usize {
+    match ty {
+        HirType::Bool | HirType::I8 | HirType::U8 => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Struct(s) => s.fields.iter().map(size_of_hir_ty).sum::<usize>().max(1),
+        HirType::Array(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
+        _ => 8,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Profiling + memory + symbol table
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProfileSample {
     pub call_count: u64,
-    /// Synthetic cycle counter — incremented per instruction. Used
-    /// as a "hotness" proxy that's cheaper than wall-clock timing.
     pub instructions_executed: u64,
 }
 
-/// Byte-slab allocator backing the interpreter's `Alloca` / `Load`
-/// / `Store`. Each allocation is a `Box<[u8]>`; the raw pointer is
-/// handed out as `InterpValue::Ptr` and the slab keeps the box alive
-/// for the interpreter's lifetime.
-///
-/// Memory is leaked at interpreter drop — that's fine for one-shot
-/// program execution; long-running embedders should drop the
-/// interpreter to reclaim. Phase E will add a generational/region
-/// reset to support repeated calls without unbounded growth.
 #[derive(Default)]
 pub struct Memory {
     allocations: Vec<Box<[u8]>>,
@@ -150,9 +1110,6 @@ impl Memory {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Allocate `n_bytes` zeroed. Returns the raw pointer. The
-    /// allocation is owned by `self`; do not free externally.
     pub fn alloc_zeroed(&mut self, n_bytes: usize) -> *mut u8 {
         let mut bytes: Box<[u8]> = vec![0u8; n_bytes].into_boxed_slice();
         let ptr = bytes.as_mut_ptr();
@@ -161,19 +1118,23 @@ impl Memory {
     }
 }
 
-/// Errors the interpreter can surface to the host.
+#[derive(Clone, Copy)]
+pub struct SymbolEntry {
+    pub ptr: *const u8,
+    pub param_count: u8,
+}
+
+unsafe impl Send for SymbolEntry {}
+unsafe impl Sync for SymbolEntry {}
+
 #[derive(Debug)]
 pub enum InterpError {
     UndefinedSsaValue(HirId),
     UnknownFunction(String),
     UnsupportedInstruction(String),
-    TypeMismatch {
-        expected: String,
-        got: String,
-    },
+    TypeMismatch { expected: String, got: String },
     DivisionByZero,
     OutOfMemory,
-    /// Wrapper for symbol calls — host-side error message.
     Host(String),
 }
 
@@ -197,642 +1158,584 @@ impl core::fmt::Display for InterpError {
 
 impl std::error::Error for InterpError {}
 
-/// Symbol address (raw function pointer cast to *const u8) plus
-/// optional parameter count for arity-checking. Stored by name.
-#[derive(Clone, Copy)]
-pub struct SymbolEntry {
-    pub ptr: *const u8,
-    pub param_count: u8,
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Interpreter (dispatch loop)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// SAFETY: SymbolEntry is a function pointer; functional purity is
-// the caller's responsibility, not the interpreter's.
-unsafe impl Send for SymbolEntry {}
-unsafe impl Sync for SymbolEntry {}
-
-/// The interpreter. Borrows a `&HirModule` and executes calls
-/// against it.
-///
-/// Construct once per module-execution session; `call` may be
-/// invoked any number of times. Per-call state (SSA value map,
-/// current block) lives inside `call`'s call-frame so multiple
-/// recursive calls don't interfere.
-pub struct HirInterpreter<'m> {
-    module: &'m HirModule,
-    /// External symbol table: name → fn ptr + arity. Populated by
-    /// `register_symbol` from the host.
+pub struct HirInterpreter {
     symbols: HashMap<String, SymbolEntry>,
-    /// Per-function profile counters.
     pub profile: HashMap<HirId, ProfileSample>,
-    /// Byte-slab allocator shared across all calls in this session.
     memory: Memory,
+    /// Per-HIR-function compiled bytecode cache. First call to a fn
+    /// triggers compilation; subsequent calls reuse the same
+    /// `CompiledFunction`. Keyed by `HirFunction::id`.
+    cache: HashMap<HirId, CompiledFunction>,
+    /// Per-function tick callbacks. Invoked once per call entry — the
+    /// callback returns `Some(ptr)` to dispatch to JIT'd code instead
+    /// of running the bytecode (the host-side beadie integration uses
+    /// this to short-circuit hot functions). `None` falls through.
+    #[allow(clippy::type_complexity)]
+    tick_callbacks: HashMap<HirId, Box<dyn FnMut() -> Option<JitDispatch> + Send>>,
 }
 
-impl<'m> HirInterpreter<'m> {
-    pub fn new(module: &'m HirModule) -> Self {
+/// When a `tick_callback` returns one of these, the interpreter
+/// dispatches the JIT'd code instead of running its bytecode.
+///
+/// The callback is responsible for ABI-correct invocation; the
+/// interpreter just transmutes per arg count and funnels through `i64`
+/// (same convention as `register_symbol`).
+#[derive(Clone, Copy)]
+pub struct JitDispatch {
+    pub ptr: *const u8,
+    pub n_params: u8,
+}
+
+unsafe impl Send for JitDispatch {}
+
+impl Default for HirInterpreter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HirInterpreter {
+    pub fn new() -> Self {
         Self {
-            module,
             symbols: HashMap::new(),
             profile: HashMap::new(),
             memory: Memory::new(),
+            cache: HashMap::new(),
+            tick_callbacks: HashMap::new(),
         }
     }
 
-    /// Register an external function symbol. `param_count` is used
-    /// only for arity validation; the actual call dispatches via a
-    /// transmute keyed on the call site's arg count.
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
         self.symbols
             .insert(name.into(), SymbolEntry { ptr, param_count });
     }
 
-    /// Invoke a top-level function by name.
-    pub fn call(&mut self, name: &str, args: Vec<InterpValue>) -> Result<InterpValue, InterpError> {
-        let func = self
-            .module
+    /// Register a per-function tick callback. Invoked on every entry to
+    /// the function; returning `Some` short-circuits to JIT dispatch.
+    /// The host-side beadie wrapper plugs `Beadie::on_invoke` in here.
+    pub fn register_tick_callback(
+        &mut self,
+        func_id: HirId,
+        cb: Box<dyn FnMut() -> Option<JitDispatch> + Send>,
+    ) {
+        self.tick_callbacks.insert(func_id, cb);
+    }
+
+    /// Profile snapshot for a function.
+    pub fn profile_for(&self, func_id: HirId) -> ProfileSample {
+        self.profile.get(&func_id).copied().unwrap_or_default()
+    }
+
+    pub fn call(
+        &mut self,
+        module: &HirModule,
+        name: &str,
+        args: Vec<ZyntaxValue>,
+    ) -> Result<ZyntaxValue, InterpError> {
+        let func = module
             .functions
             .values()
             .find(|f| f.name.resolve_global().as_deref() == Some(name))
             .ok_or_else(|| InterpError::UnknownFunction(name.to_string()))?;
-        self.call_function(func, args)
+        let func_id = func.id;
+        self.call_by_id(module, func_id, args)
     }
 
-    /// Invoke a specific HIR function with already-evaluated args.
-    fn call_function(
+    fn call_by_id(
         &mut self,
-        func: &'m HirFunction,
-        args: Vec<InterpValue>,
-    ) -> Result<InterpValue, InterpError> {
+        module: &HirModule,
+        func_id: HirId,
+        args: Vec<ZyntaxValue>,
+    ) -> Result<ZyntaxValue, InterpError> {
         // Profile.
-        let sample = self.profile.entry(func.id).or_default();
-        sample.call_count += 1;
+        self.profile.entry(func_id).or_default().call_count += 1;
 
-        // SSA value map for this call frame.
-        let mut values: HashMap<HirId, InterpValue> = HashMap::new();
+        // Tier-1 shortcut: if a JIT dispatch is ready for this fn,
+        // call it instead of interpreting.
+        if let Some(cb) = self.tick_callbacks.get_mut(&func_id) {
+            if let Some(dispatch) = cb() {
+                return Ok(call_jit_dispatch(dispatch, &args));
+            }
+        }
 
-        // Bind params.
-        for (i, param) in func.signature.params.iter().enumerate() {
-            let arg = args.get(i).cloned().unwrap_or(InterpValue::Undef);
-            // Param HirIds may differ from signature.params[i].id —
-            // the SSA builder mints fresh Parameter(idx) values for
-            // the body. Find them.
-            for (val_id, val_def) in func.values.iter() {
-                if matches!(val_def.kind, HirValueKind::Parameter(idx) if idx as usize == i) {
-                    values.insert(*val_id, arg.clone());
+        // Compile-on-first-use.
+        if !self.cache.contains_key(&func_id) {
+            let func = module
+                .functions
+                .get(&func_id)
+                .ok_or(InterpError::UndefinedSsaValue(func_id))?;
+            let cf = compile_function(func)?;
+            self.cache.insert(func_id, cf);
+        }
+
+        // Lift the compiled function out of the cache so we can mutate
+        // `self.memory` / `self.symbols` / `self.cache` during nested
+        // calls. The map ownership returns at the end.
+        let cf = self.cache.remove(&func_id).unwrap();
+        let result = self.run(module, &cf, args, func_id);
+        // Put the (immutable) compiled function back.
+        self.cache.insert(func_id, cf);
+        result
+    }
+
+    fn run(
+        &mut self,
+        module: &HirModule,
+        cf: &CompiledFunction,
+        args: Vec<ZyntaxValue>,
+        func_id: HirId,
+    ) -> Result<ZyntaxValue, InterpError> {
+        let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
+
+        // Bind params into regs[0..n_params].
+        for (i, a) in args.into_iter().enumerate() {
+            if i < cf.n_params as usize {
+                regs[i] = a;
+            }
+        }
+
+        let mut pc: usize = 0;
+        let code = &cf.code;
+
+        while pc < code.len() {
+            if let Some(p) = self.profile.get_mut(&func_id) {
+                p.instructions_executed += 1;
+            }
+            match &code[pc] {
+                Op::LoadConst { dst, c } => {
+                    regs[*dst as usize] = cf.const_pool[*c as usize].clone();
+                    pc += 1;
                 }
-            }
-            // Also register the signature.params[i].id for direct refs.
-            values.insert(param.id, arg);
-        }
-
-        // Bind constants from func.values up front so Variable
-        // lookups for constant HirIds resolve.
-        for (val_id, val_def) in func.values.iter() {
-            if let HirValueKind::Constant(c) = &val_def.kind {
-                values.insert(*val_id, const_to_interp(c, &val_def.ty));
-            }
-        }
-
-        // Execute starting from entry_block. Track the predecessor
-        // for phi resolution.
-        let mut current = func.entry_block;
-        let mut prev: Option<HirId> = None;
-
-        loop {
-            let block = func
-                .blocks
-                .get(&current)
-                .ok_or_else(|| InterpError::UndefinedSsaValue(current))?;
-
-            // Resolve phi nodes on entry to the block.
-            for phi in &block.phis {
-                let prev_block = prev.ok_or_else(|| {
-                    InterpError::Host(format!(
-                        "phi node at block {:?} entered with no predecessor",
-                        current
-                    ))
-                })?;
-                for (val_id, pred_id) in &phi.incoming {
-                    if *pred_id == prev_block {
-                        let v = values.get(val_id).cloned().unwrap_or(InterpValue::Undef);
-                        values.insert(phi.result, v);
-                        break;
+                Op::Move { dst, src } => {
+                    regs[*dst as usize] = regs[*src as usize].clone();
+                    pc += 1;
+                }
+                Op::IAdd { dst, lhs, rhs } => {
+                    let v = ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| {
+                        a.wrapping_add(b)
+                    })?;
+                    regs[*dst as usize] = v;
+                    pc += 1;
+                }
+                Op::ISub { dst, lhs, rhs } => {
+                    let v = ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| {
+                        a.wrapping_sub(b)
+                    })?;
+                    regs[*dst as usize] = v;
+                    pc += 1;
+                }
+                Op::IMul { dst, lhs, rhs } => {
+                    let v = ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| {
+                        a.wrapping_mul(b)
+                    })?;
+                    regs[*dst as usize] = v;
+                    pc += 1;
+                }
+                Op::IDiv { dst, lhs, rhs } => {
+                    let rv = ireg_i64(&regs[*rhs as usize])?;
+                    if rv == 0 {
+                        return Err(InterpError::DivisionByZero);
                     }
+                    let v = ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a / b)?;
+                    regs[*dst as usize] = v;
+                    pc += 1;
                 }
-            }
-
-            // Execute instructions in order.
-            for inst in &block.instructions {
-                self.exec_instruction(inst, &mut values, func)?;
-                if let Some(p) = self.profile.get_mut(&func.id) {
-                    p.instructions_executed += 1;
+                Op::IRem { dst, lhs, rhs } => {
+                    let rv = ireg_i64(&regs[*rhs as usize])?;
+                    if rv == 0 {
+                        return Err(InterpError::DivisionByZero);
+                    }
+                    let v = ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a % b)?;
+                    regs[*dst as usize] = v;
+                    pc += 1;
                 }
-            }
-
-            // Dispatch terminator.
-            match &block.terminator {
-                HirTerminator::Return { values: ret_vals } => {
-                    let v = if ret_vals.is_empty() {
-                        InterpValue::Void
-                    } else {
-                        values
-                            .get(&ret_vals[0])
-                            .cloned()
-                            .ok_or(InterpError::UndefinedSsaValue(ret_vals[0]))?
+                Op::IAnd { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a & b)?;
+                    pc += 1;
+                }
+                Op::IOr { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a | b)?;
+                    pc += 1;
+                }
+                Op::IXor { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a ^ b)?;
+                    pc += 1;
+                }
+                Op::IShl { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| {
+                            a.wrapping_shl(b as u32)
+                        })?;
+                    pc += 1;
+                }
+                Op::IShr { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        ibin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| {
+                            a.wrapping_shr(b as u32)
+                        })?;
+                    pc += 1;
+                }
+                Op::INeg { dst, src } => {
+                    let v = ireg_i64(&regs[*src as usize])?;
+                    let dst_ty = &cf.reg_types[*dst as usize];
+                    regs[*dst as usize] = value_from_i64_as(dst_ty, v.wrapping_neg());
+                    pc += 1;
+                }
+                Op::BNot { dst, src } => {
+                    let dst_ty = &cf.reg_types[*dst as usize];
+                    regs[*dst as usize] = match &regs[*src as usize] {
+                        ZyntaxValue::Bool(b) => ZyntaxValue::Bool(!*b),
+                        other => {
+                            let v = value_to_i64(other).unwrap_or(0);
+                            value_from_i64_as(dst_ty, !v)
+                        }
                     };
-                    return Ok(v);
+                    pc += 1;
                 }
-                HirTerminator::Branch { target } => {
-                    prev = Some(current);
-                    current = *target;
+                Op::FAdd { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a + b)?;
+                    pc += 1;
                 }
-                HirTerminator::CondBranch {
-                    condition,
-                    true_target,
-                    false_target,
-                } => {
-                    let cond = values
-                        .get(condition)
-                        .ok_or(InterpError::UndefinedSsaValue(*condition))?;
-                    let take_true = match cond {
-                        InterpValue::Bool(b) => *b,
-                        InterpValue::I8(x) => *x != 0,
-                        InterpValue::I16(x) => *x != 0,
-                        InterpValue::I32(x) => *x != 0,
-                        InterpValue::I64(x) => *x != 0,
-                        InterpValue::U8(x) => *x != 0,
-                        InterpValue::U16(x) => *x != 0,
-                        InterpValue::U32(x) => *x != 0,
-                        InterpValue::U64(x) => *x != 0,
+                Op::FSub { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a - b)?;
+                    pc += 1;
+                }
+                Op::FMul { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a * b)?;
+                    pc += 1;
+                }
+                Op::FDiv { dst, lhs, rhs } => {
+                    regs[*dst as usize] =
+                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a / b)?;
+                    pc += 1;
+                }
+                Op::FNeg { dst, src } => {
+                    regs[*dst as usize] = match &regs[*src as usize] {
+                        ZyntaxValue::Float(x) => ZyntaxValue::Float(-*x),
+                        other => other.clone(),
+                    };
+                    pc += 1;
+                }
+                Op::ICmpEq { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        ireg_i64(&regs[*lhs as usize])? == ireg_i64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::ICmpNe { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        ireg_i64(&regs[*lhs as usize])? != ireg_i64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::ICmpLt { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        ireg_i64(&regs[*lhs as usize])? < ireg_i64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::ICmpLe { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        ireg_i64(&regs[*lhs as usize])? <= ireg_i64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::ICmpGt { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        ireg_i64(&regs[*lhs as usize])? > ireg_i64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::ICmpGe { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        ireg_i64(&regs[*lhs as usize])? >= ireg_i64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::FCmpEq { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        freg_f64(&regs[*lhs as usize])? == freg_f64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::FCmpNe { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        freg_f64(&regs[*lhs as usize])? != freg_f64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::FCmpLt { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        freg_f64(&regs[*lhs as usize])? < freg_f64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::FCmpLe { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        freg_f64(&regs[*lhs as usize])? <= freg_f64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::FCmpGt { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        freg_f64(&regs[*lhs as usize])? > freg_f64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::FCmpGe { dst, lhs, rhs } => {
+                    regs[*dst as usize] = ZyntaxValue::Bool(
+                        freg_f64(&regs[*lhs as usize])? >= freg_f64(&regs[*rhs as usize])?,
+                    );
+                    pc += 1;
+                }
+                Op::Cast { dst, src, op, ty } => {
+                    let target = &cf.type_pool[*ty as usize];
+                    regs[*dst as usize] = eval_cast(*op, regs[*src as usize].clone(), target)?;
+                    pc += 1;
+                }
+                Op::Alloca { dst, size_bytes } => {
+                    let ptr = self.memory.alloc_zeroed((*size_bytes).max(1) as usize);
+                    regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
+                    pc += 1;
+                }
+                Op::Load { dst, ptr, ty } => {
+                    let target = &cf.type_pool[*ty as usize];
+                    let p = match &regs[*ptr as usize] {
+                        ZyntaxValue::Pointer(p) => *p,
                         other => {
                             return Err(InterpError::TypeMismatch {
-                                expected: "bool/integer".to_string(),
+                                expected: "pointer".to_string(),
                                 got: format!("{:?}", other),
                             })
                         }
                     };
-                    prev = Some(current);
-                    current = if take_true {
-                        *true_target
-                    } else {
-                        *false_target
-                    };
+                    regs[*dst as usize] = unsafe { read_typed(p, target) };
+                    pc += 1;
                 }
-                HirTerminator::Switch {
-                    value,
-                    cases,
+                Op::Store { ptr, val, ty } => {
+                    let target = &cf.type_pool[*ty as usize];
+                    let p = match &regs[*ptr as usize] {
+                        ZyntaxValue::Pointer(p) => *p,
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "pointer".to_string(),
+                                got: format!("{:?}", other),
+                            })
+                        }
+                    };
+                    let v = regs[*val as usize].clone();
+                    unsafe { write_typed(p, &v, target) };
+                    pc += 1;
+                }
+                Op::ExtractValue { dst, src, idx } => {
+                    let indices = &cf.indices_pool[*idx as usize];
+                    let mut cur = regs[*src as usize].clone();
+                    for i in indices {
+                        cur = match cur {
+                            ZyntaxValue::Tuple(mut fields) => fields.swap_remove(*i as usize),
+                            scalar => scalar,
+                        };
+                    }
+                    regs[*dst as usize] = cur;
+                    pc += 1;
+                }
+                Op::InsertValue { dst, agg, val, idx } => {
+                    let indices = &cf.indices_pool[*idx as usize];
+                    let mut new_agg = regs[*agg as usize].clone();
+                    insert_value_recursive(&mut new_agg, indices, regs[*val as usize].clone());
+                    regs[*dst as usize] = new_agg;
+                    pc += 1;
+                }
+                Op::Jump { target } => {
+                    pc = *target as usize;
+                }
+                Op::JumpIf { cond, t, f } => {
+                    let take = match &regs[*cond as usize] {
+                        ZyntaxValue::Bool(b) => *b,
+                        other => value_to_i64(other).map(|n| n != 0).ok_or_else(|| {
+                            InterpError::TypeMismatch {
+                                expected: "bool/int".to_string(),
+                                got: format!("{:?}", other),
+                            }
+                        })?,
+                    };
+                    pc = if take { *t as usize } else { *f as usize };
+                }
+                Op::Switch {
+                    scrut,
+                    table,
                     default,
                 } => {
-                    let scrutinee = values
-                        .get(value)
-                        .ok_or(InterpError::UndefinedSsaValue(*value))?
-                        .to_i64()
-                        .ok_or_else(|| InterpError::TypeMismatch {
+                    let v = value_to_i64(&regs[*scrut as usize]).ok_or_else(|| {
+                        InterpError::TypeMismatch {
                             expected: "integer".to_string(),
                             got: "non-integer scrutinee".to_string(),
-                        })?;
+                        }
+                    })?;
+                    let tbl = &cf.switch_pool[*table as usize];
                     let mut taken = *default;
-                    for (case_const, case_target) in cases {
-                        if let HirConstant::I32(n) = case_const {
-                            if scrutinee == *n as i64 {
-                                taken = *case_target;
-                                break;
-                            }
-                        } else if let HirConstant::I64(n) = case_const {
-                            if scrutinee == *n {
-                                taken = *case_target;
-                                break;
-                            }
+                    for (k, target) in tbl {
+                        if *k == v {
+                            taken = *target;
+                            break;
                         }
                     }
-                    prev = Some(current);
-                    current = taken;
+                    pc = taken as usize;
                 }
-                HirTerminator::Unreachable => {
+                Op::Ret { src } => {
+                    return Ok(regs[*src as usize].clone());
+                }
+                Op::RetVoid => {
+                    return Ok(ZyntaxValue::Void);
+                }
+                Op::Unreachable => {
                     return Err(InterpError::Host(
                         "execution reached unreachable terminator".to_string(),
                     ));
                 }
-                HirTerminator::Invoke { .. } => {
-                    return Err(InterpError::UnsupportedInstruction(
-                        "Invoke (unwinding) not yet implemented".to_string(),
-                    ));
-                }
-                HirTerminator::PatternMatch { .. } => {
-                    return Err(InterpError::UnsupportedInstruction(
-                        "PatternMatch (raw pattern dispatch) not yet implemented \
-                         — should be lowered to Switch / CondBranch before \
-                         interpretation"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
-    /// Execute a single instruction. Mutates `values` to bind any
-    /// result.
-    fn exec_instruction(
-        &mut self,
-        inst: &HirInstruction,
-        values: &mut HashMap<HirId, InterpValue>,
-        func: &HirFunction,
-    ) -> Result<(), InterpError> {
-        let _ = func; // currently unused; reserved for function-scoped lookups
-        match inst {
-            HirInstruction::Binary {
-                result,
-                op,
-                left,
-                right,
-                ..
-            } => {
-                let l = values
-                    .get(left)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*left))?;
-                let r = values
-                    .get(right)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*right))?;
-                let v = eval_binary(*op, l, r)?;
-                values.insert(*result, v);
-                Ok(())
-            }
-            HirInstruction::Unary {
-                result,
-                op,
-                operand,
-                ..
-            } => {
-                let o = values
-                    .get(operand)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*operand))?;
-                values.insert(*result, eval_unary(*op, o)?);
-                Ok(())
-            }
-            HirInstruction::Cast {
-                result,
-                ty,
-                op,
-                operand,
-            } => {
-                let o = values
-                    .get(operand)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*operand))?;
-                values.insert(*result, eval_cast(*op, o, ty)?);
-                Ok(())
-            }
-            HirInstruction::Alloca {
-                result,
-                ty,
-                count,
-                align: _,
-            } => {
-                let element_bytes = size_of_hir_ty(ty);
-                let n = match count {
-                    Some(c) => values.get(c).and_then(|v| v.to_i64()).unwrap_or(1).max(1) as usize,
-                    None => 1,
-                };
-                let bytes = element_bytes.saturating_mul(n);
-                let ptr = self.memory.alloc_zeroed(bytes.max(1));
-                values.insert(*result, InterpValue::Ptr(ptr));
-                Ok(())
-            }
-            HirInstruction::Load {
-                result, ty, ptr, ..
-            } => {
-                let p = values
-                    .get(ptr)
-                    .ok_or(InterpError::UndefinedSsaValue(*ptr))?;
-                let raw = match p {
-                    InterpValue::Ptr(p) => unsafe { read_typed(*p, ty) },
-                    other => {
-                        return Err(InterpError::TypeMismatch {
-                            expected: "pointer".to_string(),
-                            got: format!("{:?}", other),
-                        })
+                Op::CallFn {
+                    dst,
+                    has_dst,
+                    fn_id,
+                    args,
+                } => {
+                    let arg_regs = &cf.args_pool[*args as usize];
+                    let arg_vals: Vec<ZyntaxValue> =
+                        arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
+                    let ret = self.call_by_id(module, *fn_id, arg_vals)?;
+                    if *has_dst {
+                        regs[*dst as usize] = ret;
                     }
-                };
-                values.insert(*result, raw);
-                Ok(())
-            }
-            HirInstruction::Store { value, ptr, .. } => {
-                let p = values
-                    .get(ptr)
-                    .ok_or(InterpError::UndefinedSsaValue(*ptr))?
-                    .clone();
-                let v = values
-                    .get(value)
-                    .ok_or(InterpError::UndefinedSsaValue(*value))?
-                    .clone();
-                if let InterpValue::Ptr(p) = p {
-                    unsafe { write_typed(p, &v) };
-                    Ok(())
-                } else {
-                    Err(InterpError::TypeMismatch {
-                        expected: "pointer".to_string(),
-                        got: format!("{:?}", p),
-                    })
+                    pc += 1;
+                }
+                Op::CallSym {
+                    dst,
+                    has_dst,
+                    sym,
+                    args,
+                    ret_ty,
+                } => {
+                    let arg_regs = &cf.args_pool[*args as usize];
+                    let arg_vals: Vec<ZyntaxValue> =
+                        arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
+                    let name = &cf.symbol_pool[*sym as usize];
+                    let entry = self
+                        .symbols
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
+                    let raw = call_extern_symbol(entry.ptr, &arg_vals);
+                    if *has_dst {
+                        let ty = &cf.type_pool[*ret_ty as usize];
+                        regs[*dst as usize] = value_from_i64_as(ty, raw);
+                    }
+                    pc += 1;
                 }
             }
-            HirInstruction::Call {
-                result,
-                callee,
-                args,
-                ..
-            } => {
-                let arg_vals: Vec<InterpValue> = args
-                    .iter()
-                    .map(|a| {
-                        values
-                            .get(a)
-                            .cloned()
-                            .ok_or(InterpError::UndefinedSsaValue(*a))
-                    })
-                    .collect::<Result<_, _>>()?;
-                let ret = self.dispatch_call(callee, arg_vals)?;
-                if let Some(r) = result {
-                    values.insert(*r, ret);
-                }
-                Ok(())
-            }
-            HirInstruction::ExtractValue {
-                result,
-                aggregate,
-                indices,
-                ..
-            } => {
-                let mut cur = values
-                    .get(aggregate)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*aggregate))?;
-                for idx in indices {
-                    cur = match cur {
-                        InterpValue::Struct(mut fields) => fields.swap_remove(*idx as usize),
-                        // Single-field flattening: an i32 received
-                        // from a flattened struct ABI behaves as the
-                        // field itself. The SSA builder's
-                        // `Field`-access rewrite already accounts for
-                        // this, so a stray ExtractValue on a scalar
-                        // means the value already IS the field.
-                        scalar => scalar,
-                    };
-                }
-                values.insert(*result, cur);
-                Ok(())
-            }
-            HirInstruction::InsertValue {
-                result,
-                aggregate,
-                value,
-                indices,
-                ..
-            } => {
-                let mut new_agg = values
-                    .get(aggregate)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*aggregate))?;
-                let v = values
-                    .get(value)
-                    .cloned()
-                    .ok_or(InterpError::UndefinedSsaValue(*value))?;
-                insert_value_recursive(&mut new_agg, indices, v);
-                values.insert(*result, new_agg);
-                Ok(())
-            }
-            // Everything else: emit a clean unsupported-instruction
-            // error so callers know exactly what to extend next.
-            other => Err(InterpError::UnsupportedInstruction(format!(
-                "{:?}",
-                std::mem::discriminant(other)
-            ))),
         }
-    }
-
-    /// Dispatch a call based on the HirCallable variant. Handles
-    /// direct fn calls (recursive into the interpreter), indirect
-    /// calls (placeholder), and Symbol calls (FFI via the registered
-    /// symbol table).
-    fn dispatch_call(
-        &mut self,
-        callee: &HirCallable,
-        args: Vec<InterpValue>,
-    ) -> Result<InterpValue, InterpError> {
-        match callee {
-            HirCallable::Function(fn_id) => {
-                let func = self
-                    .module
-                    .functions
-                    .get(fn_id)
-                    .ok_or(InterpError::UndefinedSsaValue(*fn_id))?;
-                self.call_function(func, args)
-            }
-            HirCallable::Symbol(name) => {
-                let entry = self
-                    .symbols
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
-                Ok(call_extern_symbol(entry.ptr, &args))
-            }
-            HirCallable::Indirect(_) => Err(InterpError::UnsupportedInstruction(
-                "indirect call (function pointer dispatch) not yet implemented".to_string(),
-            )),
-            HirCallable::Intrinsic(_) => Err(InterpError::UnsupportedInstruction(
-                "Intrinsic dispatch not yet implemented".to_string(),
-            )),
-            HirCallable::FuncRef(_) => Err(InterpError::UnsupportedInstruction(
-                "FuncRef in call position — FuncRef is a value, not a call target".to_string(),
-            )),
-        }
+        // Fell off the end without a Ret → void.
+        Ok(ZyntaxValue::Void)
     }
 }
 
-// ---------------------------------------------------------------------
-// Free helpers
-// ---------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers (free functions)
+// ─────────────────────────────────────────────────────────────────────────────
 
-fn const_to_interp(c: &HirConstant, _ty: &HirType) -> InterpValue {
-    match c {
-        HirConstant::Bool(b) => InterpValue::Bool(*b),
-        HirConstant::I8(x) => InterpValue::I8(*x),
-        HirConstant::I16(x) => InterpValue::I16(*x),
-        HirConstant::I32(x) => InterpValue::I32(*x),
-        HirConstant::I64(x) => InterpValue::I64(*x),
-        HirConstant::U8(x) => InterpValue::U8(*x),
-        HirConstant::U16(x) => InterpValue::U16(*x),
-        HirConstant::U32(x) => InterpValue::U32(*x),
-        HirConstant::U64(x) => InterpValue::U64(*x),
-        HirConstant::F32(x) => InterpValue::F32(*x),
-        HirConstant::F64(x) => InterpValue::F64(*x),
-        HirConstant::Null(_) => InterpValue::Ptr(core::ptr::null_mut()),
-        _ => InterpValue::Undef,
-    }
+/// Integer-binop helper. Pulls i64 from each operand, runs `f`,
+/// returns the raw i64 — callers (the dispatch loop) mask to the
+/// target HirType from `cf.reg_types[dst]` via `value_from_i64_as`.
+fn ibin(
+    l: &ZyntaxValue,
+    r: &ZyntaxValue,
+    f: impl FnOnce(i64, i64) -> i64,
+) -> Result<ZyntaxValue, InterpError> {
+    let li = ireg_i64(l)?;
+    let ri = ireg_i64(r)?;
+    Ok(ZyntaxValue::Int(f(li, ri)))
 }
 
-fn eval_binary(op: BinaryOp, l: InterpValue, r: InterpValue) -> Result<InterpValue, InterpError> {
-    use BinaryOp::*;
-    // Integer fast path: pull both as i64 and dispatch.
-    if let (Some(li), Some(ri)) = (l.to_i64(), r.to_i64()) {
-        let res = match op {
-            Add => li.wrapping_add(ri),
-            Sub => li.wrapping_sub(ri),
-            Mul => li.wrapping_mul(ri),
-            Div => {
-                if ri == 0 {
-                    return Err(InterpError::DivisionByZero);
-                }
-                li / ri
-            }
-            Rem => {
-                if ri == 0 {
-                    return Err(InterpError::DivisionByZero);
-                }
-                li % ri
-            }
-            // `And`/`Or`/`Xor` are bitwise in HirBinaryOp; there's no
-            // separate short-circuit variant.
-            And => li & ri,
-            Or => li | ri,
-            Xor => li ^ ri,
-            Shl => li.wrapping_shl(ri as u32),
-            Shr => li.wrapping_shr(ri as u32),
-            Eq => return Ok(InterpValue::Bool(li == ri)),
-            Ne => return Ok(InterpValue::Bool(li != ri)),
-            Lt => return Ok(InterpValue::Bool(li < ri)),
-            Le => return Ok(InterpValue::Bool(li <= ri)),
-            Gt => return Ok(InterpValue::Bool(li > ri)),
-            Ge => return Ok(InterpValue::Bool(li >= ri)),
-            _ => {
-                return Err(InterpError::UnsupportedInstruction(format!(
-                    "binary op {:?} on integers",
-                    op
-                )))
-            }
-        };
-        // Preserve the wider operand's type for the result.
-        Ok(promote_to_typed(&l, &r, res))
-    } else if let (InterpValue::F64(lf), InterpValue::F64(rf)) = (&l, &r) {
-        let lf = *lf;
-        let rf = *rf;
-        let res = match op {
-            Add => InterpValue::F64(lf + rf),
-            Sub => InterpValue::F64(lf - rf),
-            Mul => InterpValue::F64(lf * rf),
-            Div => InterpValue::F64(lf / rf),
-            FEq | Eq => InterpValue::Bool(lf == rf),
-            FNe | Ne => InterpValue::Bool(lf != rf),
-            FLt | Lt => InterpValue::Bool(lf < rf),
-            FLe | Le => InterpValue::Bool(lf <= rf),
-            FGt | Gt => InterpValue::Bool(lf > rf),
-            FGe | Ge => InterpValue::Bool(lf >= rf),
-            _ => {
-                return Err(InterpError::UnsupportedInstruction(format!(
-                    "binary op {:?} on f64",
-                    op
-                )))
-            }
-        };
-        Ok(res)
-    } else {
-        Err(InterpError::TypeMismatch {
-            expected: "matching numeric types".to_string(),
-            got: format!("{:?} {:?}", l, r),
-        })
-    }
+fn fbin(
+    l: &ZyntaxValue,
+    r: &ZyntaxValue,
+    f: impl FnOnce(f64, f64) -> f64,
+) -> Result<ZyntaxValue, InterpError> {
+    let lf = freg_f64(l)?;
+    let rf = freg_f64(r)?;
+    Ok(ZyntaxValue::Float(f(lf, rf)))
 }
 
-fn promote_to_typed(l: &InterpValue, r: &InterpValue, raw: i64) -> InterpValue {
-    let lhs_w = type_width(l);
-    let rhs_w = type_width(r);
-    let widest = if lhs_w >= rhs_w { l } else { r };
-    match widest {
-        InterpValue::I8(_) => InterpValue::I8(raw as i8),
-        InterpValue::I16(_) => InterpValue::I16(raw as i16),
-        InterpValue::I32(_) => InterpValue::I32(raw as i32),
-        InterpValue::U8(_) => InterpValue::U8(raw as u8),
-        InterpValue::U16(_) => InterpValue::U16(raw as u16),
-        InterpValue::U32(_) => InterpValue::U32(raw as u32),
-        InterpValue::U64(_) => InterpValue::U64(raw as u64),
-        _ => InterpValue::I64(raw),
-    }
+fn ireg_i64(v: &ZyntaxValue) -> Result<i64, InterpError> {
+    value_to_i64(v).ok_or_else(|| InterpError::TypeMismatch {
+        expected: "integer".to_string(),
+        got: format!("{:?}", v),
+    })
 }
 
-fn type_width(v: &InterpValue) -> u8 {
-    match v {
-        InterpValue::Bool(_) => 1,
-        InterpValue::I8(_) | InterpValue::U8(_) => 8,
-        InterpValue::I16(_) | InterpValue::U16(_) => 16,
-        InterpValue::I32(_) | InterpValue::U32(_) | InterpValue::F32(_) => 32,
-        InterpValue::I64(_) | InterpValue::U64(_) | InterpValue::F64(_) | InterpValue::Ptr(_) => 64,
-        _ => 0,
-    }
+fn freg_f64(v: &ZyntaxValue) -> Result<f64, InterpError> {
+    value_to_f64(v).ok_or_else(|| InterpError::TypeMismatch {
+        expected: "float".to_string(),
+        got: format!("{:?}", v),
+    })
 }
 
-fn eval_unary(op: UnaryOp, o: InterpValue) -> Result<InterpValue, InterpError> {
-    use UnaryOp::*;
-    match (op, &o) {
-        (Neg, InterpValue::I64(x)) => Ok(InterpValue::I64(-*x)),
-        (Neg, InterpValue::I32(x)) => Ok(InterpValue::I32(-*x)),
-        (Neg, InterpValue::F64(x)) => Ok(InterpValue::F64(-*x)),
-        (Neg, InterpValue::F32(x)) => Ok(InterpValue::F32(-*x)),
-        (Not, InterpValue::Bool(b)) => Ok(InterpValue::Bool(!*b)),
-        (Not, InterpValue::I64(x)) => Ok(InterpValue::I64(!*x)),
-        (Not, InterpValue::I32(x)) => Ok(InterpValue::I32(!*x)),
-        _ => Err(InterpError::UnsupportedInstruction(format!(
-            "unary {:?} on {:?}",
-            op, o
-        ))),
-    }
-}
-
-fn eval_cast(op: CastOp, o: InterpValue, ty: &HirType) -> Result<InterpValue, InterpError> {
-    let raw_i64 = o.to_i64();
+fn eval_cast(op: CastOp, o: ZyntaxValue, ty: &HirType) -> Result<ZyntaxValue, InterpError> {
+    let raw_i64 = value_to_i64(&o);
+    let raw_f64 = value_to_f64(&o);
     match op {
         CastOp::Trunc | CastOp::ZExt | CastOp::SExt | CastOp::Bitcast => {
             if let Some(n) = raw_i64 {
-                Ok(InterpValue::from_i64_as(ty, n))
+                Ok(value_from_i64_as(ty, n))
             } else {
                 Ok(o)
             }
         }
         CastOp::PtrToInt => {
-            if let InterpValue::Ptr(p) = o {
-                Ok(InterpValue::from_i64_as(ty, p as i64))
+            if let ZyntaxValue::Pointer(p) = o {
+                Ok(value_from_i64_as(ty, p as i64))
             } else if let Some(n) = raw_i64 {
-                Ok(InterpValue::from_i64_as(ty, n))
+                Ok(value_from_i64_as(ty, n))
             } else {
                 Ok(o)
             }
         }
         CastOp::IntToPtr => {
             if let Some(n) = raw_i64 {
-                Ok(InterpValue::Ptr(n as *mut u8))
+                Ok(ZyntaxValue::Pointer(n as *mut u8))
             } else {
                 Ok(o)
             }
         }
-        CastOp::FpExt => match o {
-            InterpValue::F32(x) => Ok(InterpValue::F64(x as f64)),
-            other => Ok(other),
+        // Float widening / narrowing. ZyntaxValue stores all floats as
+        // f64; for `FpTrunc` to f32 we narrow then re-widen so the
+        // resulting `Float` has f32-precision content.
+        CastOp::FpExt => match raw_f64 {
+            Some(x) => Ok(ZyntaxValue::Float(x)),
+            None => Ok(o),
         },
-        CastOp::FpTrunc => match o {
-            InterpValue::F64(x) => Ok(InterpValue::F32(x as f32)),
-            other => Ok(other),
+        CastOp::FpTrunc => match raw_f64 {
+            Some(x) => Ok(ZyntaxValue::Float(x as f32 as f64)),
+            None => Ok(o),
         },
-        CastOp::FpToSi | CastOp::FpToUi => match o {
-            InterpValue::F64(x) => Ok(InterpValue::from_i64_as(ty, x as i64)),
-            InterpValue::F32(x) => Ok(InterpValue::from_i64_as(ty, x as i64)),
-            other => Ok(other),
+        CastOp::FpToSi | CastOp::FpToUi => match raw_f64 {
+            Some(x) => Ok(value_from_i64_as(ty, x as i64)),
+            None => Ok(o),
         },
         CastOp::SiToFp | CastOp::UiToFp => {
             if let Some(n) = raw_i64 {
                 match ty {
-                    HirType::F64 => Ok(InterpValue::F64(n as f64)),
-                    HirType::F32 => Ok(InterpValue::F32(n as f32)),
+                    HirType::F64 => Ok(ZyntaxValue::Float(n as f64)),
+                    HirType::F32 => Ok(ZyntaxValue::Float(n as f32 as f64)),
                     _ => Ok(o),
                 }
             } else {
@@ -842,139 +1745,167 @@ fn eval_cast(op: CastOp, o: InterpValue, ty: &HirType) -> Result<InterpValue, In
     }
 }
 
-fn size_of_hir_ty(ty: &HirType) -> usize {
-    match ty {
-        HirType::Bool | HirType::I8 | HirType::U8 => 1,
-        HirType::I16 | HirType::U16 => 2,
-        HirType::I32 | HirType::U32 | HirType::F32 => 4,
-        HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
-        HirType::I128 | HirType::U128 => 16,
-        HirType::Struct(s) => s.fields.iter().map(size_of_hir_ty).sum::<usize>().max(1),
-        HirType::Array(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
-        _ => 8, // conservative default
-    }
-}
-
-/// Recursively `InsertValue` into a struct hierarchy.
-fn insert_value_recursive(agg: &mut InterpValue, indices: &[u32], v: InterpValue) {
+fn insert_value_recursive(agg: &mut ZyntaxValue, indices: &[u32], v: ZyntaxValue) {
     if indices.is_empty() {
         *agg = v;
         return;
     }
+    // The SSA builder lowers `Foo { x: 10, y: 20 }` as a chain of
+    // `InsertValue` ops starting from an `Undef` aggregate. Materialise
+    // `Undef` into an empty `Struct` so successive inserts can grow it.
+    if matches!(agg, ZyntaxValue::Undef) {
+        *agg = ZyntaxValue::Tuple(Vec::new());
+    }
     let head = indices[0] as usize;
     let tail = &indices[1..];
-    if let InterpValue::Struct(fields) = agg {
-        if head < fields.len() {
-            insert_value_recursive(&mut fields[head], tail, v);
+    if let ZyntaxValue::Tuple(fields) = agg {
+        // Pad with `Undef` so the index we're writing to exists.
+        while fields.len() <= head {
+            fields.push(ZyntaxValue::Undef);
+        }
+        insert_value_recursive(&mut fields[head], tail, v);
+    }
+}
+
+unsafe fn read_typed(ptr: *mut u8, ty: &HirType) -> ZyntaxValue {
+    match ty {
+        HirType::Bool => ZyntaxValue::Bool(*ptr != 0),
+        HirType::I8 => ZyntaxValue::I8(*ptr as i8),
+        HirType::U8 => ZyntaxValue::U8(*ptr),
+        HirType::I16 => ZyntaxValue::I16(*(ptr as *const i16)),
+        HirType::U16 => ZyntaxValue::U16(*(ptr as *const u16)),
+        HirType::I32 => ZyntaxValue::I32(*(ptr as *const i32)),
+        HirType::U32 => ZyntaxValue::U32(*(ptr as *const u32)),
+        HirType::F32 => ZyntaxValue::F32(*(ptr as *const f32)),
+        HirType::I64 => ZyntaxValue::Int(*(ptr as *const i64)),
+        HirType::U64 => ZyntaxValue::UInt(*(ptr as *const u64)),
+        HirType::F64 => ZyntaxValue::Float(*(ptr as *const f64)),
+        HirType::Ptr(_) => ZyntaxValue::Pointer(*(ptr as *const *mut u8)),
+        _ => ZyntaxValue::Int(*(ptr as *const i64)),
+    }
+}
+
+/// Width-aware store. The `HirType` tells us how many bytes to write
+/// regardless of whether the value uses a generic or precise variant.
+unsafe fn write_typed(ptr: *mut u8, v: &ZyntaxValue, ty: &HirType) {
+    // Coerce both sides to i64/f64 so we don't need a 2D table of
+    // (HirType, variant) match arms.
+    match ty {
+        HirType::Bool => {
+            if let ZyntaxValue::Bool(b) = v {
+                *ptr = *b as u8;
+            }
+        }
+        HirType::I8 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut i8) = n as i8;
+            }
+        }
+        HirType::I16 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut i16) = n as i16;
+            }
+        }
+        HirType::I32 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut i32) = n as i32;
+            }
+        }
+        HirType::I64 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut i64) = n;
+            }
+        }
+        HirType::U8 => {
+            if let Some(n) = value_to_i64(v) {
+                *ptr = n as u8;
+            }
+        }
+        HirType::U16 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut u16) = n as u16;
+            }
+        }
+        HirType::U32 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut u32) = n as u32;
+            }
+        }
+        HirType::U64 => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut u64) = n as u64;
+            }
+        }
+        HirType::F32 => {
+            if let Some(f) = value_to_f64(v) {
+                *(ptr as *mut f32) = f as f32;
+            }
+        }
+        HirType::F64 => {
+            if let Some(f) = value_to_f64(v) {
+                *(ptr as *mut f64) = f;
+            }
+        }
+        HirType::Ptr(_) => {
+            if let ZyntaxValue::Pointer(p) = v {
+                *(ptr as *mut *mut u8) = *p;
+            }
+        }
+        _ => {
+            if let Some(n) = value_to_i64(v) {
+                *(ptr as *mut i64) = n;
+            }
         }
     }
 }
 
-/// Reading a typed value from a raw pointer. Used by `Load`.
-///
-/// # Safety
-///
-/// `ptr` must be valid for reads of at least `size_of_hir_ty(ty)`
-/// bytes and properly aligned (we assume 8-byte slots for all types).
-unsafe fn read_typed(ptr: *mut u8, ty: &HirType) -> InterpValue {
-    match ty {
-        HirType::Bool => InterpValue::Bool(*ptr != 0),
-        HirType::I8 => InterpValue::I8(*ptr as i8),
-        HirType::U8 => InterpValue::U8(*ptr),
-        HirType::I16 => InterpValue::I16(*(ptr as *const i16)),
-        HirType::U16 => InterpValue::U16(*(ptr as *const u16)),
-        HirType::I32 => InterpValue::I32(*(ptr as *const i32)),
-        HirType::U32 => InterpValue::U32(*(ptr as *const u32)),
-        HirType::F32 => InterpValue::F32(*(ptr as *const f32)),
-        HirType::I64 => InterpValue::I64(*(ptr as *const i64)),
-        HirType::U64 => InterpValue::U64(*(ptr as *const u64)),
-        HirType::F64 => InterpValue::F64(*(ptr as *const f64)),
-        HirType::Ptr(_) => InterpValue::Ptr(*(ptr as *const *mut u8)),
-        _ => InterpValue::I64(*(ptr as *const i64)),
-    }
+/// Dispatch into JIT'd code via the `JitDispatch` produced by a
+/// tick callback. Same i64-funneled ABI as `call_extern_symbol`.
+fn call_jit_dispatch(d: JitDispatch, args: &[ZyntaxValue]) -> ZyntaxValue {
+    let raw = call_extern_symbol(d.ptr, args);
+    ZyntaxValue::Int(raw)
 }
 
-/// Writing a typed value to a raw pointer. Used by `Store`.
-///
-/// # Safety
-///
-/// Same as `read_typed`.
-unsafe fn write_typed(ptr: *mut u8, v: &InterpValue) {
-    match v {
-        InterpValue::Bool(b) => *ptr = *b as u8,
-        InterpValue::I8(x) => *(ptr as *mut i8) = *x,
-        InterpValue::U8(x) => *ptr = *x,
-        InterpValue::I16(x) => *(ptr as *mut i16) = *x,
-        InterpValue::U16(x) => *(ptr as *mut u16) = *x,
-        InterpValue::I32(x) => *(ptr as *mut i32) = *x,
-        InterpValue::U32(x) => *(ptr as *mut u32) = *x,
-        InterpValue::F32(x) => *(ptr as *mut f32) = *x,
-        InterpValue::I64(x) => *(ptr as *mut i64) = *x,
-        InterpValue::U64(x) => *(ptr as *mut u64) = *x,
-        InterpValue::F64(x) => *(ptr as *mut f64) = *x,
-        InterpValue::Ptr(p) => *(ptr as *mut *mut u8) = *p,
-        // Aggregates: not directly representable in raw memory at
-        // this phase. Phase B.2 will add per-field stores via GEP.
-        _ => {}
-    }
-}
-
-/// Call an extern "C" symbol whose pointer was registered with the
-/// interpreter. The dispatch is by arg count — we transmute to the
-/// appropriate fn pointer signature and invoke.
-///
-/// All args + return are funnelled through i64; the caller is
-/// responsible for promoting/demoting against the actual symbol
-/// signature. This matches what ZRTL's existing `register_runtime_symbol`
-/// path expects.
-fn call_extern_symbol(ptr: *const u8, args: &[InterpValue]) -> InterpValue {
-    // Convert args to i64 for the C ABI.
-    let raw_args: Vec<i64> = args.iter().map(|v| v.to_i64().unwrap_or(0)).collect();
+fn call_extern_symbol(ptr: *const u8, args: &[ZyntaxValue]) -> i64 {
+    let raw_args: Vec<i64> = args.iter().map(|v| value_to_i64(v).unwrap_or(0)).collect();
     unsafe {
         match raw_args.len() {
             0 => {
                 let f: extern "C" fn() -> i64 = core::mem::transmute(ptr);
-                InterpValue::I64(f())
+                f()
             }
             1 => {
                 let f: extern "C" fn(i64) -> i64 = core::mem::transmute(ptr);
-                InterpValue::I64(f(raw_args[0]))
+                f(raw_args[0])
             }
             2 => {
                 let f: extern "C" fn(i64, i64) -> i64 = core::mem::transmute(ptr);
-                InterpValue::I64(f(raw_args[0], raw_args[1]))
+                f(raw_args[0], raw_args[1])
             }
             3 => {
                 let f: extern "C" fn(i64, i64, i64) -> i64 = core::mem::transmute(ptr);
-                InterpValue::I64(f(raw_args[0], raw_args[1], raw_args[2]))
+                f(raw_args[0], raw_args[1], raw_args[2])
             }
             4 => {
                 let f: extern "C" fn(i64, i64, i64, i64) -> i64 = core::mem::transmute(ptr);
-                InterpValue::I64(f(raw_args[0], raw_args[1], raw_args[2], raw_args[3]))
+                f(raw_args[0], raw_args[1], raw_args[2], raw_args[3])
             }
-            // 5+ args: rare in ZRTL signatures today; we'll extend
-            // when the first real plugin needs it.
-            n => InterpValue::I64(
-                // Fallback: pretend it returns 0 so the trace stays
-                // useful; the host will see the missing arity in the
-                // unsupported error elsewhere.
-                {
-                    let _ = (ptr, n);
-                    0
-                },
-            ),
+            _ => 0,
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hir::{
-        HirFunction, HirFunctionSignature, HirInstruction, HirModule, HirParam, HirTerminator,
-        HirType, HirValue, HirValueKind, ParamAttributes,
+        HirBlock, HirFunctionSignature, HirParam, HirTerminator, HirType, HirValue, HirValueKind,
+        ParamAttributes,
     };
-    use indexmap::IndexMap;
     use std::collections::HashSet;
     use zyntax_typed_ast::InternedString;
 
@@ -1019,13 +1950,10 @@ mod tests {
 
     /// `def add(a: i64, b: i64): i64 { return a + b }`
     #[test]
-    fn interpreter_runs_simple_add() {
+    fn bc_runs_simple_add() {
         let mut func = mk_fn("add", vec![HirType::I64, HirType::I64], vec![HirType::I64]);
-        // Synthesize Parameter(0/1) values referenced by Binary.
         let p0 = func.signature.params[0].id;
         let p1 = func.signature.params[1].id;
-        // Re-register them as Parameter-kind values (HirFunction::new
-        // doesn't auto-create per-index Parameter values).
         func.values.insert(
             p0,
             HirValue {
@@ -1063,19 +1991,21 @@ mod tests {
         let func_id = func.id;
         module.functions.insert(func_id, func);
 
-        let mut interp = HirInterpreter::new(&module);
+        let mut interp = HirInterpreter::new();
         let result = interp
-            .call("add", vec![InterpValue::I64(10), InterpValue::I64(32)])
+            .call(
+                &module,
+                "add",
+                vec![ZyntaxValue::Int(10), ZyntaxValue::Int(32)],
+            )
             .expect("call should succeed");
-        assert!(matches!(result, InterpValue::I64(42)));
+        assert!(matches!(result, ZyntaxValue::Int(42)));
     }
 
-    /// `def main(): i64 { if (true) return 1 else return 0 }` —
-    /// exercises CondBranch + multiple return points.
+    /// `def main(): i64 { if (true) return 1 else return 0 }`
     #[test]
-    fn interpreter_runs_cond_branch() {
+    fn bc_runs_cond_branch() {
         let mut func = mk_fn("main", vec![], vec![HirType::I64]);
-
         let true_const = add_value(
             &mut func,
             HirType::Bool,
@@ -1091,7 +2021,6 @@ mod tests {
             HirType::I64,
             HirValueKind::Constant(HirConstant::I64(0)),
         );
-
         let entry_id = func.entry_block;
         let then_id = HirId::new();
         let else_id = HirId::new();
@@ -1127,38 +2056,135 @@ mod tests {
             true_target: then_id,
             false_target: else_id,
         };
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        let func_id = func.id;
+        module.functions.insert(func_id, func);
+        let mut interp = HirInterpreter::new();
+        let result = interp.call(&module, "main", vec![]).unwrap();
+        assert!(matches!(result, ZyntaxValue::Int(1)));
+    }
+
+    /// `def loop_to_ten(): i64 { let i = 0; while i < 10 { i += 1 }; i }`
+    /// — exercises phi nodes (i carries across iterations).
+    #[test]
+    fn bc_phi_loop() {
+        let mut func = mk_fn("loop_to_ten", vec![], vec![HirType::I64]);
+        let zero = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(0)),
+        );
+        let one = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(1)),
+        );
+        let ten = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(10)),
+        );
+
+        let entry_id = func.entry_block;
+        let header_id = HirId::new();
+        let body_id = HirId::new();
+        let exit_id = HirId::new();
+
+        // phi result for `i`
+        let i_phi = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        // i + 1 result
+        let i_next = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        // i < 10 result
+        let cmp = add_value(&mut func, HirType::Bool, HirValueKind::Instruction);
+
+        // Entry → header (no instructions, just jump).
+        let entry = func.blocks.get_mut(&entry_id).unwrap();
+        entry.terminator = HirTerminator::Branch { target: header_id };
+
+        // Header: phi i = [zero from entry, i_next from body]; cmp = i < 10; cond-branch.
+        let header = HirBlock {
+            id: header_id,
+            label: None,
+            phis: vec![crate::hir::HirPhi {
+                result: i_phi,
+                ty: HirType::I64,
+                incoming: vec![(zero, entry_id), (i_next, body_id)],
+            }],
+            instructions: vec![HirInstruction::Binary {
+                result: cmp,
+                op: BinaryOp::Lt,
+                ty: HirType::I64,
+                left: i_phi,
+                right: ten,
+            }],
+            terminator: HirTerminator::CondBranch {
+                condition: cmp,
+                true_target: body_id,
+                false_target: exit_id,
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+        func.blocks.insert(header_id, header);
+
+        // Body: i_next = i + 1; branch back to header.
+        let body = HirBlock {
+            id: body_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![HirInstruction::Binary {
+                result: i_next,
+                op: BinaryOp::Add,
+                ty: HirType::I64,
+                left: i_phi,
+                right: one,
+            }],
+            terminator: HirTerminator::Branch { target: header_id },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+        func.blocks.insert(body_id, body);
+
+        // Exit: return i_phi.
+        let exit = HirBlock {
+            id: exit_id,
+            label: None,
+            phis: vec![],
+            instructions: vec![],
+            terminator: HirTerminator::Return {
+                values: vec![i_phi],
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: vec![],
+            successors: vec![],
+        };
+        func.blocks.insert(exit_id, exit);
 
         let mut module = HirModule::new(InternedString::new_global("test"));
         let func_id = func.id;
         module.functions.insert(func_id, func);
-
-        let mut interp = HirInterpreter::new(&module);
-        let result = interp.call("main", vec![]).unwrap();
-        assert!(matches!(result, InterpValue::I64(1)));
+        let mut interp = HirInterpreter::new();
+        let result = interp.call(&module, "loop_to_ten", vec![]).unwrap();
+        assert!(matches!(result, ZyntaxValue::Int(10)), "got {:?}", result);
     }
 
     /// Profile counters increment per call.
     #[test]
-    fn interpreter_records_profile_samples() {
+    fn bc_records_profile_samples() {
         let mut func = mk_fn("noop", vec![], vec![HirType::Void]);
         let entry_id = func.entry_block;
         func.blocks.get_mut(&entry_id).unwrap().terminator =
             HirTerminator::Return { values: vec![] };
-
         let mut module = HirModule::new(InternedString::new_global("test"));
         let func_id = func.id;
         module.functions.insert(func_id, func);
-
-        let mut interp = HirInterpreter::new(&module);
+        let mut interp = HirInterpreter::new();
         for _ in 0..3 {
-            interp.call("noop", vec![]).unwrap();
+            interp.call(&module, "noop", vec![]).unwrap();
         }
         let sample = interp.profile.get(&func_id).copied().unwrap_or_default();
         assert_eq!(sample.call_count, 3);
-    }
-
-    fn _silence_indexmap_use() {
-        // Touch IndexMap to keep its import used.
-        let _: IndexMap<HirId, HirFunction> = IndexMap::new();
     }
 }
