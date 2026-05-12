@@ -29,12 +29,14 @@
 //! loop header); extern-symbol calls (`HirCallable::Symbol`)
 //! lowered to wasm imports under module `"extern"` with an
 //! `<name>@<arity>` suffix that lets the JS host pick the matching
-//! per-arity dispatcher without parsing the wasm type section.
-//! Internal HIR-function calls, indirect calls, intrinsics, struct
-//! memory, effects, and inter-phi cycles still stub out to a clear
-//! `WasmEmitError::Unsupported`. The emitter is intentionally
-//! conservative — any HIR shape it can't handle bails so the
-//! interpreter keeps that function in BC.
+//! per-arity dispatcher without parsing the wasm type section;
+//! 8-byte `Load` / `Store` (i64 / u64 / f64) against the host's
+//! linear memory imported as `(import "host" "memory")`. Internal
+//! HIR-function calls, indirect calls, intrinsics, `Alloca` /
+//! `GetElementPtr`, sub-i64 memory widths, effects, and inter-phi
+//! cycles still stub out to a clear `WasmEmitError::Unsupported`.
+//! The emitter is intentionally conservative — any HIR shape it
+//! can't handle bails so the interpreter keeps that function in BC.
 //!
 //! Value representation:
 //! * `HirType::I64` / `I32` / `I16` / `I8` / `Bool` / `UInt`-family
@@ -51,7 +53,7 @@ use std::collections::HashMap;
 
 use wasm_encoder::{
     CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    Instruction as WasmInst, Module, TypeSection, ValType,
+    Instruction as WasmInst, MemArg, MemoryType, Module, TypeSection, ValType,
 };
 
 // ---------------------------------------------------------------------------
@@ -221,6 +223,12 @@ struct FunctionEmitter<'a> {
     /// wasm function-index of the matching import. Built lazily as
     /// the body emit encounters Call instructions.
     import_indices: HashMap<String, u32>,
+    /// `true` once `scan_imports` has spotted at least one
+    /// `Load`/`Store` instruction. Triggers a `(import "host"
+    /// "memory" (memory 0))` declaration so the emitted wasm
+    /// shares the host runtime's linear memory — that's how
+    /// JIT'd code reads structs / arrays the BC interp built.
+    needs_memory_import: bool,
 }
 
 /// Per-block state threaded through `emit_terminator` so jumps
@@ -253,6 +261,7 @@ impl<'a> FunctionEmitter<'a> {
             n_params: 0,
             imports: Vec::new(),
             import_indices: HashMap::new(),
+            needs_memory_import: false,
         }
     }
 
@@ -312,14 +321,33 @@ impl<'a> FunctionEmitter<'a> {
         module.section(&types);
 
         // Import section. One `(import "extern" "<name>@<arity>"
-        // (func (type <idx>)))` per discovered Symbol callee.
-        if !self.imports.is_empty() {
+        // (func (type <idx>)))` per discovered Symbol callee, plus
+        // a host-shared linear memory if any Load/Store fires
+        // inside the body.
+        if !self.imports.is_empty() || self.needs_memory_import {
             let mut imports = ImportSection::new();
             for (name, arity) in &self.imports {
                 let type_idx = *arity_to_type_idx
                     .get(arity)
                     .expect("arity → type-index mapping populated above");
                 imports.import("extern", name, EntityType::Function(type_idx));
+            }
+            if self.needs_memory_import {
+                // `minimum: 0` — accept whatever the host has.
+                // `maximum: None` — no upper bound. `memory64: false`
+                // — host wasm is 32-bit memory (linear-memory addrs
+                // are i32). Shared/threading flags off for now.
+                imports.import(
+                    "host",
+                    "memory",
+                    EntityType::Memory(MemoryType {
+                        minimum: 0,
+                        maximum: None,
+                        memory64: false,
+                        shared: false,
+                        page_size_log2: None,
+                    }),
+                );
             }
             module.section(&imports);
         }
@@ -431,6 +459,12 @@ impl<'a> FunctionEmitter<'a> {
     fn scan_imports(&mut self) -> Result<()> {
         for block in self.func.blocks.values() {
             for inst in &block.instructions {
+                if matches!(
+                    inst,
+                    HirInstruction::Load { .. } | HirInstruction::Store { .. }
+                ) {
+                    self.needs_memory_import = true;
+                }
                 if let HirInstruction::Call { callee, args, .. } = inst {
                     match callee {
                         HirCallable::Symbol(name) => {
@@ -745,6 +779,71 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(rhs);
                 emit_binary_op(out, *op, ty)?;
                 out.push(dst);
+                Ok(())
+            }
+            HirInstruction::Load {
+                result, ty, ptr, ..
+            } => {
+                // Load addresses come in as i64 (the BC interp's
+                // funneled ABI funnels pointers through i64). Wasm
+                // memory operands are i32, so wrap before the load.
+                //
+                // Width selection: i64 / u64 / f64 / pointers (any
+                // 8-byte HIR type) → 8-byte load. Smaller widths
+                // / unsupported types stay `Unsupported` until we
+                // grow the table; the BC interp keeps that function.
+                out.push(self.local_get(*ptr)?);
+                out.push(WasmInst::I32WrapI64);
+                let memarg = MemArg {
+                    offset: 0,
+                    align: 3, // log2(8) — 8-byte aligned
+                    memory_index: 0,
+                };
+                let load = match ty {
+                    HirType::I64 | HirType::U64 => WasmInst::I64Load(memarg),
+                    HirType::F64 => WasmInst::F64Load(memarg),
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "Load of HirType {:?} (only I64/U64/F64 supported in this slice)",
+                            other
+                        )));
+                    }
+                };
+                out.push(load);
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::Store { value, ptr, .. } => {
+                // Wasm `*.store` takes (addr, value) on the stack;
+                // push them in that order. Value's wasm type
+                // dictates the store opcode.
+                out.push(self.local_get(*ptr)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(self.local_get(*value)?);
+
+                let value_ty = self
+                    .func
+                    .values
+                    .get(value)
+                    .ok_or(WasmEmitError::UnknownValue(*value))?
+                    .ty
+                    .clone();
+                let memarg = MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                };
+                let store = match value_ty {
+                    HirType::I64 | HirType::U64 => WasmInst::I64Store(memarg),
+                    HirType::F64 => WasmInst::F64Store(memarg),
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "Store of HirType {:?} (only I64/U64/F64 supported in this slice)",
+                            other
+                        )));
+                    }
+                };
+                out.push(store);
                 Ok(())
             }
             HirInstruction::Call {
@@ -1654,6 +1753,109 @@ mod tests {
         assert!(
             found_import,
             "expected `(import \"extern\" \"ext_double@1\")` in emitted module"
+        );
+    }
+
+    /// `def load_then_store(addr: i64, value: i64): i64 {
+    ///     let cur = *addr;        // Load
+    ///     *addr = cur + value;    // Add + Store
+    ///     return cur;
+    /// }`
+    ///
+    /// Validates that Load/Store lower correctly AND that the
+    /// emitted module imports `(host, memory)` so the JIT'd code
+    /// can read/write the host's linear memory.
+    #[test]
+    fn emits_load_and_store_with_memory_import() {
+        let addr_id = HirId::new();
+        let value_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: addr_id,
+                    name: InternedString::new_global("addr"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: value_id,
+                    name: InternedString::new_global("value"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("load_then_store"), sig);
+        for (idx, id) in [(0u32, addr_id), (1, value_id)] {
+            func.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: HirType::I64,
+                    kind: HirValueKind::Parameter(idx),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        let cur = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let sum = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Load {
+            result: cur,
+            ty: HirType::I64,
+            ptr: addr_id,
+            align: 8,
+            volatile: false,
+        });
+        entry.instructions.push(HirInstruction::Binary {
+            result: sum,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: cur,
+            right: value_id,
+        });
+        entry.instructions.push(HirInstruction::Store {
+            value: sum,
+            ptr: addr_id,
+            align: 8,
+            volatile: false,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![cur] };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit load/store function");
+        m.validate_full().expect("module structurally valid");
+
+        // The module must declare a memory import so the host can
+        // pass its memory in at instantiate time.
+        let parser = wasmparser::Parser::new(0);
+        let mut found_memory_import = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "host"
+                        && import.name == "memory"
+                        && matches!(import.ty, wasmparser::TypeRef::Memory(_))
+                    {
+                        found_memory_import = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_memory_import,
+            "expected `(import \"host\" \"memory\" (memory ...))` declaration"
         );
     }
 

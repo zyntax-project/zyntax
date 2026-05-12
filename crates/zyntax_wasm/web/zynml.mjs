@@ -98,12 +98,24 @@ function installJitHost() {
             const mod = new WebAssembly.Module(bytes);
 
             // Build the importObject from the module's declared
-            // imports. Single namespace `"extern"`; each entry maps
-            // to a JS shim that calls back into the host wasm's
-            // _zyntax_call_extern_<arity> exports.
+            // imports. Two namespaces today:
+            //   - `"extern"` — function imports, one per Symbol
+            //     callee with an `@arity` suffix in the name.
+            //     Each maps to a JS shim that calls back into the
+            //     host wasm's `_zyntax_call_extern_<arity>` exports.
+            //   - `"host"` — non-function imports the JIT'd module
+            //     needs from the runtime. The only entry today is
+            //     `"memory"`, the host wasm's linear memory, so
+            //     JIT'd `i64.load` / `i64.store` ops read/write the
+            //     same heap the BC interpreter built.
             const importObj = {};
             const imports = WebAssembly.Module.imports(mod);
             for (const imp of imports) {
+                if (imp.module === "host" && imp.name === "memory") {
+                    if (!importObj.host) importObj.host = {};
+                    importObj.host.memory = zynmlBindings.memory;
+                    continue;
+                }
                 if (imp.kind !== "function") continue;
                 if (imp.module !== "extern") {
                     console.warn(
