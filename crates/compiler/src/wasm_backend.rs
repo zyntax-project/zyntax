@@ -22,14 +22,14 @@
 //!   full wasmparser pipeline.
 //!
 //! Current coverage: primitive i64/f64 arithmetic; multi-block
-//! control flow (`Return` / `Branch` / `CondBranch`) lowered via a
-//! universal dispatch-loop pattern; phi nodes resolved out-of-SSA
-//! via predecessor-edge moves (`local.set` on the matching incoming
-//! value before `br` to the loop header). Structs, calls, effects,
-//! `Switch`, and inter-phi cycles still stub out to a clear
-//! `WasmEmitError::Unsupported`. The emitter is intentionally
-//! conservative — any HIR shape it can't handle bails so the
-//! interpreter keeps that function in BC.
+//! control flow (`Return` / `Branch` / `CondBranch` / `Switch` over
+//! integer constants) lowered via a universal dispatch-loop pattern;
+//! phi nodes resolved out-of-SSA via predecessor-edge moves
+//! (`local.set` on the matching incoming value before `br` to the
+//! loop header). Structs, calls, effects, and inter-phi cycles
+//! still stub out to a clear `WasmEmitError::Unsupported`. The
+//! emitter is intentionally conservative — any HIR shape it can't
+//! handle bails so the interpreter keeps that function in BC.
 //!
 //! Value representation:
 //! * `HirType::I64` / `I32` / `I16` / `I8` / `Bool` / `UInt`-family
@@ -680,6 +680,57 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(WasmInst::Br(ctx.loop_depth));
                 Ok(())
             }
+            HirTerminator::Switch {
+                value,
+                default,
+                cases,
+            } => {
+                let ctx = dispatch.ok_or_else(|| {
+                    WasmEmitError::Unsupported(
+                        "Switch in single-block function (should be unreachable)".into(),
+                    )
+                })?;
+                // Lower to a sequence of `if`/`end` blocks — one per
+                // case. Each `if` tests `value == case_constant` and
+                // conditionally jumps to that case's target; the
+                // default fires if none of the cases matched (fall-
+                // through after the last `end`).
+                //
+                // Wasm depth math: each `if` adds 1 to the relative
+                // depth needed to reach the surrounding `loop`. Since
+                // each case's `br` lives INSIDE its own `if`, the
+                // depth is `loop_depth + 1`. The default `br` sits
+                // OUTSIDE all the `if`s, so its depth is just
+                // `loop_depth`.
+                for (case_const, case_target) in cases {
+                    // Emit the case-constant + equality test.
+                    out.push(self.local_get(*value)?);
+                    let case_i64 = case_constant_to_i64(case_const)?;
+                    out.push(WasmInst::I64Const(case_i64));
+                    out.push(WasmInst::I64Eq);
+                    out.push(WasmInst::If(wasm_encoder::BlockType::Empty));
+                    // Match: phi moves + dispatch.
+                    self.emit_phi_moves(out, *case_target, ctx.from_block)?;
+                    let case_idx = *ctx
+                        .block_indices
+                        .get(case_target)
+                        .ok_or(WasmEmitError::UnknownValue(*case_target))?;
+                    out.push(WasmInst::I32Const(case_idx as i32));
+                    out.push(WasmInst::LocalSet(ctx.next_block_local));
+                    out.push(WasmInst::Br(ctx.loop_depth + 1));
+                    out.push(WasmInst::End);
+                }
+                // Default — reached only if no case matched.
+                self.emit_phi_moves(out, *default, ctx.from_block)?;
+                let default_idx = *ctx
+                    .block_indices
+                    .get(default)
+                    .ok_or(WasmEmitError::UnknownValue(*default))?;
+                out.push(WasmInst::I32Const(default_idx as i32));
+                out.push(WasmInst::LocalSet(ctx.next_block_local));
+                out.push(WasmInst::Br(ctx.loop_depth));
+                Ok(())
+            }
             HirTerminator::CondBranch {
                 condition,
                 true_target,
@@ -808,6 +859,37 @@ fn lower_type(ty: &HirType) -> Result<ValType> {
         I64 | I32 | I16 | I8 | U64 | U32 | U16 | U8 | Bool => ValType::I64,
         F64 | F32 => ValType::F64,
         other => return Err(WasmEmitError::Unsupported(format!("type {:?}", other))),
+    })
+}
+
+/// Coerce a `HirConstant` case discriminator into an i64 for the
+/// switch dispatcher. Mirrors the `emit_constant` ABI — every
+/// integer / bool widens to i64; floats and other types aren't
+/// switchable today (rejected by HIR lowering long before us, but
+/// the explicit error here keeps the contract observable).
+fn case_constant_to_i64(c: &HirConstant) -> Result<i64> {
+    Ok(match c {
+        HirConstant::I64(n) => *n,
+        HirConstant::I32(n) => *n as i64,
+        HirConstant::I16(n) => *n as i64,
+        HirConstant::I8(n) => *n as i64,
+        HirConstant::U64(n) => *n as i64,
+        HirConstant::U32(n) => *n as i64,
+        HirConstant::U16(n) => *n as i64,
+        HirConstant::U8(n) => *n as i64,
+        HirConstant::Bool(b) => {
+            if *b {
+                1
+            } else {
+                0
+            }
+        }
+        other => {
+            return Err(WasmEmitError::Unsupported(format!(
+                "Switch case constant {:?} (only integer/bool case discriminators supported)",
+                other
+            )))
+        }
     })
 }
 
@@ -1228,6 +1310,113 @@ mod tests {
         let m = WasmBackend::new()
             .compile_function(&func)
             .expect("emit phi-join function");
+        m.validate_full().expect("module structurally valid");
+    }
+
+    /// `def switch_demo(tag: i64): i64`
+    ///
+    /// ```text
+    /// entry: switch tag {
+    ///     0 -> bb_zero,
+    ///     1 -> bb_one,
+    ///     default -> bb_other,
+    /// }
+    /// bb_zero:  return 100
+    /// bb_one:   return 200
+    /// bb_other: return 999
+    /// ```
+    ///
+    /// Validates the `Switch` lowering: three `if cmp; phi+set+br;
+    /// end` blocks for the explicit cases, plus a default that fires
+    /// when none match.
+    #[test]
+    fn emits_switch_three_way() {
+        let tag_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: tag_id,
+                name: InternedString::new_global("tag"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("switch_demo"), sig);
+        func.values.insert(
+            tag_id,
+            HirValue {
+                id: tag_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+
+        let hundred = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(100)),
+        );
+        let two_hundred = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(200)),
+        );
+        let nine_nine_nine = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(999)),
+        );
+
+        let bb_zero = HirId::new();
+        let bb_one = HirId::new();
+        let bb_other = HirId::new();
+        add_block(
+            &mut func,
+            bb_zero,
+            Vec::new(),
+            HirTerminator::Return {
+                values: vec![hundred],
+            },
+        );
+        add_block(
+            &mut func,
+            bb_one,
+            Vec::new(),
+            HirTerminator::Return {
+                values: vec![two_hundred],
+            },
+        );
+        add_block(
+            &mut func,
+            bb_other,
+            Vec::new(),
+            HirTerminator::Return {
+                values: vec![nine_nine_nine],
+            },
+        );
+
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.terminator = HirTerminator::Switch {
+            value: tag_id,
+            default: bb_other,
+            cases: vec![
+                (HirConstant::I64(0), bb_zero),
+                (HirConstant::I64(1), bb_one),
+            ],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit Switch");
         m.validate_full().expect("module structurally valid");
     }
 
