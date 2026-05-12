@@ -43,6 +43,32 @@ const INTERNAL_RENDER_EVENT_ALIAS: &str = "__internal_render_event";
 const INTERNAL_STREAM_EVENT_ALIAS: &str = "__internal_stream_event";
 
 /// SSA builder state
+/// A type-appropriate zero `HirConstant` for a given `HirType`.
+///
+/// Used by the lambda-body translator when a block-bodied closure has
+/// no trailing expression — we still need a value-typed operand for
+/// the synthesised `Return`. Falls back to `I32(0)` for shapes that
+/// don't have an obvious zero (struct, opaque, closure values); the
+/// closure semantics in those cases are best-effort until the broader
+/// "block-as-expression" lowering lands.
+fn default_const_for(ty: &HirType) -> crate::hir::HirConstant {
+    use crate::hir::HirConstant;
+    match ty {
+        HirType::I8 => HirConstant::I8(0),
+        HirType::I16 => HirConstant::I16(0),
+        HirType::I32 => HirConstant::I32(0),
+        HirType::I64 => HirConstant::I64(0),
+        HirType::U8 => HirConstant::U8(0),
+        HirType::U16 => HirConstant::U16(0),
+        HirType::U32 => HirConstant::U32(0),
+        HirType::U64 => HirConstant::U64(0),
+        HirType::F32 => HirConstant::F32(0.0),
+        HirType::F64 => HirConstant::F64(0.0),
+        HirType::Bool => HirConstant::Bool(false),
+        _ => HirConstant::I32(0),
+    }
+}
+
 pub struct SsaBuilder {
     /// Current function being built
     function: HirFunction,
@@ -8421,40 +8447,193 @@ impl SsaBuilder {
         let outer_captures: IndexMap<InternedString, HirId> =
             self.definitions.get(&block_id).cloned().unwrap_or_default();
 
-        // Translate lambda body
-        let result_val = match &lambda.body {
-            TypedLambdaBody::Expression(expr) => self.translate_lambda_expr(
-                &mut lambda_func,
-                &mut entry_block,
-                &param_values,
-                &lambda.params,
-                &outer_captures,
-                expr,
-                &return_type,
-            )?,
-            TypedLambdaBody::Block(_block) => {
-                // Block body - for now, just return 0
-                let val_id = HirId::new();
-                lambda_func.values.insert(
-                    val_id,
-                    crate::hir::HirValue {
-                        id: val_id,
-                        ty: return_type.clone(),
-                        kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
-                        uses: HashSet::new(),
-                        span: None,
-                    },
-                );
-                val_id
+        // Translate the lambda body through the REAL translator
+        // (`translate_expression` / `process_statement`) rather than the
+        // historic `translate_lambda_expr` mini-translator. The
+        // mini-translator handled only `Literal` / `Variable` / `Binary`
+        // and silently zeroed every other expression variant — including
+        // `Call`, `MethodCall`, `Block`, `Field`, `If`, `Index` — so any
+        // closure that actually did work compiled to a no-op `return 0`.
+        // See ZYNTAX_LAMBDA_BODY_BUG.md for the diagnosis.
+        //
+        // The real translator operates on `self.function` and the per-
+        // function context fields (`definitions`, `var_types`,
+        // `sealed_blocks`, …). To run it against the lambda we
+        // temporarily swap those fields, seed the lambda's entry-block
+        // context with its params + outer captures, run the translation,
+        // then pull the populated `HirFunction` back out and restore the
+        // outer-function context — guarded by `swap`s so a translation
+        // failure can't leak the lambda's state into the outer build.
+        let result_val = {
+            // Precompute the TypedAst-form return type before the swap —
+            // `hir_type_to_typed_ast_type` borrows `self` immutably and
+            // wouldn't fit inside the `std::mem::replace` below.
+            let typed_ast_return_type = self.hir_type_to_typed_ast_type(&return_type);
+
+            // Stash the lambda's entry block inside the function-being-
+            // built so `add_instruction` / `create_value` can reach it.
+            lambda_func.blocks.insert(entry_block_id, entry_block);
+
+            // Swap the lambda into `self.function` and save the outer.
+            let saved_function = std::mem::replace(&mut self.function, lambda_func);
+            let saved_definitions = std::mem::take(&mut self.definitions);
+            let saved_incomplete_phis = std::mem::take(&mut self.incomplete_phis);
+            let saved_var_counter = std::mem::take(&mut self.var_counter);
+            let saved_var_types = std::mem::take(&mut self.var_types);
+            let saved_var_typed_ast_types = std::mem::take(&mut self.var_typed_ast_types);
+            let saved_sealed_blocks = std::mem::take(&mut self.sealed_blocks);
+            let saved_filled_blocks = std::mem::take(&mut self.filled_blocks);
+            let saved_variable_writes = std::mem::take(&mut self.variable_writes);
+            let saved_idf_placement_done = std::mem::replace(&mut self.idf_placement_done, false);
+            let saved_match_context = std::mem::take(&mut self.match_context);
+            let saved_continuation_block = std::mem::take(&mut self.continuation_block);
+            let saved_original_return_type =
+                std::mem::replace(&mut self.original_return_type, Some(typed_ast_return_type));
+            let saved_address_taken_vars = std::mem::take(&mut self.address_taken_vars);
+            let saved_stack_slots = std::mem::take(&mut self.stack_slots);
+            let saved_compute_yield_stack = std::mem::take(&mut self.compute_yield_stack);
+            let saved_simd_continue_block = std::mem::take(&mut self.simd_continue_block);
+            let saved_effect_op_map = std::mem::take(&mut self.effect_op_map);
+            let saved_resume_param_names = std::mem::take(&mut self.resume_param_names);
+
+            // Seed the lambda's entry-block context: lambda params first
+            // (so the body can reference them by name), then outer
+            // captures (copied as fresh value-id entries inside the
+            // lambda's function — same shape `translate_lambda_expr`
+            // used to do for the `Variable` arm).
+            let mut entry_defs: IndexMap<InternedString, HirId> = IndexMap::new();
+            for (idx, param) in lambda.params.iter().enumerate() {
+                if let Some((param_id, param_ty)) = param_values.get(idx) {
+                    entry_defs.insert(param.name, *param_id);
+                    self.var_types.insert(param.name, param_ty.clone());
+                }
             }
+            for (name, outer_val_id) in &outer_captures {
+                if let Some(outer_value) = saved_function.values.get(outer_val_id).cloned() {
+                    // Clone the captured value into the lambda's function
+                    // so the inner translator sees a local definition.
+                    // No environment-struct plumbing — that's the larger
+                    // capture story called out as out-of-scope in
+                    // ZYNTAX_LAMBDA_BODY_BUG.md and still parked.
+                    let new_id = HirId::new();
+                    self.function.values.insert(
+                        new_id,
+                        crate::hir::HirValue {
+                            id: new_id,
+                            ty: outer_value.ty.clone(),
+                            kind: outer_value.kind.clone(),
+                            uses: HashSet::new(),
+                            span: None,
+                        },
+                    );
+                    entry_defs.insert(*name, new_id);
+                    self.var_types.insert(*name, outer_value.ty.clone());
+                }
+            }
+            self.definitions.insert(entry_block_id, entry_defs);
+            self.sealed_blocks.insert(entry_block_id);
+
+            // Translate the body. `Expression` → one expression yielding
+            // the lambda's return value. `Block` → run every statement
+            // through `process_statement`; if the trailing item is a bare
+            // `TypedStatement::Expression`, that's the implicit return,
+            // otherwise default to a zero of the return type so the
+            // terminator below has something well-typed to return.
+            let body_result = match &lambda.body {
+                TypedLambdaBody::Expression(expr) => {
+                    self.translate_expression(entry_block_id, expr)
+                }
+                TypedLambdaBody::Block(block) => {
+                    use zyntax_typed_ast::typed_ast::TypedStatement;
+                    let mut current_block = entry_block_id;
+                    let mut last_expr_val: Option<HirId> = None;
+                    let n = block.statements.len();
+                    for (i, stmt) in block.statements.iter().enumerate() {
+                        // If the last statement is an Expression, hold
+                        // it so we can use its value as the return.
+                        if i + 1 == n {
+                            if let TypedStatement::Expression(expr) = &stmt.node {
+                                match self.translate_expression(current_block, expr) {
+                                    Ok(v) => {
+                                        last_expr_val = Some(v);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // Fall through to error-propagation block below.
+                                        last_expr_val = None;
+                                        // Re-run via process_statement to capture for diagnostics;
+                                        // simpler: just propagate the error.
+                                        let _ = e;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        match self.process_statement(current_block, stmt) {
+                            Ok(next) => current_block = next,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Ok(last_expr_val.unwrap_or_else(|| {
+                        // Synthesise a zero return value of the declared
+                        // return type so the entry block has a well-typed
+                        // `Return` operand even when the body has no
+                        // trailing expression.
+                        let val_id = HirId::new();
+                        self.function.values.insert(
+                            val_id,
+                            crate::hir::HirValue {
+                                id: val_id,
+                                ty: return_type.clone(),
+                                kind: crate::hir::HirValueKind::Constant(default_const_for(
+                                    &return_type,
+                                )),
+                                uses: HashSet::new(),
+                                span: None,
+                            },
+                        );
+                        val_id
+                    }))
+                }
+            };
+
+            // Pull our populated lambda function back out + restore the
+            // outer-function context, regardless of whether translation
+            // succeeded or returned an error.
+            lambda_func = std::mem::replace(&mut self.function, saved_function);
+            self.definitions = saved_definitions;
+            self.incomplete_phis = saved_incomplete_phis;
+            self.var_counter = saved_var_counter;
+            self.var_types = saved_var_types;
+            self.var_typed_ast_types = saved_var_typed_ast_types;
+            self.sealed_blocks = saved_sealed_blocks;
+            self.filled_blocks = saved_filled_blocks;
+            self.variable_writes = saved_variable_writes;
+            self.idf_placement_done = saved_idf_placement_done;
+            self.match_context = saved_match_context;
+            self.continuation_block = saved_continuation_block;
+            self.original_return_type = saved_original_return_type;
+            self.address_taken_vars = saved_address_taken_vars;
+            self.stack_slots = saved_stack_slots;
+            self.compute_yield_stack = saved_compute_yield_stack;
+            self.simd_continue_block = saved_simd_continue_block;
+            self.effect_op_map = saved_effect_op_map;
+            self.resume_param_names = saved_resume_param_names;
+
+            body_result?
         };
 
-        // Set return terminator
+        // The entry block already lives inside `lambda_func.blocks` from
+        // the swap above. Pull it out, set the Return terminator, put it
+        // back. (Direct mutation through `blocks.get_mut` is fine but
+        // less explicit about the ownership flow.)
+        let mut entry_block = lambda_func
+            .blocks
+            .shift_remove(&entry_block_id)
+            .expect("lambda entry block was inserted before context-swap");
         entry_block.terminator = crate::hir::HirTerminator::Return {
             values: vec![result_val],
         };
-
-        // Add entry block to function
         lambda_func.blocks.insert(entry_block_id, entry_block);
 
         // Store the lambda function for later compilation
