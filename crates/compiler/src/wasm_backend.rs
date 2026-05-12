@@ -3,11 +3,14 @@
 //! Same role on wasm32 that [`crate::cranelift_backend`] plays on
 //! native: when a function gets hot, the BC interpreter hands its
 //! `HirFunction` to this emitter, gets back a `WasmModule` (raw
-//! wasm bytes), and the host's wasm crate calls
-//! `WebAssembly.instantiate(bytes, importObject)` to slot it into a
-//! shared funcref table. Subsequent calls to that HIR function
-//! dispatch through `call_indirect` against the table entry instead
-//! of stepping through bytecode.
+//! wasm bytes), and the host's wasm crate hands the bytes to
+//! `WebAssembly.compile(bytes)` (or the sync `new
+//! WebAssembly.Module(bytes)`) to produce a `Module`. The host then
+//! `new WebAssembly.Instance(mod, importObject)`s it and slots the
+//! exported `entry` function into a shared funcref table.
+//! Subsequent calls to that HIR function dispatch through
+//! `call_indirect` against the table entry instead of stepping
+//! through bytecode.
 //!
 //! Modeled on `wren_lift/src/codegen/wasm.rs` but consuming our HIR
 //! directly:
@@ -83,8 +86,23 @@ type Result<T> = std::result::Result<T, WasmEmitError>;
 // Output
 // ---------------------------------------------------------------------------
 
-/// A compiled wasm module (raw bytes). Hand-off to the JS host
-/// (browser `WebAssembly.instantiate` / Node `WebAssembly.compile`).
+/// A compiled wasm module (raw bytes). Hand-off shape to the JS
+/// host:
+///
+/// ```js
+/// const mod  = await WebAssembly.compile(bytes);
+/// const inst = await WebAssembly.instantiate(mod, importObject);
+/// const fn   = inst.exports.entry;
+/// jitTable.set(slot, fn);
+/// ```
+///
+/// (Or the synchronous `new WebAssembly.Module(bytes)` / `new
+/// WebAssembly.Instance(mod, ...)` pair when the host wants to
+/// avoid the `await`.)
+///
+/// The `bytes` field is the only state — there's no associated
+/// metadata to thread through. Validation and instantiation are
+/// the host's responsibility.
 #[derive(Clone, Debug)]
 pub struct WasmModule {
     pub bytes: Vec<u8>,
