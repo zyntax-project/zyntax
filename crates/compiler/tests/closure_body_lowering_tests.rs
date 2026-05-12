@@ -188,6 +188,278 @@ fn find_closure_fn(module: &zyntax_compiler::hir::HirModule) -> &zyntax_compiler
         .expect("closure function should be present in lowered module")
 }
 
+/// Regression test for the Blinc-reported issue (see updated
+/// ZYNTAX_LAMBDA_BODY_BUG.md "Status of the local checkout"
+/// section): the lambda-body fix shouldn't cause OTHER top-level
+/// functions to disappear from the lowered module. The bug report
+/// observed `Ok([])` — empty function list — when the program had
+/// both a closure-using function AND a sibling top-level fn.
+///
+/// Build a TypedProgram with three decls:
+///   - `extern fn sink(value: i32): i32`
+///   - `def helper(): i64 { return 99 }` — sibling top-level fn
+///     with no lambda inside.
+///   - `def main(): i64 { let f = def(): sink(42); return 0 }` —
+///     same closure shape as `expression_bodied_closure_emits_call_to_extern`.
+///
+/// Assert: the lowered HIR module contains BOTH `helper` AND `main`
+/// AND a `__lambda_*` function. Failure mode would be a missing
+/// `helper` (or worse, empty `module.functions`).
+#[test]
+fn sibling_top_level_fns_survive_closure_lowering() {
+    let mut arena = AstArena::new();
+
+    // Sibling function with NO closure.
+    let helper_name = arena.intern_string("helper");
+    let mut helper_fn = TypedFunction::default();
+    helper_fn.name = helper_name;
+    helper_fn.return_type = Type::Primitive(PrimitiveType::I64);
+    helper_fn.body = Some(TypedBlock {
+        statements: vec![typed_node(
+            TypedStatement::Return(Some(Box::new(typed_node(
+                TypedExpression::Literal(TypedLiteral::Integer(99)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )))),
+            Type::Primitive(PrimitiveType::Unit),
+            span(),
+        )],
+        span: span(),
+    });
+
+    // Closure-containing function (shape from
+    // `expression_bodied_closure_emits_call_to_extern`).
+    let closure_body = TypedLambdaBody::Expression(Box::new(call_sink(&mut arena, 42)));
+    let let_stmt = let_f_eq_closure(&mut arena, closure_body);
+    let main_name = arena.intern_string("main");
+    let mut main_fn = TypedFunction::default();
+    main_fn.name = main_name;
+    main_fn.return_type = Type::Primitive(PrimitiveType::I32);
+    main_fn.body = Some(TypedBlock {
+        statements: vec![let_stmt, return_zero()],
+        span: span(),
+    });
+
+    let mut program = TypedProgram {
+        declarations: vec![
+            typed_node(
+                make_extern_sink(&mut arena),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            typed_node(
+                TypedDeclaration::Function(helper_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+            typed_node(
+                TypedDeclaration::Function(main_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        span: span(),
+        source_files: vec![],
+        type_registry: TypeRegistry::new(),
+    };
+
+    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    let type_registry = Arc::new(TypeRegistry::new());
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("closure_test");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+    let module = ctx
+        .lower_program(&mut program)
+        .expect("lower three-decl program");
+    std::env::remove_var("SKIP_TYPE_CHECK");
+
+    let names: Vec<String> = module
+        .functions
+        .values()
+        .filter_map(|f| f.name.resolve_global())
+        .collect();
+
+    // Expect at least: sink (extern), helper, main, __lambda_*
+    let has_helper = names.iter().any(|n| n == "helper");
+    let has_main = names.iter().any(|n| n == "main");
+    let has_lambda = names.iter().any(|n| n.starts_with("__lambda_"));
+
+    assert!(
+        has_helper && has_main && has_lambda,
+        "expected the module to contain helper + main + a __lambda_* function. \
+         got: {:?}",
+        names
+    );
+}
+
+/// Closer to the Blinc-reported shape: the lambda is passed as a
+/// CALL ARGUMENT (not assigned to a let), and the lambda body
+/// references an outer captured variable. This is the form
+/// `Div(on_click = || { count.set(count.get() + 1) })` reduces to
+/// after Blinc's frontend produces TypedAst.
+///
+/// Surfacing this as a separate test in case `let f = lambda` and
+/// `extern_call(lambda)` go through different lowering paths.
+#[test]
+fn lambda_as_call_arg_with_capture_survives() {
+    let mut arena = AstArena::new();
+
+    // extern fn ext_call(handler: i64): i64
+    // We use i64 for the lambda-as-handler position since
+    // closures lower to opaque function pointers in the i64-funneled
+    // ABI.
+    let ext_name = arena.intern_string("ext_call");
+    let handler_name = arena.intern_string("handler");
+    let mut handler_param = TypedParameter::default();
+    handler_param.name = handler_name;
+    handler_param.ty = Type::Primitive(PrimitiveType::I64);
+    handler_param.span = span();
+    let mut ext_fn = TypedFunction::default();
+    ext_fn.name = ext_name;
+    ext_fn.params = vec![handler_param];
+    ext_fn.return_type = Type::Primitive(PrimitiveType::I64);
+    ext_fn.body = None;
+    ext_fn.is_external = true;
+    let ext_decl = TypedDeclaration::Function(ext_fn);
+
+    // sink — used inside the lambda body (call-with-capture)
+    let sink_decl = make_extern_sink(&mut arena);
+
+    // render_view fn:
+    //   def render_view(): i64 {
+    //       let count = 5
+    //       return ext_call(def(): sink(count))
+    //   }
+    let count_name = arena.intern_string("count");
+    let five = typed_node(
+        TypedExpression::Literal(TypedLiteral::Integer(5)),
+        Type::Primitive(PrimitiveType::I32),
+        span(),
+    );
+    let let_count = typed_node(
+        TypedStatement::Let(TypedLet {
+            name: count_name,
+            ty: Type::Primitive(PrimitiveType::I32),
+            mutability: zyntax_typed_ast::Mutability::Immutable,
+            initializer: Some(Box::new(five)),
+            span: span(),
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    // sink(count) — lambda body, captures `count`
+    let sink_lookup = arena.intern_string("sink");
+    let count_ref = typed_node(
+        TypedExpression::Variable(count_name),
+        Type::Primitive(PrimitiveType::I32),
+        span(),
+    );
+    let sink_call = typed_node(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(typed_node(
+                TypedExpression::Variable(sink_lookup),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            )),
+            type_args: vec![],
+            positional_args: vec![count_ref],
+            named_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I32),
+        span(),
+    );
+
+    // def(): sink(count)
+    let lambda = typed_node(
+        TypedExpression::Lambda(TypedLambda {
+            params: vec![],
+            body: TypedLambdaBody::Expression(Box::new(sink_call)),
+            captures: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+
+    // ext_call(<lambda>)
+    let ext_lookup = arena.intern_string("ext_call");
+    let ext_call_expr = typed_node(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(typed_node(
+                TypedExpression::Variable(ext_lookup),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            )),
+            type_args: vec![],
+            positional_args: vec![lambda],
+            named_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::I64),
+        span(),
+    );
+
+    let return_stmt = typed_node(
+        TypedStatement::Return(Some(Box::new(ext_call_expr))),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let render_view_name = arena.intern_string("render_view");
+    let mut render_view_fn = TypedFunction::default();
+    render_view_fn.name = render_view_name;
+    render_view_fn.return_type = Type::Primitive(PrimitiveType::I64);
+    render_view_fn.body = Some(TypedBlock {
+        statements: vec![let_count, return_stmt],
+        span: span(),
+    });
+
+    let mut program = TypedProgram {
+        declarations: vec![
+            typed_node(ext_decl, Type::Primitive(PrimitiveType::Unit), span()),
+            typed_node(sink_decl, Type::Primitive(PrimitiveType::Unit), span()),
+            typed_node(
+                TypedDeclaration::Function(render_view_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        span: span(),
+        source_files: vec![],
+        type_registry: TypeRegistry::new(),
+    };
+
+    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    let type_registry = Arc::new(TypeRegistry::new());
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("blinc_shape");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+    let module = ctx
+        .lower_program(&mut program)
+        .expect("lower Blinc-shape program");
+    std::env::remove_var("SKIP_TYPE_CHECK");
+
+    let names: Vec<String> = module
+        .functions
+        .values()
+        .filter_map(|f| f.name.resolve_global())
+        .collect();
+    let has_render_view = names.iter().any(|n| n == "render_view");
+    let has_lambda = names.iter().any(|n| n.starts_with("__lambda_"));
+
+    assert!(
+        has_render_view,
+        "render_view missing from lowered module. functions present: {:?}",
+        names
+    );
+    assert!(
+        has_lambda,
+        "__lambda_* missing from lowered module. functions present: {:?}",
+        names
+    );
+}
+
 #[test]
 fn expression_bodied_closure_emits_call_to_extern() {
     let mut arena = AstArena::new();
