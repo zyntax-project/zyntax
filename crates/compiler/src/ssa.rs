@@ -43,6 +43,32 @@ const INTERNAL_RENDER_EVENT_ALIAS: &str = "__internal_render_event";
 const INTERNAL_STREAM_EVENT_ALIAS: &str = "__internal_stream_event";
 
 /// SSA builder state
+/// Look up an entry in `function_symbols` by the resolved-string
+/// form of its `InternedString` key. Used as a fallback when the
+/// direct InternedString lookup misses because two `InternedString`
+/// instances carry the same underlying global string but compare
+/// unequal at the `IndexMap` key level (different interner arenas).
+///
+/// O(N) in the map size; only called on the call-resolution
+/// fall-through path after the direct lookup has already missed,
+/// so the cost is amortised against the much rarer Indirect
+/// fallback.
+fn lookup_by_resolved_name(map: &IndexMap<InternedString, HirId>, target: &str) -> Option<HirId> {
+    map.iter()
+        .find(|(k, _)| k.resolve_global().as_deref() == Some(target))
+        .map(|(_, v)| *v)
+}
+
+/// Same shape for `extern_link_names: IndexMap<InternedString, String>`.
+fn lookup_link_by_resolved_name(
+    map: &IndexMap<InternedString, String>,
+    target: &str,
+) -> Option<String> {
+    map.iter()
+        .find(|(k, _)| k.resolve_global().as_deref() == Some(target))
+        .map(|(_, v)| v.clone())
+}
+
 /// A type-appropriate zero `HirConstant` for a given `HirType`.
 ///
 /// Used by the lambda-body translator when a block-bodied closure has
@@ -3425,17 +3451,68 @@ impl SsaBuilder {
                                 None,
                                 Some(*func_name),
                             )
+                        } else if let Some(func_id) =
+                            lookup_by_resolved_name(&self.function_symbols, &name_str)
+                        {
+                            // Fallback: the callee's `InternedString`
+                            // didn't match any registered key directly,
+                            // but two `InternedString`s carrying the
+                            // same underlying global string can exist
+                            // when different parts of the pipeline
+                            // intern through different arenas. The
+                            // Blinc layer-4 path (lambda body produced
+                            // by `resolve_signal_calls`) hit this when
+                            // the rewritten `Variable("__signal_set_i32")`
+                            // had a different InternedString instance
+                            // than the same name in `function_symbols`.
+                            // String-equality fallback resolves it.
+                            log::debug!(
+                                "[SSA] Resolved Function call '{}' via name fallback \
+                                 (direct InternedString lookup missed; same string)",
+                                name_str,
+                            );
+                            (
+                                crate::hir::HirCallable::Function(func_id),
+                                None,
+                                Some(*func_name),
+                            )
+                        } else if let Some(link_name) =
+                            lookup_link_by_resolved_name(&self.extern_link_names, &name_str)
+                        {
+                            log::debug!(
+                                "[SSA] Resolved extern call '{}' -> '{}' via name fallback",
+                                name_str,
+                                link_name,
+                            );
+                            (
+                                crate::hir::HirCallable::Symbol(link_name),
+                                None,
+                                Some(*func_name),
+                            )
                         } else {
-                            // Debug: Log what we're looking for and what's available
-                            if !self.extern_link_names.is_empty() {
-                                let available: Vec<_> = self
-                                    .extern_link_names
-                                    .keys()
-                                    .filter_map(|k| k.resolve_global())
-                                    .collect();
-                                log::debug!("[SSA] Function '{}' not in extern_link_names ({} entries). Sample: {:?}",
-                                name_str, self.extern_link_names.len(), &available[..available.len().min(10)]);
-                            }
+                            // Debug: log every dimension of the miss so
+                            // Blinc-side / similar embedders can pinpoint
+                            // why a known function isn't resolving.
+                            let fs_keys: Vec<String> = self
+                                .function_symbols
+                                .keys()
+                                .filter_map(|k| k.resolve_global())
+                                .collect();
+                            let extern_keys: Vec<String> = self
+                                .extern_link_names
+                                .keys()
+                                .filter_map(|k| k.resolve_global())
+                                .collect();
+                            log::debug!(
+                                "[SSA] Indirect fallback for callee '{}': \
+                                 function_symbols has {} entries (sample: {:?}), \
+                                 extern_link_names has {} entries (sample: {:?})",
+                                name_str,
+                                fs_keys.len(),
+                                &fs_keys[..fs_keys.len().min(8)],
+                                extern_keys.len(),
+                                &extern_keys[..extern_keys.len().min(8)],
+                            );
                             // Variable lookup (function pointer)
                             let callee_val = self.translate_expression(block_id, callee)?;
                             (
@@ -8538,9 +8615,7 @@ impl SsaBuilder {
                     // exactly the path the Blinc-side `count.set(...)`
                     // pattern hit (see ZYNTAX_LAMBDA_BODY_BUG.md
                     // "Update — what Blinc should do next" section).
-                    if let Some(outer_typed_ast_ty) =
-                        saved_var_typed_ast_types.get(name).cloned()
-                    {
+                    if let Some(outer_typed_ast_ty) = saved_var_typed_ast_types.get(name).cloned() {
                         self.var_typed_ast_types.insert(*name, outer_typed_ast_ty);
                     }
                 }

@@ -22,7 +22,7 @@
 use std::sync::{Arc, Mutex};
 
 use zyntax_compiler::{
-    hir::HirInstruction,
+    hir::{HirCallable, HirInstruction},
     lowering::{AstLowering, LoweringConfig, LoweringContext},
 };
 use zyntax_typed_ast::{
@@ -458,6 +458,169 @@ fn lambda_as_call_arg_with_capture_survives() {
         "__lambda_* missing from lowered module. functions present: {:?}",
         names
     );
+
+    // Blinc layer-4 regression check: inside the lambda body, the
+    // call to `sink` (a known extern) should lower as
+    // `HirCallable::Symbol` or `Function`, NOT `Indirect`. An
+    // `Indirect` here means the lambda-body translator failed to
+    // resolve the extern through `function_symbols` /
+    // `extern_link_names` the same way the outer translator does,
+    // which downstream surfaces as the Cranelift "function pointer
+    // not in value_map" error Blinc-side.
+    let lambda_fn = module
+        .functions
+        .values()
+        .find(|f| {
+            f.name
+                .resolve_global()
+                .as_deref()
+                .map(|n| n.starts_with("__lambda_"))
+                .unwrap_or(false)
+        })
+        .expect("lambda function present");
+    for block in lambda_fn.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Call { callee, .. } = inst {
+                if let HirCallable::Indirect(value_id) = callee {
+                    panic!(
+                        "Lambda body's call lowered as \
+                         HirCallable::Indirect({:?}), but `sink` is \
+                         a known extern function. function_symbols / \
+                         extern_link_names should resolve it as Symbol \
+                         the same way the outer scope does.",
+                        value_id
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Blinc layer-4 specific repro: a function that calls an extern
+/// in BOTH its outer body AND inside a nested lambda. The outer
+/// call should lower as `HirCallable::Symbol`/`Function`; the
+/// Blinc-reported bug is that the inner (lambda-body) call
+/// lowered as `HirCallable::Indirect` because the function-symbol
+/// resolution path didn't fire.
+///
+/// If this test ever fails, the bug has reproduced — share the
+/// failing call's lower output with the dump from Blinc.
+#[test]
+fn lambda_body_extern_call_resolves_same_as_outer() {
+    let mut arena = AstArena::new();
+    let sink_decl = make_extern_sink(&mut arena);
+
+    // Outer fn body:
+    //   let _x = sink(10)                    ;; outer call, should be Symbol
+    //   let f = def(): sink(20)              ;; inner call, ALSO should be Symbol
+    //   return 0
+    let outer_sink_call = call_sink(&mut arena, 10);
+    let inner_sink_call = call_sink(&mut arena, 20);
+    let x_name = arena.intern_string("_x");
+    let let_outer_call = typed_node(
+        TypedStatement::Let(TypedLet {
+            name: x_name,
+            ty: Type::Primitive(PrimitiveType::I32),
+            mutability: zyntax_typed_ast::Mutability::Immutable,
+            initializer: Some(Box::new(outer_sink_call)),
+            span: span(),
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    let lambda_body = TypedLambdaBody::Expression(Box::new(inner_sink_call));
+    let let_closure = let_f_eq_closure(&mut arena, lambda_body);
+
+    let main_name = arena.intern_string("main");
+    let mut main_fn = TypedFunction::default();
+    main_fn.name = main_name;
+    main_fn.return_type = Type::Primitive(PrimitiveType::I32);
+    main_fn.body = Some(TypedBlock {
+        statements: vec![let_outer_call, let_closure, return_zero()],
+        span: span(),
+    });
+
+    let mut program = TypedProgram {
+        declarations: vec![
+            typed_node(sink_decl, Type::Primitive(PrimitiveType::Unit), span()),
+            typed_node(
+                TypedDeclaration::Function(main_fn),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            ),
+        ],
+        span: span(),
+        source_files: vec![],
+        type_registry: TypeRegistry::new(),
+    };
+
+    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    let type_registry = Arc::new(TypeRegistry::new());
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("layer4_repro");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+    let module = ctx
+        .lower_program(&mut program)
+        .expect("lower outer + inner extern-call program");
+    std::env::remove_var("SKIP_TYPE_CHECK");
+
+    // Find both main and the lambda; check the callee variant in
+    // each. If the outer resolves Symbol but inner resolves
+    // Indirect, the Blinc-reported regression has reproduced.
+    let main_fn_hir = module
+        .functions
+        .values()
+        .find(|f| f.name.resolve_global().as_deref() == Some("main"))
+        .expect("main present");
+    let lambda_fn = module
+        .functions
+        .values()
+        .find(|f| {
+            f.name
+                .resolve_global()
+                .as_deref()
+                .map(|n| n.starts_with("__lambda_"))
+                .unwrap_or(false)
+        })
+        .expect("lambda present");
+
+    fn callee_kinds(func: &zyntax_compiler::hir::HirFunction) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for block in func.blocks.values() {
+            for inst in &block.instructions {
+                if let HirInstruction::Call { callee, .. } = inst {
+                    out.push(match callee {
+                        HirCallable::Symbol(_) => "Symbol",
+                        HirCallable::Function(_) => "Function",
+                        HirCallable::Indirect(_) => "Indirect",
+                        HirCallable::Intrinsic(_) => "Intrinsic",
+                        HirCallable::FuncRef(_) => "FuncRef",
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    let outer_kinds = callee_kinds(main_fn_hir);
+    let inner_kinds = callee_kinds(lambda_fn);
+    assert!(
+        outer_kinds
+            .iter()
+            .any(|k| *k == "Symbol" || *k == "Function"),
+        "outer call to `sink` should resolve as Symbol/Function. Got: {:?}",
+        outer_kinds,
+    );
+    assert!(
+        !inner_kinds.iter().any(|k| *k == "Indirect"),
+        "lambda body's call to `sink` lowered as Indirect, but outer \
+         resolves it as Symbol/Function. This is the Blinc layer-4 \
+         regression. Outer: {:?}, Inner: {:?}",
+        outer_kinds,
+        inner_kinds,
+    );
 }
 
 /// Reproduces the Blinc-side bug per ZYNTAX_LAMBDA_BODY_BUG.md
@@ -601,6 +764,34 @@ fn expression_bodied_closure_emits_call_to_extern() {
             .map(std::mem::discriminant)
             .collect::<Vec<_>>(),
     );
+
+    // Stronger assertion (Blinc layer-4 regression): the call to
+    // `sink` should lower as `HirCallable::Symbol` or
+    // `HirCallable::Function`, NOT `Indirect`. The latter would
+    // mean the lambda-body translator failed to resolve `sink`
+    // through `function_symbols` / `extern_link_names` the same
+    // way the outer translator does — leading to the Cranelift
+    // "function pointer not in value_map" error Blinc-side.
+    for inst in &entry.instructions {
+        if let HirInstruction::Call { callee, .. } = inst {
+            match callee {
+                HirCallable::Symbol(_) | HirCallable::Function(_) => {
+                    // Direct call — what we expect.
+                }
+                HirCallable::Indirect(_) => {
+                    panic!(
+                        "Lambda body's call to `sink` lowered as \
+                         HirCallable::Indirect, but `sink` is a known \
+                         extern function and the outer translator \
+                         resolves it as Symbol. This is the Blinc \
+                         layer-4 regression: function-name resolution \
+                         doesn't work inside lambda bodies."
+                    );
+                }
+                other => panic!("unexpected callee variant: {:?}", other),
+            }
+        }
+    }
 }
 
 #[test]

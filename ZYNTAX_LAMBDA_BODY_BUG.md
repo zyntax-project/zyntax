@@ -569,3 +569,69 @@ the cascade panic (only one non-extern function — `render_view` — so
 the Err is returned, no next-iter `FunctionBuilder::new`); but it
 will still skip the lambda function and so leave `render_main` with
 a no-op closure.
+
+---
+
+## Update — 2026-05-12 (layer 4 response): InternedString-mismatch fallback + diagnostics
+
+### Synthetic shape doesn't reproduce
+
+Wrote three new layer-4 tests in
+`closure_body_lowering_tests.rs`:
+
+- `expression_bodied_closure_emits_call_to_extern` (tightened) —
+  asserts the inner Call lowers as Symbol/Function, NOT Indirect.
+- `lambda_as_call_arg_with_capture_survives` (tightened) — same
+  shape with a captured outer var; same assertion.
+- `lambda_body_extern_call_resolves_same_as_outer` (new) — outer
+  AND inner call the same extern; asserts both resolve the same
+  way.
+
+**All three pass on the current local checkout.** So my synthetic
+TypedAST doesn't reproduce Blinc's layer-4 symptom. The most
+likely difference: the `InternedString` instance Blinc's
+`resolve_signal_calls` produces for the rewritten
+`Variable("__signal_set_i32")` callee compares unequal to the
+matching key in `function_symbols` / `extern_link_names`, even
+though both `resolve_global()` to the same string. Different
+interner arenas → different `InternedString` handles → `IndexMap`
+lookup misses.
+
+### Defensive fix
+
+Added a string-name fallback to `translate_expression`'s Call
+resolution path in `ssa.rs:3409–3500`:
+
+1. Direct `InternedString` lookup in `function_symbols` (existing).
+2. Direct `InternedString` lookup in `extern_link_names` (existing).
+3. **NEW**: walk `function_symbols.iter()`, match by
+   `key.resolve_global() == name_str`. O(N), only runs after the
+   fast lookups miss.
+4. **NEW**: same fallback for `extern_link_names`.
+5. Only after all four miss does the resolution fall through to
+   `HirCallable::Indirect`. The miss site now logs the full
+   `function_symbols` + `extern_link_names` key list (resolved
+   strings) at `debug!` so the failure mode is observable.
+
+Two small helpers (`lookup_by_resolved_name`,
+`lookup_link_by_resolved_name`) at the top of the file
+encapsulate the string-equality walk.
+
+This should silently fix Blinc's case if my InternedString-mismatch
+theory is right. If the bug persists, the new debug log will
+print exactly which keys are available vs the name being looked
+up — that'll narrow it to the real cause.
+
+### What Blinc should do next
+
+Re-run with `RUST_LOG=zyntax_compiler::ssa=debug` against the
+latest checkout. Either:
+
+1. **The closure body compiles cleanly** — the fallback caught the
+   InternedString mismatch and resolved the externs as Symbol /
+   Function. The Cranelift `value_map` error goes away.
+2. **The Indirect fallback still fires** — the debug log will
+   show `function_symbols` keys + the name being looked up.
+   Share that log; we'll see if the name truly isn't in either
+   map (a different bug), or if some shape escapes both
+   fallbacks.
