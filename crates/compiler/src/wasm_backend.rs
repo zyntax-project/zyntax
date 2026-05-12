@@ -21,8 +21,12 @@
 //!   stronger `validate_full()` (gated on `cfg(test)`) runs the
 //!   full wasmparser pipeline.
 //!
-//! Initial scope: primitive i64/f64 arithmetic + immediate return.
-//! Control flow, structs, calls, effects all stub out to a clear
+//! Current coverage: primitive i64/f64 arithmetic; multi-block
+//! control flow (`Return` / `Branch` / `CondBranch`) lowered via a
+//! universal dispatch-loop pattern; phi nodes resolved out-of-SSA
+//! via predecessor-edge moves (`local.set` on the matching incoming
+//! value before `br` to the loop header). Structs, calls, effects,
+//! `Switch`, and inter-phi cycles still stub out to a clear
 //! `WasmEmitError::Unsupported`. The emitter is intentionally
 //! conservative — any HIR shape it can't handle bails so the
 //! interpreter keeps that function in BC.
@@ -205,6 +209,11 @@ struct FunctionEmitter<'a> {
 /// dispatch-loop lowering. `None` in single-block functions — the
 /// terminator never `br`s, only `return`s.
 struct DispatchCtx<'b> {
+    /// HIR block id of the predecessor whose terminator is being
+    /// emitted. Phi resolution needs this to pick the right
+    /// incoming edge — each `HirPhi.incoming` is a list of
+    /// `(value, predecessor_block_id)` pairs.
+    from_block: HirId,
     /// Local index of the i32 "next block" dispatch variable.
     next_block_local: u32,
     /// Relative depth from the terminator's emission site outward
@@ -326,10 +335,27 @@ impl<'a> FunctionEmitter<'a> {
                 }
                 HirValueKind::Parameter(_) => { /* already mapped */ }
                 _ => {
-                    // Globals / phis / etc. unsupported in this
-                    // initial slice; the use site will hit
-                    // UnknownValue and bail.
+                    // Globals / etc. unsupported in this initial
+                    // slice; the use site will hit UnknownValue and
+                    // bail.
                 }
+            }
+        }
+
+        // Phi-result locals. Each `HirBlock::phis[i].result` carries
+        // an SSA value-id and a type; emit a local of that type so
+        // predecessor-edge moves (Phase E.3.1 out-of-SSA lowering)
+        // have a single destination they can `local.set` regardless
+        // of which incoming edge fires.
+        for block in self.func.blocks.values() {
+            for phi in &block.phis {
+                if self.local_map.contains_key(&phi.result) {
+                    continue;
+                }
+                let ty = lower_type(&phi.ty)?;
+                let local_idx = self.n_params + self.locals.len() as u32;
+                self.local_map.insert(phi.result, local_idx);
+                self.locals.push(ty);
             }
         }
         Ok(())
@@ -412,14 +438,26 @@ impl<'a> FunctionEmitter<'a> {
     }
 
     fn emit_multi_block(&mut self, out: &mut Vec<WasmInst<'static>>) -> Result<()> {
-        // Reject phis up front — see the docstring on `emit_body`.
+        // Inter-phi conflict check: if a phi's incoming value is
+        // another phi's result in the SAME block, we'd need parallel-
+        // copy resolution (with temporaries) to avoid stomping on the
+        // value before reading it. Bail rather than emit incorrect
+        // code — production HIR from `SsaBuilder` doesn't produce
+        // these shapes for the loops we care about; if it ever does,
+        // a follow-up can implement the parallel-copy split.
         for block in self.func.blocks.values() {
-            if !block.phis.is_empty() {
-                return Err(WasmEmitError::Unsupported(format!(
-                    "phi nodes (block {:?} has {} phis)",
-                    block.id,
-                    block.phis.len()
-                )));
+            let phi_results: std::collections::HashSet<HirId> =
+                block.phis.iter().map(|p| p.result).collect();
+            for phi in &block.phis {
+                for (val, _pred) in &phi.incoming {
+                    if phi_results.contains(val) {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "phi cycle in block {:?}: phi result {:?} \
+                             references another phi in the same block",
+                            block.id, phi.result
+                        )));
+                    }
+                }
             }
         }
 
@@ -517,6 +555,7 @@ impl<'a> FunctionEmitter<'a> {
             let outer_blocks_remaining = (n_blocks as usize) - depth_from_inside - 1;
             let loop_depth = outer_blocks_remaining as u32;
             let dispatch_ctx = DispatchCtx {
+                from_block: *block_id,
                 next_block_local,
                 loop_depth,
                 block_indices: &block_indices,
@@ -626,9 +665,12 @@ impl<'a> FunctionEmitter<'a> {
                             .into(),
                     )
                 })?;
-                // Set `$next = target_idx` then `br` to the loop
-                // header so the next iteration's `br_table` lands
-                // us in the target block.
+                // Out-of-SSA: write each of `target`'s phi results
+                // BEFORE we jump, so the destination block sees the
+                // value matching the edge we came from. Then set
+                // `$next = target_idx; br loop_depth` so the next
+                // dispatch iteration enters the target block.
+                self.emit_phi_moves(out, *target, ctx.from_block)?;
                 let idx = *ctx
                     .block_indices
                     .get(target)
@@ -664,10 +706,16 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(self.local_get(*condition)?);
                 out.push(WasmInst::I32WrapI64);
                 out.push(WasmInst::If(wasm_encoder::BlockType::Empty));
+                // True arm: phi moves for `true_target` from this
+                // predecessor, then dispatch.
+                self.emit_phi_moves(out, *true_target, ctx.from_block)?;
                 out.push(WasmInst::I32Const(true_idx as i32));
                 out.push(WasmInst::LocalSet(ctx.next_block_local));
                 out.push(WasmInst::Br(ctx.loop_depth + 1));
                 out.push(WasmInst::Else);
+                // False arm: phi moves for `false_target` from this
+                // predecessor, then dispatch.
+                self.emit_phi_moves(out, *false_target, ctx.from_block)?;
                 out.push(WasmInst::I32Const(false_idx as i32));
                 out.push(WasmInst::LocalSet(ctx.next_block_local));
                 out.push(WasmInst::Br(ctx.loop_depth + 1));
@@ -695,6 +743,53 @@ impl<'a> FunctionEmitter<'a> {
             .get(&id)
             .ok_or(WasmEmitError::UnknownValue(id))?;
         Ok(WasmInst::LocalSet(idx))
+    }
+
+    /// Emit `local.set` moves for each phi in `target` block whose
+    /// incoming edge matches `from_block`. This is the out-of-SSA
+    /// step — the wasm-side equivalent of inserting predecessor-edge
+    /// copies. Each phi result has a pre-allocated local; the
+    /// matching incoming value's local is `local.get`'d and pushed
+    /// into the result local right before the `br` to the dispatch
+    /// loop.
+    ///
+    /// If a phi has no incoming edge from `from_block` (shouldn't
+    /// happen for well-formed SSA but defensive) the phi is left
+    /// unchanged on this edge.
+    ///
+    /// Phi cycles (one phi's result referenced by another phi's
+    /// incoming in the same target) are rejected by
+    /// `emit_multi_block`'s up-front check, so this loop emits the
+    /// moves in declaration order without parallel-copy resolution.
+    fn emit_phi_moves(
+        &self,
+        out: &mut Vec<WasmInst<'static>>,
+        target: HirId,
+        from_block: HirId,
+    ) -> Result<()> {
+        let block = self
+            .func
+            .blocks
+            .get(&target)
+            .ok_or(WasmEmitError::UnknownValue(target))?;
+        for phi in &block.phis {
+            let incoming_val = phi.incoming.iter().find_map(|(value, pred)| {
+                if *pred == from_block {
+                    Some(*value)
+                } else {
+                    None
+                }
+            });
+            if let Some(value_id) = incoming_val {
+                let dst = *self
+                    .local_map
+                    .get(&phi.result)
+                    .ok_or(WasmEmitError::UnknownValue(phi.result))?;
+                out.push(self.local_get(value_id)?);
+                out.push(WasmInst::LocalSet(dst));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1031,11 +1126,118 @@ mod tests {
         m.validate_full().expect("module structurally valid");
     }
 
-    /// A phi node in any block still bails — out-of-SSA conversion
-    /// (Phase E.3.1) hasn't landed yet. Asserting the bail path
-    /// keeps the interpreter-fallback contract documented in code.
+    /// `def pick_phi(cond: bool): i64 {
+    ///     bb_entry: if cond -> bb_then; else -> bb_else
+    ///     bb_then:  Branch bb_join (phi.incoming += (one, bb_then))
+    ///     bb_else:  Branch bb_join (phi.incoming += (two, bb_else))
+    ///     bb_join:  result = phi(bb_then -> one, bb_else -> two); return result
+    /// }`
+    ///
+    /// Tests out-of-SSA lowering: the join block's phi result must be
+    /// written by predecessor-edge moves (`local.set` before the
+    /// `br`) so the destination block reads the value matching the
+    /// edge we came from.
     #[test]
-    fn phi_node_block_bails_cleanly() {
+    fn emits_phi_at_join_block_via_predecessor_edge_moves() {
+        use crate::hir::HirPhi;
+        let cond_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: cond_id,
+                name: InternedString::new_global("cond"),
+                ty: HirType::Bool,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("pick_phi"), sig);
+        func.values.insert(
+            cond_id,
+            HirValue {
+                id: cond_id,
+                ty: HirType::Bool,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let one = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(1)),
+        );
+        let two = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(2)),
+        );
+        let phi_result = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+
+        let then_id = HirId::new();
+        let else_id = HirId::new();
+        let join_id = HirId::new();
+        add_block(
+            &mut func,
+            then_id,
+            Vec::new(),
+            HirTerminator::Branch { target: join_id },
+        );
+        add_block(
+            &mut func,
+            else_id,
+            Vec::new(),
+            HirTerminator::Branch { target: join_id },
+        );
+        // Join block carries the phi.
+        let mut join_block = crate::hir::HirBlock {
+            id: join_id,
+            label: None,
+            phis: vec![HirPhi {
+                result: phi_result,
+                ty: HirType::I64,
+                incoming: vec![(one, then_id), (two, else_id)],
+            }],
+            instructions: Vec::new(),
+            terminator: HirTerminator::Return {
+                values: vec![phi_result],
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        };
+        // Insert join block.
+        func.blocks.insert(join_id, join_block.clone());
+        // Suppress unused-mut warning in some compilers.
+        let _ = &mut join_block;
+
+        // Entry CondBranch.
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.terminator = HirTerminator::CondBranch {
+            condition: cond_id,
+            true_target: then_id,
+            false_target: else_id,
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit phi-join function");
+        m.validate_full().expect("module structurally valid");
+    }
+
+    /// Inter-phi cycle (one phi's result feeds another phi's
+    /// incoming in the SAME block) still bails — that case needs
+    /// parallel-copy resolution with temporaries and isn't
+    /// implemented. The bail keeps the interpreter-fallback contract
+    /// documented in code.
+    #[test]
+    fn phi_cycle_bails_cleanly() {
         use crate::hir::HirPhi;
         let sig = HirFunctionSignature {
             params: vec![],
@@ -1048,36 +1250,61 @@ mod tests {
             effects: vec![],
             is_pure: false,
         };
-        let mut func = HirFunction::new(InternedString::new_global("withphi"), sig);
-        let phi_id = HirId::new();
-        // Inject a phi into the entry block.
-        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
-        entry.phis.push(HirPhi {
-            result: phi_id,
-            ty: HirType::I64,
-            incoming: Vec::new(),
-        });
-        entry.terminator = HirTerminator::Return { values: vec![] };
-        // Add a second block so we hit `emit_multi_block` (single
-        // block also rejects phis via the `if blocks.len() == 1`
-        // path, but the multi-block check is the one we want to
-        // exercise here).
-        let b = HirId::new();
+        let mut func = HirFunction::new(InternedString::new_global("phi_cycle"), sig);
+        let one = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(1)),
+        );
+        let pred = HirId::new();
         add_block(
             &mut func,
-            b,
+            pred,
             Vec::new(),
-            HirTerminator::Return { values: vec![] },
+            HirTerminator::Return { values: vec![one] },
         );
+
+        let phi_a = HirId::new();
+        let phi_b = HirId::new();
+        let join_id = HirId::new();
+        let join_block = crate::hir::HirBlock {
+            id: join_id,
+            label: None,
+            phis: vec![
+                HirPhi {
+                    result: phi_a,
+                    ty: HirType::I64,
+                    // phi_a's incoming references phi_b's result —
+                    // forms a cycle.
+                    incoming: vec![(phi_b, pred)],
+                },
+                HirPhi {
+                    result: phi_b,
+                    ty: HirType::I64,
+                    incoming: vec![(one, pred)],
+                },
+            ],
+            instructions: Vec::new(),
+            terminator: HirTerminator::Return {
+                values: vec![phi_a],
+            },
+            dominance_frontier: HashSet::new(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        };
+        func.blocks.insert(join_id, join_block);
+
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.terminator = HirTerminator::Branch { target: join_id };
 
         match WasmBackend::new().compile_function(&func) {
             Err(WasmEmitError::Unsupported(msg)) => {
                 assert!(
-                    msg.contains("phi"),
-                    "expected phi-related Unsupported, got: {msg}"
+                    msg.contains("phi cycle"),
+                    "expected phi-cycle bail, got: {msg}"
                 );
             }
-            other => panic!("expected Unsupported, got {:?}", other),
+            other => panic!("expected Unsupported(phi cycle), got {:?}", other),
         }
     }
 }
