@@ -1,0 +1,20 @@
+{
+    "name": "zyntax-wasm",
+    "version": "0.1.0",
+    "description": "Browser/Node.js shim over the Zyntax interpreter (wasm32 build).",
+    "type": "module",
+    "scripts": {
+        "build:node": "./build.sh node",
+        "build:web": "./build.sh web",
+        "build": "./build.sh both",
+        "test": "node test/node_smoke.mjs",
+        "test:build": "./build.sh node && node test/node_smoke.mjs"
+    },
+    "files": [
+        "web/",
+        "pkg-web/",
+        "pkg-node/"
+    ],
+    "license": "Apache-2.0",
+    "private": true
+}

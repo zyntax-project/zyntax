@@ -113,65 +113,81 @@ impl Grammar2 {
     ) -> Grammar2Result<TypedProgram> {
         use zyntax_typed_ast::source::SourceFile;
 
-        const PARSE_STACK_SIZE_BYTES: usize = 64 * 1024 * 1024;
-
         let grammar = Arc::clone(&self.grammar);
         let source_owned = source.to_string();
         let filename_owned = filename.to_string();
 
-        let handle = std::thread::Builder::new()
-            .name("grammar2-parse".to_string())
-            .stack_size(PARSE_STACK_SIZE_BYTES)
-            .spawn(move || {
-                let interpreter = GrammarInterpreter::new(&grammar);
+        // Native: parse on a worker thread with a 64 MiB stack so deeply
+        // recursive grammars (e.g. expression precedence chains) don't
+        // smash the default 8 MiB main-thread stack.
+        //
+        // wasm32: `std::thread::spawn` returns "operation not supported
+        // on this platform" — single-threaded environment. The
+        // interpreter's recursion fits in the host's stack budget for
+        // the demo programs the wasm shim runs, and there's no
+        // configurable stack-size knob in browser JS engines anyway.
+        // Run inline.
+        let parse_inline = move || -> Grammar2Result<TypedProgram> {
+            let interpreter = GrammarInterpreter::new(&grammar);
 
-                let mut builder = TypedASTBuilder::new();
-                let mut registry = TypeRegistry::new();
-                let mut state = ParserState::new(&source_owned, &mut builder, &mut registry);
+            let mut builder = TypedASTBuilder::new();
+            let mut registry = TypeRegistry::new();
+            let mut state = ParserState::new(&source_owned, &mut builder, &mut registry);
 
-                // Parse from the entry rule
-                let result = interpreter.parse(&mut state);
+            let result = interpreter.parse(&mut state);
 
-                match result {
-                    ParseResult::Success(ParsedValue::Program(mut program), _) => {
-                        // Add source file for diagnostics
-                        program.source_files = vec![SourceFile::new(
-                            filename_owned.clone(),
-                            source_owned.clone(),
-                        )];
-                        Ok(*program)
-                    }
-                    ParseResult::Success(other, _) => {
-                        // If we get something other than a program, wrap it
-                        eprintln!(
-                            "[Grammar2] Warning: parse returned {:?}, expected Program",
-                            std::mem::discriminant(&other)
-                        );
-                        Err(Grammar2Error::UnexpectedResult)
-                    }
-                    ParseResult::Failure(e) => Err(Grammar2Error::SourceParseError(format!(
-                        "Parse error at {}:{}: expected {:?}",
-                        e.line, e.column, e.expected
-                    ))),
+            match result {
+                ParseResult::Success(ParsedValue::Program(mut program), _) => {
+                    program.source_files = vec![SourceFile::new(
+                        filename_owned.clone(),
+                        source_owned.clone(),
+                    )];
+                    Ok(*program)
                 }
-            })
-            .map_err(|e| {
-                Grammar2Error::SourceParseError(format!("Failed to spawn parser thread: {}", e))
-            })?;
+                ParseResult::Success(other, _) => {
+                    eprintln!(
+                        "[Grammar2] Warning: parse returned {:?}, expected Program",
+                        std::mem::discriminant(&other)
+                    );
+                    Err(Grammar2Error::UnexpectedResult)
+                }
+                ParseResult::Failure(e) => Err(Grammar2Error::SourceParseError(format!(
+                    "Parse error at {}:{}: expected {:?}",
+                    e.line, e.column, e.expected
+                ))),
+            }
+        };
 
-        handle.join().map_err(|panic_payload| {
-            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic payload".to_string()
-            };
-            Grammar2Error::SourceParseError(format!(
-                "Grammar2 parser thread panicked: {}",
-                panic_msg
-            ))
-        })?
+        #[cfg(target_arch = "wasm32")]
+        {
+            parse_inline()
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            const PARSE_STACK_SIZE_BYTES: usize = 64 * 1024 * 1024;
+            let handle = std::thread::Builder::new()
+                .name("grammar2-parse".to_string())
+                .stack_size(PARSE_STACK_SIZE_BYTES)
+                .spawn(parse_inline)
+                .map_err(|e| {
+                    Grammar2Error::SourceParseError(format!("Failed to spawn parser thread: {}", e))
+                })?;
+
+            handle.join().map_err(|panic_payload| {
+                let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                Grammar2Error::SourceParseError(format!(
+                    "Grammar2 parser thread panicked: {}",
+                    panic_msg
+                ))
+            })?
+        }
     }
 
     /// Parse source code with plugin signatures (for proper extern declarations)

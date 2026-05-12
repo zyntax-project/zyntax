@@ -1,0 +1,10 @@
+# Bump the wasm linear-memory stack to 16 MiB. The Grammar2 parser
+# is deeply recursive (packrat PEG over the ZynML grammar's
+# expression-precedence chain) and the LLVM lld-wasm default of 1
+# MiB blows out on real source — surfaces as `RuntimeError:
+# unreachable` from a stack-pointer guard in the emitted wasm.
+#
+# Native uses a 64 MiB worker thread (`grammar2.rs`); wasm32 has no
+# threads so we configure the main-stack size at link time instead.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=67108864"]

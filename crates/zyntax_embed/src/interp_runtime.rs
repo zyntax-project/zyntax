@@ -92,20 +92,25 @@ pub struct InterpRuntime {
     /// profile counters, FFI symbol table, and tick callbacks.
     interp: HirInterpreter,
     /// Beadie's multi-tier orchestrator. Owns per-tier brokers and
-    /// per-bead promotion state.
+    /// per-bead promotion state. Native-only: beadie's
+    /// `TieredAdapter::new` eagerly spawns broker worker threads,
+    /// which fails on wasm32 (no threads). On wasm the interpreter
+    /// is the entire execution path — no tier-up infrastructure.
+    #[cfg(feature = "native")]
     tiered: Arc<TieredAdapter>,
     /// Per-function `TieredBound` carrying the bead and per-tier
-    /// queued-state. Indexed by `HirFunction::id`.
+    /// queued-state. Indexed by `HirFunction::id`. Native-only,
+    /// same reasoning as `tiered`.
+    #[cfg(feature = "native")]
     bounds: HashMap<HirId, TieredBound>,
     /// Per-function OSR bead-id, baked into JIT'd code as a constant
     /// so back-edge probes can find the bead. Indexed by
-    /// `HirFunction::id`.
+    /// `HirFunction::id`. Native-only.
+    #[cfg(feature = "native")]
     bead_ids: HashMap<HirId, u64>,
     /// Persisted tier config — populated by `with_threshold` so that
     /// `install_jit` (no-arg) inherits the requested promotion
     /// threshold instead of clobbering it with `TieredConfig::default`.
-    /// Always `Some` on native; `None` on wasm builds where the JIT
-    /// path doesn't exist.
     #[cfg(feature = "native")]
     tier_config: TieredConfig,
 }
@@ -144,25 +149,20 @@ fn default_tier_policies() -> Vec<Box<dyn beadie::HotnessPolicy>> {
     vec![Box::new(ThresholdPolicy::new(warm))]
 }
 
-#[cfg(not(feature = "native"))]
-fn default_tier_policies() -> Vec<Box<dyn beadie::HotnessPolicy>> {
-    // On non-native builds, no JIT tier exists, so any promotion
-    // policy is dead weight. We still register a single never-firing
-    // tier so `TieredAdapter::register` works.
-    vec![Box::new(beadie::ThresholdPolicy::new(u32::MAX))]
-}
-
 impl InterpRuntime {
-    /// Create an empty runtime. Tier policies come from
-    /// [`TieredConfig::default`] on native (warm/hot thresholds from
-    /// `ProfileConfig::default`); on wasm builds the JIT tier never
-    /// fires.
+    /// Create an empty runtime. On native, tier policies come from
+    /// [`TieredConfig::default`] (warm/hot thresholds from
+    /// `ProfileConfig::default`). On wasm there is no JIT tier — the
+    /// interpreter runs everything.
     pub fn new() -> Self {
         Self {
             module: None,
             interp: HirInterpreter::new(),
+            #[cfg(feature = "native")]
             tiered: Arc::new(TieredAdapter::new(default_tier_policies())),
+            #[cfg(feature = "native")]
             bounds: HashMap::new(),
+            #[cfg(feature = "native")]
             bead_ids: HashMap::new(),
             #[cfg(feature = "native")]
             tier_config: TieredConfig::default(),
@@ -241,20 +241,24 @@ impl InterpRuntime {
     /// can resolve back to the bead from a probe site.
     pub fn compile_module(&mut self, module: HirModule) {
         let module = Arc::new(module);
-        self.bounds.clear();
-        self.bead_ids.clear();
-        for func_id in module.functions.keys() {
-            // CoreHandle is `*mut ()`. We use the HirId's address as
-            // an opaque token; beadie stores but never dereferences it.
-            let core_ptr: *mut () = (func_id as *const HirId) as *mut ();
-            let bound = self.tiered.register(core_ptr, None);
-            #[cfg(feature = "native")]
-            {
+        // Beadie bookkeeping is native-only — see field docs on
+        // `tiered`/`bounds`/`bead_ids`. On wasm the interpreter runs
+        // the module directly with no tier-up scaffolding.
+        #[cfg(feature = "native")]
+        {
+            self.bounds.clear();
+            self.bead_ids.clear();
+            for func_id in module.functions.keys() {
+                // CoreHandle is `*mut ()`. We use the HirId's address
+                // as an opaque token; beadie stores but never
+                // dereferences it.
+                let core_ptr: *mut () = (func_id as *const HirId) as *mut ();
+                let bound = self.tiered.register(core_ptr, None);
                 let bead_id = zyntax_compiler::osr::next_bead_id();
                 zyntax_compiler::osr::register_bead(bead_id, Arc::clone(bound.bead()));
                 self.bead_ids.insert(*func_id, bead_id);
+                self.bounds.insert(*func_id, bound);
             }
-            self.bounds.insert(*func_id, bound);
         }
         self.module = Some(module);
     }
@@ -351,6 +355,11 @@ impl InterpRuntime {
     /// `feature = "llvm-backend"`, [`Self::install_llvm_jit`]) which
     /// build the appropriate per-tier dispatch closure for you. This
     /// generic seam is what Phase E plugs the wasm-emitter into.
+    ///
+    /// Native-only — wasm has no JIT tier yet (Phase E hasn't shipped
+    /// the wasm-encoder hot-function path) and `self.tiered`/`bounds`
+    /// don't exist on that target.
+    #[cfg(feature = "native")]
     pub fn set_jit_compiler<F>(&mut self, compile: F)
     where
         F: Fn(usize, HirId) -> Option<(*const u8, u8)> + Send + Sync + Clone + 'static,
@@ -431,6 +440,8 @@ impl InterpRuntime {
 
     /// Expose the bead for a function. Mainly for tests / advanced
     /// callers that want to inspect promotion state directly.
+    /// Native-only — no beadie state exists on wasm.
+    #[cfg(feature = "native")]
     pub fn bead_for(&self, func_id: HirId) -> Option<&Arc<Bead>> {
         self.bounds.get(&func_id).map(|b| b.bead())
     }
@@ -438,6 +449,8 @@ impl InterpRuntime {
     /// Expose the multi-tier `TieredBound` for a function.
     /// `bound.current_tier()` returns the tier the function is
     /// currently running at (`None` while still interpreted).
+    /// Native-only.
+    #[cfg(feature = "native")]
     pub fn bound_for(&self, func_id: HirId) -> Option<&TieredBound> {
         self.bounds.get(&func_id)
     }
@@ -445,9 +458,16 @@ impl InterpRuntime {
     /// All function ids that have a registered bound. Test/diagnostic
     /// hook for callers that need to walk the bound set (since the
     /// runtime doesn't otherwise expose the HirModule's function
-    /// table).
+    /// table). Native-only — wasm returns an empty iterator.
     pub fn registered_function_ids(&self) -> impl Iterator<Item = HirId> + '_ {
-        self.bounds.keys().copied()
+        #[cfg(feature = "native")]
+        {
+            self.bounds.keys().copied()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            std::iter::empty()
+        }
     }
 }
 
