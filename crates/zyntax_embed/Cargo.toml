@@ -15,6 +15,10 @@ categories = ["compilers", "development-tools"]
 zyntax_compiler = { path = "../compiler", default-features = false }
 zyn_peg = { path = "../zyn_peg" }
 zyntax_typed_ast = { path = "../typed_ast" }
+# Phase C: the StaticPlugin accessor type comes from the SDK so the
+# `zrtl_plugin!` macro can hand it back to ZyntaxRuntime without a
+# `dlopen`. Lightweight pure-Rust dep; works on wasm32 too.
+zrtl = { path = "../../sdk/zrtl" }
 pattern_engine = { path = "../pattern_engine" }
 normalization_pass = { path = "../passes/normalization" }
 algebraic_effects_pass = { path = "../passes/algebraic_effects" }

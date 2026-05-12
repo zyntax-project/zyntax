@@ -617,7 +617,20 @@ macro_rules! __fill_param_array {
 
 /// Macro to define a complete ZRTL plugin
 ///
-/// This creates both the symbol table and plugin info exports.
+/// This creates both the symbol table and plugin info exports, plus a
+/// `static_plugin()` accessor for static-linking flows (wasm32 / static
+/// stdlib registration).
+///
+/// On non-wasm32 targets the `#[no_mangle]` exports `_zrtl_info` and
+/// `_zrtl_symbols` are emitted so the legacy `dlopen`-based loader
+/// (see `crates/compiler/src/zrtl.rs`) can find them. On wasm32 those
+/// exports are gated off — there is no dlopen and emitting them once
+/// per linked plugin would collide at link time when more than one
+/// plugin is statically linked into the same wasm module.
+///
+/// The `static_plugin()` accessor is always emitted. It returns a
+/// `StaticPlugin` view over the plugin's name and symbol table that
+/// `ZyntaxRuntime::register_static_plugin` consumes.
 ///
 /// # Example (legacy, no signatures)
 ///
@@ -643,29 +656,104 @@ macro_rules! __fill_param_array {
 ///     ]
 /// }
 /// ```
+///
+/// # Static linking (e.g. wasm32)
+///
+/// ```ignore
+/// // In the host (zyntax_embed-based binary):
+/// runtime.register_static_plugin(zrtl_io::static_plugin());
+/// ```
 #[macro_export]
 macro_rules! zrtl_plugin {
     // New unified syntax that supports both legacy and signature forms
     (name: $name:expr, symbols: [$( ($($entry:tt)*) ),* $(,)?]) => {
-        // Plugin info export
-        #[no_mangle]
-        pub static _zrtl_info: $crate::ZrtlInfo = $crate::ZrtlInfo::new(
-            concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char
-        );
+        /// Symbol table for this plugin. Includes the trailing
+        /// null-name sentinel that the dlopen loader expects.
+        const _ZRTL_PLUGIN_SYMBOLS_LEN: usize = $crate::__count_symbols!($(($($entry)*))*) + 1;
 
-        // Symbol table export - use a static array with C ABI layout
-        // The loader expects *const ZrtlSymbol (a simple pointer to the first element)
-        #[no_mangle]
-        pub static _zrtl_symbols: [$crate::ZrtlSymbol; {
-            // Count symbols + 1 for sentinel
-            $crate::__count_symbols!($(($($entry)*))*)  + 1
-        }] = [
+        /// Symbol table data. Module-private so the cdylib export and
+        /// the static accessor share one source of truth.
+        static _ZRTL_PLUGIN_SYMBOLS: [$crate::ZrtlSymbol; _ZRTL_PLUGIN_SYMBOLS_LEN] = [
             $(
                 $crate::__zrtl_symbol_entry!($($entry)*),
             )*
             $crate::ZrtlSymbol::null(), // Sentinel
         ];
+
+        /// Plugin metadata.
+        static _ZRTL_PLUGIN_INFO: $crate::ZrtlInfo = $crate::ZrtlInfo::new(
+            concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char,
+        );
+
+        // `#[no_mangle]` exports for the dlopen path. Gated off on
+        // wasm32 where there is no dlopen and where multiple plugins
+        // are statically linked into a single module (so the unmangled
+        // names would collide at link time).
+        #[cfg(not(target_arch = "wasm32"))]
+        #[no_mangle]
+        pub static _zrtl_info: $crate::ZrtlInfo = $crate::ZrtlInfo::new(
+            concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char
+        );
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[no_mangle]
+        pub static _zrtl_symbols: [$crate::ZrtlSymbol; _ZRTL_PLUGIN_SYMBOLS_LEN] = [
+            $(
+                $crate::__zrtl_symbol_entry!($($entry)*),
+            )*
+            $crate::ZrtlSymbol::null(),
+        ];
+
+        /// Static accessor for register-without-dlopen flows
+        /// (wasm32, embedded native binaries). Always emitted.
+        pub fn static_plugin() -> $crate::StaticPlugin {
+            // SAFETY: the symbol table ends with a null-name sentinel
+            // entry, matching the contract `StaticPlugin::symbols`
+            // documents. The slice excludes that sentinel.
+            $crate::StaticPlugin {
+                info: &_ZRTL_PLUGIN_INFO,
+                symbols: &_ZRTL_PLUGIN_SYMBOLS[..(_ZRTL_PLUGIN_SYMBOLS_LEN - 1)],
+            }
+        }
     };
+}
+
+/// Host-side view of a statically-linked ZRTL plugin.
+///
+/// Produced by the `zrtl_plugin!` macro's `static_plugin()` accessor.
+/// `ZyntaxRuntime::register_static_plugin` walks `symbols` and forwards
+/// each entry into the runtime's FFI table — same shape as what
+/// `ZrtlPlugin::load` produces after a `dlopen`, but without ever
+/// touching the filesystem or `libloading`.
+///
+/// `symbols` does NOT include the trailing null-name sentinel that the
+/// dlopen path uses to find the end of the table.
+#[derive(Clone, Copy)]
+pub struct StaticPlugin {
+    /// Plugin metadata (name + ZRTL ABI version).
+    pub info: &'static ZrtlInfo,
+    /// Function table. Each entry's `name` is a null-terminated C
+    /// string, `ptr` is the function pointer, `sig` is an optional
+    /// signature for auto-boxing.
+    pub symbols: &'static [ZrtlSymbol],
+}
+
+// SAFETY: `info` and `symbols` are both `&'static`; the underlying
+// statics are themselves Send + Sync (see `ZrtlSymbol`/`ZrtlInfo`).
+unsafe impl Send for StaticPlugin {}
+unsafe impl Sync for StaticPlugin {}
+
+impl StaticPlugin {
+    /// Plugin name, decoded from the `info.name` C string.
+    /// Returns `None` if the string isn't valid UTF-8.
+    pub fn name(&self) -> Option<&'static str> {
+        // SAFETY: `info.name` is constructed by `zrtl_plugin!` from a
+        // `concat!(..., "\0")` literal, which is always
+        // null-terminated valid UTF-8.
+        unsafe { std::ffi::CStr::from_ptr(self.info.name) }
+            .to_str()
+            .ok()
+    }
 }
 
 /// Trait for types that can be registered as ZRTL types

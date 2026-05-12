@@ -108,8 +108,8 @@ pub use array::{ArrayConstPtr, ArrayIterator, ArrayPtr, OwnedArray};
 pub use dynamic_box::{DropFn, DynamicBox};
 pub use generic_box::{GenericBox, GenericTypeArgs, MAX_TYPE_ARGS};
 pub use plugin::{
-    TypeInfo, ZrtlInfo, ZrtlSigFlags, ZrtlSymbol, ZrtlSymbolEntry, ZrtlSymbolSig, ZrtlTyped,
-    MAX_PARAMS, ZRTL_VERSION,
+    StaticPlugin, TypeInfo, ZrtlInfo, ZrtlSigFlags, ZrtlSymbol, ZrtlSymbolEntry, ZrtlSymbolSig,
+    ZrtlTyped, MAX_PARAMS, ZRTL_VERSION,
 };
 pub use string::{OwnedString, StringConstPtr, StringPtr, StringView};
 pub use type_system::{PrimitiveSize, TypeCategory, TypeFlags, TypeTag};
