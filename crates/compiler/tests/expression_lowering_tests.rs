@@ -653,21 +653,23 @@ fn test_matmul_missing_impl_reports_clear_error() {
     let arena = Arc::new(Mutex::new(arena));
     let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
 
+    // Historic behaviour: this lowering was silently swallowed at
+    // `log::trace!` level so the function would disappear from the
+    // HIR module with no surfaced error. That was the mechanism
+    // behind the Blinc `Ok([])` regression — see
+    // ZYNTAX_LAMBDA_BODY_BUG.md. The new policy surfaces real
+    // lowering errors for non-generic functions; this test now
+    // asserts that intent (matching its own name).
     let result = ctx.lower_program(&mut program);
-    assert!(
-        result.is_ok(),
-        "Lowering should complete while skipping invalid functions: {:?}",
-        result.err()
+    let err = result.expect_err(
+        "lowering an unresolvable matmul should fail loudly, not silently drop the function",
     );
-
-    let module = result.unwrap();
-    let matmul_fn_present = module
-        .functions
-        .values()
-        .any(|f| f.name.resolve_global().as_deref() == Some("matmul_missing_impl"));
+    let err_str = format!("{:?}", err);
     assert!(
-        !matmul_fn_present,
-        "Invalid matmul function should be dropped from lowered module"
+        err_str.contains("MatMul")
+            || err_str.contains("matmul")
+            || err_str.contains("matrix multiplication"),
+        "expected the error to identify the missing MatMul impl, got: {err_str}",
     );
 }
 

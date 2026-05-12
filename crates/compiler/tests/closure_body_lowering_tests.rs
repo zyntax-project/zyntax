@@ -460,6 +460,120 @@ fn lambda_as_call_arg_with_capture_survives() {
     );
 }
 
+/// Reproduces the Blinc-side bug per ZYNTAX_LAMBDA_BODY_BUG.md
+/// "Suggested minimum to reproduce in a Zyntax-only test": a
+/// non-extern `render_view` alongside ~20 sibling extern decls
+/// silently drops `render_view` from the lowered HIR module.
+///
+/// Blinc's instrumented diagnostic showed:
+///   typed_program: 20 functions including non-extern `render_view`
+///   after lower_typed_program: 19 functions, all extern,
+///   `render_view` missing.
+///
+/// This test mirrors that mix — one non-extern + 19 externs
+/// covering the union of name shapes Blinc emits (`$Blinc$…`,
+/// `__signal_get_…`, `__set_overlay_…`, etc.).
+#[test]
+fn many_externs_dont_drop_non_extern_render_view() {
+    let mut arena = AstArena::new();
+
+    // 19 externs spanning the name shapes from the bug report.
+    let extern_names = [
+        "__set_overlay_corner_radius__",
+        "__signal_get_i32",
+        "__set_overlay_border_width__",
+        "text",
+        "$Blinc$text",
+        "__set_overlay_border_color__",
+        "__signal_get_string",
+        "__signal_get_f64",
+        "__new_child_list__",
+        "__push_child__",
+        "text_int",
+        "$Blinc$text_int",
+        "__set_overlay_opacity__",
+        "__set_overlay_bg__",
+        "__new_style_overlay__",
+        "__fstring_format__",
+        "$Blinc$format_int",
+        "string_concat",
+        "$Blinc$string_concat",
+    ];
+    let mut decls: Vec<zyntax_typed_ast::TypedNode<TypedDeclaration>> = extern_names
+        .iter()
+        .map(|name| {
+            let n = arena.intern_string(name);
+            let mut f = TypedFunction::default();
+            f.name = n;
+            f.return_type = Type::Primitive(PrimitiveType::I64);
+            f.body = None;
+            f.is_external = true;
+            typed_node(
+                TypedDeclaration::Function(f),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            )
+        })
+        .collect();
+
+    // Non-extern `render_view`. Body just returns 0 — we're testing
+    // whether it SURVIVES lowering, not what it computes.
+    let render_view_name = arena.intern_string("render_view");
+    let mut render_view_fn = TypedFunction::default();
+    render_view_fn.name = render_view_name;
+    render_view_fn.return_type = Type::Primitive(PrimitiveType::I64);
+    render_view_fn.body = Some(TypedBlock {
+        statements: vec![typed_node(
+            TypedStatement::Return(Some(Box::new(typed_node(
+                TypedExpression::Literal(TypedLiteral::Integer(0)),
+                Type::Primitive(PrimitiveType::I64),
+                span(),
+            )))),
+            Type::Primitive(PrimitiveType::Unit),
+            span(),
+        )],
+        span: span(),
+    });
+    decls.push(typed_node(
+        TypedDeclaration::Function(render_view_fn),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    ));
+
+    let mut program = TypedProgram {
+        declarations: decls,
+        span: span(),
+        source_files: vec![],
+        type_registry: TypeRegistry::new(),
+    };
+
+    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    let type_registry = Arc::new(TypeRegistry::new());
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("blinc_repro");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+    let module = ctx
+        .lower_program(&mut program)
+        .expect("lower 20-decl Blinc-shape program");
+    std::env::remove_var("SKIP_TYPE_CHECK");
+
+    let non_extern_names: Vec<String> = module
+        .functions
+        .values()
+        .filter(|f| !f.is_external)
+        .filter_map(|f| f.name.resolve_global())
+        .collect();
+    assert!(
+        non_extern_names.iter().any(|n| n == "render_view"),
+        "render_view dropped from lowered module — repro of the \
+         Blinc bug. Non-extern functions present: {:?}. Total \
+         functions: {}.",
+        non_extern_names,
+        module.functions.len(),
+    );
+}
+
 #[test]
 fn expression_bodied_closure_emits_call_to_extern() {
     let mut arena = AstArena::new();

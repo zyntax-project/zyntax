@@ -215,7 +215,7 @@ fn create_max_function() -> HirFunction {
     let phi = HirPhi {
         result,
         ty: HirType::I32,
-        incoming: vec![(then_block, param_a), (else_block, param_b)],
+        incoming: vec![(param_a, then_block), (param_b, else_block)],
     };
 
     let merge = func.blocks.get_mut(&merge_block).unwrap();
@@ -302,7 +302,7 @@ fn create_abs_function() -> HirFunction {
     let phi = HirPhi {
         result,
         ty: HirType::I32,
-        incoming: vec![(then_block, neg_result), (else_block, param_x)],
+        incoming: vec![(neg_result, then_block), (param_x, else_block)],
     };
 
     let merge = func.blocks.get_mut(&merge_block).unwrap();
@@ -376,7 +376,7 @@ fn create_countdown_function() -> HirFunction {
     let phi = HirPhi {
         result: n_phi,
         ty: HirType::I32,
-        incoming: vec![(entry_block, param_n), (loop_body, n_minus_1)],
+        incoming: vec![(param_n, entry_block), (n_minus_1, loop_body)],
     };
 
     let cmp_inst = HirInstruction::Binary {
@@ -485,13 +485,13 @@ fn create_factorial_function() -> HirFunction {
     let i_phi_node = HirPhi {
         result: i_phi,
         ty: HirType::I32,
-        incoming: vec![(entry_block, one), (loop_body, new_i)],
+        incoming: vec![(one, entry_block), (new_i, loop_body)],
     };
 
     let acc_phi_node = HirPhi {
         result: acc_phi,
         ty: HirType::I32,
-        incoming: vec![(entry_block, one), (loop_body, new_acc)],
+        incoming: vec![(one, entry_block), (new_acc, loop_body)],
     };
 
     let header = func.blocks.get_mut(&loop_header).unwrap();
@@ -608,9 +608,9 @@ fn create_sign_function() -> HirFunction {
         result,
         ty: HirType::I32,
         incoming: vec![
-            (positive_block, one),
-            (negative_block, minus_one),
-            (zero_block, zero),
+            (one, positive_block),
+            (minus_one, negative_block),
+            (zero, zero_block),
         ],
     };
 

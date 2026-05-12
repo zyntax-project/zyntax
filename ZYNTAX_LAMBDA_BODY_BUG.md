@@ -149,101 +149,223 @@ can continue to be no-op'd for the bodies this patch unblocks.
 
 ## Status of the local checkout at `/Users/amaterasu/Vibranium/zyntax`
 
-The local checkout (HEAD `0aea7aa92fd7e6c1a5c190b25c76e4c9f84ad2fb`)
-already contains a partial fix for this in `ssa.rs::translate_closure`
-— `TypedLambdaBody::Block` now iterates statements and calls
-`translate_expression` instead of returning constant 0. The closure
-unit tests in that checkout
-(`crates/compiler/tests/closure_body_lowering_tests.rs`) assert the
-HIR contains `Call` instructions and pass against the local code.
+The local checkout's two-PR delta does fix the lambda-body drop:
+`crates/compiler/tests/closure_body_lowering_tests.rs` now covers
+both the original drop and the sibling-fn regression case and all 4
+tests pass against the local code.
 
-**However, pointing Blinc at the local checkout via `[patch]`
-regresses regular function emission.** Concretely:
-
-- Source:
-  ```text
-  signal count: i32
-  view {
-      Div(on_click = || { count.set(count.get() + 1) }) { Text("+1") }
-  }
-  ```
-- Compile output against upstream rev `5b0dfab7`:
-  `Ok(["__lambda_HirId(…)", "render_view"])` — both functions emitted.
-  `render_main` resolves `render_view` and returns the widget handle.
-- Compile output against the local checkout:
-  `Ok([])` — empty. Both `render_view` and the lambda are missing.
-  `render_main` fails with `Backend("Function not found: render_view")`.
-
-So the closure-body fix as it stands regresses the value-returning
-view shape Blinc relies on — something the local lambda work touches
-must be interfering with regular function registration for
-`render_view` / component view methods. The HIR-level closure tests
-don't exercise this path (they build their own `TypedProgram` and
-call `lower_program` directly), so the regression doesn't show up in
-the local checkout's own test suite.
-
-When the upstream fix lands, please verify that for a program of the
-form
+**The end-to-end regression still reproduces in Blinc, though, and the
+new synthetic tests don't catch it.** Re-pointed Blinc at the local
+checkout via `[patch]` and reran the probe. Same shape Blinc uses:
 
 ```text
-extern fn $Blinc$Div$view(children: i64, style: i64, class: string, on_click: i64): i64
-extern fn sink(value: i32)
-fn render_view(): i64 {
-    return $Blinc$Div$view(0, 0, "", 0)
+signal count: i32
+view {
+    Div(on_click = || { count.set(count.get() + 1) }) { Text("+1") }
 }
 ```
 
-`render_view` ends up in the compiled module's symbol list, JIT-calling
-it returns the inner widget handle, and a closure declared elsewhere
-in the same program (e.g. `|| { sink(42) }`) still emits a `Call`
-instruction in its lowered body.
+Instrumented `zyntax_embed::runtime::compile_typed_program` to dump
+`hir_module.functions` at three points + dumped the typed program
+right after `parse_to_typed_ast`. Result:
 
-Blinc's `[patch."https://github.com/darmie/zyntax"]` block in
-`Cargo.toml` is currently commented out for this reason; uncomment
-it to retest once the regression is resolved.
+```
+[BLINC] typed program after parse_to_typed_ast — 20 functions:
+  render_view                       ← NON-extern, body present
+  __set_overlay_corner_radius__ (extern)
+  __signal_get_i32 (extern)
+  __set_overlay_border_width__ (extern)
+  text (extern)
+  $Blinc$text (extern)
+  __set_overlay_border_color__ (extern)
+  __signal_get_string (extern)
+  __signal_get_f64 (extern)
+  __new_child_list__ (extern)
+  __push_child__ (extern)
+  text_int (extern)
+  $Blinc$text_int (extern)
+  __set_overlay_opacity__ (extern)
+  __set_overlay_bg__ (extern)
+  __new_style_overlay__ (extern)
+  __fstring_format__ (extern)
+  $Blinc$format_int (extern)
+  string_concat (extern)
+  $Blinc$string_concat (extern)
+
+[BLINC-DEBUG] after lower_typed_program: 19 fns (0 non-extern). Names:
+  [all 19 externs above, render_view missing]
+[BLINC-DEBUG] after apply_krio_async_lowering: 19 fns (0 non-extern). ← unchanged
+[BLINC-DEBUG] after apply_krio_effect_lowering: 19 fns (0 non-extern). ← unchanged
+compile result: Ok([])
+render_main result: Err(Backend("Function not found: render_view"))
+```
+
+### What this tells us
+
+- **The regression is inside `lower_typed_program`**, not in
+  `apply_krio_async_lowering` / `apply_krio_effect_lowering`. The
+  module is already missing `render_view` at the first snapshot.
+- The typed program input is healthy — `render_view` is present,
+  non-extern, with a body, alongside 19 extern declarations.
+- The lowering accepts the program without error (no
+  `CompilerError::Lowering(...)` surfaced), but silently drops the
+  one non-extern function on the way to HIR.
+- Both synthetic regression tests pass because they don't replicate
+  this shape — they have at most ~3 declarations and don't go through
+  the `parse_with_signatures` extern-injection path that gets Blinc
+  to 19 externs.
+
+### Suggested minimum to reproduce in a Zyntax-only test
+
+Build a `TypedProgram` with:
+
+1. A non-extern `render_view`: `fn render_view(): i64 { return $Blinc$Div$view(0, 0, "", 0) }`.
+2. ~15-20 sibling extern function declarations covering the union of
+   the names from Blinc's dump above (the specific names don't
+   matter, only the count + the mix of `$Blinc$…` /
+   `__set_overlay_…` / `__signal_get_…` shapes).
+3. A `Lambda` expression nested in `render_view`'s body.
+
+Lower it and assert `render_view` survives. Today against the local
+checkout that program would produce a module with the 19 externs and
+no `render_view` — same observed behaviour as Blinc.
+
+### Blinc-side workaround
+
+`[patch."https://github.com/darmie/zyntax"]` block in Blinc's
+workspace `Cargo.toml` is currently active so this is reproducible
+without bumping the rev. Once the lowering regression is resolved,
+the patch can stay in (the closure-body fix is the thing Blinc
+actually needs). If the patch needs to be reverted to unblock
+something else in the meantime, comment the three lines under
+`[patch."https://github.com/darmie/zyntax"]` — Blinc reverts to the
+silent-drop-but-renders-fine behaviour against upstream rev
+`5b0dfab7…`.
 
 ---
 
-## Update — 2026-05-12: synthetic Blinc shapes pass HIR-level lowering
+## Update — 2026-05-12: silent-drop mechanism identified + fixed
 
-Added two regression tests in
-`crates/compiler/tests/closure_body_lowering_tests.rs`:
+Found the mechanism. `crates/compiler/src/lowering.rs::lower_declaration`
+was swallowing every `lower_function` error at `log::trace!` level
+and removing the function from the symbol table:
 
-- `sibling_top_level_fns_survive_closure_lowering` — three decls
-  (extern `sink`, `def helper(): i64 { return 99 }`, `def main():
-  i32 { let f = def(): sink(42); return 0 }`). Asserts all three
-  non-extern functions + the synthesised `__lambda_*` end up in
-  `module.functions`.
-- `lambda_as_call_arg_with_capture_survives` — the closer-to-Blinc
-  shape: lambda passed as a CALL ARGUMENT (not a let binding),
-  body references a captured outer variable. Asserts both
-  `render_view` and `__lambda_*` survive lowering.
+```rust
+if let Err(e) = self.lower_function(func) {
+    log::trace!("[LOWERING WARN] Skipping function '{}': {:?}", func_name, e);
+    self.symbols.functions.remove(&func.name);
+}
+```
 
-Both pass against HEAD `28d503c…` (Phase E.5 landed). The
-sibling-fn case + the call-arg-with-capture case do NOT reproduce
-the `Ok([])` symptom on this checkout.
+`log::trace!` is invisible without `RUST_LOG=trace`. The function
+disappeared from the module, compilation kept going as if nothing
+happened, the caller saw `Ok([])`. That's the `render_view`-vanishes
+mechanism.
 
-Possible interpretations:
-1. The Blinc report was against a stale checkout state — maybe
-   the lambda-fix commit (`5453cc0…`) without the subsequent
-   compile-pass churn from the wasm track. Re-test against the
-   latest HEAD with `[patch]` re-enabled and see if `Ok([])`
-   still reproduces.
-2. The repro depends on shapes the synthetic TypedProgram doesn't
-   reach — e.g. signal-runtime struct field access, method-call
-   trait dispatch on the captured value, or a Blinc-frontend
-   syntax desugaring that produces an unusual TypedAst the
-   synthetic version doesn't replicate.
-3. The repro depends on a code path OUTSIDE SSA lowering — e.g.
-   the wasm-target krio passes (`apply_krio_async_lowering` /
-   `apply_krio_effect_lowering` in `compile_typed_program`) that
-   run AFTER `lower_typed_program` and could in principle
-   silently drop functions on certain shapes.
+The blanket swallow was historical generic-function leniency:
+monomorphic instantiations come from call sites via
+`monomorphize_module`, so failing to lower the original generic
+decl is benign. Applying that same leniency to non-generic
+non-extern functions hid genuine bugs.
 
-If Blinc still observes the empty-function-list regression after
-re-pulling, the most productive next step is to capture
-`compile_typed_program`'s `hir_module.functions` count BEFORE the
-post-lowering passes (`apply_krio_*`) and AFTER, then dump the
-function names. That isolates whether SSA produces them and one
-of the subsequent passes drops them, vs. SSA never produces them
-in the first place.
+### Fix
+
+`lower_declaration` now distinguishes:
+
+- **Generic functions** (non-empty `type_params`): keep the
+  `log::trace!` swallow — instantiations are emitted at call sites
+  by `monomorphize_module`, so the original generic skip is
+  harmless.
+- **Non-generic non-extern functions**: propagate the error
+  directly via `?`. Compilation fails loudly with the underlying
+  SSA / lowering error instead of producing a module silently
+  missing functions.
+
+`tests/expression_lowering_tests.rs::test_matmul_missing_impl_reports_clear_error`
+was updated to match its own name — it now asserts that an
+unresolvable `MatMul` impl produces `CompilerError::Analysis(...)`,
+not a silent drop.
+
+### What Blinc should do next
+
+Re-run the failing program against the latest local checkout.
+Compilation will either:
+
+1. **Fail with the actual `lower_function` error** that was
+   silently dropped before. Share that error here so we can chase
+   it directly (likely a method-resolution path through the
+   lambda's captured `count.set` / `count.get`).
+2. **Succeed entirely** — meaning the upstream changes are
+   sufficient on their own.
+
+Either way the path forward is unambiguous now: no more `Ok([])`
+hiding the real cause.
+
+---
+
+## Update — 2026-05-12 (Blinc side): silent-drop fix confirmed, next layer revealed
+
+The `lower_declaration` fix lands cleanly. Re-ran a minimal probe
+against the latest local checkout:
+
+```rust
+// crates/blinc_dsl_core/examples/_probe_closure.rs
+let res = dsl.compile_source(
+    r##"
+    signal count: i32
+    view {
+        Div(on_click = || { count.set(count.get() + 1) }) { Text("+1") }
+    }
+    "##,
+    "probe_closure.blinc",
+);
+```
+
+**Before the fix** (`log::trace!` swallow): `compile_source` returned
+`Ok([])`, `render_main` then failed with `Backend("Function not found:
+render_view")`. The lowering error was invisible.
+
+**After the fix**: `compile_source` now returns
+
+```
+Err(Compile("Execution error: Lowering error: Analysis(\"Cannot access fields on non-struct type: Any\")"))
+```
+
+So the silent-drop mechanism is gone — exactly as the update intended.
+The error that was previously being swallowed is now front and centre:
+something inside the lambda body is trying to do field/method access
+on a value typed as `Any`.
+
+### Likely site
+
+This is the path your update predicted: "method-resolution path through
+the lambda's captured `count.set` / `count.get`."
+
+Inside the lambda `|| { count.set(count.get() + 1) }`, `count` is an
+outer signal that is *not* a typed struct — Blinc's signal substrate
+exposes it via `__signal_get_i32` / `__signal_set_i32` externs, not as
+a struct with `.get` / `.set` methods. The Blinc DSL has a post-parse
+pass `resolve_signal_calls` that rewrites `<signal>.get()` /
+`<signal>.set(v)` into direct extern calls before lowering.
+
+When the lambda body is processed, it looks like the rewrite either
+(a) isn't seeing inside the lambda body, or (b) the lambda body is
+being analyzed with `count` typed as `Any` before the rewrite gets a
+chance, so the analyser sees `Any.set(...)` and bails with the new
+"Cannot access fields on non-struct type" error.
+
+If you can share the file:line where this analysis error is raised
+(it's "Cannot access fields on non-struct type: Any" — likely in
+`crates/compiler/src/...` near a field-access or method-resolution
+arm), we can narrow whether the fix is Blinc-side (run the signal
+rewrite earlier / inside lambda bodies) or Zyntax-side (lambda body
+analysis missing some context other top-level statements have).
+
+### Repro
+
+The probe above is the minimal repro — single signal, single lambda
+calling `.set` / `.get` on it. No FSMs, no view-renderer, no
+component, no externs other than what `BlincDsl::new()` registers.
+
+The `[patch."https://github.com/darmie/zyntax"]` block in Blinc's
+`Cargo.toml` remains active.

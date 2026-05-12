@@ -1817,14 +1817,38 @@ impl LoweringContext {
     fn lower_declaration(&mut self, decl: &TypedNode<TypedDeclaration>) -> CompilerResult<()> {
         match &decl.node {
             TypedDeclaration::Function(func) => {
-                // Catch and warn about function failures - complex generic functions may fail
-                // but we shouldn't fail the entire compilation for unused code
-                if let Err(e) = self.lower_function(func) {
-                    let func_name = func.name.resolve_global().unwrap_or_default();
-                    LOWERING_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
-                    log::trace!("[LOWERING WARN] Skipping function '{}': {:?}", func_name, e);
-                    // Remove from symbol table if it was registered
-                    self.symbols.functions.remove(&func.name);
+                // Generic functions are allowed to fail here: their
+                // monomorphic instantiations come from call sites
+                // via `monomorphize_module`, so failing to lower
+                // the original generic decl is benign. Keep the
+                // existing swallow-with-trace for that case.
+                //
+                // Non-generic functions failing is a REAL bug —
+                // either in the SSA builder or in the input
+                // TypedProgram. The historical code swallowed
+                // these too (at `log::trace!`, invisible by
+                // default), which hid the Blinc-side
+                // `render_view`-disappears-into-`Ok([])` regression
+                // documented in ZYNTAX_LAMBDA_BODY_BUG.md. Propagate
+                // the error instead — the compilation should fail
+                // loudly with the underlying SSA/lowering error
+                // instead of silently producing a module that's
+                // missing one of its functions.
+                let is_generic = !func.type_params.is_empty();
+                if is_generic {
+                    if let Err(e) = self.lower_function(func) {
+                        let func_name = func.name.resolve_global().unwrap_or_default();
+                        LOWERING_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+                        log::trace!(
+                            "[LOWERING] skipping generic function '{}' \
+                             (monomorphic instances emitted at call sites): {:?}",
+                            func_name,
+                            e,
+                        );
+                        self.symbols.functions.remove(&func.name);
+                    }
+                } else {
+                    self.lower_function(func)?;
                 }
             }
 
