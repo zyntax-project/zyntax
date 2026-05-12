@@ -86,11 +86,45 @@ function installJitHost() {
      * `bytes` arrives as a `Uint8Array` — wasm-bindgen marshals
      * the `&[u8]` for us. `WebAssembly.Module` takes a copy, so
      * we don't need to worry about wasm-memory lifetimes.
+     *
+     * Phase E.5: builds an `importObject` for instantiation by
+     * parsing the wasm module's imports list. Each import lives
+     * under module name `"extern"` and is named `<symbol>@<arity>`;
+     * we strip the suffix to recover the symbol name + pick the
+     * matching `_zyntax_call_extern_<arity>` dispatcher.
      */
     globalThis._zyntax_jit_install = function _zyntax_jit_install(bytes) {
         try {
-            const mod  = new WebAssembly.Module(bytes);
-            const inst = new WebAssembly.Instance(mod, {});
+            const mod = new WebAssembly.Module(bytes);
+
+            // Build the importObject from the module's declared
+            // imports. Single namespace `"extern"`; each entry maps
+            // to a JS shim that calls back into the host wasm's
+            // _zyntax_call_extern_<arity> exports.
+            const importObj = {};
+            const imports = WebAssembly.Module.imports(mod);
+            for (const imp of imports) {
+                if (imp.kind !== "function") continue;
+                if (imp.module !== "extern") {
+                    console.warn(
+                        `_zyntax_jit_install: unexpected import module "${imp.module}"`,
+                    );
+                    continue;
+                }
+                const at = imp.name.lastIndexOf("@");
+                if (at < 0) {
+                    console.warn(
+                        `_zyntax_jit_install: import "${imp.name}" missing @arity suffix`,
+                    );
+                    continue;
+                }
+                const symbolName = imp.name.slice(0, at);
+                const arity = parseInt(imp.name.slice(at + 1), 10);
+                if (!importObj.extern) importObj.extern = {};
+                importObj.extern[imp.name] = makeExternDispatcher(symbolName, arity);
+            }
+
+            const inst = new WebAssembly.Instance(mod, importObj);
             const fn = inst.exports.entry;
             if (typeof fn !== "function") return 0xFFFFFFFF;
             jitFuncs.push(fn);
@@ -103,6 +137,36 @@ function installJitHost() {
             return 0xFFFFFFFF;
         }
     };
+
+    /** Build a JS dispatcher that calls the right
+     *  `_zyntax_call_extern_<arity>` export with `symbolName` as
+     *  the first arg + the JIT'd module's actual args after. */
+    function makeExternDispatcher(symbolName, arity) {
+        const exports = zynmlBindings;
+        switch (arity) {
+            case 0:
+                return () => exports._zyntax_call_extern_0(symbolName);
+            case 1:
+                return (a0) =>
+                    exports._zyntax_call_extern_1(symbolName, a0);
+            case 2:
+                return (a0, a1) =>
+                    exports._zyntax_call_extern_2(symbolName, a0, a1);
+            case 3:
+                return (a0, a1, a2) =>
+                    exports._zyntax_call_extern_3(symbolName, a0, a1, a2);
+            default:
+                // Out-of-coverage arity: a JIT'd call to this would
+                // fault on instantiate (no matching dispatcher).
+                // Returning a throwing thunk surfaces the issue at
+                // the call site instead of silently coercing.
+                return () => {
+                    throw new Error(
+                        `_zyntax_jit: extern "${symbolName}" arity ${arity} not supported`,
+                    );
+                };
+        }
+    }
 
     /** Zero-arg / i64-return dispatch shim. JIT'd `entry` exports
      *  return a BigInt under wasm-bindgen's i64 ABI; we coerce to

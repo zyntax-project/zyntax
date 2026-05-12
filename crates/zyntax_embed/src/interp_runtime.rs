@@ -270,6 +270,12 @@ impl InterpRuntime {
         self.interp.register_symbol(name, ptr, param_count);
     }
 
+    /// Snapshot of the FFI symbol table — forwarded from the inner
+    /// `HirInterpreter`. See [`HirInterpreter::symbol_table_snapshot`].
+    pub fn symbol_table_snapshot(&self) -> Vec<(String, *const u8, u8)> {
+        self.interp.symbol_table_snapshot()
+    }
+
     /// Install the wasm-JIT compile + dispatch hooks on the BC
     /// interpreter (Phase E.6 — wasm32-target tier-up path).
     ///

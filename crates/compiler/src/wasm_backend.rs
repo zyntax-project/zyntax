@@ -26,10 +26,15 @@
 //! integer constants) lowered via a universal dispatch-loop pattern;
 //! phi nodes resolved out-of-SSA via predecessor-edge moves
 //! (`local.set` on the matching incoming value before `br` to the
-//! loop header). Structs, calls, effects, and inter-phi cycles
-//! still stub out to a clear `WasmEmitError::Unsupported`. The
-//! emitter is intentionally conservative — any HIR shape it can't
-//! handle bails so the interpreter keeps that function in BC.
+//! loop header); extern-symbol calls (`HirCallable::Symbol`)
+//! lowered to wasm imports under module `"extern"` with an
+//! `<name>@<arity>` suffix that lets the JS host pick the matching
+//! per-arity dispatcher without parsing the wasm type section.
+//! Internal HIR-function calls, indirect calls, intrinsics, struct
+//! memory, effects, and inter-phi cycles still stub out to a clear
+//! `WasmEmitError::Unsupported`. The emitter is intentionally
+//! conservative — any HIR shape it can't handle bails so the
+//! interpreter keeps that function in BC.
 //!
 //! Value representation:
 //! * `HirType::I64` / `I32` / `I16` / `I8` / `Bool` / `UInt`-family
@@ -39,13 +44,14 @@
 //! * Other types → `WasmEmitError::Unsupported` for now.
 
 use crate::hir::{
-    BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType, HirValueKind,
+    BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
+    HirValueKind,
 };
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction as WasmInst,
-    Module, TypeSection, ValType,
+    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
+    Instruction as WasmInst, Module, TypeSection, ValType,
 };
 
 // ---------------------------------------------------------------------------
@@ -201,6 +207,20 @@ struct FunctionEmitter<'a> {
     /// (indices 0..N) refer to these and aren't redeclared in the
     /// locals section.
     n_params: u32,
+    /// Wasm imports we need to declare so `HirCallable::Symbol`
+    /// calls can resolve. Insertion order maps directly to wasm
+    /// function-index 0..imports.len(); the compiled function is
+    /// at function-index `imports.len()`.
+    ///
+    /// Each entry records `(import_name_with_arity_suffix, arity)`.
+    /// The arity-suffixed name (e.g. `"$IO$println@1"`) lets the
+    /// JS host pick the matching dispatcher at instantiation time
+    /// without parsing the wasm type section.
+    imports: Vec<(String, u32)>,
+    /// Lookup table from a `HirCallable::Symbol(name)` value to the
+    /// wasm function-index of the matching import. Built lazily as
+    /// the body emit encounters Call instructions.
+    import_indices: HashMap<String, u32>,
 }
 
 /// Per-block state threaded through `emit_terminator` so jumps
@@ -231,6 +251,8 @@ impl<'a> FunctionEmitter<'a> {
             local_map: HashMap::new(),
             locals: Vec::new(),
             n_params: 0,
+            imports: Vec::new(),
+            import_indices: HashMap::new(),
         }
     }
 
@@ -244,13 +266,34 @@ impl<'a> FunctionEmitter<'a> {
         //    use, the def's local index is already in `local_map`.
         self.allocate_instruction_locals()?;
 
-        // 3. Emit the function body.
+        // 3. Discover wasm imports. Each `HirCallable::Symbol(name)`
+        //    becomes one import; arity-suffixed so the JS host can
+        //    pick the right dispatcher without parsing the wasm
+        //    type section.
+        self.scan_imports()?;
+
+        // 4. Emit the function body.
         let body = self.emit_body()?;
 
-        // 4. Build the module: type → function → export → code.
+        // 5. Build the module: type → import → function → export → code.
         let mut module = Module::new();
 
+        // Type section: one entry per unique import signature, then
+        // the compiled function's own type. Each import shares the
+        // same wasm-side shape — N i64 params, 1 i64 result —
+        // matching the BC interpreter's i64-funneled ABI.
         let mut types = TypeSection::new();
+        let mut arity_to_type_idx: HashMap<u32, u32> = HashMap::new();
+        for &(_, arity) in &self.imports {
+            if arity_to_type_idx.contains_key(&arity) {
+                continue;
+            }
+            let idx = types.len() as u32;
+            let params: Vec<ValType> = (0..arity).map(|_| ValType::I64).collect();
+            types.function(params, [ValType::I64]);
+            arity_to_type_idx.insert(arity, idx);
+        }
+        let func_type_idx = types.len() as u32;
         let params: Vec<ValType> = self
             .func
             .signature
@@ -268,12 +311,29 @@ impl<'a> FunctionEmitter<'a> {
         types.function(params.iter().copied(), results.iter().copied());
         module.section(&types);
 
+        // Import section. One `(import "extern" "<name>@<arity>"
+        // (func (type <idx>)))` per discovered Symbol callee.
+        if !self.imports.is_empty() {
+            let mut imports = ImportSection::new();
+            for (name, arity) in &self.imports {
+                let type_idx = *arity_to_type_idx
+                    .get(arity)
+                    .expect("arity → type-index mapping populated above");
+                imports.import("extern", name, EntityType::Function(type_idx));
+            }
+            module.section(&imports);
+        }
+
         let mut functions = FunctionSection::new();
-        functions.function(0);
+        functions.function(func_type_idx);
         module.section(&functions);
 
+        // The compiled function lives at wasm function-index
+        // `imports.len()` — imports occupy indices 0..imports.len().
+        let func_index = self.imports.len() as u32;
+
         let mut exports = ExportSection::new();
-        exports.export("entry", ExportKind::Func, 0);
+        exports.export("entry", ExportKind::Func, func_index);
         module.section(&exports);
 
         let mut code = CodeSection::new();
@@ -356,6 +416,56 @@ impl<'a> FunctionEmitter<'a> {
                 let local_idx = self.n_params + self.locals.len() as u32;
                 self.local_map.insert(phi.result, local_idx);
                 self.locals.push(ty);
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk every `HirInstruction::Call` in every block and register
+    /// each `HirCallable::Symbol(name)` callee as a wasm import. The
+    /// import name carries the arity suffix (`name@N`) so the JS
+    /// host can dispatch without parsing the wasm type section.
+    /// Internal calls (`Function(id)` / `Indirect(..)` / etc.) hit
+    /// `Unsupported` here — they'd need a more elaborate
+    /// cross-function dispatch story (E.5.2+).
+    fn scan_imports(&mut self) -> Result<()> {
+        for block in self.func.blocks.values() {
+            for inst in &block.instructions {
+                if let HirInstruction::Call { callee, args, .. } = inst {
+                    match callee {
+                        HirCallable::Symbol(name) => {
+                            let arity = args.len() as u32;
+                            let import_name = format!("{}@{}", name, arity);
+                            if !self.import_indices.contains_key(&import_name) {
+                                let idx = self.imports.len() as u32;
+                                self.imports.push((import_name.clone(), arity));
+                                self.import_indices.insert(import_name, idx);
+                            }
+                        }
+                        HirCallable::Function(_) => {
+                            return Err(WasmEmitError::Unsupported(
+                                "internal HIR function call (HirCallable::Function) — \
+                                 cross-function dispatch not yet wired"
+                                    .into(),
+                            ));
+                        }
+                        HirCallable::Indirect(_) => {
+                            return Err(WasmEmitError::Unsupported(
+                                "indirect call (HirCallable::Indirect)".into(),
+                            ));
+                        }
+                        HirCallable::Intrinsic(_) => {
+                            return Err(WasmEmitError::Unsupported(
+                                "intrinsic call (HirCallable::Intrinsic)".into(),
+                            ));
+                        }
+                        HirCallable::FuncRef(_) => {
+                            return Err(WasmEmitError::Unsupported(
+                                "function-as-pointer (HirCallable::FuncRef)".into(),
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -635,6 +745,51 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(rhs);
                 emit_binary_op(out, *op, ty)?;
                 out.push(dst);
+                Ok(())
+            }
+            HirInstruction::Call {
+                result,
+                callee,
+                args,
+                ..
+            } => {
+                // Only `HirCallable::Symbol` reaches here — other
+                // variants were rejected by `scan_imports`.
+                let name = match callee {
+                    HirCallable::Symbol(n) => n,
+                    _ => {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "non-Symbol callee in emit_instruction: {:?}",
+                            std::mem::discriminant(callee)
+                        )))
+                    }
+                };
+                let arity = args.len() as u32;
+                let import_name = format!("{}@{}", name, arity);
+                let import_idx = *self.import_indices.get(&import_name).ok_or_else(|| {
+                    // `scan_imports` walked the same instructions, so this
+                    // is a structural bug rather than a coverage gap.
+                    WasmEmitError::Validation(format!(
+                        "call site for `{}` has no matching import index",
+                        import_name
+                    ))
+                })?;
+
+                // Push each arg via `local.get`.
+                for arg in args {
+                    out.push(self.local_get(*arg)?);
+                }
+                out.push(WasmInst::Call(import_idx));
+
+                // Imports always have i64 result type (matches the
+                // BC interp's i64-funneled ABI). If the HIR call
+                // produces a value, capture it; otherwise drop the
+                // return value off the stack.
+                if let Some(result_id) = result {
+                    out.push(self.local_set(*result_id)?);
+                } else {
+                    out.push(WasmInst::Drop);
+                }
                 Ok(())
             }
             other => Err(WasmEmitError::Unsupported(format!(
@@ -1418,6 +1573,131 @@ mod tests {
             .compile_function(&func)
             .expect("emit Switch");
         m.validate_full().expect("module structurally valid");
+    }
+
+    /// `def double_via_extern(x: i64): i64 { return ext_double(x) }`
+    ///
+    /// Verifies that:
+    ///   - The wasm module declares an import named `"ext_double@1"`
+    ///     under module `"extern"`, with `(i64) -> i64` signature.
+    ///   - The function call site emits `local.get $x; call <imp>;
+    ///     local.set $result; local.get $result; return`.
+    ///   - The result type lines up with the function's return
+    ///     signature so wasmparser accepts the module.
+    #[test]
+    fn emits_call_to_extern_symbol() {
+        let x_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: x_id,
+                name: InternedString::new_global("x"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("double_via_extern"), sig);
+        func.values.insert(
+            x_id,
+            HirValue {
+                id: x_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+
+        // Result of the call.
+        let call_result = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Call {
+            result: Some(call_result),
+            callee: HirCallable::Symbol("ext_double".to_string()),
+            args: vec![x_id],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![call_result],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit extern-call function");
+        m.validate_full().expect("module structurally valid");
+
+        // The import we emit should be discoverable via
+        // `wasmparser::Parser` — sanity check that the suffix-name
+        // convention round-trips. The host's JS-side dispatcher
+        // splits on `@` to recover (name, arity).
+        let parser = wasmparser::Parser::new(0);
+        let mut found_import = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "extern" && import.name == "ext_double@1" {
+                        found_import = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_import,
+            "expected `(import \"extern\" \"ext_double@1\")` in emitted module"
+        );
+    }
+
+    /// Internal HIR-function calls (`HirCallable::Function`) still
+    /// bail because cross-function JIT dispatch isn't wired yet.
+    /// Asserts the documented Unsupported path.
+    #[test]
+    fn internal_function_call_bails_cleanly() {
+        let other_func = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("calls_other"), sig);
+        let call_result = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Call {
+            result: Some(call_result),
+            callee: HirCallable::Function(other_func),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![call_result],
+        };
+
+        match WasmBackend::new().compile_function(&func) {
+            Err(WasmEmitError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("internal HIR function"),
+                    "expected internal-call bail, got: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
     }
 
     /// Inter-phi cycle (one phi's result feeds another phi's

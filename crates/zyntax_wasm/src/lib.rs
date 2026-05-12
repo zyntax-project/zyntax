@@ -189,6 +189,111 @@ fn js_jit_call_0_i64(_handle: u32) -> i64 {
 /// Matches the docstring on the extern above.
 const JIT_INSTALL_FAILED: u32 = u32::MAX;
 
+// ---------------------------------------------------------------------------
+// Native-symbol bridge for JIT'd extern calls (Phase E.5)
+// ---------------------------------------------------------------------------
+//
+// JIT'd modules import `(extern "<name>@<arity>")` for every ZRTL
+// symbol they call. The host page builds an `importObject` for the
+// instantiation by parsing the wasm module's imports list; each
+// dispatcher calls back into this wasm via one of the
+// `_zyntax_call_extern_<N>` exports below. We thread the active
+// runtime's symbol table through a `RefCell` so the exports can
+// resolve `name` to a function pointer without owning the runtime.
+//
+// SAFETY: the function pointers come from statically-linked plugin
+// crates on wasm32 (Phase C), so they're real wasm function
+// references that wasm-bindgen's transmute can call directly.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    /// Snapshot of the active `InterpRuntime`'s symbol table for
+    /// the duration of a `run()` call. Populated by `run_impl`
+    /// before dispatch and cleared on exit. Keyed by raw symbol
+    /// name (without the `@<arity>` suffix that the wasm import
+    /// carries — the JS dispatcher strips it before calling our
+    /// exports).
+    static ACTIVE_SYMBOLS: RefCell<HashMap<String, *const u8>> =
+        RefCell::new(HashMap::new());
+}
+
+fn lookup_active_symbol(name: &str) -> Option<*const u8> {
+    ACTIVE_SYMBOLS.with(|s| s.borrow().get(name).copied())
+}
+
+/// Dispatcher for zero-arg ZRTL externs. JS-side
+/// `_zyntax_call_extern_0(name)` from a JIT'd module's import
+/// shim calls into this. Returns `0` when the symbol isn't found
+/// (defensive — the JIT compile gate only fires when the symbol
+/// is in the snapshot, but a stale handle after runtime tear-down
+/// would otherwise be UB).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_extern_0(name: &str) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn() -> i64 = unsafe { core::mem::transmute(ptr) };
+    f()
+}
+
+/// One-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_extern_1(name: &str, a0: i64) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(ptr) };
+    f(a0)
+}
+
+/// Two-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_extern_2(name: &str, a0: i64, a1: i64) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64) -> i64 = unsafe { core::mem::transmute(ptr) };
+    f(a0, a1)
+}
+
+/// Three-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_extern_3(name: &str, a0: i64, a1: i64, a2: i64) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { core::mem::transmute(ptr) };
+    f(a0, a1, a2)
+}
+
+// Non-wasm32 stubs so the crate's native cargo build is happy.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_extern_0(_name: &str) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_extern_1(_name: &str, _a0: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_extern_2(_name: &str, _a0: i64, _a1: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_extern_3(_name: &str, _a0: i64, _a1: i64, _a2: i64) -> i64 {
+    0
+}
+
 /// Install the wasm-JIT compile + dispatch hooks on an
 /// `InterpRuntime`. Called from `run_impl` once per fresh runtime.
 ///
@@ -317,14 +422,36 @@ fn run_impl(source: &str) -> RunResult {
     register_wasm_jit_hooks(&mut rt);
     rt.compile_module(hir_module);
 
-    match rt.call_function("main", vec![]) {
+    // Mirror the runtime's FFI symbol table into the thread-local
+    // store so JIT'd modules' extern calls (Phase E.5) can resolve
+    // names through `_zyntax_call_extern_*` without holding a
+    // reference to the runtime.
+    let symbol_snapshot = rt.symbol_table_snapshot();
+    ACTIVE_SYMBOLS.with(|s| {
+        let mut map = s.borrow_mut();
+        map.clear();
+        for (name, ptr, _arity) in symbol_snapshot {
+            map.insert(name, ptr);
+        }
+    });
+
+    let result = match rt.call_function("main", vec![]) {
         Ok(v) => RunResult {
             output: format_value(&v),
             ok: true,
             error_kind: ErrorKind::None,
         },
         Err(e) => runtime_err(format!("runtime error: {e}")),
-    }
+    };
+
+    // Clear the active-symbol thread-local so a subsequent `run()`
+    // with a different runtime doesn't see stale pointers. Pointer
+    // staleness here would manifest as silent miscompile / UB
+    // (transmuting an old plugin's fn ptr through the new
+    // runtime's wasm-JIT'd module).
+    ACTIVE_SYMBOLS.with(|s| s.borrow_mut().clear());
+
+    result
 }
 
 fn compile_err(msg: impl Into<String>) -> RunResult {

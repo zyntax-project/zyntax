@@ -1252,6 +1252,22 @@ impl HirInterpreter {
             .insert(name.into(), SymbolEntry { ptr, param_count });
     }
 
+    /// Snapshot of every registered FFI symbol — name → `(ptr,
+    /// param_count)`. Returns owned strings + raw pointers; the
+    /// pointers stay valid as long as the registering plugin's
+    /// statics outlive the snapshot (always true for the
+    /// `register_static_plugin` path on wasm32).
+    ///
+    /// Used by the wasm-JIT host to mirror the table into a
+    /// thread-local store that `_zyntax_call_extern_*` exports
+    /// dispatch through.
+    pub fn symbol_table_snapshot(&self) -> Vec<(String, *const u8, u8)> {
+        self.symbols
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.ptr, entry.param_count))
+            .collect()
+    }
+
     /// Register a per-function tick callback. Invoked on every entry to
     /// the function; returning `Some` short-circuits to JIT dispatch.
     /// The host-side beadie wrapper plugs `Beadie::on_invoke` in here.
