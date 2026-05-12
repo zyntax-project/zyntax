@@ -407,3 +407,165 @@ fields on non-struct type` error, share the new `count.ty` value
 the error surfaces — that'll tell us whether the captured-type
 mirror is still wrong, or whether `resolve_signal_calls` itself
 isn't recursing into lambda bodies for some other reason.
+
+---
+
+## Update — 2026-05-12 (later still): cranelift indirect-call now surfaces too
+
+Blinc-side now reports:
+
+```
+zyntax_compiler::cranelift_backend: Indirect call: function pointer
+HirId(...) not in value_map
+```
+
+Three sites in `cranelift_backend.rs` had the same anti-pattern as
+`lower_declaration`'s silent swallow:
+
+1. `HirCallable::Indirect` in the main call-emit arm (line 2444):
+   `warn!` + `iconst(0)` → `call_indirect` into address 0 → silent
+   SIGSEGV at runtime, no path back to the cause.
+2. `HirInstruction::IndirectCall` (line 2857): `log::trace!` + the
+   same `iconst(0)` fallback.
+3. `HirCallable::Indirect` in `FuncRef` emit (line 5770):
+   `self.value_map[func_ptr]` bare indexing → panic with an
+   unhelpful out-of-bounds message.
+
+All three now return `CompilerError::Backend(...)` with the
+specific HirId. Blinc-side callers get a usable diagnostic
+instead of a runtime crash or an obscure panic.
+
+### What to expect now on the Blinc side
+
+Re-run the probe. The error you see should be the new
+`CompilerError::Backend("indirect call: function-pointer value
+HirId(...) is referenced but never defined ...")`. That's
+actually surfacing a real SSA-lowering bug — the closure value's
+`CreateClosure` instruction isn't reaching Cranelift's
+`value_map` for some shape Blinc emits.
+
+To narrow it: the HirId in the new error is the indirect-call's
+callee. Trace back where that HirId is supposed to be defined
+in the HIR. Likely candidates (in priority order):
+
+1. A `CreateClosure` for the on-click lambda is emitted but its
+   `result` HirId never enters Cranelift's `value_map` (maybe
+   because the SSA put it in a block that Cranelift skipped, or
+   the `function_map` lookup at line 3403 fell through to the
+   else branch and `null_ptr` got stored but under a DIFFERENT
+   HirId than the indirect-call references).
+2. The closure value was passed AS AN ARGUMENT to an extern, and
+   the SSA tried to re-call the captured value INSIDE that
+   extern's body (won't happen — externs have no body).
+3. Some `HirCallable::Indirect` is being emitted with a
+   parameter HirId, but parameter HirIds should be in
+   `value_map` from `build_param_locals` at the top of every
+   function.
+
+If you can share the HIR dump (`hir_dump.rs` should print it
+for a single function), or `RUST_LOG=debug` logs showing what
+instructions were emitted in `render_view`'s body, we can
+pinpoint which of the above (or something else) is firing.
+
+---
+
+## Update — 2026-05-12 (Blinc side, layer 4): every call in the lambda body lowers as `Indirect`
+
+### Confirmed from layers 2 + 3
+
+- Captured-variable type fix lands: `Cannot access fields on
+  non-struct type: Any` no longer fires. `count` inside the lambda
+  resolves to its real signal type.
+- Blinc-side `resolve_signal_calls` / `resolve_fsm_trigger_calls`
+  walkers now descend into `TypedExpression::Lambda` bodies (the
+  walkers previously had no Lambda arm — added that, see
+  `crates/blinc_dsl_core/src/lib.rs` `rewrite_expr` matches), so the
+  typed AST handed to Zyntax has the in-lambda `count.set(...)` /
+  `CounterFsm.trigger(...)` rewritten to direct `Call(Variable
+  ("__signal_set_i32"), [...])` / `Call(Variable ("__fsm_runtime_trigger__"), [...])`
+  before lowering. Identical to the shape the top-level body uses.
+- Cranelift backend's improved error messages land: we now see a
+  `CompilerError::Backend("indirect call: function-pointer value
+  HirId(...) is referenced but never defined ...")` instead of a
+  silent SIGSEGV.
+
+### New observation: not just one indirect call — *all* of them
+
+With `RUST_LOG=zyntax_compiler::cranelift_backend=debug`, the lambda
+body (`|| { count.set(count.get() + 1); CounterFsm.trigger("Idle.Increment"); CounterFsm.trigger("Counting.Increment") }`) dumps as:
+
+```
+[Cranelift]   inst[0]: Call { callee: Indirect(HirId(...)), args: [HirId(...), HirId(...)], ... }
+[Cranelift]   inst[1]: Call { callee: Indirect(HirId(...)), args: [HirId(...), HirId(...)], ... }
+[Cranelift]   inst[2]: Call { callee: Indirect(HirId(...)), args: [HirId(...), HirId(...)], ... }
+[Cranelift]   inst[3]: Call { callee: Indirect(HirId(...)), args: [HirId(...), HirId(...)], ... }
+[Cranelift]   inst[4]: Call { callee: Indirect(HirId(...)), args: [HirId(...), HirId(...)], ... }
+
+[CRANELIFT] Skipping function: Backend("indirect call: function-pointer value
+   HirId(caadeed6-…) is referenced but never defined in this function's value_map…")
+```
+
+So *every* call site in the lambda body emits as `HirCallable::Indirect(callee_value)`,
+including the calls to known extern symbols (`__signal_set_i32`,
+`__signal_get_i32`, `__fsm_runtime_trigger__`). At the top level
+`translate_expression`'s `Call` arm recognises a `Variable` callee that
+resolves to a known function name and emits `HirCallable::Symbol(name)`;
+inside a lambda body that resolution doesn't happen, so each call gets
+the `Variable`'s value HirId as an `Indirect` callee — and nothing
+defines those HirIds in the function's value_map.
+
+This is exactly the failure mode Proposal (A) called out:
+
+> "Today `translate_lambda_expr` is a hand-rolled mini-translator
+> maintained in parallel with the real one. ... The straightforward
+> fix is to lift the lambda body into a regular `HirFunction` and run
+> it through `translate_expression`, the same way FSM tick guards
+> already are."
+
+The current closure-body-lowering tests cover `Block` / `Call` /
+`MethodCall` / `Field` *shapes* but don't assert the `HirCallable`
+variant — adding an assertion that
+`Call { callee: Variable(name) }` where `name` resolves to a known
+function symbol lowers to `HirCallable::Symbol(name)` (not `Indirect`)
+inside a lambda body would catch this.
+
+### Cascade panic (still present): `FunctionBuilderContext` not finalised on error
+
+When `compile_function_body` returns `Err` via `?` between
+`FunctionBuilder::new` (cranelift_backend.rs:1341) and
+`builder.finalize()` (around line 4702), the `FunctionBuilderContext`
+stays dirty. The next iteration's `FunctionBuilder::new` panics:
+
+```
+thread 'main' panicked at cranelift-frontend-0.106.2/src/frontend.rs:295:9:
+assertion failed: func_ctx.is_empty()
+   3: <FunctionBuilder>::new
+   4: <CraneliftBackend>::compile_function_body  (cranelift_backend.rs:1341)
+   5: <CraneliftBackend>::compile_module        (cranelift_backend.rs:486)
+```
+
+The new `Backend(...)` returns from layer 3 surface the underlying
+error cleanly, but the same `?` path that returns them leaves
+`self.builder_context` dirty for the next iteration's
+`FunctionBuilder::new` — which panics. Once layer 4 (lambda lowering
+emitting `Symbol` for direct externs) is fixed the trigger goes
+away in this specific case, but the panic remains latent: any future
+`compile_function_body` error path will hit the same cascade.
+
+Minimum fix: ensure cleanup on all error paths — structure
+`compile_function_body` so every error path falls through
+`builder.finalize()` first, or reset
+`self.builder_context = FunctionBuilderContext::new()` (and similarly
+`self.codegen_context.clear()`) before returning an early-error from
+between create-builder and finalize.
+
+### Repro
+
+`crates/blinc_dsl_core/examples/counter_dsl.{rs,blinc}` against the
+current local Zyntax checkout, run with
+`RUST_LOG=zyntax_compiler::cranelift_backend=debug`, gives the trace
+above. The minimal `_probe_closure.rs` from layer 2 *might not* trip
+the cascade panic (only one non-extern function — `render_view` — so
+the Err is returned, no next-iter `FunctionBuilder::new`); but it
+will still skip the lambda function and so leave `render_main` with
+a no-op closure.

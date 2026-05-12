@@ -2439,13 +2439,39 @@ impl CraneliftBackend {
                                     }
                                 }
                                 HirCallable::Indirect(func_ptr_id) => {
-                                    // Indirect call through closure/function pointer
-                                    // The closure value IS the function pointer (for non-capturing lambdas)
-                                    let func_ptr_val = self.value_map.get(func_ptr_id).copied()
-                                        .unwrap_or_else(|| {
-                                            warn!(" Indirect call: function pointer {:?} not in value_map", func_ptr_id);
-                                            builder.ins().iconst(types::I64, 0)
-                                        });
+                                    // Indirect call through closure/function pointer.
+                                    // The closure value IS the function pointer (for
+                                    // non-capturing lambdas).
+                                    //
+                                    // If the func-ptr value isn't in `value_map`, the
+                                    // SSA referenced a value that was never defined
+                                    // (or never reached Cranelift via an emitted
+                                    // instruction). Historically we warned + fell
+                                    // back to `iconst(0)`, then `call_indirect`'d
+                                    // into address 0 — silent SIGSEGV at runtime
+                                    // with no path back to the actual cause. Same
+                                    // anti-pattern as the `lower_function` silent
+                                    // swallow (see ZYNTAX_LAMBDA_BODY_BUG.md "Update
+                                    // — silent-drop mechanism identified").
+                                    //
+                                    // Return a proper compile-time error instead.
+                                    // Blinc-side callers get a `CompilerError::Backend`
+                                    // pointing at the offending HirId; we can then
+                                    // chase the missing definition.
+                                    let func_ptr_val = match self.value_map.get(func_ptr_id).copied() {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(crate::CompilerError::Backend(format!(
+                                                "indirect call: function-pointer value {:?} \
+                                                 is referenced but never defined in this \
+                                                 function's value_map. SSA lowering produced \
+                                                 a call to a value that wasn't emitted by an \
+                                                 earlier instruction (CreateClosure / FuncRef \
+                                                 / Load / Parameter).",
+                                                func_ptr_id
+                                            )));
+                                        }
+                                    };
 
                                     // Create signature for the indirect call
                                     let mut sig = self.module.make_signature();
@@ -2827,12 +2853,25 @@ impl CraneliftBackend {
                             args,
                             return_ty,
                         } => {
-                            // Indirect call through function pointer (for trait dispatch)
+                            // Indirect call through function pointer (for
+                            // trait dispatch). Same silent-SIGSEGV anti-pattern
+                            // as the `HirCallable::Indirect` arm above —
+                            // hitting iconst(0) means we'd call_indirect into
+                            // address 0 at runtime. Surface the missing-value
+                            // as a real `CompilerError::Backend` so callers
+                            // (including Blinc) get a usable diagnostic
+                            // instead of a runtime crash.
                             let func_ptr_val = match self.value_map.get(func_ptr).copied() {
                                 Some(v) => v,
                                 None => {
-                                    log::trace!("[WARN] IndirectCall: func_ptr {:?} not found in value_map! Using 0.", func_ptr);
-                                    builder.ins().iconst(types::I64, 0)
+                                    return Err(crate::CompilerError::Backend(format!(
+                                        "IndirectCall: function-pointer value {:?} \
+                                         is referenced but never defined in this \
+                                         function's value_map. Trait-dispatch / fn-ptr \
+                                         lowering produced a call to a value that \
+                                         wasn't emitted by an earlier instruction.",
+                                        func_ptr
+                                    )));
                                 }
                             };
 
@@ -5728,7 +5767,21 @@ impl CraneliftBackend {
                         }
                     }
                     HirCallable::Indirect(func_ptr) => {
-                        let ptr_val = self.value_map[func_ptr];
+                        // Same missing-value handling as the other Indirect
+                        // arms above — surface a proper Backend error instead
+                        // of `self.value_map[func_ptr]` panicking with an
+                        // unhelpful index-out-of-bounds.
+                        let ptr_val = match self.value_map.get(func_ptr).copied() {
+                            Some(v) => v,
+                            None => {
+                                return Err(crate::CompilerError::Backend(format!(
+                                    "HirCallable::Indirect: function-pointer value {:?} \
+                                     is referenced but never defined in this function's \
+                                     value_map.",
+                                    func_ptr
+                                )));
+                            }
+                        };
                         // For indirect calls, we need a signature reference
                         // This is a simplified version - in reality we'd need to track function signatures
                         let sig_ref = builder.import_signature(self.module.make_signature());
