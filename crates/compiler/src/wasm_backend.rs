@@ -199,6 +199,22 @@ struct FunctionEmitter<'a> {
     n_params: u32,
 }
 
+/// Per-block state threaded through `emit_terminator` so jumps
+/// can translate HIR `Branch` / `CondBranch` targets into the right
+/// wasm `br` relative-depth + `$next_block` assignment for the
+/// dispatch-loop lowering. `None` in single-block functions — the
+/// terminator never `br`s, only `return`s.
+struct DispatchCtx<'b> {
+    /// Local index of the i32 "next block" dispatch variable.
+    next_block_local: u32,
+    /// Relative depth from the terminator's emission site outward
+    /// to the enclosing `loop`. `br loop_depth` re-enters the
+    /// dispatch table for the next block.
+    loop_depth: u32,
+    /// HIR block id → 0-based dispatch index.
+    block_indices: &'b HashMap<HirId, u32>,
+}
+
 impl<'a> FunctionEmitter<'a> {
     fn new(func: &'a HirFunction) -> Self {
         Self {
@@ -336,30 +352,200 @@ impl<'a> FunctionEmitter<'a> {
             }
         }
 
-        // Emit each basic block in insertion order. The initial
-        // slice only handles single-block functions; multi-block
-        // control flow comes in Phase E.3 with structured wasm
-        // emission (Block / Loop / If).
-        if self.func.blocks.len() > 1 {
-            return Err(WasmEmitError::Unsupported(format!(
-                "multi-block function ({} blocks); control flow lands in Phase E.3",
-                self.func.blocks.len()
-            )));
+        // Single-block fast path — straight-line code with one
+        // terminator, no dispatch infrastructure needed.
+        if self.func.blocks.len() == 1 {
+            let (_, block) = self
+                .func
+                .blocks
+                .iter()
+                .next()
+                .ok_or_else(|| WasmEmitError::Unsupported("function with no blocks".into()))?;
+            if !block.phis.is_empty() {
+                return Err(WasmEmitError::Unsupported(
+                    "phi node in single-block function (should be impossible)".into(),
+                ));
+            }
+            for inst in &block.instructions {
+                self.emit_instruction(&mut out, inst)?;
+            }
+            self.emit_terminator(&mut out, &block.terminator, None)?;
+            return Ok(out);
         }
 
-        let (_, block) = self
-            .func
-            .blocks
-            .iter()
-            .next()
-            .ok_or_else(|| WasmEmitError::Unsupported("function with no blocks".into()))?;
-
-        for inst in &block.instructions {
-            self.emit_instruction(&mut out, inst)?;
-        }
-        self.emit_terminator(&mut out, &block.terminator)?;
-
+        // Multi-block path — dispatch-loop lowering.
+        //
+        // Wasm only has structured control flow (`block`/`loop`/`if`
+        // with `br` to enclosing labels). HIR is an arbitrary CFG.
+        // The universal correct lowering: a `loop` wrapping a stack
+        // of `block`s with a `br_table` at the start that dispatches
+        // on a single i32 "next block" local. Each terminator either:
+        //   * sets `$next = <succ_idx>` and `br` to the loop header,
+        //   * or returns directly out of the function.
+        //
+        //   (loop $dispatch
+        //     (block $b_N-1
+        //       ...
+        //       (block $b_1
+        //         (block $b_0
+        //           (br_table 0 1 ... N-1 (local.get $next)))
+        //         ;; block 0 body + terminator
+        //       )
+        //       ;; block 1 body + terminator
+        //     )
+        //     ;; block N-1 body + terminator
+        //   )
+        //
+        // The dispatching label-stack depth equals the number of
+        // blocks. `br $dispatch` from inside (depth N) re-enters the
+        // loop and the `br_table` jumps to the right block on the
+        // next iteration. `Return` terminators don't `br` at all —
+        // they emit operands and `return`, leaving the entire loop
+        // structure intact.
+        //
+        // Phi nodes are NOT yet handled. A function with any
+        // `block.phis` non-empty bails to `Unsupported` so the
+        // interpreter keeps it in BC. Out-of-SSA via predecessor-
+        // edge moves lands in a follow-up (Phase E.3.1).
+        self.emit_multi_block(&mut out)?;
         Ok(out)
+    }
+
+    fn emit_multi_block(&mut self, out: &mut Vec<WasmInst<'static>>) -> Result<()> {
+        // Reject phis up front — see the docstring on `emit_body`.
+        for block in self.func.blocks.values() {
+            if !block.phis.is_empty() {
+                return Err(WasmEmitError::Unsupported(format!(
+                    "phi nodes (block {:?} has {} phis)",
+                    block.id,
+                    block.phis.len()
+                )));
+            }
+        }
+
+        // Assign a 0-based index to each block. Entry must be index
+        // 0 so the dispatch-loop falls into it on the first
+        // iteration (we initialise `$next = 0` implicitly via the
+        // default-zero of the local).
+        let entry = self.func.entry_block;
+        let mut block_indices: HashMap<HirId, u32> = HashMap::new();
+        let mut block_order: Vec<HirId> = Vec::new();
+        block_indices.insert(entry, 0);
+        block_order.push(entry);
+        for id in self.func.blocks.keys() {
+            if *id == entry {
+                continue;
+            }
+            block_indices.insert(*id, block_order.len() as u32);
+            block_order.push(*id);
+        }
+        let n_blocks = block_order.len() as u32;
+
+        // Allocate the "next block" dispatch local (i32). Its
+        // default-zero value picks `entry` (block 0) on first entry.
+        let next_block_local = self.n_params + self.locals.len() as u32;
+        self.locals.push(ValType::I32);
+
+        // Emit the loop + nested blocks. Walk depth from N-1 down
+        // to 0, opening a `block` at each step. The innermost
+        // `block` (depth 0, i.e. closest to the `br_table`) holds
+        // the dispatch; bodies fan out as we close blocks.
+        out.push(WasmInst::Loop(wasm_encoder::BlockType::Empty));
+
+        // Open one wasm `block` per HIR block.
+        for _ in 0..n_blocks {
+            out.push(WasmInst::Block(wasm_encoder::BlockType::Empty));
+        }
+
+        // br_table for dispatch. Targets are relative-depth indices
+        // from the br_table location outward:
+        //   depth 0 → innermost block → block 0 body
+        //   depth 1 → next block → block 1 body
+        //   ...
+        //   depth N-1 → outermost block → block N-1 body
+        //
+        // br_table's "default" target uses the same relative-depth
+        // scheme. We use depth 0 as the safe default — if a
+        // mis-set `$next` somehow falls through, it just executes
+        // the entry block again rather than corrupting control
+        // flow.
+        out.push(WasmInst::LocalGet(next_block_local));
+        out.push(WasmInst::BrTable(
+            (0..n_blocks).collect::<Vec<u32>>().into(),
+            0,
+        ));
+
+        // Emit each block's body followed by its `End` (closing the
+        // wasm `block` we opened above). Loop runs in `block_order`
+        // (entry first) so the textual emission order matches the
+        // index numbering.
+        for (depth_from_inside, block_id) in block_order.iter().enumerate() {
+            let block = &self.func.blocks[block_id];
+
+            // Close the surrounding `block` for THIS HIR block.
+            out.push(WasmInst::End);
+
+            // Instructions in this block.
+            for inst in &block.instructions {
+                self.emit_instruction(out, inst)?;
+            }
+
+            // Terminator. `dispatch_ctx` lets the terminator emit
+            // `br $dispatch` jumps via the right relative depth.
+            //
+            // After closing the `end` for THIS HIR block (just
+            // pushed above), we're sitting inside `n_blocks -
+            // depth_from_inside - 1` remaining wasm `block`s, which
+            // themselves sit inside the `loop`. Relative depth 0
+            // from this emission point is the nearest enclosing
+            // block (or the loop if all blocks have been closed).
+            //
+            // The `loop` label sits at relative depth equal to the
+            // count of enclosing wasm `block`s — NOT +1 — because
+            // br-to-loop counts the loop itself as one of the
+            // labels in scope.
+            //
+            //   for n_blocks = 2:
+            //     after closing inner block (depth_from_inside=0):
+            //       remaining outer blocks = 1, loop_depth = 1
+            //     after closing outer block (depth_from_inside=1):
+            //       remaining outer blocks = 0, loop_depth = 0
+            //
+            // CondBranch additionally opens an `if` block inside
+            // this scope, so depths emitted from inside the if/else
+            // body need +1 — handled at the terminator emit site.
+            let outer_blocks_remaining = (n_blocks as usize) - depth_from_inside - 1;
+            let loop_depth = outer_blocks_remaining as u32;
+            let dispatch_ctx = DispatchCtx {
+                next_block_local,
+                loop_depth,
+                block_indices: &block_indices,
+            };
+            self.emit_terminator(out, &block.terminator, Some(&dispatch_ctx))?;
+        }
+
+        // Close the outer `loop`, then emit `unreachable` at the
+        // function level. Two purposes:
+        //
+        // 1. **Trap on bug.** Every well-formed HIR terminator
+        //    either `return`s out of the function or `br`s back to
+        //    the loop header — control should never structurally
+        //    fall off the loop. `unreachable` makes "fell off" a
+        //    clean trap rather than executing into whatever
+        //    follows in the code section.
+        //
+        // 2. **Satisfy the function's return type.** The loop has
+        //    `BlockType::Empty`, so after its `end` the stack is
+        //    empty. The function's signature may demand an i64 /
+        //    f64; `unreachable` after the loop end makes the stack
+        //    polymorphic-bottom, which satisfies any expected
+        //    result type at the function end. Putting `unreachable`
+        //    *inside* the loop would leave an empty stack after the
+        //    loop closes and trip the wasm validator with "expected
+        //    i64 but nothing on stack".
+        out.push(WasmInst::End);
+        out.push(WasmInst::Unreachable);
+        Ok(())
     }
 
     fn emit_constant(
@@ -423,6 +609,7 @@ impl<'a> FunctionEmitter<'a> {
         &self,
         out: &mut Vec<WasmInst<'static>>,
         term: &HirTerminator,
+        dispatch: Option<&DispatchCtx<'_>>,
     ) -> Result<()> {
         match term {
             HirTerminator::Return { values } => {
@@ -430,6 +617,61 @@ impl<'a> FunctionEmitter<'a> {
                     out.push(self.local_get(*v)?);
                 }
                 out.push(WasmInst::Return);
+                Ok(())
+            }
+            HirTerminator::Branch { target } => {
+                let ctx = dispatch.ok_or_else(|| {
+                    WasmEmitError::Unsupported(
+                        "unconditional Branch in single-block function (should be unreachable)"
+                            .into(),
+                    )
+                })?;
+                // Set `$next = target_idx` then `br` to the loop
+                // header so the next iteration's `br_table` lands
+                // us in the target block.
+                let idx = *ctx
+                    .block_indices
+                    .get(target)
+                    .ok_or(WasmEmitError::UnknownValue(*target))?;
+                out.push(WasmInst::I32Const(idx as i32));
+                out.push(WasmInst::LocalSet(ctx.next_block_local));
+                out.push(WasmInst::Br(ctx.loop_depth));
+                Ok(())
+            }
+            HirTerminator::CondBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                let ctx = dispatch.ok_or_else(|| {
+                    WasmEmitError::Unsupported(
+                        "CondBranch in single-block function (should be unreachable)".into(),
+                    )
+                })?;
+                let true_idx = *ctx
+                    .block_indices
+                    .get(true_target)
+                    .ok_or(WasmEmitError::UnknownValue(*true_target))?;
+                let false_idx = *ctx
+                    .block_indices
+                    .get(false_target)
+                    .ok_or(WasmEmitError::UnknownValue(*false_target))?;
+                // Wasm `if`/`else` consumes an i32; HIR conditions
+                // are bool widened to i64 in our representation, so
+                // narrow it to i32 here. `i32.wrap_i64` truncates
+                // the low 32 bits which is exactly the right
+                // boolean check (any non-zero → true).
+                out.push(self.local_get(*condition)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(WasmInst::If(wasm_encoder::BlockType::Empty));
+                out.push(WasmInst::I32Const(true_idx as i32));
+                out.push(WasmInst::LocalSet(ctx.next_block_local));
+                out.push(WasmInst::Br(ctx.loop_depth + 1));
+                out.push(WasmInst::Else);
+                out.push(WasmInst::I32Const(false_idx as i32));
+                out.push(WasmInst::LocalSet(ctx.next_block_local));
+                out.push(WasmInst::Br(ctx.loop_depth + 1));
+                out.push(WasmInst::End);
                 Ok(())
             }
             other => Err(WasmEmitError::Unsupported(format!(
@@ -645,11 +887,38 @@ mod tests {
         m.validate_full().expect("module structurally valid");
     }
 
+    /// Build an empty extra block keyed by `id` and graft it onto
+    /// `func.blocks`. Helper for control-flow tests below.
+    fn add_block(
+        func: &mut HirFunction,
+        id: HirId,
+        instructions: Vec<HirInstruction>,
+        terminator: HirTerminator,
+    ) {
+        func.blocks.insert(
+            id,
+            HirBlock {
+                id,
+                label: None,
+                phis: Vec::new(),
+                instructions,
+                terminator,
+                dominance_frontier: HashSet::new(),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+            },
+        );
+    }
+
+    /// `def chained(): i64 { goto B; B: return 13 }` — entry block
+    /// unconditionally branches to a successor that returns. Tests
+    /// the dispatch-loop lowering with two blocks linked by a
+    /// `Branch` terminator and no phis.
     #[test]
-    fn unsupported_terminator_bails_cleanly() {
+    fn emits_two_block_branch_chain() {
         let sig = HirFunctionSignature {
             params: vec![],
-            returns: vec![],
+            returns: vec![HirType::I64],
             type_params: vec![],
             const_params: vec![],
             lifetime_params: vec![],
@@ -658,33 +927,157 @@ mod tests {
             effects: vec![],
             is_pure: false,
         };
-        let mut func = HirFunction::new(InternedString::new_global("twoblocks"), sig);
-        // Add a second block to force the multi-block branch.
-        let extra_block = HirId::new();
-        func.blocks.insert(
-            extra_block,
-            HirBlock {
-                id: extra_block,
-                label: None,
-                phis: Vec::new(),
-                instructions: Vec::new(),
-                terminator: HirTerminator::Return { values: vec![] },
-                dominance_frontier: HashSet::new(),
-                predecessors: Vec::new(),
-                successors: Vec::new(),
+        let mut func = HirFunction::new(InternedString::new_global("chained"), sig);
+        let thirteen = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(13)),
+        );
+
+        // Block B: returns the constant.
+        let b_id = HirId::new();
+        add_block(
+            &mut func,
+            b_id,
+            Vec::new(),
+            HirTerminator::Return {
+                values: vec![thirteen],
             },
         );
 
-        let r = WasmBackend::new().compile_function(&func);
-        match r {
+        // Entry block: unconditional branch to B.
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.terminator = HirTerminator::Branch { target: b_id };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit two-block chain");
+        m.validate_full().expect("module structurally valid");
+    }
+
+    /// `def pick(cond: bool): i64 { if cond then return 1 else return 2 }`
+    /// CondBranch with both arms returning — exercises `If`/`Else`
+    /// lowering of the two-target terminator and the I32WrapI64
+    /// narrowing of the boolean condition.
+    #[test]
+    fn emits_cond_branch_with_two_returning_arms() {
+        let cond_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: cond_id,
+                name: InternedString::new_global("cond"),
+                ty: HirType::Bool,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("pick"), sig);
+        // Param value-id with `Parameter(0)` kind so the use site
+        // can `local.get` it.
+        func.values.insert(
+            cond_id,
+            HirValue {
+                id: cond_id,
+                ty: HirType::Bool,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+
+        let one = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(1)),
+        );
+        let two = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(2)),
+        );
+
+        let then_id = HirId::new();
+        let else_id = HirId::new();
+        add_block(
+            &mut func,
+            then_id,
+            Vec::new(),
+            HirTerminator::Return { values: vec![one] },
+        );
+        add_block(
+            &mut func,
+            else_id,
+            Vec::new(),
+            HirTerminator::Return { values: vec![two] },
+        );
+
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.terminator = HirTerminator::CondBranch {
+            condition: cond_id,
+            true_target: then_id,
+            false_target: else_id,
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit cond-branch");
+        m.validate_full().expect("module structurally valid");
+    }
+
+    /// A phi node in any block still bails — out-of-SSA conversion
+    /// (Phase E.3.1) hasn't landed yet. Asserting the bail path
+    /// keeps the interpreter-fallback contract documented in code.
+    #[test]
+    fn phi_node_block_bails_cleanly() {
+        use crate::hir::HirPhi;
+        let sig = HirFunctionSignature {
+            params: vec![],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("withphi"), sig);
+        let phi_id = HirId::new();
+        // Inject a phi into the entry block.
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.phis.push(HirPhi {
+            result: phi_id,
+            ty: HirType::I64,
+            incoming: Vec::new(),
+        });
+        entry.terminator = HirTerminator::Return { values: vec![] };
+        // Add a second block so we hit `emit_multi_block` (single
+        // block also rejects phis via the `if blocks.len() == 1`
+        // path, but the multi-block check is the one we want to
+        // exercise here).
+        let b = HirId::new();
+        add_block(
+            &mut func,
+            b,
+            Vec::new(),
+            HirTerminator::Return { values: vec![] },
+        );
+
+        match WasmBackend::new().compile_function(&func) {
             Err(WasmEmitError::Unsupported(msg)) => {
                 assert!(
-                    msg.contains("multi-block"),
-                    "expected multi-block bail, got: {}",
-                    msg
+                    msg.contains("phi"),
+                    "expected phi-related Unsupported, got: {msg}"
                 );
             }
-            other => panic!("expected unsupported error, got {:?}", other),
+            other => panic!("expected Unsupported, got {:?}", other),
         }
     }
 }
