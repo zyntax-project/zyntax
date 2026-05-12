@@ -1176,6 +1176,40 @@ pub struct HirInterpreter {
     /// this to short-circuit hot functions). `None` falls through.
     #[allow(clippy::type_complexity)]
     tick_callbacks: HashMap<HirId, Box<dyn FnMut() -> Option<JitDispatch> + Send>>,
+    /// Wasm-JIT compile hook (Phase E.6 — wasm32 only path).
+    ///
+    /// Called the first time a function crosses
+    /// `wasm_jit_threshold` invocations. The host (zyntax_wasm
+    /// crate) wires this to:
+    ///   1. `WasmBackend::compile_function(func)` to produce wasm bytes,
+    ///   2. ship the bytes to JS via a wasm-bindgen extern,
+    ///   3. JS `WebAssembly.compile + instantiate`s + stashes the exported function in a funcref table,
+    ///   4. returns the table index as the `u32` handle.
+    ///
+    /// Returning `None` keeps the function in BC forever (clean
+    /// fallback for HIR shapes the wasm emitter can't lower yet).
+    #[allow(clippy::type_complexity)]
+    wasm_compile_hook: Option<Box<dyn FnMut(&HirFunction) -> Option<u32> + Send>>,
+    /// Wasm-JIT dispatch hook. Once a function has a cached handle,
+    /// every subsequent call routes through this hook instead of
+    /// the BC dispatch loop. The host implementation dispatches via
+    /// a wasm-bindgen extern that takes (handle, args).
+    ///
+    /// The args slice carries `ZyntaxValue`s in the same i64-/f64-
+    /// funneled form as `call_extern_symbol` (the FFI ABI); the
+    /// hook narrows / boxes them on the JS side per the function's
+    /// signature.
+    #[allow(clippy::type_complexity)]
+    wasm_dispatch_hook:
+        Option<Box<dyn FnMut(u32, &[ZyntaxValue]) -> Result<ZyntaxValue, InterpError> + Send>>,
+    /// Cached `u32` handles returned by the wasm compile hook,
+    /// keyed by HIR function id. Presence triggers dispatch via
+    /// `wasm_dispatch_hook`.
+    wasm_jit_handles: HashMap<HirId, u32>,
+    /// Hot threshold for the wasm tier-up. Defaults to 1 so the
+    /// demo path JITs on first reuse; tunable via
+    /// [`Self::set_wasm_jit_threshold`].
+    wasm_jit_threshold: u64,
 }
 
 /// When a `tick_callback` returns one of these, the interpreter
@@ -1206,6 +1240,10 @@ impl HirInterpreter {
             memory: Memory::new(),
             cache: HashMap::new(),
             tick_callbacks: HashMap::new(),
+            wasm_compile_hook: None,
+            wasm_dispatch_hook: None,
+            wasm_jit_handles: HashMap::new(),
+            wasm_jit_threshold: 1,
         }
     }
 
@@ -1223,6 +1261,39 @@ impl HirInterpreter {
         cb: Box<dyn FnMut() -> Option<JitDispatch> + Send>,
     ) {
         self.tick_callbacks.insert(func_id, cb);
+    }
+
+    /// Install the wasm-JIT compile hook. See [`Self::wasm_compile_hook`]
+    /// docs. Called at most once per function — the returned handle is
+    /// cached for all subsequent calls.
+    pub fn set_wasm_compile_hook(
+        &mut self,
+        hook: Box<dyn FnMut(&HirFunction) -> Option<u32> + Send>,
+    ) {
+        self.wasm_compile_hook = Some(hook);
+    }
+
+    /// Install the wasm-JIT dispatch hook. Called every time a function
+    /// with a cached handle is invoked. See [`Self::wasm_dispatch_hook`]
+    /// docs.
+    pub fn set_wasm_dispatch_hook(
+        &mut self,
+        hook: Box<dyn FnMut(u32, &[ZyntaxValue]) -> Result<ZyntaxValue, InterpError> + Send>,
+    ) {
+        self.wasm_dispatch_hook = Some(hook);
+    }
+
+    /// Tune the wasm-JIT hot threshold (default 1 — JIT on first
+    /// reuse). 0 means JIT eagerly on first call; large values keep
+    /// functions in BC longer.
+    pub fn set_wasm_jit_threshold(&mut self, n: u64) {
+        self.wasm_jit_threshold = n;
+    }
+
+    /// Whether `func_id` has a cached wasm-JIT handle. Diagnostic /
+    /// test hook; production callers don't need to know.
+    pub fn has_wasm_jit_handle(&self, func_id: HirId) -> bool {
+        self.wasm_jit_handles.contains_key(&func_id)
     }
 
     /// Profile snapshot for a function.
@@ -1252,13 +1323,51 @@ impl HirInterpreter {
         args: Vec<ZyntaxValue>,
     ) -> Result<ZyntaxValue, InterpError> {
         // Profile.
-        self.profile.entry(func_id).or_default().call_count += 1;
+        let call_count = {
+            let p = self.profile.entry(func_id).or_default();
+            p.call_count += 1;
+            p.call_count
+        };
+
+        // Wasm-JIT fast path. If we already have a handle, route
+        // straight to the host's dispatch hook — same role the
+        // native tick_callback plays for Cranelift / LLVM ptrs, but
+        // through an opaque u32 handle (a JS funcref table index)
+        // because wasm32 doesn't have addressable function ptrs.
+        if let Some(handle) = self.wasm_jit_handles.get(&func_id).copied() {
+            if let Some(cb) = self.wasm_dispatch_hook.as_mut() {
+                return cb(handle, &args);
+            }
+            // Dispatch hook was uninstalled after compile fired —
+            // stale handle, drop it and fall back to BC.
+            self.wasm_jit_handles.remove(&func_id);
+        }
 
         // Tier-1 shortcut: if a JIT dispatch is ready for this fn,
-        // call it instead of interpreting.
+        // call it instead of interpreting (native Cranelift / LLVM
+        // path).
         if let Some(cb) = self.tick_callbacks.get_mut(&func_id) {
             if let Some(dispatch) = cb() {
                 return Ok(call_jit_dispatch(dispatch, &args));
+            }
+        }
+
+        // Wasm-JIT hot detection. Once `call_count` crosses the
+        // threshold, hand the HirFunction to the host compile hook.
+        // Hook returns `Some(handle)` on success, `None` on failure
+        // (unsupported HIR shape) — in either case we still run the
+        // current call through BC; the JIT entry kicks in on the
+        // NEXT invocation.
+        if call_count >= self.wasm_jit_threshold
+            && !self.wasm_jit_handles.contains_key(&func_id)
+            && self.wasm_compile_hook.is_some()
+        {
+            if let Some(func) = module.functions.get(&func_id) {
+                if let Some(hook) = self.wasm_compile_hook.as_mut() {
+                    if let Some(handle) = hook(func) {
+                        self.wasm_jit_handles.insert(func_id, handle);
+                    }
+                }
             }
         }
 

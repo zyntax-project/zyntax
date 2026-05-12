@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
 # Direct access to `compile_to_hir` + `CompilationConfig`. The
 # embed crate re-exports HirInterpreter but not the lowering API.
-zyntax_compiler = { path = "../compiler", default-features = false }
+zyntax_compiler = { path = "../compiler", default-features = false, features = ["wasm-jit"] }
 # Plugin SDK so we can construct `zrtl::StaticPlugin` instances.
 zrtl = { path = "../../sdk/zrtl" }
 

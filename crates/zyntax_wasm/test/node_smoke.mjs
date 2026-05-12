@@ -63,6 +63,36 @@ async function main() {
         );
     }
 
+    // Phase E.8: hot-function tier-up smoke test. The interpreter's
+    // default `wasm_jit_threshold` is 1, so the SECOND call to a
+    // function should hit the wasm-encoder JIT. We can't observe
+    // the tier transition from the host today (no diagnostic
+    // counter export yet), but we CAN verify two things:
+    //   1. A program that calls `main()` once still works (already
+    //      covered by the cases above).
+    //   2. A program that calls a helper function twice from main
+    //      — exercising the second-call JIT path — still returns
+    //      the correct value. If the JIT install failed midway or
+    //      the dispatch hook returned a wrong value, this would
+    //      regress against the interpreter answer.
+    {
+        // Two calls to the same helper from `main` — the FIRST call
+        // installs the wasm-JIT handle (threshold = 1), the SECOND
+        // call routes through the JS dispatch shim. If JIT install
+        // or dispatch were broken we'd either crash here or get the
+        // wrong value back.
+        const src =
+            "def trivial(): i64 { return 99 }\n" +
+            "def main(): i64 { return trivial() + trivial() }\n";
+        const r = await run(src);
+        check("hot-function via helper call ok", r.ok === true, `output=${r.output}`);
+        check(
+            "hot-function tier-up preserves return value",
+            r.output === "198",
+            `got '${r.output}'`,
+        );
+    }
+
     console.log("");
     if (failed === 0) {
         console.log("All checks passed.");

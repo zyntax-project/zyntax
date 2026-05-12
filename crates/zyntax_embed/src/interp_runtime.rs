@@ -270,6 +270,38 @@ impl InterpRuntime {
         self.interp.register_symbol(name, ptr, param_count);
     }
 
+    /// Install the wasm-JIT compile + dispatch hooks on the BC
+    /// interpreter (Phase E.6 — wasm32-target tier-up path).
+    ///
+    /// The compile hook is invoked the first time a function crosses
+    /// the interpreter's `wasm_jit_threshold` invocation count; the
+    /// host returns an opaque `u32` handle (a JS-side funcref table
+    /// index) or `None` to keep the function in BC. The dispatch
+    /// hook then routes all future calls to that function through
+    /// the matching JS extern.
+    ///
+    /// The corresponding native ladder uses `set_jit_compiler` (BC →
+    /// Cranelift → LLVM via fn pointers). The wasm path is split
+    /// out because wasm32 has no addressable function pointers —
+    /// dispatch has to go through a JS-owned funcref table.
+    #[allow(clippy::type_complexity)]
+    pub fn install_wasm_jit_hooks(
+        &mut self,
+        compile: Box<dyn FnMut(&zyntax_compiler::hir::HirFunction) -> Option<u32> + Send>,
+        dispatch: Box<
+            dyn FnMut(
+                    u32,
+                    &[zyntax_compiler::value::ZyntaxValue],
+                ) -> Result<
+                    zyntax_compiler::value::ZyntaxValue,
+                    zyntax_compiler::hir_interp::InterpError,
+                > + Send,
+        >,
+    ) {
+        self.interp.set_wasm_compile_hook(compile);
+        self.interp.set_wasm_dispatch_hook(dispatch);
+    }
+
     /// Register a statically-linked ZRTL plugin into the BC
     /// interpreter's FFI table. Wasm-shim equivalent of
     /// `ZyntaxRuntime::register_static_plugin` — same SDK

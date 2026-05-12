@@ -18,6 +18,8 @@
 
 use wasm_bindgen::prelude::*;
 
+use zyntax_compiler::hir_interp::InterpError;
+use zyntax_compiler::wasm_backend::WasmBackend;
 use zyntax_embed::interp_runtime::InterpRuntime;
 use zyntax_embed::{Grammar2, ZyntaxString, ZyntaxValue};
 
@@ -109,6 +111,142 @@ pub fn version() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Wasm-JIT hooks (Phase E.6 + E.7)
+// ---------------------------------------------------------------------------
+//
+// The interpreter (zyntax_compiler::hir_interp) keeps every cold call
+// in bytecode. When a function's call count crosses the hot
+// threshold the interpreter calls our `compile_hook` with the
+// `HirFunction`; we run `WasmBackend::compile_function`, ship the
+// emitted wasm bytes to JS via `_zyntax_jit_install`, and store the
+// returned funcref table index as the function's JIT handle. On
+// every subsequent call the interpreter routes through
+// `_zyntax_jit_call_*` (one extern per arity) instead of running BC.
+//
+// JS holds the funcref table off-wasm because:
+//   * wasm32 has no addressable function pointers; only table indices.
+//   * `WebAssembly.compile(bytes)` lives on the JS side anyway, so
+//     it makes sense for JS to own the table the resulting Instance's
+//     exports live in.
+//
+// The host page provides three globals (see `web/zynml.mjs`):
+//   * `_zyntax_jit_install(bytes_ptr, bytes_len) -> u32` — install
+//     a freshly-emitted wasm module, returns its table index.
+//   * `_zyntax_jit_call_0_i64(handle) -> i64` — zero-arg dispatch
+//     for `entry` exports that return i64.
+//
+// (Higher-arity dispatch externs land in Phase E.6.1 once `WasmBackend`
+// emits multi-arg call sites.)
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    /// JS-provided shim:
+    ///
+    /// ```js
+    /// globalThis._zyntax_jit_install = (bytes) => {
+    ///   const mod  = new WebAssembly.Module(bytes);
+    ///   const inst = new WebAssembly.Instance(mod, { /* imports */ });
+    ///   return jitRegistry.push(inst.exports.entry) - 1;
+    /// };
+    /// ```
+    ///
+    /// `bytes` arrives as a `Uint8Array` — wasm-bindgen marshalls
+    /// the `&[u8]` through linear memory automatically. Returns
+    /// `u32::MAX` (0xFFFFFFFF) to signal failure; we drop that
+    /// handle and keep the function in BC.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _zyntax_jit_install)]
+    fn js_jit_install(bytes: &[u8]) -> u32;
+
+    /// Zero-arg / i64-return dispatch shim:
+    ///
+    /// ```js
+    /// globalThis._zyntax_jit_call_0_i64 = (handle) =>
+    ///   jitRegistry[handle]();
+    /// ```
+    ///
+    /// JIT'd `entry` exports return wasm `i64` which wasm-bindgen
+    /// surfaces as a JS `BigInt`. The shim returns it directly;
+    /// wasm-bindgen marshalls back to Rust `i64` on the boundary.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _zyntax_jit_call_0_i64)]
+    fn js_jit_call_0_i64(handle: u32) -> i64;
+}
+
+// Non-wasm32 stubs so the crate's `cargo test` (native target) can
+// still build. The native test pipeline doesn't exercise the JIT
+// hooks — wasm-pack + Node.js does (see `test/node_smoke.mjs`).
+#[cfg(not(target_arch = "wasm32"))]
+fn js_jit_install(_bytes: &[u8]) -> u32 {
+    u32::MAX
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_jit_call_0_i64(_handle: u32) -> i64 {
+    0
+}
+
+/// Sentinel returned from `_zyntax_jit_install` on JS-side failure.
+/// Matches the docstring on the extern above.
+const JIT_INSTALL_FAILED: u32 = u32::MAX;
+
+/// Install the wasm-JIT compile + dispatch hooks on an
+/// `InterpRuntime`. Called from `run_impl` once per fresh runtime.
+///
+/// The compile hook:
+///   * runs `WasmBackend::compile_function`,
+///   * hands the bytes to JS, gets a handle back,
+///   * returns `Some(handle)` on success and `None` on failure
+///     (unsupported HIR shape, JS-side install failure, function
+///     signature outside our zero-arg-i64-return demo coverage).
+///
+/// The dispatch hook unboxes the args to match the function's
+/// signature and calls the matching `js_jit_call_*` extern. For now
+/// only `() -> i64` is supported; anything else bails out as
+/// `InterpError::Host(...)`.
+fn register_wasm_jit_hooks(rt: &mut InterpRuntime) {
+    let backend = WasmBackend::new();
+    let compile_hook = Box::new(
+        move |func: &zyntax_compiler::hir::HirFunction| -> Option<u32> {
+            // Only zero-arg / single-i64-return for now. Anything else
+            // stays BC — matches the WasmBackend coverage gates.
+            if !func.signature.params.is_empty() {
+                return None;
+            }
+            if func.signature.returns.len() != 1
+                || !matches!(
+                    func.signature.returns[0],
+                    zyntax_compiler::hir::HirType::I64
+                )
+            {
+                return None;
+            }
+            let module = backend.compile_function(func).ok()?;
+            let handle = js_jit_install(&module.bytes);
+            if handle == JIT_INSTALL_FAILED {
+                None
+            } else {
+                Some(handle)
+            }
+        },
+    );
+
+    let dispatch_hook = Box::new(
+        |handle: u32, args: &[ZyntaxValue]| -> Result<ZyntaxValue, InterpError> {
+            if !args.is_empty() {
+                return Err(InterpError::Host(
+                    "wasm-JIT dispatch: only zero-arg functions supported in this slice"
+                        .to_string(),
+                ));
+            }
+            let raw = js_jit_call_0_i64(handle);
+            Ok(ZyntaxValue::Int(raw))
+        },
+    );
+
+    rt.install_wasm_jit_hooks(compile_hook, dispatch_hook);
+}
+
+// ---------------------------------------------------------------------------
 // Static plugin registration
 // ---------------------------------------------------------------------------
 //
@@ -172,9 +310,11 @@ fn run_impl(source: &str) -> RunResult {
     };
 
     // 3. Spin up an interpreter, register any statically-linked
-    //    plugins, and dispatch `main`.
+    //    plugins, wire the wasm-JIT tier-up hooks, and dispatch
+    //    `main`.
     let mut rt = InterpRuntime::new();
     register_static_plugins(&mut rt);
+    register_wasm_jit_hooks(&mut rt);
     rt.compile_module(hir_module);
 
     match rt.call_function("main", vec![]) {
