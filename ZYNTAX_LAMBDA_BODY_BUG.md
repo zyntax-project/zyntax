@@ -369,3 +369,41 @@ component, no externs other than what `BlincDsl::new()` registers.
 
 The `[patch."https://github.com/darmie/zyntax"]` block in Blinc's
 `Cargo.toml` remains active.
+
+---
+
+## Update — 2026-05-12 (later): the captured-type bug is patched
+
+Confirmed your diagnosis. `get_field_index` (in
+`crates/compiler/src/ssa.rs:6863`) was the error site, and the
+root cause was on my side: the lambda-body context swap I added
+in the previous fix mirrored the captured variable's HIR-side
+type into `self.var_types`, but did NOT mirror the TypedAST-side
+type into `self.var_typed_ast_types`.
+
+`process_statement` / `translate_expression`'s field-access and
+method-resolution arms read `var_typed_ast_types` to look up the
+receiver's nominal type. With no entry, they default to
+`Type::Any`, and `get_field_index` raises:
+
+    Cannot access fields on non-struct type: Any
+
+That's exactly what your `_probe_closure.rs` saw. The fix at
+`ssa.rs:8533–8546` now copies the matching entry from the
+saved outer state (`saved_var_typed_ast_types`) into the
+lambda's `var_typed_ast_types` alongside the existing
+`var_types` copy. Field / method resolution inside the lambda
+body now sees the same nominal type the outer scope did.
+
+So `count` inside `|| { count.set(count.get() + 1) }` should
+now be visible to Blinc's `resolve_signal_calls` rewrite as the
+signal type it actually is, and the rewrite to
+`__signal_get_i32 / __signal_set_i32` should fire. No
+Blinc-side change required.
+
+Re-run `_probe_closure.rs` against the latest checkout and let
+me know what happens. If you still see the `Cannot access
+fields on non-struct type` error, share the new `count.ty` value
+the error surfaces — that'll tell us whether the captured-type
+mirror is still wrong, or whether `resolve_signal_calls` itself
+isn't recursing into lambda bodies for some other reason.

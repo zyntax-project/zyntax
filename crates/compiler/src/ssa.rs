@@ -8528,6 +8528,21 @@ impl SsaBuilder {
                     );
                     entry_defs.insert(*name, new_id);
                     self.var_types.insert(*name, outer_value.ty.clone());
+                    // ALSO mirror the TypedAST-side type. Field /
+                    // method resolution in `process_statement`
+                    // reads `var_typed_ast_types` to look up the
+                    // receiver's nominal type — without this entry
+                    // it defaults to `Type::Any` and `.field` /
+                    // `.method()` access bails with `Cannot access
+                    // fields on non-struct type: Any`. That's
+                    // exactly the path the Blinc-side `count.set(...)`
+                    // pattern hit (see ZYNTAX_LAMBDA_BODY_BUG.md
+                    // "Update — what Blinc should do next" section).
+                    if let Some(outer_typed_ast_ty) =
+                        saved_var_typed_ast_types.get(name).cloned()
+                    {
+                        self.var_typed_ast_types.insert(*name, outer_typed_ast_ty);
+                    }
                 }
             }
             self.definitions.insert(entry_block_id, entry_defs);
