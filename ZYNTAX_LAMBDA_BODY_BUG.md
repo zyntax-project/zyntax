@@ -635,3 +635,32 @@ latest checkout. Either:
    Share that log; we'll see if the name truly isn't in either
    map (a different bug), or if some shape escapes both
    fallbacks.
+
+---
+
+## Update — 2026-05-12: cascade-panic fix landed
+
+The latent `FunctionBuilderContext` cascade-panic described in the
+"Cascade panic" section above is now fixed. `compile_function_body`
+([crates/compiler/src/cranelift_backend.rs:971](crates/compiler/src/cranelift_backend.rs#L971))
+resets its per-function scratch state at function entry rather than
+relying on the success path's tail to clean up:
+
+```rust
+self.builder_context = FunctionBuilderContext::new();
+self.codegen_context.clear();
+self.value_map.clear();
+self.block_map.clear();
+```
+
+This decouples error paths from the next call's correctness. Any
+future `?` early-return between `FunctionBuilder::new` and
+`builder.finalize()` is now automatically safe — the next iteration
+of `compile_module`'s loop starts with a clean context regardless
+of how the previous one exited. The Cranelift assertion
+`assertion failed: func_ctx.is_empty()` cannot fire from this
+cascade anymore; future errors surface as clean
+`CompilerError::Backend(...)` values to the caller.
+
+Workspace tests pass (zyntax_compiler: 150 unit + integration tests
+green, clippy clean, fmt clean).

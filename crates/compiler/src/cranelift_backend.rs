@@ -974,6 +974,26 @@ impl CraneliftBackend {
         function: &HirFunction,
         hir_module: &HirModule,
     ) -> CompilerResult<()> {
+        // Reset per-function scratch state on every entry. The success
+        // path clears these at the *end* of the function (~line 4784);
+        // the OSR helper error path clears them inline. But any error
+        // returning via `?` between `FunctionBuilder::new`
+        // (~line 1365) and `builder.finalize()` (~line 4705) leaves
+        // them dirty. The next call to this function then crashes
+        // inside Cranelift instead of producing a clean compiler
+        // error — `FunctionBuilder::new` asserts its context is
+        // empty: `assertion failed: func_ctx.is_empty()`. The Blinc
+        // bug (ZYNTAX_LAMBDA_BODY_BUG.md, "Cascade panic" section)
+        // hit exactly this cascade.
+        //
+        // Resetting at entry is cheap and decouples error paths from
+        // the next call's correctness — any future early-return is
+        // automatically safe.
+        self.builder_context = FunctionBuilderContext::new();
+        self.codegen_context.clear();
+        self.value_map.clear();
+        self.block_map.clear();
+
         // Get the already-declared function ID. In OSR-helper mode the
         // FuncId comes from `compile_osr_func_id` (set by the helper
         // emission code) since the helper isn't in `function_map`.
@@ -2458,10 +2478,12 @@ impl CraneliftBackend {
                                     // Blinc-side callers get a `CompilerError::Backend`
                                     // pointing at the offending HirId; we can then
                                     // chase the missing definition.
-                                    let func_ptr_val = match self.value_map.get(func_ptr_id).copied() {
-                                        Some(v) => v,
-                                        None => {
-                                            return Err(crate::CompilerError::Backend(format!(
+                                    let func_ptr_val =
+                                        match self.value_map.get(func_ptr_id).copied() {
+                                            Some(v) => v,
+                                            None => {
+                                                return Err(crate::CompilerError::Backend(
+                                                    format!(
                                                 "indirect call: function-pointer value {:?} \
                                                  is referenced but never defined in this \
                                                  function's value_map. SSA lowering produced \
@@ -2469,9 +2491,10 @@ impl CraneliftBackend {
                                                  earlier instruction (CreateClosure / FuncRef \
                                                  / Load / Parameter).",
                                                 func_ptr_id
-                                            )));
-                                        }
-                                    };
+                                            ),
+                                                ));
+                                            }
+                                        };
 
                                     // Create signature for the indirect call
                                     let mut sig = self.module.make_signature();
