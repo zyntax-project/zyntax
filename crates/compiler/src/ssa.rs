@@ -3073,7 +3073,19 @@ impl SsaBuilder {
 
                 // `@` must dispatch through MatMul::matmul; do not silently alias to numeric `mul`.
                 if matches!(op, FrontendOp::MatMul) {
-                    return Err(crate::CompilerError::Analysis(format!(
+                    // Lowering, not Analysis — `lower_declaration`
+                    // routes Analysis errors through silent-drop
+                    // (consistent with the historic
+                    // yield-outside-compute policy). A missing
+                    // matmul impl is a true lowering failure: the
+                    // source asked for an operation that has no HIR
+                    // encoding for the operand type, so the function
+                    // can't be lowered at all and the caller must
+                    // hear about it. Surfacing the error as Lowering
+                    // makes `test_matmul_missing_impl_reports_clear_error`
+                    // pass while leaving Analysis routing intact for
+                    // genuinely-recoverable cases.
+                    return Err(crate::CompilerError::Lowering(format!(
                         "matrix multiplication '@' requires MatMul::matmul implementation for lhs type {:?}",
                         left_with_type.ty
                     )));
@@ -6546,8 +6558,11 @@ impl SsaBuilder {
             );
             crate::hir::HirCallable::Symbol(runtime_symbol)
         } else if matches!(op, FrontendOp::MatMul) {
-            // MatMul must not silently fall back.
-            return Err(crate::CompilerError::Analysis(format!(
+            // MatMul must not silently fall back. Use Lowering, not
+            // Analysis — see the comment on the sibling MatMul error
+            // site above for why this category-not-Analysis matters
+            // for `lower_declaration`'s silent-drop routing.
+            return Err(crate::CompilerError::Lowering(format!(
                 "matrix multiplication '@' requires MatMul::matmul implementation for type {:?} (expected '{}' or '{}')",
                 left_type, function_candidates[0], function_candidates[1]
             )));
@@ -8905,7 +8920,7 @@ impl SsaBuilder {
                 )?;
 
                 if matches!(bin.op, zyntax_typed_ast::typed_ast::BinaryOp::MatMul) {
-                    return Err(crate::CompilerError::Analysis(
+                    return Err(crate::CompilerError::Lowering(
                         "matrix multiplication '@' requires trait dispatch and is not supported in lambda const lowering".to_string(),
                     ));
                 }

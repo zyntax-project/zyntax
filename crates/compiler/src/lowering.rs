@@ -1847,8 +1847,41 @@ impl LoweringContext {
                         );
                         self.symbols.functions.remove(&func.name);
                     }
-                } else {
-                    self.lower_function(func)?;
+                } else if let Err(e) = self.lower_function(func) {
+                    // Two error classes from lower_function:
+                    //
+                    //   * `CompilerError::Analysis(...)` — the body
+                    //     is structurally well-formed but uses a
+                    //     construct in a way the analyser rejects
+                    //     (`yield` outside `compute`, await inside
+                    //     a non-async fn, …). Skip the function,
+                    //     warn, and continue: the rest of the
+                    //     module is still useful and the surface
+                    //     semantic test (`functions.is_empty()`)
+                    //     catches that this specific fn didn't
+                    //     export.
+                    //
+                    //   * Everything else (`Lowering`, `Backend`,
+                    //     `Optimization`) — propagate. These point
+                    //     at SSA-builder bugs or genuinely
+                    //     malformed input (e.g. the Blinc-side
+                    //     `render_view` silently dropping —
+                    //     ZYNTAX_LAMBDA_BODY_BUG.md). Surfacing
+                    //     them is what turned a confusing
+                    //     "Function not found: render_view" into
+                    //     an actionable lowering error.
+                    let func_name = func.name.resolve_global().unwrap_or_default();
+                    if matches!(e, crate::CompilerError::Analysis(_)) {
+                        LOWERING_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+                        log::warn!(
+                            "[LOWERING] skipping function '{}' due to analysis error: {}",
+                            func_name,
+                            e,
+                        );
+                        self.symbols.functions.remove(&func.name);
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
 

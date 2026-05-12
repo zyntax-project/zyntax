@@ -206,6 +206,20 @@ pub struct CompilationConfig {
     pub enable_borrow_check: bool,
     /// Enable effect analysis and checking (validates algebraic effect usage)
     pub enable_effect_check: bool,
+    /// Extern aliases to inject into `extern_link_names` before SSA
+    /// lowering. Each entry maps an in-source identifier the program
+    /// will reference (e.g. `__signal_set_i32`) to the registered
+    /// host symbol name (e.g. `$Signal$set_i32`). Without an entry
+    /// here a call to that identifier lowers as
+    /// `HirCallable::Function(...)` and the wasm backend currently
+    /// rejects internal-function dispatch (E.5.2+ work). Adding the
+    /// alias routes the call through `HirCallable::Symbol(name)`,
+    /// which the wasm backend imports as
+    /// `(import "extern" "<name>@<arity>" …)`. The interpreter and
+    /// Cranelift backends both treat Symbol calls as FFI lookups
+    /// against the runtime's registered-symbol table, so the same
+    /// declaration works across native + wasm.
+    pub builtins: indexmap::IndexMap<String, String>,
 }
 
 impl std::fmt::Debug for CompilationConfig {
@@ -241,6 +255,7 @@ impl Default for CompilationConfig {
             import_resolver: None,
             enable_borrow_check: false, // Disabled by default for now
             enable_effect_check: true,  // Enable effect checking by default
+            builtins: indexmap::IndexMap::new(),
         }
     }
 }
@@ -1432,7 +1447,13 @@ pub fn compile_to_hir(
         hot_reload: config.hot_reload,
         strict_mode: false, // Default to non-strict
         import_resolver: config.import_resolver.clone(),
-        builtins: indexmap::IndexMap::new(), // Empty - callers with grammar should use runtime directly
+        // Forward caller-supplied extern aliases. The wasm shim
+        // uses this to inject test-only externs (e.g. `__zw_test_double`)
+        // so source-level calls lower as `HirCallable::Symbol`,
+        // which is the only callee variant the wasm backend
+        // currently emits. Callers that don't need any aliases
+        // (the default) pass an empty map.
+        builtins: config.builtins.clone(),
         use_krio_async: false,
     };
 

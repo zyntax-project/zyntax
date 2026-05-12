@@ -572,6 +572,7 @@ fn test_compilation_pipeline_all_features() {
         import_resolver: None,
         enable_borrow_check: false,
         enable_effect_check: true,
+        builtins: indexmap::IndexMap::new(),
     };
 
     let result = compile_to_hir(&mut program, type_registry, config);
@@ -650,6 +651,7 @@ fn test_compilation_pipeline_with_memory_optimizations() {
         import_resolver: None,
         enable_borrow_check: false,
         enable_effect_check: true,
+        builtins: indexmap::IndexMap::new(),
     };
 
     let result = compile_to_hir(&mut program, type_registry, config);

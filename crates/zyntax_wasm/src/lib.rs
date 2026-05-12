@@ -513,10 +513,27 @@ fn register_wasm_jit_hooks(rt: &mut InterpRuntime) {
 //         rt.register_static_plugin(zrtl_string::static_plugin());
 //         // ...
 //     }
-fn register_static_plugins(_rt: &mut InterpRuntime) {
+fn register_static_plugins(rt: &mut InterpRuntime) {
     // Intentionally empty for the initial demo: a pure-arithmetic
     // `def main(): i64 { ... }` exercises the parse → lower →
     // interpret pipeline without needing any ZRTL symbols.
+
+    // Phase E.5 end-to-end smoke test extern. `__zw_test_double` is
+    // a host-provided extern that doubles its single i64 argument.
+    // Used by `test/node_smoke.mjs` to verify the JIT'd module →
+    // JS dispatcher → `_zyntax_call_extern_1` → ACTIVE_SYMBOLS →
+    // transmute path actually executes a host call correctly.
+    // Always registered (cheap; just adds one entry to the symbol
+    // table) so the smoke test doesn't need a feature flag.
+    rt.register_symbol("__zw_test_double", __zw_test_double as *const u8, 1);
+}
+
+/// Test-only extern: doubles its argument. Lives outside the
+/// `register_static_plugins` body so its address survives across
+/// runtime tear-downs and can safely be transmuted to
+/// `extern "C" fn(i64) -> i64` inside `_zyntax_call_extern_1`.
+extern "C" fn __zw_test_double(x: i64) -> i64 {
+    x.wrapping_mul(2)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +573,17 @@ fn run_impl(source: &str) -> RunResult {
     // The interpreter consumes HIR directly, so disable HIR-level
     // optimisations that target the Cranelift consumer.
     config.opt_level = 0;
+    // Inject extern aliases the wasm-only test surface needs. Each
+    // entry goes into `LoweringConfig.builtins` → `extern_link_names`
+    // BEFORE the source's `collect_declarations` runs. SSA's Call
+    // arm checks `extern_link_names` and emits `HirCallable::Symbol`
+    // — which is the only callee shape `WasmBackend` currently
+    // emits to a wasm `(import "extern" "<name>@<arity>" …)`. The
+    // matching host symbol is registered in `register_static_plugins`.
+    config.builtins.insert(
+        "__zw_test_double".to_string(),
+        "__zw_test_double".to_string(),
+    );
     let hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config) {
         Ok(m) => m,
         Err(e) => return compile_err(format!("HIR lowering failed: {e}")),

@@ -93,6 +93,35 @@ async function main() {
         );
     }
 
+    // Phase E.5 end-to-end: a hot function whose body calls a host-
+    // provided extern. The first call to `hot()` runs in BC and
+    // resolves `__zw_test_double` through the interpreter's symbol
+    // table (FFI path → registered Rust function). That call brings
+    // `hot()` to the JIT threshold; the second call runs the wasm-
+    // emitter output. The JIT'd module imports
+    // `extern.__zw_test_double@1`, which the JS dispatcher routes
+    // through `_zyntax_call_extern_1("__zw_test_double", 21)` →
+    // `ACTIVE_SYMBOLS` → transmute → host call → 42. Both calls
+    // return the same value, so `main()` returns 84.
+    //
+    // Regression target: if the wasm-emit, host-bridge, or JS
+    // dispatcher path were broken, this test would either get a
+    // RuntimeError or return a wrong number. The trivial-helper
+    // case above DOESN'T cover this because its hot function has
+    // no outgoing calls — pure constant return.
+    {
+        const src =
+            "def hot(): i64 { return __zw_test_double(21) }\n" +
+            "def main(): i64 { return hot() + hot() }\n";
+        const r = await run(src);
+        check("extern-call hot fn ok", r.ok === true, `output=${r.output}`);
+        check(
+            "extern-call hot fn returns 84 (21*2 + 21*2 across BC + JIT)",
+            r.output === "84",
+            `got '${r.output}'`,
+        );
+    }
+
     console.log("");
     if (failed === 0) {
         console.log("All checks passed.");
