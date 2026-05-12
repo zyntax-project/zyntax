@@ -433,6 +433,41 @@ impl ZPack {
     pub fn has_runtime(&self) -> bool {
         self.runtime.is_some()
     }
+
+    /// Pull the raw runtime bytes for an arbitrary target triple out of
+    /// a zpack reader, without trying to `dlopen` them.
+    ///
+    /// This is the universal extraction path used by wasm-targeted
+    /// builds: the loaded `Self::runtime` field is `None` on wasm32 (no
+    /// `dlopen`), so the embedder uses this to pull the
+    /// `wasm32-unknown-unknown` section's bytes out and hand them off
+    /// to the JS-side wasm loader (Phase F) — or to a host-side static
+    /// linkage flow.
+    ///
+    /// On native this is also handy for cross-target tooling that
+    /// wants to inspect or re-pack the wasm slice from a multi-target
+    /// zpack without spinning up the dlopen machinery.
+    ///
+    /// Returns `Ok(None)` when the zpack doesn't carry a runtime
+    /// section for `target` (i.e. the archive is single-platform or
+    /// targets a different triple set). `Err` is reserved for IO
+    /// failures and invalid archive layouts.
+    pub fn read_runtime_bytes<R: Read + Seek>(
+        reader: R,
+        target: &str,
+    ) -> Result<Option<Vec<u8>>, ZPackError> {
+        let mut archive =
+            ZipArchive::new(reader).map_err(|e| ZPackError::InvalidArchive(e.to_string()))?;
+        let file_path = format!("lib/{}/runtime.zrtl", target);
+        let mut file = match archive.by_name(&file_path) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let mut bytes = Vec::with_capacity(file.size() as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| ZPackError::IoError(e.to_string()))?;
+        Ok(Some(bytes))
+    }
 }
 
 /// ZPack writer for creating archives
