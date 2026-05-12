@@ -67,6 +67,13 @@ cranelift-module = { version = "0.106", optional = true }
 cranelift-native = { version = "0.106", optional = true }
 inkwell = { version = "0.7.1", features = ["llvm21-1"], optional = true }  # LLVM bindings
 
+# Wasm encoder for the hot-function tier-1 JIT (Phase E). Optional
+# so non-wasm-target builds don't pay the dep cost.
+wasm-encoder = { version = "0.213", optional = true }
+# Module validator — codegen unit tests use it to assert the emitter's
+# output is structurally well-formed before wiring it into the host.
+wasmparser = { version = "0.213", optional = true }
+
 [dev-dependencies]
 env_logger = "0.11"
 criterion = "0.5"
@@ -79,7 +86,11 @@ harness = false
 default = ["cranelift-backend", "dynamic-plugins"]
 cranelift-backend = ["cranelift", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 llvm-backend = ["inkwell"]
-all-backends = ["cranelift-backend", "llvm-backend"]
+# Wasm-emitting tier-1 JIT for hot HIR functions (Phase E). The
+# emitter itself works on any host; the consumer (wasm runtime)
+# turns the emitted bytes into an instantiated module.
+wasm-jit = ["wasm-encoder", "wasmparser"]
+all-backends = ["cranelift-backend", "llvm-backend", "wasm-jit"]
 # `dynamic-plugins` enables runtime loading of ZRTL plugins from `.zrtl`
 # files via libloading (dlopen). Off for wasm32 targets — see the
 # wasm-build plan at /Users/amaterasu/.claude/plans/effervescent-pondering-sutton.md

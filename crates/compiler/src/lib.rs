@@ -57,6 +57,9 @@ pub mod llvm_backend;
 #[cfg(feature = "llvm-backend")]
 pub mod llvm_jit_backend; // LLVM MCJIT for hot-path optimization
 
+#[cfg(feature = "wasm-jit")]
+pub mod wasm_backend; // HIR → wasm hot-function tier-1 JIT (Phase E)
+
 #[cfg(feature = "cranelift-backend")]
 pub mod beadie_adapter; // beadie::JitBackend wrappers for our backends
 pub mod osr; // On-stack replacement infrastructure (probe, registry, layout)
