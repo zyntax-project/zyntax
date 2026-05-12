@@ -272,6 +272,98 @@ pub fn _zyntax_call_extern_3(name: &str, a0: i64, a1: i64, a2: i64) -> i64 {
     f(a0, a1, a2)
 }
 
+/// Four-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_extern_4(name: &str, a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { core::mem::transmute(ptr) };
+    f(a0, a1, a2, a3)
+}
+
+/// Five-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_extern_5(name: &str, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = unsafe { core::mem::transmute(ptr) };
+    f(a0, a1, a2, a3, a4)
+}
+
+/// Six-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_extern_6(
+    name: &str,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+        unsafe { core::mem::transmute(ptr) };
+    f(a0, a1, a2, a3, a4, a5)
+}
+
+/// Seven-i64-arg dispatcher.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_extern_7(
+    name: &str,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    a6: i64,
+) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+        unsafe { core::mem::transmute(ptr) };
+    f(a0, a1, a2, a3, a4, a5, a6)
+}
+
+/// Eight-i64-arg dispatcher. Covers `zrtl_tensor::matmul` and the
+/// remaining double-handful-of-args plugin entry points we ship today
+/// (zrtl_simd, zrtl_audio mixing); higher arities currently bail at
+/// `makeExternDispatcher` (zynml.mjs) with a clear error rather than
+/// silently miscalling.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_extern_8(
+    name: &str,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    a6: i64,
+    a7: i64,
+) -> i64 {
+    let Some(ptr) = lookup_active_symbol(name) else {
+        return 0;
+    };
+    let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+        unsafe { core::mem::transmute(ptr) };
+    f(a0, a1, a2, a3, a4, a5, a6, a7)
+}
+
 // Non-wasm32 stubs so the crate's native cargo build is happy.
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
@@ -291,6 +383,61 @@ pub fn _zyntax_call_extern_2(_name: &str, _a0: i64, _a1: i64) -> i64 {
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub fn _zyntax_call_extern_3(_name: &str, _a0: i64, _a1: i64, _a2: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_extern_4(_name: &str, _a0: i64, _a1: i64, _a2: i64, _a3: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_extern_5(_name: &str, _a0: i64, _a1: i64, _a2: i64, _a3: i64, _a4: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_extern_6(
+    _name: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+    _a5: i64,
+) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_extern_7(
+    _name: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+    _a5: i64,
+    _a6: i64,
+) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_extern_8(
+    _name: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+    _a5: i64,
+    _a6: i64,
+    _a7: i64,
+) -> i64 {
     0
 }
 

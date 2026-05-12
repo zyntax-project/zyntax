@@ -1756,6 +1756,87 @@ mod tests {
         );
     }
 
+    /// Phase E.6.1: higher-arity extern calls. The JS dispatcher
+    /// (zynml.mjs `makeExternDispatcher`) covers arities 0–8 today;
+    /// the wasm bytes need to import the same `name@N` convention so
+    /// the host can route the call. This test asserts arity-5 round-
+    /// trips through the import-section encoding identically to arity
+    /// 1 (covered above).
+    #[test]
+    fn emits_call_to_extern_symbol_arity_5() {
+        let param_ids: Vec<HirId> = (0..5).map(|_| HirId::new()).collect();
+        let sig = HirFunctionSignature {
+            params: param_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| HirParam {
+                    id: *id,
+                    name: InternedString::new_global(&format!("a{}", i)),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                })
+                .collect(),
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("call_5"), sig);
+        for (idx, id) in param_ids.iter().enumerate() {
+            func.values.insert(
+                *id,
+                HirValue {
+                    id: *id,
+                    ty: HirType::I64,
+                    kind: HirValueKind::Parameter(idx as u32),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        let call_result = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Call {
+            result: Some(call_result),
+            callee: HirCallable::Symbol("ext_five_arg".to_string()),
+            args: param_ids.clone(),
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![call_result],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit arity-5 extern-call function");
+        m.validate_full().expect("module structurally valid");
+
+        let parser = wasmparser::Parser::new(0);
+        let mut found_import = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "extern" && import.name == "ext_five_arg@5" {
+                        found_import = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_import,
+            "expected `(import \"extern\" \"ext_five_arg@5\")` in emitted module — \
+             the JS dispatcher relies on the `name@arity` convention to route \
+             through `_zyntax_call_extern_5`"
+        );
+    }
+
     /// `def load_then_store(addr: i64, value: i64): i64 {
     ///     let cur = *addr;        // Load
     ///     *addr = cur + value;    // Add + Store

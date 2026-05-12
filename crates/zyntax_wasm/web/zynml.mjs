@@ -152,7 +152,14 @@ function installJitHost() {
 
     /** Build a JS dispatcher that calls the right
      *  `_zyntax_call_extern_<arity>` export with `symbolName` as
-     *  the first arg + the JIT'd module's actual args after. */
+     *  the first arg + the JIT'd module's actual args after.
+     *
+     *  Arities 0-8 are covered today; that range fits every plugin
+     *  symbol we ship (zrtl_io / string / math / vector / simd /
+     *  tensor / audio / model), the largest of which —
+     *  `$Tensor$matmul` — takes 8 i64-funneled args. Higher arities
+     *  fall through to a throwing thunk so unsupported calls fault
+     *  loudly at the JIT call site instead of silently miscoercing. */
     function makeExternDispatcher(symbolName, arity) {
         const exports = zynmlBindings;
         switch (arity) {
@@ -167,6 +174,27 @@ function installJitHost() {
             case 3:
                 return (a0, a1, a2) =>
                     exports._zyntax_call_extern_3(symbolName, a0, a1, a2);
+            case 4:
+                return (a0, a1, a2, a3) =>
+                    exports._zyntax_call_extern_4(symbolName, a0, a1, a2, a3);
+            case 5:
+                return (a0, a1, a2, a3, a4) =>
+                    exports._zyntax_call_extern_5(symbolName, a0, a1, a2, a3, a4);
+            case 6:
+                return (a0, a1, a2, a3, a4, a5) =>
+                    exports._zyntax_call_extern_6(symbolName, a0, a1, a2, a3, a4, a5);
+            case 7:
+                return (a0, a1, a2, a3, a4, a5, a6) =>
+                    exports._zyntax_call_extern_7(
+                        symbolName,
+                        a0, a1, a2, a3, a4, a5, a6,
+                    );
+            case 8:
+                return (a0, a1, a2, a3, a4, a5, a6, a7) =>
+                    exports._zyntax_call_extern_8(
+                        symbolName,
+                        a0, a1, a2, a3, a4, a5, a6, a7,
+                    );
             default:
                 // Out-of-coverage arity: a JIT'd call to this would
                 // fault on instantiate (no matching dispatcher).
@@ -174,7 +202,7 @@ function installJitHost() {
                 // the call site instead of silently coercing.
                 return () => {
                     throw new Error(
-                        `_zyntax_jit: extern "${symbolName}" arity ${arity} not supported`,
+                        `_zyntax_jit: extern "${symbolName}" arity ${arity} not supported (max 8)`,
                     );
                 };
         }
