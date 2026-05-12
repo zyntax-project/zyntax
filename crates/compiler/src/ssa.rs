@@ -3513,8 +3513,41 @@ impl SsaBuilder {
                                 extern_keys.len(),
                                 &extern_keys[..extern_keys.len().min(8)],
                             );
-                            // Variable lookup (function pointer)
+                            // Translate the callee — for a Variable, this either
+                            // reads an existing local (a real function-pointer-typed
+                            // value) or, if the name is truly unknown, synthesises
+                            // an Undef placeholder via `read_variable`.
                             let callee_val = self.translate_expression(block_id, callee)?;
+
+                            // Refuse to emit `Indirect(Undef)`. An indirect call
+                            // through a null pointer either fails Cranelift
+                            // verification (best case) or JITs to a call to address
+                            // 0 and SIGSEGVs at runtime (worst case, ZYNTAX_LAMBDA_BODY_BUG.md
+                            // "Update — Layer 5"). Either outcome hides the real
+                            // problem — a Call to a name that resolves to nothing
+                            // in scope. Surface that as a clean compiler error so
+                            // embedders see "declare your extern" instead of a
+                            // crash with no IR context. Legitimate Indirect calls
+                            // (e.g. a local `let f = some_function; f(42)`) yield
+                            // a non-Undef callee_val and pass through unchanged.
+                            let callee_is_undef = self
+                                .function
+                                .values
+                                .get(&callee_val)
+                                .map(|v| matches!(v.kind, HirValueKind::Undef))
+                                .unwrap_or(true);
+                            if callee_is_undef {
+                                return Err(crate::CompilerError::Lowering(format!(
+                                    "Call to undefined function '{name}'. \
+                                     Declare it as `extern fn {name}(...)` if it's \
+                                     host-provided, or define it in scope before \
+                                     this call. ({fs_count} known functions, \
+                                     {ext_count} known externs.)",
+                                    name = name_str,
+                                    fs_count = fs_keys.len(),
+                                    ext_count = extern_keys.len(),
+                                )));
+                            }
                             (
                                 crate::hir::HirCallable::Indirect(callee_val),
                                 Some(callee_val),
@@ -8637,6 +8670,7 @@ impl SsaBuilder {
                     use zyntax_typed_ast::typed_ast::TypedStatement;
                     let mut current_block = entry_block_id;
                     let mut last_expr_val: Option<HirId> = None;
+                    let mut errored: Option<crate::CompilerError> = None;
                     let n = block.statements.len();
                     for (i, stmt) in block.statements.iter().enumerate() {
                         // If the last statement is an Expression, hold
@@ -8649,11 +8683,22 @@ impl SsaBuilder {
                                         continue;
                                     }
                                     Err(e) => {
-                                        // Fall through to error-propagation block below.
-                                        last_expr_val = None;
-                                        // Re-run via process_statement to capture for diagnostics;
-                                        // simpler: just propagate the error.
-                                        let _ = e;
+                                        // Capture the error and break — the
+                                        // context-restoration tail must run
+                                        // before we can propagate. Direct
+                                        // `return Err(e)` would skip the
+                                        // restoration and leave the outer
+                                        // function's state corrupted with
+                                        // the lambda's swapped-in fields.
+                                        // The previous `let _ = e; break`
+                                        // silently swallowed the error,
+                                        // letting an undefined-callee
+                                        // Lowering error vanish and the
+                                        // lambda compile to an empty body
+                                        // returning zero (ZYNTAX_LAMBDA_BODY_BUG.md
+                                        // Layer 5: Blinc-side
+                                        // `Indirect(Undef)` SIGSEGV).
+                                        errored = Some(e);
                                         break;
                                     }
                                 }
@@ -8661,29 +8706,36 @@ impl SsaBuilder {
                         }
                         match self.process_statement(current_block, stmt) {
                             Ok(next) => current_block = next,
-                            Err(e) => return Err(e),
+                            Err(e) => {
+                                errored = Some(e);
+                                break;
+                            }
                         }
                     }
-                    Ok(last_expr_val.unwrap_or_else(|| {
-                        // Synthesise a zero return value of the declared
-                        // return type so the entry block has a well-typed
-                        // `Return` operand even when the body has no
-                        // trailing expression.
-                        let val_id = HirId::new();
-                        self.function.values.insert(
-                            val_id,
-                            crate::hir::HirValue {
-                                id: val_id,
-                                ty: return_type.clone(),
-                                kind: crate::hir::HirValueKind::Constant(default_const_for(
-                                    &return_type,
-                                )),
-                                uses: HashSet::new(),
-                                span: None,
-                            },
-                        );
-                        val_id
-                    }))
+                    if let Some(e) = errored {
+                        Err(e)
+                    } else {
+                        Ok(last_expr_val.unwrap_or_else(|| {
+                            // Synthesise a zero return value of the declared
+                            // return type so the entry block has a well-typed
+                            // `Return` operand even when the body has no
+                            // trailing expression.
+                            let val_id = HirId::new();
+                            self.function.values.insert(
+                                val_id,
+                                crate::hir::HirValue {
+                                    id: val_id,
+                                    ty: return_type.clone(),
+                                    kind: crate::hir::HirValueKind::Constant(default_const_for(
+                                        &return_type,
+                                    )),
+                                    uses: HashSet::new(),
+                                    span: None,
+                                },
+                            );
+                            val_id
+                        }))
+                    }
                 }
             };
 

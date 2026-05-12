@@ -841,3 +841,77 @@ fn block_bodied_closure_runs_each_statement() {
             .collect::<Vec<_>>(),
     );
 }
+
+/// Layer 5 regression (ZYNTAX_LAMBDA_BODY_BUG.md): when a lambda body
+/// calls a function name that resolves to NOTHING in scope —
+/// undeclared as extern, undefined as a local — the SSA Call lowering
+/// must surface a clean `CompilerError::Lowering` rather than fall
+/// through to `HirCallable::Indirect(Undef)`. The Indirect-of-Undef
+/// path was Blinc's "+1 lambda fails verification, Reset lambda
+/// SIGSEGVs" symmetric pair: an indirect call through a null pointer
+/// either trips Cranelift's verifier (best case) or JITs to address 0
+/// (worst case). Both hide the real bug — the embedder forgot to
+/// declare a host-provided extern. This test asserts the embedder gets
+/// the error instead of a crash.
+#[test]
+fn undefined_callee_in_lambda_body_surfaces_lowering_error() {
+    let mut arena = AstArena::new();
+
+    // Build a Call to a name we never declare:
+    //     undefined_extern()
+    // not registered as extern, not in scope.
+    let undefined_name = arena.intern_string("undefined_extern");
+    let undefined_call = typed_node(
+        TypedExpression::Call(zyntax_typed_ast::TypedCall {
+            callee: Box::new(typed_node(
+                TypedExpression::Variable(undefined_name),
+                Type::Primitive(PrimitiveType::Unit),
+                span(),
+            )),
+            type_args: vec![],
+            positional_args: vec![],
+            named_args: vec![],
+        }),
+        Type::Primitive(PrimitiveType::Unit),
+        span(),
+    );
+
+    // Wrap in a Block-bodied lambda: `|| { undefined_extern() }`.
+    let body = TypedLambdaBody::Block(TypedBlock {
+        statements: vec![typed_node(
+            TypedStatement::Expression(Box::new(undefined_call)),
+            Type::Primitive(PrimitiveType::Unit),
+            span(),
+        )],
+        span: span(),
+    });
+
+    let program = build_program(body, &mut arena);
+
+    // Run lowering manually (not via the `lower()` helper, which panics
+    // on Err) so we can assert on the error shape.
+    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    let type_registry = Arc::new(TypeRegistry::new());
+    let config = LoweringConfig::default();
+    let module_name = arena.intern_string("undefined_callee_test");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
+    let result = {
+        let mut prog = program;
+        ctx.lower_program(&mut prog)
+    };
+    std::env::remove_var("SKIP_TYPE_CHECK");
+
+    let err = result.expect_err(
+        "Lowering a lambda body that calls an undeclared function must \
+         return Err — falling through to Indirect(Undef) hides the \
+         missing-extern bug as a runtime SIGSEGV.",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("undefined_extern") && msg.to_lowercase().contains("undefined"),
+        "Expected a clear 'call to undefined function undefined_extern' \
+         error message, got: {}",
+        msg
+    );
+}

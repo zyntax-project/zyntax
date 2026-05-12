@@ -664,3 +664,245 @@ cascade anymore; future errors surface as clean
 
 Workspace tests pass (zyntax_compiler: 150 unit + integration tests
 green, clippy clean, fmt clean).
+
+---
+
+## Update — 2026-05-12 (Blinc side, layer 5): partial fix — statement-position calls in lambdas still emit `Indirect(Undef)`
+
+Re-ran `counter_dsl` against the latest local checkout. Two findings:
+
+### Finding 1: nested-expression `Call` inside an arg resolves correctly; the statement-position outer call does not
+
+The `+1` button's lambda body:
+
+```text
+count.set(count.get() + 1)             ← outer (statement)
+CounterFsm.trigger("Idle.Increment")   ← statement
+CounterFsm.trigger("Counting.Increment") ← statement
+```
+
+After Blinc's `resolve_signal_calls` / `resolve_fsm_trigger_calls`
+rewrites, the typed AST is:
+
+```text
+Call(Variable("__signal_set_i32"),
+     ["count", Binary(Add, Call(Variable("__signal_get_i32"), ["count"]), 1)])
+Call(Variable("__fsm_runtime_trigger__"), ["CounterFsm", "Idle.Increment"])
+Call(Variable("__fsm_runtime_trigger__"), ["CounterFsm", "Counting.Increment"])
+```
+
+Cranelift dump for the corresponding lambda function (`RUST_LOG=…debug`):
+
+```
+[Cranelift]   inst[0]: Call { result: Some(...), callee: Function(HirId(6e061031-…)), args: [..."count"] }
+[Cranelift]   inst[1]: Binary { op: Add, ... }
+[Cranelift]   inst[2]: Call { result: None,    callee: Indirect(HirId(04ad38b7-…)), args: [...] }
+[Cranelift]   inst[3]: Call { result: None,    callee: Indirect(HirId(3a7a9535-…)), args: [...] }
+[Cranelift]   inst[4]: Call { result: None,    callee: Indirect(HirId(a4c59c38-…)), args: [...] }
+
+[Cranelift]   Value HirId(04ad38b7-…) kind=Undef
+[Cranelift]   Value HirId(3a7a9535-…) kind=Undef
+[Cranelift]   Value HirId(a4c59c38-…) kind=Undef
+
+[CRANELIFT] Skipping function 'InternedString(SymbolU32 { value: 78 })':
+   Backend("indirect call: function-pointer value HirId(a4c59c38-…) is referenced
+   but never defined in this function's value_map…")
+```
+
+- `inst[0]` (the nested `count.get()` inside the arg of `set(...)`) is in
+  **expression position** — it goes through `translate_expression`'s
+  `Call` arm and emits `HirCallable::Function(HirId)`. Correct.
+- `inst[2]` (the outer `count.set(...)`), `inst[3]`, `inst[4]` are in
+  **statement position** inside the lambda body — they go through the
+  lambda-body translator, which apparently still doesn't resolve a
+  `Variable` callee to a `Symbol` / `Function` lookup. Result: the
+  callee value is the `Variable`'s value-HirId itself, materialised
+  as `kind=Undef`, and the `Call` instruction's `callee` is wrapped
+  in `Indirect(...)`.
+
+The lambda is rejected by verification (good — your layer 3 surface)
+and `function_map.remove(id)` drops it. Then `render_view`'s
+`CreateClosure` for that HirId hits:
+
+```
+WARN cranelift_backend:  CreateClosure: Lambda function HirId(e4caaf98-…) not found
+```
+
+and falls back to `iconst(0)`. Blinc-side sees `on_click_closure == 0`
+and skips the handler attach — `+1` button has no handler at runtime.
+
+### Finding 2: a simpler lambda makes it past verification but JITs to a `call_indirect → 0` and segfaults when invoked
+
+The `Reset` button's lambda body:
+
+```text
+count.set(0)
+CounterFsm.trigger("Counting.Reset")
+```
+
+Two statements, both statement-position calls. Both should hit the
+same Indirect/Undef pattern, but **this lambda's compile succeeds**
+(`function_map` keeps it, `CreateClosure` returns a real
+`func_addr`, Blinc attaches the handler). Then at click time:
+
+```
+SIGSEGV
+```
+
+In other words: a lambda where every statement-position call is
+`Indirect(Undef)` passed verification and emitted as
+`call_indirect r0, &args` (the `iconst(0)` callee from the layer 3
+fallback path in the *non-error* lookup branch). Calling address 0
+crashes the process.
+
+That's the same root cause as Finding 1, but reaching runtime
+instead of failing verification. The asymmetry between the two
+lambdas (one rejected, one accepted with a crashing pointer) is
+likely a verifier subtlety — the failing one references three
+distinct Undef values plus an extra `Binary` result on a value
+chain, the passing one only references Undefs that don't transitively
+feed any returned value. Either way, the underlying fix is the
+same.
+
+### Diagnosis
+
+Statement-position `Call(Variable(name), args)` inside a lambda
+body still skips the Variable→Symbol/Function resolution that
+`translate_expression`'s `Call` arm performs at the top level.
+That's exactly the Proposal-A scenario — the hand-rolled
+lambda-body translator hasn't reached parity with
+`translate_expression`'s `Call` arm.
+
+Layer 3's improved error messages are surfacing the issue, but
+they're only caught when the resulting IR is unverifiable.
+A statement-position call whose return value is unused can
+emit cleanly past verification with a null callee and crash at
+runtime.
+
+### What would catch both shapes
+
+The closure-body-lowering tests don't assert anything about the
+`HirCallable` variant. An assertion of the form
+
+> for every `Call` instruction inside a translated lambda body
+> where the typed-AST callee is `TypedExpression::Variable(name)`
+> and `name` resolves to a known function symbol in scope, the
+> emitted `HirCallable` MUST be `Function(HirId)` /
+> `Symbol(name)` — never `Indirect(_)`
+
+would catch the +1 lambda *and* the Reset lambda, regardless of
+whether they happen to pass Cranelift verification.
+
+### Repro (still the same)
+
+`crates/blinc_dsl_core/examples/counter_dsl.{rs,blinc}` against the
+current local Zyntax checkout, with `RUST_LOG=zyntax_compiler::
+cranelift_backend=debug`, prints both shapes above.
+
+---
+
+## Update — 2026-05-12: Layer 5 resolution
+
+### Diagnosis (revised)
+
+The "statement-position vs expression-position" framing was a
+misdiagnosis. Inside the lambda body context-swap, **both** positions
+reach `translate_expression`'s Call arm (statements via
+`process_statement` → `translate_expression`; nested args via direct
+recursion). `function_symbols` and `extern_link_names` are NOT
+swapped — they're SsaBuilder-wide state, visible from both
+positions identically. So the same resolver runs for both `+1`'s inner
+`__signal_get_i32` and outer `__signal_set_i32`.
+
+The actual asymmetry: `__signal_get_i32` was declared as `extern`
+in Blinc's typed program (visible in the dump in the prior
+update — `__signal_get_i32 (extern)`, `__signal_get_string (extern)`,
+`__signal_get_f64 (extern)`); `__signal_set_i32` was **not**
+declared. The Variable→Symbol resolver missed the latter through
+both direct InternedString lookup and the by-resolved-name
+fallback because the name truly wasn't registered. The lookup
+falling through to `Indirect(translate_expression(Variable(name)))`
+then synthesised an `Undef` value (the standard "unknown variable"
+behaviour of `read_variable`), and the call instruction wrapped
+that `Undef` as its callee. That's the `Indirect(HirId(...))`
+where `kind=Undef` the Cranelift dump showed.
+
+The position-correlation in Blinc's specific test case is coincidence:
+`get` was nested as an arg of `set`'s outer call. If `get`/`set`
+were swapped, the asymmetry would invert.
+
+### Fix landed
+
+Two changes in [crates/compiler/src/ssa.rs](crates/compiler/src/ssa.rs):
+
+1. **`translate_expression` Call arm** (`else` branch around the
+   former line 3492): after `translate_expression(callee)` produces
+   the would-be Indirect target, check whether the resulting
+   `HirValue.kind` is `HirValueKind::Undef`. If so, return
+   `CompilerError::Lowering` with a clear "Call to undefined
+   function '{name}'. Declare it as `extern fn {name}(...)` if
+   it's host-provided…" message naming the missing symbol. The
+   error message also reports the current counts of known
+   functions and externs to help embedders triage. Legitimate
+   Indirect calls (local of function-pointer type, e.g.
+   `let f = some_function; f(42)`) yield a non-Undef value and
+   pass through unchanged.
+
+2. **`translate_closure` Block-body** (around the former line 8684):
+   replaced `let _ = e; break` — which silently dropped a real
+   `CompilerError` from the inner translator and let the lambda
+   body compile to an empty function returning zero — with a
+   captured-error pattern that records the error, breaks the
+   loop, and surfaces it through `body_result?` after the
+   context-restoration tail. The previous code was the proximate
+   reason the new Lowering error from change (1) never reached
+   the caller in the first test run; an empty lambda body with
+   a Return-zero terminator was emitted instead.
+
+The combination produces a clean error path: a lambda body that
+calls an undeclared function returns `Err(CompilerError::Lowering)`
+naming the missing symbol, all the way out to the
+`compile_typed_program` caller. No more `Indirect(Undef)` →
+unverifiable IR or null-callee SIGSEGV.
+
+### Regression test
+
+`crates/compiler/tests/closure_body_lowering_tests.rs::undefined_callee_in_lambda_body_surfaces_lowering_error`
+builds a minimal program `|| { undefined_extern() }` where
+`undefined_extern` is not declared, lowers it, and asserts the
+result is `Err` with a message containing both `undefined_extern`
+and `undefined`. Together with the existing six tests in the
+file (which all still pass), the suite now covers:
+
+- Block / Call / MethodCall / Block-with-let / Lambda-as-arg
+  shapes lowering correctly when the callee IS declared.
+- The same callees resolving as `Symbol`/`Function`, never
+  `Indirect`.
+- Undeclared callees inside lambda bodies producing a clean
+  `CompilerError::Lowering` rather than a silent no-op or
+  runtime crash.
+
+### What Blinc should do next
+
+The Layer 5 SIGSEGV will be replaced by a `CompilerError::Lowering`
+naming each missing extern. The message lists exactly which symbol
+isn't registered. Two options:
+
+1. **Declare the missing externs** in the typed program before
+   compile. `__signal_set_i32`, `__signal_set_f64`,
+   `__signal_set_string`, `__fsm_runtime_trigger__`, and any other
+   names the `resolve_signal_calls` / `resolve_fsm_trigger_calls`
+   rewriters emit should appear as `extern fn ...` declarations
+   alongside the `_get_` siblings that already do. This is the
+   correct fix — the rewriter is producing calls to symbols the
+   typed program doesn't acknowledge.
+
+2. **Add them to `extern_link_names` directly** through the
+   SsaBuilder/lowering API if you want to avoid synthesising
+   declarations. The relevant entry point is
+   [`LoweringSymbols.extern_link_names`](crates/compiler/src/lowering.rs:261) —
+   inserting `InternedString` → link-name pairs there before
+   lowering kicks in achieves the same effect as declarations.
+
+Either path makes the new compile error go away. The error message
+is precisely the contract you should code against.
