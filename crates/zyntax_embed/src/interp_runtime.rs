@@ -82,7 +82,7 @@ use zyntax_typed_ast::{TypeRegistry, TypedProgram};
 /// Cranelift opt2). On wasm targets the JIT side is gated off; the
 /// interpreter is the only execution path until the wasm-emitting
 /// backend lands (Phase E).
-pub(crate) struct InterpRuntime {
+pub struct InterpRuntime {
     /// The HIR module being executed. Filled by `compile_module` /
     /// `compile_typed_program`. Wrapped in `Arc` so per-function tick
     /// callbacks can hold a stable reference without re-borrowing
@@ -264,6 +264,44 @@ impl InterpRuntime {
     /// the ZRTL ABI convention).
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
         self.interp.register_symbol(name, ptr, param_count);
+    }
+
+    /// Register a statically-linked ZRTL plugin into the BC
+    /// interpreter's FFI table. Wasm-shim equivalent of
+    /// `ZyntaxRuntime::register_static_plugin` — same SDK
+    /// `StaticPlugin` input, no native backend on the other side.
+    ///
+    /// Walks the plugin's symbol table (excluding the trailing
+    /// null-name sentinel) and forwards each entry into the
+    /// interpreter via [`Self::register_symbol`]. Signatures are
+    /// dropped on this path since the interpreter doesn't need
+    /// auto-boxing info — the BC ops already know the operand types
+    /// from the HIR they're walking.
+    pub fn register_static_plugin(&mut self, plugin: zrtl::StaticPlugin) {
+        use std::ffi::CStr;
+        for sym in plugin.symbols {
+            // SAFETY: the `name` pointer in a `zrtl_plugin!`-generated
+            // table is always a `concat!("...", "\0")` static literal —
+            // null-terminated and valid UTF-8.
+            let name = unsafe {
+                match CStr::from_ptr(sym.name).to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                }
+            };
+            // `param_count` is derived from the SDK signature when
+            // available; fall back to 0 (i.e. "no params") otherwise —
+            // the interpreter's call dispatch only uses param_count to
+            // pre-funnel args through `i64`, so 0 is the safe default
+            // for symbols that happen not to carry signature info.
+            let param_count = if sym.sig.is_null() {
+                0
+            } else {
+                // SAFETY: non-null sig is a static `ZrtlSymbolSig`.
+                unsafe { (*sym.sig).param_count }
+            };
+            self.interp.register_symbol(name, sym.ptr, param_count);
+        }
     }
 
     /// Bridge from a `RuntimeSymbolInfo` slice (the shape

@@ -1,0 +1,41 @@
+[package]
+name = "zyntax_wasm"
+version = "0.1.0"
+edition = "2021"
+description = "wasm-bindgen entry shim for the Zyntax/ZynML runtime — parse + interpret ZynML in browser / wasi hosts."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The interpreter-backed runtime. `default-features = false` so we
+# don't drag in Cranelift / libloading / the native ZyntaxRuntime —
+# the wasm shim drives `InterpRuntime` directly. `parse-only` keeps
+# parser + TypedAST + the lowering passes available.
+zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
+# Direct access to `compile_to_hir` + `CompilationConfig`. The
+# embed crate re-exports HirInterpreter but not the lowering API.
+zyntax_compiler = { path = "../compiler", default-features = false }
+# Plugin SDK so we can construct `zrtl::StaticPlugin` instances.
+zrtl = { path = "../../sdk/zrtl" }
+
+# wasm-bindgen entry point + future-to-Promise bridge for async
+# `run()` calls (matches `wren_lift/wasm/Cargo.toml`).
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+serde = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Surface unhandled panics as `console.error` with a stack trace
+# instead of the bare `unreachable executed` wasm trap.
+console_error_panic_hook = "0.1"
+# Substitute for `std::time::Instant`, which panics on
+# wasm32-unknown-unknown. Pulled in by the perf-logging code below.
+web-time = "1"
+
+[lints]
+workspace = true

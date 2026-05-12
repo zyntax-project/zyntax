@@ -10,6 +10,7 @@ members = [
     "crates/zyn_peg",
     "crates/haxe_zyntax_runtime",
     "crates/zyntax_embed",
+    "crates/zyntax_wasm",
     "crates/zynml",
     "crates/pattern_engine",
     "crates/passes/normalization",

@@ -63,16 +63,18 @@ mod grammar;
 mod grammar2;
 #[cfg(feature = "native")]
 mod import_chain;
-/// BC-interpreter-backed execution engine — internal scaffolding for
-/// [`runtime::ZyntaxRuntime`]. Holds the `HirInterpreter`, beadie's
-/// `TieredAdapter`, and the FFI symbol table. Not part of the public
-/// API; callers go through `ZyntaxRuntime`'s execution methods.
-pub(crate) mod interp_runtime;
+/// BC-interpreter-backed execution engine. On native it's internal
+/// scaffolding for [`runtime::ZyntaxRuntime`]; on wasm32 (where the
+/// native runtime is gated off) it's the primary execution entry
+/// point that the [`zyntax_wasm`] crate's wasm-bindgen shim wires
+/// up. Holds the `HirInterpreter`, beadie's `TieredAdapter` (tier 0
+/// only on wasm), and the FFI symbol table.
+pub mod interp_runtime;
 pub mod iterator;
 // `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
-// loader, async executor). Disabled in `parse-only` builds — the
-// browser path (Phase B+) will introduce a separate interpreter-
-// backed runtime module.
+// loader, async executor). Native-only — the wasm-target entry point
+// (separate `zyntax_wasm` crate, Phase F) wires the BC interpreter
+// directly without dragging the native backend along.
 #[cfg(feature = "native")]
 mod runtime;
 mod string;
