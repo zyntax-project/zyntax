@@ -231,8 +231,85 @@ pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> 
         // dispatcher matches correctly on every platform.
         *(r.state_machine_ptr as *mut i64) = r.next_state;
         // Re-poll the caller's poll fn synchronously until Ready.
+        //
+        // Guarded by two diagnostic counters so a runaway resume on a
+        // platform we haven't manually verified (Windows multi-shot,
+        // abort, async-out-of-line) panics with actionable context
+        // rather than spinning forever or growing the call stack
+        // until SEH stops it. The thresholds are intentionally loose
+        // enough that legitimate multi-shot work (J.1: handler calls
+        // k three times; J.3: async out-of-line poll-Pending loops
+        // until external signal) doesn't trip them.
+        //
+        //   - LOOP_BUDGET caps the spin inside this one resume call.
+        //     A correct poll_fn returns Ready (rc != 0) on the first
+        //     iteration for every synchronous resume path; Pending
+        //     in a row beyond this budget means the state machine is
+        //     stuck in a state that doesn't make progress.
+        //
+        //   - REENTRY_BUDGET (thread-local) caps total resume
+        //     re-entry depth across the chain. Multi-shot legitimately
+        //     re-enters once per `k(v)` call; runaway re-entry
+        //     (perform → handler → k → resume → re-perform → handler
+        //     → …) shows up as depth climbing without bound.
+        //
+        // Both guards convert "hang" into "panic with state slot,
+        // next_state, value, and iteration count" — far more useful
+        // CI signal than a 60-second timeout.
         let poll_fn: extern "C" fn(*mut u8) -> i64 = core::mem::transmute(r.poll_fn_ptr);
+
+        const LOOP_BUDGET: u32 = 100_000;
+        const REENTRY_BUDGET: u32 = 4096;
+        thread_local! {
+            static REENTRY_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+        }
+
+        // RAII guard: decrement depth on every exit path, including
+        // panic-unwind, so a panicked test thread that libtest catches
+        // doesn't leave a stale counter for the next test on the same
+        // thread.
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                REENTRY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+
+        let depth = REENTRY_DEPTH.with(|d| {
+            let n = d.get().saturating_add(1);
+            d.set(n);
+            n
+        });
+        let _guard = DepthGuard;
+        if depth > REENTRY_BUDGET {
+            panic!(
+                "__zyntax_effect_resume re-entry depth exceeded {} \
+                 (state_machine_ptr={:p}, next_state={}, value={}). \
+                 Likely an infinite perform→handler→resume→re-perform \
+                 cycle — the state machine's dispatcher is not landing \
+                 on the resume entry after the resume runtime sets the \
+                 state slot. Check (a) the i64 width on every state-slot \
+                 read/write across the boundary, (b) the calling \
+                 convention used to call poll_fn (must match the JIT'd \
+                 function's emitted convention), (c) whether next_state \
+                 is a valid Switch case in the dispatcher's layout.",
+                REENTRY_BUDGET, r.state_machine_ptr, r.next_state, value
+            );
+        }
+
+        let mut iter = 0u32;
         loop {
+            iter = iter.saturating_add(1);
+            if iter > LOOP_BUDGET {
+                panic!(
+                    "__zyntax_effect_resume inner poll loop exceeded {} \
+                     iterations without Ready (state_machine_ptr={:p}, \
+                     next_state={}, value={}, depth={}). poll_fn keeps \
+                     returning Pending (rc=0); the state machine is stuck \
+                     in a state that never reaches a Return.",
+                    LOOP_BUDGET, r.state_machine_ptr, r.next_state, value, depth
+                );
+            }
             let rc = poll_fn(r.state_machine_ptr);
             if rc != 0 {
                 return rc;
