@@ -41,6 +41,16 @@ fn poll_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+fn run_with_large_stack(test_body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("interp-jit-tier-up-large-stack".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(test_body)
+        .expect("spawn large-stack test thread")
+        .join()
+        .expect("large-stack test thread panicked");
+}
+
 #[test]
 fn tier_up_to_cranelift_preserves_correctness() {
     let rt = compile_with_jit(
@@ -125,58 +135,60 @@ fn tier_up_actually_fires_with_low_threshold() {
 
 #[test]
 fn tier_up_recursive_fibonacci_crosses_threshold() {
-    // Recursive fib explodes the call tree, easily crossing the
-    // threshold mid-recursion. Beadie's broker fires; subsequent
-    // recursive calls dispatch the JIT'd code.
-    let rt = compile_with_jit(
-        r#"
-        def fib(n: i64): i64 {
-            if n < 2 {
-                return n
+    run_with_large_stack(|| {
+        // Recursive fib explodes the call tree, easily crossing the
+        // threshold mid-recursion. Beadie's broker fires; subsequent
+        // recursive calls dispatch the JIT'd code.
+        let rt = compile_with_jit(
+            r#"
+            def fib(n: i64): i64 {
+                if n < 2 {
+                    return n
+                }
+                return fib(n - 1) + fib(n - 2)
             }
-            return fib(n - 1) + fib(n - 2)
-        }
-        "#,
-        100,
-    );
+            "#,
+            100,
+        );
 
-    let r = rt
-        .call_function_raw("fib", vec![ZyntaxValue::Int(20)])
-        .unwrap();
-    assert_eq!(
-        r.as_i64(),
-        Some(6765),
-        "fib(20) tier-up broke value: {:?}",
-        r
-    );
+        let r = rt
+            .call_function_raw("fib", vec![ZyntaxValue::Int(20)])
+            .unwrap();
+        assert_eq!(
+            r.as_i64(),
+            Some(6765),
+            "fib(20) tier-up broke value: {:?}",
+            r
+        );
 
-    // Second call — most dispatches go through the JIT now.
-    let r = rt
-        .call_function_raw("fib", vec![ZyntaxValue::Int(20)])
-        .unwrap();
-    assert_eq!(
-        r.as_i64(),
-        Some(6765),
-        "fib(20) (warm) broke value: {:?}",
-        r
-    );
+        // Second call: most dispatches go through the JIT now.
+        let r = rt
+            .call_function_raw("fib", vec![ZyntaxValue::Int(20)])
+            .unwrap();
+        assert_eq!(
+            r.as_i64(),
+            Some(6765),
+            "fib(20) (warm) broke value: {:?}",
+            r
+        );
 
-    // Verify the bead reports compiled.
-    let func_ids = rt.interp_registered_function_ids();
-    assert!(!func_ids.is_empty());
-    let any_compiled = poll_until(Duration::from_millis(1000), || {
-        func_ids.iter().any(|fid| rt.interp_function_compiled(*fid))
+        // Verify the bead reports compiled.
+        let func_ids = rt.interp_registered_function_ids();
+        assert!(!func_ids.is_empty());
+        let any_compiled = poll_until(Duration::from_millis(1000), || {
+            func_ids.iter().any(|fid| rt.interp_function_compiled(*fid))
+        });
+        assert!(
+            any_compiled,
+            "fib never tiered up to Cranelift — broker didn't fire"
+        );
+
+        // Heavier load: confirm correctness under recursive JIT dispatch.
+        let r = rt
+            .call_function_raw("fib", vec![ZyntaxValue::Int(25)])
+            .unwrap();
+        assert_eq!(r.as_i64(), Some(75025), "fib(25) broke value: {:?}", r);
     });
-    assert!(
-        any_compiled,
-        "fib never tiered up to Cranelift — broker didn't fire"
-    );
-
-    // Heavier load — confirm correctness under recursive JIT dispatch.
-    let r = rt
-        .call_function_raw("fib", vec![ZyntaxValue::Int(25)])
-        .unwrap();
-    assert_eq!(r.as_i64(), Some(75025), "fib(25) broke value: {:?}", r);
 }
 
 #[test]

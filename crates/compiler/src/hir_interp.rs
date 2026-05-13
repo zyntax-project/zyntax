@@ -1338,6 +1338,24 @@ impl HirInterpreter {
         func_id: HirId,
         args: Vec<ZyntaxValue>,
     ) -> Result<ZyntaxValue, InterpError> {
+        if let Some(func) = module.functions.get(&func_id) {
+            if func.is_external {
+                let name = func
+                    .link_name
+                    .clone()
+                    .or_else(|| func.name.resolve_global())
+                    .ok_or_else(|| InterpError::UnknownFunction(format!("{:?}", func_id)))?;
+                let entry = self
+                    .symbols
+                    .get(&name)
+                    .copied()
+                    .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
+                let raw = call_extern_symbol(entry.ptr, &args);
+                let ret_ty = func.signature.returns.first().unwrap_or(&HirType::Void);
+                return Ok(value_from_i64_as(ret_ty, raw));
+            }
+        }
+
         // Profile.
         let call_count = {
             let p = self.profile.entry(func_id).or_default();

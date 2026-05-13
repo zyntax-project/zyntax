@@ -83,7 +83,7 @@ extern_fn_decl_with_params = { "extern" ~ "fn" ~ name:identifier ~ "(" ~ params:
       params: params,
       return_type: ret,
       body: None,
-      is_extern: true,
+      is_external: true,
   }
 
 extern_fn_decl_no_params = { "extern" ~ "fn" ~ name:identifier ~ "(" ~ ")" ~ ret:type_expr ~ ";" }
@@ -92,11 +92,13 @@ extern_fn_decl_no_params = { "extern" ~ "fn" ~ name:identifier ~ "(" ~ ")" ~ ret
       params: [],
       return_type: ret,
       body: None,
-      is_extern: true,
+      is_external: true,
   }
 
-fn_decl = { async_fn_decl | sync_fn_decl }
-  -> TypedDeclaration { }
+fn_decl = { decl:fn_decl_inner }
+  -> decl
+
+fn_decl_inner = { async_fn_decl | sync_fn_decl }
 
 sync_fn_decl = { fn_decl_with_params | fn_decl_no_params }
 
@@ -139,8 +141,8 @@ fn_decl_no_params = { "fn" ~ name:identifier ~ "(" ~ ")" ~ ret:type_expr ~ body:
 fn_param_list = { p:fn_param_item* }
   -> p
 
-fn_param_item = { fn_param_any ~ ","? }
-  -> fn_param_any
+fn_param_item = { p:fn_param_any ~ ","? }
+  -> p
 
 fn_param_any = { comptime_param | fn_param }
 
@@ -159,8 +161,10 @@ fn_param = { name:identifier ~ ":" ~ ty:type_expr }
 
 // ===== Variable Declarations =====
 
-const_decl = { const_decl_typed | const_decl_untyped }
-  -> TypedDeclaration { }
+const_decl = { decl:const_decl_inner }
+  -> decl
+
+const_decl_inner = { const_decl_typed | const_decl_untyped }
 
 const_decl_typed = { "const" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr ~ ";" }
   -> TypedDeclaration::Variable {
@@ -177,8 +181,10 @@ const_decl_untyped = { "const" ~ name:identifier ~ "=" ~ init:expr ~ ";" }
       mutability: Mutability::Immutable,
   }
 
-var_decl = { var_decl_typed | var_decl_untyped }
-  -> TypedDeclaration { }
+var_decl = { decl:var_decl_inner }
+  -> decl
+
+var_decl_inner = { var_decl_typed | var_decl_untyped }
 
 var_decl_typed = { "var" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr ~ ";" }
   -> TypedDeclaration::Variable {
@@ -327,23 +333,48 @@ block = { "{" ~ stmts:statement* ~ "}" }
   }
 
 // ===== Expressions =====
-// For now, simplified to avoid complex binary folding
-
 expr = { e:comparison_expr }
   -> e
 
-comparison_expr = { left:add_expr ~ (op:comparison_op ~ right:add_expr)? }
-  -> left
+comparison_expr = { comparison_with_op | comparison_no_op }
+
+comparison_with_op = { left:add_expr ~ op:comparison_op ~ right:add_expr }
+  -> TypedExpression::Binary {
+      op: op,
+      left: Box::new(left),
+      right: Box::new(right),
+  }
+
+comparison_no_op = { inner:add_expr }
+  -> inner
 
 comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">" }
 
-add_expr = { left:mul_expr ~ (op:add_op ~ right:mul_expr)? }
-  -> left
+add_expr = { add_with_op | add_no_op }
+
+add_with_op = { left:mul_expr ~ op:add_op ~ right:mul_expr }
+  -> TypedExpression::Binary {
+      op: op,
+      left: Box::new(left),
+      right: Box::new(right),
+  }
+
+add_no_op = { inner:mul_expr }
+  -> inner
 
 add_op = @{ "+" | "-" }
 
-mul_expr = { left:unary_expr ~ (op:mul_op ~ right:unary_expr)? }
-  -> left
+mul_expr = { mul_with_op | mul_no_op }
+
+mul_with_op = { left:unary_expr ~ op:mul_op ~ right:unary_expr }
+  -> TypedExpression::Binary {
+      op: op,
+      left: Box::new(left),
+      right: Box::new(right),
+  }
+
+mul_no_op = { inner:unary_expr }
+  -> inner
 
 mul_op = @{ "*" | "/" }
 

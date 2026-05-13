@@ -2714,6 +2714,12 @@ impl ZyntaxRuntime {
                 .map_err(|e| RuntimeError::Execution(e.to_string()))?;
         }
 
+        if let Some(sig) = self.function_signatures.get(name) {
+            if let Ok(mut interp) = self.interp.lock() {
+                interp.register_symbol(name, ptr, sig.params.len() as u8);
+            }
+        }
+
         Ok(())
     }
 
