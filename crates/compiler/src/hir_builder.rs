@@ -1145,7 +1145,21 @@ impl<'b, 'arena> FunctionBuilder<'b, 'arena> {
             return_types: Vec::new(),
             type_params,
             is_external: false,
-            calling_convention: CallingConvention::Fast,
+            // Default to `C` (platform default ABI: SysV on Unix x86_64,
+            // WindowsFastcall on x86_64-msvc, AppleAarch64 on ARM
+            // macOS). Tests routinely transmute the resulting function
+            // pointer as `extern "C" fn(...)` (or even bare `fn(...)`)
+            // and invoke through the platform ABI. Cranelift's `Fast`
+            // register layout overlaps with SysV closely enough to mask
+            // a mismatch on macOS / Linux x86_64 / Apple aarch64, but
+            // diverges sharply from MS x64 on Windows → the call reads
+            // args from the wrong registers, producing garbage. Mirrors
+            // the analogous default in
+            // `lowering.rs::set_function_attributes`.
+            //
+            // `begin_extern_function(...)` takes an explicit
+            // CallingConvention parameter so externs are unaffected.
+            calling_convention: CallingConvention::C,
         }
     }
 
