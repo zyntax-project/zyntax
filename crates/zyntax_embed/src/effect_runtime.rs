@@ -209,10 +209,27 @@ pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> 
         // Store `value` at result_slot_offset within the state machine.
         let result_slot = r.state_machine_ptr.add(r.result_slot_offset as usize) as *mut i64;
         *result_slot = value;
-        // Set the dispatcher state slot (offset 0, u32-wide) to
-        // next_state. The upper 4 bytes of the 8-byte slot are
-        // unused — the Switch dispatcher reads a u32.
-        *(r.state_machine_ptr as *mut u32) = r.next_state as u32;
+        // Set the dispatcher state slot (offset 0) to next_state. The
+        // dispatcher's `AsyncLoadSlot` reads the slot as **i64** (see
+        // `krio_adapter::emit::emit_dispatcher` — `ty: HirType::I64`),
+        // so we must write the full 8 bytes, not just the low u32.
+        // The previous u32-only store left the upper 4 bytes as
+        // whatever happened to be in stack memory before the slot was
+        // first used; on macOS / Linux those bytes are reliably zero
+        // (OS pre-zeros stack pages + the layout doesn't touch them
+        // before the first write), so the loaded i64 equalled
+        // next_state and Switch matched the expected case. On
+        // x86_64-pc-windows-msvc the stack region carries garbage
+        // from prior frames — the loaded i64 was
+        // `(garbage_high << 32) | next_state`, which matched no
+        // Switch case, fell through to `default = resume_entries[0]`,
+        // re-ran the perform path, the handler called `k(v)` again,
+        // resume → re-poll → re-perform → real stack-growing
+        // recursion → STATUS_STACK_OVERFLOW (0xc00000fd) in
+        // `phase_i5_breakthrough_real_resume_continuation` on Windows
+        // CI. Writing the full i64 zeroes the upper bytes and the
+        // dispatcher matches correctly on every platform.
+        *(r.state_machine_ptr as *mut i64) = r.next_state;
         // Re-poll the caller's poll fn synchronously until Ready.
         let poll_fn: extern "C" fn(*mut u8) -> i64 = core::mem::transmute(r.poll_fn_ptr);
         loop {
