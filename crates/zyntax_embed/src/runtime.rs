@@ -1220,6 +1220,7 @@ impl ZyntaxRuntime {
         // that references them links cleanly. No-op for modules that
         // don't (the JIT only resolves symbols the IR actually calls).
         crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        runtime.finalize_runtime_symbols()?;
         Ok(runtime)
     }
 
@@ -1245,6 +1246,7 @@ impl ZyntaxRuntime {
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
         };
         crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        runtime.finalize_runtime_symbols()?;
         Ok(runtime)
     }
 
