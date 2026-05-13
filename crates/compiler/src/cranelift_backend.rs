@@ -2904,17 +2904,44 @@ impl CraneliftBackend {
                                 .collect();
 
                             // Create signature for the indirect call.
-                            // IMPORTANT: must use CallConv::Fast to match
-                            // how regular functions are declared via
-                            // `translate_signature` (which maps HIR's
-                            // default `CallingConvention::Fast` →
-                            // `CallConv::Fast`). `make_signature()` returns
-                            // the module-default convention which on some
-                            // platforms (e.g. AppleAarch64, SystemV) is
-                            // different — the mismatch corrupts arg/return
-                            // register layout and segfaults on the call.
+                            // Use the module's default calling convention —
+                            // the platform ABI that maps from HIR's
+                            // `CallingConvention::C` in `translate_signature`
+                            // (SystemV on Unix x86_64, WindowsFastcall on
+                            // x86_64-msvc, AppleAarch64 on ARM macOS, etc.).
+                            //
+                            // This previously hard-coded `CallConv::Fast` to
+                            // match what `translate_signature` emitted when
+                            // HIR `CallingConvention::Fast` was the lowered-
+                            // function default. After commit 2581f86 made `C`
+                            // (= platform default) the default for every
+                            // user TypedFunction, that pinning became a
+                            // mismatch: the callee was declared with
+                            // `WindowsFastcall` on Windows but the indirect
+                            // call site forced Fast, so args landed in
+                            // SysV-flavoured registers (e.g. rdi) while the
+                            // callee read from MS x64 registers (e.g. rcx).
+                            //
+                            // The mismatch manifested as `sync_entry`'s poll
+                            // loop indirectly calling `poll_fn(sm_ptr)` and
+                            // `poll_fn` reading garbage for its state-machine
+                            // pointer — dispatcher loads garbage state, Switch
+                            // falls through to `default = resume_entries[0]`
+                            // (the perform site) over and over, the outer loop
+                            // spins on rc=0 (Pending) because poll_fn never
+                            // reaches a Ready return on the wrong sm pointer.
+                            // The hang manifested on `phase_j1_multi_shot`,
+                            // `phase_j2_abort`, `phase_j3_async`, and
+                            // `tier3_abort_pattern` on Windows CI — none of
+                            // which hit `__zyntax_effect_resume`'s re-entry
+                            // guard because the runaway was outside it.
+                            //
+                            // i5 happened to pass on Windows because its single-
+                            // shot resume path goes through __zyntax_effect_resume
+                            // which directly invokes poll_fn via Rust's extern
+                            // "C" transmute (= MS x64), bypassing this code path
+                            // entirely on the inner re-entry.
                             let mut sig = self.module.make_signature();
-                            sig.call_conv = CallConv::Fast;
 
                             // Add parameters
                             for _ in &arg_values {
