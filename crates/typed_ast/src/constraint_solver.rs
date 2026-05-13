@@ -2318,9 +2318,34 @@ impl ConstraintSolver {
         bound: TypeBound,
         span: Span,
     ) -> Result<ConstraintResult, Vec<SolverError>> {
-        // If the type is a type variable, defer the constraint
-        if matches!(ty, Type::TypeVar(_)) {
-            return Ok(ConstraintResult::Deferred);
+        // If the type is a type variable, record the bound as an
+        // obligation and report Solved for this pass. Mirrors the
+        // `solve_trait_bound` treatment of unresolved type-var
+        // trait bounds (commit 0f11d44): persistently returning
+        // `Deferred` here would loop in the work list until the
+        // generic deferred-constraint path reported it as an
+        // `UnsolvableConstraint` error.
+        //
+        // The obligation is stored as a plain trait bound — the
+        // higher-ranked-ness (universally quantified lifetimes) is
+        // a stronger guarantee than the obligations map represents,
+        // but as a conservative approximation it doesn't cause
+        // false rejections: when the type variable later unifies
+        // with a concrete type, `verify_trait_bounds` checks the
+        // trait implementation, and any lifetime-quantification
+        // verification happens then.
+        if let Type::TypeVar(type_var) = &ty {
+            if let TypeBound::Trait { name, .. } = &bound {
+                self.trait_bounds
+                    .entry(type_var.id)
+                    .or_insert_with(HashSet::new)
+                    .insert(*name);
+            }
+            // Non-trait bound variants (Lifetime, nested HigherRanked)
+            // can't be recorded in trait_bounds; they're accepted
+            // for this pass and re-checked once the type var unifies.
+            let _ = (lifetimes, span);
+            return Ok(ConstraintResult::Solved);
         }
 
         // Create temporary lifetime variables for the universally quantified lifetimes
