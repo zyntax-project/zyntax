@@ -100,6 +100,20 @@ fn create_continue_function() -> HirFunction {
 
     let mut func = HirFunction::new(name, sig);
 
+    // The test transmutes the JIT'd function pointer as
+    // `extern "C" fn(i32) -> i32` (line 70) and invokes it through
+    // the host's platform ABI. `HirFunction::new` defaults to
+    // `CallingConvention::Fast` (Cranelift's internal convention),
+    // whose register layout happens to overlap with extern "C" on
+    // SysV-flavoured ABIs (macOS / Linux x86_64 / Apple aarch64)
+    // but diverges on x86_64-msvc — argument registers shift and
+    // the i32 parameter `n` reads garbage, so the loop condition
+    // `i < n` falls through immediately and the function returns 0
+    // instead of 8. Declare the C ABI explicitly so the HIR's
+    // calling convention matches the transmute regardless of
+    // host platform.
+    func.calling_convention = CallingConvention::C;
+
     // Create blocks
     let entry_block = func.entry_block;
     let loop_header = func.create_block();

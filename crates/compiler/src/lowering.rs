@@ -2354,12 +2354,32 @@ impl LoweringContext {
             _ => {}
         }
 
-        // Set calling convention (before async transformation)
-        hir_func.calling_convention = if func.visibility == Visibility::Public {
-            crate::hir::CallingConvention::C
-        } else {
-            crate::hir::CallingConvention::Fast
-        };
+        // Set calling convention. All user-defined functions get `C` —
+        // i.e. the platform default ABI (SysV on Unix x86_64,
+        // WindowsFastcall on x86_64-msvc, AppleAarch64 on ARM macOS).
+        //
+        // The previous policy (`Public → C`, otherwise → `Fast`) was a
+        // foot-gun for embedders: any host that obtains a function
+        // pointer via `CraneliftBackend::get_function_ptr` invariably
+        // transmutes it as `extern "C" fn(...)` and invokes it through
+        // the platform ABI. Cranelift's `CallConv::Fast` register
+        // layout overlaps with SysV closely enough that those calls
+        // happened to work on macOS / Linux x86_64 / Apple aarch64 by
+        // coincidence — but on `x86_64-pc-windows-msvc` the Microsoft
+        // x64 ABI (rcx/rdx/r8/r9 + 32-byte shadow space + rax return)
+        // diverges sharply, and the call corrupts argument registers
+        // or the return value. Blinc's FSM guard fn (a generated
+        // private TypedFunction returning i32, invoked from Rust as
+        // `extern "C" fn() -> i32`) hit this on Windows CI as a
+        // 0xC0000005 access violation. Defaulting every user function
+        // to `C` removes the coincidence — the ABI matches the
+        // transmute everywhere.
+        //
+        // Internal compiler-generated helpers (lambdas, async state
+        // machines, OSR trampolines) built via `HirFunction::new`
+        // still default to `Fast` at construction time; this only
+        // changes the lowering of user `TypedFunction`s.
+        hir_func.calling_convention = crate::hir::CallingConvention::C;
     }
 
     /// Compute parameter attributes

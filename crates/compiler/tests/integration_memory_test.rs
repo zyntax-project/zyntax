@@ -1,7 +1,7 @@
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::{
-    HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction, HirParam, HirTerminator,
-    HirType, HirValueKind, ParamAttributes,
+    CallingConvention, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
+    HirParam, HirTerminator, HirType, HirValueKind, ParamAttributes,
 };
 use zyntax_typed_ast::{arena::AstArena, InternedString};
 
@@ -57,6 +57,9 @@ fn test_memory_roundtrip_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::I32, HirValueKind::Parameter(0));
 
@@ -141,6 +144,9 @@ fn test_memory_i64_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::I64, HirValueKind::Parameter(0));
 
@@ -225,6 +231,9 @@ fn test_memory_f64_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::F64, HirValueKind::Parameter(0));
 
@@ -320,6 +329,9 @@ fn test_multiple_allocations_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_a = func.create_value(HirType::I32, HirValueKind::Parameter(0));
     let param_b = func.create_value(HirType::I32, HirValueKind::Parameter(1));
@@ -449,6 +461,9 @@ fn test_memory_update_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::I32, HirValueKind::Parameter(0));
 

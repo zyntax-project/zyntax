@@ -54,6 +54,9 @@ fn test_struct_roundtrip() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca Point
@@ -155,6 +158,9 @@ fn test_nested_struct_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca Outer
@@ -259,6 +265,9 @@ fn test_array_roundtrip() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca array
@@ -344,6 +353,9 @@ fn test_2d_array_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca 2D array
@@ -425,6 +437,9 @@ fn test_array_of_structs_execution() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca array
@@ -504,6 +519,9 @@ fn test_mixed_size_struct() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca struct

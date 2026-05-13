@@ -169,6 +169,9 @@ fn create_max_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     // Create blocks
     let entry_block = func.entry_block;
@@ -249,6 +252,9 @@ fn create_abs_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block = func.entry_block;
     let then_block = func.create_block();
@@ -336,6 +342,9 @@ fn create_countdown_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block = func.entry_block;
     let loop_header = func.create_block();
@@ -427,6 +436,9 @@ fn create_factorial_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block = func.entry_block;
     let loop_header = func.create_block();
@@ -535,6 +547,9 @@ fn create_sign_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block = func.entry_block;
     let positive_block = func.create_block();

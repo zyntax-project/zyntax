@@ -169,6 +169,9 @@ fn create_test_add_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     // Create a simple block that adds the parameters
     let entry_block_id = func.entry_block;
@@ -229,6 +232,9 @@ fn create_test_f64_extern_function(
     };
 
     let mut func = HirFunction::new(create_test_string(name), sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     func.is_external = true;
     func.calling_convention = calling_convention;
     func
@@ -463,6 +469,9 @@ fn create_arithmetic_function(name: &str, op: BinaryOp) -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_a = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -516,6 +525,9 @@ fn create_comparison_function(name: &str, op: BinaryOp) -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_a = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -575,6 +587,9 @@ fn create_vector_arithmetic_function(
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_a = func.create_value(vec_ty.clone(), HirValueKind::Parameter(0));
@@ -636,6 +651,9 @@ fn create_float_arithmetic_function(name: &str, op: BinaryOp, ty: HirType) -> Hi
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_a = func.create_value(ty.clone(), HirValueKind::Parameter(0));
     let param_b = func.create_value(ty.clone(), HirValueKind::Parameter(1));
@@ -680,6 +698,9 @@ fn create_control_flow_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     // Create blocks
     let entry_block = func.entry_block;
@@ -778,6 +799,9 @@ fn create_caller_function(callee_id: HirId) -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -860,6 +884,9 @@ fn create_select_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_a = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -926,6 +953,9 @@ fn create_extract_value_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_s = func.create_value(
@@ -990,6 +1020,9 @@ fn create_insert_value_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_s = func.create_value(
@@ -1094,6 +1127,9 @@ fn create_sqrt_intrinsic_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::F64, HirValueKind::Parameter(0));
@@ -1141,6 +1177,9 @@ fn create_ctpop_intrinsic_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -1188,6 +1227,9 @@ fn create_malloc_intrinsic_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_size = func.create_value(HirType::I64, HirValueKind::Parameter(0));
@@ -1238,6 +1280,9 @@ fn create_free_intrinsic_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
@@ -1285,6 +1330,9 @@ fn create_incref_intrinsic_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
@@ -1384,6 +1432,9 @@ fn create_union_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_value = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -1448,6 +1499,9 @@ fn create_closure_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
     let param_x = func.create_value(HirType::I32, HirValueKind::Parameter(0));
@@ -1499,6 +1553,9 @@ fn create_pattern_match_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     // Create blocks for pattern matching
     let entry_block = func.entry_block;
@@ -1626,6 +1683,9 @@ fn create_alloca_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Alloca i32
@@ -1670,6 +1730,9 @@ fn create_load_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
         HirType::Ptr(Box::new(HirType::I32)),
@@ -1726,6 +1789,9 @@ fn create_store_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
         HirType::Ptr(Box::new(HirType::I32)),
@@ -1781,6 +1847,9 @@ fn create_gep_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_arr = func.create_value(
         HirType::Ptr(Box::new(array_ty.clone())),
@@ -1837,6 +1906,9 @@ fn create_combined_memory_test_function() -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_val = func.create_value(HirType::I32, HirValueKind::Parameter(0));
 
@@ -1914,6 +1986,9 @@ fn test_simple_struct_extract() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_p = func.create_value(
@@ -1978,6 +2053,9 @@ fn test_simple_struct_insert() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_p = func.create_value(
@@ -2035,6 +2113,9 @@ fn test_array_extract() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_arr = func.create_value(HirType::Ptr(Box::new(array_ty)), HirValueKind::Parameter(0));
@@ -2092,6 +2173,9 @@ fn test_array_insert() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_arr = func.create_value(
@@ -2156,6 +2240,9 @@ fn test_nested_struct() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
@@ -2214,6 +2301,9 @@ fn test_array_of_structs() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_points =
@@ -2265,6 +2355,9 @@ fn test_2d_array() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_matrix = func.create_value(
@@ -2327,6 +2420,9 @@ fn test_mixed_struct_types() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
@@ -2395,6 +2491,9 @@ fn test_deeply_nested_struct() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
@@ -2460,6 +2559,9 @@ fn test_super_trait_upcast() {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
 
     let entry_block_id = func.entry_block;
 
@@ -2589,6 +2691,9 @@ fn make_f32_to_f32_func(fn_name: &str) -> (HirFunction, HirId) {
         is_pure: false,
     };
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let param = func.create_value(HirType::F32, HirValueKind::Parameter(0));
     (func, param)
 }
@@ -2613,6 +2718,9 @@ fn make_i32_to_i32_func(fn_name: &str) -> (HirFunction, HirId) {
         is_pure: false,
     };
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let param = func.create_value(HirType::I32, HirValueKind::Parameter(0));
     (func, param)
 }
@@ -2645,6 +2753,9 @@ fn make_f64f64_to_f64_func(fn_name: &str) -> (HirFunction, HirId, HirId) {
         is_pure: false,
     };
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let p0 = func.create_value(HirType::F64, HirValueKind::Parameter(0));
     let p1 = func.create_value(HirType::F64, HirValueKind::Parameter(1));
     (func, p0, p1)
@@ -3072,6 +3183,9 @@ fn make_ptr_to_f32_func(fn_name: &str) -> (HirFunction, HirId) {
         is_pure: false,
     };
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let ptr_id = func.create_value(
         HirType::Ptr(Box::new(HirType::F32)),
         HirValueKind::Parameter(0),
@@ -3237,6 +3351,9 @@ fn test_vector_store_f32x4_executes() {
         is_pure: false,
     };
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let ptr_id = func.create_value(
         HirType::Ptr(Box::new(HirType::F32)),
         HirValueKind::Parameter(0),
@@ -3334,6 +3451,9 @@ fn test_emit_elementwise_simd_loop_f32_mul() {
     };
 
     let mut func = HirFunction::new(fn_name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry = func.entry_block;
 
     let data_ptr = func.create_value(
@@ -3556,6 +3676,9 @@ fn create_module_with_perform_effect() -> HirModule {
     };
 
     let mut func = HirFunction::new(func_name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Add PerformEffect instruction
@@ -3596,6 +3719,9 @@ fn create_module_with_handle_effect() -> HirModule {
     };
 
     let mut func = HirFunction::new(func_name, sig);
+    // Match the platform `extern "C"` ABI — `HirFunction::new` defaults
+    // to `Fast`, which diverges from MS x64 on Windows.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Create continuation block first (body will branch to it)

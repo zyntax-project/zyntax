@@ -200,6 +200,11 @@ fn create_binary_op_function(name: &str, op: BinaryOp) -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — the test transmutes
+    // `func_ptr` as `extern "C" fn(...)`. `HirFunction::new` defaults to
+    // `Fast`, which coincidentally overlaps with SysV on macOS/Linux
+    // x86_64 but diverges from MS x64 on Windows → access violation.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     // Create parameter values
@@ -258,6 +263,11 @@ fn create_float_binary_op_function(name: &str, op: BinaryOp) -> HirFunction {
     };
 
     let mut func = HirFunction::new(name, sig);
+    // Match the platform `extern "C"` ABI — the test transmutes
+    // `func_ptr` as `extern "C" fn(...)`. `HirFunction::new` defaults to
+    // `Fast`, which coincidentally overlaps with SysV on macOS/Linux
+    // x86_64 but diverges from MS x64 on Windows → access violation.
+    func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
     let param_a = func.create_value(HirType::F64, HirValueKind::Parameter(0));
