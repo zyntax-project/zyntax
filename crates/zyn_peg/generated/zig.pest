@@ -12,7 +12,8 @@ enum_variant = { identifier ~ ","?  }
 extern_fn_decl = { extern_fn_decl_with_params | extern_fn_decl_no_params  }
 extern_fn_decl_with_params = { "extern" ~ "fn" ~ identifier ~ "(" ~ fn_param_list ~ ")" ~ type_expr ~ ";"  }
 extern_fn_decl_no_params = { "extern" ~ "fn" ~ identifier ~ "(" ~ ")" ~ type_expr ~ ";"  }
-fn_decl = { async_fn_decl | sync_fn_decl  }
+fn_decl = { fn_decl_inner  }
+fn_decl_inner = { async_fn_decl | sync_fn_decl  }
 sync_fn_decl = { fn_decl_with_params | fn_decl_no_params  }
 async_fn_decl = { async_fn_decl_with_params | async_fn_decl_no_params  }
 async_fn_decl_with_params = { "async" ~ "fn" ~ identifier ~ "(" ~ fn_param_list ~ ")" ~ type_expr ~ block  }
@@ -24,10 +25,12 @@ fn_param_item = { fn_param_any ~ ","?  }
 fn_param_any = { comptime_param | fn_param  }
 comptime_param = { "comptime" ~ identifier ~ ":" ~ type_expr  }
 fn_param = { identifier ~ ":" ~ type_expr  }
-const_decl = { const_decl_typed | const_decl_untyped  }
+const_decl = { const_decl_inner  }
+const_decl_inner = { const_decl_typed | const_decl_untyped  }
 const_decl_typed = { "const" ~ identifier ~ ":" ~ type_expr ~ "=" ~ expr ~ ";"  }
 const_decl_untyped = { "const" ~ identifier ~ "=" ~ expr ~ ";"  }
-var_decl = { var_decl_typed | var_decl_untyped  }
+var_decl = { var_decl_inner  }
+var_decl_inner = { var_decl_typed | var_decl_untyped  }
 var_decl_typed = { "var" ~ identifier ~ ":" ~ type_expr ~ "=" ~ expr ~ ";"  }
 var_decl_untyped = { "var" ~ identifier ~ "=" ~ expr ~ ";"  }
 type_expr = { pointer_type | optional_type | error_union_type | array_type | primitive_type | named_type  }
@@ -56,11 +59,17 @@ local_var_untyped = { "var" ~ identifier ~ "=" ~ expr ~ ";"  }
 expr_stmt = { expr ~ ";"  }
 block = { "{" ~ statement* ~ "}"  }
 expr = { comparison_expr  }
-comparison_expr = { add_expr ~ (comparison_op ~ add_expr)?  }
+comparison_expr = { comparison_with_op | comparison_no_op  }
+comparison_with_op = { add_expr ~ comparison_op ~ add_expr  }
+comparison_no_op = { add_expr  }
 comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">"  }
-add_expr = { mul_expr ~ (add_op ~ mul_expr)?  }
+add_expr = { add_with_op | add_no_op  }
+add_with_op = { mul_expr ~ add_op ~ mul_expr  }
+add_no_op = { mul_expr  }
 add_op = @{ "+" | "-"  }
-mul_expr = { unary_expr ~ (mul_op ~ unary_expr)?  }
+mul_expr = { mul_with_op | mul_no_op  }
+mul_with_op = { unary_expr ~ mul_op ~ unary_expr  }
+mul_no_op = { unary_expr  }
 mul_op = @{ "*" | "/"  }
 unary_expr = { unary_with_op | primary  }
 unary_with_op = { unary_op ~ primary  }
