@@ -1115,12 +1115,13 @@ mod tests {
                 attributes: vec![],
             }],
             return_type: Type::Primitive(PrimitiveType::I32),
-            body: TypedBlock {
+            body: Some(TypedBlock {
                 statements: vec![],
                 span: Span::new(10, 15),
-            },
+            }),
             visibility: Visibility::Public,
             is_async: false,
+            ..Default::default()
         };
 
         assert_eq!(go_func.params.len(), 1);
@@ -1218,7 +1219,7 @@ mod tests {
         // Go array: [5]int
         let go_array = Type::Array {
             element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
-            size: Some(5),
+            size: Some(ConstValue::Int(5)),
             nullability: NullabilityKind::NonNull,
         };
 
@@ -1229,7 +1230,11 @@ mod tests {
             nullability: NullabilityKind::NonNull,
         };
 
-        if let Type::Array { size: Some(5), .. } = go_array {
+        if let Type::Array {
+            size: Some(ConstValue::Int(5)),
+            ..
+        } = go_array
+        {
             // Array has fixed size
         } else {
             panic!("Expected fixed size array");
