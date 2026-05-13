@@ -1169,22 +1169,49 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // Mint values + build the new instruction sequence.
         let mut new_insts: Vec<HirInstruction> = Vec::new();
 
-        // r_ptr = Alloca(i64 x 4) — 32-byte stack slot.
+        // r_ptr = malloc(32) — 32-byte heap slot.
+        //
+        // Resume<T> structs need to outlive the perform site's stack
+        // frame in the async out-of-line case (phase J.3): the handler
+        // stashes `k` (= this pointer) somewhere reachable from outside
+        // poll_fn, and the host later calls `__zyntax_effect_resume(k, v)`
+        // out-of-line. If `r_ptr` is an Alloca (stack slot), the pointer
+        // is dangling the moment poll_fn returns — every subsequent
+        // dereference reads whatever the runtime stack scribbled over
+        // the old slot.
+        //
+        // On macOS / Linux x86_64 the stack region below the old rsp
+        // happens to survive long enough for synthetic test harness
+        // paths to read the stale-but-intact Resume struct. On
+        // x86_64-pc-windows-msvc the intervening Rust frames between
+        // poll_fn's return and the out-of-line invocation overwrite
+        // the old slot — typically clearing `next_state` to 0, which
+        // routes the dispatcher's Switch to `default = resume_entries[0]`
+        // (the perform site) instead of the resume entry, producing
+        // wrong results for `phase_j3_async_out_of_line_resume`.
+        //
+        // Heap-allocate to make every perform site's Resume<T> live as
+        // long as someone has a pointer to it. The 32 bytes leak on
+        // every perform (no free hook yet) — bounded by the program's
+        // total perform-site execution count; a future Tier 3 refinement
+        // can refcount or arena-collect.
         let r_ptr_id = mint_value(
             &mut function.values,
             HirType::Ptr(Box::new(HirType::U8)),
             HirValueKind::Instruction,
         );
-        let alloca_count_id = mint_value(
+        let r_size_id = mint_value(
             &mut function.values,
             HirType::I64,
-            HirValueKind::Constant(HirConstant::I64(4)),
+            HirValueKind::Constant(HirConstant::I64(32)),
         );
-        new_insts.push(HirInstruction::Alloca {
-            result: r_ptr_id,
-            ty: HirType::I64,
-            count: Some(alloca_count_id),
-            align: 8,
+        new_insts.push(HirInstruction::Call {
+            result: Some(r_ptr_id),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![r_size_id],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
         });
 
         // r_poll_fn_ptr = CreateClosure(poll_fn_id) (self-reference).
