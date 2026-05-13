@@ -2,6 +2,9 @@
 //!
 //! Test the Cranelift backend IR generation and compilation.
 
+use cranelift_codegen::ir::types;
+#[cfg(target_os = "windows")]
+use cranelift_codegen::isa::CallConv;
 use std::collections::HashSet;
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
@@ -104,6 +107,36 @@ fn test_signature_translation() {
     }
 }
 
+#[test]
+fn test_extern_c_uses_platform_native_calling_convention_for_f64_abi() {
+    let backend = CraneliftBackend::new().expect("Failed to create backend");
+
+    let c_func = create_test_f64_extern_function("host_c_f64", CallingConvention::C);
+    let system_func = create_test_f64_extern_function("host_system_f64", CallingConvention::System);
+
+    let c_sig = backend
+        .translate_signature(&c_func)
+        .expect("translate extern C f64 signature");
+    let system_sig = backend
+        .translate_signature(&system_func)
+        .expect("translate system f64 signature");
+
+    assert_eq!(
+        c_sig.call_conv, system_sig.call_conv,
+        "extern C host calls must use the ISA's platform-native ABI; \
+         forcing SystemV breaks Rust extern \"C\" calls on Windows"
+    );
+
+    #[cfg(target_os = "windows")]
+    assert_eq!(c_sig.call_conv, CallConv::WindowsFastcall);
+
+    assert_eq!(c_sig.params.len(), 2);
+    assert_eq!(c_sig.params[0].value_type, types::F64);
+    assert_eq!(c_sig.params[1].value_type, types::I64);
+    assert_eq!(c_sig.returns.len(), 1);
+    assert_eq!(c_sig.returns[0].value_type, types::F64);
+}
+
 // Helper functions to create test HIR structures
 
 fn create_test_add_function() -> HirFunction {
@@ -163,6 +196,41 @@ fn create_test_add_function() -> HirFunction {
         values: vec![result],
     });
 
+    func
+}
+
+fn create_test_f64_extern_function(
+    name: &str,
+    calling_convention: CallingConvention,
+) -> HirFunction {
+    let sig = HirFunctionSignature {
+        params: vec![
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("x"),
+                ty: HirType::F64,
+                attributes: ParamAttributes::default(),
+            },
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("bits"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+            },
+        ],
+        returns: vec![HirType::F64],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let mut func = HirFunction::new(create_test_string(name), sig);
+    func.is_external = true;
+    func.calling_convention = calling_convention;
     func
 }
 

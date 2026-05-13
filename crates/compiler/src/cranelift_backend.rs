@@ -4896,17 +4896,15 @@ impl CraneliftBackend {
 
         let mut cranelift_sig = self.module.make_signature();
 
-        // Set calling convention
-        // For System, use the ISA's default calling convention (platform-native)
-        // This ensures compatibility with ZRTL plugins on all platforms
+        // Set calling convention. `module.make_signature()` starts with the
+        // ISA default, which is the native ABI for host externs: SystemV on
+        // Unix x86_64, WindowsFastcall on x86_64-msvc, AppleAarch64 on ARM
+        // macOS, etc. Keep both C and System on that default so calls into
+        // Rust `extern "C"`/ZRTL symbols use the platform ABI.
         cranelift_sig.call_conv = match function.calling_convention {
-            crate::hir::CallingConvention::C => CallConv::SystemV,
+            crate::hir::CallingConvention::C => cranelift_sig.call_conv,
             crate::hir::CallingConvention::Fast => CallConv::Fast,
-            crate::hir::CallingConvention::System => {
-                // Use the default calling convention from make_signature()
-                // which is platform-native (AppleAarch64 on ARM Mac, SystemV on x86, etc.)
-                cranelift_sig.call_conv
-            }
+            crate::hir::CallingConvention::System => cranelift_sig.call_conv,
             crate::hir::CallingConvention::WebKit => CallConv::Fast,
         };
 
