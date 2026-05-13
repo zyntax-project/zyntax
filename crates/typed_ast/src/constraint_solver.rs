@@ -1909,17 +1909,19 @@ impl ConstraintSolver {
 
         match &resolved_ty {
             Type::TypeVar(type_var) => {
-                // For type variables, accumulate trait bounds
+                // For unresolved type variables, accumulate trait bounds as
+                // obligations. They will be checked when the variable is
+                // unified with a concrete type.
                 self.trait_bounds
                     .entry(type_var.id)
                     .or_insert_with(HashSet::new)
                     .insert(trait_name);
 
-                // Check if we have a concrete type that we can verify against
+                // Check if we have a concrete type that we can verify against.
                 if let Some(concrete_ty) = self.subst.map.get(&type_var.id) {
                     self.verify_trait_bounds(concrete_ty.clone(), std::iter::once(trait_name), span)
                 } else {
-                    Ok(ConstraintResult::Deferred)
+                    Ok(ConstraintResult::Solved)
                 }
             }
 
