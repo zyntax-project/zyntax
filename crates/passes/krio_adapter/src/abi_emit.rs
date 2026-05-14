@@ -1101,6 +1101,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
     handler_resolution: &std::collections::HashMap<(HirId, InternedString), HirId>,
     poll_fn_id: HirId,
     frame_ptr: HirId,
+    resume_scratch_slot: u32,
 ) {
     // First pass: collect (block_id, inst_idx, metadata) without
     // mutating to avoid borrow conflicts.
@@ -1169,49 +1170,47 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // Mint values + build the new instruction sequence.
         let mut new_insts: Vec<HirInstruction> = Vec::new();
 
-        // r_ptr = malloc(32) — 32-byte heap slot.
+        // r_ptr = sm_ptr + resume_scratch_slot * 8.
         //
-        // Resume<T> structs need to outlive the perform site's stack
-        // frame in the async out-of-line case (phase J.3): the handler
-        // stashes `k` (= this pointer) somewhere reachable from outside
-        // poll_fn, and the host later calls `__zyntax_effect_resume(k, v)`
-        // out-of-line. If `r_ptr` is an Alloca (stack slot), the pointer
-        // is dangling the moment poll_fn returns — every subsequent
-        // dereference reads whatever the runtime stack scribbled over
-        // the old slot.
+        // The Resume<T> struct (4 i64 fields = 32 bytes) lives in a
+        // fixed 4-slot region reserved at the end of the state
+        // machine by `orchestrator::lower_async_function`. Embedding
+        // it in the SM rather than malloc'ing per perform-site
+        // invocation eliminates the per-perform 32-byte leak the
+        // previous `Intrinsic::Malloc(32)` introduced — the scratch's
+        // lifetime matches the SM's (already heap-allocated, never
+        // freed today), so no new free path is needed.
         //
-        // On macOS / Linux x86_64 the stack region below the old rsp
-        // happens to survive long enough for synthetic test harness
-        // paths to read the stale-but-intact Resume struct. On
-        // x86_64-pc-windows-msvc the intervening Rust frames between
-        // poll_fn's return and the out-of-line invocation overwrite
-        // the old slot — typically clearing `next_state` to 0, which
-        // routes the dispatcher's Switch to `default = resume_entries[0]`
-        // (the perform site) instead of the resume entry, producing
-        // wrong results for `phase_j3_async_out_of_line_resume`.
+        // Resume<T> structs must outlive the perform site's stack
+        // frame in the async out-of-line case (phase J.3): the
+        // handler stashes `k` (= this pointer) somewhere reachable
+        // from outside poll_fn, and the host later calls
+        // `__zyntax_effect_resume(k, v)` out-of-line. An Alloca
+        // (stack slot) would dangle the moment poll_fn returns; a
+        // malloc'd buffer works but leaks. The SM-embedded slot
+        // gives us the outlive semantics with no extra allocation.
         //
-        // Heap-allocate to make every perform site's Resume<T> live as
-        // long as someone has a pointer to it. The 32 bytes leak on
-        // every perform (no free hook yet) — bounded by the program's
-        // total perform-site execution count; a future Tier 3 refinement
-        // can refcount or arena-collect.
+        // Limitation: all perform sites in this function share this
+        // one scratch region. Nested or interleaved performs with
+        // async stashing (host holds k from perform A while perform
+        // B's handler runs) would alias the slot and corrupt the
+        // stashed pointer. Current tests all have a single perform
+        // site per function; extending to N per-perform scratches is
+        // a future refinement when multi-perform-with-stash programs
+        // land.
+        let scratch_offset_bytes = (resume_scratch_slot as i64) * 8;
+        let scratch_offset_id = mint_const_i64(&mut function.values, scratch_offset_bytes);
         let r_ptr_id = mint_value(
             &mut function.values,
             HirType::Ptr(Box::new(HirType::U8)),
             HirValueKind::Instruction,
         );
-        let r_size_id = mint_value(
-            &mut function.values,
-            HirType::I64,
-            HirValueKind::Constant(HirConstant::I64(32)),
-        );
-        new_insts.push(HirInstruction::Call {
-            result: Some(r_ptr_id),
-            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
-            args: vec![r_size_id],
-            type_args: vec![],
-            const_args: vec![],
-            is_tail: false,
+        new_insts.push(HirInstruction::Binary {
+            result: r_ptr_id,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: frame_ptr,
+            right: scratch_offset_id,
         });
 
         // r_poll_fn_ptr = CreateClosure(poll_fn_id) (self-reference).

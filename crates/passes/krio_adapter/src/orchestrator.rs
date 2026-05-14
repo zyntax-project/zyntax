@@ -96,6 +96,24 @@ pub struct LowerResult {
     /// Used by the entry function to size the malloc. Computed as
     /// `max(captures_slot, state_slot, param_slots) + 1`.
     pub num_slots: u32,
+    /// Base slot index of the 4-slot region reserved at the END of the
+    /// state machine for the Resume<T> struct scratch space. The
+    /// algebraic-effects perform-site lowering writes its 32-byte
+    /// Resume<T> (poll_fn_ptr / state_machine_ptr / result_slot_offset
+    /// / next_state) into `sm_ptr + resume_scratch_slot * 8` rather
+    /// than calling malloc(32) per perform-site invocation. The struct
+    /// lives as long as the state machine does — no per-perform heap
+    /// allocation, no leak.
+    ///
+    /// Limitation: all perform sites in the same function share this
+    /// one scratch region. Nested or interleaved performs with async
+    /// stashing (host holds k from perform A while perform B's
+    /// handler runs) would alias the slot and corrupt the stashed
+    /// pointer. Current tests all have a single perform site per
+    /// function; extending to N per-perform scratches (one per site)
+    /// is a future refinement when multi-perform-with-stash programs
+    /// land.
+    pub resume_scratch_slot: u32,
 }
 
 /// Errors the orchestrator may surface.
@@ -245,7 +263,16 @@ pub fn lower_async_function(
         state_slot,
         after_awaits_slot,
     );
-    let num_slots: u32 = after_performs_slot;
+    // Reserve 4 slots at the end for the Resume<T> struct scratch
+    // space (4 i64 fields: poll_fn_ptr, state_machine_ptr,
+    // result_slot_offset, next_state). Embedding it in the state
+    // machine instead of malloc'ing per perform-site invocation
+    // eliminates the bounded-but-unbounded leak the previous
+    // `Intrinsic::Malloc(32)` introduced — the scratch's lifetime
+    // matches the SM's (already heap-allocated, never freed today),
+    // so no new free path is needed.
+    let resume_scratch_slot: u32 = after_performs_slot;
+    let num_slots: u32 = after_performs_slot + 4;
 
     // F.2 follow-up: the await lowering creates new resume blocks
     // that may now be predecessors of phi blocks (e.g. loop headers
@@ -270,6 +297,7 @@ pub fn lower_async_function(
         param_slots,
         state_slot,
         num_slots,
+        resume_scratch_slot,
     })
 }
 

@@ -959,6 +959,7 @@ fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> Runtim
             &handler_resolution,
             new_poll_id,
             post_reshape_frame_ptr,
+            lower_result.resume_scratch_slot,
         );
 
         // Phase 3: SYNC entry wrapper (returns T, not *Promise<T>).
