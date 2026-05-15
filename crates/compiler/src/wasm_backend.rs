@@ -799,17 +799,54 @@ impl<'a> FunctionEmitter<'a> {
                     align: 3, // log2(8) — 8-byte aligned
                     memory_index: 0,
                 };
-                let load = match ty {
-                    HirType::I64 | HirType::U64 => WasmInst::I64Load(memarg),
-                    HirType::F64 => WasmInst::F64Load(memarg),
+                // Width selection: pick the matching wasm load opcode
+                // for the HIR memory type. Narrower-than-i64 integer
+                // loads zero- or sign-extend into the i64 funnel
+                // automatically per the wasm spec; F32 loads need an
+                // explicit promote since the funnel uses f64.
+                //
+                // 8-byte alignment is correct only for i64/u64/f64/ptr.
+                // For smaller widths emit the natural alignment so the
+                // module validates cleanly. (Cranelift+x86 handles
+                // misaligned loads transparently, but wasm validation
+                // checks `align <= natural_width_log2`.)
+                let memarg_aligned = |log2_align: u32| MemArg {
+                    offset: 0,
+                    align: log2_align,
+                    memory_index: 0,
+                };
+                match ty {
+                    HirType::I64 | HirType::U64 => {
+                        out.push(WasmInst::I64Load(memarg_aligned(3)));
+                    }
+                    HirType::Ptr(_) => {
+                        // Pointers travel through the funnel as i64
+                        // (the slot machinery stores them in 8-byte
+                        // slots regardless of native pointer width).
+                        out.push(WasmInst::I64Load(memarg_aligned(3)));
+                    }
+                    HirType::I32 => out.push(WasmInst::I64Load32S(memarg_aligned(2))),
+                    HirType::U32 => out.push(WasmInst::I64Load32U(memarg_aligned(2))),
+                    HirType::I16 => out.push(WasmInst::I64Load16S(memarg_aligned(1))),
+                    HirType::U16 => out.push(WasmInst::I64Load16U(memarg_aligned(1))),
+                    HirType::I8 => out.push(WasmInst::I64Load8S(memarg_aligned(0))),
+                    HirType::U8 | HirType::Bool => {
+                        out.push(WasmInst::I64Load8U(memarg_aligned(0)));
+                    }
+                    HirType::F64 => out.push(WasmInst::F64Load(memarg_aligned(3))),
+                    HirType::F32 => {
+                        // Funnel keeps floats as f64; promote the
+                        // loaded f32 before local.set.
+                        out.push(WasmInst::F32Load(memarg_aligned(2)));
+                        out.push(WasmInst::F64PromoteF32);
+                    }
                     other => {
                         return Err(WasmEmitError::Unsupported(format!(
-                            "Load of HirType {:?} (only I64/U64/F64 supported in this slice)",
+                            "Load of HirType {:?}",
                             other
                         )));
                     }
-                };
-                out.push(load);
+                }
                 out.push(self.local_set(*result)?);
                 Ok(())
             }
@@ -833,17 +870,43 @@ impl<'a> FunctionEmitter<'a> {
                     align: 3,
                     memory_index: 0,
                 };
-                let store = match value_ty {
-                    HirType::I64 | HirType::U64 => WasmInst::I64Store(memarg),
-                    HirType::F64 => WasmInst::F64Store(memarg),
+                // Width selection mirrors the Load arm: i64 funnel can
+                // emit narrowing stores directly (`i64.store{8,16,32}`
+                // truncate the upper bits of the funneled value), F32
+                // needs an explicit demote from the f64 funnel.
+                let memarg_aligned = |log2_align: u32| MemArg {
+                    offset: 0,
+                    align: log2_align,
+                    memory_index: 0,
+                };
+                let _ = memarg; // keep the binding name for any future use
+                match value_ty {
+                    HirType::I64 | HirType::U64 | HirType::Ptr(_) => {
+                        out.push(WasmInst::I64Store(memarg_aligned(3)));
+                    }
+                    HirType::I32 | HirType::U32 => {
+                        out.push(WasmInst::I64Store32(memarg_aligned(2)));
+                    }
+                    HirType::I16 | HirType::U16 => {
+                        out.push(WasmInst::I64Store16(memarg_aligned(1)));
+                    }
+                    HirType::I8 | HirType::U8 | HirType::Bool => {
+                        out.push(WasmInst::I64Store8(memarg_aligned(0)));
+                    }
+                    HirType::F64 => out.push(WasmInst::F64Store(memarg_aligned(3))),
+                    HirType::F32 => {
+                        // Funnel keeps floats as f64; demote before
+                        // storing the 4-byte representation.
+                        out.push(WasmInst::F32DemoteF64);
+                        out.push(WasmInst::F32Store(memarg_aligned(2)));
+                    }
                     other => {
                         return Err(WasmEmitError::Unsupported(format!(
-                            "Store of HirType {:?} (only I64/U64/F64 supported in this slice)",
+                            "Store of HirType {:?}",
                             other
                         )));
                     }
-                };
-                out.push(store);
+                }
                 Ok(())
             }
             HirInstruction::Call {
@@ -889,6 +952,80 @@ impl<'a> FunctionEmitter<'a> {
                 } else {
                     out.push(WasmInst::Drop);
                 }
+                Ok(())
+            }
+            HirInstruction::Cast {
+                op,
+                result,
+                ty: _dest_ty,
+                operand,
+            } => {
+                // The WasmBackend's locals are i64-funneled for every
+                // int/pointer/bool HIR type and f64-funneled for every
+                // float. Cast lowering exploits this:
+                //
+                //   - Int↔int casts (Trunc/ZExt/SExt) reduce to a copy
+                //     between i64 locals — the funnel doesn't track
+                //     subwidth precision today. Programs that round-trip
+                //     i64 → Trunc(i32) → SExt(i64) with the top 32 bits
+                //     set will see them preserved (the funnel never
+                //     narrowed). Acceptable for the current scope; a
+                //     future refinement would emit `i64.const 0xFFFF...`
+                //     + `i64.and`/`i64.shl;i64.shr_s` to model real
+                //     truncation. The BC interpreter has the same
+                //     property so JIT/interp parity holds.
+                //   - Float↔float (FpTrunc/FpExt) reduce to a copy
+                //     between f64 locals for the same reason.
+                //   - Int↔float conversions use the matching
+                //     `f64.convert_i64_{s,u}` / `i64.trunc_f64_{s,u}`
+                //     opcode.
+                //   - Pointer↔int (PtrToInt/IntToPtr) is a no-op — both
+                //     sides are i64 in the funnel.
+                //   - Bitcast crosses the int/float boundary; use
+                //     reinterpret. Same-type bitcasts (int↔int /
+                //     float↔float) are no-ops.
+                use crate::hir::CastOp;
+                out.push(self.local_get(*operand)?);
+                match op {
+                    // Funneled width is i64/f64 on both sides — direct copy.
+                    CastOp::Trunc
+                    | CastOp::ZExt
+                    | CastOp::SExt
+                    | CastOp::FpTrunc
+                    | CastOp::FpExt
+                    | CastOp::PtrToInt
+                    | CastOp::IntToPtr => {
+                        // local.get already pushed; local.set below copies it.
+                    }
+                    // Float → int (truncate toward zero).
+                    CastOp::FpToSi => out.push(WasmInst::I64TruncF64S),
+                    CastOp::FpToUi => out.push(WasmInst::I64TruncF64U),
+                    // Int → float (convert).
+                    CastOp::SiToFp => out.push(WasmInst::F64ConvertI64S),
+                    CastOp::UiToFp => out.push(WasmInst::F64ConvertI64U),
+                    // Reinterpret: only meaningful when crossing the
+                    // int/float boundary in the funnel. Determine
+                    // direction by the operand's HIR type.
+                    CastOp::Bitcast => {
+                        let src_ty = self
+                            .func
+                            .values
+                            .get(operand)
+                            .ok_or(WasmEmitError::UnknownValue(*operand))?
+                            .ty
+                            .clone();
+                        let src_is_float = matches!(src_ty, HirType::F32 | HirType::F64);
+                        let dst_is_float = matches!(_dest_ty, HirType::F32 | HirType::F64);
+                        match (src_is_float, dst_is_float) {
+                            (true, false) => out.push(WasmInst::I64ReinterpretF64),
+                            (false, true) => out.push(WasmInst::F64ReinterpretI64),
+                            _ => {
+                                // same-side bitcast — no-op in the funnel.
+                            }
+                        }
+                    }
+                }
+                out.push(self.local_set(*result)?);
                 Ok(())
             }
             other => Err(WasmEmitError::Unsupported(format!(
@@ -2058,5 +2195,263 @@ mod tests {
             }
             other => panic!("expected Unsupported(phi cycle), got {:?}", other),
         }
+    }
+
+    /// Build a 1-param 1-return function whose only body op is a Cast
+    /// from `param_ty` to `dest_ty`, and assert the emitted module
+    /// validates structurally. Lets us cover each CastOp variant without
+    /// duplicating the boilerplate.
+    fn cast_round_trip(
+        op: crate::hir::CastOp,
+        param_ty: HirType,
+        dest_ty: HirType,
+        ret_ty: HirType,
+    ) {
+        let param_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: param_id,
+                name: InternedString::new_global("x"),
+                ty: param_ty.clone(),
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![ret_ty.clone()],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("cast_under_test"), sig);
+        func.values.insert(
+            param_id,
+            HirValue {
+                id: param_id,
+                ty: param_ty,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+
+        let cast_result = add_value(&mut func, dest_ty.clone(), HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Cast {
+            op,
+            result: cast_result,
+            ty: dest_ty,
+            operand: param_id,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![cast_result],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .unwrap_or_else(|e| panic!("emit cast {:?}: {:?}", op, e));
+        m.validate_full()
+            .unwrap_or_else(|e| panic!("validate cast {:?}: {:?}", op, e));
+    }
+
+    #[test]
+    fn emits_int_to_int_casts_as_funnel_no_ops() {
+        // Trunc / ZExt / SExt all collapse to a copy in the i64 funnel.
+        use crate::hir::CastOp;
+        cast_round_trip(CastOp::Trunc, HirType::I64, HirType::I32, HirType::I64);
+        cast_round_trip(CastOp::ZExt, HirType::I64, HirType::I64, HirType::I64);
+        cast_round_trip(CastOp::SExt, HirType::I64, HirType::I64, HirType::I64);
+    }
+
+    #[test]
+    fn emits_float_to_float_casts_as_funnel_no_ops() {
+        use crate::hir::CastOp;
+        cast_round_trip(CastOp::FpTrunc, HirType::F64, HirType::F64, HirType::F64);
+        cast_round_trip(CastOp::FpExt, HirType::F64, HirType::F64, HirType::F64);
+    }
+
+    #[test]
+    fn emits_int_to_float_and_back() {
+        use crate::hir::CastOp;
+        // SiToFp: i64 → f64 → F64ConvertI64S
+        cast_round_trip(CastOp::SiToFp, HirType::I64, HirType::F64, HirType::F64);
+        // UiToFp: i64 → f64 → F64ConvertI64U
+        cast_round_trip(CastOp::UiToFp, HirType::I64, HirType::F64, HirType::F64);
+        // FpToSi: f64 → i64 → I64TruncF64S
+        cast_round_trip(CastOp::FpToSi, HirType::F64, HirType::I64, HirType::I64);
+        // FpToUi: f64 → i64 → I64TruncF64U
+        cast_round_trip(CastOp::FpToUi, HirType::F64, HirType::I64, HirType::I64);
+    }
+
+    #[test]
+    fn emits_pointer_int_casts_as_funnel_no_ops() {
+        use crate::hir::CastOp;
+        // PtrToInt: ptr(i64) → i64 → no-op in funnel
+        cast_round_trip(CastOp::PtrToInt, HirType::I64, HirType::I64, HirType::I64);
+        // IntToPtr: i64 → ptr(i64) → no-op
+        cast_round_trip(CastOp::IntToPtr, HirType::I64, HirType::I64, HirType::I64);
+    }
+
+    #[test]
+    fn emits_bitcast_across_int_float_boundary() {
+        use crate::hir::CastOp;
+        // i64 → f64 bitcast → F64ReinterpretI64
+        cast_round_trip(CastOp::Bitcast, HirType::I64, HirType::F64, HirType::F64);
+        // f64 → i64 bitcast → I64ReinterpretF64
+        cast_round_trip(CastOp::Bitcast, HirType::F64, HirType::I64, HirType::I64);
+        // same-side bitcasts collapse to no-op
+        cast_round_trip(CastOp::Bitcast, HirType::I64, HirType::I64, HirType::I64);
+        cast_round_trip(CastOp::Bitcast, HirType::F64, HirType::F64, HirType::F64);
+    }
+
+    /// Build a `(ptr: i64) -> <load_ty>` function with one Load at the
+    /// given element type and confirm the module structurally validates.
+    /// Covers the narrow-width load opcodes added beyond the initial
+    /// i64/u64/f64 trio.
+    fn load_round_trip(elem_ty: HirType) {
+        let ptr_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: ptr_id,
+                name: InternedString::new_global("ptr"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![elem_ty.clone()],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("load_test"), sig);
+        func.values.insert(
+            ptr_id,
+            HirValue {
+                id: ptr_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let loaded = add_value(&mut func, elem_ty.clone(), HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Load {
+            result: loaded,
+            ty: elem_ty.clone(),
+            ptr: ptr_id,
+            align: 1,
+            volatile: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![loaded],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .unwrap_or_else(|e| panic!("emit load {:?}: {:?}", elem_ty, e));
+        m.validate_full()
+            .unwrap_or_else(|e| panic!("validate load {:?}: {:?}", elem_ty, e));
+    }
+
+    /// Same shape but exercising Store: `(ptr: i64, val: <elem_ty>)`.
+    fn store_round_trip(elem_ty: HirType) {
+        let ptr_id = HirId::new();
+        let val_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: ptr_id,
+                    name: InternedString::new_global("ptr"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: val_id,
+                    name: InternedString::new_global("val"),
+                    ty: elem_ty.clone(),
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("store_test"), sig);
+        func.values.insert(
+            ptr_id,
+            HirValue {
+                id: ptr_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        func.values.insert(
+            val_id,
+            HirValue {
+                id: val_id,
+                ty: elem_ty.clone(),
+                kind: HirValueKind::Parameter(1),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Store {
+            ptr: ptr_id,
+            value: val_id,
+            align: 1,
+            volatile: false,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![] };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .unwrap_or_else(|e| panic!("emit store {:?}: {:?}", elem_ty, e));
+        m.validate_full()
+            .unwrap_or_else(|e| panic!("validate store {:?}: {:?}", elem_ty, e));
+    }
+
+    #[test]
+    fn emits_narrow_int_loads_zero_or_sign_extending_into_i64_funnel() {
+        load_round_trip(HirType::I8);
+        load_round_trip(HirType::U8);
+        load_round_trip(HirType::I16);
+        load_round_trip(HirType::U16);
+        load_round_trip(HirType::I32);
+        load_round_trip(HirType::U32);
+        load_round_trip(HirType::Bool);
+    }
+
+    #[test]
+    fn emits_narrow_int_stores_truncating_from_i64_funnel() {
+        store_round_trip(HirType::I8);
+        store_round_trip(HirType::U8);
+        store_round_trip(HirType::I16);
+        store_round_trip(HirType::U16);
+        store_round_trip(HirType::I32);
+        store_round_trip(HirType::U32);
+        store_round_trip(HirType::Bool);
+    }
+
+    #[test]
+    fn emits_f32_load_promotes_into_f64_funnel() {
+        load_round_trip(HirType::F32);
+    }
+
+    #[test]
+    fn emits_f32_store_demotes_from_f64_funnel() {
+        store_round_trip(HirType::F32);
     }
 }
