@@ -487,7 +487,10 @@ impl<'a> FunctionEmitter<'a> {
             for inst in &block.instructions {
                 if matches!(
                     inst,
-                    HirInstruction::Load { .. } | HirInstruction::Store { .. }
+                    HirInstruction::Load { .. }
+                        | HirInstruction::Store { .. }
+                        | HirInstruction::AsyncSaveSlot { .. }
+                        | HirInstruction::AsyncLoadSlot { .. }
                 ) {
                     self.needs_memory_import = true;
                 }
@@ -1083,6 +1086,95 @@ impl<'a> FunctionEmitter<'a> {
                                 // same-side bitcast — no-op in the funnel.
                             }
                         }
+                    }
+                }
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::AsyncSaveSlot { frame, slot, value } => {
+                // Async/effect state-machine slot write. The frame is
+                // an 8-byte-aligned heap pointer and each slot is a
+                // uniform 8-byte cell at offset `slot * 8`. Lower as
+                // an `i64.store` with the slot offset folded into
+                // the memarg.
+                //
+                // Values arrive in their funneled form: i64 locals
+                // for any int/pointer/bool, f64 locals for floats.
+                // Floats need a bit-reinterpret to i64 before the
+                // i64.store since slots are i64-wide and the
+                // matching AsyncLoadSlot expects to read back the
+                // same bit pattern.
+                let value_ty = self
+                    .func
+                    .values
+                    .get(value)
+                    .ok_or(WasmEmitError::UnknownValue(*value))?
+                    .ty
+                    .clone();
+                out.push(self.local_get(*frame)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(self.local_get(*value)?);
+                if matches!(value_ty, HirType::F64) {
+                    out.push(WasmInst::I64ReinterpretF64);
+                } else if matches!(value_ty, HirType::F32) {
+                    // F32 lives in the f64 funnel; demote, reinterpret
+                    // the resulting i32 as a value (cast to i64 via
+                    // zero-extend) so the i64 slot keeps the bit
+                    // pattern AsyncLoadSlot will recover.
+                    out.push(WasmInst::F32DemoteF64);
+                    out.push(WasmInst::I32ReinterpretF32);
+                    out.push(WasmInst::I64ExtendI32U);
+                }
+                out.push(WasmInst::I64Store(MemArg {
+                    offset: (*slot as u64) * 8,
+                    align: 3,
+                    memory_index: 0,
+                }));
+                Ok(())
+            }
+            HirInstruction::AsyncLoadSlot {
+                result,
+                ty,
+                frame,
+                slot,
+            } => {
+                // Inverse of AsyncSaveSlot. Always load an i64 from
+                // `frame + slot * 8`; reinterpret/narrow to the
+                // result_ty's funneled wasm shape after.
+                out.push(self.local_get(*frame)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(WasmInst::I64Load(MemArg {
+                    offset: (*slot as u64) * 8,
+                    align: 3,
+                    memory_index: 0,
+                }));
+                match ty {
+                    // I64/U64/Bool/Ptr/narrow-ints all stay as the
+                    // loaded i64 in the funnel.
+                    HirType::I64
+                    | HirType::U64
+                    | HirType::I32
+                    | HirType::U32
+                    | HirType::I16
+                    | HirType::U16
+                    | HirType::I8
+                    | HirType::U8
+                    | HirType::Bool
+                    | HirType::Ptr(_) => { /* no-op */ }
+                    HirType::F64 => out.push(WasmInst::F64ReinterpretI64),
+                    HirType::F32 => {
+                        // Symmetric inverse of the F32 save path:
+                        // truncate i64 → i32, reinterpret to f32,
+                        // promote into the f64 funnel.
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::F32ReinterpretI32);
+                        out.push(WasmInst::F64PromoteF32);
+                    }
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "AsyncLoadSlot of HirType {:?}",
+                            other
+                        )));
                     }
                 }
                 out.push(self.local_set(*result)?);
@@ -2625,6 +2717,97 @@ mod tests {
         assert!(
             found_free,
             "expected `(import \"host\" \"free@1\")` in emitted module"
+        );
+    }
+
+    /// `def slot_round_trip(frame: i64, value: i64) -> i64 {
+    ///     AsyncSaveSlot frame[3] = value;
+    ///     return AsyncLoadSlot frame[3];
+    /// }`
+    ///
+    /// Exercises the algebraic-effects-style slot ABI:
+    /// AsyncSaveSlot writes i64 at frame + slot*8, AsyncLoadSlot reads
+    /// it back. Round-trip through the state-machine layout.
+    #[test]
+    fn emits_async_save_and_load_slot_round_trip() {
+        let frame_id = HirId::new();
+        let value_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: frame_id,
+                    name: InternedString::new_global("frame"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: value_id,
+                    name: InternedString::new_global("value"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("slot_rt"), sig);
+        for (idx, id) in [(0u32, frame_id), (1, value_id)] {
+            func.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: HirType::I64,
+                    kind: HirValueKind::Parameter(idx),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        let loaded = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::AsyncSaveSlot {
+            frame: frame_id,
+            slot: 3,
+            value: value_id,
+        });
+        entry.instructions.push(HirInstruction::AsyncLoadSlot {
+            result: loaded,
+            ty: HirType::I64,
+            frame: frame_id,
+            slot: 3,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![loaded],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit slot round-trip");
+        m.validate_full().expect("module structurally valid");
+
+        // The module needs `(import "host" "memory" ...)` since both
+        // slot ops touch linear memory.
+        let parser = wasmparser::Parser::new(0);
+        let mut found_memory = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "host" && import.name == "memory" {
+                        found_memory = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_memory,
+            "expected `(import \"host\" \"memory\" (memory ...))` for slot ops"
         );
     }
 }
