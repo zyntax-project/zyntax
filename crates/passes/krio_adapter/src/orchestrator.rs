@@ -96,24 +96,27 @@ pub struct LowerResult {
     /// Used by the entry function to size the malloc. Computed as
     /// `max(captures_slot, state_slot, param_slots) + 1`.
     pub num_slots: u32,
-    /// Base slot index of the 4-slot region reserved at the END of the
-    /// state machine for the Resume<T> struct scratch space. The
-    /// algebraic-effects perform-site lowering writes its 32-byte
-    /// Resume<T> (poll_fn_ptr / state_machine_ptr / result_slot_offset
-    /// / next_state) into `sm_ptr + resume_scratch_slot * 8` rather
-    /// than calling malloc(32) per perform-site invocation. The struct
+    /// Base slot index of the per-perform Resume<T> scratch region
+    /// reserved near the END of the state machine. Each perform site
+    /// owns 5 slots (= the 5 fields of `Resume<T>`: poll_fn_ptr,
+    /// state_machine_ptr, result_slot_offset, next_state,
+    /// refcount_offset) at
+    /// `sm_ptr + (resume_scratch_slot + site_idx * 5) * 8`. The struct
     /// lives as long as the state machine does — no per-perform heap
-    /// allocation, no leak.
-    ///
-    /// Limitation: all perform sites in the same function share this
-    /// one scratch region. Nested or interleaved performs with async
-    /// stashing (host holds k from perform A while perform B's
-    /// handler runs) would alias the slot and corrupt the stashed
-    /// pointer. Current tests all have a single perform site per
-    /// function; extending to N per-perform scratches (one per site)
-    /// is a future refinement when multi-perform-with-stash programs
-    /// land.
+    /// allocation, no leak, and per-site regions avoid aliasing when
+    /// async stashing crosses multiple perform sites.
     pub resume_scratch_slot: u32,
+    /// Slot index of the single i64 atomic refcount at the very end
+    /// of the state machine. `generate_sync_entry` initialises it to
+    /// 1 at SM construction and calls
+    /// `__zyntax_runtime_release_sm_by_offset(sm_ptr, refcount_slot * 8)`
+    /// on its return path so the SM auto-frees on a sync call. Hosts
+    /// that capture a Resume<T> pointer for use after the original
+    /// `runtime.call_function` returns (the j3 async-out-of-line
+    /// pattern) call `__zyntax_runtime_retain_sm(resume_ptr)` to
+    /// pin the SM before the call returns, and the matching
+    /// `__zyntax_runtime_release_sm(resume_ptr)` when they're done.
+    pub refcount_slot: u32,
 }
 
 /// Errors the orchestrator may surface.
@@ -263,16 +266,29 @@ pub fn lower_async_function(
         state_slot,
         after_awaits_slot,
     );
-    // Reserve 4 slots at the end for the Resume<T> struct scratch
-    // space (4 i64 fields: poll_fn_ptr, state_machine_ptr,
-    // result_slot_offset, next_state). Embedding it in the state
-    // machine instead of malloc'ing per perform-site invocation
-    // eliminates the bounded-but-unbounded leak the previous
-    // `Intrinsic::Malloc(32)` introduced — the scratch's lifetime
-    // matches the SM's (already heap-allocated, never freed today),
-    // so no new free path is needed.
+    // Reserve 5 slots PER PERFORM SITE for the Resume<T> struct scratch
+    // space (5 i64 fields: poll_fn_ptr, state_machine_ptr,
+    // result_slot_offset, next_state, refcount_offset). Plus 1 final
+    // slot at the very end for the SM's atomic refcount.
+    //
+    // `lower_perform_effect_calls` adds exactly 1 result slot per
+    // perform site between `after_awaits_slot` and `after_performs_slot`,
+    // so the count is the slot delta. Reserve at least one 5-slot
+    // region even when there are no perform sites so the slot index
+    // returned is always valid (callers shouldn't have to special-case
+    // zero-perform programs).
+    //
+    // Per-site scratch regions avoid aliasing when multiple perform
+    // sites in one function stash via async-out-of-line (each site
+    // gets its own Resume<T>). The refcount slot at the very end
+    // lets `generate_sync_entry` auto-free the SM on its return path,
+    // unless a host has called `__zyntax_runtime_retain_sm` to pin
+    // the SM for later out-of-line resume.
+    let perform_count = after_performs_slot.saturating_sub(after_awaits_slot);
     let resume_scratch_slot: u32 = after_performs_slot;
-    let num_slots: u32 = after_performs_slot + 4;
+    let after_scratch_slot: u32 = after_performs_slot + perform_count.max(1) * 5;
+    let refcount_slot: u32 = after_scratch_slot;
+    let num_slots: u32 = after_scratch_slot + 1;
 
     // F.2 follow-up: the await lowering creates new resume blocks
     // that may now be predecessors of phi blocks (e.g. loop headers
@@ -298,6 +314,7 @@ pub fn lower_async_function(
         state_slot,
         num_slots,
         resume_scratch_slot,
+        refcount_slot,
     })
 }
 

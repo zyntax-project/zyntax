@@ -48,6 +48,16 @@ use zyntax_compiler::zrtl::{
     PrimitiveSize, TypeCategory, TypeFlags, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
 };
 
+// C `free` for releasing state-machine allocations. The JIT-side
+// allocation uses `Intrinsic::Malloc` which lowers to libc's
+// `malloc`, so the matching deallocator is `free`. Declared as a raw
+// extern rather than via the `libc` crate to avoid pulling that
+// dependency in for one symbol.
+extern "C" {
+    #[link_name = "free"]
+    fn c_free(ptr: *mut core::ffi::c_void);
+}
+
 /// One handler in scope: the effect it handles, plus opaque pointers
 /// into its closed-over state and operation-dispatch table.
 ///
@@ -162,20 +172,29 @@ pub extern "C" fn __zyntax_effect_lookup_handler(effect_id: u64) -> *mut u8 {
 /// Layout of the Resume<T> struct, as compiled code constructs it at
 /// each perform site (see
 /// `krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites`).
-/// 32 bytes, 4 i64-sized fields, `#[repr(C)]` so the field offsets
-/// match what the HIR `Store` instructions emit (0, 8, 16, 24).
+/// 40 bytes, 5 i64-sized fields, `#[repr(C)]` so the field offsets
+/// match what the HIR `Store` instructions emit (0, 8, 16, 24, 32).
 ///
 /// `result_slot_offset` is in bytes (already pre-multiplied by 8 in
 /// the compiled code), so we can use it directly as a byte offset
 /// into `state_machine_ptr`. `next_state` is the dispatcher state-id
 /// the caller's Switch routes to on the next poll — `Switch` reads
 /// a `u32` from offset 0, so we store the low 32 bits there.
+///
+/// `refcount_offset` is the byte offset from `state_machine_ptr` to
+/// the SM's atomic refcount slot. The host's
+/// `__zyntax_runtime_retain_sm` / `release_sm` helpers use it to
+/// navigate from a Resume pointer back to the SM's refcount without
+/// needing to know the SM's layout. Stored per perform site since
+/// the refcount slot's offset depends on the SM's total size, which
+/// varies per function.
 #[repr(C)]
 struct Resume {
     poll_fn_ptr: *const u8,
     state_machine_ptr: *mut u8,
     result_slot_offset: i64,
     next_state: i64,
+    refcount_offset: i64,
 }
 
 /// Resume the suspended caller with `value`.
@@ -329,6 +348,83 @@ pub extern "C" fn __zyntax_effect_abort(value: i64) -> i64 {
     value
 }
 
+/// Atomically increment the state machine's refcount, given a Resume<T>
+/// pointer that lives inside the SM. Hosts that capture a Resume
+/// pointer for use AFTER the original `runtime.call_function` returns
+/// (the async-out-of-line pattern — see `phase_j3_async_out_of_line_resume`)
+/// must call this BEFORE the call returns, otherwise `generate_sync_entry`
+/// auto-frees the SM on its return path and the captured pointer
+/// dangles. Pair every retain with a `__zyntax_runtime_release_sm`
+/// when the host is done with the pointer.
+///
+/// The Resume<T> struct (laid out by
+/// `upgrade_resume_struct_at_perform_sites`) carries `state_machine_ptr`
+/// at offset 8 and `refcount_offset` at offset 32, so this helper can
+/// navigate without needing to know the SM's full layout.
+#[no_mangle]
+pub unsafe extern "C" fn __zyntax_runtime_retain_sm(resume_struct: *mut u8) {
+    if resume_struct.is_null() {
+        return;
+    }
+    use core::sync::atomic::{AtomicI64, Ordering};
+    let r = &*(resume_struct as *const Resume);
+    if r.state_machine_ptr.is_null() {
+        return;
+    }
+    let refcount_ptr = r.state_machine_ptr.add(r.refcount_offset as usize) as *mut AtomicI64;
+    (*refcount_ptr).fetch_add(1, Ordering::AcqRel);
+}
+
+/// Atomically decrement the state machine's refcount via a Resume<T>
+/// pointer; free the SM if the count reaches zero. The complement of
+/// `__zyntax_runtime_retain_sm`. Hosts call this when they're done
+/// with a previously-retained Resume pointer.
+///
+/// Safe to call multiple times only if matched by retains — a release
+/// past zero would corrupt the refcount and lead to use-after-free.
+#[no_mangle]
+pub unsafe extern "C" fn __zyntax_runtime_release_sm(resume_struct: *mut u8) {
+    if resume_struct.is_null() {
+        return;
+    }
+    use core::sync::atomic::{AtomicI64, Ordering};
+    let r = &*(resume_struct as *const Resume);
+    if r.state_machine_ptr.is_null() {
+        return;
+    }
+    let refcount_ptr = r.state_machine_ptr.add(r.refcount_offset as usize) as *mut AtomicI64;
+    let prev = (*refcount_ptr).fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        // Last reference — free the SM. The allocator is whatever
+        // `Intrinsic::Malloc` lowers to in the Cranelift backend.
+        // Today that's the platform `libc::malloc`; the matching free
+        // is `libc::free`.
+        c_free(r.state_machine_ptr as *mut core::ffi::c_void);
+    }
+}
+
+/// JIT-side release: decrement the SM's refcount, free if zero. Same
+/// behaviour as `__zyntax_runtime_release_sm` but takes the SM
+/// pointer + refcount byte-offset directly rather than navigating
+/// through a Resume<T> struct. Used by `generate_sync_entry`'s
+/// return path where there's no Resume pointer in scope but the
+/// JIT has both pieces of info as constants.
+#[no_mangle]
+pub unsafe extern "C" fn __zyntax_runtime_release_sm_by_offset(
+    sm_ptr: *mut u8,
+    refcount_offset: i64,
+) {
+    if sm_ptr.is_null() {
+        return;
+    }
+    use core::sync::atomic::{AtomicI64, Ordering};
+    let refcount_ptr = sm_ptr.add(refcount_offset as usize) as *mut AtomicI64;
+    let prev = (*refcount_ptr).fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        c_free(sm_ptr as *mut core::ffi::c_void);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Signature constants for register_effect_runtime_symbols
 // ─────────────────────────────────────────────────────────────────────
@@ -441,6 +537,43 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             flags: ZrtlSigFlags::EFFECTFUL,
             return_type: TypeTag::I64,
             params: params1(TypeTag::I64),
+        },
+    );
+
+    // retain_sm(resume_struct: *u8) -> void
+    runtime.register_function_typed(
+        "__zyntax_runtime_retain_sm",
+        __zyntax_runtime_retain_sm as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::VOID,
+            params: params1(ptr_tag()),
+        },
+    );
+
+    // release_sm(resume_struct: *u8) -> void
+    runtime.register_function_typed(
+        "__zyntax_runtime_release_sm",
+        __zyntax_runtime_release_sm as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::VOID,
+            params: params1(ptr_tag()),
+        },
+    );
+
+    // release_sm_by_offset(sm_ptr: *u8, refcount_offset: i64) -> void
+    // JIT-side variant; sync_entry's return path calls this.
+    runtime.register_function_typed(
+        "__zyntax_runtime_release_sm_by_offset",
+        __zyntax_runtime_release_sm_by_offset as *const u8,
+        ZrtlSymbolSig {
+            param_count: 2,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::VOID,
+            params: params2(ptr_tag(), TypeTag::I64),
         },
     );
 }

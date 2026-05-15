@@ -264,6 +264,8 @@ fn generate_sync_entry_produces_poll_loop_with_original_signature() {
     let num_slots = 3;
     let param_slots = vec![(sig.params[0].id, 1u32)];
     let state_slot = 0;
+    // SM layout: slot 0 = state, slot 1 = param, slot 2 = refcount.
+    let refcount_slot = 2;
 
     let entry = generate_sync_entry(
         InternedString::new_global("my_effect_fn"),
@@ -272,6 +274,7 @@ fn generate_sync_entry_produces_poll_loop_with_original_signature() {
         num_slots,
         &param_slots,
         state_slot,
+        refcount_slot,
     );
 
     // Signature preserved: (i32) -> i64

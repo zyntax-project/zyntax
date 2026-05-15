@@ -960,6 +960,7 @@ fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> Runtim
             new_poll_id,
             post_reshape_frame_ptr,
             lower_result.resume_scratch_slot,
+            lower_result.refcount_slot,
         );
 
         // Phase 3: SYNC entry wrapper (returns T, not *Promise<T>).
@@ -970,6 +971,7 @@ fn apply_krio_effect_lowering(module: &mut zyntax_compiler::HirModule) -> Runtim
             lower_result.num_slots,
             &lower_result.param_slots,
             lower_result.state_slot,
+            lower_result.refcount_slot,
         );
         entry_fn.id = fn_id;
 

@@ -88,7 +88,8 @@ mod value;
 pub use effect_runtime::register_effect_runtime_symbols;
 pub use effect_runtime::{
     __zyntax_effect_abort, __zyntax_effect_lookup_handler, __zyntax_effect_pop_handler,
-    __zyntax_effect_push_handler, __zyntax_effect_resume,
+    __zyntax_effect_push_handler, __zyntax_effect_resume, __zyntax_runtime_release_sm,
+    __zyntax_runtime_release_sm_by_offset, __zyntax_runtime_retain_sm,
 };
 
 pub use array::ZyntaxArray;

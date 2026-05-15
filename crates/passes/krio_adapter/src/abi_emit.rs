@@ -1102,6 +1102,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
     poll_fn_id: HirId,
     frame_ptr: HirId,
     resume_scratch_slot: u32,
+    refcount_slot: u32,
 ) {
     // First pass: collect (block_id, inst_idx, metadata) without
     // mutating to avoid borrow conflicts.
@@ -1145,7 +1146,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
     }
 
     // Second pass: process each perform site.
-    for site in sites {
+    for (site_idx, site) in sites.iter().enumerate() {
         // Find ready_block via the yield_block's terminator.
         let ready_block_id = match function.blocks.get(&site.block_id) {
             Some(b) => match &b.terminator {
@@ -1170,35 +1171,22 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // Mint values + build the new instruction sequence.
         let mut new_insts: Vec<HirInstruction> = Vec::new();
 
-        // r_ptr = sm_ptr + resume_scratch_slot * 8.
+        // r_ptr = sm_ptr + (resume_scratch_slot + site_idx * 5) * 8.
         //
-        // The Resume<T> struct (4 i64 fields = 32 bytes) lives in a
-        // fixed 4-slot region reserved at the end of the state
-        // machine by `orchestrator::lower_async_function`. Embedding
-        // it in the SM rather than malloc'ing per perform-site
-        // invocation eliminates the per-perform 32-byte leak the
-        // previous `Intrinsic::Malloc(32)` introduced — the scratch's
-        // lifetime matches the SM's (already heap-allocated, never
-        // freed today), so no new free path is needed.
+        // The Resume<T> struct (5 i64 fields = 40 bytes) lives in a
+        // 5-slot region reserved PER PERFORM SITE at the end of the
+        // state machine by `orchestrator::lower_async_function`. Each
+        // perform site gets its own region: site 0 uses slots
+        // [scratch_base, scratch_base+5), site 1 uses
+        // [scratch_base+5, scratch_base+10), etc.
         //
-        // Resume<T> structs must outlive the perform site's stack
-        // frame in the async out-of-line case (phase J.3): the
-        // handler stashes `k` (= this pointer) somewhere reachable
-        // from outside poll_fn, and the host later calls
-        // `__zyntax_effect_resume(k, v)` out-of-line. An Alloca
-        // (stack slot) would dangle the moment poll_fn returns; a
-        // malloc'd buffer works but leaks. The SM-embedded slot
-        // gives us the outlive semantics with no extra allocation.
-        //
-        // Limitation: all perform sites in this function share this
-        // one scratch region. Nested or interleaved performs with
-        // async stashing (host holds k from perform A while perform
-        // B's handler runs) would alias the slot and corrupt the
-        // stashed pointer. Current tests all have a single perform
-        // site per function; extending to N per-perform scratches is
-        // a future refinement when multi-perform-with-stash programs
-        // land.
-        let scratch_offset_bytes = (resume_scratch_slot as i64) * 8;
+        // The 5th field is `refcount_offset`, a byte offset from
+        // `state_machine_ptr` to the SM's atomic refcount slot.
+        // Host retain/release helpers (`__zyntax_runtime_retain_sm` /
+        // `release_sm`) use it to navigate from a Resume pointer back
+        // to the refcount without knowing the SM's layout.
+        let site_scratch_slot = resume_scratch_slot + (site_idx as u32) * 5;
+        let scratch_offset_bytes = (site_scratch_slot as i64) * 8;
         let scratch_offset_id = mint_const_i64(&mut function.values, scratch_offset_bytes);
         let r_ptr_id = mint_value(
             &mut function.values,
@@ -1233,15 +1221,19 @@ pub fn upgrade_resume_struct_at_perform_sites(
         });
 
         // Stores at field offsets: 0=poll_fn_ptr, 8=state_machine_ptr,
-        // 16=result_slot_offset, 24=next_state. Each store is
-        // (Binary Add base+offset → field_ptr) + (Store value at field_ptr).
-        // Pre-mint all needed values up front (closure-capture-free).
+        // 16=result_slot_offset, 24=next_state, 32=refcount_offset.
+        // Each store is (Binary Add base+offset → field_ptr) +
+        // (Store value at field_ptr). Pre-mint all needed values up
+        // front (closure-capture-free).
         let off0 = mint_const_i64(&mut function.values, 0);
         let off8 = mint_const_i64(&mut function.values, 8);
         let off16 = mint_const_i64(&mut function.values, 16);
         let off24 = mint_const_i64(&mut function.values, 24);
+        let off32 = mint_const_i64(&mut function.values, 32);
         let result_offset_const = mint_const_i64(&mut function.values, (result_slot * 8) as i64);
         let next_state_const_id = mint_const_i64(&mut function.values, next_state as i64);
+        let refcount_offset_const =
+            mint_const_i64(&mut function.values, (refcount_slot as i64) * 8);
         let fp0 = mint_value(
             &mut function.values,
             HirType::Ptr(Box::new(HirType::I64)),
@@ -1258,6 +1250,11 @@ pub fn upgrade_resume_struct_at_perform_sites(
             HirValueKind::Instruction,
         );
         let fp24 = mint_value(
+            &mut function.values,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        let fp32 = mint_value(
             &mut function.values,
             HirType::Ptr(Box::new(HirType::I64)),
             HirValueKind::Instruction,
@@ -1316,6 +1313,23 @@ pub fn upgrade_resume_struct_at_perform_sites(
         new_insts.push(HirInstruction::Store {
             ptr: fp24,
             value: next_state_const_id,
+            align: 8,
+            volatile: false,
+        });
+        // Field 32: refcount_offset (byte offset from SM base to
+        // the atomic refcount slot — host retain/release helpers use
+        // this to navigate from a Resume<T> pointer back to the SM
+        // refcount without knowing the SM's layout).
+        new_insts.push(HirInstruction::Binary {
+            result: fp32,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: r_ptr_id,
+            right: off32,
+        });
+        new_insts.push(HirInstruction::Store {
+            ptr: fp32,
+            value: refcount_offset_const,
             align: 8,
             volatile: false,
         });
@@ -2015,6 +2029,7 @@ pub fn generate_sync_entry(
     num_slots: u32,
     param_slots: &[(HirId, u32)],
     state_slot: u32,
+    refcount_slot: u32,
 ) -> HirFunction {
     // Entry sig: same params + same returns as the original.
     let entry_sig = HirFunctionSignature {
@@ -2108,6 +2123,35 @@ pub fn generate_sync_entry(
     entry_instructions.push(HirInstruction::Store {
         ptr: state_field_ptr_id,
         value: state_init_id,
+        align: 8,
+        volatile: false,
+    });
+
+    // Initialize the refcount slot to 1. The zero-init loop above
+    // already wrote 0 to every slot including this one; overwrite
+    // with the initial owning reference. `generate_sync_entry`'s
+    // return path then calls `__zyntax_runtime_release_sm_by_offset`
+    // before its Return — refcount drops to 0 and the SM frees on
+    // sync calls, UNLESS a host (j3-style async out-of-line) called
+    // `__zyntax_runtime_retain_sm` to bump the refcount before the
+    // sync return.
+    let refcount_init_id = mint_const_i64(&mut entry.values, 1);
+    let refcount_slot_offset_id = mint_const_i64(&mut entry.values, refcount_slot as i64 * 8);
+    let refcount_field_ptr_id = mint_value(
+        &mut entry.values,
+        HirType::Ptr(Box::new(HirType::I64)),
+        HirValueKind::Instruction,
+    );
+    entry_instructions.push(HirInstruction::Binary {
+        result: refcount_field_ptr_id,
+        op: BinaryOp::Add,
+        ty: HirType::I64,
+        left: sm_ptr_id,
+        right: refcount_slot_offset_id,
+    });
+    entry_instructions.push(HirInstruction::Store {
+        ptr: refcount_field_ptr_id,
+        value: refcount_init_id,
         align: 8,
         volatile: false,
     });
@@ -2217,7 +2261,30 @@ pub fn generate_sync_entry(
         successors: vec![],
     };
 
-    // return_block: cast i64 → return type, return.
+    // Build the SM-release call that runs in the return block BEFORE
+    // the Return instruction. `__zyntax_runtime_release_sm_by_offset`
+    // (`extern "C" fn(*mut u8, i64)`) atomically decrements the
+    // SM's refcount slot and frees the SM if the count drops to 0.
+    // Default flow: refcount was init to 1 in entry, no host called
+    // retain → release frees → no leak. j3-style async-out-of-line
+    // retain-before-stash flow: refcount was bumped to 2 by the
+    // host → release leaves it at 1 → SM stays alive for the
+    // out-of-line resume.
+    //
+    // The release call is `void` so it doesn't pin rc_id alive past
+    // the call site — rc was loaded by the prior IndirectCall and
+    // sits in a register, independent of the SM allocation.
+    let refcount_byte_offset_id = mint_const_i64(&mut entry.values, refcount_slot as i64 * 8);
+    let release_call = HirInstruction::Call {
+        result: None,
+        callee: HirCallable::Symbol("__zyntax_runtime_release_sm_by_offset".to_string()),
+        args: vec![sm_ptr_id, refcount_byte_offset_id],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    };
+
+    // return_block: release SM, cast i64 → return type, return.
     let return_value = if original_signature.returns.is_empty() {
         // Void return — just return.
         None
@@ -2237,12 +2304,15 @@ pub fn generate_sync_entry(
                 id: return_block_id,
                 label: Some(InternedString::new_global("sync_entry_return")),
                 phis: vec![],
-                instructions: vec![HirInstruction::Cast {
-                    op: cast_op,
-                    result: cast_id,
-                    ty: ret_ty.clone(),
-                    operand: rc_id,
-                }],
+                instructions: vec![
+                    release_call,
+                    HirInstruction::Cast {
+                        op: cast_op,
+                        result: cast_id,
+                        ty: ret_ty.clone(),
+                        operand: rc_id,
+                    },
+                ],
                 terminator: HirTerminator::Return {
                     values: vec![cast_id],
                 },
@@ -2259,7 +2329,7 @@ pub fn generate_sync_entry(
         id: return_block_id,
         label: Some(InternedString::new_global("sync_entry_return")),
         phis: vec![],
-        instructions: vec![],
+        instructions: vec![release_call],
         terminator: HirTerminator::Return {
             values: return_value.map(|v| vec![v]).unwrap_or_default(),
         },

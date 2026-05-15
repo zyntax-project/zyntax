@@ -1106,6 +1106,18 @@ const STASH_SENTINEL: i64 = -1;
 /// Pending and would otherwise spin forever.
 #[no_mangle]
 extern "C" fn test_stash_resume(k: *mut u8) -> i64 {
+    // Retain the state machine before stashing. `generate_sync_entry`
+    // auto-releases the SM on its return path; without an explicit
+    // retain here the SM would be freed before we got a chance to
+    // drive the continuation out-of-line, and the stashed Resume
+    // pointer would dangle. The retain bumps the refcount from 1
+    // (set by sync_entry) to 2 — sync_entry's release brings it
+    // back to 1, the SM stays alive for the out-of-line resume, and
+    // the test's final release (or implicit leak at process exit)
+    // brings it to 0 to free.
+    unsafe {
+        zyntax_embed::__zyntax_runtime_retain_sm(k);
+    }
     let mut slot = stashed_resume_slot().lock().unwrap();
     *slot = k as usize;
     STASH_SENTINEL
