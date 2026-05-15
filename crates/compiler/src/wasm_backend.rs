@@ -585,6 +585,18 @@ impl<'a> FunctionEmitter<'a> {
                 ) {
                     self.needs_memory_import = true;
                 }
+                // `Alloca` lowers to a `host.malloc(size)` call —
+                // register the same import the explicit
+                // `Intrinsic::Malloc` case uses so the emit-time
+                // index lookup resolves.
+                if matches!(inst, HirInstruction::Alloca { .. }) {
+                    let import_name = "host.malloc@1".to_string();
+                    if !self.import_indices.contains_key(&import_name) {
+                        let idx = self.imports.len() as u32;
+                        self.imports.push((import_name.clone(), 1));
+                        self.import_indices.insert(import_name, idx);
+                    }
+                }
                 // `HirInstruction::IndirectCall` and the
                 // `HirCallable::Indirect` variant inside a regular
                 // `Call` both lower to a wasm `call_indirect` against
@@ -1221,6 +1233,52 @@ impl<'a> FunctionEmitter<'a> {
                         }
                     }
                 }
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::Alloca {
+                result,
+                ty,
+                count,
+                align: _,
+            } => {
+                // Lower to `host.malloc(size)`. `size = sizeof(ty) *
+                // count` (or just `sizeof(ty)` when count is None).
+                // Today the allocation leaks at function exit — a
+                // future refinement would carve a per-frame bump
+                // region out of host-supplied scratch, but for now
+                // we share the same heap path as `Intrinsic::Malloc`
+                // (host.malloc@1).
+                //
+                // Element byte sizes match the natural HIR layout so
+                // pointer arithmetic at HIR / interp level stays
+                // consistent with what the JIT'd module sees.
+                let elem_bytes: i64 = match ty {
+                    HirType::I8 | HirType::U8 | HirType::Bool => 1,
+                    HirType::I16 | HirType::U16 => 2,
+                    HirType::I32 | HirType::U32 | HirType::F32 => 4,
+                    HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "Alloca of HirType {:?}",
+                            other
+                        )));
+                    }
+                };
+                // Compute the total byte size on the wasm stack.
+                if let Some(count_id) = count {
+                    out.push(self.local_get(*count_id)?);
+                    out.push(WasmInst::I64Const(elem_bytes));
+                    out.push(WasmInst::I64Mul);
+                } else {
+                    out.push(WasmInst::I64Const(elem_bytes));
+                }
+                let import_idx = *self.import_indices.get("host.malloc@1").ok_or_else(|| {
+                    WasmEmitError::Validation(
+                        "Alloca emitted but host.malloc@1 import missing".into(),
+                    )
+                })?;
+                out.push(WasmInst::Call(import_idx));
                 out.push(self.local_set(*result)?);
                 Ok(())
             }
@@ -3056,6 +3114,79 @@ mod tests {
         assert!(
             found_table,
             "expected `(import \"host\" \"fn_table\" (table ...))` for indirect call"
+        );
+    }
+
+    /// `def alloc_buf(n: i64) -> i64 {
+    ///     let buf = alloca(i64, n);
+    ///     return buf as i64;
+    /// }`
+    ///
+    /// Exercises `HirInstruction::Alloca` with a dynamic count.
+    /// Verifies the emitted module imports `host.malloc@1` and
+    /// validates structurally — the host-malloc-backed alloca
+    /// lowering shares the malloc import with explicit
+    /// `Intrinsic::Malloc`.
+    #[test]
+    fn emits_alloca_as_host_malloc_call() {
+        let n_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: n_id,
+                name: InternedString::new_global("n"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("alloc_buf"), sig);
+        func.values.insert(
+            n_id,
+            HirValue {
+                id: n_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let buf = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Alloca {
+            result: buf,
+            ty: HirType::I64,
+            count: Some(n_id),
+            align: 8,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![buf] };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit alloca");
+        m.validate_full().expect("module structurally valid");
+
+        let parser = wasmparser::Parser::new(0);
+        let mut found_malloc = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "host" && import.name == "malloc@1" {
+                        found_malloc = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_malloc,
+            "expected `(import \"host\" \"malloc@1\")` for Alloca lowering"
         );
     }
 }
