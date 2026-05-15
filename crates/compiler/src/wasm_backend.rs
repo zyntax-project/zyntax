@@ -320,17 +320,30 @@ impl<'a> FunctionEmitter<'a> {
         types.function(params.iter().copied(), results.iter().copied());
         module.section(&types);
 
-        // Import section. One `(import "extern" "<name>@<arity>"
-        // (func (type <idx>)))` per discovered Symbol callee, plus
-        // a host-shared linear memory if any Load/Store fires
-        // inside the body.
+        // Import section. One `(import <module> <name> (func (type <idx>)))`
+        // per discovered callee, plus a host-shared linear memory if any
+        // Load/Store fires inside the body.
+        //
+        // Module routing keys off the import-name prefix:
+        //   - keys starting with `internal.` → module `internal`,
+        //     wasm name is `<hex_id>@<arity>` (strip the prefix). The
+        //     host's per-import dispatcher routes back to the BC
+        //     interpreter or a sibling JIT'd module.
+        //   - everything else → module `extern`, wasm name as-is.
+        //     The host's `_zyntax_call_extern_N` dispatcher routes
+        //     these.
         if !self.imports.is_empty() || self.needs_memory_import {
             let mut imports = ImportSection::new();
-            for (name, arity) in &self.imports {
+            for (key, arity) in &self.imports {
                 let type_idx = *arity_to_type_idx
                     .get(arity)
                     .expect("arity → type-index mapping populated above");
-                imports.import("extern", name, EntityType::Function(type_idx));
+                let (module, wasm_name) = if let Some(rest) = key.strip_prefix("internal.") {
+                    ("internal", rest)
+                } else {
+                    ("extern", key.as_str())
+                };
+                imports.import(module, wasm_name, EntityType::Function(type_idx));
             }
             if self.needs_memory_import {
                 // `minimum: 0` — accept whatever the host has.
@@ -450,12 +463,20 @@ impl<'a> FunctionEmitter<'a> {
     }
 
     /// Walk every `HirInstruction::Call` in every block and register
-    /// each `HirCallable::Symbol(name)` callee as a wasm import. The
-    /// import name carries the arity suffix (`name@N`) so the JS
-    /// host can dispatch without parsing the wasm type section.
-    /// Internal calls (`Function(id)` / `Indirect(..)` / etc.) hit
-    /// `Unsupported` here — they'd need a more elaborate
-    /// cross-function dispatch story (E.5.2+).
+    /// each external (`Symbol`) or internal (`Function(id)`) callee
+    /// as a wasm import. The import key carries the arity suffix
+    /// (`name@N`) so the JS host can dispatch without parsing the
+    /// wasm type section.
+    ///
+    /// Two import-name conventions:
+    ///   - `<symbol_name>@<arity>` for `HirCallable::Symbol` — the
+    ///     host's `_zyntax_call_extern_N` dispatcher routes these.
+    ///   - `internal.<hir_id_hex>@<arity>` for `HirCallable::Function`
+    ///     — the host routes these through a per-runtime function
+    ///     table back into the BC interpreter (or a sibling JIT'd
+    ///     module if the callee is also hot). The `internal.` prefix
+    ///     is what `import_module_for_name` keys off when emitting
+    ///     the wasm import section.
     fn scan_imports(&mut self) -> Result<()> {
         for block in self.func.blocks.values() {
             for inst in &block.instructions {
@@ -476,12 +497,14 @@ impl<'a> FunctionEmitter<'a> {
                                 self.import_indices.insert(import_name, idx);
                             }
                         }
-                        HirCallable::Function(_) => {
-                            return Err(WasmEmitError::Unsupported(
-                                "internal HIR function call (HirCallable::Function) — \
-                                 cross-function dispatch not yet wired"
-                                    .into(),
-                            ));
+                        HirCallable::Function(callee_id) => {
+                            let arity = args.len() as u32;
+                            let import_name = format!("internal.{}@{}", callee_id.to_hex(), arity);
+                            if !self.import_indices.contains_key(&import_name) {
+                                let idx = self.imports.len() as u32;
+                                self.imports.push((import_name.clone(), arity));
+                                self.import_indices.insert(import_name, idx);
+                            }
                         }
                         HirCallable::Indirect(_) => {
                             return Err(WasmEmitError::Unsupported(
@@ -915,19 +938,21 @@ impl<'a> FunctionEmitter<'a> {
                 args,
                 ..
             } => {
-                // Only `HirCallable::Symbol` reaches here — other
-                // variants were rejected by `scan_imports`.
-                let name = match callee {
-                    HirCallable::Symbol(n) => n,
+                // `Symbol` and `Function` reach here — both routed
+                // through wasm imports. Everything else was rejected
+                // by `scan_imports`.
+                let import_name = match callee {
+                    HirCallable::Symbol(n) => format!("{}@{}", n, args.len()),
+                    HirCallable::Function(id) => {
+                        format!("internal.{}@{}", id.to_hex(), args.len())
+                    }
                     _ => {
                         return Err(WasmEmitError::Unsupported(format!(
-                            "non-Symbol callee in emit_instruction: {:?}",
+                            "unsupported callee in emit_instruction: {:?}",
                             std::mem::discriminant(callee)
                         )))
                     }
                 };
-                let arity = args.len() as u32;
-                let import_name = format!("{}@{}", name, arity);
                 let import_idx = *self.import_indices.get(&import_name).ok_or_else(|| {
                     // `scan_imports` walked the same instructions, so this
                     // is a structural bug rather than a coverage gap.
@@ -2077,12 +2102,16 @@ mod tests {
         );
     }
 
-    /// Internal HIR-function calls (`HirCallable::Function`) still
-    /// bail because cross-function JIT dispatch isn't wired yet.
-    /// Asserts the documented Unsupported path.
+    /// Internal HIR-function calls (`HirCallable::Function`) now
+    /// emit as `(import "internal" "<hex_id>@<arity>" (func ...))`,
+    /// matching the per-import-dispatcher convention the host's JS
+    /// glue uses to route calls back through the runtime registry.
+    /// Asserts the import lands in the wasm module's import section
+    /// under module `internal` with the expected hex-id name.
     #[test]
-    fn internal_function_call_bails_cleanly() {
+    fn emits_call_to_internal_function_as_import() {
         let other_func = HirId::new();
+        let other_hex = other_func.to_hex();
         let sig = HirFunctionSignature {
             params: vec![],
             returns: vec![HirType::I64],
@@ -2109,15 +2138,30 @@ mod tests {
             values: vec![call_result],
         };
 
-        match WasmBackend::new().compile_function(&func) {
-            Err(WasmEmitError::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("internal HIR function"),
-                    "expected internal-call bail, got: {msg}"
-                );
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit internal-function-call module");
+        m.validate_full().expect("module structurally valid");
+
+        // Walk the import section, look for our internal call.
+        let expected_name = format!("{}@0", other_hex);
+        let parser = wasmparser::Parser::new(0);
+        let mut found_import = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "internal" && import.name == expected_name {
+                        found_import = true;
+                    }
+                }
             }
-            other => panic!("expected Unsupported, got {:?}", other),
         }
+        assert!(
+            found_import,
+            "expected `(import \"internal\" \"{}\")` in emitted module",
+            expected_name
+        );
     }
 
     /// Inter-phi cycle (one phi's result feeds another phi's

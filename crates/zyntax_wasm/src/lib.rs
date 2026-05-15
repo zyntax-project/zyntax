@@ -441,6 +441,294 @@ pub fn _zyntax_call_extern_8(
     0
 }
 
+// ---------------------------------------------------------------------------
+// Internal-call bridge for cross-function JIT calls
+// ---------------------------------------------------------------------------
+//
+// `HirCallable::Function(id)` calls inside JIT'd wasm modules emit
+// imports under the `internal` module: `internal.<hex_id>@<arity>`
+// (see `WasmBackend::scan_imports`). The JS dispatcher
+// (`makeInternalDispatcher` in zynml.mjs) routes those imports
+// through the matching `_zyntax_call_internal_<N>` export below.
+//
+// Each export looks up the hex id in `ACTIVE_INTERNAL_FNS` (populated
+// by `run_impl` from the runtime's module) to recover the function's
+// name, then reaches the active `InterpRuntime` through
+// `ACTIVE_RUNTIME` and calls `call_function`. The interp may dispatch
+// the inner call to a sibling JIT'd module (recursive wasm call), to
+// the BC interpreter, or to its tier-up infrastructure — whichever is
+// current for that function.
+//
+// SAFETY: `ACTIVE_RUNTIME` carries a raw `*mut InterpRuntime` that's
+// also borrowed mutably by the outer `call_function` call. Single-
+// threaded wasm makes this re-entry sound (the outer borrow is parked
+// in a paused wasm call frame while the inner dispatch runs through
+// the same runtime). The unsafety is contained here; the contract
+// callers see is the standard "every export resolves through the
+// active runtime."
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Pointer to the runtime that's currently executing a `run()`
+    /// call. Populated by `run_impl` before dispatch, cleared on
+    /// exit. Null between calls.
+    static ACTIVE_RUNTIME: RefCell<*mut InterpRuntime> =
+        const { RefCell::new(core::ptr::null_mut()) };
+
+    /// Map of hex-encoded HirId → function name for every function in
+    /// the active runtime's module. Populated by `run_impl` so the
+    /// `_zyntax_call_internal_<N>` exports can resolve a `Function(id)`
+    /// import back to the name `InterpRuntime::call_function` accepts.
+    static ACTIVE_INTERNAL_FNS: RefCell<HashMap<String, String>> =
+        RefCell::new(HashMap::new());
+}
+
+#[cfg(target_arch = "wasm32")]
+fn call_internal_by_hex(hex_id: &str, args: Vec<zyntax_compiler::value::ZyntaxValue>) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    let name = match ACTIVE_INTERNAL_FNS.with(|m| m.borrow().get(hex_id).cloned()) {
+        Some(n) => n,
+        None => return 0,
+    };
+    let rt_ptr = ACTIVE_RUNTIME.with(|r| *r.borrow());
+    if rt_ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: see the module-level comment above. The outer caller's
+    // `&mut` to the runtime is parked in a wasm call frame; we re-
+    // enter via this *mut for the duration of the inner call only.
+    let rt = unsafe { &mut *rt_ptr };
+    match rt.call_function(&name, args) {
+        Ok(ZyntaxValue::Int(i)) => i,
+        Ok(_) => 0,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_internal_0(hex_id: &str) -> i64 {
+    call_internal_by_hex(hex_id, vec![])
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_internal_1(hex_id: &str, a0: i64) -> i64 {
+    call_internal_by_hex(hex_id, vec![zyntax_compiler::value::ZyntaxValue::Int(a0)])
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_internal_2(hex_id: &str, a0: i64, a1: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(hex_id, vec![ZyntaxValue::Int(a0), ZyntaxValue::Int(a1)])
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_internal_3(hex_id: &str, a0: i64, a1: i64, a2: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(
+        hex_id,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+        ],
+    )
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_internal_4(hex_id: &str, a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(
+        hex_id,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+            ZyntaxValue::Int(a3),
+        ],
+    )
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_internal_5(hex_id: &str, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(
+        hex_id,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+            ZyntaxValue::Int(a3),
+            ZyntaxValue::Int(a4),
+        ],
+    )
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_internal_6(
+    hex_id: &str,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(
+        hex_id,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+            ZyntaxValue::Int(a3),
+            ZyntaxValue::Int(a4),
+            ZyntaxValue::Int(a5),
+        ],
+    )
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_internal_7(
+    hex_id: &str,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    a6: i64,
+) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(
+        hex_id,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+            ZyntaxValue::Int(a3),
+            ZyntaxValue::Int(a4),
+            ZyntaxValue::Int(a5),
+            ZyntaxValue::Int(a6),
+        ],
+    )
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_internal_8(
+    hex_id: &str,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    a6: i64,
+    a7: i64,
+) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_internal_by_hex(
+        hex_id,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+            ZyntaxValue::Int(a3),
+            ZyntaxValue::Int(a4),
+            ZyntaxValue::Int(a5),
+            ZyntaxValue::Int(a6),
+            ZyntaxValue::Int(a7),
+        ],
+    )
+}
+
+// Non-wasm32 stubs so the crate's native cargo build is happy.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_internal_0(_hex_id: &str) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_internal_1(_hex_id: &str, _a0: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_internal_2(_hex_id: &str, _a0: i64, _a1: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_internal_3(_hex_id: &str, _a0: i64, _a1: i64, _a2: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_internal_4(_hex_id: &str, _a0: i64, _a1: i64, _a2: i64, _a3: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_internal_5(
+    _hex_id: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_internal_6(
+    _hex_id: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+    _a5: i64,
+) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_internal_7(
+    _hex_id: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+    _a5: i64,
+    _a6: i64,
+) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_internal_8(
+    _hex_id: &str,
+    _a0: i64,
+    _a1: i64,
+    _a2: i64,
+    _a3: i64,
+    _a4: i64,
+    _a5: i64,
+    _a6: i64,
+    _a7: i64,
+) -> i64 {
+    0
+}
+
 /// Install the wasm-JIT compile + dispatch hooks on an
 /// `InterpRuntime`. Called from `run_impl` once per fresh runtime.
 ///
@@ -610,6 +898,39 @@ fn run_impl(source: &str) -> RunResult {
         }
     });
 
+    // Mirror the HIR module's function table — hex-id → name — so
+    // JIT'd modules' internal calls (HirCallable::Function) can
+    // resolve `internal.<hex_id>@<arity>` imports back to the
+    // function name `InterpRuntime::call_function` accepts. Only
+    // wasm32 builds populate this; the native build's
+    // ACTIVE_INTERNAL_FNS is gated out.
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(module) = rt.module() {
+            let snapshot: Vec<(String, String)> = module
+                .functions
+                .iter()
+                .filter_map(|(id, f)| {
+                    let name = f.name.resolve_global()?;
+                    Some((id.to_hex(), name))
+                })
+                .collect();
+            ACTIVE_INTERNAL_FNS.with(|m| {
+                let mut map = m.borrow_mut();
+                map.clear();
+                for (hex, name) in snapshot {
+                    map.insert(hex, name);
+                }
+            });
+        }
+        // Park a *mut to the runtime so internal-call dispatchers
+        // can re-enter `call_function`. SAFETY: see the module-level
+        // comment on ACTIVE_RUNTIME — single-threaded wasm makes the
+        // re-entry sound.
+        let rt_ptr: *mut InterpRuntime = &mut rt;
+        ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = rt_ptr);
+    }
+
     let result = match rt.call_function("main", vec![]) {
         Ok(v) => RunResult {
             output: format_value(&v),
@@ -625,6 +946,11 @@ fn run_impl(source: &str) -> RunResult {
     // (transmuting an old plugin's fn ptr through the new
     // runtime's wasm-JIT'd module).
     ACTIVE_SYMBOLS.with(|s| s.borrow_mut().clear());
+    #[cfg(target_arch = "wasm32")]
+    {
+        ACTIVE_INTERNAL_FNS.with(|m| m.borrow_mut().clear());
+        ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = core::ptr::null_mut());
+    }
 
     result
 }

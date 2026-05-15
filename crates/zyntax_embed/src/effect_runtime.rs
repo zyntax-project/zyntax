@@ -53,9 +53,23 @@ use zyntax_compiler::zrtl::{
 // `malloc`, so the matching deallocator is `free`. Declared as a raw
 // extern rather than via the `libc` crate to avoid pulling that
 // dependency in for one symbol.
+//
+// Native targets link against libc directly. On wasm32-unknown-unknown
+// there's no libc; the WasmBackend doesn't yet emit `Intrinsic::Malloc`
+// either (debt #2 in the wasm work) so the SM-release path is never
+// invoked there. A no-op stub keeps the link clean until wasm32 grows
+// its own allocator pair.
+#[cfg(not(target_arch = "wasm32"))]
 extern "C" {
     #[link_name = "free"]
     fn c_free(ptr: *mut core::ffi::c_void);
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn c_free(_ptr: *mut core::ffi::c_void) {
+    // wasm32 path doesn't reach SM auto-free yet (no Intrinsic::Malloc
+    // emission in WasmBackend). When it lands, replace with the
+    // matching deallocator.
 }
 
 /// One handler in scope: the effect it handles, plus opaque pointers

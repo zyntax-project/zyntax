@@ -117,12 +117,6 @@ function installJitHost() {
                     continue;
                 }
                 if (imp.kind !== "function") continue;
-                if (imp.module !== "extern") {
-                    console.warn(
-                        `_zyntax_jit_install: unexpected import module "${imp.module}"`,
-                    );
-                    continue;
-                }
                 const at = imp.name.lastIndexOf("@");
                 if (at < 0) {
                     console.warn(
@@ -130,10 +124,28 @@ function installJitHost() {
                     );
                     continue;
                 }
-                const symbolName = imp.name.slice(0, at);
+                const baseName = imp.name.slice(0, at);
                 const arity = parseInt(imp.name.slice(at + 1), 10);
-                if (!importObj.extern) importObj.extern = {};
-                importObj.extern[imp.name] = makeExternDispatcher(symbolName, arity);
+                if (imp.module === "extern") {
+                    if (!importObj.extern) importObj.extern = {};
+                    importObj.extern[imp.name] = makeExternDispatcher(baseName, arity);
+                    continue;
+                }
+                if (imp.module === "internal") {
+                    // Internal HIR-function call. `baseName` is the
+                    // callee's HirId as 32-char lowercase hex.
+                    // The host's `_zyntax_call_internal_<arity>`
+                    // dispatcher routes back into the runtime's
+                    // function table (BC interpreter today; a sibling
+                    // JIT'd module in a future tier-up of multi-hot
+                    // function programs).
+                    if (!importObj.internal) importObj.internal = {};
+                    importObj.internal[imp.name] = makeInternalDispatcher(baseName, arity);
+                    continue;
+                }
+                console.warn(
+                    `_zyntax_jit_install: unexpected import module "${imp.module}"`,
+                );
             }
 
             const inst = new WebAssembly.Instance(mod, importObj);
@@ -203,6 +215,56 @@ function installJitHost() {
                 return () => {
                     throw new Error(
                         `_zyntax_jit: extern "${symbolName}" arity ${arity} not supported (max 8)`,
+                    );
+                };
+        }
+    }
+
+    /** Build a JS dispatcher for an `internal.<hex_id>@<arity>`
+     *  import — a call to another HIR function in the same runtime.
+     *  Routes through `_zyntax_call_internal_<arity>(hex_id, args)`
+     *  which calls back into the BC interpreter (or a sibling JIT'd
+     *  module once cross-function JIT lands). Same arity contract
+     *  as the extern dispatcher. */
+    function makeInternalDispatcher(hexId, arity) {
+        const exports = zynmlBindings;
+        switch (arity) {
+            case 0:
+                return () => exports._zyntax_call_internal_0(hexId);
+            case 1:
+                return (a0) =>
+                    exports._zyntax_call_internal_1(hexId, a0);
+            case 2:
+                return (a0, a1) =>
+                    exports._zyntax_call_internal_2(hexId, a0, a1);
+            case 3:
+                return (a0, a1, a2) =>
+                    exports._zyntax_call_internal_3(hexId, a0, a1, a2);
+            case 4:
+                return (a0, a1, a2, a3) =>
+                    exports._zyntax_call_internal_4(hexId, a0, a1, a2, a3);
+            case 5:
+                return (a0, a1, a2, a3, a4) =>
+                    exports._zyntax_call_internal_5(hexId, a0, a1, a2, a3, a4);
+            case 6:
+                return (a0, a1, a2, a3, a4, a5) =>
+                    exports._zyntax_call_internal_6(hexId, a0, a1, a2, a3, a4, a5);
+            case 7:
+                return (a0, a1, a2, a3, a4, a5, a6) =>
+                    exports._zyntax_call_internal_7(
+                        hexId,
+                        a0, a1, a2, a3, a4, a5, a6,
+                    );
+            case 8:
+                return (a0, a1, a2, a3, a4, a5, a6, a7) =>
+                    exports._zyntax_call_internal_8(
+                        hexId,
+                        a0, a1, a2, a3, a4, a5, a6, a7,
+                    );
+            default:
+                return () => {
+                    throw new Error(
+                        `_zyntax_jit: internal "${hexId}" arity ${arity} not supported (max 8)`,
                     );
                 };
         }

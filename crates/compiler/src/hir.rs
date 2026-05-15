@@ -174,6 +174,15 @@ impl HirId {
     pub fn new() -> Self {
         HirId(Uuid::new_v4())
     }
+
+    /// Hyphenless lowercase hex (32 chars) of the underlying UUID.
+    /// Used as a stable string identifier where one is needed —
+    /// e.g. encoding a cross-function reference into a wasm import
+    /// name (`internal.<hex>@<arity>`) so the host's per-import
+    /// dispatcher can route the call back to the right HIR function.
+    pub fn to_hex(&self) -> String {
+        self.0.simple().to_string()
+    }
 }
 
 /// HIR module representing a compilation unit
