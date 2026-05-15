@@ -442,6 +442,97 @@ pub fn _zyntax_call_extern_8(
 }
 
 // ---------------------------------------------------------------------------
+// Host allocator for `Intrinsic::Malloc` / `Intrinsic::Free`
+// ---------------------------------------------------------------------------
+//
+// JIT'd modules import `host.malloc@1` / `host.free@1` for any
+// `HirCallable::Intrinsic(Malloc|Free)` calls (see
+// `WasmBackend::scan_imports`). The JS dispatcher
+// (`makeHostDispatcher` in zynml.mjs) routes them through the two
+// exports below, which use Rust's global allocator.
+//
+// We prepend an 8-byte size header to every allocation so `free` can
+// recover the original `Layout` — `std::alloc::dealloc` requires the
+// exact layout the original `alloc` used, and the JIT'd caller only
+// hands us a raw pointer. The header is invisible to user code: the
+// pointer we return is offset 8 past the actual allocation.
+
+#[allow(dead_code)]
+fn host_alloc_impl(size: i64) -> i64 {
+    use core::alloc::Layout;
+    if size <= 0 {
+        return 0;
+    }
+    // 8-byte header + payload.
+    let total = match (size as usize).checked_add(8) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let layout = match Layout::from_size_align(total, 8) {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    // SAFETY: layout is valid and non-zero-size.
+    let raw = unsafe { std::alloc::alloc(layout) };
+    if raw.is_null() {
+        return 0;
+    }
+    // Store the total size (not just user size — we need it for
+    // dealloc) at offset 0.
+    // SAFETY: just-allocated 8-byte-aligned region of `total` bytes.
+    unsafe {
+        *(raw as *mut usize) = total;
+    }
+    // Hand back the offset-8 pointer (user payload start) as i64.
+    // On wasm32 the address is 32-bit; the high i64 bits stay zero.
+    (unsafe { raw.add(8) }) as usize as i64
+}
+
+#[allow(dead_code)]
+fn host_free_impl(ptr: i64) -> i64 {
+    use core::alloc::Layout;
+    if ptr == 0 {
+        return 0;
+    }
+    let user_ptr = ptr as usize as *mut u8;
+    // SAFETY: caller passed back a pointer originally returned by
+    // `host_alloc_impl`, which prepends the 8-byte size header.
+    let raw_ptr = unsafe { user_ptr.sub(8) };
+    let total = unsafe { *(raw_ptr as *mut usize) };
+    let layout = match Layout::from_size_align(total, 8) {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    // SAFETY: matched layout from the prepended header.
+    unsafe {
+        std::alloc::dealloc(raw_ptr, layout);
+    }
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_alloc(size: i64) -> i64 {
+    host_alloc_impl(size)
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_free(ptr: i64) -> i64 {
+    host_free_impl(ptr)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_alloc(size: i64) -> i64 {
+    host_alloc_impl(size)
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_free(ptr: i64) -> i64 {
+    host_free_impl(ptr)
+}
+
+// ---------------------------------------------------------------------------
 // Internal-call bridge for cross-function JIT calls
 // ---------------------------------------------------------------------------
 //

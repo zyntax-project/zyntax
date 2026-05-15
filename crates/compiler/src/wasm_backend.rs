@@ -329,9 +329,12 @@ impl<'a> FunctionEmitter<'a> {
         //     wasm name is `<hex_id>@<arity>` (strip the prefix). The
         //     host's per-import dispatcher routes back to the BC
         //     interpreter or a sibling JIT'd module.
-        //   - everything else → module `extern`, wasm name as-is.
-        //     The host's `_zyntax_call_extern_N` dispatcher routes
-        //     these.
+        //   - keys starting with `host.` → module `host`, wasm name is
+        //     `<intrinsic>@<arity>` (strip the prefix). The host's
+        //     dispatcher routes these to the runtime's allocator
+        //     (`host.malloc@1`, `host.free@1`).
+        //   - everything else → module `extern`, wasm name as-is. The
+        //     host's `_zyntax_call_extern_N` dispatcher routes these.
         if !self.imports.is_empty() || self.needs_memory_import {
             let mut imports = ImportSection::new();
             for (key, arity) in &self.imports {
@@ -340,6 +343,8 @@ impl<'a> FunctionEmitter<'a> {
                     .expect("arity → type-index mapping populated above");
                 let (module, wasm_name) = if let Some(rest) = key.strip_prefix("internal.") {
                     ("internal", rest)
+                } else if let Some(rest) = key.strip_prefix("host.") {
+                    ("host", rest)
                 } else {
                     ("extern", key.as_str())
                 };
@@ -511,10 +516,33 @@ impl<'a> FunctionEmitter<'a> {
                                 "indirect call (HirCallable::Indirect)".into(),
                             ));
                         }
-                        HirCallable::Intrinsic(_) => {
-                            return Err(WasmEmitError::Unsupported(
-                                "intrinsic call (HirCallable::Intrinsic)".into(),
-                            ));
+                        HirCallable::Intrinsic(intr) => {
+                            // Allocator intrinsics route through host
+                            // imports: `host.malloc@1` (size → ptr) and
+                            // `host.free@1` (ptr → 0). The JS dispatcher
+                            // wires them to the runtime's wasm-bindgen
+                            // allocator. Other intrinsics still bail —
+                            // some have native wasm opcodes (memcpy/
+                            // memset → `memory.copy`/`memory.fill`),
+                            // others (math, bit-manipulation, overflow)
+                            // need per-intrinsic emit logic.
+                            let name = match intr {
+                                crate::hir::Intrinsic::Malloc => "host.malloc",
+                                crate::hir::Intrinsic::Free => "host.free",
+                                other => {
+                                    return Err(WasmEmitError::Unsupported(format!(
+                                        "intrinsic call ({:?})",
+                                        other
+                                    )));
+                                }
+                            };
+                            let arity = args.len() as u32;
+                            let import_name = format!("{}@{}", name, arity);
+                            if !self.import_indices.contains_key(&import_name) {
+                                let idx = self.imports.len() as u32;
+                                self.imports.push((import_name.clone(), arity));
+                                self.import_indices.insert(import_name, idx);
+                            }
                         }
                         HirCallable::FuncRef(_) => {
                             return Err(WasmEmitError::Unsupported(
@@ -938,13 +966,20 @@ impl<'a> FunctionEmitter<'a> {
                 args,
                 ..
             } => {
-                // `Symbol` and `Function` reach here — both routed
-                // through wasm imports. Everything else was rejected
-                // by `scan_imports`.
+                // `Symbol`, `Function`, and the allocator
+                // `Intrinsic`s (Malloc/Free) reach here — all routed
+                // through wasm imports. Other callees were rejected by
+                // `scan_imports`.
                 let import_name = match callee {
                     HirCallable::Symbol(n) => format!("{}@{}", n, args.len()),
                     HirCallable::Function(id) => {
                         format!("internal.{}@{}", id.to_hex(), args.len())
+                    }
+                    HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc) => {
+                        format!("host.malloc@{}", args.len())
+                    }
+                    HirCallable::Intrinsic(crate::hir::Intrinsic::Free) => {
+                        format!("host.free@{}", args.len())
                     }
                     _ => {
                         return Err(WasmEmitError::Unsupported(format!(
@@ -2497,5 +2532,99 @@ mod tests {
     #[test]
     fn emits_f32_store_demotes_from_f64_funnel() {
         store_round_trip(HirType::F32);
+    }
+
+    /// `def alloc_and_free(size: i64) -> i64 {
+    ///     let p = malloc(size);
+    ///     free(p);
+    ///     return p as i64;
+    /// }`
+    ///
+    /// Asserts the emitted wasm module declares two host-routed
+    /// imports — `(import "host" "malloc@1" ...)` and
+    /// `(import "host" "free@1" ...)` — and validates structurally.
+    #[test]
+    fn emits_malloc_and_free_as_host_imports() {
+        use crate::hir::Intrinsic;
+        let size_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: size_id,
+                name: InternedString::new_global("size"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("alloc_and_free"), sig);
+        func.values.insert(
+            size_id,
+            HirValue {
+                id: size_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+
+        let ptr_id = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Call {
+            result: Some(ptr_id),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![size_id],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry.instructions.push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Intrinsic(Intrinsic::Free),
+            args: vec![ptr_id],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![ptr_id],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit malloc/free module");
+        m.validate_full().expect("module structurally valid");
+
+        let parser = wasmparser::Parser::new(0);
+        let mut found_malloc = false;
+        let mut found_free = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "host" && import.name == "malloc@1" {
+                        found_malloc = true;
+                    }
+                    if import.module == "host" && import.name == "free@1" {
+                        found_free = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_malloc,
+            "expected `(import \"host\" \"malloc@1\")` in emitted module"
+        );
+        assert!(
+            found_free,
+            "expected `(import \"host\" \"free@1\")` in emitted module"
+        );
     }
 }

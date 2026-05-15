@@ -143,6 +143,17 @@ function installJitHost() {
                     importObj.internal[imp.name] = makeInternalDispatcher(baseName, arity);
                     continue;
                 }
+                if (imp.module === "host") {
+                    // Allocator intrinsics. `baseName` is `malloc` or
+                    // `free`; the WasmBackend emits these for
+                    // `HirCallable::Intrinsic(Malloc|Free)`. Route via
+                    // `_zyntax_call_host_alloc` / `_zyntax_call_host_free`
+                    // which call wasm-bindgen's allocator under the
+                    // hood.
+                    if (!importObj.host) importObj.host = {};
+                    importObj.host[imp.name] = makeHostDispatcher(baseName, arity);
+                    continue;
+                }
                 console.warn(
                     `_zyntax_jit_install: unexpected import module "${imp.module}"`,
                 );
@@ -268,6 +279,28 @@ function installJitHost() {
                     );
                 };
         }
+    }
+
+    /** Build a JS dispatcher for `host.malloc@1` / `host.free@1`
+     *  imports. The WasmBackend emits these for
+     *  `HirCallable::Intrinsic(Malloc|Free)` calls. Routes through
+     *  matching `_zyntax_call_host_alloc` / `_zyntax_call_host_free`
+     *  exports that delegate to wasm-bindgen's `__wbindgen_malloc` /
+     *  `__wbindgen_free`. Only arity 1 is meaningful for either
+     *  intrinsic; anything else is a structural bug and throws. */
+    function makeHostDispatcher(baseName, arity) {
+        const exports = zynmlBindings;
+        if (baseName === "malloc" && arity === 1) {
+            return (size) => exports._zyntax_call_host_alloc(size);
+        }
+        if (baseName === "free" && arity === 1) {
+            return (ptr) => exports._zyntax_call_host_free(ptr);
+        }
+        return () => {
+            throw new Error(
+                `_zyntax_jit: host "${baseName}" arity ${arity} not supported`,
+            );
+        };
     }
 
     /** Zero-arg / i64-return dispatch shim. JIT'd `entry` exports
