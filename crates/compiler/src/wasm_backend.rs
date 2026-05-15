@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 use wasm_encoder::{
     CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    Instruction as WasmInst, MemArg, MemoryType, Module, TypeSection, ValType,
+    Instruction as WasmInst, MemArg, MemoryType, Module, RefType, TableType, TypeSection, ValType,
 };
 
 // ---------------------------------------------------------------------------
@@ -229,6 +229,29 @@ struct FunctionEmitter<'a> {
     /// shares the host runtime's linear memory — that's how
     /// JIT'd code reads structs / arrays the BC interp built.
     needs_memory_import: bool,
+    /// `true` once `scan_imports` has spotted at least one
+    /// `IndirectCall` / `HirCallable::Indirect` inside a `Call`.
+    /// Triggers `(import "host" "fn_table" (table 0 funcref))`,
+    /// the function table the JIT'd module's `call_indirect`
+    /// dispatches against. The host populates the table as it
+    /// creates closures / function references — bare emit support
+    /// alone won't make indirect calls work end-to-end (a future
+    /// CreateClosure pass on the WasmBackend has to add table
+    /// entries), but the table import keeps the module valid so
+    /// downstream phases can layer atop a consistent ABI.
+    needs_fn_table_import: bool,
+    /// Set of arities used by IndirectCall / HirCallable::Indirect
+    /// inside this function. The type section emits one
+    /// `(arity i64) → i64` signature per arity (deduped against
+    /// import arities) so each `call_indirect` has a type_index to
+    /// reference.
+    indirect_call_arities: std::collections::HashSet<u32>,
+    /// Final `arity → type_index` mapping, populated by
+    /// `prepare_type_indices` between `scan_imports` and `emit_body`
+    /// so emit-time code (esp. `call_indirect`) can reference type
+    /// indices without re-deriving them. The actual `TypeSection`
+    /// gets written from this map in the module-assembly step.
+    arity_to_type_idx: HashMap<u32, u32>,
 }
 
 /// Per-block state threaded through `emit_terminator` so jumps
@@ -262,6 +285,45 @@ impl<'a> FunctionEmitter<'a> {
             imports: Vec::new(),
             import_indices: HashMap::new(),
             needs_memory_import: false,
+            needs_fn_table_import: false,
+            indirect_call_arities: std::collections::HashSet::new(),
+            arity_to_type_idx: HashMap::new(),
+        }
+    }
+
+    /// Look up the wasm type index for an `(N i64) → i64` signature.
+    /// Populated by `prepare_type_indices` from the union of import
+    /// arities and indirect-call arities; the type section emits in
+    /// the same order this map records. Errors if the arity is
+    /// unknown — that means `scan_imports` missed an import or
+    /// indirect call.
+    fn lookup_type_idx_for_arity(&self, arity: u32) -> Result<u32> {
+        self.arity_to_type_idx.get(&arity).copied().ok_or_else(|| {
+            WasmEmitError::Validation(format!(
+                "no type index registered for arity {} — \
+                 scan_imports likely missed a call site",
+                arity
+            ))
+        })
+    }
+
+    /// Build the arity → type-index mapping the body and type section
+    /// share. Call between `scan_imports` and `emit_body`.
+    fn prepare_type_indices(&mut self) {
+        let mut next_idx: u32 = 0;
+        for &(_, arity) in &self.imports {
+            self.arity_to_type_idx.entry(arity).or_insert_with(|| {
+                let idx = next_idx;
+                next_idx += 1;
+                idx
+            });
+        }
+        for &arity in &self.indirect_call_arities {
+            self.arity_to_type_idx.entry(arity).or_insert_with(|| {
+                let idx = next_idx;
+                next_idx += 1;
+                idx
+            });
         }
     }
 
@@ -281,6 +343,11 @@ impl<'a> FunctionEmitter<'a> {
         //    type section.
         self.scan_imports()?;
 
+        // 3b. Precompute arity → type_index so emit_body can
+        // reference type indices in `call_indirect` without
+        // re-deriving them at type-section-emit time.
+        self.prepare_type_indices();
+
         // 4. Emit the function body.
         let body = self.emit_body()?;
 
@@ -292,16 +359,20 @@ impl<'a> FunctionEmitter<'a> {
         // same wasm-side shape — N i64 params, 1 i64 result —
         // matching the BC interpreter's i64-funneled ABI.
         let mut types = TypeSection::new();
-        let mut arity_to_type_idx: HashMap<u32, u32> = HashMap::new();
-        for &(_, arity) in &self.imports {
-            if arity_to_type_idx.contains_key(&arity) {
-                continue;
-            }
-            let idx = types.len() as u32;
+        // Emit one `(arity i64) → i64` per registered arity in
+        // index order. `prepare_type_indices` chose the indices to
+        // match this emission order.
+        let mut sorted_entries: Vec<(u32, u32)> = self
+            .arity_to_type_idx
+            .iter()
+            .map(|(arity, idx)| (*idx, *arity))
+            .collect();
+        sorted_entries.sort_by_key(|(idx, _)| *idx);
+        for (_, arity) in sorted_entries {
             let params: Vec<ValType> = (0..arity).map(|_| ValType::I64).collect();
             types.function(params, [ValType::I64]);
-            arity_to_type_idx.insert(arity, idx);
         }
+        let arity_to_type_idx = &self.arity_to_type_idx;
         let func_type_idx = types.len() as u32;
         let params: Vec<ValType> = self
             .func
@@ -335,7 +406,7 @@ impl<'a> FunctionEmitter<'a> {
         //     (`host.malloc@1`, `host.free@1`).
         //   - everything else → module `extern`, wasm name as-is. The
         //     host's `_zyntax_call_extern_N` dispatcher routes these.
-        if !self.imports.is_empty() || self.needs_memory_import {
+        if !self.imports.is_empty() || self.needs_memory_import || self.needs_fn_table_import {
             let mut imports = ImportSection::new();
             for (key, arity) in &self.imports {
                 let type_idx = *arity_to_type_idx
@@ -364,6 +435,26 @@ impl<'a> FunctionEmitter<'a> {
                         memory64: false,
                         shared: false,
                         page_size_log2: None,
+                    }),
+                );
+            }
+            if self.needs_fn_table_import {
+                // `(import "host" "fn_table" (table 0 funcref))` — the
+                // host-maintained function table our `call_indirect`s
+                // dispatch against. The host populates it via a future
+                // CreateClosure / function-as-pointer pass; today the
+                // table can be empty (call_indirect into an unbound
+                // slot traps cleanly, matching the documented contract
+                // until CreateClosure lands on the WasmBackend).
+                imports.import(
+                    "host",
+                    "fn_table",
+                    EntityType::Table(TableType {
+                        element_type: RefType::FUNCREF,
+                        minimum: 0,
+                        maximum: None,
+                        table64: false,
+                        shared: false,
                     }),
                 );
             }
@@ -494,6 +585,25 @@ impl<'a> FunctionEmitter<'a> {
                 ) {
                     self.needs_memory_import = true;
                 }
+                // `HirInstruction::IndirectCall` and the
+                // `HirCallable::Indirect` variant inside a regular
+                // `Call` both lower to a wasm `call_indirect` against
+                // the host-imported function table. Record the table
+                // import need and the arity (for type registration in
+                // the type section).
+                if let HirInstruction::IndirectCall { args, .. } = inst {
+                    self.needs_fn_table_import = true;
+                    self.indirect_call_arities.insert(args.len() as u32);
+                }
+                if let HirInstruction::Call {
+                    callee: HirCallable::Indirect(_),
+                    args,
+                    ..
+                } = inst
+                {
+                    self.needs_fn_table_import = true;
+                    self.indirect_call_arities.insert(args.len() as u32);
+                }
                 if let HirInstruction::Call { callee, args, .. } = inst {
                     match callee {
                         HirCallable::Symbol(name) => {
@@ -515,9 +625,11 @@ impl<'a> FunctionEmitter<'a> {
                             }
                         }
                         HirCallable::Indirect(_) => {
-                            return Err(WasmEmitError::Unsupported(
-                                "indirect call (HirCallable::Indirect)".into(),
-                            ));
+                            // Already accounted for by the pre-match
+                            // `needs_fn_table_import` / `indirect_call_arities`
+                            // bookkeeping above. No import-name entry needed —
+                            // the call site uses `call_indirect` against the
+                            // table import, not a named function import.
                         }
                         HirCallable::Intrinsic(intr) => {
                             // Allocator intrinsics route through host
@@ -969,10 +1081,31 @@ impl<'a> FunctionEmitter<'a> {
                 args,
                 ..
             } => {
-                // `Symbol`, `Function`, and the allocator
-                // `Intrinsic`s (Malloc/Free) reach here — all routed
-                // through wasm imports. Other callees were rejected by
-                // `scan_imports`.
+                // `Symbol`, `Function`, the allocator `Intrinsic`s
+                // (Malloc/Free), and `Indirect` reach here.
+                // Indirect emits `call_indirect`; everything else
+                // resolves to a named import + `call`.
+                if let HirCallable::Indirect(fn_ptr_id) = callee {
+                    let arity = args.len() as u32;
+                    let type_idx = self.lookup_type_idx_for_arity(arity)?;
+                    for arg in args {
+                        out.push(self.local_get(*arg)?);
+                    }
+                    // The fn_ptr lives as i64 in the funnel; the table
+                    // index is i32. Wrap before call_indirect.
+                    out.push(self.local_get(*fn_ptr_id)?);
+                    out.push(WasmInst::I32WrapI64);
+                    out.push(WasmInst::CallIndirect {
+                        type_index: type_idx,
+                        table_index: 0,
+                    });
+                    if let Some(result_id) = result {
+                        out.push(self.local_set(*result_id)?);
+                    } else {
+                        out.push(WasmInst::Drop);
+                    }
+                    return Ok(());
+                }
                 let import_name = match callee {
                     HirCallable::Symbol(n) => format!("{}@{}", n, args.len()),
                     HirCallable::Function(id) => {
@@ -1089,6 +1222,35 @@ impl<'a> FunctionEmitter<'a> {
                     }
                 }
                 out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::IndirectCall {
+                result,
+                func_ptr,
+                args,
+                return_ty: _,
+            } => {
+                // Standalone IndirectCall (distinct from
+                // `Call { callee: Indirect, ... }`). Same wasm lowering:
+                // push args, push fn_ptr (wrapped to i32), then
+                // `call_indirect` against the host-imported table.
+                // Return type is funneled to i64 like every other call.
+                let arity = args.len() as u32;
+                let type_idx = self.lookup_type_idx_for_arity(arity)?;
+                for arg in args {
+                    out.push(self.local_get(*arg)?);
+                }
+                out.push(self.local_get(*func_ptr)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(WasmInst::CallIndirect {
+                    type_index: type_idx,
+                    table_index: 0,
+                });
+                if let Some(result_id) = result {
+                    out.push(self.local_set(*result_id)?);
+                } else {
+                    out.push(WasmInst::Drop);
+                }
                 Ok(())
             }
             HirInstruction::AsyncSaveSlot { frame, slot, value } => {
@@ -2808,6 +2970,92 @@ mod tests {
         assert!(
             found_memory,
             "expected `(import \"host\" \"memory\" (memory ...))` for slot ops"
+        );
+    }
+
+    /// `def call_via_ptr(fn_ptr: i64, arg: i64) -> i64 {
+    ///     return (*fn_ptr)(arg);
+    /// }`
+    ///
+    /// Exercises `HirInstruction::IndirectCall`. Asserts the emitted
+    /// module imports `(table 0 funcref)` under `host.fn_table` and
+    /// validates structurally — the `call_indirect` opcode references
+    /// the type registered for arity 1.
+    #[test]
+    fn emits_indirect_call_via_host_fn_table() {
+        let fn_ptr_id = HirId::new();
+        let arg_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: fn_ptr_id,
+                    name: InternedString::new_global("fn_ptr"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: arg_id,
+                    name: InternedString::new_global("arg"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("call_via_ptr"), sig);
+        for (idx, id) in [(0u32, fn_ptr_id), (1, arg_id)] {
+            func.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: HirType::I64,
+                    kind: HirValueKind::Parameter(idx),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        let call_result = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::IndirectCall {
+            result: Some(call_result),
+            func_ptr: fn_ptr_id,
+            args: vec![arg_id],
+            return_ty: HirType::I64,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![call_result],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit indirect call");
+        m.validate_full().expect("module structurally valid");
+
+        let parser = wasmparser::Parser::new(0);
+        let mut found_table = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "host" && import.name == "fn_table" {
+                        if let wasmparser::TypeRef::Table(_) = import.ty {
+                            found_table = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_table,
+            "expected `(import \"host\" \"fn_table\" (table ...))` for indirect call"
         );
     }
 }
