@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<!--
+  Browser deliverable for Phase F: load the zyntax_wasm bundle and
+  run a ZynML program in-page. Requires the page to be served with
+  `Cross-Origin-Opener-Policy: same-origin` +
+  `Cross-Origin-Embedder-Policy: require-corp` headers if you want
+  the cross-origin-isolated execution context (needed for any future
+  SharedArrayBuffer / threaded wasm work). Without those headers
+  the page still runs — `Zyntax.run` returns the program's result
+  on a single thread — it just won't be isolated.
+
+  See `examples/web/serve.sh` for a dev-mode static server that
+  sets the headers, and `docs/wasm-deployment.md` for production
+  hosting recipes (Nginx / Caddy / Cloudflare Workers).
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Zyntax browser demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                Roboto, sans-serif;
+            max-width: 720px;
+            margin: 2em auto;
+            padding: 0 1em;
+            color: #1a1a1a;
+            line-height: 1.5;
+        }
+        code, pre {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: #f4f4f4;
+            border-radius: 4px;
+        }
+        code { padding: 2px 5px; font-size: 0.95em; }
+        pre {
+            padding: 12px;
+            overflow-x: auto;
+        }
+        textarea {
+            width: 100%;
+            box-sizing: border-box;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 13px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 10px;
+        }
+        button {
+            margin-top: 8px;
+            padding: 8px 16px;
+            font-size: 14px;
+            border: 1px solid #888;
+            background: #fafafa;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:active { background: #eee; }
+        .status {
+            margin-top: 12px;
+            padding: 8px 12px;
+            border-radius: 4px;
+            background: #eef6ff;
+            border: 1px solid #cce0ff;
+        }
+        .status.error {
+            background: #fff0f0;
+            border-color: #ffcccc;
+            color: #a00;
+        }
+        .meta {
+            color: #666;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Zyntax browser demo</h1>
+    <p class="meta" id="meta">Loading wasm module…</p>
+
+    <p>Source:</p>
+    <textarea id="src" rows="6">def main(): i64 { return 6 * 7 }</textarea>
+    <button id="run">Run</button>
+
+    <div class="status" id="out">Output: (run a program above)</div>
+
+    <h2>About</h2>
+    <p>
+        This page loads <code>zyntax_wasm</code> built with
+        <code>wasm-pack build --target web</code> and runs a ZynML
+        source in-browser. The wasm module ships the full grammar,
+        bytecode interpreter, and the wasm-emitting Tier-1 JIT —
+        hot functions get JIT-compiled to fresh wasm modules and
+        re-instantiated transparently.
+    </p>
+    <p>
+        Isolation status:
+        <code id="isolated">unknown</code>. Cross-origin isolation
+        is required for <code>SharedArrayBuffer</code> + threaded
+        wasm (future worker-pool runtime). See
+        <code>docs/wasm-deployment.md</code> for hosting recipes.
+    </p>
+
+    <script type="module">
+        import {
+            initZynml,
+            run,
+            version,
+            isolated,
+            ErrorKind,
+        } from "../../crates/zyntax_wasm/web/zynml.mjs";
+
+        const meta = document.getElementById("meta");
+        const out = document.getElementById("out");
+        const isoSpan = document.getElementById("isolated");
+
+        try {
+            await initZynml();
+            meta.textContent = `Loaded ${await version()}`;
+            isoSpan.textContent = isolated() ? "yes" : "no";
+        } catch (e) {
+            meta.textContent = `Failed to load wasm: ${e}`;
+            meta.className = "status error";
+            throw e;
+        }
+
+        document.getElementById("run").addEventListener("click", async () => {
+            const src = document.getElementById("src").value;
+            out.className = "status";
+            out.textContent = "Running…";
+            try {
+                const r = await run(src);
+                if (r.ok) {
+                    out.textContent = `Output: ${r.output}`;
+                } else {
+                    out.className = "status error";
+                    const kindName = Object.keys(ErrorKind).find(
+                        (k) => ErrorKind[k] === r.errorKind,
+                    ) ?? r.errorKind;
+                    out.textContent = `Error (${kindName}): ${r.output}`;
+                }
+            } catch (e) {
+                out.className = "status error";
+                out.textContent = `Exception: ${e}`;
+            }
+        });
+    </script>
+</body>
+</html>

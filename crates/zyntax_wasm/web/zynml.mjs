@@ -360,3 +360,25 @@ export const ErrorKind = Object.freeze({
     CompileError: 1,
     RuntimeError: 2,
 });
+
+/**
+ * Whether the host page is cross-origin isolated. Returns `false` in
+ * Node, `globalThis.crossOriginIsolated` in browsers. Cross-origin
+ * isolation is what lets a page use `SharedArrayBuffer`, `Atomics`,
+ * and the threading-flavoured wasm features that a future Phase F
+ * worker-pool runtime would need; it requires the page to ship
+ * with both:
+ *
+ *     Cross-Origin-Opener-Policy:   same-origin
+ *     Cross-Origin-Embedder-Policy: require-corp
+ *
+ * Without isolation, `run()` still works on a single thread — the
+ * algebraic-effects runtime falls back to direct synchronous polling
+ * — but features that need atomics will throw at the call site
+ * instead of silently corrupting. See `docs/wasm-deployment.md` for
+ * hosting recipes.
+ */
+export function isolated() {
+    if (typeof globalThis === "undefined") return false;
+    return globalThis.crossOriginIsolated === true;
+}
