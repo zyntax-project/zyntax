@@ -183,6 +183,20 @@ impl HirId {
     pub fn to_hex(&self) -> String {
         self.0.simple().to_string()
     }
+
+    /// Folded 64-bit hash of the UUID, suitable as a runtime
+    /// "closure handle" baked into JIT'd wasm modules. UUIDs are
+    /// 128 bits; the WasmBackend's i64-funneled ABI carries one 64-bit
+    /// value through each register. xor-folding preserves entropy while
+    /// fitting the funnel — collisions across handles within a single
+    /// runtime are astronomically unlikely (the host maintains a
+    /// HashMap<i64, …> keyed by this value).
+    pub fn to_handle_hash(&self) -> i64 {
+        let b = self.0.as_bytes();
+        let lo = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        let hi = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+        (lo ^ hi) as i64
+    }
 }
 
 /// HIR module representing a compilation unit

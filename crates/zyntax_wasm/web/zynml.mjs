@@ -296,6 +296,49 @@ function installJitHost() {
         if (baseName === "free" && arity === 1) {
             return (ptr) => exports._zyntax_call_host_free(ptr);
         }
+        // Per-frame stack ops for Alloca. The WasmBackend emits a
+        // prologue (`stack_save@0` → captured into a local) and a
+        // matching epilogue at every Return (`stack_restore@1` with
+        // the saved mark), so every Alloca'd region auto-frees on
+        // function exit.
+        if (baseName === "stack_save" && arity === 0) {
+            return () => exports._zyntax_call_host_stack_save();
+        }
+        if (baseName === "stack_alloc" && arity === 1) {
+            return (size) => exports._zyntax_call_host_stack_alloc(size);
+        }
+        if (baseName === "stack_restore" && arity === 1) {
+            return (mark) => exports._zyntax_call_host_stack_restore(mark);
+        }
+        // Host-routed indirect calls. `arity` here is `handle + N args`,
+        // so the dispatcher takes `handle + (arity-1)` args. CreateClosure
+        // produces the handle as a folded HirId hash; the host's
+        // `_zyntax_call_host_indirect_<arity-1>` resolves to the
+        // function name and re-enters call_function.
+        if (baseName === "indirect_call") {
+            // arity = 1 + n_args. Min arity 1 (handle only).
+            switch (arity) {
+                case 1:
+                    return (h) => exports._zyntax_call_host_indirect_0(h);
+                case 2:
+                    return (h, a0) => exports._zyntax_call_host_indirect_1(h, a0);
+                case 3:
+                    return (h, a0, a1) =>
+                        exports._zyntax_call_host_indirect_2(h, a0, a1);
+                case 4:
+                    return (h, a0, a1, a2) =>
+                        exports._zyntax_call_host_indirect_3(h, a0, a1, a2);
+                case 5:
+                    return (h, a0, a1, a2, a3) =>
+                        exports._zyntax_call_host_indirect_4(h, a0, a1, a2, a3);
+                default:
+                    return () => {
+                        throw new Error(
+                            `_zyntax_jit: host.indirect_call arity ${arity} not supported (max 5)`,
+                        );
+                    };
+            }
+        }
         return () => {
             throw new Error(
                 `_zyntax_jit: host "${baseName}" arity ${arity} not supported`,
@@ -343,6 +386,29 @@ async function bindings() {
  */
 export async function run(source) {
     const b = await bindings();
+    return b.run(source);
+}
+
+/**
+ * Promise-returning variant of `run`. Today this is a thin wrapper —
+ * synchronous compile + execute, with the result handed back via a
+ * resolved Promise so callers using `await Zyntax.call_async(...)`
+ * have a stable API. The shape is forward-compatible with a richer
+ * async runtime: once `@effect`-annotated functions can yield to the
+ * JS event loop (via either threaded wasm + worker-pool drive or a
+ * single-threaded `requestIdleCallback`-based scheduler), this entry
+ * point will dispatch through it without changing the call site.
+ *
+ * Use `run` for purely synchronous programs (saves the microtask),
+ * `call_async` when the program returns from a host-side promise
+ * (e.g. `fetch`) or for forward compatibility with effect handlers.
+ */
+export async function call_async(source) {
+    const b = await bindings();
+    // Punt one microtask so synchronous compile errors still surface
+    // through the Promise rejection path rather than throwing
+    // synchronously from inside `await`.
+    await Promise.resolve();
     return b.run(source);
 }
 

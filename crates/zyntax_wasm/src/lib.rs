@@ -16,6 +16,8 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(unused))]
 
+pub mod worker_pool;
+
 use wasm_bindgen::prelude::*;
 
 use zyntax_compiler::hir_interp::InterpError;
@@ -533,6 +535,117 @@ pub fn _zyntax_call_host_free(ptr: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Per-frame stack allocator for `HirInstruction::Alloca`
+// ---------------------------------------------------------------------------
+//
+// JIT'd modules with Alloca emit a prologue/epilogue pair: at function
+// entry `host.stack_save@0` captures the current frame mark; every
+// `Return` calls `host.stack_restore@1(mark)` to release any
+// Alloca'd regions allocated since. Allocations themselves go through
+// `host.stack_alloc@1(size)`. The host bookkeeping is a thread-local
+// Vec of raw pointers; the mark is the Vec's length at frame entry,
+// restore truncates above the mark and frees each popped pointer.
+//
+// SAFETY: every pointer stored in `STACK_FRAME_PTRS` was returned by
+// `host_alloc_impl` (which prepends the 8-byte size header). The
+// restore path passes them back to `host_free_impl` which knows the
+// layout.
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Stack of live Alloca'd pointers in call-frame order. Push via
+    /// `stack_alloc`, pop-down-to-mark via `stack_restore`.
+    static STACK_FRAME_PTRS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[allow(dead_code)]
+fn host_stack_save_impl() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        STACK_FRAME_PTRS.with(|s| s.borrow().len() as i64)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Native build doesn't need the per-thread frame tracking —
+        // generate_sync_entry mallocs the SM with its own lifecycle;
+        // Alloca on native goes through Cranelift's libc malloc.
+        // Return a sentinel so the matching restore is a no-op.
+        0
+    }
+}
+
+#[allow(dead_code)]
+fn host_stack_alloc_impl(size: i64) -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ptr = host_alloc_impl(size);
+        if ptr != 0 {
+            STACK_FRAME_PTRS.with(|s| s.borrow_mut().push(ptr));
+        }
+        ptr
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Fall through to plain heap allocation; the wasm32 frame-
+        // tracking isn't needed.
+        host_alloc_impl(size)
+    }
+}
+
+#[allow(dead_code)]
+fn host_stack_restore_impl(mark: i64) -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mark = mark.max(0) as usize;
+        STACK_FRAME_PTRS.with(|s| {
+            let mut v = s.borrow_mut();
+            while v.len() > mark {
+                if let Some(ptr) = v.pop() {
+                    host_free_impl(ptr);
+                }
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = mark;
+    }
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_stack_save() -> i64 {
+    host_stack_save_impl()
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_stack_alloc(size: i64) -> i64 {
+    host_stack_alloc_impl(size)
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_stack_restore(mark: i64) -> i64 {
+    host_stack_restore_impl(mark)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_stack_save() -> i64 {
+    host_stack_save_impl()
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_stack_alloc(size: i64) -> i64 {
+    host_stack_alloc_impl(size)
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_stack_restore(mark: i64) -> i64 {
+    host_stack_restore_impl(mark)
+}
+
+// ---------------------------------------------------------------------------
 // Internal-call bridge for cross-function JIT calls
 // ---------------------------------------------------------------------------
 //
@@ -572,6 +685,14 @@ thread_local! {
     /// import back to the name `InterpRuntime::call_function` accepts.
     static ACTIVE_INTERNAL_FNS: RefCell<HashMap<String, String>> =
         RefCell::new(HashMap::new());
+
+    /// Map of folded HirId hash (`HirId::to_handle_hash`) → function
+    /// name. Backs the `_zyntax_call_host_indirect_<N>` exports —
+    /// CreateClosure emits the hash as the runtime closure handle,
+    /// IndirectCall calls back through this map. Populated alongside
+    /// ACTIVE_INTERNAL_FNS at `run_impl` entry.
+    static ACTIVE_CLOSURE_FNS: RefCell<HashMap<i64, String>> =
+        RefCell::new(HashMap::new());
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -594,6 +715,100 @@ fn call_internal_by_hex(hex_id: &str, args: Vec<zyntax_compiler::value::ZyntaxVa
         Ok(_) => 0,
         Err(_) => 0,
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn call_indirect_by_handle(handle: i64, args: Vec<zyntax_compiler::value::ZyntaxValue>) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    let name = match ACTIVE_CLOSURE_FNS.with(|m| m.borrow().get(&handle).cloned()) {
+        Some(n) => n,
+        None => return 0,
+    };
+    let rt_ptr = ACTIVE_RUNTIME.with(|r| *r.borrow());
+    if rt_ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: same as call_internal_by_hex — single-threaded wasm,
+    // outer &mut is parked in a paused wasm call frame.
+    let rt = unsafe { &mut *rt_ptr };
+    match rt.call_function(&name, args) {
+        Ok(ZyntaxValue::Int(i)) => i,
+        Ok(_) => 0,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_indirect_0(handle: i64) -> i64 {
+    call_indirect_by_handle(handle, vec![])
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_indirect_1(handle: i64, a0: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_indirect_by_handle(handle, vec![ZyntaxValue::Int(a0)])
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_indirect_2(handle: i64, a0: i64, a1: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_indirect_by_handle(handle, vec![ZyntaxValue::Int(a0), ZyntaxValue::Int(a1)])
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_call_host_indirect_3(handle: i64, a0: i64, a1: i64, a2: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_indirect_by_handle(
+        handle,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+        ],
+    )
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_host_indirect_4(handle: i64, a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    use zyntax_compiler::value::ZyntaxValue;
+    call_indirect_by_handle(
+        handle,
+        vec![
+            ZyntaxValue::Int(a0),
+            ZyntaxValue::Int(a1),
+            ZyntaxValue::Int(a2),
+            ZyntaxValue::Int(a3),
+        ],
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_indirect_0(_handle: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_indirect_1(_handle: i64, _a0: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_indirect_2(_handle: i64, _a0: i64, _a1: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_call_host_indirect_3(_handle: i64, _a0: i64, _a1: i64, _a2: i64) -> i64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn _zyntax_call_host_indirect_4(_handle: i64, _a0: i64, _a1: i64, _a2: i64, _a3: i64) -> i64 {
+    0
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -998,19 +1213,26 @@ fn run_impl(source: &str) -> RunResult {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(module) = rt.module() {
-            let snapshot: Vec<(String, String)> = module
+            let snapshot: Vec<(String, i64, String)> = module
                 .functions
                 .iter()
                 .filter_map(|(id, f)| {
                     let name = f.name.resolve_global()?;
-                    Some((id.to_hex(), name))
+                    Some((id.to_hex(), id.to_handle_hash(), name))
                 })
                 .collect();
             ACTIVE_INTERNAL_FNS.with(|m| {
                 let mut map = m.borrow_mut();
                 map.clear();
-                for (hex, name) in snapshot {
-                    map.insert(hex, name);
+                for (hex, _hash, name) in &snapshot {
+                    map.insert(hex.clone(), name.clone());
+                }
+            });
+            ACTIVE_CLOSURE_FNS.with(|m| {
+                let mut map = m.borrow_mut();
+                map.clear();
+                for (_hex, hash, name) in &snapshot {
+                    map.insert(*hash, name.clone());
                 }
             });
         }
@@ -1040,6 +1262,7 @@ fn run_impl(source: &str) -> RunResult {
     #[cfg(target_arch = "wasm32")]
     {
         ACTIVE_INTERNAL_FNS.with(|m| m.borrow_mut().clear());
+        ACTIVE_CLOSURE_FNS.with(|m| m.borrow_mut().clear());
         ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = core::ptr::null_mut());
     }
 

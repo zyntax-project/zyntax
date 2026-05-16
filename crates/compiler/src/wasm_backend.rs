@@ -252,6 +252,13 @@ struct FunctionEmitter<'a> {
     /// indices without re-deriving them. The actual `TypeSection`
     /// gets written from this map in the module-assembly step.
     arity_to_type_idx: HashMap<u32, u32>,
+    /// Set by `allocate_stack_frame_local` when at least one `Alloca`
+    /// is present in the function. Holds the local index of the i64
+    /// "stack frame mark" that the prologue captures via
+    /// `host.stack_save@0` and every `Return` restores via
+    /// `host.stack_restore@1`. None when there's no Alloca — no
+    /// prologue, no per-Return cleanup needed.
+    stack_mark_local: Option<u32>,
 }
 
 /// Per-block state threaded through `emit_terminator` so jumps
@@ -288,6 +295,7 @@ impl<'a> FunctionEmitter<'a> {
             needs_fn_table_import: false,
             indirect_call_arities: std::collections::HashSet::new(),
             arity_to_type_idx: HashMap::new(),
+            stack_mark_local: None,
         }
     }
 
@@ -343,7 +351,18 @@ impl<'a> FunctionEmitter<'a> {
         //    type section.
         self.scan_imports()?;
 
-        // 3b. Precompute arity → type_index so emit_body can
+        // 3b. If any Alloca was registered, allocate the i64 local
+        // that the prologue uses to capture the frame's stack mark.
+        // Every Return will restore the mark via
+        // `host.stack_restore@1`, auto-freeing any per-frame Alloca'd
+        // regions.
+        if self.import_indices.contains_key("host.stack_save@0") {
+            let idx = self.n_params + self.locals.len() as u32;
+            self.locals.push(ValType::I64);
+            self.stack_mark_local = Some(idx);
+        }
+
+        // 3c. Precompute arity → type_index so emit_body can
         // reference type indices in `call_indirect` without
         // re-deriving them at type-section-emit time.
         self.prepare_type_indices();
@@ -585,27 +604,44 @@ impl<'a> FunctionEmitter<'a> {
                 ) {
                     self.needs_memory_import = true;
                 }
-                // `Alloca` lowers to a `host.malloc(size)` call —
-                // register the same import the explicit
-                // `Intrinsic::Malloc` case uses so the emit-time
-                // index lookup resolves.
+                // `Alloca` lowers to a `host.stack_alloc(size)` call
+                // bracketed by `host.stack_save` (prologue) and
+                // `host.stack_restore` (per-Return epilogue), so every
+                // Alloca'd region auto-frees at function exit. Register
+                // all three imports up front when any Alloca is present.
                 if matches!(inst, HirInstruction::Alloca { .. }) {
-                    let import_name = "host.malloc@1".to_string();
-                    if !self.import_indices.contains_key(&import_name) {
-                        let idx = self.imports.len() as u32;
-                        self.imports.push((import_name.clone(), 1));
-                        self.import_indices.insert(import_name, idx);
+                    for (name, arity) in [
+                        ("host.stack_save@0", 0u32),
+                        ("host.stack_alloc@1", 1u32),
+                        ("host.stack_restore@1", 1u32),
+                    ] {
+                        if !self.import_indices.contains_key(name) {
+                            let idx = self.imports.len() as u32;
+                            self.imports.push((name.to_string(), arity));
+                            self.import_indices.insert(name.to_string(), idx);
+                        }
                     }
                 }
                 // `HirInstruction::IndirectCall` and the
                 // `HirCallable::Indirect` variant inside a regular
-                // `Call` both lower to a wasm `call_indirect` against
-                // the host-imported function table. Record the table
-                // import need and the arity (for type registration in
-                // the type section).
+                // `Call` both lower to a host-routed dispatcher call:
+                // `host.indirect_call@<arity+1>(handle, args...)`. The
+                // host resolves the handle (a folded hash of the
+                // callee's HirId — produced by CreateClosure) and
+                // re-enters the runtime through the standard
+                // call_function path. Single dispatcher per arity
+                // covers every indirect call; closures with captures
+                // bake the captures into the host's closure entry
+                // rather than carrying them through the wasm call.
                 if let HirInstruction::IndirectCall { args, .. } = inst {
-                    self.needs_fn_table_import = true;
-                    self.indirect_call_arities.insert(args.len() as u32);
+                    // +1 for the handle arg.
+                    let import_name = format!("host.indirect_call@{}", args.len() + 1);
+                    if !self.import_indices.contains_key(&import_name) {
+                        let idx = self.imports.len() as u32;
+                        self.imports
+                            .push((import_name.clone(), (args.len() + 1) as u32));
+                        self.import_indices.insert(import_name, idx);
+                    }
                 }
                 if let HirInstruction::Call {
                     callee: HirCallable::Indirect(_),
@@ -613,8 +649,13 @@ impl<'a> FunctionEmitter<'a> {
                     ..
                 } = inst
                 {
-                    self.needs_fn_table_import = true;
-                    self.indirect_call_arities.insert(args.len() as u32);
+                    let import_name = format!("host.indirect_call@{}", args.len() + 1);
+                    if !self.import_indices.contains_key(&import_name) {
+                        let idx = self.imports.len() as u32;
+                        self.imports
+                            .push((import_name.clone(), (args.len() + 1) as u32));
+                        self.import_indices.insert(import_name, idx);
+                    }
                 }
                 if let HirInstruction::Call { callee, args, .. } = inst {
                     match callee {
@@ -685,6 +726,25 @@ impl<'a> FunctionEmitter<'a> {
 
     fn emit_body(&mut self) -> Result<Vec<WasmInst<'static>>> {
         let mut out = Vec::new();
+
+        // Stack-frame prologue. When the function contains any
+        // Alloca, capture the current host-managed stack mark into
+        // `stack_mark_local`. Each `Return` emits the matching
+        // `host.stack_restore@1(stack_mark_local)` to release every
+        // Alloca'd region back to this mark — that's how per-frame
+        // auto-free works for the WasmBackend.
+        if let Some(mark_local) = self.stack_mark_local {
+            let save_idx = *self
+                .import_indices
+                .get("host.stack_save@0")
+                .ok_or_else(|| {
+                    WasmEmitError::Validation(
+                        "stack_mark_local allocated but host.stack_save@0 import missing".into(),
+                    )
+                })?;
+            out.push(WasmInst::Call(save_idx));
+            out.push(WasmInst::LocalSet(mark_local));
+        }
 
         // Emit constants up front so subsequent uses can `local.get`.
         // Walk in deterministic order (the function's value map)
@@ -1095,22 +1155,23 @@ impl<'a> FunctionEmitter<'a> {
             } => {
                 // `Symbol`, `Function`, the allocator `Intrinsic`s
                 // (Malloc/Free), and `Indirect` reach here.
-                // Indirect emits `call_indirect`; everything else
-                // resolves to a named import + `call`.
+                // Indirect routes through the host
+                // (`host.indirect_call@<arity+1>(handle, ...args)`);
+                // everything else resolves to a named import + `call`.
                 if let HirCallable::Indirect(fn_ptr_id) = callee {
-                    let arity = args.len() as u32;
-                    let type_idx = self.lookup_type_idx_for_arity(arity)?;
+                    let import_name = format!("host.indirect_call@{}", args.len() + 1);
+                    let import_idx = *self.import_indices.get(&import_name).ok_or_else(|| {
+                        WasmEmitError::Validation(format!(
+                            "Call(Indirect) at arity {} but `{}` import missing",
+                            args.len(),
+                            import_name
+                        ))
+                    })?;
+                    out.push(self.local_get(*fn_ptr_id)?);
                     for arg in args {
                         out.push(self.local_get(*arg)?);
                     }
-                    // The fn_ptr lives as i64 in the funnel; the table
-                    // index is i32. Wrap before call_indirect.
-                    out.push(self.local_get(*fn_ptr_id)?);
-                    out.push(WasmInst::I32WrapI64);
-                    out.push(WasmInst::CallIndirect {
-                        type_index: type_idx,
-                        table_index: 0,
-                    });
+                    out.push(WasmInst::Call(import_idx));
                     if let Some(result_id) = result {
                         out.push(self.local_set(*result_id)?);
                     } else {
@@ -1242,13 +1303,12 @@ impl<'a> FunctionEmitter<'a> {
                 count,
                 align: _,
             } => {
-                // Lower to `host.malloc(size)`. `size = sizeof(ty) *
-                // count` (or just `sizeof(ty)` when count is None).
-                // Today the allocation leaks at function exit — a
-                // future refinement would carve a per-frame bump
-                // region out of host-supplied scratch, but for now
-                // we share the same heap path as `Intrinsic::Malloc`
-                // (host.malloc@1).
+                // Lower to `host.stack_alloc(size)`. `size = sizeof(ty)
+                // * count` (or just `sizeof(ty)` when count is None).
+                // The function prologue captured the stack mark; the
+                // matching `host.stack_restore@1(mark)` in every
+                // Return path frees this region (plus every other
+                // Alloca in the frame) at function exit — no leak.
                 //
                 // Element byte sizes match the natural HIR layout so
                 // pointer arithmetic at HIR / interp level stays
@@ -1273,11 +1333,15 @@ impl<'a> FunctionEmitter<'a> {
                 } else {
                     out.push(WasmInst::I64Const(elem_bytes));
                 }
-                let import_idx = *self.import_indices.get("host.malloc@1").ok_or_else(|| {
-                    WasmEmitError::Validation(
-                        "Alloca emitted but host.malloc@1 import missing".into(),
-                    )
-                })?;
+                let import_idx =
+                    *self
+                        .import_indices
+                        .get("host.stack_alloc@1")
+                        .ok_or_else(|| {
+                            WasmEmitError::Validation(
+                                "Alloca emitted but host.stack_alloc@1 import missing".into(),
+                            )
+                        })?;
                 out.push(WasmInst::Call(import_idx));
                 out.push(self.local_set(*result)?);
                 Ok(())
@@ -1289,26 +1353,58 @@ impl<'a> FunctionEmitter<'a> {
                 return_ty: _,
             } => {
                 // Standalone IndirectCall (distinct from
-                // `Call { callee: Indirect, ... }`). Same wasm lowering:
-                // push args, push fn_ptr (wrapped to i32), then
-                // `call_indirect` against the host-imported table.
-                // Return type is funneled to i64 like every other call.
-                let arity = args.len() as u32;
-                let type_idx = self.lookup_type_idx_for_arity(arity)?;
+                // `Call { callee: Indirect, ... }`). Same lowering:
+                // push handle, push args, call the host-routed
+                // dispatcher `host.indirect_call@<arity+1>`.
+                let import_name = format!("host.indirect_call@{}", args.len() + 1);
+                let import_idx = *self.import_indices.get(&import_name).ok_or_else(|| {
+                    WasmEmitError::Validation(format!(
+                        "IndirectCall at arity {} but `{}` import missing",
+                        args.len(),
+                        import_name
+                    ))
+                })?;
+                out.push(self.local_get(*func_ptr)?);
                 for arg in args {
                     out.push(self.local_get(*arg)?);
                 }
-                out.push(self.local_get(*func_ptr)?);
-                out.push(WasmInst::I32WrapI64);
-                out.push(WasmInst::CallIndirect {
-                    type_index: type_idx,
-                    table_index: 0,
-                });
+                out.push(WasmInst::Call(import_idx));
                 if let Some(result_id) = result {
                     out.push(self.local_set(*result_id)?);
                 } else {
                     out.push(WasmInst::Drop);
                 }
+                Ok(())
+            }
+            HirInstruction::CreateClosure {
+                result,
+                function,
+                captures,
+                ..
+            } => {
+                // Produce a runtime closure handle: a folded hash of
+                // the callee's HirId. The host has registered every
+                // function in the active runtime's module under this
+                // hash (see `ACTIVE_HIR_BY_HASH` in zyntax_wasm), so
+                // `IndirectCall` can resolve handle → function name
+                // via `host.indirect_call@<arity+1>`.
+                //
+                // Captures aren't yet propagated through the wasm
+                // path — programs that depend on closure captures need
+                // to stay in the BC interpreter. The handle still
+                // works for capture-free closures (the common case for
+                // sync_entry's poll_fn, abi_emit's Resume struct
+                // poll_fn_ptr, etc.).
+                if !captures.is_empty() {
+                    return Err(WasmEmitError::Unsupported(format!(
+                        "CreateClosure with {} captures — wasm-JIT supports \
+                         capture-free closures only; programs with captured \
+                         state stay in BC",
+                        captures.len()
+                    )));
+                }
+                out.push(WasmInst::I64Const(function.to_handle_hash()));
+                out.push(self.local_set(*result)?);
                 Ok(())
             }
             HirInstruction::AsyncSaveSlot { frame, slot, value } => {
@@ -1415,6 +1511,30 @@ impl<'a> FunctionEmitter<'a> {
     ) -> Result<()> {
         match term {
             HirTerminator::Return { values } => {
+                // Stack-frame epilogue. If the function used Alloca
+                // (prologue captured a stack mark), restore the mark
+                // before returning so all per-frame Alloca'd regions
+                // get released. Returning the result value is unaffected
+                // — its bits are already in a wasm local; the
+                // `host.stack_restore@1` call only touches the
+                // host-managed stack pointer.
+                if let Some(mark_local) = self.stack_mark_local {
+                    let restore_idx =
+                        *self
+                            .import_indices
+                            .get("host.stack_restore@1")
+                            .ok_or_else(|| {
+                                WasmEmitError::Validation(
+                                    "stack_mark_local set but host.stack_restore@1 import missing"
+                                        .into(),
+                                )
+                            })?;
+                    out.push(WasmInst::LocalGet(mark_local));
+                    out.push(WasmInst::Call(restore_idx));
+                    // `host.stack_restore@1` returns i64 (uniform funnel);
+                    // drop it.
+                    out.push(WasmInst::Drop);
+                }
                 for v in values {
                     out.push(self.local_get(*v)?);
                 }
@@ -3036,11 +3156,11 @@ mod tests {
     /// }`
     ///
     /// Exercises `HirInstruction::IndirectCall`. Asserts the emitted
-    /// module imports `(table 0 funcref)` under `host.fn_table` and
-    /// validates structurally — the `call_indirect` opcode references
-    /// the type registered for arity 1.
+    /// module declares `host.indirect_call@2` (one handle + one arg
+    /// = arity 2 from wasm's perspective) and validates structurally.
+    /// The handle is a folded HirId hash produced by CreateClosure.
     #[test]
-    fn emits_indirect_call_via_host_fn_table() {
+    fn emits_indirect_call_as_host_dispatcher_import() {
         let fn_ptr_id = HirId::new();
         let arg_id = HirId::new();
         let sig = HirFunctionSignature {
@@ -3098,23 +3218,57 @@ mod tests {
         m.validate_full().expect("module structurally valid");
 
         let parser = wasmparser::Parser::new(0);
-        let mut found_table = false;
+        let mut found_dispatcher = false;
         for payload in parser.parse_all(&m.bytes) {
             if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
                 for import in reader {
                     let import = import.unwrap();
-                    if import.module == "host" && import.name == "fn_table" {
-                        if let wasmparser::TypeRef::Table(_) = import.ty {
-                            found_table = true;
-                        }
+                    if import.module == "host" && import.name == "indirect_call@2" {
+                        found_dispatcher = true;
                     }
                 }
             }
         }
         assert!(
-            found_table,
-            "expected `(import \"host\" \"fn_table\" (table ...))` for indirect call"
+            found_dispatcher,
+            "expected `(import \"host\" \"indirect_call@2\")` for indirect call"
         );
+    }
+
+    /// `def make_closure(): i64 { return create_closure(some_fn); }`
+    /// returning a runtime handle to `some_fn` (a folded HirId hash).
+    /// Asserts the emit succeeds and the result is set without error.
+    #[test]
+    fn emits_create_closure_as_handle_constant() {
+        let other_fn = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("make_closure"), sig);
+        let handle = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::CreateClosure {
+            result: handle,
+            closure_ty: HirType::I64,
+            function: other_fn,
+            captures: vec![],
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![handle],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit CreateClosure");
+        m.validate_full().expect("module structurally valid");
     }
 
     /// `def alloc_buf(n: i64) -> i64 {
@@ -3123,12 +3277,13 @@ mod tests {
     /// }`
     ///
     /// Exercises `HirInstruction::Alloca` with a dynamic count.
-    /// Verifies the emitted module imports `host.malloc@1` and
-    /// validates structurally — the host-malloc-backed alloca
-    /// lowering shares the malloc import with explicit
-    /// `Intrinsic::Malloc`.
+    /// Verifies the emitted module imports the three
+    /// `host.stack_*@N` ops and validates structurally — the
+    /// per-frame stack-alloc convention means every Alloca region
+    /// auto-frees when the function returns (the prologue captures
+    /// `stack_save`, the Return path emits `stack_restore`).
     #[test]
-    fn emits_alloca_as_host_malloc_call() {
+    fn emits_alloca_as_host_stack_alloc_call() {
         let n_id = HirId::new();
         let sig = HirFunctionSignature {
             params: vec![HirParam {
@@ -3173,20 +3328,31 @@ mod tests {
         m.validate_full().expect("module structurally valid");
 
         let parser = wasmparser::Parser::new(0);
-        let mut found_malloc = false;
+        let mut found_save = false;
+        let mut found_alloc = false;
+        let mut found_restore = false;
         for payload in parser.parse_all(&m.bytes) {
             if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
                 for import in reader {
                     let import = import.unwrap();
-                    if import.module == "host" && import.name == "malloc@1" {
-                        found_malloc = true;
+                    if import.module == "host" {
+                        match import.name {
+                            "stack_save@0" => found_save = true,
+                            "stack_alloc@1" => found_alloc = true,
+                            "stack_restore@1" => found_restore = true,
+                            _ => {}
+                        }
                     }
                 }
             }
         }
         assert!(
-            found_malloc,
-            "expected `(import \"host\" \"malloc@1\")` for Alloca lowering"
+            found_save && found_alloc && found_restore,
+            "expected host.stack_save@0 / stack_alloc@1 / stack_restore@1 \
+             imports for Alloca per-frame lowering (got save={}, alloc={}, restore={})",
+            found_save,
+            found_alloc,
+            found_restore
         );
     }
 }

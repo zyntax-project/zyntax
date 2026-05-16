@@ -66,10 +66,30 @@ extern "C" {
 }
 
 #[cfg(target_arch = "wasm32")]
-unsafe fn c_free(_ptr: *mut core::ffi::c_void) {
-    // wasm32 path doesn't reach SM auto-free yet (no Intrinsic::Malloc
-    // emission in WasmBackend). When it lands, replace with the
-    // matching deallocator.
+unsafe fn c_free(ptr: *mut core::ffi::c_void) {
+    // wasm32 doesn't have libc free. Pair with the size-header
+    // allocation convention `zyntax_wasm::host_alloc_impl` uses:
+    // the caller-visible pointer is offset 8 past the underlying
+    // allocation; the 8 bytes before it carry the total allocation
+    // size used by `Layout::from_size_align`. Recover the layout and
+    // hand back to Rust's global allocator.
+    //
+    // This is safe IFF the SM was allocated with the same convention.
+    // Today the only wasm32 path that reaches here is the
+    // algebraic-effects refcount drop in `__zyntax_runtime_release_sm`
+    // / `release_sm_by_offset`; SM allocation on wasm32 ultimately
+    // routes through `host.malloc@1` (WasmBackend emit) or
+    // `host_alloc_impl` directly. Both prepend the size header.
+    use core::alloc::Layout;
+    if ptr.is_null() {
+        return;
+    }
+    let user_ptr = ptr as *mut u8;
+    let raw_ptr = user_ptr.sub(8);
+    let total = *(raw_ptr as *mut usize);
+    if let Ok(layout) = Layout::from_size_align(total, 8) {
+        std::alloc::dealloc(raw_ptr, layout);
+    }
 }
 
 /// One handler in scope: the effect it handles, plus opaque pointers

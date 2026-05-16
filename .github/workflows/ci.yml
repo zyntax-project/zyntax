@@ -184,3 +184,58 @@ jobs:
           RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests execution::test_execute_prelude_only_example -- --nocapture
           RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests runtime::test_runtime_profile_tiered_development -- --nocapture
           RUST_MIN_STACK=134217728 cargo test -p zynml --test e2e_tests runtime::test_runtime_event_capture_render_and_stream -- --nocapture
+
+  wasm-headless-chrome:
+    name: wasm headless-chrome smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-headless-chrome
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Build zyntax_wasm (web target)
+        working-directory: crates/zyntax_wasm
+        run: ./build.sh web
+
+      - name: Build zyntax_wasm (node target)
+        working-directory: crates/zyntax_wasm
+        run: ./build.sh node
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Single-threaded fallback path — Node has no
+      # crossOriginIsolated context, so this exercises the non-isolated
+      # code path of zynml.mjs end-to-end.
+      - name: Run Node smoke
+        working-directory: crates/zyntax_wasm
+        run: node test/node_smoke.mjs
+
+      # Headless-Chrome run exercises the same surface under a real
+      # browser. The wasm-pack test harness drives Chromium through
+      # wasm-bindgen-test; when `tests/wasm/` lands with bindgen-test
+      # cases, this step enforces no regression.
+      - name: Run headless Chrome smoke (when wasm-pack tests land)
+        working-directory: crates/zyntax_wasm
+        run: |
+          if [ -d tests/wasm ]; then
+            wasm-pack test --headless --chrome
+          else
+            echo "no tests/wasm/ yet — node_smoke.mjs covered the surface"
+          fi

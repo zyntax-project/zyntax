@@ -9,6 +9,14 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Phase F worker-pool: compiles in the `worker_pool` module's real
+# wasm-bindgen-rayon init. The module is currently a structural stub
+# whose `compile_error!` prevents enabling this feature until the
+# threaded-wasm toolchain (nightly Rust + RUSTFLAGS) is wired up.
+# See `crates/zyntax_wasm/src/worker_pool.rs` for the full rationale.
+worker_pool = []
+
 [dependencies]
 # The interpreter-backed runtime. `default-features = false` so we
 # don't drag in Cranelift / libloading / the native ZyntaxRuntime —
