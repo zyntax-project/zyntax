@@ -1,17 +1,19 @@
 <!DOCTYPE html>
 <!--
   Browser deliverable for Phase F: load the zyntax_wasm bundle and
-  run a ZynML program in-page. Requires the page to be served with
-  `Cross-Origin-Opener-Policy: same-origin` +
-  `Cross-Origin-Embedder-Policy: require-corp` headers if you want
-  the cross-origin-isolated execution context (needed for any future
-  SharedArrayBuffer / threaded wasm work). Without those headers
-  the page still runs — `Zyntax.run` returns the program's result
-  on a single thread — it just won't be isolated.
+  run a ZynML program. Defaults to `createZyntax({mode: "worker"})`
+  so the interpreter runs in a Web Worker and the UI thread stays
+  responsive even on long programs.
 
-  See `examples/web/serve.sh` for a dev-mode static server that
-  sets the headers, and `docs/wasm-deployment.md` for production
-  hosting recipes (Nginx / Caddy / Cloudflare Workers).
+  The vendored `coi-serviceworker.js` installs `COOP: same-origin` +
+  `COEP: require-corp` via a service worker, so this page works on
+  any host (even ones where you can't control response headers like
+  GitHub Pages, Cloudflare R2 static sites, etc.). When the page is
+  already cross-origin isolated from server-side headers (e.g.
+  `examples/web/serve.sh` for development), the service worker is a
+  no-op. `Zyntax.isolated()` reports the resulting state.
+
+  See `docs/wasm-deployment.md` for the full deployment guide.
 -->
 <html lang="en">
 <head>
@@ -96,17 +98,22 @@
     <p>
         Isolation status:
         <code id="isolated">unknown</code>. Cross-origin isolation
-        is required for <code>SharedArrayBuffer</code> + threaded
-        wasm (future worker-pool runtime). See
+        is required for <code>SharedArrayBuffer</code> + a future
+        SAB-backed worker-pool runtime. The single-Worker mode in
+        use today does <em>not</em> require it. See
         <code>docs/wasm-deployment.md</code> for hosting recipes.
     </p>
 
+    <!-- Service-worker COI installer. No-op when the host already
+         sends COOP/COEP headers (e.g. `examples/web/serve.sh`);
+         otherwise installs a SW that rewrites responses to add
+         them. Must be in the page's root scope to control the
+         page itself, hence loaded inline (not inside a module). -->
+    <script src="../../crates/zyntax_wasm/web/coi-serviceworker.js"></script>
+
     <script type="module">
         import {
-            initZynml,
-            run,
-            version,
-            isolated,
+            createZyntax,
             ErrorKind,
         } from "../../crates/zyntax_wasm/web/zynml.mjs";
 
@@ -114,10 +121,14 @@
         const out = document.getElementById("out");
         const isoSpan = document.getElementById("isolated");
 
+        let zx;
         try {
-            await initZynml();
-            meta.textContent = `Loaded ${await version()}`;
-            isoSpan.textContent = isolated() ? "yes" : "no";
+            // mode: "worker" runs the interpreter off the UI thread.
+            // Falls back transparently to inline if the consumer
+            // passes mode: "main".
+            zx = await createZyntax({ mode: "worker" });
+            meta.textContent = `Loaded ${await zx.version()}`;
+            isoSpan.textContent = zx.isolated() ? "yes" : "no";
         } catch (e) {
             meta.textContent = `Failed to load wasm: ${e}`;
             meta.className = "status error";
@@ -129,7 +140,7 @@
             out.className = "status";
             out.textContent = "Running…";
             try {
-                const r = await run(src);
+                const r = await zx.run(src);
                 if (r.ok) {
                     out.textContent = `Output: ${r.output}`;
                 } else {

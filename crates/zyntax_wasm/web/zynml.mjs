@@ -427,6 +427,184 @@ export const ErrorKind = Object.freeze({
     RuntimeError: 2,
 });
 
+// ---------------------------------------------------------------------------
+// Worker-mode entry (mirrors wren_lift's `createWlift`)
+// ---------------------------------------------------------------------------
+//
+// The default ESM API above (`initZynml` + `run` + `call_async`) runs
+// the interpreter inline on whatever thread imported the module — the
+// UI thread in a browser, or the Node main thread under `node`. That
+// works but blocks the page on long-running programs.
+//
+// `createZyntax({ mode: "worker" })` (browser only) spawns a Web
+// Worker hosting `worker.js`, which loads its own copy of the wasm
+// module and runs the interpreter off the UI thread. The returned
+// handle has the same `.run(source)` / `.call_async(source)` /
+// `.version()` surface, but each call is async-by-construction and
+// the UI thread stays responsive regardless of how long the program
+// takes to finish.
+//
+// `mode: "main"` is the inline path — same as calling `initZynml` +
+// `run` directly. Exists so embedders can pick at construction time
+// and keep the call site identical across modes.
+
+let __workerNextId = 1;
+
+class WorkerZyntax {
+    constructor({ workerUrl } = {}) {
+        // `import.meta.url` resolves the worker beside this file so
+        // the consumer doesn't have to thread URLs through itself.
+        // Override with `workerUrl` for bundlers that rewrite paths.
+        const url = workerUrl ?? new URL("./worker.js", import.meta.url);
+        this.worker = new Worker(url, { type: "module" });
+        this.pending = new Map();
+        this.ready = new Promise((resolve) => {
+            const onReady = (ev) => {
+                if (ev.data?.cmd === "ready") {
+                    this.worker.removeEventListener("message", onReady);
+                    this.version_ = ev.data.version;
+                    resolve(this);
+                }
+            };
+            this.worker.addEventListener("message", onReady);
+        });
+        this.worker.addEventListener("message", (ev) => {
+            const m = ev.data;
+            if (!m || typeof m.cmd !== "string") return;
+            if (m.cmd === "ready") return; // handled above
+            const entry = this.pending.get(m.id);
+            if (!entry) return;
+            this.pending.delete(m.id);
+            if (m.cmd === "error") {
+                entry.reject(new Error(m.message));
+                return;
+            }
+            entry.resolve(m);
+        });
+    }
+
+    _send(cmd, payload) {
+        const id = __workerNextId++;
+        const p = new Promise((resolve, reject) => {
+            this.pending.set(id, { resolve, reject });
+        });
+        this.worker.postMessage({ cmd, id, ...payload });
+        return p;
+    }
+
+    /**
+     * Run a ZynML source in the worker. Returns a Promise of a
+     * `RunResult`-shaped object: `{ output, ok, errorKind }`.
+     */
+    async run(source) {
+        const r = await this._send("run", { source });
+        return { output: r.output, ok: r.ok, errorKind: r.errorKind };
+    }
+
+    /** Same surface as `run`; exists so worker-mode + main-mode have
+     *  identical APIs. The worker is already async by construction. */
+    async call_async(source) {
+        return this.run(source);
+    }
+
+    /** Worker-side wasm build identifier. */
+    async version() {
+        if (this.version_) return this.version_;
+        const r = await this._send("version", {});
+        return r.version;
+    }
+
+    /** Mirror of `isolated()` above. Worker contexts inherit the
+     *  page's isolation state, so this still answers the page-level
+     *  question. */
+    isolated() {
+        return isolated();
+    }
+
+    /** Tear down the Worker. Pending operations reject with the
+     *  given reason (or a default). After `terminate`, the handle
+     *  is unusable. */
+    terminate(reason = "terminated") {
+        for (const { reject } of this.pending.values()) {
+            reject(new Error(reason));
+        }
+        this.pending.clear();
+        this.worker.terminate();
+    }
+}
+
+class MainZyntax {
+    constructor() {
+        this.version_ = null;
+    }
+
+    async init(opts) {
+        await initZynml(opts);
+        this.version_ = (await bindings()).version();
+        return this;
+    }
+
+    async run(source) {
+        const b = await bindings();
+        return b.run(source);
+    }
+
+    async call_async(source) {
+        return call_async(source);
+    }
+
+    async version() {
+        return this.version_ ?? (await bindings()).version();
+    }
+
+    isolated() {
+        return isolated();
+    }
+
+    terminate() {
+        // No-op for main mode — the wasm module stays loaded for
+        // the lifetime of the page. Provided so embedders can call
+        // `terminate()` without branching on mode.
+    }
+}
+
+/**
+ * Create a Zyntax handle backed by either a Web Worker (default) or
+ * the calling thread. Mirrors `wren_lift`'s `createWlift({ mode })`.
+ *
+ * @param {Object} [opts]
+ * @param {"worker"|"main"} [opts.mode="worker"]
+ *        `"worker"` (browser only) spawns a Worker hosting
+ *        `worker.js`. `"main"` runs inline on the calling thread.
+ *        Node has no Workers in the browser sense, so `mode` is
+ *        forced to `"main"` there.
+ * @param {URL|string} [opts.workerUrl]
+ *        Override the Worker script URL. Defaults to `./worker.js`
+ *        resolved relative to this file.
+ * @param {URL|RequestInfo} [opts.module]
+ *        Passed through to `initZynml` in main mode; ignored in
+ *        worker mode (the worker resolves its own wasm URL).
+ * @returns {Promise<WorkerZyntax|MainZyntax>}
+ */
+export async function createZyntax(opts = {}) {
+    const isNode =
+        typeof process !== "undefined" &&
+        process.versions &&
+        process.versions.node;
+    const mode = isNode ? "main" : opts.mode ?? "worker";
+    if (mode === "worker") {
+        const z = new WorkerZyntax({ workerUrl: opts.workerUrl });
+        await z.ready;
+        return z;
+    }
+    if (mode === "main") {
+        return await new MainZyntax().init({ module: opts.module });
+    }
+    throw new Error(
+        `createZyntax: unknown mode '${mode}', expected 'worker' or 'main'`,
+    );
+}
+
 /**
  * Whether the host page is cross-origin isolated. Returns `false` in
  * Node, `globalThis.crossOriginIsolated` in browsers. Cross-origin

@@ -30,6 +30,36 @@ if (isolated()) {
 }
 ```
 
+## Worker mode vs. main mode
+
+There are two ways to run the interpreter in a browser. Both work on
+stable Rust with the default `zyntax_wasm` build; the choice is
+purely about whether you want the interpreter to share a thread with
+your UI.
+
+**Worker mode** (default) — `createZyntax({ mode: "worker" })`
+spawns a Web Worker that loads its own copy of the wasm module and
+runs the BC interpreter off the UI thread. The page stays responsive
+regardless of how long the program takes to finish. Returned handle:
+
+```js
+import { createZyntax } from "/path/to/zynml.mjs";
+const zx = await createZyntax({ mode: "worker" });
+const r  = await zx.run("def main(): i64 { return 42 }");
+console.log(r.output); // "42"
+```
+
+**Main mode** — `createZyntax({ mode: "main" })` runs the
+interpreter inline on the calling thread. Faster (no postMessage
+hop, direct access to the wasm linear memory), but a long program
+freezes the UI. Choose this for pages where memory throughput
+matters more than responsiveness (e.g. an in-page tool that streams
+many KB/frame between Zyntax and a canvas).
+
+Both modes expose the same `.run` / `.call_async` / `.version` /
+`.isolated` / `.terminate` surface, so the call site doesn't change
+when you swap them. In Node, `mode` is forced to `"main"`.
+
 ## What COOP and COEP do, briefly
 
 | Header | Value | Effect |
@@ -130,35 +160,53 @@ before they reach the browser.
 ## When you can't set the headers
 
 CDN-hosted widgets that embed into pages you don't control can't
-require COOP/COEP — the embedding page's headers govern. Two
-mitigations:
+require COOP/COEP — the embedding page's headers govern. The
+default `zyntax_wasm` build works fine without isolation (worker
+mode and main mode both run single-threaded), so the only thing
+isolation gates is the future SAB-backed worker pool.
 
-1. **Ship a single-threaded build** and accept that anything which
-   needs `SharedArrayBuffer` will throw. This is the current shape
-   of `zyntax_wasm` — single-threaded works without isolation.
-2. **Service-worker header injection** (a hack some demos use) —
-   register a service worker that intercepts every fetch and adds
-   the COOP/COEP headers on its way to the page. Works but only
-   for the second visit after the worker is registered; first-load
-   misses the headers, and the worker itself has to be served from
-   the same origin. Recommended only for hosting demos / playgrounds.
+If you do want isolation on a host you don't control,
+`crates/zyntax_wasm/web/coi-serviceworker.js` (vendored MIT, from
+the `coi-serviceworker` project) installs a service worker that
+re-writes responses to add the COOP/COEP headers. Drop it next to
+your page and include it inline:
 
-## Future Phase F items not yet shipped
+```html
+<script src="coi-serviceworker.js"></script>
+```
 
-The current Phase F delivery is the minimum-viable browser shape:
-example page + headered serve script + this docs page + an
-`isolated()` runtime check. Still to come:
+Caveats:
 
-- **Worker pool** (`crates/zyntax_wasm/src/worker_pool.rs`) gated
-  on `crossOriginIsolated`, driving parallel poll-fn invocations
-  for `@effect`-annotated functions that suspend across awaits.
-  Requires the threaded-wasm toolchain (`wasm-bindgen-rayon` +
-  nightly Rust today, stable when the threading proposal lands).
-- **Async runtime entry** (`Zyntax.call_async`) returning a JS
-  `Promise` so effect handlers can yield to the browser event loop
-  instead of synchronously polling.
-- **Headless-Chrome CI** that exercises the full algebraic-effects
-  test suite under both isolated and non-isolated configurations
-  to catch fallback regressions.
+- First-load misses the headers — the service worker isn't
+  controlling the page yet. It reloads itself once on first install
+  to engage. Users see a single auto-refresh.
+- The service worker itself has to be served from the same origin
+  as the page; the script can't be CDN-hosted.
+- Works on GitHub Pages, Cloudflare R2 static sites, S3 + CloudFront
+  without origin-side header config — anywhere you can drop a JS
+  file alongside the page.
 
-Each of these is independent and can land in its own phase.
+`examples/web/index.html` ships with this script included so the
+demo works on hosts without server-side header control. When the
+host already sends COOP/COEP, the service worker is a no-op.
+
+## Future items not yet shipped
+
+The current browser delivery is end-to-end functional: single-
+Worker offload, optional COI service worker, vendored worker.js,
+isolated() runtime check, headless-Chrome CI smoke. Still to come:
+
+- **SAB-backed Worker pool** (`crates/zyntax_wasm/src/worker_pool.rs`)
+  driving parallel poll-fn invocations across N Workers via shared
+  `WebAssembly.Memory`. Requires the threaded-wasm toolchain
+  (`wasm-bindgen-rayon` + nightly Rust + custom RUSTFLAGS today,
+  stable when the threading proposal lands). Strict superset of
+  the single-Worker mode; falls back when isolation isn't
+  available.
+- **Cross-Worker effect resume** — when the SAB-backed pool lands,
+  algebraic-effect resume continuations can hop Workers instead of
+  serialising through the main thread.
+
+Each of these is independent and can land in its own phase. Today's
+single-Worker mode covers every test we have and is what the
+headless-Chrome CI exercises.

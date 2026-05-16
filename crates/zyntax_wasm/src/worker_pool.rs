@@ -1,66 +1,86 @@
-//! Worker-pool runtime for browser environments. Gated behind the
-//! `worker_pool` cargo feature (not yet enabled by default).
+//! Worker-mode runtime status. The interesting code lives in
+//! `web/worker.js` and `web/zynml.mjs::createZyntax`; this module
+//! exists to document the threading model and expose compile-time
+//! probes for embedders.
 //!
-//! The shape Phase F asks for: a cross-origin-isolated page can spawn
-//! a pool of Web Workers each running a copy of the wasm module, and
-//! the main thread's `Zyntax.call_async` distributes algebraic-effects
-//! state-machine poll fns across them. Workers communicate with the
-//! main thread through `SharedArrayBuffer` + `Atomics.wait`/`notify`.
+//! ## What "worker mode" means in zyntax_wasm
 //!
-//! ## Why this is a stub today
+//! There are two threading rungs the runtime can sit on in a
+//! browser. The first is shipped and stable; the second is opt-in
+//! and gated on a build-pipeline upgrade.
 //!
-//! Threaded wasm in the rustc/cargo toolchain still requires:
+//! ### Rung 1 — single-Worker offload (default, stable, shipped)
 //!
-//!   - **Nightly Rust** for the `atomics` target feature
-//!     (`-C target-feature=+atomics,+bulk-memory,+mutable-globals`).
-//!   - `wasm-bindgen-rayon` (and its `init_thread_pool` JS shim) or
-//!     an equivalent custom Worker bootstrap.
-//!   - A build pipeline that runs `wasm-pack build --target web` with
-//!     `RUSTFLAGS` and a custom rust-toolchain so the wasm module
-//!     advertises the right capabilities to the browser.
-//!   - The page itself MUST be cross-origin isolated
-//!     (`Cross-Origin-Opener-Policy: same-origin` +
-//!     `Cross-Origin-Embedder-Policy: require-corp`) for the
-//!     browser to instantiate the threaded module — without those
-//!     headers `SharedArrayBuffer` is unavailable and the threaded
-//!     wasm import resolution fails.
+//! `createZyntax({ mode: "worker" })` in `web/zynml.mjs` spawns a
+//! Web Worker hosting `web/worker.js`, which loads its own copy of
+//! the wasm module and runs the BC interpreter off the UI thread.
+//! The page communicates via `postMessage` (`{cmd: "run", id,
+//! source}` → `{cmd: "result", id, output, ok, errorKind}`).
 //!
-//! Until the threading toolchain stabilises on stable Rust, this
-//! crate's default build stays single-threaded. The single-threaded
-//! path covers every test we have today; only Phase F's async-effect
-//! runtime needs the pool.
+//! Properties:
+//!   - stable Rust toolchain, no `RUSTFLAGS` gymnastics;
+//!   - no `SharedArrayBuffer`, no cross-origin isolation required;
+//!   - UI stays responsive while a ZynML program runs to
+//!     completion, even on long compute loops;
+//!   - one Worker, not a pool — the wasm module is single-threaded
+//!     and that's fine for the BC interpreter today.
 //!
-//! ## What the API looks like when enabled
+//! This is the model `wren_lift/wasm/web/worker.js` ships with;
+//! it covers every test we have and is what the headless-Chrome
+//! CI smoke exercises.
 //!
-//! ```ignore
-//! #[cfg(feature = "worker_pool")]
-//! pub async fn init_worker_pool(n_workers: usize) -> Result<(), JsValue> {
-//!     wasm_bindgen_rayon::init_thread_pool(n_workers).await
-//! }
-//! ```
+//! ### Rung 2 — SAB-backed Worker pool (opt-in, future)
 //!
-//! Hosts gate the call on `crossOriginIsolated`:
+//! `mode: "worker", shared: true` (not yet exposed) would ask the
+//! Worker to expose its `WebAssembly.Memory` (backed by
+//! `SharedArrayBuffer`) to the page, and a future
+//! `wasm-bindgen-rayon`-driven scheduler would distribute hot
+//! algebraic-effects poll fns across N Workers. This is the rung
+//! that needs:
 //!
-//! ```js
-//! if (Zyntax.isolated()) {
-//!     await initWorkerPool(navigator.hardwareConcurrency);
-//! }
-//! ```
+//!   - **Nightly Rust** for the `atomics` / `bulk-memory` /
+//!     `mutable-globals` target features. Pinned in a
+//!     `crates/zyntax_wasm/rust-toolchain.toml` when adopted.
+//!   - `RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,
+//!     +mutable-globals"` plus `wasm-pack build --target web
+//!     --release -- -Z build-std=std,panic_abort`.
+//!   - The page MUST be cross-origin isolated (`COOP: same-origin`
+//!     + `COEP: require-corp`). The vendored `coi-serviceworker.js`
+//!     handles this without server-side header control — the
+//!     service worker re-writes responses to add the headers, and
+//!     `Zyntax.isolated()` reports the resulting state.
 //!
-//! See `docs/wasm-deployment.md` for the header recipes and the
-//! Cargo feature naming convention.
+//! When this rung lands, the existing single-Worker path stays —
+//! `shared: true` is a strict superset and falls back if the
+//! environment can't provide isolation.
+//!
+//! ## Compile-time probes
+//!
+//! The `worker_pool` cargo feature is reserved for the rung-2
+//! build (it'll flip on the SAB-backed `wasm-bindgen-rayon` glue
+//! when that lands). Today it's purely a marker — enabling it
+//! `compile_error!`s loudly so accidental flips don't ship a
+//! half-built runtime.
+//!
+//! Embedders can branch on `worker_pool_compiled_in()` at compile
+//! time to decide whether the threaded path is available. The
+//! single-Worker rung is always available in browser contexts
+//! regardless of this flag.
 
 #[cfg(feature = "worker_pool")]
 compile_error!(
-    "worker_pool feature is a structural stub — flip the `compile_error!` \
-     to the real wasm-bindgen-rayon init once the threaded-wasm toolchain \
-     is wired (nightly Rust + RUSTFLAGS in build.sh + jsconfig in \
-     examples/web). Until then this feature is intentionally inert."
+    "worker_pool feature is reserved for the SAB-backed wasm-bindgen-rayon \
+     build. The single-Worker offload path is implemented in JS (see \
+     crates/zyntax_wasm/web/worker.js + createZyntax in zynml.mjs) and is \
+     always available without this feature. Flip the compile_error! to the \
+     real wasm_bindgen_rayon::init_thread_pool call once the threaded-wasm \
+     toolchain is wired up (nightly Rust + RUSTFLAGS in build.sh)."
 );
 
-/// Whether the worker-pool feature has been compiled in. Always
-/// `false` on the default build; the docs/wasm-deployment.md doc
-/// references this so embedder code can branch deterministically.
+/// Whether the SAB-backed worker-pool rung has been compiled in.
+/// Always `false` on the default build. Independent of whether the
+/// JS-side single-Worker mode is in use — that mode requires no
+/// Rust-side feature.
 pub const fn worker_pool_compiled_in() -> bool {
     #[cfg(feature = "worker_pool")]
     {
