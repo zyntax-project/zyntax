@@ -310,6 +310,25 @@ function installJitHost() {
         if (baseName === "stack_restore" && arity === 1) {
             return (mark) => exports._zyntax_call_host_stack_restore(mark);
         }
+        // Cooperative-async host bridges (Phase I+). The wasm
+        // module imports `host.async_set_timeout@2` and friends
+        // when a krio_adapter-emitted SM reaches an `await
+        // __builtin_*` site; the dispatcher here wires each to the
+        // matching JS Promise primitive and reports completion
+        // back via `_zyntax_resolve_future` (Phase G plumbing).
+        if (baseName === "async_set_timeout" && arity === 2) {
+            return (handle, ms) => {
+                // `handle` arrives as a BigInt (wasm i64). The
+                // resolve export also takes i64; pass it through
+                // verbatim so the round-trip is exact. ms arrives
+                // as BigInt; setTimeout wants a Number.
+                setTimeout(
+                    () => zynmlBindings._zyntax_resolve_future(handle, 0n),
+                    Number(ms),
+                );
+            };
+        }
+
         // Host-routed indirect calls. `arity` here is `handle + N args`,
         // so the dispatcher takes `handle + (arity-1)` args. CreateClosure
         // produces the handle as a folded HirId hash; the host's

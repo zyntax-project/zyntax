@@ -460,6 +460,77 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm_by_offset(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Cooperative-async host bridges (Phase I)
+// ─────────────────────────────────────────────────────────────────────
+//
+// `__zyntax_async_set_timeout(handle, ms)` is the simplest host
+// bridge — kicks off an async wait of `ms` milliseconds and calls
+// `host_futures::resolve_future(handle, 0)` when it elapses.
+//
+// On native: spawns a worker thread that sleeps and resolves.
+// `FutureTable` is currently thread-local, so the resolve fires on
+// the worker thread; the host_futures `set_complete_task_callback`
+// invocation (if any) also fires there. For Phase I.0 the native
+// shape exists primarily to register the symbol so the JIT can
+// resolve the name; meaningful native async sleep still uses the
+// existing tokio-backed `ZyntaxPromise` path.
+//
+// On wasm32: declared as a Rust-callable wrapper around the
+// `host.async_set_timeout` wasm import the JS side provides. The
+// JS shim (`web/zynml.mjs::makeHostDispatcher`) wires it to
+// `setTimeout(ms, () => _zyntax_resolve_future(handle, 0))`.
+//
+// Phase I.1 (separate commit) wires the krio_adapter sentinel
+// that emits `register_future(...)` + `__zyntax_async_set_timeout`
+// at `await __builtin_sleep(...)` sites; Phase I.0 is the bridge
+// plumbing only — tests invoke `register_future` + the symbol
+// directly without ZynML-level integration.
+
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
+    // Worker thread does the sleep; resolve_future fires on the
+    // worker thread. FutureTable is thread-local so the resolve
+    // only takes effect if the caller's thread is the one that
+    // also called register_future. For Phase I.0 native tests
+    // we don't actually invoke this — we'd need cross-thread
+    // FutureTable visibility for that to make sense. The
+    // worker-thread path here exists for symmetry with the wasm
+    // side: callers that own a single-thread runtime (most
+    // embedders) can use it as a real async timer; multi-thread
+    // callers should route through the tokio-backed runtime
+    // instead.
+    let ms = ms.max(0) as u64;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        // Best-effort resolve. If the FutureTable doesn't have
+        // the handle (different thread), this returns
+        // UnknownHandle and the SM never wakes up — caller's
+        // responsibility to ensure the resolve thread is the
+        // same as the register thread.
+        crate::host_futures::resolve_future(handle, 0);
+    });
+}
+
+// Wasm32: thin wrapper around the JS-provided host import. The
+// extern block uses wasm-bindgen-style decoration so the wasm
+// module gets a `(import "host" "async_set_timeout@2"
+// (func (param i64 i64)))` entry; the JS instantiation provides
+// the actual setTimeout call.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "host")]
+extern "C" {
+    #[link_name = "async_set_timeout@2"]
+    fn host_async_set_timeout_import(handle: i64, ms: i64);
+}
+
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
+    unsafe { host_async_set_timeout_import(handle, ms) }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Signature constants for register_effect_runtime_symbols
 // ─────────────────────────────────────────────────────────────────────
 
@@ -497,6 +568,25 @@ const fn params3(a: TypeTag, b: TypeTag, c: TypeTag) -> [TypeTag; MAX_PARAMS] {
     p[0] = a;
     p[1] = b;
     p[2] = c;
+    p
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn params6(
+    a: TypeTag,
+    b: TypeTag,
+    c: TypeTag,
+    d: TypeTag,
+    e: TypeTag,
+    f: TypeTag,
+) -> [TypeTag; MAX_PARAMS] {
+    let mut p = empty_params();
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+    p[4] = e;
+    p[5] = f;
     p
 }
 
@@ -608,6 +698,46 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             flags: ZrtlSigFlags::EFFECTFUL,
             return_type: TypeTag::VOID,
             params: params2(ptr_tag(), TypeTag::I64),
+        },
+    );
+
+    // async_set_timeout(handle: i64, ms: i64) -> void
+    // Phase I.0 — native side spawns a worker thread that sleeps
+    // and calls resolve_future. The JIT side emits a call to this
+    // symbol; the krio_adapter sentinel work (Phase I.1) handles
+    // the SM context for the matching register_future call.
+    runtime.register_function_typed(
+        "__zyntax_async_set_timeout",
+        __zyntax_async_set_timeout as *const u8,
+        ZrtlSymbolSig {
+            param_count: 2,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::VOID,
+            params: params2(TypeTag::I64, TypeTag::I64),
+        },
+    );
+
+    // register_future(poll_fn_ptr, sm_ptr, result_offset,
+    //                 next_state, refcount_offset, task_id) -> i64
+    // The krio_adapter sentinel emit (Phase I.1) calls this
+    // immediately before issuing the host bridge call. Returns
+    // the i64 future handle the bridge passes to JS so JS can
+    // call _zyntax_resolve_future when its Promise settles.
+    runtime.register_function_typed(
+        "__zyntax_register_future",
+        crate::host_futures::__zyntax_register_future as *const u8,
+        ZrtlSymbolSig {
+            param_count: 6,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::I64,
+            params: params6(
+                ptr_tag(),
+                ptr_tag(),
+                TypeTag::I64,
+                TypeTag::I64,
+                TypeTag::I64,
+                TypeTag::I64,
+            ),
         },
     );
 }
