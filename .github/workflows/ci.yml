@@ -228,14 +228,9 @@ jobs:
         run: node test/node_smoke.mjs
 
       # Headless-Chrome run exercises the same surface under a real
-      # browser. The wasm-pack test harness drives Chromium through
-      # wasm-bindgen-test; when `tests/wasm/` lands with bindgen-test
-      # cases, this step enforces no regression.
-      - name: Run headless Chrome smoke (when wasm-pack tests land)
+      # browser. `tests/browser_smoke.rs` covers the wasm-bindgen
+      # exports + Phase G/H/I.0 bridge plumbing under a real Chrome
+      # engine via wasm-bindgen-test.
+      - name: Run headless Chrome smoke
         working-directory: crates/zyntax_wasm
-        run: |
-          if [ -d tests/wasm ]; then
-            wasm-pack test --headless --chrome
-          else
-            echo "no tests/wasm/ yet — node_smoke.mjs covered the surface"
-          fi
+        run: wasm-pack test --headless --chrome

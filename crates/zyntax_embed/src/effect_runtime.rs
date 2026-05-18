@@ -512,22 +512,25 @@ pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
     });
 }
 
-// Wasm32: thin wrapper around the JS-provided host import. The
-// extern block uses wasm-bindgen-style decoration so the wasm
-// module gets a `(import "host" "async_set_timeout@2"
-// (func (param i64 i64)))` entry; the JS instantiation provides
-// the actual setTimeout call.
-#[cfg(target_arch = "wasm32")]
-#[link(wasm_import_module = "host")]
-extern "C" {
-    #[link_name = "async_set_timeout@2"]
-    fn host_async_set_timeout_import(handle: i64, ms: i64);
-}
-
+// Wasm32: Rust-side stub. The actual bridge call gets emitted by
+// the WasmBackend as a `host.async_set_timeout@2` import in
+// JIT-compiled SM modules (Phase I.1 krio sentinel work); the
+// Rust-side function exists solely so the symbol can be
+// registered with the InterpRuntime's symbol table for JIT
+// extern-name resolution.
+//
+// Today's wasm path doesn't actually call this function — krio
+// emits the host import directly at await-site rewrites — so
+// this body never runs in production wasm builds. We avoid
+// declaring a wasm extern block here so the host import doesn't
+// leak into the wasm-bindgen-test runner (which tries to
+// `require()` every import module name at test setup time).
 #[cfg(target_arch = "wasm32")]
 #[no_mangle]
-pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
-    unsafe { host_async_set_timeout_import(handle, ms) }
+pub extern "C" fn __zyntax_async_set_timeout(_handle: i64, _ms: i64) {
+    // Intentional no-op. The wasm-target call path goes through
+    // JIT-emitted `(import "host" "async_set_timeout@2" ...)` —
+    // never through this Rust entry point.
 }
 
 // ─────────────────────────────────────────────────────────────────────

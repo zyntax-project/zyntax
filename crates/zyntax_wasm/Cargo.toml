@@ -37,5 +37,13 @@ console_error_panic_hook = "0.1"
 # wasm32-unknown-unknown. Pulled in by the perf-logging code below.
 web-time = "1"
 
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# Browser test harness — drives wasm-bindgen-decorated test fns
+# under headless Chrome / Firefox via `wasm-pack test --headless
+# --chrome`. The CI workflow at `.github/workflows/ci.yml`
+# (`wasm-headless-chrome` job) runs `wasm-pack test --headless
+# --chrome` whenever `tests/wasm/` exists.
+wasm-bindgen-test = "0.3"
+
 [lints]
 workspace = true
