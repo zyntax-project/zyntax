@@ -326,6 +326,14 @@ function installJitHost() {
                     () => zynmlBindings._zyntax_resolve_future(handle, 0n),
                     Number(ms),
                 );
+                // All wasm imports in our pipeline are typed
+                // `(N i64) → i64` for ABI uniformity (see
+                // `wasm_backend.rs::prepare_type_indices`). Void-
+                // returning host bridges still need to push an i64
+                // onto the wasm stack — return 0n so the wasm side
+                // sees a well-typed value and either Drops it or
+                // stores it into an unused local.
+                return 0n;
             };
         }
 
@@ -428,7 +436,30 @@ export async function run(source) {
 const taskResolvers = new Map();
 let nextTaskId = 1;
 
+// BC-interpreter path uses a JS hook (not a wasm import) for the
+// host-bridge call, because zyntax_embed (where the symbol table
+// lives) doesn't depend on wasm-bindgen. The wasm-side wrapper
+// (`__zw_async_set_timeout_via_js` in zyntax_wasm/src/lib.rs)
+// invokes this hook through wasm-bindgen's globalThis lookup.
+//
+// The JIT path imports `host.async_set_timeout@2` directly and
+// hits `makeHostDispatcher` instead; that route doesn't use this
+// hook. Both paths converge on `_zyntax_resolve_future` for the
+// SM advancement.
+function installHostBridgeHooks() {
+    if (globalThis._zyntax_call_host_async_set_timeout) return;
+    globalThis._zyntax_call_host_async_set_timeout = (handle, ms) => {
+        const ms_n = typeof ms === "bigint" ? Number(ms) : ms;
+        setTimeout(() => {
+            if (zynmlBindings) {
+                zynmlBindings._zyntax_resolve_future(handle, 0n);
+            }
+        }, ms_n);
+    };
+}
+
 function installCompleteTaskHook() {
+    installHostBridgeHooks();
     if (globalThis._zyntax_complete_task) return;
     globalThis._zyntax_complete_task = (taskId, value, ok) => {
         // Bigint inputs from wasm-bindgen i64 marshalling.

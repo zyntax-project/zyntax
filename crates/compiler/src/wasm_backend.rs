@@ -661,7 +661,17 @@ impl<'a> FunctionEmitter<'a> {
                     match callee {
                         HirCallable::Symbol(name) => {
                             let arity = args.len() as u32;
-                            let import_name = format!("{}@{}", name, arity);
+                            // Cooperative-async host bridges (Phase I.2+)
+                            // route under module `"host"` so the JS
+                            // dispatcher in `web/zynml.mjs::makeHostDispatcher`
+                            // picks them up. Everything else defaults to
+                            // the `"extern"` module (regular ZRTL plugin
+                            // symbols, math intrinsics, etc).
+                            let import_name = if let Some(host_name) = host_bridge_wasm_name(name) {
+                                format!("{}@{}", host_name, arity)
+                            } else {
+                                format!("{}@{}", name, arity)
+                            };
                             if !self.import_indices.contains_key(&import_name) {
                                 let idx = self.imports.len() as u32;
                                 self.imports.push((import_name.clone(), arity));
@@ -1180,7 +1190,15 @@ impl<'a> FunctionEmitter<'a> {
                     return Ok(());
                 }
                 let import_name = match callee {
-                    HirCallable::Symbol(n) => format!("{}@{}", n, args.len()),
+                    HirCallable::Symbol(n) => {
+                        // Match the host-bridge rewrite in scan_imports
+                        // so the lookup hits the right entry.
+                        if let Some(host_name) = host_bridge_wasm_name(n) {
+                            format!("{}@{}", host_name, args.len())
+                        } else {
+                            format!("{}@{}", n, args.len())
+                        }
+                    }
                     HirCallable::Function(id) => {
                         format!("internal.{}@{}", id.to_hex(), args.len())
                     }
@@ -1743,6 +1761,34 @@ fn lower_type(ty: &HirType) -> Result<ValType> {
         F64 | F32 => ValType::F64,
         other => return Err(WasmEmitError::Unsupported(format!("type {:?}", other))),
     })
+}
+
+/// Rewrite a `HirCallable::Symbol(name)` reference into the
+/// `host.*`-module form used by cooperative-async bridges
+/// (Phase I.2+). Returns `Some(host_form_name)` when `name` matches
+/// the `__zyntax_async_*` naming convention; the caller appends
+/// `@<arity>` and uses the result as the wasm import key.
+///
+/// Mapping:
+///   `__zyntax_async_set_timeout` → `host.async_set_timeout`
+///   `__zyntax_async_fetch`       → `host.async_fetch`
+///
+/// The WasmBackend's import-section emit (around line 434) keys off
+/// the `host.` prefix to put these imports under module `"host"`
+/// (where the JS dispatcher in `web/zynml.mjs::makeHostDispatcher`
+/// expects them) rather than the default `"extern"` module. Native
+/// builds don't go through the WasmBackend, so they keep resolving
+/// `__zyntax_async_*` directly through the runtime symbol table.
+///
+/// Returns `None` for any other symbol so the default `extern`
+/// routing still handles regular ZRTL plugin symbols, math
+/// intrinsics, etc.
+fn host_bridge_wasm_name(symbol_name: &str) -> Option<String> {
+    let rest = symbol_name.strip_prefix("__zyntax_")?;
+    if !rest.starts_with("async_") {
+        return None;
+    }
+    Some(format!("host.{}", rest))
 }
 
 /// Coerce a `HirConstant` case discriminator into an i64 for the
@@ -2463,6 +2509,119 @@ mod tests {
             "expected `(import \"extern\" \"ext_five_arg@5\")` in emitted module — \
              the JS dispatcher relies on the `name@arity` convention to route \
              through `_zyntax_call_extern_5`"
+        );
+    }
+
+    /// Phase I.3 — cooperative-async host bridges. When a function
+    /// calls `HirCallable::Symbol("__zyntax_async_set_timeout")` (the
+    /// shape krio_adapter emits at host-bridge await sites), the
+    /// resulting wasm module must import the symbol under module
+    /// `"host"` with name `"async_set_timeout@N"` — that's where
+    /// `web/zynml.mjs::makeHostDispatcher` registers its setTimeout
+    /// bridge.
+    ///
+    /// Without this rewrite the symbol would default to module
+    /// `"extern"` and the JS side would route through
+    /// `_zyntax_call_extern_N`, which calls into the runtime symbol
+    /// table — where Phase I.0 stubbed `__zyntax_async_set_timeout`
+    /// as a no-op for wasm32. setTimeout would never fire and the SM
+    /// would park forever.
+    #[test]
+    fn host_bridge_symbol_routes_to_host_module() {
+        let handle_id = HirId::new();
+        let ms_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: handle_id,
+                    name: InternedString::new_global("handle"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: ms_id,
+                    name: InternedString::new_global("ms"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("kick_sleep"), sig);
+        func.values.insert(
+            handle_id,
+            HirValue {
+                id: handle_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        func.values.insert(
+            ms_id,
+            HirValue {
+                id: ms_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(1),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+
+        let call_result = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Call {
+            result: Some(call_result),
+            callee: HirCallable::Symbol("__zyntax_async_set_timeout".to_string()),
+            args: vec![handle_id, ms_id],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![call_result],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit host-bridge call");
+        m.validate_full().expect("module structurally valid");
+
+        let parser = wasmparser::Parser::new(0);
+        let mut found_host_import = false;
+        let mut found_extern_import = false;
+        for payload in parser.parse_all(&m.bytes) {
+            if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+                for import in reader {
+                    let import = import.unwrap();
+                    if import.module == "host" && import.name == "async_set_timeout@2" {
+                        found_host_import = true;
+                    }
+                    if import.module == "extern" && import.name == "__zyntax_async_set_timeout@2" {
+                        found_extern_import = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_host_import,
+            "expected `(import \"host\" \"async_set_timeout@2\")` — the cooperative-\
+             async path needs the host module routing so the JS-side dispatcher \
+             (web/zynml.mjs::makeHostDispatcher) bridges setTimeout"
+        );
+        assert!(
+            !found_extern_import,
+            "host-bridge symbol should NOT leak into the extern module — that path \
+             routes through `_zyntax_call_extern_N` which hits the Phase I.0 no-op \
+             wasm32 stub"
         );
     }
 

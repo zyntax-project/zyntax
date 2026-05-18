@@ -1185,6 +1185,49 @@ fn register_static_plugins(rt: &mut InterpRuntime) {
     // Always registered (cheap; just adds one entry to the symbol
     // table) so the smoke test doesn't need a feature flag.
     rt.register_symbol("__zw_test_double", __zw_test_double as *const u8, 1);
+
+    // Phase I.3 — cooperative-async runtime symbols for wasm32.
+    //
+    // On native, `register_effect_runtime_symbols` wires these into
+    // a `ZyntaxRuntime`. The wasm path doesn't go through that
+    // (different runtime shape), so we register the same set here
+    // manually for the BC interpreter to find. The JIT path emits
+    // a `host.async_set_timeout@2` import directly — that route is
+    // independent of this symbol table.
+    //
+    // `__zyntax_register_future` is target-uniform — same C ABI
+    // function on native and wasm32. Always points at the
+    // zyntax_embed implementation.
+    rt.register_symbol(
+        "__zyntax_register_future",
+        zyntax_embed::__zyntax_register_future as *const u8,
+        6,
+    );
+    // `__zyntax_async_set_timeout` is target-divergent. The
+    // zyntax_embed wasm32 impl is a no-op stub (it can't call into
+    // JS without the wasm-bindgen dep, which we keep in this crate
+    // only). Substitute a wasm-bindgen-backed wrapper that routes
+    // to `globalThis._zyntax_call_host_async_set_timeout`, which
+    // `web/zynml.mjs::installCompleteTaskHook` (and worker.js)
+    // wire to `setTimeout(ms, resolve_future(handle, 0))`.
+    #[cfg(target_arch = "wasm32")]
+    {
+        rt.register_symbol(
+            "__zyntax_async_set_timeout",
+            __zw_async_set_timeout_via_js as *const u8,
+            2,
+        );
+    }
+    // Native: the zyntax_embed impl spawns a worker thread; usable
+    // as-is.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rt.register_symbol(
+            "__zyntax_async_set_timeout",
+            zyntax_embed::__zyntax_async_set_timeout as *const u8,
+            2,
+        );
+    }
 }
 
 /// Test-only extern: doubles its argument. Lives outside the
@@ -1193,6 +1236,45 @@ fn register_static_plugins(rt: &mut InterpRuntime) {
 /// `extern "C" fn(i64) -> i64` inside `_zyntax_call_extern_1`.
 extern "C" fn __zw_test_double(x: i64) -> i64 {
     x.wrapping_mul(2)
+}
+
+// ----- Cooperative-async host-bridge JS hooks (Phase I.3) ------
+//
+// The BC interpreter on wasm32 calls these via the symbol table
+// (registered in `register_static_plugins`). The JIT path uses the
+// `host.async_*@N` imports emitted by the WasmBackend directly —
+// no Rust glue needed there.
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    /// JS-provided cooperative-async setTimeout shim:
+    ///
+    /// ```js
+    /// globalThis._zyntax_call_host_async_set_timeout = (handle, ms) => {
+    ///   setTimeout(
+    ///     () => bindings._zyntax_resolve_future(handle, 0n),
+    ///     Number(ms),
+    ///   );
+    /// };
+    /// ```
+    ///
+    /// Called from `__zw_async_set_timeout_via_js` below — the BC
+    /// interp's `Call(Symbol("__zyntax_async_set_timeout"))` lands
+    /// in `_zyntax_call_extern_2`, which transmutes the registered
+    /// function pointer to `extern "C" fn(i64, i64) -> i64` and
+    /// invokes it; that's where we end up calling JS.
+    #[wasm_bindgen(
+        js_namespace = globalThis,
+        js_name = _zyntax_call_host_async_set_timeout
+    )]
+    fn js_host_async_set_timeout(handle: i64, ms: i64);
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_async_set_timeout_via_js(handle: i64, ms: i64) -> i64 {
+    js_host_async_set_timeout(handle, ms);
+    0
 }
 
 // ---------------------------------------------------------------------------

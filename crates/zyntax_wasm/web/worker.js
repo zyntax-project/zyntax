@@ -37,6 +37,21 @@ import * as zyntax_wasm from "../pkg-web/zyntax_wasm.js";
 
 const { default: init, version, run } = zyntax_wasm;
 
+// Install the cooperative-async host bridge hook on the worker's
+// globalThis BEFORE init(). Mirrors `installHostBridgeHooks` in
+// zynml.mjs — the worker has its own globalThis, so the page-side
+// install doesn't reach here. wasm-bindgen looks up
+// `globalThis._zyntax_call_host_async_set_timeout` at instantiate
+// time when the wasm module references the extern; absent of the
+// hook produces "not a function" panics on the first
+// `await __zyntax_async_set_timeout` invocation.
+globalThis._zyntax_call_host_async_set_timeout = (handle, ms) => {
+    const ms_n = typeof ms === "bigint" ? Number(ms) : ms;
+    setTimeout(() => {
+        zyntax_wasm._zyntax_resolve_future(handle, 0n);
+    }, ms_n);
+};
+
 // `init()` runs once at startup. After it resolves, the BC
 // interpreter is ready and we can drain queued messages.
 await init();
