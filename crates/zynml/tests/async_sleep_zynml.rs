@@ -1,49 +1,39 @@
-//! Phase I.4b — verify that the ZynML source pipeline produces the
-//! HIR shape that the krio_adapter Phase I.2 cooperative-await
-//! lowering expects when a user writes `await sleep(100)`.
+//! Phase I.4b/I.4c — end-to-end native execution of cooperative-async
+//! ZynML source.
 //!
-//! Specifically: `Call(Symbol("__zyntax_async_set_timeout"), [100])`
-//! immediately followed by `Call(Intrinsic::Await, [...])` in the
-//! same block. This is what Phase I.2's `find_producing_call` →
-//! `lower_host_bridge_await_site` chain keys off (see
-//! `crates/passes/krio_adapter/tests/stages_i2_host_bridge_await.rs`
-//! for the corresponding krio-side verification on a synthetic
-//! fixture).
+//! Parses + compiles + drives:
 //!
-//! Two upstream pieces are validated by this test together:
+//! ```zynml
+//! async def main(): i64 {
+//!     await sleep(100)
+//!     return 42
+//! }
+//! ```
 //!
-//!   1. **Phase I.4a builtin alias** — `sleep` →
-//!      `__zyntax_async_set_timeout` lives in `CompilationConfig.
-//!      builtins`, gets copied into `LoweringContext.
-//!      extern_link_names`, and gets consulted by SSA's Call
-//!      resolution.
+//! Asserts the Promise resolves with 42 and wall-clock measures
+//! ≥ 90 ms (proves the cooperative parking machinery + native
+//! synchronous bridge fired — if `sleep(100)` collapsed to no-op
+//! the test would finish in ~0 ms).
 //!
-//!   2. **Phase I.4 SSA fix** — the await-of-call resolver at
-//!      `crates/compiler/src/ssa.rs::TypedExpression::Await` (Call
-//!      sub-path) now consults `extern_link_names` after
-//!      `function_symbols`, mirroring the main Call handler. Without
-//!      this fix, `await sleep(100)` falls through to
-//!      `HirCallable::Indirect` (translates the bare `sleep`
-//!      identifier as a value lookup) and Phase I.2's Symbol-callable
-//!      detection never fires.
-//!
-//! What's deliberately NOT tested here: actual JIT execution. The
-//! native Cranelift execution path has unresolved integration issues
-//! around CreateClosure value-map population and Promise-entry
-//! wrapping that need a focused debugging session of their own. The
-//! HIR-shape verification here proves the surface ergonomics work;
-//! execution wiring is the next session's deliverable.
+//! Execution test requires `krio-async-backend` feature so
+//! `apply_krio_async_lowering` runs and Phase I.2's cooperative-await
+//! lowering kicks in. The shape test below has no such requirement
+//! and runs in every config.
 
 use std::sync::Arc;
+#[cfg(feature = "krio-async-backend")]
+use std::time::Instant;
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_compiler::hir::{HirCallable, HirInstruction};
-use zyntax_embed::{compile_to_hir, CompilationConfig, HirModule};
+#[cfg(feature = "krio-async-backend")]
+use zyntax_embed::ZyntaxRuntime;
+use zyntax_embed::{compile_to_hir, CompilationConfig};
 
+#[cfg(feature = "krio-async-backend")]
 #[test]
-fn sleep_alias_lowers_to_symbol_callable_at_await_site() {
+fn await_sleep_runs_to_42_with_wall_clock_yield() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("ZynML grammar should compile");
-    let mut program = grammar
+    let program = grammar
         .parse_with_filename(
             r#"
             async def main(): i64 {
@@ -55,55 +45,75 @@ fn sleep_alias_lowers_to_symbol_callable_at_await_site() {
         )
         .expect("source should parse");
 
+    let mut rt = ZyntaxRuntime::new().expect("runtime");
+    rt.config_mut().builtins.insert(
+        "sleep".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
+    rt.compile_typed_program(program)
+        .expect("typed-program → HIR → krio → install should succeed");
+
+    let promise = rt
+        .call_async("main", &[])
+        .expect("call_async should return a Promise");
+    let start = Instant::now();
+    let result = promise.await_raw().expect("Promise should resolve cleanly");
+    let elapsed = start.elapsed();
+
+    assert_eq!(result.as_i64(), Some(42), "got {:?}", result);
+    assert!(
+        elapsed.as_millis() >= 90,
+        "expected ≥ 90ms (cooperative parking + native sleep bridge); got {:?}",
+        elapsed
+    );
+}
+
+// Compile-only verification (no feature gate) — proves the SSA
+// builtin-alias rewrite produces a Symbol callable even without
+// the krio-async-backend feature. The execution counterpart above
+// only runs with the feature.
+#[test]
+fn sleep_alias_lowers_to_symbol_callable() {
+    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("ZynML grammar should compile");
+    let mut program = grammar
+        .parse_with_filename(
+            r#"
+            async def main(): i64 {
+                await sleep(100)
+                return 42
+            }
+            "#,
+            "<async_sleep_zynml_shape>",
+        )
+        .expect("source should parse");
+
     let mut config = CompilationConfig::default();
     config.builtins.insert(
         "sleep".to_string(),
         "__zyntax_async_set_timeout".to_string(),
     );
-
     let type_registry = Arc::new(program.type_registry.clone());
-    let hir_module: HirModule =
+    let hir_module =
         compile_to_hir(&mut program, type_registry, config).expect("HIR lowering should succeed");
 
-    // The OLD async-transform path (default when `use_krio_async`
-    // is off in CompilationConfig) splits `async def main` into
-    // multiple functions: an entry that allocates a Promise + a
-    // poll fn that contains the body's HIR. The Symbol callable
-    // appears in one of those functions (we walk them all rather
-    // than assume which one). When the `krio-async-backend` feature
-    // is active, the OLD transform is skipped and a separate krio
-    // pipeline runs which preserves the Symbol-+-Await adjacency
-    // that Phase I.2 keys off — that adjacency is verified directly
-    // in `crates/passes/krio_adapter/tests/stages_i2_host_bridge_await.rs`.
-    // Here we only assert the upstream SSA piece: the alias rewrote
-    // `sleep` to the Symbol callable.
-    let mut found_symbol_call = false;
+    let mut found = false;
     for func in hir_module.functions.values() {
         for block in func.blocks.values() {
             for inst in &block.instructions {
-                if let HirInstruction::Call {
-                    callee: HirCallable::Symbol(name),
+                if let zyntax_compiler::hir::HirInstruction::Call {
+                    callee: zyntax_compiler::hir::HirCallable::Symbol(name),
                     ..
                 } = inst
                 {
                     if name == "__zyntax_async_set_timeout" {
-                        found_symbol_call = true;
+                        found = true;
                     }
                 }
             }
         }
     }
-
     assert!(
-        found_symbol_call,
-        "expected `Call(Symbol(\"__zyntax_async_set_timeout\"))` somewhere in the \
-         compiled module (Phase I.4a builtin alias + Phase I.4 SSA fix should \
-         rewrite `Call(Variable(\"sleep\"), ...)` to a Symbol callable). \
-         Module functions: {:?}",
-        hir_module
-            .functions
-            .values()
-            .filter_map(|f| f.name.resolve_global())
-            .collect::<Vec<_>>()
+        found,
+        "expected `Call(Symbol(\"__zyntax_async_set_timeout\"))` somewhere in the module"
     );
 }

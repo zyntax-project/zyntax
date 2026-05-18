@@ -1110,6 +1110,21 @@ fn apply_krio_async_lowering(_module: &mut zyntax_compiler::HirModule) -> Runtim
             // This rewrite is a no-op for any function that doesn't
             // contain Phase I.2-emitted CreateClosures, so it's safe
             // to run unconditionally.
+            //
+            // Same pass also fixes `Call(Symbol("__zyntax_register_future"))`
+            // args[1] — the SM frame ptr. Phase I.2 captured the
+            // orchestrator's `frame_ptr` AS IT WAS at emit time. For
+            // fns with no params (e.g. async `main`), that's a dummy
+            // `HirId::new()`; for fns with params it's the signature
+            // param id. Neither matches the post-reshape sm_ptr
+            // (which `reshape_to_poll_abi` mints fresh as
+            // Parameter(0)). Cranelift's value_map only has the new
+            // sm_ptr — so we point the Call there explicitly.
+            let post_reshape_sm_ptr_id = function
+                .values
+                .iter()
+                .find(|(_, v)| matches!(v.kind, zyntax_compiler::hir::HirValueKind::Parameter(0)))
+                .map(|(id, _)| *id);
             for block in function.blocks.values_mut() {
                 for inst in &mut block.instructions {
                     if let zyntax_compiler::hir::HirInstruction::CreateClosure {
@@ -1119,6 +1134,18 @@ fn apply_krio_async_lowering(_module: &mut zyntax_compiler::HirModule) -> Runtim
                     {
                         if *target == original_id {
                             *target = new_poll_id;
+                        }
+                    }
+                    if let zyntax_compiler::hir::HirInstruction::Call {
+                        callee: zyntax_compiler::hir::HirCallable::Symbol(name),
+                        args,
+                        ..
+                    } = inst
+                    {
+                        if name == "__zyntax_register_future" && args.len() >= 2 {
+                            if let Some(sm_ptr) = post_reshape_sm_ptr_id {
+                                args[1] = sm_ptr;
+                            }
                         }
                     }
                 }
