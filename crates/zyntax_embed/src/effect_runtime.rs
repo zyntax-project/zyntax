@@ -489,27 +489,26 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm_by_offset(
 #[cfg(not(target_arch = "wasm32"))]
 #[no_mangle]
 pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
-    // Worker thread does the sleep; resolve_future fires on the
-    // worker thread. FutureTable is thread-local so the resolve
-    // only takes effect if the caller's thread is the one that
-    // also called register_future. For Phase I.0 native tests
-    // we don't actually invoke this — we'd need cross-thread
-    // FutureTable visibility for that to make sense. The
-    // worker-thread path here exists for symmetry with the wasm
-    // side: callers that own a single-thread runtime (most
-    // embedders) can use it as a real async timer; multi-thread
-    // callers should route through the tokio-backed runtime
-    // instead.
-    let ms = ms.max(0) as u64;
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(ms));
-        // Best-effort resolve. If the FutureTable doesn't have
-        // the handle (different thread), this returns
-        // UnknownHandle and the SM never wakes up — caller's
-        // responsibility to ensure the resolve thread is the
-        // same as the register thread.
-        crate::host_futures::resolve_future(handle, 0);
-    });
+    // Native path: synchronous sleep + inline resolve on the same
+    // thread that registered the future. This is the simplest
+    // shape that round-trips through the FutureTable correctly
+    // (which is thread-local) and is sufficient for native
+    // semantics — "async sleep" on a multi-threaded host just
+    // means the calling thread blocks for `ms` ms, like any
+    // blocking I/O. The cooperative-yield-to-event-loop concept
+    // is wasm-specific (single-threaded event loop); native
+    // callers that want true async cooperation should drive their
+    // SMs via the existing tokio-backed ZyntaxPromise plumbing.
+    //
+    // The cooperative-parking machinery still runs (the SM polls
+    // call `__zyntax_register_future` before this function, this
+    // function calls `resolve_future` which advances the SM by
+    // one poll). The only thing native skips is "yield control
+    // back to a JS event loop while waiting" — there's no event
+    // loop to yield to.
+    let ms_u64 = ms.max(0) as u64;
+    std::thread::sleep(std::time::Duration::from_millis(ms_u64));
+    crate::host_futures::resolve_future(handle, 0);
 }
 
 // Wasm32: Rust-side stub. The actual bridge call gets emitted by

@@ -4736,10 +4736,23 @@ impl SsaBuilder {
                     let callee = &call.callee;
                     let args = &call.positional_args;
 
-                    // Resolve the callable
+                    // Resolve the callable. Mirrors the resolution order
+                    // used by the main `TypedExpression::Call` handler
+                    // earlier in this file — function_symbols first,
+                    // then extern_link_names (the alias mechanism the
+                    // builtins map flows through). Without the
+                    // extern_link_names step, calls like
+                    // `await sleep(100)` where `sleep` is aliased to
+                    // `__zyntax_async_set_timeout` via
+                    // `config.builtins` fall through to `Indirect`
+                    // (translating the bare `sleep` identifier as a
+                    // value lookup), and the krio_adapter Phase I.2
+                    // cooperative-await detection — which keys off
+                    // `HirCallable::Symbol("__zyntax_async_*")` — never
+                    // fires.
                     let (hir_callable, _) =
                         if let TypedExpression::Variable(func_name) = &callee.node {
-                            let name_str = func_name.resolve_global().unwrap_or_else(|| {
+                            let _name_str = func_name.resolve_global().unwrap_or_else(|| {
                                 let arena = self.arena.lock().unwrap();
                                 arena
                                     .resolve_string(*func_name)
@@ -4749,6 +4762,8 @@ impl SsaBuilder {
 
                             if let Some(&func_id) = self.function_symbols.get(func_name) {
                                 (crate::hir::HirCallable::Function(func_id), None)
+                            } else if let Some(link_name) = self.extern_link_names.get(func_name) {
+                                (crate::hir::HirCallable::Symbol(link_name.clone()), None)
                             } else {
                                 let callee_val = self.translate_expression(block_id, callee)?;
                                 (

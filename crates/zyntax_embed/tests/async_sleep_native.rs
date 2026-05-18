@@ -104,26 +104,19 @@ fn async_set_timeout_resolves_after_at_least_ms() {
 
 #[test]
 fn async_set_timeout_symbol_is_callable_natively() {
-    // Smoke test the native impl invocation path itself. The
-    // worker-thread resolve won't reach our thread-local
-    // FutureTable, so this can't validate the round-trip yet —
-    // it just confirms the symbol is callable, doesn't panic,
-    // and the worker thread does run.
-    //
-    // Important assertion: the call returns immediately (the
-    // sleep is on the worker thread). If it blocked the current
-    // thread for 50ms we'd see it in the wall-clock here.
+    // Phase I.4a changed the native impl from "spawn worker thread"
+    // to "synchronous sleep + inline resolve_future" so the
+    // FutureTable's thread-local nature works cleanly. The function
+    // now blocks the calling thread for `ms` ms — like any blocking
+    // I/O — and resolves any registered future for the given
+    // handle inline before returning. With an unknown handle (as in
+    // this smoke test), resolve_future is a no-op.
     let start = Instant::now();
     __zyntax_async_set_timeout(123456, 50);
     let elapsed = start.elapsed();
     assert!(
-        elapsed.as_millis() < 30,
-        "__zyntax_async_set_timeout should return immediately; took {:?}",
+        elapsed.as_millis() >= 45,
+        "__zyntax_async_set_timeout should block for the requested duration; took {:?}",
         elapsed
     );
-
-    // Give the worker thread time to fire so it doesn't outlive
-    // the test process — its resolve will hit an empty table and
-    // do nothing, but we want it to complete cleanly.
-    std::thread::sleep(Duration::from_millis(80));
 }

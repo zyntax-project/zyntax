@@ -1421,6 +1421,22 @@ fn run_impl(source: &str) -> RunResult {
         "__zw_test_double".to_string(),
         "__zw_test_double".to_string(),
     );
+    // Phase I.4a cooperative-async builtins. `sleep` is the user-
+    // facing alias (`await sleep(100)` in ZynML source); it rewrites
+    // at SSA Call lowering to a `HirCallable::Symbol(
+    // "__zyntax_async_set_timeout")` callee, which the Phase I.2
+    // krio_adapter cooperative-await lowering recognises (Symbol
+    // names starting with `__zyntax_async_`). The self-alias entry
+    // for the target name keeps direct invocations working too,
+    // for tests / internal callers that prefer the explicit form.
+    config.builtins.insert(
+        "sleep".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
+    config.builtins.insert(
+        "__zyntax_async_set_timeout".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
     let hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config) {
         Ok(m) => m,
         Err(e) => return compile_err(format!("HIR lowering failed: {e}")),

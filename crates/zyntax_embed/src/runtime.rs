@@ -1093,7 +1093,36 @@ fn apply_krio_async_lowering(_module: &mut zyntax_compiler::HirModule) -> Runtim
             // `await double(x)` ends up calling `double$poll(x)`
             // directly, which has the wrong signature → SEGV.
             let new_poll_id = HirId::new();
+            let original_id = function.id;
             function.id = new_poll_id;
+
+            // Phase I.4 — the krio Phase I.2 cooperative-await
+            // lowering inside `lower_async_function` (above) emits
+            // `CreateClosure { function: function.id, .. }` capturing
+            // `function.id` AS IT WAS AT EMIT TIME (= original_id).
+            // After the swap, that field now refers to the entry
+            // function instead of the poll function. Rewrite any
+            // CreateClosure references from original_id to new_poll_id
+            // so the closure produces a pointer to the (just-renamed)
+            // poll function — what `register_future` /
+            // `resolve_future` need to advance the SM correctly.
+            //
+            // This rewrite is a no-op for any function that doesn't
+            // contain Phase I.2-emitted CreateClosures, so it's safe
+            // to run unconditionally.
+            for block in function.blocks.values_mut() {
+                for inst in &mut block.instructions {
+                    if let zyntax_compiler::hir::HirInstruction::CreateClosure {
+                        function: target,
+                        ..
+                    } = inst
+                    {
+                        if *target == original_id {
+                            *target = new_poll_id;
+                        }
+                    }
+                }
+            }
 
             // Phase 3: generate the Promise-returning entry. Uses the
             // ORIGINAL signature (snapshot above) so the runtime's
@@ -2851,8 +2880,20 @@ impl ZyntaxRuntime {
             &mut self.runtime_events,
             self.event_sink.as_ref(),
         );
-        // Lower to HIR (no builtins available when compiling directly)
-        let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        // Lower to HIR, threading `config.builtins` (extern aliases) so
+        // cooperative-async builtins like `sleep` →
+        // `__zyntax_async_set_timeout` (and any caller-injected
+        // aliases) resolve at SSA Call lowering. Prior to this we
+        // passed an empty map here, which silently dropped the
+        // runtime's config — so `rt.config_mut().builtins.insert(...)`
+        // had no effect on `compile_typed_program`'s output.
+        let builtins: indexmap::IndexMap<String, String> = self
+            .config
+            .builtins
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut hir_module = self.lower_typed_program(program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
 

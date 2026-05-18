@@ -491,7 +491,7 @@ pub fn lower_await_calls(
         // FutureTable side; `crates/zyntax_wasm/web/zynml.mjs` for
         // the JS bridge shims that resolve handles.
         let producing = find_producing_call(&function.blocks, &yield_hir, promise_ptr, await_idx);
-        if let Some((producing_idx, symbol_name)) = producing {
+        if let Some((producing_idx, symbol_name)) = &producing {
             if symbol_name.starts_with("__zyntax_async_") {
                 let result_slot = next_slot;
                 next_slot += 1;
@@ -503,10 +503,10 @@ pub fn lower_await_calls(
                     state_slot,
                     result_slot,
                     result_id,
-                    result_ty,
+                    result_ty.clone(),
                     next_state,
                     await_idx,
-                    producing_idx,
+                    *producing_idx,
                 );
                 continue;
             }
