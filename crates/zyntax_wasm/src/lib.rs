@@ -811,6 +811,46 @@ pub fn _zyntax_call_host_indirect_4(_handle: i64, _a0: i64, _a1: i64, _a2: i64, 
     0
 }
 
+// -- Cooperative-async exports (Phase G) ------------------------
+//
+// Thin wasm-bindgen wrappers around `zyntax_embed::host_futures`.
+// JS-side host bridges (`_wlift_set_timeout`-style shims in
+// `web/zynml.mjs`) call these when their Promise settles to
+// advance the parked state machine by one poll.
+//
+// `_zyntax_resolve_future(handle, value)` writes `value` into the
+// parked SM's result slot, advances its state, and polls once.
+// Returns an i32 outcome code: 0 = re-parked (SM yielded again),
+// 1 = ready (SM reached terminal Return), 2 = unknown handle.
+//
+// `_zyntax_reject_future(handle, msg)` is the failure path —
+// currently resolves with -1 as a sentinel; richer error
+// propagation (typed Result return) is the follow-up.
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_resolve_future(handle: i64, value: i64) -> i32 {
+    zyntax_embed::host_futures::resolve_future(handle, value).as_i32()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn _zyntax_reject_future(handle: i64, msg: &str) -> i32 {
+    zyntax_embed::host_futures::reject_future(handle, msg).as_i32()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_resolve_future(handle: i64, value: i64) -> i32 {
+    zyntax_embed::host_futures::resolve_future(handle, value).as_i32()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub fn _zyntax_reject_future(handle: i64, msg: &str) -> i32 {
+    zyntax_embed::host_futures::reject_future(handle, msg).as_i32()
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn _zyntax_call_internal_0(hex_id: &str) -> i64 {

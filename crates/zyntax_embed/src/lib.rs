@@ -61,6 +61,13 @@ mod effect_runtime;
 mod error;
 mod grammar;
 mod grammar2;
+/// Cooperative-async future table. Browser-runtime parking layer
+/// that breaks the spin-poll in `__zyntax_effect_resume` for SMs
+/// that wait on host async ops (setTimeout / fetch / WebSocket).
+/// Used by the Phase H+ scheduler in `crates/zyntax_wasm`; native
+/// targets get the same surface so the per-bridge stdlib code
+/// stays target-uniform.
+pub mod host_futures;
 #[cfg(feature = "native")]
 mod import_chain;
 /// BC-interpreter-backed execution engine. On native it's internal
@@ -91,6 +98,10 @@ pub use effect_runtime::{
     __zyntax_effect_push_handler, __zyntax_effect_resume, __zyntax_runtime_release_sm,
     __zyntax_runtime_release_sm_by_offset, __zyntax_runtime_retain_sm,
 };
+// Cooperative-async externs. Phase G plumbing — the browser shim
+// in zyntax_wasm exports thin wrappers around these so JS-side
+// host bridges can park / resolve / reject SMs.
+pub use host_futures::{__zyntax_register_future, __zyntax_reject_future, __zyntax_resolve_future};
 
 pub use array::ZyntaxArray;
 // Re-export the BC interpreter so embedders that want a bare
