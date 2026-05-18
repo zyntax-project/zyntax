@@ -475,6 +475,43 @@ pub fn lower_await_calls(
             v.ty = result_ty.clone();
         }
 
+        // Phase I.2 — cooperative-async host-bridge detection.
+        //
+        // If the Call that produced `promise_ptr` is to a runtime
+        // Symbol whose name starts with `__zyntax_async_` (sleep,
+        // fetch, ws_open, …), the awaited value isn't a real
+        // Promise<T> we should poll. Instead the JS-side bridge
+        // shim will eventually call `_zyntax_resolve_future` to
+        // advance the SM directly. Emit a parking sequence — register
+        // a future-handle with the current SM context, pass the
+        // handle to the bridge call, save state, return Pending —
+        // and skip the Promise-polling state machine entirely.
+        //
+        // See `crates/zyntax_embed/src/host_futures.rs` for the
+        // FutureTable side; `crates/zyntax_wasm/web/zynml.mjs` for
+        // the JS bridge shims that resolve handles.
+        let producing = find_producing_call(&function.blocks, &yield_hir, promise_ptr, await_idx);
+        if let Some((producing_idx, symbol_name)) = producing {
+            if symbol_name.starts_with("__zyntax_async_") {
+                let result_slot = next_slot;
+                next_slot += 1;
+                lower_host_bridge_await_site(
+                    function,
+                    yield_hir,
+                    resume_hir,
+                    frame,
+                    state_slot,
+                    result_slot,
+                    result_id,
+                    result_ty,
+                    next_state,
+                    await_idx,
+                    producing_idx,
+                );
+                continue;
+            }
+        }
+
         // Allocate two slots for this await.
         let promise_slot = next_slot;
         next_slot += 1;
@@ -774,6 +811,228 @@ pub fn lower_await_calls(
     }
 
     next_slot
+}
+
+/// Scan `yield_block.instructions[..await_idx]` (reversed) for the
+/// `Call` instruction whose `result == promise_ptr`. Returns the
+/// instruction index and, if the callee is `HirCallable::Symbol`, the
+/// symbol name. Returns `None` if the producing instruction isn't a
+/// Call (e.g. `promise_ptr` is loaded from a slot, or comes from a
+/// parameter — paths that don't go through a fresh extern call site).
+fn find_producing_call(
+    blocks: &indexmap::IndexMap<HirId, HirBlock>,
+    yield_hir: &HirId,
+    promise_ptr: HirId,
+    await_idx: usize,
+) -> Option<(usize, String)> {
+    let block = blocks.get(yield_hir)?;
+    for i in (0..await_idx).rev() {
+        if let HirInstruction::Call {
+            callee,
+            result: Some(r),
+            ..
+        } = &block.instructions[i]
+        {
+            if *r == promise_ptr {
+                if let HirCallable::Symbol(name) = callee {
+                    return Some((i, name.clone()));
+                }
+                // Producing call exists but isn't a Symbol callable
+                // (e.g. a Function or Indirect call) — return the
+                // index with an empty name so the host-bridge check
+                // falls through to the existing Promise lowering.
+                return Some((i, String::new()));
+            }
+        }
+    }
+    None
+}
+
+/// Cooperative-async lowering for an await site whose awaited value
+/// comes from a `Call(Symbol("__zyntax_async_*"))` — sleep, fetch,
+/// ws_open, etc. Replaces the Promise-polling state machine with a
+/// parking sequence:
+///
+///   yield_block (rewritten):
+///     [original pre-call instructions unchanged]
+///     poll_fn_closure = CreateClosure(this_fn_id)
+///     handle = __zyntax_register_future(
+///         poll_fn_closure, frame,
+///         result_slot * 8, next_state, 0 /*refcount*/, 0 /*task_id*/)
+///     [bridge Call with `handle` prepended to args; result dropped]
+///     [original instructions between producing Call and the Await]
+///     AsyncSaveSlot state_slot ← next_state
+///     return 0   (Pending — JS resolve_future will advance the SM)
+///
+///   resume_block (existing block, prepended):
+///     result_id = AsyncLoadSlot(result_slot)
+///     [rest of resume body unchanged]
+///
+/// The `__zyntax_register_future` symbol is registered by
+/// `zyntax_embed::register_effect_runtime_symbols`. The bridge
+/// `__zyntax_async_*` symbols themselves are extern calls that the
+/// runtime resolves either as native function pointers (host
+/// thread-spawning impl) or as wasm imports (`host.async_*@N` —
+/// the WasmBackend emits the import when it sees the Symbol
+/// callable; the JS-side dispatcher in `web/zynml.mjs` wires each
+/// to its real JS Promise primitive).
+#[allow(clippy::too_many_arguments)]
+fn lower_host_bridge_await_site(
+    function: &mut HirFunction,
+    yield_hir: HirId,
+    resume_hir: HirId,
+    frame: HirId,
+    state_slot: u32,
+    result_slot: u32,
+    result_id: HirId,
+    result_ty: HirType,
+    next_state: u32,
+    await_idx: usize,
+    producing_idx: usize,
+) {
+    // Mint all constants + SSA values up front so we don't have to
+    // re-borrow function.values while iterating instructions.
+    let result_offset_const = mint_const_i64(&mut function.values, (result_slot as i64) * 8);
+    let next_state_const = mint_const_i64(&mut function.values, next_state as i64);
+    // `refcount_offset` is unused by host_futures::resolve_future
+    // today (async-out-of-line + Resume<T> retain/release isn't
+    // wired for bridges yet). Pass 0; revisit when sleep + retain
+    // need to coexist.
+    let refcount_offset_const = mint_const_i64(&mut function.values, 0);
+    // `task_id` ties the parked future to a top-level JS Promise
+    // resolver in the multi-task scheduler. Phase H ships
+    // single-task scheduling; pass 0 here, multi-task scheduling
+    // will thread the real ID through from the entry point.
+    let task_id_const = mint_const_i64(&mut function.values, 0);
+
+    let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
+        params: vec![HirType::Ptr(Box::new(HirType::U8))],
+        returns: vec![HirType::I64],
+        lifetime_params: vec![],
+        is_variadic: false,
+    }));
+    let poll_fn_closure_id = mint_value(
+        &mut function.values,
+        poll_fn_ty.clone(),
+        HirValueKind::Instruction,
+    );
+    let handle_id = mint_value(
+        &mut function.values,
+        HirType::I64,
+        HirValueKind::Instruction,
+    );
+    let pending_zero = mint_const_i64(&mut function.values, 0);
+
+    // Snapshot what we need from yield_block before borrowing mutably.
+    let function_id = function.id;
+    let (pre_producing, producing_call, between, _kept_post) = {
+        let yield_block = function.blocks.get(&yield_hir).expect("yield block exists");
+        let pre = yield_block.instructions[..producing_idx].to_vec();
+        let producing = yield_block.instructions[producing_idx].clone();
+        let between = yield_block.instructions[producing_idx + 1..await_idx].to_vec();
+        let post = yield_block
+            .instructions
+            .iter()
+            .skip(await_idx + 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        (pre, producing, between, post)
+    };
+
+    // Rewrite the bridge Call: prepend `handle` to args, drop the
+    // result binding (the bridge returns void; the Promise<T>
+    // pointer the SSA expected isn't real for host bridges).
+    let rewritten_bridge = if let HirInstruction::Call {
+        callee,
+        args,
+        type_args,
+        const_args,
+        ..
+    } = producing_call
+    {
+        let mut new_args = vec![handle_id];
+        new_args.extend(args);
+        HirInstruction::Call {
+            result: None,
+            callee,
+            args: new_args,
+            type_args,
+            const_args,
+            is_tail: false,
+        }
+    } else {
+        // find_producing_call only returns Some for Call instructions,
+        // so this is unreachable. Defensive — fall back to a no-op so
+        // a bug elsewhere doesn't crash the compile.
+        log::warn!(
+            "[krio-adapter] cooperative-await: producing instruction at \
+             yield_block[{}] wasn't a Call — skipping host-bridge rewrite",
+            producing_idx
+        );
+        return;
+    };
+
+    // Assemble new yield_block contents.
+    let mut new_insts: Vec<HirInstruction> = pre_producing;
+    new_insts.push(HirInstruction::CreateClosure {
+        result: poll_fn_closure_id,
+        closure_ty: poll_fn_ty,
+        function: function_id,
+        captures: vec![],
+    });
+    new_insts.push(HirInstruction::Call {
+        result: Some(handle_id),
+        callee: HirCallable::Symbol("__zyntax_register_future".to_string()),
+        args: vec![
+            poll_fn_closure_id,
+            frame,
+            result_offset_const,
+            next_state_const,
+            refcount_offset_const,
+            task_id_const,
+        ],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    new_insts.push(rewritten_bridge);
+    // Preserve any instructions between the producing Call and the
+    // Intrinsic::Await (captures-lift saves emitted by emit_save_load,
+    // for instance).
+    new_insts.extend(between);
+    new_insts.push(HirInstruction::AsyncSaveSlot {
+        frame,
+        slot: state_slot,
+        value: next_state_const,
+    });
+
+    // Commit yield_block: new instructions + Return Pending terminator.
+    let yield_block = function
+        .blocks
+        .get_mut(&yield_hir)
+        .expect("yield block exists");
+    yield_block.instructions = new_insts;
+    yield_block.terminator = HirTerminator::Return {
+        values: vec![pending_zero],
+    };
+
+    // Prepend AsyncLoadSlot to the resume block so result_id is
+    // defined when the SM dispatcher routes here on the next poll
+    // (after JS-side `_zyntax_resolve_future` has set state to
+    // next_state and written the result value).
+    let load_result_inst = HirInstruction::AsyncLoadSlot {
+        result: result_id,
+        ty: result_ty,
+        frame,
+        slot: result_slot,
+    };
+    let resume_block = function
+        .blocks
+        .get_mut(&resume_hir)
+        .expect("resume block exists");
+    let mut new_resume_insts = vec![load_result_inst];
+    new_resume_insts.extend(resume_block.instructions.drain(..));
+    resume_block.instructions = new_resume_insts;
 }
 
 /// Replace each `PerformEffect` site in a yield block with the

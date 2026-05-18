@@ -296,6 +296,130 @@ pub fn module_of(function: HirFunction) -> HirModule {
     module
 }
 
+/// Build an async function whose await target is an extern Symbol
+/// call matching the cooperative-async host-bridge naming convention
+/// (`__zyntax_async_*`). Mirrors `make_async_function_with_one_await`
+/// but swaps the inner `Call(Function(foo))` for
+/// `Call(Symbol(symbol_name))` so the Phase I.2 cooperative parking
+/// lowering in `lower_await_calls` fires.
+///
+/// ```pseudo
+/// async fn aw(input: i32) -> i32 {
+///     let x = input + 1
+///     let r = await __zyntax_async_set_timeout(input)
+///     return x + r
+/// }
+/// ```
+pub fn make_async_function_with_host_bridge_await(symbol_name: &str) -> AsyncFnFixture {
+    let mut sig = HirFunctionSignature {
+        params: vec![],
+        returns: vec![HirType::I32],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: true,
+        effects: vec![],
+        is_pure: false,
+    };
+    sig.is_async = true;
+
+    let mut function = HirFunction::new(InternedString::new_global("aw_host"), sig);
+    function.is_external = false;
+
+    let input = HirId::new();
+    let const_one = HirId::new();
+    let live_across = HirId::new();
+    let bridge_result = HirId::new();
+    let await_result = HirId::new();
+    let return_val = HirId::new();
+
+    for (id, ty) in [
+        (input, HirType::I32),
+        (const_one, HirType::I32),
+        (live_across, HirType::I32),
+        (bridge_result, HirType::I32),
+        (await_result, HirType::I32),
+        (return_val, HirType::I32),
+    ] {
+        let kind = if id == const_one {
+            HirValueKind::Constant(zyntax_compiler::hir::HirConstant::I32(1))
+        } else {
+            HirValueKind::Instruction
+        };
+        function.values.insert(
+            id,
+            HirValue {
+                id,
+                ty,
+                kind,
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+    }
+
+    let entry_id = HirId::new();
+    let mut entry = HirBlock {
+        id: entry_id,
+        label: Some(InternedString::new_global("entry")),
+        phis: vec![],
+        instructions: vec![],
+        terminator: HirTerminator::Return {
+            values: vec![return_val],
+        },
+        dominance_frontier: HashSet::new(),
+        predecessors: vec![],
+        successors: vec![],
+    };
+    // x = input + 1
+    entry.instructions.push(HirInstruction::Binary {
+        op: zyntax_compiler::hir::BinaryOp::Add,
+        result: live_across,
+        ty: HirType::I32,
+        left: input,
+        right: const_one,
+    });
+    // bridge_result = __zyntax_async_set_timeout(input)
+    // (Symbol callable — the cooperative-await lowering kicks in iff
+    // this is what the SSA produces, i.e. an extern call to a
+    // `__zyntax_async_*` name.)
+    entry.instructions.push(HirInstruction::Call {
+        result: Some(bridge_result),
+        callee: HirCallable::Symbol(symbol_name.to_string()),
+        args: vec![input],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    entry.instructions.push(HirInstruction::Call {
+        result: Some(await_result),
+        callee: HirCallable::Intrinsic(Intrinsic::Await),
+        args: vec![bridge_result],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    entry.instructions.push(HirInstruction::Binary {
+        op: zyntax_compiler::hir::BinaryOp::Add,
+        result: return_val,
+        ty: HirType::I32,
+        left: live_across,
+        right: await_result,
+    });
+
+    let mut blocks = IndexMap::new();
+    blocks.insert(entry_id, entry);
+    function.blocks = blocks;
+    function.entry_block = entry_id;
+
+    AsyncFnFixture {
+        function,
+        live_across,
+        await_result,
+    }
+}
+
 /// `live_out` map containing just `live_across` for the function's
 /// entry block. Mirrors what zyntax's existing per-block liveness
 /// analysis would produce for the canonical fixture.
