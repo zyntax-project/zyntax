@@ -10,7 +10,7 @@
 //! reruns under a real browser to verify wasm-bindgen's binding
 //! generation hasn't drifted from the Rust signatures.
 
-use zyntax_wasm::{run, version, ErrorKind};
+use zyntax_wasm::{_zyntax_run_async, run, version, ErrorKind};
 
 #[test]
 fn version_is_self_describing() {
@@ -43,4 +43,28 @@ fn parse_error_classifies_as_compile_error() {
     let result = run("def main(): i64 { return 7");
     assert!(!result.ok());
     assert!(matches!(result.error_kind(), ErrorKind::CompileError));
+}
+
+// ----- Phase H: cooperative-async entry --------------------------
+
+#[test]
+fn run_async_sync_program_returns_same_runresult_as_run() {
+    // For sync programs `_zyntax_run_async` is exactly `run` plus
+    // the `js_complete_task` callback (no-op on native). The
+    // returned RunResult shape stays identical so the JS Promise
+    // wrapper has something to inspect even before the callback
+    // fires.
+    let r = _zyntax_run_async("def main(): i64 { return 42 }", 1);
+    assert!(r.ok(), "output={}", r.output());
+    assert_eq!(r.output(), "42");
+    assert!(matches!(r.error_kind(), ErrorKind::None));
+}
+
+#[test]
+fn run_async_compile_error_bubbles_through_runresult() {
+    // Failure path: no callback firing; the Promise wrapper sees
+    // `ok=false` on the returned RunResult and resolves with that.
+    let r = _zyntax_run_async("def main(): i64 { return 7", 2);
+    assert!(!r.ok());
+    assert!(matches!(r.error_kind(), ErrorKind::CompileError));
 }

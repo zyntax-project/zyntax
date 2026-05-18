@@ -389,27 +389,106 @@ export async function run(source) {
     return b.run(source);
 }
 
+// ---------------------------------------------------------------------------
+// Cooperative-async resolver registry (Phase H)
+// ---------------------------------------------------------------------------
+//
+// `call_async` returns a Promise that resolves when the runtime
+// hands back a result through `_zyntax_complete_task(taskId,
+// value, ok)`. For sync programs the callback fires inline during
+// `_zyntax_run_async`'s call; for programs that park on host
+// bridges (Phase I+) it fires later when the SM eventually
+// reaches Ready.
+//
+// `taskResolvers` lives on `globalThis` so the wasm-imported
+// `_zyntax_complete_task` (which wasm-bindgen resolves through
+// `js_namespace = globalThis`) can find it regardless of module
+// scope. Worker mode installs its own copy in the worker's
+// `globalThis`.
+
+const taskResolvers = new Map();
+let nextTaskId = 1;
+
+function installCompleteTaskHook() {
+    if (globalThis._zyntax_complete_task) return;
+    globalThis._zyntax_complete_task = (taskId, value, ok) => {
+        // Bigint inputs from wasm-bindgen i64 marshalling.
+        const id = typeof taskId === "bigint" ? Number(taskId) : taskId;
+        const r = taskResolvers.get(id);
+        if (!r) return;
+        taskResolvers.delete(id);
+        // For Phase H we marshal the value through `RunResult.output`
+        // (the synchronous return value the wasm-side `run_impl`
+        // already formatted). The bare `value` (an i64) is the
+        // resume-slot bridge value used by Phase I+ parking; for
+        // sync completions it's the parsed numeric form of the
+        // same output and either field works.
+        r.resolve({
+            output: r.output != null ? r.output : String(value),
+            ok: ok === 1 || ok === 1n,
+            errorKind: 0,
+        });
+    };
+}
+
 /**
- * Promise-returning variant of `run`. Today this is a thin wrapper —
- * synchronous compile + execute, with the result handed back via a
- * resolved Promise so callers using `await Zyntax.call_async(...)`
- * have a stable API. The shape is forward-compatible with a richer
- * async runtime: once `@effect`-annotated functions can yield to the
- * JS event loop (via either threaded wasm + worker-pool drive or a
- * single-threaded `requestIdleCallback`-based scheduler), this entry
- * point will dispatch through it without changing the call site.
+ * Promise-returning entry that routes through `_zyntax_run_async`.
+ * For sync programs, the Promise resolves on the next microtask
+ * after `_zyntax_complete_task` fires inline from wasm. For
+ * programs that park on host bridges (sleep / fetch / WebSocket
+ * — Phase I+), the Promise stays pending until the parked SM
+ * reaches Ready and host_futures' completion callback drives
+ * `_zyntax_complete_task` asynchronously.
  *
- * Use `run` for purely synchronous programs (saves the microtask),
- * `call_async` when the program returns from a host-side promise
- * (e.g. `fetch`) or for forward compatibility with effect handlers.
+ * The shape is forward-compatible: today's call site continues to
+ * work when Phase I lands actual yielding behavior without
+ * changing this signature.
  */
 export async function call_async(source) {
     const b = await bindings();
-    // Punt one microtask so synchronous compile errors still surface
-    // through the Promise rejection path rather than throwing
-    // synchronously from inside `await`.
-    await Promise.resolve();
-    return b.run(source);
+    installCompleteTaskHook();
+    return new Promise((resolve, reject) => {
+        const taskId = nextTaskId++;
+        // Pre-register the resolver before kicking off the wasm
+        // call. The wasm-side `_zyntax_run_async` may fire
+        // `_zyntax_complete_task` synchronously, in which case
+        // the resolver entry must already be in place.
+        taskResolvers.set(taskId, { resolve, reject, output: null });
+        let initial;
+        try {
+            initial = b._zyntax_run_async(source, BigInt(taskId));
+        } catch (e) {
+            taskResolvers.delete(taskId);
+            reject(e);
+            return;
+        }
+        // Compile / runtime errors don't fire complete_task. Stash
+        // the RunResult's `output` so the synchronous-success path
+        // below also has it available, then resolve directly with
+        // the failure payload.
+        if (!initial.ok) {
+            taskResolvers.delete(taskId);
+            resolve({
+                output: initial.output,
+                ok: false,
+                errorKind: initial.errorKind,
+            });
+            return;
+        }
+        // Synchronous-success path: wasm already fired
+        // _zyntax_complete_task, which removed the resolver entry
+        // and resolved the Promise. If the entry's still around,
+        // wasm didn't fire complete_task — that means the task
+        // parked (Phase I+). Either way nothing else to do here.
+        const stillPending = taskResolvers.get(taskId);
+        if (stillPending) {
+            // Phase I+: task is parked, attach the wasm-formatted
+            // output to the resolver entry so complete_task's
+            // String(value) fallback isn't used when we know the
+            // semantic output (this matters once parking arrives).
+            stillPending.output = initial.output;
+        }
+    });
 }
 
 /**

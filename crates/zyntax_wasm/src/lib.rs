@@ -172,6 +172,28 @@ extern "C" {
     /// wasm-bindgen marshalls back to Rust `i64` on the boundary.
     #[wasm_bindgen(js_namespace = globalThis, js_name = _zyntax_jit_call_0_i64)]
     fn js_jit_call_0_i64(handle: u32) -> i64;
+
+    /// JS-provided cooperative-async completion shim. Phase H+.
+    /// When the scheduler hands a parked task its final result —
+    /// either synchronously after `_zyntax_run_async` returns, or
+    /// asynchronously when a host bridge's `_zyntax_resolve_future`
+    /// drives the parked SM to Ready — we call this to notify the
+    /// JS-side Promise resolver registry.
+    ///
+    /// ```js
+    /// globalThis._zyntax_complete_task = (taskId, value, ok) => {
+    ///   const r = taskResolvers.get(taskId);
+    ///   if (!r) return;
+    ///   taskResolvers.delete(taskId);
+    ///   r.resolve({ output: String(value), ok, errorKind: 0 });
+    /// };
+    /// ```
+    ///
+    /// `ok` is 1 on normal completion, 0 on rejection (reserved for
+    /// future use; today every completion is ok=1 because rejection
+    /// resolves with the -1 sentinel via the value path).
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _zyntax_complete_task)]
+    fn js_complete_task(task_id: i64, value: i64, ok: u32);
 }
 
 // Non-wasm32 stubs so the crate's `cargo test` (native target) can
@@ -186,6 +208,9 @@ fn js_jit_install(_bytes: &[u8]) -> u32 {
 fn js_jit_call_0_i64(_handle: u32) -> i64 {
     0
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_complete_task(_task_id: i64, _value: i64, _ok: u32) {}
 
 /// Sentinel returned from `_zyntax_jit_install` on JS-side failure.
 /// Matches the docstring on the extern above.
@@ -1186,6 +1211,102 @@ extern "C" fn __zw_test_double(x: i64) -> i64 {
 #[wasm_bindgen]
 pub fn run(source: &str) -> RunResult {
     run_impl(source)
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative-async top-level scheduler (Phase H)
+// ---------------------------------------------------------------------------
+//
+// `_zyntax_run_async(source, task_id)` is the Promise-routed entry
+// point. For sync programs it behaves like `run` but additionally
+// calls back into JS via `js_complete_task(task_id, value, ok)`
+// before returning, so the JS-side `taskResolvers` map can resolve
+// the Promise. For programs that eventually park on a host bridge
+// (Phase I+), the wasm side returns the initial "parked" RunResult
+// while the InterpRuntime stays alive in `RUNTIME_HOLDER`; later
+// `resolve_future` calls drive the SM to Ready and host_futures'
+// installed callback fires `js_complete_task` at that point.
+//
+// Phase H ships the synchronous half — no parking yet — so the
+// Promise plumbing is testable end-to-end without waiting on
+// Phase I's krio_adapter sentinel work.
+//
+// Lifetime: `RUNTIME_HOLDER` is intentionally a thread-local
+// `HashMap` (not an `Option<...>`) so multiple in-flight tasks
+// can coexist when Phase K eventually adds multi-task scheduling.
+// For Phase H the map only ever contains zero or one entry.
+
+thread_local! {
+    /// Active per-task runtimes. The scheduler stashes a runtime
+    /// here when a top-level task parks so its SM allocations
+    /// survive across `resolve_future` hops; the host_futures
+    /// completion callback removes the entry on Ready.
+    static RUNTIME_HOLDER: RefCell<HashMap<i64, InterpRuntime>> =
+        RefCell::new(HashMap::new());
+
+    /// Whether `install_complete_task_bridge` has already wired
+    /// host_futures' completion callback into `js_complete_task`.
+    /// Idempotent — install on the first `_zyntax_run_async` call.
+    static COMPLETE_TASK_BRIDGE_INSTALLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Ensure host_futures' completion callback is wired to
+/// `js_complete_task`. The bridge fires whenever
+/// `host_futures::resolve_future` drives a parked SM to Ready —
+/// including for tasks that parked across the wasm-export
+/// boundary (Phase I) and synchronous tasks whose run_async
+/// completion path also routes through this (uniform behavior).
+fn install_complete_task_bridge() {
+    if COMPLETE_TASK_BRIDGE_INSTALLED.with(|c| c.get()) {
+        return;
+    }
+    zyntax_embed::host_futures::set_complete_task_callback(Box::new(|task_id, value| {
+        // Drop the runtime first — calling out to JS while it's
+        // borrowed risks re-entrancy hazards (the JS resolver
+        // could in turn trigger another wasm call). Removing the
+        // entry hands ownership back to local scope; it drops
+        // when this closure returns.
+        let _rt = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+        js_complete_task(task_id, value, 1);
+    }));
+    COMPLETE_TASK_BRIDGE_INSTALLED.with(|c| c.set(true));
+}
+
+/// Promise-routed entry point. Same compile-and-run pipeline as
+/// [`run`] but the result is delivered through `js_complete_task`
+/// (the JS-side Promise resolver registry hook) rather than
+/// solely through the returned `RunResult`. For sync programs the
+/// completion fires inline before this function returns; for
+/// programs that park on a host bridge it fires later when the
+/// SM reaches Ready.
+///
+/// The returned `RunResult` carries diagnostic info: `ok=false`
+/// means compile failed BEFORE the task could start; `ok=true`
+/// means the task either completed synchronously (resolver
+/// already fired) or is parked (resolver will fire later).
+#[wasm_bindgen]
+pub fn _zyntax_run_async(source: &str, task_id: i64) -> RunResult {
+    install_complete_task_bridge();
+    let result = run_impl(source);
+    if result.ok {
+        // Synchronous completion path. Marshal the output's i64
+        // form for js_complete_task — for now we pass 0 since
+        // `output` is a stringified value; the JS side reads the
+        // `output` field from the RunResult directly. The `value`
+        // arg threading the parking-resume path is what matters.
+        //
+        // Parse `output` as i64 best-effort so simple numeric
+        // programs round-trip cleanly through the resolver
+        // callback; richer types fall back to 0.
+        let value = result.output.parse::<i64>().unwrap_or(0);
+        js_complete_task(task_id, value, 1);
+    }
+    // Compile/runtime errors: caller's Promise wrapper sees the
+    // returned RunResult and resolves with `ok=false`; don't fire
+    // js_complete_task for these so the registry doesn't have to
+    // distinguish "failed" from "succeeded with value 0."
+    result
 }
 
 fn run_impl(source: &str) -> RunResult {
