@@ -2100,7 +2100,8 @@ impl HirInterpreter {
                     };
                     let target_ty = &cf.type_pool[*ty as usize];
                     let src = unsafe { frame_ptr.add((*slot as usize) * 8) };
-                    regs[*dst as usize] = unsafe { read_typed(src, target_ty) };
+                    let v = unsafe { read_typed(src, target_ty) };
+                    regs[*dst as usize] = v;
                     pc += 1;
                 }
                 Op::CallIndirect {

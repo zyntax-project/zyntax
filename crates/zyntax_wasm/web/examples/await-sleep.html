@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ZynML demo — await sleep</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="./_demo.css" />
+</head>
+<body>
+<h1>await sleep <span class="demo-tag">async</span></h1>
+<p class="description">
+    The minimum cooperative-async program: park on
+    <code>await sleep(100)</code>, then return 42. The runtime parks
+    the state machine, the JS-side <code>setTimeout(…, 100)</code>
+    fires, the SM resumes, and the Promise resolves.
+</p>
+
+<pre class="source"><code>async def main(): i64 {
+    await sleep(100)
+    return 42
+}</code></pre>
+
+<div class="expected">
+    expected output: <strong>42</strong> · elapsed
+    <strong>≥ 90 ms</strong> (the parking actually yielded; a
+    busy-wait would finish in &lt;5 ms).
+</div>
+
+<div class="controls">
+    <button id="demo-run" class="run-btn" disabled>Run</button>
+    <span id="demo-status" class="status">…</span>
+</div>
+
+<div id="demo-result" class="result"></div>
+
+<div class="footer">
+    zynml wasm build: <code id="zynml-version">—</code> ·
+    <a href="./index.html">← all demos</a>
+</div>
+
+<script type="module">
+    import { runDemo } from "./_demo.js";
+
+    runDemo({
+        source: "async def main(): i64 {\n    await sleep(100)\n    return 42\n}\n",
+        expected: { output: "42", minElapsedMs: 90 },
+    });
+</script>
+</body>
+</html>

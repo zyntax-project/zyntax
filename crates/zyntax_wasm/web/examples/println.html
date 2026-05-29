@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ZynML demo — println to console.log</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="./_demo.css" />
+<style>
+    .console-panel {
+        background: #1d1d1f;
+        color: #f0f0f5;
+        border-radius: 8px;
+        padding: 1rem;
+        margin-top: 1rem;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.85rem;
+        line-height: 1.4;
+        min-height: 6rem;
+        max-height: 18rem;
+        overflow-y: auto;
+        white-space: pre-wrap;
+    }
+    .console-panel .line { display: block; }
+    .console-panel .line:empty::before { content: " "; }
+    .console-panel-header {
+        font-size: 0.85rem;
+        color: #6e6e73;
+        margin-top: 1.25rem;
+    }
+</style>
+</head>
+<body>
+<h1>println → console.log <span class="demo-tag">io</span></h1>
+<p class="description">
+    ZynML's <code>println()</code> on the wasm target routes through
+    a <code>_zyntax_console_log</code> wasm-bindgen extern. The
+    default <code>zynml.mjs</code> binding calls
+    <code>console.log</code>, so each line shows up both in DevTools
+    and (because this page intercepts <code>console.log</code>) in
+    the panel below.
+</p>
+
+<pre class="source"><code>def main(): i64 {
+    println("hello from ZynML")
+    println_i64(7 * 6)
+    println_bool(true)
+    return 0
+}</code></pre>
+
+<div class="expected">
+    expected: three lines — <strong>hello from ZynML</strong>,
+    <strong>42</strong>, <strong>true</strong>. Status
+    <strong>ok</strong>.
+</div>
+
+<div class="controls">
+    <button id="demo-run" class="run-btn" disabled>Run</button>
+    <span id="demo-status" class="status">…</span>
+</div>
+
+<div id="demo-result" class="result"></div>
+
+<div class="console-panel-header">browser console output (live):</div>
+<div id="console-panel" class="console-panel"></div>
+
+<div class="footer">
+    zynml wasm build: <code id="zynml-version">—</code> ·
+    <a href="./index.html">← all demos</a>
+</div>
+
+<script type="module">
+    import { runDemo } from "./_demo.js";
+
+    // Mirror console.log into the in-page panel so the demo works
+    // without DevTools open. The page-side hook also catches anything
+    // ZynML's println dispatches through `_zyntax_console_log`.
+    const panel = document.getElementById("console-panel");
+    const realLog = console.log.bind(console);
+    console.log = function (...args) {
+        realLog(...args);
+        const line = document.createElement("span");
+        line.className = "line";
+        line.textContent = args
+            .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+            .join(" ");
+        panel.appendChild(line);
+        panel.appendChild(document.createTextNode("\n"));
+        panel.scrollTop = panel.scrollHeight;
+    };
+
+    runDemo({
+        source:
+            'def main(): i64 {\n' +
+            '    println("hello from ZynML")\n' +
+            '    println_i64(7 * 6)\n' +
+            '    println_bool(true)\n' +
+            '    return 0\n' +
+            '}\n',
+        expected: { output: "0" },
+    });
+</script>
+</body>
+</html>

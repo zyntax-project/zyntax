@@ -39,6 +39,9 @@ export async function initZynml(opts = {}) {
     // Install JIT host shims BEFORE the wasm module loads so any
     // `start` hook that touches them sees the live globals.
     installJitHost();
+    // Console sink defaults too — the wasm-bindgen externs that
+    // route println bind to globalThis at instantiate time.
+    installConsoleHook();
 
     // Lazy load so the shim works under both targets without
     // up-front conditional imports.
@@ -458,6 +461,39 @@ function installHostBridgeHooks() {
     };
 }
 
+/**
+ * Default console sink wired into the wasm-side `$IO$println` /
+ * `$IO$print` shims. Host pages can replace either of these globals
+ * to capture output (e.g. for a custom DOM log panel, a test
+ * harness, or anything else):
+ *
+ *     globalThis._zyntax_console_log = (line) => { ... };
+ *     globalThis._zyntax_console_log_partial = (chunk) => { ... };
+ *
+ * `installConsoleHook` only installs defaults — it never overwrites
+ * a host-provided implementation, so the override-from-host pattern
+ * keeps working.
+ */
+function installConsoleHook() {
+    if (!globalThis._zyntax_console_log) {
+        globalThis._zyntax_console_log = (line) => console.log(line);
+    }
+    if (!globalThis._zyntax_console_log_partial) {
+        // Accumulate partial chunks until a `\n` arrives; emit a
+        // single console.log per logical line so DevTools shows the
+        // same line breaks the user's program intended.
+        let buf = "";
+        globalThis._zyntax_console_log_partial = (chunk) => {
+            buf += chunk;
+            let nl;
+            while ((nl = buf.indexOf("\n")) !== -1) {
+                globalThis._zyntax_console_log(buf.slice(0, nl));
+                buf = buf.slice(nl + 1);
+            }
+        };
+    }
+}
+
 function installCompleteTaskHook() {
     installHostBridgeHooks();
     if (globalThis._zyntax_complete_task) return;
@@ -473,8 +509,11 @@ function installCompleteTaskHook() {
         // resume-slot bridge value used by Phase I+ parking; for
         // sync completions it's the parsed numeric form of the
         // same output and either field works.
+        // Parked-path RunResult.output is intentionally "" (the
+        // value isn't known synchronously) — treat empty-string the
+        // same as null and fall back to the i64 we got handed.
         r.resolve({
-            output: r.output != null ? r.output : String(value),
+            output: r.output ? r.output : String(value),
             ok: ok === 1 || ok === 1n,
             errorKind: 0,
         });
@@ -532,11 +571,14 @@ export async function call_async(source) {
         // parked (Phase I+). Either way nothing else to do here.
         const stillPending = taskResolvers.get(taskId);
         if (stillPending) {
-            // Phase I+: task is parked, attach the wasm-formatted
-            // output to the resolver entry so complete_task's
-            // String(value) fallback isn't used when we know the
-            // semantic output (this matters once parking arrives).
-            stillPending.output = initial.output;
+            // Phase I+: task is parked. `initial.output` is "" on
+            // the parked path (the user value isn't known until the
+            // SM resumes and complete_task fires) — only attach it
+            // when non-empty so we don't shadow the eventual
+            // `String(value)` fallback inside complete_task.
+            if (initial.output) {
+                stillPending.output = initial.output;
+            }
         }
     });
 }

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ZynML browser demos</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="./_demo.css" />
+<style>
+    ul.demo-list {
+        list-style: none;
+        padding: 0;
+    }
+    ul.demo-list li {
+        background: white;
+        border: 1px solid #d2d2d7;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.75rem 0;
+    }
+    ul.demo-list li a {
+        font-weight: 600;
+        font-size: 1.05rem;
+        color: #0a84ff;
+        text-decoration: none;
+    }
+    ul.demo-list li a:hover { text-decoration: underline; }
+    ul.demo-list li p {
+        margin: 0.25rem 0 0 0;
+        color: #4a4a4f;
+        font-size: 0.9rem;
+    }
+
+    pre.build {
+        background: #1d1d1f;
+        color: #f0f0f5;
+        padding: 1rem;
+        border-radius: 8px;
+        overflow-x: auto;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.85rem;
+        line-height: 1.4;
+    }
+</style>
+</head>
+<body>
+<h1>ZynML browser demos</h1>
+<p class="description">
+    Each page loads the wasm bundle, runs a small ZynML program
+    through <code>call_async</code>, and reports the result + the
+    wall-clock elapsed. The elapsed-time check is the load-bearing
+    bit: a real cooperative yield surfaces as ≥ N ms, while a
+    busy-wait would finish in microseconds.
+</p>
+
+<h2>Cooperative-async demos</h2>
+<ul class="demo-list">
+    <li>
+        <a href="./await-sleep.html">await sleep</a>
+        <p>
+            Minimum cooperative-async program. Parks on a single
+            <code>await sleep(100)</code>, returns 42.
+        </p>
+    </li>
+    <li>
+        <a href="./chained-sleeps.html">chained awaits</a>
+        <p>
+            Two consecutive awaits with a local binding between
+            them. Exercises captures-lift across multiple yields.
+        </p>
+    </li>
+    <li>
+        <a href="./arithmetic-then-await.html">arithmetic, then await</a>
+        <p>
+            Synchronous setup, then a single await; verifies live
+            locals survive the park.
+        </p>
+    </li>
+</ul>
+
+<h2>I/O demos</h2>
+<ul class="demo-list">
+    <li>
+        <a href="./println.html">println → console.log</a>
+        <p>
+            <code>println("…")</code>, <code>println_i64</code>,
+            <code>println_bool</code> in ZynML — all routed through
+            wasm-bindgen to <code>console.log</code>. Output shows up
+            both in DevTools and inline on the page.
+        </p>
+    </li>
+</ul>
+
+<h2>Build &amp; serve</h2>
+<p class="description">
+    Each demo loads <code>../pkg-web/zyntax_wasm.js</code> + its
+    sibling <code>.wasm</code>. Build the bundle first, then serve
+    <code>crates/zyntax_wasm/web/</code> over HTTP (the
+    <code>file://</code> scheme blocks ES-module imports of wasm
+    glue).
+</p>
+<pre class="build">cd crates/zyntax_wasm
+./build.sh web
+
+# Recommended: Node server with cross-origin-isolation headers
+# (COOP / COEP / CORP — unlocks SharedArrayBuffer and the advanced
+# wasm feature set):
+node web/serve.js 8000
+# then visit http://localhost:8000/web/examples/index.html
+
+# Alternative if you only need basic wasm: any static server works.
+#   python3 -m http.server 8000
+# (no COOP/COEP — fine for the current demos but limits future
+# features.)</pre>
+
+<div class="footer">
+    Source: <code>crates/zyntax_wasm/web/examples/</code>
+</div>
+</body>
+</html>

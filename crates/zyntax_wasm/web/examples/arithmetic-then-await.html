@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ZynML demo — arithmetic, then await</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="./_demo.css" />
+</head>
+<body>
+<h1>arithmetic then await <span class="demo-tag">async</span></h1>
+<p class="description">
+    Synchronous setup followed by a single await. Verifies that the
+    captures-lift transform stages live locals across the yield
+    boundary correctly — the result of <code>a * b</code> must
+    survive the park.
+</p>
+
+<pre class="source"><code>async def main(): i64 {
+    let a = 7
+    let b = 6
+    let c = a * b
+    await sleep(80)
+    return c
+}</code></pre>
+
+<div class="expected">
+    expected output: <strong>42</strong> · elapsed
+    <strong>≥ 70 ms</strong>.
+</div>
+
+<div class="controls">
+    <button id="demo-run" class="run-btn" disabled>Run</button>
+    <span id="demo-status" class="status">…</span>
+</div>
+
+<div id="demo-result" class="result"></div>
+
+<div class="footer">
+    zynml wasm build: <code id="zynml-version">—</code> ·
+    <a href="./index.html">← all demos</a>
+</div>
+
+<script type="module">
+    import { runDemo } from "./_demo.js";
+
+    runDemo({
+        source:
+            "async def main(): i64 {\n" +
+            "    let a = 7\n" +
+            "    let b = 6\n" +
+            "    let c = a * b\n" +
+            "    await sleep(80)\n" +
+            "    return c\n" +
+            "}\n",
+        expected: { output: "42", minElapsedMs: 70 },
+    });
+</script>
+</body>
+</html>

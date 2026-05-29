@@ -255,6 +255,54 @@ fn install_resolve_future_helper() {
 }
 
 #[wasm_bindgen_test]
+async fn run_async_arithmetic_then_await_returns_42() {
+    install_host_stubs();
+    install_async_host_shims();
+    install_resolve_future_helper();
+
+    // Reproducer for the `arithmetic-then-await` browser demo hanging.
+    // Sync setup (3 lets), then a single `await sleep`, then return.
+    // `c = a * b` must survive the park as a captures-lift saved slot.
+    let source = "async def main(): i64 {\n    let a = 7\n    let b = 6\n    let c = a * b\n    await sleep(80)\n    return c\n}\n";
+    let task_id: i64 = 142;
+
+    let register_resolver = js_sys::eval(&format!(
+        r#"
+        (function() {{
+            return new Promise(function(resolve) {{
+                globalThis.__zw_test_task_resolvers.set({}, resolve);
+            }});
+        }})()
+        "#,
+        task_id
+    ))
+    .expect("eval should produce a Promise");
+    let promise: js_sys::Promise = register_resolver.dyn_into().expect("Promise");
+
+    let initial = _zyntax_run_async(source, task_id);
+    assert!(initial.ok(), "compile/start: output={}", initial.output());
+
+    let timeout_promise: js_sys::Promise = js_sys::eval(
+        r#"
+        new Promise(function(_, reject) {
+            setTimeout(function() {
+                reject(new Error('5s timeout — complete_task never fired'));
+            }, 5000);
+        })
+        "#,
+    )
+    .expect("eval timeout")
+    .dyn_into()
+    .expect("Promise");
+    let race = js_sys::Promise::race(&js_sys::Array::of2(&promise, &timeout_promise));
+    let resolved = wasm_bindgen_futures::JsFuture::from(race)
+        .await
+        .expect("Promise should resolve cleanly");
+    let value = resolved.as_f64().expect("resolver delivered a number");
+    assert!((value - 42.0).abs() < 0.5, "expected 42, got {value}",);
+}
+
+#[wasm_bindgen_test]
 async fn run_async_with_sleep_yields_and_returns_42() {
     install_host_stubs();
     install_async_host_shims();

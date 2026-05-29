@@ -925,11 +925,18 @@ fn lower_host_bridge_await_site(
 
     // Snapshot what we need from yield_block before borrowing mutably.
     let function_id = function.id;
-    let (pre_producing, producing_call, between, _kept_post) = {
+    let (pre_producing, producing_call, between, post_await) = {
         let yield_block = function.blocks.get(&yield_hir).expect("yield block exists");
         let pre = yield_block.instructions[..producing_idx].to_vec();
         let producing = yield_block.instructions[producing_idx].clone();
         let between = yield_block.instructions[producing_idx + 1..await_idx].to_vec();
+        // Capture instructions AFTER the `Intrinsic::Await`. The
+        // `emit_save_load` captures-lift pass (in
+        // `crates/passes/krio_adapter/src/emit.rs`) pushes
+        // `AsyncSaveSlot` ops at the end of the yield block — they
+        // land in this `post_await` slice and would be lost if we
+        // dropped them. They must run BEFORE we yield (Pending), so
+        // splice them in below the bridge call.
         let post = yield_block
             .instructions
             .iter()
@@ -1000,6 +1007,15 @@ fn lower_host_bridge_await_site(
     // Intrinsic::Await (captures-lift saves emitted by emit_save_load,
     // for instance).
     new_insts.extend(between);
+    // Preserve captures-lift saves that landed AFTER the
+    // `Intrinsic::Await` (emit_save_load pushes them at the end of
+    // the original yield block). Without this step, any live SSA
+    // value computed before the yield — a Binary result, a Load,
+    // anything other than a Constant — would never be written to
+    // its slot, and the resume side's `AsyncLoadSlot` would read
+    // zero, which manifests as the SM re-parking forever instead of
+    // reaching `Return`.
+    new_insts.extend(post_await);
     new_insts.push(HirInstruction::AsyncSaveSlot {
         frame,
         slot: state_slot,

@@ -1305,6 +1305,24 @@ fn register_static_plugins(rt: &mut InterpRuntime) {
             2,
         );
     }
+
+    // Browser `$IO$*` shims: route ZynML's `println` / `print` to JS
+    // so the output shows up in DevTools (and in any custom UI sink
+    // a host page wires up). The default JS side calls `console.log`.
+    //
+    // Wired manually rather than pulling zrtl_io as a wasm dep
+    // because zrtl_io's `println!` would write to a wasm-stdout the
+    // browser doesn't surface.
+    #[cfg(target_arch = "wasm32")]
+    {
+        rt.register_symbol("$IO$print", __zw_io_print as *const u8, 1);
+        rt.register_symbol("$IO$println", __zw_io_println as *const u8, 1);
+        rt.register_symbol("$IO$eprintln", __zw_io_eprintln as *const u8, 1);
+        rt.register_symbol("$IO$print_i64", __zw_io_print_i64 as *const u8, 1);
+        rt.register_symbol("$IO$println_i64", __zw_io_println_i64 as *const u8, 1);
+        rt.register_symbol("$IO$println_f64", __zw_io_println_f64 as *const u8, 1);
+        rt.register_symbol("$IO$println_bool", __zw_io_println_bool as *const u8, 1);
+    }
 }
 
 /// Test-only extern: doubles its argument. Lives outside the
@@ -1313,6 +1331,138 @@ fn register_static_plugins(rt: &mut InterpRuntime) {
 /// `extern "C" fn(i64) -> i64` inside `_zyntax_call_extern_1`.
 extern "C" fn __zw_test_double(x: i64) -> i64 {
     x.wrapping_mul(2)
+}
+
+/// Wire user-level `println` / `print` / `eprintln` etc. aliases to the
+/// matching `$IO$*` extern symbols registered in `register_static_plugins`.
+/// Mirrors the `sleep → __zyntax_async_set_timeout` pattern just above —
+/// `LoweringConfig.builtins` is what the SSA Call lowering consults to
+/// turn an unresolved `Variable("println")` callee into a
+/// `HirCallable::Symbol("$IO$println")`.
+fn install_io_builtin_aliases(config: &mut zyntax_compiler::CompilationConfig) {
+    for (alias, target) in [
+        ("print", "$IO$print"),
+        ("println", "$IO$println"),
+        ("eprintln", "$IO$eprintln"),
+        ("print_i64", "$IO$print_i64"),
+        ("println_i64", "$IO$println_i64"),
+        ("println_f64", "$IO$println_f64"),
+        ("println_bool", "$IO$println_bool"),
+    ] {
+        config
+            .builtins
+            .insert(alias.to_string(), target.to_string());
+    }
+}
+
+// ─── Browser `println` bridge ──────────────────────────────────────────
+//
+// `register_static_plugins` registers a small set of `$IO$*` symbols
+// (the names ZynML's compiler maps `println(...)` calls to on the
+// extern path) against wasm32-only wrappers that route the output
+// through wasm-bindgen to `globalThis._zyntax_console_log(line)`. The
+// host page is free to override that JS function — the default
+// implementation in `web/zynml.mjs` calls `console.log`.
+//
+// Why not use `zrtl_io` directly? The zrtl_io plugin's `io_println`
+// calls Rust's `println!`, which on wasm32 writes to a stdout that
+// the browser never surfaces. The wrappers below preserve the same
+// ABI (i.e. `extern "C" fn(StringConstPtr)`) but redirect the bytes
+// to JS, so user code keeps using plain `println("hello")` and the
+// output shows up in DevTools.
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    /// JS-side line sink. `zynml.mjs` installs a default that
+    /// console.logs each line; host pages can override to capture
+    /// output into a DOM element or a JS test harness.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _zyntax_console_log)]
+    fn js_console_log(line: &str);
+
+    /// `print` variant (no trailing newline). The default
+    /// implementation in `zynml.mjs` accumulates partial lines and
+    /// flushes on `\n` so console.log boundaries match user intent.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _zyntax_console_log_partial)]
+    fn js_console_log_partial(chunk: &str);
+}
+
+/// Read a ZRTL `StringConstPtr` ([i32 length][utf8 bytes...]) into a
+/// borrowed &str. Returns "" on null / malformed UTF-8 so the caller
+/// always has a valid view.
+///
+/// Accepts the pointer as a raw `i64` because the BC interpreter's
+/// `call_extern_symbol` transmutes every registered fn to
+/// `extern "C" fn(i64, …) -> i64` — on wasm32 a `fn(*const i32)`
+/// surfaces in the function table with an `i32` arg, which mismatches
+/// the transmute and traps with "function signature mismatch". The
+/// uniform-i64 wrappers below match the table signature exactly and
+/// cast back to the pointer inside.
+///
+/// # Safety
+///
+/// Caller guarantees the low bits of `ptr` (when cast to a pointer)
+/// either are null or point at a ZRTL string header followed by
+/// `length` UTF-8 bytes.
+#[cfg(target_arch = "wasm32")]
+unsafe fn zrtl_str_borrow_i64<'a>(ptr: i64) -> &'a str {
+    let ptr = ptr as usize as *const i32;
+    if ptr.is_null() {
+        return "";
+    }
+    let len = (*ptr).max(0) as usize;
+    let data = (ptr as *const u8).add(core::mem::size_of::<i32>());
+    let bytes = core::slice::from_raw_parts(data, len);
+    core::str::from_utf8(bytes).unwrap_or("")
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_print(s_ptr: i64) -> i64 {
+    js_console_log_partial(unsafe { zrtl_str_borrow_i64(s_ptr) });
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_println(s_ptr: i64) -> i64 {
+    js_console_log(unsafe { zrtl_str_borrow_i64(s_ptr) });
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_println_i64(v: i64) -> i64 {
+    js_console_log(&format!("{v}"));
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_print_i64(v: i64) -> i64 {
+    js_console_log_partial(&format!("{v}"));
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_println_f64(v_bits: i64) -> i64 {
+    // Float printing: BC interp passes the i64 bit-pattern of an f64
+    // (same `value_to_i64` truncation rule that floats use elsewhere
+    // on this path). Reinterpret then format.
+    let v = f64::from_bits(v_bits as u64);
+    js_console_log(&format!("{v}"));
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_println_bool(v: i64) -> i64 {
+    js_console_log(if v != 0 { "true" } else { "false" });
+    0
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn __zw_io_eprintln(s_ptr: i64) -> i64 {
+    // Same channel — JS host can split eprintln into console.error
+    // by inspecting the registered symbol if it cares; demo path
+    // just goes through console.log for simplicity.
+    js_console_log(unsafe { zrtl_str_borrow_i64(s_ptr) });
+    0
 }
 
 // ----- Cooperative-async host-bridge JS hooks (Phase I.3) ------
@@ -1562,6 +1712,7 @@ fn run_async_impl(source: &str, task_id: i64) -> RunResult {
         "__zyntax_async_set_timeout".to_string(),
         "__zyntax_async_set_timeout".to_string(),
     );
+    install_io_builtin_aliases(&mut config);
     let mut hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config)
     {
         Ok(m) => m,
@@ -1835,6 +1986,7 @@ fn run_impl(source: &str) -> RunResult {
         "__zyntax_async_set_timeout".to_string(),
         "__zyntax_async_set_timeout".to_string(),
     );
+    install_io_builtin_aliases(&mut config);
     let mut hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config)
     {
         Ok(m) => m,

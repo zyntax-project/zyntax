@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ZynML demo — chained awaits</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="./_demo.css" />
+</head>
+<body>
+<h1>chained awaits <span class="demo-tag">async</span></h1>
+<p class="description">
+    Two consecutive <code>await sleep</code> calls separated by a
+    local binding. Exercises the krio captures-lift transform: the
+    local <code>x</code> defined between awaits must be saved to the
+    state-machine frame across the first yield and reloaded on
+    resume.
+</p>
+
+<pre class="source"><code>async def main(): i64 {
+    await sleep(50)
+    let x = 10
+    await sleep(50)
+    return x * 4
+}</code></pre>
+
+<div class="expected">
+    expected output: <strong>40</strong> · elapsed
+    <strong>≥ 90 ms</strong> (two ~50 ms parks must compound).
+</div>
+
+<div class="controls">
+    <button id="demo-run" class="run-btn" disabled>Run</button>
+    <span id="demo-status" class="status">…</span>
+</div>
+
+<div id="demo-result" class="result"></div>
+
+<div class="footer">
+    zynml wasm build: <code id="zynml-version">—</code> ·
+    <a href="./index.html">← all demos</a>
+</div>
+
+<script type="module">
+    import { runDemo } from "./_demo.js";
+
+    runDemo({
+        source:
+            "async def main(): i64 {\n" +
+            "    await sleep(50)\n" +
+            "    let x = 10\n" +
+            "    await sleep(50)\n" +
+            "    return x * 4\n" +
+            "}\n",
+        expected: { output: "40", minElapsedMs: 90 },
+    });
+</script>
+</body>
+</html>
