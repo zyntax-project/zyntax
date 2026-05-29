@@ -890,6 +890,15 @@ impl<'g> GrammarInterpreter<'g> {
             TypedExpression::Unary(unary) => unary.operand.ty.clone(),
             // Binary operations have the same type as their left operand
             TypedExpression::Binary(binary) => binary.left.ty.clone(),
+            // `if cond { e } else { e }` evaluated as an expression
+            // takes its type from the then-branch — the type-checker
+            // later verifies both arms agree. Without this default the
+            // outer node arrives as `Type::Unit`, which `convert_type`
+            // lowers to `HirType::Void` and the resulting phi value
+            // is invisible to downstream `Load`/`Store` (the bound
+            // local reads back zero / the default of whatever the
+            // load coerces to).
+            TypedExpression::If(if_expr) => if_expr.then_branch.ty.clone(),
             _ => Type::Primitive(PrimitiveType::Unit),
         };
 
