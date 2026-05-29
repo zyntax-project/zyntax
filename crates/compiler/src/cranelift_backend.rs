@@ -335,6 +335,11 @@ impl CraneliftBackend {
         for (name, ptr) in crate::osr::osr_runtime_symbols() {
             builder.symbol(name, ptr);
         }
+        // String-op runtime intrinsics — referenced unconditionally
+        // by `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
+        for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
+            builder.symbol(name, ptr);
+        }
 
         // Register all runtime symbols (both stdlib and frontend-specific)
         // All symbols are now provided via the plugin system
@@ -1764,6 +1769,59 @@ impl CraneliftBackend {
                                     // Get operand type from left value, not result type
                                     let operand_ty =
                                         function.values.get(left).map(|v| &v.ty).unwrap_or(ty);
+
+                                    // String equality / inequality routes
+                                    // through the `zrtl_string_equals`
+                                    // runtime helper — raw pointer
+                                    // comparison would only succeed when
+                                    // both operands point at the SAME
+                                    // interned string allocation, not
+                                    // whenever the byte contents match.
+                                    // Strings lower to `Ptr(I8)`;
+                                    // Lt/Le/Gt/Ge on strings would need
+                                    // a separate strcmp-style helper and
+                                    // isn't covered here yet.
+                                    let is_string_op = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                                        && match operand_ty {
+                                            HirType::Ptr(inner) => {
+                                                matches!(**inner, HirType::I8)
+                                            }
+                                            _ => false,
+                                        };
+                                    if is_string_op {
+                                        let mut sig = self.module.make_signature();
+                                        let ptr_ty = self.module.target_config().pointer_type();
+                                        sig.params.push(AbiParam::new(ptr_ty));
+                                        sig.params.push(AbiParam::new(ptr_ty));
+                                        sig.returns.push(AbiParam::new(types::I32));
+                                        let func_id = self
+                                            .module
+                                            .declare_function(
+                                                "zrtl_string_equals",
+                                                Linkage::Import,
+                                                &sig,
+                                            )
+                                            .map_err(|e| {
+                                                CompilerError::Backend(format!(
+                                                    "Failed to declare zrtl_string_equals: {}",
+                                                    e
+                                                ))
+                                            })?;
+                                        let func_ref =
+                                            self.module.declare_func_in_func(func_id, builder.func);
+                                        let call = builder.ins().call(func_ref, &[lhs, rhs]);
+                                        let eq_i32 = builder.inst_results(call)[0];
+                                        let eq_i8 = builder.ins().ireduce(types::I8, eq_i32);
+                                        let result_val = if matches!(op, BinaryOp::Eq) {
+                                            eq_i8
+                                        } else {
+                                            let one = builder.ins().iconst(types::I8, 1);
+                                            builder.ins().bxor(eq_i8, one)
+                                        };
+                                        self.value_map.insert(*result, result_val);
+                                        continue;
+                                    }
+
                                     let cc = match op {
                                         BinaryOp::Eq => IntCC::Equal,
                                         BinaryOp::Ne => IntCC::NotEqual,
@@ -7197,6 +7255,57 @@ impl CraneliftBackend {
                     | BinaryOp::Ge => {
                         // Get operand type from left value, not result type
                         let operand_ty = function.values.get(left).map(|v| &v.ty).unwrap_or(ty);
+
+                        // String equality / inequality routes through
+                        // the `zrtl_string_equals` runtime helper —
+                        // raw pointer comparison would only succeed
+                        // when both operands point at the SAME interned
+                        // string allocation, not whenever the byte
+                        // contents match. Strings lower to
+                        // `Ptr(I8)`; Lt/Le/Gt/Ge on strings would need
+                        // a separate strcmp-style helper and isn't
+                        // covered here yet.
+                        let is_string_op = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                            && match operand_ty {
+                                HirType::Ptr(inner) => matches!(**inner, HirType::I8),
+                                _ => false,
+                            };
+                        if is_string_op {
+                            let mut sig = self.module.make_signature();
+                            let ptr_ty = self.module.target_config().pointer_type();
+                            sig.params.push(AbiParam::new(ptr_ty));
+                            sig.params.push(AbiParam::new(ptr_ty));
+                            sig.returns.push(AbiParam::new(types::I32));
+                            let func_id = self
+                                .module
+                                .declare_function("zrtl_string_equals", Linkage::Import, &sig)
+                                .map_err(|e| {
+                                    CompilerError::Backend(format!(
+                                        "Failed to declare zrtl_string_equals: {}",
+                                        e
+                                    ))
+                                })?;
+                            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                            let call = builder.ins().call(func_ref, &[lhs, rhs]);
+                            let eq_i32 = builder.inst_results(call)[0];
+                            // Truncate i32 → i8 to match the rest of
+                            // the comparison path (which returns the
+                            // raw icmp result, an i8 bool).
+                            let eq_i8 = builder.ins().ireduce(types::I8, eq_i32);
+                            self.value_map.insert(
+                                *result,
+                                if matches!(op, BinaryOp::Eq) {
+                                    eq_i8
+                                } else {
+                                    // For Ne: bxor with 1 to invert
+                                    // the 0/1 boolean payload.
+                                    let one = builder.ins().iconst(types::I8, 1);
+                                    builder.ins().bxor(eq_i8, one)
+                                },
+                            );
+                            return Ok(());
+                        }
+
                         let cc = match op {
                             BinaryOp::Eq => IntCC::Equal,
                             BinaryOp::Ne => IntCC::NotEqual,
@@ -7598,6 +7707,11 @@ impl CraneliftBackend {
         // OSR runtime symbols must be re-registered on every module rebuild —
         // tier-0 codegen emits probe call sites unconditionally for any loop.
         for (name, ptr) in crate::osr::osr_runtime_symbols() {
+            builder.symbol(name, ptr);
+        }
+        // String-op runtime intrinsics — referenced unconditionally
+        // by `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
+        for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
             builder.symbol(name, ptr);
         }
         for (name, ptr) in &all_symbols {

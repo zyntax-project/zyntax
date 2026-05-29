@@ -490,6 +490,27 @@ impl<'g> GrammarInterpreter<'g> {
                 TypedStatement::Break(value.map(Box::new))
             }
             "Continue" => TypedStatement::Continue,
+            "Block" => {
+                // `TypedStatement::Block { statements: <expr> }` — the
+                // grammar-side rule passes a list of statements via
+                // the `statements:` field. `construct_block` handles
+                // the same shape for `TypedBlock { … }` actions; we
+                // delegate to it and unwrap the `ParsedValue::Block`
+                // payload. Lets grammar authors emit native statement
+                // blocks without the `Expression(Block(…))` wrapping
+                // workaround.
+                let block_val = self.construct_block(fields, state, span)?;
+                let block = match block_val {
+                    ParsedValue::Block(b) => b,
+                    other => {
+                        return Err(format!(
+                            "TypedStatement::Block: construct_block returned non-Block value: {:?}",
+                            other
+                        ));
+                    }
+                };
+                TypedStatement::Block(block)
+            }
             "LetPattern" => {
                 let pattern = self.get_field_as_pattern("pattern", fields, state)?;
                 let initializer = self.get_field_as_expr("initializer", fields, state)?;
