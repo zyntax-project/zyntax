@@ -458,6 +458,198 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
     }
 }
 
+// ─── ariadne renderer ──────────────────────────────────────────────────
+//
+// Phase L: default renderer. `ConsoleDiagnosticDisplay` is the legacy
+// hand-rolled ANSI escape path. `AriadneDiagnosticDisplay` routes
+// through the `ariadne` crate (snippet boxes, arrows, multi-span
+// support, colour fallback). Both implement `DiagnosticDisplay`.
+//
+// Multi-file caveat: `Span` carries no `file_id` today (see the TODO
+// at `ConsoleDiagnosticDisplay::fmt_diagnostic` ~line 358). We
+// preserve the single-file assumption — the renderer pulls the
+// filename from `SourceMap::get_file_by_id(0)` and labels every
+// annotation against that. Threading `file_id` through `Span` is a
+// separate piece of work.
+
+/// `ariadne`-backed diagnostic renderer. Default for the compiler
+/// from Phase L onward. Produces snippet boxes with arrow annotations
+/// and a chevron-style multi-span layout.
+pub struct AriadneDiagnosticDisplay {
+    /// Whether to use ANSI colour. Default true; falls back gracefully
+    /// when the writer is non-tty (ariadne handles that automatically
+    /// via its `with_color` config flag).
+    pub use_colors: bool,
+}
+
+impl Default for AriadneDiagnosticDisplay {
+    fn default() -> Self {
+        Self { use_colors: true }
+    }
+}
+
+/// `ariadne::Cache` adapter that pulls source from a `SourceMap`.
+/// Cache `Id` is the filename string. ariadne calls `fetch` lazily as
+/// it renders, so we build the `ariadne::Source` on first use and
+/// memoize it for subsequent labels.
+struct SourceMapCache<'a> {
+    source_map: &'a SourceMap,
+    cached: HashMap<String, ariadne::Source<String>>,
+}
+
+impl<'a> ariadne::Cache<String> for SourceMapCache<'a> {
+    type Storage = String;
+
+    fn fetch(&mut self, id: &String) -> Result<&ariadne::Source<Self::Storage>, impl fmt::Debug> {
+        if !self.cached.contains_key(id) {
+            // Explicit binding so both arms of the `?`-shaped path
+            // produce a single concrete `String` error type — ariadne's
+            // `Result<_, impl Debug>` return type can't otherwise infer
+            // it.
+            let content: Result<String, String> = self
+                .source_map
+                .get_file(id)
+                .map(|f| f.content.clone())
+                .ok_or_else(|| format!("source file not found in map: {id}"));
+            let content = content?;
+            self.cached
+                .insert(id.clone(), ariadne::Source::from(content));
+        }
+        let result: Result<&ariadne::Source<String>, String> =
+            Ok(self.cached.get(id).expect("just inserted"));
+        result
+    }
+
+    fn display<'b>(&self, id: &'b String) -> Option<impl fmt::Display + 'b> {
+        Some(id.clone())
+    }
+}
+
+impl AriadneDiagnosticDisplay {
+    fn level_to_kind(
+        level: DiagnosticLevel,
+    ) -> (ariadne::ReportKind<'static>, Option<&'static str>) {
+        match level {
+            DiagnosticLevel::Ice => (ariadne::ReportKind::Error, Some("ICE")),
+            DiagnosticLevel::Error => (ariadne::ReportKind::Error, None),
+            DiagnosticLevel::Warning => (ariadne::ReportKind::Warning, None),
+            DiagnosticLevel::Note => (ariadne::ReportKind::Advice, None),
+            DiagnosticLevel::Help => (ariadne::ReportKind::Advice, None),
+        }
+    }
+
+    fn style_to_color(style: AnnotationStyle) -> ariadne::Color {
+        match style {
+            AnnotationStyle::Primary => ariadne::Color::Red,
+            AnnotationStyle::Secondary => ariadne::Color::Blue,
+            // ariadne has no semantic "info" lane; neutral white is
+            // close enough and stays readable on dark + light terms.
+            AnnotationStyle::Info => ariadne::Color::White,
+        }
+    }
+}
+
+impl DiagnosticDisplay for AriadneDiagnosticDisplay {
+    fn fmt_diagnostic(
+        &self,
+        diagnostic: &Diagnostic,
+        source_map: &SourceMap,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        // Single-file assumption: pull the filename from file_id 0.
+        // Multi-file diagnostics would need a `file_id` on `Span` —
+        // tracked at the TODO inside `ConsoleDiagnosticDisplay`.
+        let filename = source_map
+            .get_file_by_id(0)
+            .map(|sf| sf.name.clone())
+            .unwrap_or_else(|| "input.zy".to_string());
+
+        let (kind, prefix) = Self::level_to_kind(diagnostic.level);
+        let header = match prefix {
+            Some(p) => format!("{p}: {}", diagnostic.message),
+            None => diagnostic.message.clone(),
+        };
+
+        // Anchor the report at the primary annotation's span when one
+        // exists; fall back to (file, 0) otherwise so even
+        // span-less diagnostics still render a header.
+        let anchor_start = diagnostic
+            .annotations
+            .iter()
+            .find(|a| a.style == AnnotationStyle::Primary)
+            .or_else(|| diagnostic.annotations.first())
+            .map(|a| a.span.start)
+            .unwrap_or(0);
+
+        let mut builder =
+            ariadne::Report::build(kind, (filename.clone(), anchor_start..anchor_start))
+                .with_message(header)
+                .with_config(ariadne::Config::new().with_color(self.use_colors));
+
+        if let Some(code) = diagnostic.code {
+            builder = builder.with_code(code.0);
+        }
+
+        for annotation in &diagnostic.annotations {
+            // ariadne dislikes zero-length ranges in labels (no
+            // visible underline); pad by 1 char so the caret still
+            // appears at the right column.
+            let start = annotation.span.start;
+            let end = if annotation.span.end > annotation.span.start {
+                annotation.span.end
+            } else {
+                annotation.span.start + 1
+            };
+            let mut label = ariadne::Label::new((filename.clone(), start..end))
+                .with_color(Self::style_to_color(annotation.style));
+            if let Some(msg) = &annotation.message {
+                label = label.with_message(msg.clone());
+            }
+            builder = builder.with_label(label);
+        }
+
+        for note in &diagnostic.notes {
+            builder = builder.with_note(note.clone());
+        }
+
+        for help in &diagnostic.help {
+            builder = builder.with_help(help.clone());
+        }
+
+        // ariadne's `Report::write_for_stdout` wants a writer + cache.
+        // We render into a Vec<u8>, then push the bytes through the
+        // user's `fmt::Formatter`. This is the standard adapter
+        // pattern when bridging `io::Write` consumers into a
+        // `fmt::Write` sink.
+        let mut cache = SourceMapCache {
+            source_map,
+            cached: HashMap::new(),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        if builder
+            .finish()
+            .write_for_stdout(&mut cache, &mut buf)
+            .is_err()
+        {
+            // Renderer failure shouldn't crash the compile; fall
+            // back to the message line so the user at least sees
+            // what went wrong.
+            return writeln!(f, "{}: {}", diagnostic.level, diagnostic.message);
+        }
+        f.write_str(&String::from_utf8_lossy(&buf))?;
+
+        // Render suggestions separately (ariadne has no native
+        // suggestion lane). Match the legacy formatter's style.
+        for suggestion in &diagnostic.suggestions {
+            writeln!(f, "   = help: {}", suggestion.message)?;
+            writeln!(f, "   |")?;
+            writeln!(f, "   | {}", suggestion.replacement)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Diagnostic collector that accumulates diagnostics during compilation
 pub struct DiagnosticCollector {
     /// Collected diagnostics
@@ -684,6 +876,55 @@ mod tests {
         assert_eq!(diag.annotations.len(), 2);
         assert_eq!(diag.help.len(), 1);
         assert_eq!(diag.notes.len(), 1);
+    }
+
+    #[test]
+    fn ariadne_renders_primary_annotation_without_panicking() {
+        // Smoke test the new default renderer: build a diagnostic that
+        // exercises a primary annotation, code, note, and help, then
+        // render it. We don't pin the exact string (ariadne's exact
+        // output may shift across patch versions) — just assert that
+        // rendering returns a non-empty string referencing the user's
+        // message and code.
+        let mut source_map = SourceMap::new();
+        source_map.add_file(
+            "test.zy".to_string(),
+            "fn main() {\n  let x: i32 = \"hello\";\n}\n".to_string(),
+        );
+
+        let diag = Diagnostic::error("type mismatch")
+            .with_code(codes::E0001)
+            .with_primary(Span::new(28, 35), "expected i32, found string")
+            .with_secondary(Span::new(17, 20), "declared as i32 here")
+            .with_note("the literal is a string but the binding's type is i32")
+            .with_help("convert the literal explicitly with `.parse::<i32>()`");
+
+        let renderer = AriadneDiagnosticDisplay {
+            // Force no-color so snapshot text stays stable & comparable.
+            use_colors: false,
+        };
+        let rendered = format!(
+            "{}",
+            DisplayWrapper {
+                diagnostic: &diag,
+                display: &renderer,
+                source_map: &source_map,
+            }
+        );
+
+        assert!(!rendered.is_empty(), "ariadne should produce output");
+        assert!(
+            rendered.contains("type mismatch"),
+            "diagnostic message must appear; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("E0001"),
+            "error code must appear; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("test.zy"),
+            "filename must appear; got: {rendered}"
+        );
     }
 
     #[test]

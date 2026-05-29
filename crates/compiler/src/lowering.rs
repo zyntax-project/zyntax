@@ -546,14 +546,14 @@ impl LoweringContext {
     pub fn display_diagnostics(&self, program: &zyntax_typed_ast::TypedProgram) {
         let diag = self.diagnostics.borrow();
         if diag.warning_count() > 0 || diag.has_errors() {
-            use zyntax_typed_ast::diagnostics::ConsoleDiagnosticDisplay;
+            use zyntax_typed_ast::diagnostics::AriadneDiagnosticDisplay;
             use zyntax_typed_ast::source::SourceMap;
 
             let mut source_map = SourceMap::new();
             for source_file in &program.source_files {
                 source_map.add_file(source_file.name.clone(), source_file.content.clone());
             }
-            let display = ConsoleDiagnosticDisplay::default();
+            let display = AriadneDiagnosticDisplay::default();
             let output = diag.display_all(&display, &source_map);
             eprint!("{}", output);
         }
@@ -647,7 +647,7 @@ impl LoweringContext {
             // If stdlib is included, suppress diagnostic output
             // (these are known false positives from generic/trait type checking)
             if !has_stdlib {
-                use zyntax_typed_ast::diagnostics::{ConsoleDiagnosticDisplay, DiagnosticDisplay};
+                use zyntax_typed_ast::diagnostics::AriadneDiagnosticDisplay;
                 use zyntax_typed_ast::source::SourceMap;
                 if std::env::var("ZYNTAX_DEBUG_TYPES").is_ok() {
                     eprintln!("\n=== Type Checking Diagnostics ===");
@@ -657,7 +657,7 @@ impl LoweringContext {
                     for source_file in &program.source_files {
                         source_map.add_file(source_file.name.clone(), source_file.content.clone());
                     }
-                    let display = ConsoleDiagnosticDisplay::default();
+                    let display = AriadneDiagnosticDisplay::default();
 
                     // Use the built-in pretty formatter
                     let diagnostic_output =

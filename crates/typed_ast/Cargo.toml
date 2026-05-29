@@ -9,6 +9,7 @@ description = "TypedAST - Common typed intermediate representation for multiple 
 # Error handling and diagnostics
 thiserror = { workspace = true }
 miette = { workspace = true }
+ariadne = { workspace = true }
 
 # Basic utilities
 serde = { workspace = true }
