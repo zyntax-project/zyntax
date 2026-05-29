@@ -422,6 +422,23 @@ pub enum Op {
         args: u32,
         ret_ty: u32,
     },
+    /// `HirInstruction::AsyncSaveSlot { frame, slot, value }` — store
+    /// `value` (as i64) at `frame + slot * 8`. Krio's SM layout uses
+    /// uniform 8-byte slots; `frame` is the SM-ptr param after
+    /// `reshape_to_poll_abi`.
+    AsyncSaveSlot {
+        frame_reg: Reg,
+        slot: u32,
+        val_reg: Reg,
+    },
+    /// `HirInstruction::AsyncLoadSlot { result, ty, frame, slot }` —
+    /// load typed value at `frame + slot * 8` into `dst`.
+    AsyncLoadSlot {
+        dst: Reg,
+        frame_reg: Reg,
+        slot: u32,
+        ty: u32,
+    },
 }
 
 /// One compiled function: bytecode stream + side pools.
@@ -1006,6 +1023,35 @@ fn lower_inst(
                 ret_ty: ret_ty_idx,
             });
         }
+        HirInstruction::AsyncSaveSlot { frame, slot, value } => {
+            // Slot is 8-byte (i64-sized) per krio's SM layout. Lower
+            // to a one-step Op::AsyncSaveSlot that at execute time
+            // computes `frame + slot * 8` and stores `value` as i64.
+            let frame_reg = reg(*frame)?;
+            let val_reg = reg(*value)?;
+            cf.code.push(Op::AsyncSaveSlot {
+                frame_reg,
+                slot: *slot,
+                val_reg,
+            });
+        }
+        HirInstruction::AsyncLoadSlot {
+            result,
+            ty,
+            frame,
+            slot,
+        } => {
+            let dst = reg(*result)?;
+            let frame_reg = reg(*frame)?;
+            let ty_idx = cf.type_pool.len() as u32;
+            cf.type_pool.push(ty.clone());
+            cf.code.push(Op::AsyncLoadSlot {
+                dst,
+                frame_reg,
+                slot: *slot,
+                ty: ty_idx,
+            });
+        }
         HirInstruction::CreateClosure {
             result,
             function,
@@ -1328,6 +1374,22 @@ pub struct HirInterpreter {
     #[allow(clippy::type_complexity)]
     indirect_call_dispatcher:
         Option<Box<dyn FnMut(i64, Vec<ZyntaxValue>) -> Result<ZyntaxValue, InterpError> + Send>>,
+
+    /// Optional escape hatch for symbol-callable dispatch. On wasm32,
+    /// `call_extern_symbol`'s transmute-to-`extern "C" fn(i64,...)` only
+    /// works when the wasm function table holds an entry whose signature
+    /// matches exactly — Rust fns with mixed `*const u8` + `i64` params
+    /// (e.g. `__zyntax_register_future`) don't, so the indirect call
+    /// traps with "function signature mismatch". When this dispatcher
+    /// is set, `Op::CallSym` consults it FIRST: a `Some(value)` return
+    /// short-circuits the transmute path. The dispatcher receives the
+    /// symbol name + the resolved arg values; it returns `Ok(Some(v))`
+    /// to hand back a value, `Ok(None)` to fall through to the native
+    /// transmute path, or `Err` to propagate.
+    #[allow(clippy::type_complexity)]
+    symbol_call_dispatcher: Option<
+        Box<dyn FnMut(&str, Vec<ZyntaxValue>) -> Result<Option<ZyntaxValue>, InterpError> + Send>,
+    >,
 }
 
 /// When a `tick_callback` returns one of these, the interpreter
@@ -1363,6 +1425,7 @@ impl HirInterpreter {
             wasm_jit_handles: HashMap::new(),
             wasm_jit_threshold: 1,
             indirect_call_dispatcher: None,
+            symbol_call_dispatcher: None,
         }
     }
 
@@ -1375,6 +1438,17 @@ impl HirInterpreter {
         >,
     ) {
         self.indirect_call_dispatcher = Some(dispatcher);
+    }
+
+    /// Install a symbol-call escape hatch (wasm32 register_future et
+    /// al). See the field doc on `symbol_call_dispatcher`.
+    pub fn set_symbol_call_dispatcher(
+        &mut self,
+        dispatcher: Box<
+            dyn FnMut(&str, Vec<ZyntaxValue>) -> Result<Option<ZyntaxValue>, InterpError> + Send,
+        >,
+    ) {
+        self.symbol_call_dispatcher = Some(dispatcher);
     }
 
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
@@ -1944,17 +2018,89 @@ impl HirInterpreter {
                     let arg_regs = &cf.args_pool[*args as usize];
                     let arg_vals: Vec<ZyntaxValue> =
                         arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
-                    let name = &cf.symbol_pool[*sym as usize];
-                    let entry = self
-                        .symbols
-                        .get(name)
-                        .copied()
-                        .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
-                    let raw = call_extern_symbol(entry.ptr, &arg_vals);
+                    let name = cf.symbol_pool[*sym as usize].clone();
+
+                    // Phase J.5 wasm32 escape hatch: route through the
+                    // installed symbol-call dispatcher first. A `Some(v)`
+                    // return short-circuits the transmute path; `None`
+                    // falls through to the native transmute below.
+                    let dispatched = if let Some(disp) = self.symbol_call_dispatcher.as_mut() {
+                        disp(&name, arg_vals.clone())?
+                    } else {
+                        None
+                    };
+
+                    let result_val = if let Some(v) = dispatched {
+                        v
+                    } else {
+                        let entry = self
+                            .symbols
+                            .get(&name)
+                            .copied()
+                            .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
+                        let raw = call_extern_symbol(entry.ptr, &arg_vals);
+                        let ty = &cf.type_pool[*ret_ty as usize];
+                        value_from_i64_as(ty, raw)
+                    };
+
                     if *has_dst {
                         let ty = &cf.type_pool[*ret_ty as usize];
-                        regs[*dst as usize] = value_from_i64_as(ty, raw);
+                        let v = match result_val {
+                            ZyntaxValue::Int(i) => value_from_i64_as(ty, i),
+                            other => other,
+                        };
+                        regs[*dst as usize] = v;
                     }
+                    pc += 1;
+                }
+                Op::AsyncSaveSlot {
+                    frame_reg,
+                    slot,
+                    val_reg,
+                } => {
+                    let frame_ptr = match &regs[*frame_reg as usize] {
+                        ZyntaxValue::Pointer(p) => *p,
+                        ZyntaxValue::Int(n) => *n as usize as *mut u8,
+                        ZyntaxValue::UInt(n) => *n as usize as *mut u8,
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "pointer (AsyncSaveSlot frame)".to_string(),
+                                got: format!("{:?}", other),
+                            })
+                        }
+                    };
+                    let val_i64 = value_to_i64(&regs[*val_reg as usize]).ok_or_else(|| {
+                        InterpError::TypeMismatch {
+                            expected: "integer (AsyncSaveSlot value)".to_string(),
+                            got: format!("{:?}", regs[*val_reg as usize]),
+                        }
+                    })?;
+                    unsafe {
+                        let dst_ptr = frame_ptr.add((*slot as usize) * 8) as *mut i64;
+                        *dst_ptr = val_i64;
+                    }
+                    pc += 1;
+                }
+                Op::AsyncLoadSlot {
+                    dst,
+                    frame_reg,
+                    slot,
+                    ty,
+                } => {
+                    let frame_ptr = match &regs[*frame_reg as usize] {
+                        ZyntaxValue::Pointer(p) => *p,
+                        ZyntaxValue::Int(n) => *n as usize as *mut u8,
+                        ZyntaxValue::UInt(n) => *n as usize as *mut u8,
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "pointer (AsyncLoadSlot frame)".to_string(),
+                                got: format!("{:?}", other),
+                            })
+                        }
+                    };
+                    let target_ty = &cf.type_pool[*ty as usize];
+                    let src = unsafe { frame_ptr.add((*slot as usize) * 8) };
+                    regs[*dst as usize] = unsafe { read_typed(src, target_ty) };
                     pc += 1;
                 }
                 Op::CallIndirect {
@@ -2242,6 +2388,55 @@ fn call_extern_symbol(ptr: *const u8, args: &[ZyntaxValue]) -> i64 {
             4 => {
                 let f: extern "C" fn(i64, i64, i64, i64) -> i64 = core::mem::transmute(ptr);
                 f(raw_args[0], raw_args[1], raw_args[2], raw_args[3])
+            }
+            5 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = core::mem::transmute(ptr);
+                f(
+                    raw_args[0],
+                    raw_args[1],
+                    raw_args[2],
+                    raw_args[3],
+                    raw_args[4],
+                )
+            }
+            6 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                    core::mem::transmute(ptr);
+                f(
+                    raw_args[0],
+                    raw_args[1],
+                    raw_args[2],
+                    raw_args[3],
+                    raw_args[4],
+                    raw_args[5],
+                )
+            }
+            7 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    core::mem::transmute(ptr);
+                f(
+                    raw_args[0],
+                    raw_args[1],
+                    raw_args[2],
+                    raw_args[3],
+                    raw_args[4],
+                    raw_args[5],
+                    raw_args[6],
+                )
+            }
+            8 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    core::mem::transmute(ptr);
+                f(
+                    raw_args[0],
+                    raw_args[1],
+                    raw_args[2],
+                    raw_args[3],
+                    raw_args[4],
+                    raw_args[5],
+                    raw_args[6],
+                    raw_args[7],
+                )
             }
             _ => 0,
         }

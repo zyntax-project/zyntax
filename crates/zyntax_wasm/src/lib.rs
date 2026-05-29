@@ -1176,6 +1176,61 @@ fn register_wasm_jit_hooks(rt: &mut InterpRuntime) {
                 Ok(zyntax_compiler::value::ZyntaxValue::Int(rc))
             },
         ));
+
+        // Phase J.5 — symbol-call escape hatch for wasm32. The BC
+        // interpreter's transmute-to-`extern "C" fn(i64,...)` only
+        // works for symbols whose actual function-table signature is
+        // pure i64. `__zyntax_register_future` mixes i32 (pointers
+        // on wasm32) + i64 params and would trap with "function
+        // signature mismatch". Intercept here and call the function
+        // directly through Rust so the wasm signature is correct.
+        rt.install_symbol_call_dispatcher(Box::new(
+            |name: &str,
+             args: Vec<zyntax_compiler::value::ZyntaxValue>|
+             -> Result<
+                Option<zyntax_compiler::value::ZyntaxValue>,
+                zyntax_compiler::hir_interp::InterpError,
+            > {
+                use zyntax_compiler::value::ZyntaxValue;
+                fn as_ptr(v: &ZyntaxValue) -> *mut u8 {
+                    match v {
+                        ZyntaxValue::Pointer(p) => *p,
+                        ZyntaxValue::Int(n) => *n as usize as *mut u8,
+                        ZyntaxValue::UInt(n) => *n as usize as *mut u8,
+                        _ => core::ptr::null_mut(),
+                    }
+                }
+                fn as_i64(v: &ZyntaxValue) -> i64 {
+                    match v {
+                        ZyntaxValue::Int(n) => *n,
+                        ZyntaxValue::UInt(n) => *n as i64,
+                        ZyntaxValue::Pointer(p) => *p as i64,
+                        _ => 0,
+                    }
+                }
+                match name {
+                    "__zyntax_register_future" if args.len() >= 6 => {
+                        // Phase I.2 emit hardcodes task_id arg to 0
+                        // (the multi-task scheduling TODO at
+                        // `lower_host_bridge_await_site`). Override
+                        // here with the active top-level task id so
+                        // `complete_task` fires against the right JS
+                        // resolver.
+                        let active_task_id = ACTIVE_TASK_ID.with(|c| c.get());
+                        let handle = zyntax_embed::__zyntax_register_future(
+                            as_ptr(&args[0]) as *const u8,
+                            as_ptr(&args[1]),
+                            as_i64(&args[2]),
+                            as_i64(&args[3]),
+                            as_i64(&args[4]),
+                            active_task_id,
+                        );
+                        Ok(Some(ZyntaxValue::Int(handle)))
+                    }
+                    _ => Ok(None),
+                }
+            },
+        ));
     }
 }
 
@@ -1360,6 +1415,16 @@ thread_local! {
     /// since wasm32 has no addressable function pointers).
     static WASM_POLL_DISPATCH_INSTALLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Active top-level task_id during `_zyntax_run_async`. Phase I.2's
+    /// bridge emit hardcodes `task_id_const = 0` in the
+    /// `__zyntax_register_future` call (the comment there flags multi-
+    /// task scheduling as future work). Until that emit threads the
+    /// real id through, the wasm symbol-call dispatcher reads from
+    /// this TLS and substitutes — so `complete_task(task_id, value)`
+    /// fires with the user-supplied id and the JS Promise resolver
+    /// registered against it actually fires.
+    static ACTIVE_TASK_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 /// Ensure host_futures' completion callback is wired to
@@ -1457,6 +1522,14 @@ fn run_async_impl(source: &str, task_id: i64) -> RunResult {
 
 #[cfg(target_arch = "wasm32")]
 fn run_async_impl(source: &str, task_id: i64) -> RunResult {
+    // Park the caller-supplied task_id where the wasm symbol-call
+    // dispatcher can read it — Phase I.2 hardcodes the
+    // `__zyntax_register_future` task_id arg to 0, and we substitute
+    // the real id when we intercept the symbol call. This is the
+    // single-task counterpart to the "multi-task scheduling" TODO at
+    // `crates/passes/krio_adapter/src/abi_emit.rs::lower_host_bridge_await_site`.
+    ACTIVE_TASK_ID.with(|c| c.set(task_id));
+
     // Compile + krio passes. Same prelude as `run_impl`; can't share
     // a helper without restructuring, so keep them in sync manually.
     let grammar = match Grammar2::from_source(ZYNML_GRAMMAR) {
@@ -1470,6 +1543,13 @@ fn run_async_impl(source: &str, task_id: i64) -> RunResult {
     let type_registry = std::sync::Arc::new(program.type_registry.clone());
     let mut config = zyntax_compiler::CompilationConfig::default();
     config.opt_level = 0;
+    // Skip the SSA-level legacy `transform_async_function`: it would
+    // eat raw `Intrinsic::Await` into a Promise-polling fallback
+    // BEFORE my Phase I.2 krio cooperative-await rewrite gets a
+    // chance. With `use_krio_async = true`, lowering keeps the
+    // await call intact and `apply_krio_async_lowering` below runs
+    // Phase I.2 against it.
+    config.use_krio_async = true;
     config.builtins.insert(
         "__zw_test_double".to_string(),
         "__zw_test_double".to_string(),
@@ -1487,30 +1567,26 @@ fn run_async_impl(source: &str, task_id: i64) -> RunResult {
         Ok(m) => m,
         Err(e) => return compile_err(format!("HIR lowering failed: {e}")),
     };
+
+    // Snapshot `main_is_async` BEFORE krio runs — once krio rewrites
+    // the async fn into a Promise-returning entry + sibling poll fn,
+    // both share the original `main` name and neither has
+    // `signature.is_async = true`, so a post-krio check can't tell
+    // "the entry happens to be sync because main was originally
+    // sync" from "the entry is sync because krio just wrapped an
+    // originally-async main". Snapshot here, use below to pick
+    // sync-vs-async dispatch path.
+    let main_is_async = hir_module
+        .functions
+        .values()
+        .any(|f| f.name.resolve_global().as_deref() == Some("main") && f.signature.is_async);
+
     if let Err(e) = zyntax_embed::krio_lowering::apply_krio_async_lowering(&mut hir_module) {
         return compile_err(format!("krio-async lowering failed: {e}"));
     }
     if let Err(e) = zyntax_embed::krio_lowering::apply_krio_effect_lowering(&mut hir_module) {
         return compile_err(format!("krio-effect lowering failed: {e}"));
     }
-
-    // Detect whether `main` is async BEFORE moving the module into
-    // the runtime — after `compile_module` the module's accessible
-    // through `rt.module()` but it's an Arc snapshot so checking
-    // here is cleaner.
-    // We can't rely on `signature.is_async` to detect async main
-    // because krio's `generate_promise_entry` produces an entry
-    // function with `is_async: false` (the entry IS the public face
-    // post-transform). Instead, detect by the SIDE-EFFECT of krio:
-    // if there's a sibling "__main_poll" function in the module,
-    // then "main" was rewritten by krio into a Promise-returning
-    // entry — its returned value will be a Promise pointer the
-    // first-poll driver below handles. Otherwise main is genuinely
-    // sync and its returned value is the program result.
-    let main_is_async = hir_module
-        .functions
-        .values()
-        .any(|f| f.name.resolve_global().as_deref() == Some("__main_poll"));
 
     // Build the runtime and immediately move it into RUNTIME_HOLDER
     // so subsequent ACTIVE_RUNTIME pointers stay valid across the

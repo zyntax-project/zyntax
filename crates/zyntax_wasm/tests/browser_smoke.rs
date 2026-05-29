@@ -219,13 +219,17 @@ fn install_async_host_shims() {
     let install_timeout = js_sys::eval(
         r#"
         globalThis._zyntax_call_host_async_set_timeout = function(handle, ms) {
-            console.log("[test] _zyntax_call_host_async_set_timeout called handle=" + handle + ", ms=" + ms);
+            console.log("[test] _zyntax_call_host_async_set_timeout handle=" + handle + ", ms=" + ms);
             const delay = typeof ms === 'bigint' ? Number(ms) : ms;
             setTimeout(function() {
-                const h = typeof handle === 'bigint' ? handle : BigInt(handle);
-                console.log("[test] setTimeout fired, calling resolve_future handle=" + h);
-                const outcome = globalThis.__zw_test_wasm_resolve_future(h, 0n);
-                console.log("[test] resolve_future outcome=" + outcome);
+                try {
+                    const h = typeof handle === 'bigint' ? handle : BigInt(handle);
+                    console.log("[test] setTimeout fired h=" + h);
+                    const outcome = globalThis.__zw_test_wasm_resolve_future(h, 0n);
+                    console.log("[test] resolve_future outcome=" + outcome);
+                } catch (e) {
+                    console.log("[test] setTimeout cb threw: " + e);
+                }
             }, delay);
         };
         "#,
@@ -250,26 +254,7 @@ fn install_resolve_future_helper() {
     helper.forget();
 }
 
-// Currently ignored: the parked-task entry point + krio lowering
-// are wired (Phase J.1-J.4), but the BC interpreter has cascading
-// gaps for the krio promise-entry shape on wasm32:
-//
-//   * 32-bit closure-handle truncation through `*const u8` —
-//     workaround for `ACTIVE_CLOSURE_FNS` is in place but doesn't
-//     fully thread through the resume path.
-//   * `HirInstruction::IndirectCall` against a closure handle —
-//     dispatcher hook installed but the Promise-polling fallback's
-//     IndirectCall reads structs via raw pointer arithmetic the BC
-//     interp's `Op::Load` can't follow when the "pointer" is a
-//     handle.
-//   * Misaligned pointer dereference panic from the resume
-//     entry's struct loads.
-//
-// The native end-to-end (Phase I.4c) works because Cranelift JIT
-// has all this support natively. The wasm path needs more BC
-// interpreter work — separate session.
 #[wasm_bindgen_test]
-#[ignore]
 async fn run_async_with_sleep_yields_and_returns_42() {
     install_host_stubs();
     install_async_host_shims();

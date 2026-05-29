@@ -573,6 +573,7 @@ fn test_compilation_pipeline_all_features() {
         enable_borrow_check: false,
         enable_effect_check: true,
         builtins: indexmap::IndexMap::new(),
+        use_krio_async: false,
     };
 
     let result = compile_to_hir(&mut program, type_registry, config);
@@ -652,6 +653,7 @@ fn test_compilation_pipeline_with_memory_optimizations() {
         enable_borrow_check: false,
         enable_effect_check: true,
         builtins: indexmap::IndexMap::new(),
+        use_krio_async: false,
     };
 
     let result = compile_to_hir(&mut program, type_registry, config);

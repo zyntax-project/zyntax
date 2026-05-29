@@ -328,6 +328,24 @@ impl InterpRuntime {
         self.interp.set_indirect_call_dispatcher(dispatcher);
     }
 
+    /// Install the BC interpreter's symbol-call escape hatch (wasm32).
+    /// See `HirInterpreter::set_symbol_call_dispatcher`.
+    #[allow(clippy::type_complexity)]
+    pub fn install_symbol_call_dispatcher(
+        &mut self,
+        dispatcher: Box<
+            dyn FnMut(
+                    &str,
+                    Vec<zyntax_compiler::value::ZyntaxValue>,
+                ) -> Result<
+                    Option<zyntax_compiler::value::ZyntaxValue>,
+                    zyntax_compiler::hir_interp::InterpError,
+                > + Send,
+        >,
+    ) {
+        self.interp.set_symbol_call_dispatcher(dispatcher);
+    }
+
     /// Register a statically-linked ZRTL plugin into the BC
     /// interpreter's FFI table. Wasm-shim equivalent of
     /// `ZyntaxRuntime::register_static_plugin` — same SDK

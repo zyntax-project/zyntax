@@ -221,6 +221,16 @@ pub struct CompilationConfig {
     /// against the runtime's registered-symbol table, so the same
     /// declaration works across native + wasm.
     pub builtins: indexmap::IndexMap<String, String>,
+    /// When `true`, the SSA-level legacy `transform_async_function`
+    /// pass is skipped so a downstream `krio_adapter` post-pass owns
+    /// the async → poll-fn state-machine transform. The wasm shim
+    /// sets this so Phase I.2's cooperative-await rewrite reaches
+    /// raw `Intrinsic::Await` calls (which the legacy transform
+    /// would otherwise eat into a Promise-polling fallback before
+    /// krio runs). Defaults to `false` for backwards compatibility
+    /// with existing native callers; flip on when calling
+    /// `apply_krio_async_lowering` afterward.
+    pub use_krio_async: bool,
 }
 
 impl std::fmt::Debug for CompilationConfig {
@@ -257,6 +267,7 @@ impl Default for CompilationConfig {
             enable_borrow_check: false, // Disabled by default for now
             enable_effect_check: true,  // Enable effect checking by default
             builtins: indexmap::IndexMap::new(),
+            use_krio_async: false,
         }
     }
 }
@@ -1455,7 +1466,7 @@ pub fn compile_to_hir(
         // currently emits. Callers that don't need any aliases
         // (the default) pass an empty map.
         builtins: config.builtins.clone(),
-        use_krio_async: false,
+        use_krio_async: config.use_krio_async,
     };
 
     // Create arena for string interning (needed for async transformation)
@@ -1500,7 +1511,10 @@ pub fn compile_to_hir(
     lowering_ctx.display_diagnostics(program);
 
     // Step 2: Async transformation (if async runtime is configured)
-    if let Some(runtime_type) = config.async_runtime {
+    // Skipped when `use_krio_async` is set so a downstream krio post-pass
+    // can do the captures-lift transform instead. Mirrors the parallel
+    // skip at `lowering.rs::lower_function` (see line ~2134).
+    if let Some(runtime_type) = config.async_runtime.filter(|_| !config.use_krio_async) {
         // Transform async functions into state machines
         let async_func_ids: Vec<HirId> = hir_module
             .functions
