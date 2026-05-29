@@ -1830,6 +1830,21 @@ impl SsaBuilder {
                 // Evaluate expression for side effects
                 self.translate_expression(block_id, expr)?;
             }
+            TypedStatement::Block(block) => {
+                // Recurse into the inner statements. Closure / lambda
+                // bodies don't go through `TypedCfgBuilder`, so the
+                // statement-form control flow split (multi-block CFG)
+                // never runs for them. Any nested `TypedStatement::Block`
+                // — emitted by frontend grammars that group statements,
+                // e.g. Blinc's `match`-arm lowering — must still execute
+                // its children. Without this arm the block falls into
+                // the `_ =>` no-op below and its contents silently drop.
+                let mut current = block_id;
+                for inner in &block.statements {
+                    current = self.process_statement(current, inner)?;
+                }
+                return Ok(current);
+            }
             TypedStatement::Yield(expr) => {
                 if self.compute_yield_stack.is_empty() {
                     return Err(crate::CompilerError::Analysis(
@@ -1892,7 +1907,115 @@ impl SsaBuilder {
                 // The CFG creates separate blocks for each pattern check and arm body
             }
 
-            // Note: Control flow statements (While, If, etc.) are now handled at the
+            // Statement-form `if` inside a closure / lambda body — these
+            // bodies bypass `TypedCfgBuilder`, so the CFG-driven If
+            // handler in `process_terminator` (which reads pre-built
+            // `block.successors`) never fires for them. Create the
+            // then/else/continuation blocks on demand here, mirroring the
+            // expression-form `TypedExpression::If` translator. The
+            // current block ends with a CondBranch into the new blocks;
+            // the returned HirId is the continuation so subsequent
+            // statements in the surrounding body land there.
+            TypedStatement::If(if_stmt) => {
+                let cond_val = self.translate_expression(block_id, &if_stmt.condition)?;
+
+                let then_id = HirId::new();
+                let else_id = HirId::new();
+                let cont_id = HirId::new();
+                self.function
+                    .blocks
+                    .insert(then_id, crate::hir::HirBlock::new(then_id));
+                self.function
+                    .blocks
+                    .insert(else_id, crate::hir::HirBlock::new(else_id));
+                self.function
+                    .blocks
+                    .insert(cont_id, crate::hir::HirBlock::new(cont_id));
+                self.definitions.insert(then_id, IndexMap::new());
+                self.definitions.insert(else_id, IndexMap::new());
+                self.definitions.insert(cont_id, IndexMap::new());
+                self.sealed_blocks.insert(then_id);
+                self.sealed_blocks.insert(else_id);
+                self.sealed_blocks.insert(cont_id);
+
+                // Inherit the current block's variable definitions so the
+                // branch bodies can read locals defined above the `if`.
+                let inherited = self
+                    .definitions
+                    .get(&block_id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.definitions.insert(then_id, inherited.clone());
+                self.definitions.insert(else_id, inherited.clone());
+                self.definitions.insert(cont_id, inherited);
+
+                {
+                    let blk = self.function.blocks.get_mut(&block_id).unwrap();
+                    blk.terminator = HirTerminator::CondBranch {
+                        condition: cond_val,
+                        true_target: then_id,
+                        false_target: else_id,
+                    };
+                    blk.successors = vec![then_id, else_id];
+                }
+                self.function
+                    .blocks
+                    .get_mut(&then_id)
+                    .unwrap()
+                    .predecessors
+                    .push(block_id);
+                self.function
+                    .blocks
+                    .get_mut(&else_id)
+                    .unwrap()
+                    .predecessors
+                    .push(block_id);
+
+                // Translate the then-branch's statements into then_id.
+                let mut then_tail = then_id;
+                for inner in &if_stmt.then_block.statements {
+                    then_tail = self.process_statement(then_tail, inner)?;
+                }
+                {
+                    let blk = self.function.blocks.get_mut(&then_tail).unwrap();
+                    if matches!(blk.terminator, HirTerminator::Unreachable) {
+                        blk.terminator = HirTerminator::Branch { target: cont_id };
+                        blk.successors = vec![cont_id];
+                    }
+                }
+                self.function
+                    .blocks
+                    .get_mut(&cont_id)
+                    .unwrap()
+                    .predecessors
+                    .push(then_tail);
+
+                // Translate the else-branch (or fall straight to cont
+                // when there's no else).
+                let mut else_tail = else_id;
+                if let Some(else_block) = &if_stmt.else_block {
+                    for inner in &else_block.statements {
+                        else_tail = self.process_statement(else_tail, inner)?;
+                    }
+                }
+                {
+                    let blk = self.function.blocks.get_mut(&else_tail).unwrap();
+                    if matches!(blk.terminator, HirTerminator::Unreachable) {
+                        blk.terminator = HirTerminator::Branch { target: cont_id };
+                        blk.successors = vec![cont_id];
+                    }
+                }
+                self.function
+                    .blocks
+                    .get_mut(&cont_id)
+                    .unwrap()
+                    .predecessors
+                    .push(else_tail);
+
+                return Ok(cont_id);
+            }
+
+            // Note: Control flow statements (While, etc.) are now handled at the
             // TypedCFG level by TypedCfgBuilder.split_at_control_flow()
             // This is the solution to Gap 2 - multi-block CFG construction
 
@@ -4104,10 +4227,27 @@ impl SsaBuilder {
                     .blocks
                     .insert(merge_block_id, HirBlock::new(merge_block_id));
 
-                // Initialize definitions for new blocks
-                self.definitions.insert(then_block_id, IndexMap::new());
-                self.definitions.insert(else_block_id, IndexMap::new());
+                // Initialize definitions for new blocks. Inherit the
+                // current block's variable bindings so the branch bodies
+                // can read locals (function params, let-bindings, outer
+                // captures) defined above the if-expression. Without
+                // inheritance, `read_variable` synthesises an incomplete
+                // phi for every outer-scope variable referenced inside the
+                // branches — which Cranelift lowers to a block parameter,
+                // and the matching `brif` ends up missing its arg list →
+                // "got 0, expected 1" verifier error. The merge block
+                // intentionally stays empty (its phis are created
+                // explicitly for the if's value below).
+                let inherited = self
+                    .definitions
+                    .get(&block_id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.definitions.insert(then_block_id, inherited.clone());
+                self.definitions.insert(else_block_id, inherited);
                 self.definitions.insert(merge_block_id, IndexMap::new());
+                self.sealed_blocks.insert(then_block_id);
+                self.sealed_blocks.insert(else_block_id);
 
                 // Set conditional branch terminator for current block
                 self.function.blocks.get_mut(&block_id).unwrap().terminator =
@@ -4133,18 +4273,28 @@ impl SsaBuilder {
                     .predecessors
                     .push(block_id);
 
-                // Translate then branch
+                // Translate then branch. The branch's translation may run
+                // its own nested control flow (another if-expression / Block
+                // chain) and end up in a DIFFERENT block — `continuation_block`
+                // points at that tail. Wire the Branch-to-merge onto that
+                // tail block, not the original `then_block_id`, otherwise
+                // we clobber the nested CondBranch and the inner branches
+                // get severed (Cranelift verifier then complains about
+                // missing brif args / unreachable blocks).
+                let saved_cont_before_then = self.continuation_block.take();
                 let then_val = self.translate_expression(then_block_id, then_branch)?;
+                let then_tail = self.continuation_block.take().unwrap_or(then_block_id);
+                self.continuation_block = saved_cont_before_then;
                 self.function
                     .blocks
-                    .get_mut(&then_block_id)
+                    .get_mut(&then_tail)
                     .unwrap()
                     .terminator = HirTerminator::Branch {
                     target: merge_block_id,
                 };
                 self.function
                     .blocks
-                    .get_mut(&then_block_id)
+                    .get_mut(&then_tail)
                     .unwrap()
                     .successors = vec![merge_block_id];
                 self.function
@@ -4152,20 +4302,24 @@ impl SsaBuilder {
                     .get_mut(&merge_block_id)
                     .unwrap()
                     .predecessors
-                    .push(then_block_id);
+                    .push(then_tail);
 
-                // Translate else branch
+                // Translate else branch — same continuation-tail handling
+                // as the then branch.
+                let saved_cont_before_else = self.continuation_block.take();
                 let else_val = self.translate_expression(else_block_id, else_branch)?;
+                let else_tail = self.continuation_block.take().unwrap_or(else_block_id);
+                self.continuation_block = saved_cont_before_else;
                 self.function
                     .blocks
-                    .get_mut(&else_block_id)
+                    .get_mut(&else_tail)
                     .unwrap()
                     .terminator = HirTerminator::Branch {
                     target: merge_block_id,
                 };
                 self.function
                     .blocks
-                    .get_mut(&else_block_id)
+                    .get_mut(&else_tail)
                     .unwrap()
                     .successors = vec![merge_block_id];
                 self.function
@@ -4173,22 +4327,34 @@ impl SsaBuilder {
                     .get_mut(&merge_block_id)
                     .unwrap()
                     .predecessors
-                    .push(else_block_id);
+                    .push(else_tail);
 
-                // Create phi in merge block
+                // Phi in merge block — only when the if-expression actually
+                // produces a value (non-Void result type). Statement-like ifs
+                // (lowered from `match` with side-effecting arms, blocks ending
+                // in unit) declare `expr.ty = Unit` → Void. Emitting a phi with
+                // ty:Void but incoming i32/i64 values from the branches' last
+                // expressions fails Cranelift's verifier (mismatched arg types).
+                // When the result is Void, return an undef-Void and skip the
+                // phi entirely — the surrounding code is using the if for side
+                // effects, not its value.
                 let result_type = self.convert_type(&expr.ty);
-                let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
-
-                self.function
-                    .blocks
-                    .get_mut(&merge_block_id)
-                    .unwrap()
-                    .phis
-                    .push(HirPhi {
-                        result,
-                        ty: result_type,
-                        incoming: vec![(then_val, then_block_id), (else_val, else_block_id)],
-                    });
+                let result = if matches!(result_type, HirType::Void) {
+                    self.create_value(HirType::Void, HirValueKind::Undef)
+                } else {
+                    let r = self.create_value(result_type.clone(), HirValueKind::Instruction);
+                    self.function
+                        .blocks
+                        .get_mut(&merge_block_id)
+                        .unwrap()
+                        .phis
+                        .push(HirPhi {
+                            result: r,
+                            ty: result_type,
+                            incoming: vec![(then_val, then_tail), (else_val, else_tail)],
+                        });
+                    r
+                };
 
                 // Set continuation block so subsequent code executes in merge block
                 self.continuation_block = Some(merge_block_id);
@@ -4931,27 +5097,52 @@ impl SsaBuilder {
                 // Block expression: evaluate all statements, return value of last expression.
                 // Used by f-string desugaring (closure approach): the block contains
                 // print() calls for each f-string part and ends with an empty string.
+                //
+                // Closure / lambda bodies pass through here too (the parser wraps the
+                // body's statement list in `TypedExpression::Block`). Any control-flow
+                // STATEMENT inside the body — `if`, `Block`, etc. — must be routed to
+                // `process_statement` so its on-demand block-creation path runs;
+                // dropping it on the `_ => {}` floor (as this arm did before) silently
+                // skipped both branches of every if-statement inside a closure.
                 let mut last_val = self.create_undef(HirType::Void);
+                let mut current = block_id;
                 for stmt in &block.statements {
                     match &stmt.node {
                         zyntax_typed_ast::typed_ast::TypedStatement::Expression(e) => {
-                            last_val = self.translate_expression(block_id, e)?;
+                            last_val = self.translate_expression(current, e)?;
                         }
                         zyntax_typed_ast::typed_ast::TypedStatement::Let(let_stmt) => {
                             if let Some(init) = &let_stmt.initializer {
-                                let val = self.translate_expression(block_id, init)?;
-                                self.write_variable(let_stmt.name, block_id, val);
+                                let val = self.translate_expression(current, init)?;
+                                self.write_variable(let_stmt.name, current, val);
                                 self.var_types
                                     .insert(let_stmt.name, self.convert_type(&let_stmt.ty));
                             }
                         }
                         zyntax_typed_ast::typed_ast::TypedStatement::Return(ret_expr) => {
                             if let Some(ret) = ret_expr {
-                                let val = self.translate_expression(block_id, ret)?;
+                                let val = self.translate_expression(current, ret)?;
                                 last_val = val;
                             }
                         }
-                        _ => {}
+                        _ => {
+                            // Route through process_statement so If / nested Block /
+                            // While / etc. get their on-demand block-creation
+                            // handlers. The returned HirId is the new "current" block
+                            // — subsequent statements in this body land there.
+                            current = self.process_statement(current, stmt)?;
+                            last_val = self.create_undef(HirType::Void);
+                        }
+                    }
+                    // If a control-flow EXPRESSION (`TypedExpression::If`,
+                    // match, …) branched and set up a merge/continuation
+                    // block, every subsequent statement in this body must
+                    // land there — not in the original `current`. Without
+                    // this consumption the brif / merge phi is left
+                    // unpopulated and Cranelift's verifier rejects with a
+                    // "mismatched argument count" error.
+                    if let Some(cont) = self.continuation_block.take() {
+                        current = cont;
                     }
                 }
                 Ok(last_val)
@@ -8646,6 +8837,15 @@ impl SsaBuilder {
                 if let Some((param_id, param_ty)) = param_values.get(idx) {
                     entry_defs.insert(param.name, *param_id);
                     self.var_types.insert(param.name, param_ty.clone());
+                    // Mirror the TypedAST-side type so resolvers that read
+                    // `var_typed_ast_types` (match lowering for string-eq,
+                    // f-string desugaring, `.field` / `.method()` access)
+                    // see the param's nominal type instead of falling back
+                    // to `Type::Any` (which downstream paths treat as Int).
+                    if let Some(ref typed_ty) = param.ty {
+                        self.var_typed_ast_types
+                            .insert(param.name, typed_ty.clone());
+                    }
                 }
             }
             for (name, outer_val_id) in &outer_captures {
@@ -8795,18 +8995,29 @@ impl SsaBuilder {
             body_result?
         };
 
-        // The entry block already lives inside `lambda_func.blocks` from
-        // the swap above. Pull it out, set the Return terminator, put it
-        // back. (Direct mutation through `blocks.get_mut` is fine but
-        // less explicit about the ownership flow.)
-        let mut entry_block = lambda_func
+        // Wire the Return terminator onto every block whose terminator
+        // is still `Unreachable`. Pre-fix this only touched
+        // `entry_block_id`, which clobbered any CondBranch a top-level
+        // if-statement set there and stranded the if-branches as
+        // unreachable code. Now if/match-lowered bodies leave a
+        // continuation block at the tail with Unreachable; those get
+        // Return. Blocks whose terminator was already set (Branch /
+        // CondBranch into a nested cont-block) stay untouched.
+        let return_values = vec![result_val];
+        let tail_ids: Vec<HirId> = lambda_func
             .blocks
-            .shift_remove(&entry_block_id)
-            .expect("lambda entry block was inserted before context-swap");
-        entry_block.terminator = crate::hir::HirTerminator::Return {
-            values: vec![result_val],
-        };
-        lambda_func.blocks.insert(entry_block_id, entry_block);
+            .iter()
+            .filter_map(|(id, blk)| {
+                matches!(blk.terminator, crate::hir::HirTerminator::Unreachable).then_some(*id)
+            })
+            .collect();
+        for id in tail_ids {
+            if let Some(blk) = lambda_func.blocks.get_mut(&id) {
+                blk.terminator = crate::hir::HirTerminator::Return {
+                    values: return_values.clone(),
+                };
+            }
+        }
 
         // Store the lambda function for later compilation
         self.closure_functions.push(lambda_func);
