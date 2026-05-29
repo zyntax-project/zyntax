@@ -1940,11 +1940,7 @@ impl SsaBuilder {
 
                 // Inherit the current block's variable definitions so the
                 // branch bodies can read locals defined above the `if`.
-                let inherited = self
-                    .definitions
-                    .get(&block_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let inherited = self.definitions.get(&block_id).cloned().unwrap_or_default();
                 self.definitions.insert(then_id, inherited.clone());
                 self.definitions.insert(else_id, inherited.clone());
                 self.definitions.insert(cont_id, inherited);
@@ -4238,11 +4234,7 @@ impl SsaBuilder {
                 // "got 0, expected 1" verifier error. The merge block
                 // intentionally stays empty (its phis are created
                 // explicitly for the if's value below).
-                let inherited = self
-                    .definitions
-                    .get(&block_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let inherited = self.definitions.get(&block_id).cloned().unwrap_or_default();
                 self.definitions.insert(then_block_id, inherited.clone());
                 self.definitions.insert(else_block_id, inherited);
                 self.definitions.insert(merge_block_id, IndexMap::new());
@@ -4285,18 +4277,11 @@ impl SsaBuilder {
                 let then_val = self.translate_expression(then_block_id, then_branch)?;
                 let then_tail = self.continuation_block.take().unwrap_or(then_block_id);
                 self.continuation_block = saved_cont_before_then;
-                self.function
-                    .blocks
-                    .get_mut(&then_tail)
-                    .unwrap()
-                    .terminator = HirTerminator::Branch {
-                    target: merge_block_id,
-                };
-                self.function
-                    .blocks
-                    .get_mut(&then_tail)
-                    .unwrap()
-                    .successors = vec![merge_block_id];
+                self.function.blocks.get_mut(&then_tail).unwrap().terminator =
+                    HirTerminator::Branch {
+                        target: merge_block_id,
+                    };
+                self.function.blocks.get_mut(&then_tail).unwrap().successors = vec![merge_block_id];
                 self.function
                     .blocks
                     .get_mut(&merge_block_id)
@@ -4310,18 +4295,11 @@ impl SsaBuilder {
                 let else_val = self.translate_expression(else_block_id, else_branch)?;
                 let else_tail = self.continuation_block.take().unwrap_or(else_block_id);
                 self.continuation_block = saved_cont_before_else;
-                self.function
-                    .blocks
-                    .get_mut(&else_tail)
-                    .unwrap()
-                    .terminator = HirTerminator::Branch {
-                    target: merge_block_id,
-                };
-                self.function
-                    .blocks
-                    .get_mut(&else_tail)
-                    .unwrap()
-                    .successors = vec![merge_block_id];
+                self.function.blocks.get_mut(&else_tail).unwrap().terminator =
+                    HirTerminator::Branch {
+                        target: merge_block_id,
+                    };
+                self.function.blocks.get_mut(&else_tail).unwrap().successors = vec![merge_block_id];
                 self.function
                     .blocks
                     .get_mut(&merge_block_id)
