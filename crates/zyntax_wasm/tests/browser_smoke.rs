@@ -152,3 +152,194 @@ fn reject_future_unknown_handle_returns_outcome_2() {
     let rc = _zyntax_reject_future(999_999_998, "test failure");
     assert_eq!(rc, 2);
 }
+
+// ----- Parked-task path (Phase J) ----------------------------
+//
+// End-to-end browser test: an async ZynML program with `await
+// sleep(100)` parks the SM, the JS-side setTimeout fires after
+// ~100ms, `_zyntax_resolve_future` drives the SM to Ready, and
+// `_zyntax_complete_task` resolves a JS Promise the test awaits.
+//
+// Verifies wall-clock ≥ 90ms — proves the parking actually
+// happened, not that the SM synchronously collapsed (which would
+// finish in ~0ms).
+
+/// Install the cooperative-async JS host shims:
+///   * `_zyntax_complete_task(task_id, value, ok)` — captures the
+///     resolved value into a JS Map keyed by task_id; per-test
+///     promise resolvers (registered before `_zyntax_run_async`)
+///     read from there.
+///   * `_zyntax_call_host_async_set_timeout(handle, ms)` — invokes
+///     real `setTimeout` then calls `_zyntax_resolve_future(handle,
+///     0)` so the parked SM advances and the Promise resolves.
+fn install_async_host_shims() {
+    let global = js_sys::global();
+
+    // Per-task resolver registry. The test awaits a JS Promise
+    // whose resolver is keyed by task_id; complete_task looks it up
+    // and resolves with the value.
+    let init_registry = js_sys::eval(
+        r#"
+        if (!globalThis.__zw_test_task_resolvers) {
+            globalThis.__zw_test_task_resolvers = new Map();
+        }
+        "#,
+    );
+    assert!(init_registry.is_ok());
+
+    // _zyntax_complete_task: look up the registered resolver and
+    // resolve it with `value`. Tests that don't register a resolver
+    // beforehand are not affected.
+    let complete_fn = Closure::wrap(Box::new(|task_id: i64, value: i64, _ok: u32| {
+        let _ = js_sys::eval(&format!(
+            r#"
+            (function() {{
+                console.log("[test] _zyntax_complete_task called task_id={}, value={}");
+                const r = globalThis.__zw_test_task_resolvers.get({});
+                if (r) {{
+                    globalThis.__zw_test_task_resolvers.delete({});
+                    r({});
+                }}
+            }})()
+            "#,
+            task_id, value, task_id, task_id, value
+        ));
+    }) as Box<dyn Fn(i64, i64, u32)>);
+    let _ = js_sys::Reflect::set(
+        &global,
+        &JsValue::from_str("_zyntax_complete_task"),
+        complete_fn.as_ref().unchecked_ref(),
+    );
+    complete_fn.forget();
+
+    // _zyntax_call_host_async_set_timeout: fire setTimeout, then
+    // resolve the future on the wasm side. Wire via JS string so we
+    // don't need a Rust-side closure that takes a wasm extern
+    // reference.
+    let install_timeout = js_sys::eval(
+        r#"
+        globalThis._zyntax_call_host_async_set_timeout = function(handle, ms) {
+            console.log("[test] _zyntax_call_host_async_set_timeout called handle=" + handle + ", ms=" + ms);
+            const delay = typeof ms === 'bigint' ? Number(ms) : ms;
+            setTimeout(function() {
+                const h = typeof handle === 'bigint' ? handle : BigInt(handle);
+                console.log("[test] setTimeout fired, calling resolve_future handle=" + h);
+                const outcome = globalThis.__zw_test_wasm_resolve_future(h, 0n);
+                console.log("[test] resolve_future outcome=" + outcome);
+            }, delay);
+        };
+        "#,
+    );
+    assert!(install_timeout.is_ok());
+}
+
+/// Bind a JS-side helper that calls the wasm `_zyntax_resolve_future`
+/// export. The setTimeout shim above can't reference the wasm
+/// binding directly because it runs through `eval`; this helper
+/// closes over the actual binding via a wasm-bindgen Closure.
+fn install_resolve_future_helper() {
+    let global = js_sys::global();
+    let helper = Closure::wrap(Box::new(|handle: i64, value: i64| -> i32 {
+        _zyntax_resolve_future(handle, value)
+    }) as Box<dyn Fn(i64, i64) -> i32>);
+    let _ = js_sys::Reflect::set(
+        &global,
+        &JsValue::from_str("__zw_test_wasm_resolve_future"),
+        helper.as_ref().unchecked_ref(),
+    );
+    helper.forget();
+}
+
+// Currently ignored: the parked-task entry point + krio lowering
+// are wired (Phase J.1-J.4), but the BC interpreter has cascading
+// gaps for the krio promise-entry shape on wasm32:
+//
+//   * 32-bit closure-handle truncation through `*const u8` —
+//     workaround for `ACTIVE_CLOSURE_FNS` is in place but doesn't
+//     fully thread through the resume path.
+//   * `HirInstruction::IndirectCall` against a closure handle —
+//     dispatcher hook installed but the Promise-polling fallback's
+//     IndirectCall reads structs via raw pointer arithmetic the BC
+//     interp's `Op::Load` can't follow when the "pointer" is a
+//     handle.
+//   * Misaligned pointer dereference panic from the resume
+//     entry's struct loads.
+//
+// The native end-to-end (Phase I.4c) works because Cranelift JIT
+// has all this support natively. The wasm path needs more BC
+// interpreter work — separate session.
+#[wasm_bindgen_test]
+#[ignore]
+async fn run_async_with_sleep_yields_and_returns_42() {
+    install_host_stubs();
+    install_async_host_shims();
+    install_resolve_future_helper();
+
+    let source = "async def main(): i64 {\n    await sleep(100)\n    return 42\n}\n";
+    let task_id: i64 = 42;
+
+    // Build a JS Promise whose resolver is keyed in
+    // `__zw_test_task_resolvers` by this task_id.
+    let register_resolver = js_sys::eval(&format!(
+        r#"
+        (function() {{
+            return new Promise(function(resolve) {{
+                globalThis.__zw_test_task_resolvers.set({}, resolve);
+            }});
+        }})()
+        "#,
+        task_id
+    ))
+    .expect("eval should produce a Promise");
+    let promise: js_sys::Promise = register_resolver.dyn_into().expect("Promise");
+
+    // Start the parked task. RunResult.ok should be true; for async
+    // programs the value is delivered later via complete_task →
+    // promise resolution.
+    let start_ms = js_sys::Date::now();
+    let initial = _zyntax_run_async(source, task_id);
+    assert!(
+        initial.ok(),
+        "run_async should compile + start the task, output={}, kind={:?}",
+        initial.output(),
+        initial.error_kind()
+    );
+
+    // Wait for complete_task to resolve the JS Promise. Race against
+    // a 5s timeout so a hung test fails fast (the underlying
+    // wasm-bindgen-test runner's default is much longer and
+    // suppresses console output on hang).
+    let timeout_promise: js_sys::Promise = js_sys::eval(
+        r#"
+        new Promise(function(_, reject) {
+            setTimeout(function() {
+                reject(new Error('5s timeout — complete_task never fired'));
+            }, 5000);
+        })
+        "#,
+    )
+    .expect("eval timeout")
+    .dyn_into()
+    .expect("Promise");
+    let race = js_sys::Promise::race(&js_sys::Array::of2(&promise, &timeout_promise));
+    let resolved = wasm_bindgen_futures::JsFuture::from(race)
+        .await
+        .expect("Promise should resolve cleanly");
+    let elapsed_ms = js_sys::Date::now() - start_ms;
+
+    // The resolver was called with the task's i64 value — should be
+    // 42 from `return 42`.
+    let value = resolved.as_f64().expect("resolver delivered a number");
+    assert!(
+        (value - 42.0).abs() < 0.5,
+        "expected 42, got {value} (initial RunResult output={:?})",
+        initial.output()
+    );
+
+    // Wall-clock proves the SM actually parked. setTimeout(100) +
+    // wasm-bindgen-test scheduling overhead → expect ≥ 90ms.
+    assert!(
+        elapsed_ms >= 90.0,
+        "expected wall-clock ≥ 90ms (cooperative parking + setTimeout); got {elapsed_ms}ms"
+    );
+}

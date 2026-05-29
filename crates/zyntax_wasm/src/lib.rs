@@ -1155,6 +1155,28 @@ fn register_wasm_jit_hooks(rt: &mut InterpRuntime) {
     );
 
     rt.install_wasm_jit_hooks(compile_hook, dispatch_hook);
+
+    // IndirectCall dispatcher — the BC interpreter routes
+    // `HirInstruction::IndirectCall` through this when the function
+    // pointer is a wasm32 closure handle (the truncated form Phase
+    // I.3 emits via `HirId::to_handle_hash` + ZyntaxValue::Pointer
+    // narrowing). The handle resolves through `ACTIVE_CLOSURE_FNS`
+    // (same map the JS-side `host.indirect_call@N` import uses)
+    // and re-enters `call_function`.
+    #[cfg(target_arch = "wasm32")]
+    {
+        rt.install_indirect_call_dispatcher(Box::new(
+            |handle: i64,
+             args: Vec<zyntax_compiler::value::ZyntaxValue>|
+             -> Result<
+                zyntax_compiler::value::ZyntaxValue,
+                zyntax_compiler::hir_interp::InterpError,
+            > {
+                let rc = call_indirect_by_handle(handle, args);
+                Ok(zyntax_compiler::value::ZyntaxValue::Int(rc))
+            },
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1353,13 @@ thread_local! {
     /// Idempotent — install on the first `_zyntax_run_async` call.
     static COMPLETE_TASK_BRIDGE_INSTALLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Whether `install_wasm_poll_dispatcher_bridge` has wired the
+    /// host_futures wasm poll dispatcher (which routes
+    /// `resolve_future`'s SM poll through `call_indirect_by_handle`
+    /// since wasm32 has no addressable function pointers).
+    static WASM_POLL_DISPATCH_INSTALLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Ensure host_futures' completion callback is wired to
@@ -1355,6 +1384,27 @@ fn install_complete_task_bridge() {
     COMPLETE_TASK_BRIDGE_INSTALLED.with(|c| c.set(true));
 }
 
+/// Install the wasm32 poll dispatcher into `host_futures` so
+/// `resolve_future` can drive parked SMs without a raw fn-ptr
+/// transmute (which wasm32 doesn't support). The dispatcher routes
+/// the closure handle through `call_indirect_by_handle` — same
+/// re-entry path Phase I.3 uses for ZynML-level indirect calls.
+fn install_wasm_poll_dispatcher_bridge() {
+    if WASM_POLL_DISPATCH_INSTALLED.with(|c| c.get()) {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        zyntax_embed::host_futures::set_wasm_poll_dispatcher(Box::new(
+            |handle: i64, sm_ptr: *mut u8| -> i64 {
+                use zyntax_compiler::value::ZyntaxValue;
+                call_indirect_by_handle(handle, vec![ZyntaxValue::Pointer(sm_ptr)])
+            },
+        ));
+    }
+    WASM_POLL_DISPATCH_INSTALLED.with(|c| c.set(true));
+}
+
 /// Promise-routed entry point. Same compile-and-run pipeline as
 /// [`run`] but the result is delivered through `js_complete_task`
 /// (the JS-side Promise resolver registry hook) rather than
@@ -1370,25 +1420,297 @@ fn install_complete_task_bridge() {
 #[wasm_bindgen]
 pub fn _zyntax_run_async(source: &str, task_id: i64) -> RunResult {
     install_complete_task_bridge();
+    install_wasm_poll_dispatcher_bridge();
+    run_async_impl(source, task_id)
+}
+
+/// Parked-task-aware entry. Compiles the source, detects whether
+/// `main` is async, and either:
+///
+/// * Sync main — calls `main()` synchronously, fires
+///   `js_complete_task(task_id, value, 1)` inline, returns ok.
+///
+/// * Async main — parks the runtime in `RUNTIME_HOLDER[task_id]`,
+///   sets up `ACTIVE_*` thread-locals pointing at the parked
+///   runtime, drives the first poll. If the SM completes
+///   synchronously (no actual yield), fires complete_task with the
+///   value. If it parks (returned 0/Pending), leaves the runtime
+///   in the holder and returns ok=true — the JS Promise stays
+///   pending until `_zyntax_resolve_future` drives the SM to Ready
+///   and the host_futures completion callback fires
+///   complete_task asynchronously.
+///
+/// Native build: parked-task internals (`ACTIVE_RUNTIME`,
+/// `call_indirect_by_handle`, etc.) are wasm32-only, so the native
+/// shim falls back to the synchronous `run_impl` path. Native
+/// callers test this function purely for its sync-program shape;
+/// the parked path is exercised by `wasm-pack test`.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_async_impl(source: &str, task_id: i64) -> RunResult {
     let result = run_impl(source);
     if result.ok {
-        // Synchronous completion path. Marshal the output's i64
-        // form for js_complete_task — for now we pass 0 since
-        // `output` is a stringified value; the JS side reads the
-        // `output` field from the RunResult directly. The `value`
-        // arg threading the parking-resume path is what matters.
-        //
-        // Parse `output` as i64 best-effort so simple numeric
-        // programs round-trip cleanly through the resolver
-        // callback; richer types fall back to 0.
         let value = result.output.parse::<i64>().unwrap_or(0);
         js_complete_task(task_id, value, 1);
     }
-    // Compile/runtime errors: caller's Promise wrapper sees the
-    // returned RunResult and resolves with `ok=false`; don't fire
-    // js_complete_task for these so the registry doesn't have to
-    // distinguish "failed" from "succeeded with value 0."
     result
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_async_impl(source: &str, task_id: i64) -> RunResult {
+    // Compile + krio passes. Same prelude as `run_impl`; can't share
+    // a helper without restructuring, so keep them in sync manually.
+    let grammar = match Grammar2::from_source(ZYNML_GRAMMAR) {
+        Ok(g) => g,
+        Err(e) => return compile_err(format!("ZynML grammar failed to load: {e}")),
+    };
+    let mut program = match grammar.parse_with_filename(source, "<run_async>") {
+        Ok(p) => p,
+        Err(e) => return compile_err(format!("parse error: {e}")),
+    };
+    let type_registry = std::sync::Arc::new(program.type_registry.clone());
+    let mut config = zyntax_compiler::CompilationConfig::default();
+    config.opt_level = 0;
+    config.builtins.insert(
+        "__zw_test_double".to_string(),
+        "__zw_test_double".to_string(),
+    );
+    config.builtins.insert(
+        "sleep".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
+    config.builtins.insert(
+        "__zyntax_async_set_timeout".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
+    let mut hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config)
+    {
+        Ok(m) => m,
+        Err(e) => return compile_err(format!("HIR lowering failed: {e}")),
+    };
+    if let Err(e) = zyntax_embed::krio_lowering::apply_krio_async_lowering(&mut hir_module) {
+        return compile_err(format!("krio-async lowering failed: {e}"));
+    }
+    if let Err(e) = zyntax_embed::krio_lowering::apply_krio_effect_lowering(&mut hir_module) {
+        return compile_err(format!("krio-effect lowering failed: {e}"));
+    }
+
+    // Detect whether `main` is async BEFORE moving the module into
+    // the runtime — after `compile_module` the module's accessible
+    // through `rt.module()` but it's an Arc snapshot so checking
+    // here is cleaner.
+    // We can't rely on `signature.is_async` to detect async main
+    // because krio's `generate_promise_entry` produces an entry
+    // function with `is_async: false` (the entry IS the public face
+    // post-transform). Instead, detect by the SIDE-EFFECT of krio:
+    // if there's a sibling "__main_poll" function in the module,
+    // then "main" was rewritten by krio into a Promise-returning
+    // entry — its returned value will be a Promise pointer the
+    // first-poll driver below handles. Otherwise main is genuinely
+    // sync and its returned value is the program result.
+    let main_is_async = hir_module
+        .functions
+        .values()
+        .any(|f| f.name.resolve_global().as_deref() == Some("__main_poll"));
+
+    // Build the runtime and immediately move it into RUNTIME_HOLDER
+    // so subsequent ACTIVE_RUNTIME pointers stay valid across the
+    // parking yield. Even sync programs go through this path for
+    // uniformity; the holder entry is removed on Ready (sync) or by
+    // the host_futures completion callback (async).
+    let mut rt = InterpRuntime::new();
+    register_static_plugins(&mut rt);
+    register_wasm_jit_hooks(&mut rt);
+    rt.compile_module(hir_module);
+
+    let symbol_snapshot = rt.symbol_table_snapshot();
+    ACTIVE_SYMBOLS.with(|s| {
+        let mut map = s.borrow_mut();
+        map.clear();
+        for (name, ptr, _arity) in symbol_snapshot {
+            map.insert(name, ptr);
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(module) = rt.module() {
+            let snapshot: Vec<(String, i64, String)> = module
+                .functions
+                .iter()
+                .filter_map(|(id, f)| {
+                    let name = f.name.resolve_global()?;
+                    Some((id.to_hex(), id.to_handle_hash(), name))
+                })
+                .collect();
+            ACTIVE_INTERNAL_FNS.with(|m| {
+                let mut map = m.borrow_mut();
+                map.clear();
+                for (hex, _hash, name) in &snapshot {
+                    map.insert(hex.clone(), name.clone());
+                }
+            });
+            ACTIVE_CLOSURE_FNS.with(|m| {
+                let mut map = m.borrow_mut();
+                map.clear();
+                for (_hex, hash, name) in &snapshot {
+                    // Insert under BOTH the full 64-bit hash AND the
+                    // 32-bit-truncated form: the BC interpreter on
+                    // wasm32 stores closure handles via `ZyntaxValue
+                    // ::Pointer((hash as usize) as *mut u8)` which
+                    // loses the upper 32 bits. Indirect-call lookups
+                    // see the truncated form; the full form keeps
+                    // native + future architectures working.
+                    map.insert(*hash, name.clone());
+                    let truncated = *hash as u32 as i64;
+                    if truncated != *hash {
+                        map.insert(truncated, name.clone());
+                    }
+                }
+            });
+        }
+    }
+
+    // Move the runtime into the holder, then point ACTIVE_RUNTIME
+    // at it via a *mut taken from inside the holder. The holder
+    // owns the runtime; the *mut stays valid as long as the entry
+    // isn't removed. Removal happens on the Ready path
+    // (complete_task callback or sync completion below).
+    RUNTIME_HOLDER.with(|h| h.borrow_mut().insert(task_id, rt));
+    {
+        let rt_ptr: *mut InterpRuntime = RUNTIME_HOLDER.with(|h| {
+            let mut map = h.borrow_mut();
+            map.get_mut(&task_id)
+                .map(|r| r as *mut InterpRuntime)
+                .unwrap_or(core::ptr::null_mut())
+        });
+        ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = rt_ptr);
+    }
+
+    // Sync path: call main, fire complete_task inline, drop runtime.
+    if !main_is_async {
+        let rt_ptr = ACTIVE_RUNTIME.with(|r| *r.borrow());
+        // SAFETY: rt_ptr was just installed and points into the
+        // holder; single-threaded wasm + no intervening removal.
+        let rt = unsafe { &mut *rt_ptr };
+        let result = match rt.call_function("main", vec![]) {
+            Ok(v) => {
+                let output = format_value(&v);
+                let value = output.parse::<i64>().unwrap_or(0);
+                // Drop runtime + clear thread-locals BEFORE firing
+                // complete_task to avoid any re-entrancy hazard.
+                let _ = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+                ACTIVE_SYMBOLS.with(|s| s.borrow_mut().clear());
+                #[cfg(target_arch = "wasm32")]
+                {
+                    ACTIVE_INTERNAL_FNS.with(|m| m.borrow_mut().clear());
+                    ACTIVE_CLOSURE_FNS.with(|m| m.borrow_mut().clear());
+                    ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = core::ptr::null_mut());
+                }
+                js_complete_task(task_id, value, 1);
+                RunResult {
+                    output,
+                    ok: true,
+                    error_kind: ErrorKind::None,
+                }
+            }
+            Err(e) => {
+                // Tear down on the failure path too.
+                let _ = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+                ACTIVE_SYMBOLS.with(|s| s.borrow_mut().clear());
+                #[cfg(target_arch = "wasm32")]
+                {
+                    ACTIVE_INTERNAL_FNS.with(|m| m.borrow_mut().clear());
+                    ACTIVE_CLOSURE_FNS.with(|m| m.borrow_mut().clear());
+                    ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = core::ptr::null_mut());
+                }
+                runtime_err(format!("runtime error: {e}"))
+            }
+        };
+        return result;
+    }
+
+    // Async path: call the Promise-returning entry, drive the
+    // first poll. krio's `generate_promise_entry` allocates the
+    // Promise struct + SM, returns the pointer; it does NOT call
+    // the poll fn itself.
+    let rt_ptr = ACTIVE_RUNTIME.with(|r| *r.borrow());
+    let rt = unsafe { &mut *rt_ptr };
+    let promise_value = match rt.call_function("main", vec![]) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+            ACTIVE_SYMBOLS.with(|s| s.borrow_mut().clear());
+            #[cfg(target_arch = "wasm32")]
+            {
+                ACTIVE_INTERNAL_FNS.with(|m| m.borrow_mut().clear());
+                ACTIVE_CLOSURE_FNS.with(|m| m.borrow_mut().clear());
+                ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = core::ptr::null_mut());
+            }
+            return runtime_err(format!("runtime error: {e}"));
+        }
+    };
+
+    // Promise layout from `generate_promise_entry`:
+    //   offset  0: sm_ptr      (*mut u8)
+    //   offset  8: poll_fn_ptr (i64 closure handle on wasm32)
+    let promise_ptr = match promise_value {
+        zyntax_compiler::value::ZyntaxValue::Pointer(p) => p,
+        zyntax_compiler::value::ZyntaxValue::Int(i) => i as *mut u8,
+        _ => {
+            let _ = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+            return runtime_err(
+                "async main entry returned non-pointer value (expected Promise<T>)".to_string(),
+            );
+        }
+    };
+    if promise_ptr.is_null() {
+        let _ = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+        return runtime_err("async main entry returned null Promise pointer".to_string());
+    }
+
+    // SAFETY: Promise was just allocated by the entry fn; lives
+    // until SM completes + entry's intrinsic Drop runs.
+    let (sm_ptr, poll_handle) = unsafe {
+        let sm_ptr = *(promise_ptr as *const *mut u8);
+        let poll_handle = *((promise_ptr as *const u8).add(8) as *const i64);
+        (sm_ptr, poll_handle)
+    };
+
+    // First poll. The body emits register_future + bridge call
+    // (setTimeout) + AsyncSaveSlot state ← next_state + Return 0
+    // (Pending). After this call, FUTURE_TABLE has the parked entry
+    // and JS-side setTimeout is queued.
+    use zyntax_compiler::value::ZyntaxValue;
+    let rc = call_indirect_by_handle(poll_handle, vec![ZyntaxValue::Pointer(sm_ptr)]);
+
+    if rc != 0 {
+        // Sync completion: SM reached Ready in the first poll
+        // (no actual yield). Fire complete_task inline.
+        let _ = RUNTIME_HOLDER.with(|h| h.borrow_mut().remove(&task_id));
+        ACTIVE_SYMBOLS.with(|s| s.borrow_mut().clear());
+        #[cfg(target_arch = "wasm32")]
+        {
+            ACTIVE_INTERNAL_FNS.with(|m| m.borrow_mut().clear());
+            ACTIVE_CLOSURE_FNS.with(|m| m.borrow_mut().clear());
+            ACTIVE_RUNTIME.with(|r| *r.borrow_mut() = core::ptr::null_mut());
+        }
+        js_complete_task(task_id, rc, 1);
+        return RunResult {
+            output: rc.to_string(),
+            ok: true,
+            error_kind: ErrorKind::None,
+        };
+    }
+
+    // Parked. RUNTIME_HOLDER keeps the runtime alive; ACTIVE_*
+    // thread-locals stay set so subsequent `_zyntax_resolve_future`
+    // calls from JS can re-enter call_function and drive the SM
+    // forward. host_futures' completion callback eventually fires
+    // js_complete_task when the SM reaches Ready.
+    RunResult {
+        output: String::new(),
+        ok: true,
+        error_kind: ErrorKind::None,
+    }
 }
 
 fn run_impl(source: &str) -> RunResult {
@@ -1437,10 +1759,25 @@ fn run_impl(source: &str) -> RunResult {
         "__zyntax_async_set_timeout".to_string(),
         "__zyntax_async_set_timeout".to_string(),
     );
-    let hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config) {
+    let mut hir_module = match zyntax_compiler::compile_to_hir(&mut program, type_registry, config)
+    {
         Ok(m) => m,
         Err(e) => return compile_err(format!("HIR lowering failed: {e}")),
     };
+
+    // Phase J — run the krio post-passes so `async def` / resumable
+    // effect fns lower to poll-fn state machines with my Phase I.2
+    // cooperative-await emit firing at `await __zyntax_async_*(...)`
+    // sites. `compile_to_hir` doesn't run these (it only does the
+    // SSA-level transform); the native path does it inside
+    // `compile_typed_program`, but the wasm shim goes through the
+    // lower-level `compile_to_hir` and so has to invoke them here.
+    if let Err(e) = zyntax_embed::krio_lowering::apply_krio_async_lowering(&mut hir_module) {
+        return compile_err(format!("krio-async lowering failed: {e}"));
+    }
+    if let Err(e) = zyntax_embed::krio_lowering::apply_krio_effect_lowering(&mut hir_module) {
+        return compile_err(format!("krio-effect lowering failed: {e}"));
+    }
 
     // 3. Spin up an interpreter, register any statically-linked
     //    plugins, wire the wasm-JIT tier-up hooks, and dispatch
@@ -1491,7 +1828,18 @@ fn run_impl(source: &str) -> RunResult {
                 let mut map = m.borrow_mut();
                 map.clear();
                 for (_hex, hash, name) in &snapshot {
+                    // Insert under BOTH the full 64-bit hash AND the
+                    // 32-bit-truncated form: the BC interpreter on
+                    // wasm32 stores closure handles via `ZyntaxValue
+                    // ::Pointer((hash as usize) as *mut u8)` which
+                    // loses the upper 32 bits. Indirect-call lookups
+                    // see the truncated form; the full form keeps
+                    // native + future architectures working.
                     map.insert(*hash, name.clone());
+                    let truncated = *hash as u32 as i64;
+                    if truncated != *hash {
+                        map.insert(truncated, name.clone());
+                    }
                 }
             });
         }

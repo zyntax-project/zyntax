@@ -78,6 +78,12 @@ mod import_chain;
 /// only on wasm), and the FFI symbol table.
 pub mod interp_runtime;
 pub mod iterator;
+/// Post-`compile_to_hir` krio passes: async-fn → poll-fn SM and
+/// resumable-effect fn → poll-fn SM. Available on both native
+/// and wasm targets (the native `ZyntaxRuntime::compile_typed_program`
+/// path delegates to these; the wasm `run_impl` calls them
+/// directly after `compile_to_hir`).
+pub mod krio_lowering;
 // `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
 // loader, async executor). Native-only — the wasm-target entry point
 // (separate `zyntax_wasm` crate, Phase F) wires the BC interpreter

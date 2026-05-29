@@ -390,6 +390,38 @@ pub enum Op {
         args: u32,
         ret_ty: u32,
     },
+    /// `Intrinsic::Malloc` lowered to a runtime-sized allocation via
+    /// the interpreter's `Memory` arena. `size_reg` carries the
+    /// byte count at runtime; result is a `ZyntaxValue::Pointer`.
+    /// Allocations leak until the InterpRuntime is dropped — fine
+    /// for Phase J's short-lived cooperative-async tasks.
+    Malloc {
+        dst: Reg,
+        has_dst: bool,
+        size_reg: Reg,
+    },
+    /// `Intrinsic::Free` no-op. The interpreter's bump-style
+    /// `Memory` doesn't expose per-allocation free; everything is
+    /// reclaimed when the runtime drops. Compiled so Free-emitting
+    /// HIR (krio's promise-entry release path) doesn't blow up.
+    FreeNoop {
+        dst: Reg,
+        has_dst: bool,
+    },
+    /// Indirect call through a function-pointer register. On wasm32
+    /// the pointer is a 32-bit-truncated closure handle (Phase I.3);
+    /// dispatch routes through `indirect_call_dispatcher` (installed
+    /// by `zyntax_wasm`) which resolves the handle through
+    /// `ACTIVE_CLOSURE_FNS` and re-enters `call_function`. Returns
+    /// `InterpError::UnsupportedInstruction` if no dispatcher is
+    /// installed.
+    CallIndirect {
+        dst: Reg,
+        has_dst: bool,
+        fn_ptr_reg: Reg,
+        args: u32,
+        ret_ty: u32,
+    },
 }
 
 /// One compiled function: bytecode stream + side pools.
@@ -915,6 +947,29 @@ fn lower_inst(
                         "indirect call".to_string(),
                     ))
                 }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc) => {
+                    // First arg carries the size in bytes.
+                    let size_reg = cf
+                        .args_pool
+                        .get(args_idx as usize)
+                        .and_then(|args| args.first().copied())
+                        .unwrap_or(0);
+                    cf.code.push(Op::Malloc {
+                        dst,
+                        has_dst,
+                        size_reg,
+                    });
+                }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Free)
+                | HirCallable::Intrinsic(crate::hir::Intrinsic::IncRef)
+                | HirCallable::Intrinsic(crate::hir::Intrinsic::DecRef)
+                | HirCallable::Intrinsic(crate::hir::Intrinsic::Drop) => {
+                    // No-op for the bump-allocator interpreter:
+                    // memory lives until the runtime drops, so
+                    // refcount/drop bookkeeping has no observable
+                    // effect during a single task's lifetime.
+                    cf.code.push(Op::FreeNoop { dst, has_dst });
+                }
                 HirCallable::Intrinsic(_) => {
                     return Err(InterpError::UnsupportedInstruction(
                         "intrinsic call".to_string(),
@@ -926,6 +981,56 @@ fn lower_inst(
                     ))
                 }
             }
+        }
+        HirInstruction::IndirectCall {
+            result,
+            func_ptr,
+            args,
+            return_ty,
+        } => {
+            let fn_ptr_reg = reg(*func_ptr)?;
+            let arg_regs: Result<Vec<Reg>, InterpError> = args.iter().map(|a| reg(*a)).collect();
+            let args_idx = cf.args_pool.len() as u32;
+            cf.args_pool.push(arg_regs?);
+            let (dst, has_dst) = match result {
+                Some(r) => (reg(*r)?, true),
+                None => (0, false),
+            };
+            let ret_ty_idx = cf.type_pool.len() as u32;
+            cf.type_pool.push(return_ty.clone());
+            cf.code.push(Op::CallIndirect {
+                dst,
+                has_dst,
+                fn_ptr_reg,
+                args: args_idx,
+                ret_ty: ret_ty_idx,
+            });
+        }
+        HirInstruction::CreateClosure {
+            result,
+            function,
+            captures,
+            ..
+        } => {
+            // Capture-free closures only — Phase I.2's
+            // cooperative-await emit produces these (the krio
+            // emitter's CreateClosure with captures=[] referring to
+            // the SM's own poll fn). The closure value is the
+            // function's HirId hash so it can be re-dispatched
+            // through `ACTIVE_CLOSURE_FNS` in the wasm shim
+            // (Phase I.3). Native callers see the same shape and
+            // can transmute through the symbol table if needed.
+            if !captures.is_empty() {
+                return Err(InterpError::UnsupportedInstruction(
+                    "CreateClosure with captures".to_string(),
+                ));
+            }
+            let dst = reg(*result)?;
+            let handle = function.to_handle_hash();
+            let const_idx = cf.const_pool.len() as u32;
+            cf.const_pool
+                .push(ZyntaxValue::Pointer(handle as usize as *mut u8));
+            cf.code.push(Op::LoadConst { dst, c: const_idx });
         }
         other => {
             return Err(InterpError::UnsupportedInstruction(format!(
@@ -1210,6 +1315,19 @@ pub struct HirInterpreter {
     /// demo path JITs on first reuse; tunable via
     /// [`Self::set_wasm_jit_threshold`].
     wasm_jit_threshold: u64,
+    /// IndirectCall dispatcher. The HIR `IndirectCall { func_ptr,
+    /// args, return_ty }` instruction reads `func_ptr` from a
+    /// register; on wasm32 the value carries a 32-bit-truncated
+    /// closure handle (Phase I.3's `HirId::to_handle_hash()` →
+    /// `ZyntaxValue::Pointer((hash as usize) as *mut u8)`). The
+    /// host runtime (`zyntax_wasm`) installs a dispatcher here
+    /// that resolves the handle through `ACTIVE_CLOSURE_FNS` and
+    /// re-enters `call_function`. Native callers can install a
+    /// transmute-based dispatcher instead; without one, IndirectCall
+    /// returns `InterpError::UnsupportedInstruction("indirect call")`.
+    #[allow(clippy::type_complexity)]
+    indirect_call_dispatcher:
+        Option<Box<dyn FnMut(i64, Vec<ZyntaxValue>) -> Result<ZyntaxValue, InterpError> + Send>>,
 }
 
 /// When a `tick_callback` returns one of these, the interpreter
@@ -1244,7 +1362,19 @@ impl HirInterpreter {
             wasm_dispatch_hook: None,
             wasm_jit_handles: HashMap::new(),
             wasm_jit_threshold: 1,
+            indirect_call_dispatcher: None,
         }
+    }
+
+    /// Install the IndirectCall dispatcher. See the field doc on
+    /// `indirect_call_dispatcher` for the contract.
+    pub fn set_indirect_call_dispatcher(
+        &mut self,
+        dispatcher: Box<
+            dyn FnMut(i64, Vec<ZyntaxValue>) -> Result<ZyntaxValue, InterpError> + Send,
+        >,
+    ) {
+        self.indirect_call_dispatcher = Some(dispatcher);
     }
 
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
@@ -1651,10 +1781,47 @@ impl HirInterpreter {
                     regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
                     pc += 1;
                 }
+                Op::Malloc {
+                    dst,
+                    has_dst,
+                    size_reg,
+                } => {
+                    let size = match &regs[*size_reg as usize] {
+                        ZyntaxValue::Int(n) => (*n).max(1) as usize,
+                        ZyntaxValue::UInt(n) => (*n).max(1) as usize,
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "integer (Malloc size)".to_string(),
+                                got: format!("{:?}", other),
+                            })
+                        }
+                    };
+                    let ptr = self.memory.alloc_zeroed(size);
+                    if *has_dst {
+                        regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
+                    }
+                    pc += 1;
+                }
+                Op::FreeNoop { dst, has_dst } => {
+                    // No-op — bump-allocator interpreter doesn't
+                    // expose per-allocation free. Zero the result
+                    // register so any consumer of Free's return
+                    // sees a defined value (Free is void in HIR but
+                    // we keep `has_dst` for shape uniformity).
+                    if *has_dst {
+                        regs[*dst as usize] = ZyntaxValue::Int(0);
+                    }
+                    pc += 1;
+                }
                 Op::Load { dst, ptr, ty } => {
                     let target = &cf.type_pool[*ty as usize];
+                    // Same tolerance as Store: accept Int/UInt as a
+                    // raw address since `IAdd(Pointer, Int)` produces
+                    // Int through the i64-funneled arithmetic path.
                     let p = match &regs[*ptr as usize] {
                         ZyntaxValue::Pointer(p) => *p,
+                        ZyntaxValue::Int(n) => *n as usize as *mut u8,
+                        ZyntaxValue::UInt(n) => *n as usize as *mut u8,
                         other => {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer".to_string(),
@@ -1667,8 +1834,14 @@ impl HirInterpreter {
                 }
                 Op::Store { ptr, val, ty } => {
                     let target = &cf.type_pool[*ty as usize];
+                    // Accept Pointer (the natural shape) and Int/UInt
+                    // (raw address — produced by `IAdd` of a Pointer
+                    // and an offset, since the BC interp's arithmetic
+                    // is i64-funneled and loses the Pointer tag).
                     let p = match &regs[*ptr as usize] {
                         ZyntaxValue::Pointer(p) => *p,
+                        ZyntaxValue::Int(n) => *n as usize as *mut u8,
+                        ZyntaxValue::UInt(n) => *n as usize as *mut u8,
                         other => {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer".to_string(),
@@ -1781,6 +1954,43 @@ impl HirInterpreter {
                     if *has_dst {
                         let ty = &cf.type_pool[*ret_ty as usize];
                         regs[*dst as usize] = value_from_i64_as(ty, raw);
+                    }
+                    pc += 1;
+                }
+                Op::CallIndirect {
+                    dst,
+                    has_dst,
+                    fn_ptr_reg,
+                    args,
+                    ret_ty,
+                } => {
+                    let handle = match &regs[*fn_ptr_reg as usize] {
+                        ZyntaxValue::Pointer(p) => *p as usize as i64,
+                        ZyntaxValue::Int(n) => *n,
+                        ZyntaxValue::UInt(n) => *n as i64,
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "function-pointer / handle".to_string(),
+                                got: format!("{:?}", other),
+                            })
+                        }
+                    };
+                    let arg_regs = &cf.args_pool[*args as usize];
+                    let arg_vals: Vec<ZyntaxValue> =
+                        arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
+                    let dispatcher = self.indirect_call_dispatcher.as_mut().ok_or_else(|| {
+                        InterpError::UnsupportedInstruction(
+                            "indirect call without dispatcher".to_string(),
+                        )
+                    })?;
+                    let result = dispatcher(handle, arg_vals)?;
+                    if *has_dst {
+                        let ty = &cf.type_pool[*ret_ty as usize];
+                        let v = match result {
+                            ZyntaxValue::Int(i) => value_from_i64_as(ty, i),
+                            other => other,
+                        };
+                        regs[*dst as usize] = v;
                     }
                     pc += 1;
                 }

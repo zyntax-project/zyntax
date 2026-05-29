@@ -308,6 +308,26 @@ impl InterpRuntime {
         self.interp.set_wasm_dispatch_hook(dispatch);
     }
 
+    /// Install the BC interpreter's IndirectCall dispatcher. The
+    /// host (e.g. `zyntax_wasm`) provides a closure that resolves a
+    /// runtime function-pointer / handle to a concrete dispatch.
+    /// See `HirInterpreter::set_indirect_call_dispatcher`.
+    #[allow(clippy::type_complexity)]
+    pub fn install_indirect_call_dispatcher(
+        &mut self,
+        dispatcher: Box<
+            dyn FnMut(
+                    i64,
+                    Vec<zyntax_compiler::value::ZyntaxValue>,
+                ) -> Result<
+                    zyntax_compiler::value::ZyntaxValue,
+                    zyntax_compiler::hir_interp::InterpError,
+                > + Send,
+        >,
+    ) {
+        self.interp.set_indirect_call_dispatcher(dispatcher);
+    }
+
     /// Register a statically-linked ZRTL plugin into the BC
     /// interpreter's FFI table. Wasm-shim equivalent of
     /// `ZyntaxRuntime::register_static_plugin` — same SDK

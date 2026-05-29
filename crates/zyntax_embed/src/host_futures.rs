@@ -122,6 +122,15 @@ impl ResolveOutcome {
     }
 }
 
+/// Signature for the wasm32-only poll dispatcher. Takes the closure
+/// handle (i64 hash from `HirId::to_handle_hash`) and the SM ptr;
+/// returns the poll fn's i64 result (0 = Pending, non-zero = Ready
+/// value). The dispatcher implementation lives in `zyntax_wasm`
+/// (which owns the InterpRuntime ↔ `ACTIVE_CLOSURE_FNS` mapping)
+/// and is installed via [`set_wasm_poll_dispatcher`] at runtime
+/// startup.
+pub type WasmPollDispatcher = Box<dyn Fn(i64, *mut u8) -> i64>;
+
 thread_local! {
     /// All currently-parked futures. Keyed by the i64 handle returned
     /// from [`register_future`]; cleared on [`resolve_future`] (one
@@ -129,6 +138,12 @@ thread_local! {
     /// a re-park inside the poll fn doesn't collide with itself).
     static FUTURE_TABLE: RefCell<HashMap<i64, ParkedFuture>> =
         RefCell::new(HashMap::new());
+
+    /// Wasm32-only poll fn dispatcher. See [`WasmPollDispatcher`] and
+    /// [`set_wasm_poll_dispatcher`]. Native targets ignore this slot
+    /// entirely — they call the poll fn via raw fn-ptr transmute.
+    static WASM_POLL_DISPATCH: RefCell<Option<WasmPollDispatcher>> =
+        const { RefCell::new(None) };
 
     /// Monotonic handle counter. Starts at 1 so `0` can stay a
     /// "no handle" sentinel for the krio_adapter sentinel emitter.
@@ -156,6 +171,18 @@ pub type CompleteTaskFn = Box<dyn Fn(i64, i64)>;
 pub fn set_complete_task_callback(cb: CompleteTaskFn) {
     COMPLETE_TASK_CALLBACK.with(|slot| {
         *slot.borrow_mut() = Some(cb);
+    });
+}
+
+/// Install the wasm32 poll dispatcher. The dispatcher takes a
+/// closure handle (i64) + SM ptr and returns the poll fn's i64
+/// result. Wasm32 hosts (zyntax_wasm) install this at runtime
+/// startup so [`resolve_future`] can drive parked SMs via the
+/// indirect-call dispatcher rather than the unavailable raw fn-ptr
+/// transmute. No-op on native (which uses the transmute path).
+pub fn set_wasm_poll_dispatcher(dispatch: WasmPollDispatcher) {
+    WASM_POLL_DISPATCH.with(|slot| {
+        *slot.borrow_mut() = Some(dispatch);
     });
 }
 
@@ -234,8 +261,7 @@ pub fn resolve_future(handle: i64, value: i64) -> ResolveOutcome {
             .add(parked.result_slot_offset as usize) as *mut i64;
         *result_slot = value;
         *(parked.state_machine_ptr as *mut i64) = parked.next_state;
-        let poll_fn: extern "C" fn(*mut u8) -> i64 = core::mem::transmute(parked.poll_fn_ptr);
-        let rc = poll_fn(parked.state_machine_ptr);
+        let rc = poll_parked_sm(&parked);
         if rc != 0 {
             // SM reached Ready. Forward the value to the scheduler
             // and return it through the outcome so the wasm export
@@ -248,6 +274,58 @@ pub fn resolve_future(handle: i64, value: i64) -> ResolveOutcome {
             // handle is now in the table. Nothing else to do here.
             ResolveOutcome::ReParked
         }
+    }
+}
+
+/// Drive the SM's poll fn once. The native and wasm32 paths differ
+/// because wasm32 has no addressable function pointers — Phase I.2's
+/// `CreateClosure` emits an i64 hash handle, not a real fn ptr, and
+/// you can't `transmute` it to `extern "C" fn(...) -> i64`.
+///
+/// Native: raw transmute + direct call. Same shape as the existing
+/// `__zyntax_effect_resume` spin-poll (effect_runtime.rs:312).
+///
+/// Wasm32: `poll_fn_ptr` is a closure handle. Route through the
+/// JS-side indirect-call dispatcher (installed by
+/// `zyntax_wasm::install_wasm_poll_dispatcher` at startup) which
+/// looks the handle up in `ACTIVE_CLOSURE_FNS` and re-enters
+/// `InterpRuntime::call_function`. Same re-entry path Phase I.3
+/// uses for ZynML-level indirect calls — the InterpRuntime is held
+/// in `ACTIVE_RUNTIME` as a `*mut` for exactly this reason, so the
+/// recursive call doesn't double-borrow the thread-local.
+///
+/// # Safety
+///
+/// Caller must hold `parked.state_machine_ptr` live for the
+/// duration of the call (the top-level scheduler's
+/// `RUNTIME_HOLDER`).
+unsafe fn poll_parked_sm(parked: &ParkedFuture) -> i64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let poll_fn: extern "C" fn(*mut u8) -> i64 = core::mem::transmute(parked.poll_fn_ptr);
+        poll_fn(parked.state_machine_ptr)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Treat `poll_fn_ptr` as an i64 closure handle (Phase I.2
+        // emits `CreateClosure` which lowers to `HirId::to_handle_hash`
+        // in the wasm backend / interp runtime; the raw bits live in
+        // `poll_fn_ptr` because that's where the Resume struct stores
+        // them and host_futures has been ABI-compatible with that all
+        // along).
+        let handle = parked.poll_fn_ptr as i64;
+        WASM_POLL_DISPATCH.with(|slot| {
+            if let Some(dispatch) = slot.borrow().as_ref() {
+                dispatch(handle, parked.state_machine_ptr)
+            } else {
+                // No dispatcher installed: park stays dead. Logged at
+                // the JS layer via console.warn after the
+                // ResolveOutcome::ReParked is observed. Returning 0
+                // (Pending) keeps the SM alive in case a late dispatch
+                // install lands before the next resolve attempt.
+                0
+            }
+        })
     }
 }
 

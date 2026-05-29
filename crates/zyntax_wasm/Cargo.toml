@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 # don't drag in Cranelift / libloading / the native ZyntaxRuntime —
 # the wasm shim drives `InterpRuntime` directly. `parse-only` keeps
 # parser + TypedAST + the lowering passes available.
-zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
+zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only", "krio-async-backend"] }
 # Direct access to `compile_to_hir` + `CompilationConfig`. The
 # embed crate re-exports HirInterpreter but not the lowering API.
 zyntax_compiler = { path = "../compiler", default-features = false, features = ["wasm-jit"] }
