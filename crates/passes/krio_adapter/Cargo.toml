@@ -13,13 +13,13 @@ zyntax_typed_ast = { path = "../../typed_ast" }
 # (zyntax_embed's `native` feature).
 zyntax_compiler  = { path = "../../compiler", default-features = false }
 
-# Pinned to a specific commit on the upstream krio repo. Phase G
-# improvements (TransformOptions::reserved_slots, validate_layout,
-# host-gotcha docs) ship in commit fe0177c. Bump the rev when newer
-# krio fixes / features land.
-krio-async     = { git = "https://github.com/darmie/krio.git", package = "krio-async",     rev = "fe0177c" }
-krio-stackless = { git = "https://github.com/darmie/krio.git", package = "krio-stackless", rev = "fe0177c" }
-krio-core      = { git = "https://github.com/darmie/krio.git", package = "krio-core",      rev = "fe0177c" }
+# Pinned to a specific commit on the upstream krio repo. Bumped to
+# 1051689 (krio-fiber Windows port + CI infrastructure; no changes
+# to the krio-async / krio-stackless / krio-core APIs zyntax uses).
+# Bump the rev when newer krio fixes / features land.
+krio-async     = { git = "https://github.com/darmie/krio.git", package = "krio-async",     rev = "1051689" }
+krio-stackless = { git = "https://github.com/darmie/krio.git", package = "krio-stackless", rev = "1051689" }
+krio-core      = { git = "https://github.com/darmie/krio.git", package = "krio-core",      rev = "1051689" }
 
 log = "0.4"
 indexmap = "2"
