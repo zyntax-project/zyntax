@@ -1493,6 +1493,7 @@ impl CraneliftBackend {
                         }
                         HirConstant::U32(v) => builder.ins().iconst(types::I32, *v as i64),
                         HirConstant::I64(v) => builder.ins().iconst(types::I64, *v),
+                        HirConstant::U64(v) => builder.ins().iconst(types::I64, *v as i64),
                         HirConstant::Bool(v) => {
                             builder.ins().iconst(types::I8, if *v { 1 } else { 0 })
                         }
@@ -1855,15 +1856,28 @@ impl CraneliftBackend {
                                         }
                                         _ => unreachable!(),
                                     };
-                                    // Widen operands to match types if needed (e.g., i32 vs i64)
+                                    // Widen operands to match types if needed (e.g., i32 vs i64).
+                                    // Use zero-extension for unsigned operand types so an
+                                    // `UnsignedLessThan` between U32 and U64 doesn't sign-
+                                    // extend the U32 value into a negative i64.
                                     let lhs_ty = builder.func.dfg.value_type(lhs);
                                     let rhs_ty = builder.func.dfg.value_type(rhs);
                                     let (lhs, rhs) =
                                         if lhs_ty != rhs_ty && lhs_ty.is_int() && rhs_ty.is_int() {
+                                            let extend = |b: &mut FunctionBuilder<'_>,
+                                                          target: cranelift_codegen::ir::Type,
+                                                          v: cranelift_codegen::ir::Value|
+                                             -> cranelift_codegen::ir::Value {
+                                                if operand_ty.is_signed() {
+                                                    b.ins().sextend(target, v)
+                                                } else {
+                                                    b.ins().uextend(target, v)
+                                                }
+                                            };
                                             if lhs_ty.bits() < rhs_ty.bits() {
-                                                (builder.ins().sextend(rhs_ty, lhs), rhs)
+                                                (extend(&mut builder, rhs_ty, lhs), rhs)
                                             } else {
-                                                (lhs, builder.ins().sextend(lhs_ty, rhs))
+                                                (lhs, extend(&mut builder, lhs_ty, rhs))
                                             }
                                         } else {
                                             (lhs, rhs)
