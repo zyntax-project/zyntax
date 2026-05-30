@@ -254,6 +254,70 @@ fn install_resolve_future_helper() {
     helper.forget();
 }
 
+fn install_console_capture() -> js_sys::Array {
+    let global = js_sys::global();
+    let lines = js_sys::Array::new();
+    let _ = js_sys::Reflect::set(
+        &global,
+        &JsValue::from_str("__zw_test_console_lines"),
+        &lines,
+    );
+    let _ = js_sys::eval(
+        r#"
+        globalThis._zyntax_console_log = function(line) {
+            globalThis.__zw_test_console_lines.push(String(line));
+        };
+        globalThis._zyntax_console_log_partial = function(chunk) { /* ignore */ };
+        "#,
+    );
+    lines
+}
+
+#[wasm_bindgen_test]
+fn println_string_literal_routes_to_console() {
+    install_host_stubs();
+    let lines = install_console_capture();
+    let r = run("def main(): i64 {\n    println(\"hello\")\n    return 0\n}\n");
+    assert!(r.ok(), "output={}", r.output());
+    let captured: Vec<String> = (0..lines.length())
+        .map(|i| lines.get(i).as_string().unwrap_or_default())
+        .collect();
+    assert!(
+        captured.iter().any(|l| l == "hello"),
+        "expected `hello` in console lines, got: {captured:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn println_bool_true_routes_to_console() {
+    install_host_stubs();
+    let lines = install_console_capture();
+    let r = run("def main(): i64 {\n    println_bool(true)\n    return 0\n}\n");
+    assert!(r.ok(), "output={}", r.output());
+    let captured: Vec<String> = (0..lines.length())
+        .map(|i| lines.get(i).as_string().unwrap_or_default())
+        .collect();
+    assert!(
+        captured.iter().any(|l| l == "true"),
+        "expected `true` in console lines, got: {captured:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn println_i64_routes_to_console() {
+    install_host_stubs();
+    let lines = install_console_capture();
+    let r = run("def main(): i64 {\n    println_i64(42)\n    return 0\n}\n");
+    assert!(r.ok(), "output={}", r.output());
+    let captured: Vec<String> = (0..lines.length())
+        .map(|i| lines.get(i).as_string().unwrap_or_default())
+        .collect();
+    assert!(
+        captured.iter().any(|l| l == "42"),
+        "expected `42` in console lines, got: {captured:?}"
+    );
+}
+
 #[wasm_bindgen_test]
 async fn run_async_arithmetic_then_await_returns_42() {
     install_host_stubs();

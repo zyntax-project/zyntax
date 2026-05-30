@@ -2935,7 +2935,7 @@ regular_string = @{ "\"" ~ string_inner* ~ "\"" }
 string_inner = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 
 // Boolean: true, false
-bool_literal = { "true" | "false" }
+bool_literal = @{ "true" | "false" }
   -> TypedExpression::BoolLiteral { value: parse_bool(text()) }
 
 // Identifier - returns the text directly for use in bindings

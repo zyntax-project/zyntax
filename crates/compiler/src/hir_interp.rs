@@ -472,7 +472,18 @@ pub struct CompiledFunction {
 
 /// Compile a single `HirFunction` to bytecode. Performed once per
 /// function on first call; the result is cached in the interpreter.
-pub fn compile_function(func: &HirFunction) -> Result<CompiledFunction, InterpError> {
+///
+/// `module` + `memory` are threaded in so the lowerer can resolve
+/// `HirValueKind::Global` references: each global with a string
+/// initializer gets a ZRTL-format buffer allocated in `memory` and
+/// the resulting pointer pre-loaded into the consuming SSA value's
+/// register via `LoadConst`. Without that, `println("hello")` would
+/// pass `0` to the host bridge (and surface as an empty line).
+pub fn compile_function(
+    module: &HirModule,
+    memory: &mut Memory,
+    func: &HirFunction,
+) -> Result<CompiledFunction, InterpError> {
     let mut cf = CompiledFunction::default();
     let mut reg_of: HashMap<HirId, Reg> = HashMap::new();
 
@@ -531,6 +542,31 @@ pub fn compile_function(func: &HirFunction) -> Result<CompiledFunction, InterpEr
             let idx = cf.const_pool.len() as u32;
             cf.const_pool.push(const_to_zyntax(c));
             const_idx_for.insert(*val_id, idx);
+        } else if let HirValueKind::Global(global_id) = &val_def.kind {
+            // Resolve the global to a ZRTL-formatted string buffer
+            // ([i32 length][utf8 bytes]) in `memory`, then pre-load
+            // the pointer into the value's register via `LoadConst`.
+            // The BC interpreter has no `Op::AddressOfGlobal` today,
+            // so we bake the address into the const pool exactly
+            // like a numeric Constant — the host bridge sees a real
+            // ZRTL string pointer and reads it the same way as a
+            // runtime-allocated one.
+            if let Some(global) = module.globals.get(global_id) {
+                if let Some(HirConstant::String(interned)) = &global.initializer {
+                    let s = interned.resolve_global().unwrap_or_default();
+                    let bytes = s.as_bytes();
+                    let total = 4 + bytes.len();
+                    let ptr = memory.alloc_zeroed(total);
+                    unsafe {
+                        *(ptr as *mut i32) = bytes.len() as i32;
+                        let data = ptr.add(4);
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+                    }
+                    let idx = cf.const_pool.len() as u32;
+                    cf.const_pool.push(ZyntaxValue::Pointer(ptr));
+                    const_idx_for.insert(*val_id, idx);
+                }
+            }
         }
     }
     // Phi result regs.
@@ -1615,7 +1651,7 @@ impl HirInterpreter {
                 .functions
                 .get(&func_id)
                 .ok_or(InterpError::UndefinedSsaValue(func_id))?;
-            let cf = compile_function(func)?;
+            let cf = compile_function(module, &mut self.memory, func)?;
             self.cache.insert(func_id, cf);
         }
 
