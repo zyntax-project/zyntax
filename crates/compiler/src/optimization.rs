@@ -434,13 +434,11 @@ pub mod passes {
         fn run(
             &mut self,
             module: &mut HirModule,
-            analysis: &ModuleAnalysis,
+            _analysis: &ModuleAnalysis,
         ) -> CompilerResult<bool> {
-            // NOTE: Inlining deferred to backend.
-            // Requires: (1) Cost heuristics, (2) Function cloning, (3) Call site replacement, (4) CFG merging
-            // FUTURE (v2.0): Implement HIR-level inlining pass
-            // Estimated effort: 15-20 hours
-            Ok(false)
+            let stats = crate::inline::run_module(module);
+            self.inlined_count += stats.inlined;
+            Ok(stats.inlined > 0)
         }
     }
 }
