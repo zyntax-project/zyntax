@@ -4,8 +4,10 @@
 //! These analyses are used by both backends for optimization and code generation.
 
 pub mod dominators;
+pub mod loops;
 
 pub use dominators::DominatorTree;
+pub use loops::{LoopForest, NaturalLoop};
 
 use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue};
 use crate::CompilerResult;
