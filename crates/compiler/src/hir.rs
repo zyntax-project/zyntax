@@ -1562,7 +1562,7 @@ impl std::hash::Hash for HirConstant {
 }
 
 /// Binary operations supported by both backends
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryOp {
     // Arithmetic
     Add,
@@ -1599,7 +1599,7 @@ pub enum BinaryOp {
 }
 
 /// Unary operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -1607,7 +1607,7 @@ pub enum UnaryOp {
 }
 
 /// Cast operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CastOp {
     // Integer casts
     Trunc,

@@ -287,11 +287,9 @@ pub mod passes {
             module: &mut HirModule,
             _analysis: &ModuleAnalysis,
         ) -> CompilerResult<bool> {
-            // NOTE: CSE deferred to backend.
-            // Requires: (1) Value numbering, (2) Dominator tree, (3) Alias analysis integration
-            // FUTURE (v2.0): Implement HIR-level CSE pass
-            // Estimated effort: 10-15 hours
-            Ok(false)
+            let stats = crate::cse::eliminate_module(module);
+            self.eliminated_count += stats.eliminated;
+            Ok(stats.eliminated > 0)
         }
     }
 
