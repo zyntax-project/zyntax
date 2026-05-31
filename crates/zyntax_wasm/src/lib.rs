@@ -1739,6 +1739,15 @@ fn run_async_impl(source: &str, task_id: i64) -> RunResult {
         return compile_err(format!("krio-effect lowering failed: {e}"));
     }
 
+    // SSA-clean HIR optimization passes. Runs AFTER krio so we
+    // optimise the FINAL HIR the BC interp will execute. The legacy
+    // `OptimizationPipeline` is intentionally skipped (its DCE pass
+    // over-eliminates when the lowering hasn't populated def-use
+    // chains, leaving dangling refs); these passes either mutate
+    // `HirValue.kind` in place or sweep operand references so they
+    // don't depend on a populated `uses` map.
+    let _opt_stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
+
     // Build the runtime and immediately move it into RUNTIME_HOLDER
     // so subsequent ACTIVE_RUNTIME pointers stay valid across the
     // parking yield. Even sync programs go through this path for
@@ -2006,6 +2015,12 @@ fn run_impl(source: &str) -> RunResult {
     if let Err(e) = zyntax_embed::krio_lowering::apply_krio_effect_lowering(&mut hir_module) {
         return compile_err(format!("krio-effect lowering failed: {e}"));
     }
+
+    // SSA-clean HIR optimization passes (const_fold + cse + inline +
+    // licm + loop_vectorize, then const_fold + cse again). See
+    // `run_async_impl` for the same rationale — runs after krio so
+    // the optimiser sees the final HIR the BC interp will execute.
+    let _opt_stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
 
     // 3. Spin up an interpreter, register any statically-linked
     //    plugins, wire the wasm-JIT tier-up hooks, and dispatch

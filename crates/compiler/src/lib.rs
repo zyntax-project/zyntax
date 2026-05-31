@@ -1649,6 +1649,65 @@ pub fn compile_to_hir(
     Ok(hir_module)
 }
 
+/// Counters from `run_interp_safe_opts`. Useful for tests + the
+/// `--print-opt-stats` style debugging surfaces.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InterpOptStats {
+    pub const_fold: const_fold::FoldStats,
+    pub cse: cse::CseStats,
+    pub licm: licm::LicmStats,
+    pub inline: inline::InlineStats,
+    pub loop_vectorize: loop_vectorize::VectorizeStats,
+}
+
+/// Run the subset of HIR optimization passes that are safe for the
+/// BC interpreter — every pass that only touches SSA value `kind` in
+/// place or substitutes uses through a sweep. Skips the legacy
+/// `DeadCodeElimination` pass (which reads `HirValue.uses` directly
+/// and over-eliminates when the lowering doesn't populate that
+/// def-use chain, leaving dangling refs) and the legacy
+/// `SimplifyCfg` (half-done, finds blocks but doesn't merge them).
+///
+/// Passes run in a sensible order:
+///   1. const_fold — gives downstream passes a tighter SSA to work
+///                   with (more invariant operands, more CSE keys)
+///   2. cse        — fold-then-cse exposes more redundancy than the
+///                   other way around
+///   3. inline     — leaf inlines expand the per-function instruction
+///                   pool that the post-pass const_fold + cse can chew
+///   4. licm       — wants stable SSA; runs after inlining
+///   5. loop_vectorize — pattern matcher prefers a clean inner loop
+///   6. const_fold (again) — catch any new constants exposed by the
+///                            previous passes (inline often does)
+///   7. cse (again)         — and the dedup that follows
+///
+/// All passes are individually fixed-point already; the outer order
+/// is a single sweep — we don't iterate the *order* itself because
+/// the rounds-2 pair already mops up the easy carryover. Anything
+/// more elaborate would need real cost-modelled scheduling.
+///
+/// Returns per-pass counters so callers can log / assert what work
+/// was done.
+pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
+    let mut stats = InterpOptStats::default();
+    stats.const_fold = const_fold::fold_module(module);
+    stats.cse = cse::eliminate_module(module);
+    stats.inline = inline::run_module(module);
+    stats.licm = licm::run_module(module);
+    stats.loop_vectorize = loop_vectorize::run_module(module);
+
+    // Round 2 — inline + LICM frequently expose new fold/CSE work.
+    // We discard the round-2 stats so the printed counters reflect
+    // total work, not just first-round work.
+    let cf2 = const_fold::fold_module(module);
+    let cse2 = cse::eliminate_module(module);
+    stats.const_fold.folded += cf2.folded;
+    stats.const_fold.iterations = stats.const_fold.iterations.max(cf2.iterations);
+    stats.cse.eliminated += cse2.eliminated;
+    stats.cse.rewrites += cse2.rewrites;
+    stats
+}
+
 /// Compile a TypedProgram to JIT executable code using Cranelift backend
 ///
 /// This is a convenience function that:

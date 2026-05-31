@@ -213,12 +213,22 @@ impl InterpRuntime {
     /// `ZyntaxRuntime::lower_typed_program` does. For class-heavy
     /// programs, do that registration first (or use `ZyntaxRuntime`).
     ///
-    /// **Optimization level**: the interpreter consumes HIR directly,
-    /// so we force `opt_level = 0`. Default `opt_level = 2` runs
-    /// optimization passes (cast elision, etc.) that are valid for the
-    /// Cranelift backend but leave dangling SSA references the
-    /// interpreter can't resolve. Tier-up to Cranelift will re-run
-    /// optimizations against its own consumer.
+    /// **Optimization level**: the interpreter consumes HIR directly.
+    /// We force `opt_level = 0` so the legacy `OptimizationPipeline`
+    /// (its `DeadCodeElimination` pass relies on `HirValue.uses`
+    /// being populated, which the lowering doesn't always do — over-
+    /// eliminates and leaves dangling refs the interpreter can't
+    /// resolve) is skipped. Tier-up to Cranelift will re-run the
+    /// optimisations against its own consumer there.
+    ///
+    /// AFTER `compile_to_hir` returns we run the SSA-clean subset of
+    /// HIR passes (`const_fold`, `cse`, `inline`, `licm`,
+    /// `loop_vectorize`) via [`zyntax_compiler::run_interp_safe_opts`].
+    /// These mutate `HirValue.kind` in place or sweep operand
+    /// references; they don't depend on a populated `uses` map and
+    /// are safe under the BC interp. The interp-runtime e2e tests in
+    /// `crates/zynml/tests/optimization_passes_e2e.rs` pin their
+    /// correctness against real ZynML programs.
     pub fn compile_typed_program(
         &mut self,
         program: &mut TypedProgram,
@@ -226,7 +236,9 @@ impl InterpRuntime {
         mut config: CompilationConfig,
     ) -> Result<(), CompilerError> {
         config.opt_level = 0;
-        let module = zyntax_compiler::compile_to_hir(program, type_registry, config)?;
+        let mut module = zyntax_compiler::compile_to_hir(program, type_registry, config)?;
+        let _opt_stats = zyntax_compiler::run_interp_safe_opts(&mut module);
+        log::debug!("[interp_runtime] HIR opts: {:?}", _opt_stats);
         self.compile_module(module);
         Ok(())
     }

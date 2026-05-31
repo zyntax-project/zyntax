@@ -9,11 +9,10 @@
 //! still confirming the passes don't introduce dangling SSA
 //! references.
 
-use std::sync::Arc;
-use zyntax_compiler::{const_fold, cse, hir::HirModule, inline, licm, loop_vectorize, ssa::SsaForm};
+use zyntax_compiler::{const_fold, cse, hir::HirModule, inline, licm, loop_vectorize};
 
-use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 use zynml::{Grammar2, ZYNML_GRAMMAR};
+use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
 /// Compile a ZynML source through the same path as the runtime, but
 /// hand back the raw `HirModule` so we can apply optimization passes
@@ -60,7 +59,10 @@ fn const_fold_arithmetic_preserves_result() {
         "#,
     );
     let stats = const_fold::fold_module(&mut module);
-    assert!(stats.folded >= 1, "expected at least one fold, got {stats:?}");
+    assert!(
+        stats.folded >= 1,
+        "expected at least one fold, got {stats:?}"
+    );
     let r = run(module, "answer", vec![]);
     assert_eq!(r.as_i64(), Some(42), "{r:?}");
 }
@@ -101,7 +103,11 @@ fn cse_does_not_change_observable_behaviour() {
         "#,
     );
     let _ = cse::eliminate_module(&mut module);
-    let r = run(module, "both", vec![ZyntaxValue::Int(3), ZyntaxValue::Int(4)]);
+    let r = run(
+        module,
+        "both",
+        vec![ZyntaxValue::Int(3), ZyntaxValue::Int(4)],
+    );
     assert_eq!(r.as_i64(), Some(24), "3*4 + 3*4 = 24, got {r:?}");
 }
 
