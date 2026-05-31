@@ -25,6 +25,7 @@ pub mod async_support;
 pub mod borrow_check; // HIR-level borrow checking pass
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cfg;
+pub mod cfg_simplify;
 pub mod const_eval;
 pub mod const_fold;
 pub mod cse;
@@ -1660,6 +1661,7 @@ pub struct InterpOptStats {
     pub licm: licm::LicmStats,
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
+    pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
 }
 
 /// Run the subset of HIR optimization passes that are safe for the
@@ -1711,13 +1713,20 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         let il = inline::run_module(module);
         let lc = licm::run_module(module);
         let lv = loop_vectorize::run_module(module);
+        // cfg_simplify runs last in the round — `const_fold`'s
+        // CondBranch-on-known-Bool collapse routinely turns
+        // conditional branches into unconditional ones, which makes
+        // the target block a straight-line successor ready for
+        // merging.
+        let cs_cfg = cfg_simplify::run_module(module);
 
         let made_progress = cf.folded > 0
             || cs.eliminated > 0
             || lcse.eliminated > 0
             || il.inlined > 0
             || lc.hoisted > 0
-            || lv.vectorized > 0;
+            || lv.vectorized > 0
+            || cs_cfg.merged > 0;
 
         // Accumulate stats from this round.
         stats.const_fold.folded += cf.folded;
@@ -1739,6 +1748,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.loop_vectorize.skipped_shape += lv.skipped_shape;
         stats.loop_vectorize.skipped_no_induction += lv.skipped_no_induction;
         stats.loop_vectorize.skipped_op_unsupported += lv.skipped_op_unsupported;
+        stats.cfg_simplify.merged += cs_cfg.merged;
 
         if !made_progress {
             break;
