@@ -37,6 +37,7 @@ pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
 pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always available)
 pub mod inline;
 pub mod licm;
+pub mod load_cse;
 pub mod loop_vectorize;
 pub mod lowering;
 pub mod memory_management;
@@ -1655,6 +1656,7 @@ pub fn compile_to_hir(
 pub struct InterpOptStats {
     pub const_fold: const_fold::FoldStats,
     pub cse: cse::CseStats,
+    pub load_cse: load_cse::LoadCseStats,
     pub licm: licm::LicmStats,
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
@@ -1692,19 +1694,25 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
     stats.const_fold = const_fold::fold_module(module);
     stats.cse = cse::eliminate_module(module);
+    // Load CSE runs after value-based CSE so the pointer ids are
+    // already canonicalised — if two GEPs CSE'd to one, the load_cse
+    // pass sees both loads using the same canonical ptr id and can
+    // collapse them.
+    stats.load_cse = load_cse::run_module(module);
     stats.inline = inline::run_module(module);
     stats.licm = licm::run_module(module);
     stats.loop_vectorize = loop_vectorize::run_module(module);
 
-    // Round 2 — inline + LICM frequently expose new fold/CSE work.
-    // We discard the round-2 stats so the printed counters reflect
-    // total work, not just first-round work.
+    // Round 2 — inline + LICM frequently expose new fold/CSE work,
+    // and Load CSE often opens up after inlining flattens a callee.
     let cf2 = const_fold::fold_module(module);
     let cse2 = cse::eliminate_module(module);
+    let lcse2 = load_cse::run_module(module);
     stats.const_fold.folded += cf2.folded;
     stats.const_fold.iterations = stats.const_fold.iterations.max(cf2.iterations);
     stats.cse.eliminated += cse2.eliminated;
     stats.cse.rewrites += cse2.rewrites;
+    stats.load_cse.eliminated += lcse2.eliminated;
     stats
 }
 

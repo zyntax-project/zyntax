@@ -190,6 +190,11 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
         }
     }
 
+    // Loads can be hoisted ONLY when the loop body has no memory
+    // effect — once we hoist a Load past a Store / Call we'd be
+    // reading stale memory. Compute the gate once per loop.
+    let loads_ok = !body_has_memory_effect(func, &lp.body);
+
     // Iterate-to-fixed-point: each pass may unlock new candidates
     // because a hoisted instruction's result becomes invariant for
     // the next pass.
@@ -215,6 +220,11 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
                               // instruction.
                 }
                 if !is_safe_to_hoist(inst) {
+                    continue;
+                }
+                // Per-instruction memory gate: Loads need the
+                // body-wide "no memory effect" check.
+                if matches!(inst, HirInstruction::Load { .. }) && !loads_ok {
                     continue;
                 }
                 if !operands_all_invariant(inst, &invariant) {
@@ -274,8 +284,39 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
         HirInstruction::Unary { .. } | HirInstruction::Cast { .. } => true,
         HirInstruction::GetElementPtr { .. } | HirInstruction::ExtractValue { .. } => true,
         HirInstruction::Select { .. } => true,
+        // `Load` is hoistable iff the loop body has no Store /
+        // Call / Atomic / Fence that could alias. That check
+        // happens at the loop level in `hoist_loop`, not per-
+        // instruction; this helper just answers "is the *shape*
+        // hoistable" and defers the memory check to the caller.
+        HirInstruction::Load { .. } => true,
         _ => false,
     }
+}
+
+/// Does any instruction in the loop body write to memory or call out?
+/// If so, we conservatively block Load hoisting; otherwise Loads of
+/// loop-invariant pointers can be safely hoisted.
+fn body_has_memory_effect(func: &HirFunction, body: &HashSet<HirId>) -> bool {
+    for &b in body {
+        let block = match func.blocks.get(&b) {
+            Some(b) => b,
+            None => continue,
+        };
+        for inst in &block.instructions {
+            if matches!(
+                inst,
+                HirInstruction::Store { .. }
+                    | HirInstruction::Call { .. }
+                    | HirInstruction::IndirectCall { .. }
+                    | HirInstruction::Atomic { .. }
+                    | HirInstruction::Fence { .. }
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Are every operand referenced by `inst` already in `invariant`?
@@ -292,6 +333,7 @@ fn operands_all_invariant(inst: &HirInstruction, invariant: &HashSet<HirId>) -> 
             all_in = check(*ptr) && indices.iter().all(|i| check(*i));
         }
         HirInstruction::ExtractValue { aggregate, .. } => all_in = check(*aggregate),
+        HirInstruction::Load { ptr, .. } => all_in = check(*ptr),
         HirInstruction::Select {
             condition,
             true_val,
@@ -579,5 +621,64 @@ mod tests {
         let stats = run(&mut f);
         assert_eq!(stats.hoisted, 0);
         assert_eq!(stats.loops_visited, 0);
+    }
+
+    #[test]
+    fn hoists_load_when_body_has_no_memory_effect() {
+        // body: r = *p   ← p is an invariant param, body never stores
+        // → Load should be hoisted into the preheader.
+        let (mut f, entry, _header, body, _exit) = mk_func();
+        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let r = add_inst(&mut f, HirType::I64);
+        f.blocks
+            .get_mut(&body)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Load {
+                result: r,
+                ty: HirType::I64,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            });
+        let stats = run(&mut f);
+        assert_eq!(stats.hoisted, 1);
+        assert!(f.blocks[&body].instructions.is_empty());
+        assert_eq!(f.blocks[&entry].instructions.len(), 1);
+    }
+
+    #[test]
+    fn does_not_hoist_load_when_body_has_store() {
+        // body: r = *p  (invariant ptr)
+        //       store v -> p
+        // The Store could overwrite what we'd read, so the Load must
+        // stay inside the loop.
+        let (mut f, _entry, _header, body, _exit) = mk_func();
+        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let v = add_param(&mut f, HirType::I64, 1);
+        let r = add_inst(&mut f, HirType::I64);
+        f.blocks
+            .get_mut(&body)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Load {
+                result: r,
+                ty: HirType::I64,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            });
+        f.blocks
+            .get_mut(&body)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Store {
+                value: v,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            });
+        let stats = run(&mut f);
+        assert_eq!(stats.hoisted, 0, "Store in body blocks Load hoist");
     }
 }

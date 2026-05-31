@@ -305,6 +305,27 @@ fn is_commutative(op: BinaryOp) -> bool {
 /// Walk every instruction and every terminator, replacing operand
 /// references via `substitutions`. Returns the number of references
 /// rewritten.
+/// Public re-export of `apply_substitutions` so sibling passes
+/// (e.g. `load_cse`) can share the rewrite machinery without
+/// duplicating the operand walker. Same contract as the private
+/// helper: walks every instruction + terminator + phi-incoming and
+/// retargets ids that appear as keys in `substitutions`.
+pub fn apply_substitutions_public(
+    func: &mut HirFunction,
+    substitutions: &HashMap<HirId, HirId>,
+) -> usize {
+    apply_substitutions(func, substitutions)
+}
+
+/// Public re-export of `remove_redundant_instructions` — drops any
+/// instruction whose result HirId is a key in `substitutions`.
+pub fn remove_redundant_instructions_public(
+    func: &mut HirFunction,
+    substitutions: &HashMap<HirId, HirId>,
+) -> usize {
+    remove_redundant_instructions(func, substitutions)
+}
+
 fn apply_substitutions(func: &mut HirFunction, substitutions: &HashMap<HirId, HirId>) -> usize {
     if substitutions.is_empty() {
         return 0;
