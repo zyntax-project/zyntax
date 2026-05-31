@@ -1692,27 +1692,58 @@ pub struct InterpOptStats {
 /// was done.
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
-    stats.const_fold = const_fold::fold_module(module);
-    stats.cse = cse::eliminate_module(module);
-    // Load CSE runs after value-based CSE so the pointer ids are
-    // already canonicalised — if two GEPs CSE'd to one, the load_cse
-    // pass sees both loads using the same canonical ptr id and can
-    // collapse them.
-    stats.load_cse = load_cse::run_module(module);
-    stats.inline = inline::run_module(module);
-    stats.licm = licm::run_module(module);
-    stats.loop_vectorize = loop_vectorize::run_module(module);
 
-    // Round 2 — inline + LICM frequently expose new fold/CSE work,
-    // and Load CSE often opens up after inlining flattens a callee.
-    let cf2 = const_fold::fold_module(module);
-    let cse2 = cse::eliminate_module(module);
-    let lcse2 = load_cse::run_module(module);
-    stats.const_fold.folded += cf2.folded;
-    stats.const_fold.iterations = stats.const_fold.iterations.max(cf2.iterations);
-    stats.cse.eliminated += cse2.eliminated;
-    stats.cse.rewrites += cse2.rewrites;
-    stats.load_cse.eliminated += lcse2.eliminated;
+    // Outer fixed-point: keeps iterating the whole sweep until none
+    // of the passes report new work. Compounding example: inline
+    // exposes new constant operands → const_fold creates a Constant
+    // → cse can now collapse a now-equivalent pair → that may free
+    // another callee for inlining (one call's args becoming
+    // syntactically identical to another's). Capped at 8 outer
+    // rounds — well above what real source needs but a guard against
+    // pathological pass-feedback loops.
+    for _ in 0..8 {
+        let cf = const_fold::fold_module(module);
+        let cs = cse::eliminate_module(module);
+        // load_cse runs after value-cse so canonical pointer ids are
+        // already chased — if two GEPs cse'd to one, the load_cse
+        // pass sees both loads using the same canonical ptr id.
+        let lcse = load_cse::run_module(module);
+        let il = inline::run_module(module);
+        let lc = licm::run_module(module);
+        let lv = loop_vectorize::run_module(module);
+
+        let made_progress = cf.folded > 0
+            || cs.eliminated > 0
+            || lcse.eliminated > 0
+            || il.inlined > 0
+            || lc.hoisted > 0
+            || lv.vectorized > 0;
+
+        // Accumulate stats from this round.
+        stats.const_fold.folded += cf.folded;
+        stats.const_fold.iterations = stats.const_fold.iterations.max(cf.iterations);
+        stats.cse.eliminated += cs.eliminated;
+        stats.cse.rewrites += cs.rewrites;
+        stats.load_cse.eliminated += lcse.eliminated;
+        stats.inline.inlined += il.inlined;
+        stats.inline.call_sites_visited += il.call_sites_visited;
+        stats.inline.skipped_too_large += il.skipped_too_large;
+        stats.inline.skipped_multi_block += il.skipped_multi_block;
+        stats.inline.skipped_unsupported += il.skipped_unsupported;
+        stats.inline.skipped_indirect += il.skipped_indirect;
+        stats.licm.hoisted += lc.hoisted;
+        stats.licm.loops_visited += lc.loops_visited;
+        stats.licm.loops_skipped_no_preheader += lc.loops_skipped_no_preheader;
+        stats.loop_vectorize.vectorized += lv.vectorized;
+        stats.loop_vectorize.loops_visited += lv.loops_visited;
+        stats.loop_vectorize.skipped_shape += lv.skipped_shape;
+        stats.loop_vectorize.skipped_no_induction += lv.skipped_no_induction;
+        stats.loop_vectorize.skipped_op_unsupported += lv.skipped_op_unsupported;
+
+        if !made_progress {
+            break;
+        }
+    }
     stats
 }
 
