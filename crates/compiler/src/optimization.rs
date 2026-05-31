@@ -254,11 +254,9 @@ pub mod passes {
 
     impl ConstantFolding {
         fn fold_constants(&mut self, func: &mut HirFunction) -> CompilerResult<bool> {
-            // NOTE: Constant folding deferred to backend.
-            // Requires: (1) Constant propagation, (2) Expression evaluation, (3) Instruction replacement
-            // FUTURE (v2.0): Implement HIR-level constant folding pass
-            // Estimated effort: 8-12 hours
-            Ok(false)
+            let stats = crate::const_fold::fold_function(func);
+            self.folded_count += stats.folded;
+            Ok(stats.folded > 0)
         }
     }
 

@@ -26,6 +26,7 @@ pub mod borrow_check; // HIR-level borrow checking pass
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cfg;
 pub mod const_eval;
+pub mod const_fold;
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
 pub mod effect_handler_resolution; // Handler resolution for effect dispatch
