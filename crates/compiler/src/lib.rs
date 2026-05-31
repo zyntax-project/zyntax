@@ -35,6 +35,7 @@ pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
 pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always available)
+pub mod licm;
 pub mod lowering;
 pub mod memory_management;
 pub mod memory_optimization; // Memory-aware optimizations

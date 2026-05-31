@@ -399,13 +399,11 @@ pub mod passes {
         fn run(
             &mut self,
             module: &mut HirModule,
-            analysis: &ModuleAnalysis,
+            _analysis: &ModuleAnalysis,
         ) -> CompilerResult<bool> {
-            // NOTE: LICM deferred to backend.
-            // Requires: (1) Loop detection, (2) Invariant analysis, (3) Hoisting logic
-            // FUTURE (v2.0): Implement HIR-level LICM pass
-            // Estimated effort: 12-16 hours
-            Ok(false)
+            let stats = crate::licm::run_module(module);
+            self.hoisted_count += stats.hoisted;
+            Ok(stats.hoisted > 0)
         }
     }
 
