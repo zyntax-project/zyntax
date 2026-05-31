@@ -304,6 +304,10 @@ fn body_has_memory_effect(func: &HirFunction, body: &HashSet<HirId>) -> bool {
             None => continue,
         };
         for inst in &block.instructions {
+            // `AsyncSaveSlot` writes to the SM frame; `CreateClosure`
+            // may capture mutable state. Both must block Load
+            // hoisting for the same reason `load_cse` treats them as
+            // memory barriers.
             if matches!(
                 inst,
                 HirInstruction::Store { .. }
@@ -311,6 +315,8 @@ fn body_has_memory_effect(func: &HirFunction, body: &HashSet<HirId>) -> bool {
                     | HirInstruction::IndirectCall { .. }
                     | HirInstruction::Atomic { .. }
                     | HirInstruction::Fence { .. }
+                    | HirInstruction::AsyncSaveSlot { .. }
+                    | HirInstruction::CreateClosure { .. }
             ) {
                 return true;
             }

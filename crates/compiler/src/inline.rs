@@ -68,10 +68,17 @@ use crate::hir::{
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
-/// Maximum number of instructions a callee can have to be eligible.
-/// Calibrated to match small leaf utility functions; tunable but
-/// kept tight since v1 doesn't do recursive inlining cost-modelling.
+/// Maximum number of instructions a single-block (leaf) callee can
+/// have to be eligible for inlining. Calibrated to match small leaf
+/// utility functions; tunable but kept tight since we don't yet do
+/// recursive inlining cost-modelling.
 const MAX_INLINE_INSTS: usize = 8;
+
+/// Maximum total instructions across all blocks for a multi-block
+/// callee. Higher than `MAX_INLINE_INSTS` because the body has more
+/// structure to amortise the inline cost (a control-flow branch
+/// usually subsumes a few instructions on each side).
+const MAX_INLINE_INSTS_MULTI_BLOCK: usize = 24;
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -194,21 +201,18 @@ fn inline_in_function(
                 }
             };
 
-            match classify(callee) {
-                CalleeClass::Ok => {}
+            let kind = match classify(callee) {
+                CalleeClass::OkLeaf => InlineKind::Leaf,
+                CalleeClass::OkMultiBlock => InlineKind::MultiBlock,
                 CalleeClass::TooLarge => {
                     stats.skipped_too_large += 1;
-                    continue;
-                }
-                CalleeClass::MultiBlock => {
-                    stats.skipped_multi_block += 1;
                     continue;
                 }
                 CalleeClass::Unsupported => {
                     stats.skipped_unsupported += 1;
                     continue;
                 }
-            }
+            };
 
             jobs.push(InlineJob {
                 block_id,
@@ -216,6 +220,7 @@ fn inline_in_function(
                 call_result: result,
                 args,
                 callee_id,
+                kind,
             });
         }
 
@@ -232,7 +237,10 @@ fn inline_in_function(
                 Some(c) => c,
                 None => continue,
             };
-            apply_inline(caller, &job, callee);
+            match job.kind {
+                InlineKind::Leaf => apply_inline(caller, &job, callee),
+                InlineKind::MultiBlock => apply_inline_multi_block(caller, &job, callee),
+            }
             stats.inlined += 1;
         }
     }
@@ -247,13 +255,20 @@ struct InlineJob {
     call_result: Option<HirId>,
     args: Vec<HirId>,
     callee_id: HirId,
+    kind: InlineKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineKind {
+    Leaf,
+    MultiBlock,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum CalleeClass {
-    Ok,
+    OkLeaf,
+    OkMultiBlock,
     TooLarge,
-    MultiBlock,
     Unsupported,
 }
 
@@ -264,38 +279,55 @@ fn classify(callee: &HirFunction) -> CalleeClass {
     if !callee.signature.effects.is_empty() {
         return CalleeClass::Unsupported;
     }
-    if callee.blocks.len() != 1 {
-        return CalleeClass::MultiBlock;
-    }
-    let entry = match callee.blocks.get(&callee.entry_block) {
-        Some(b) => b,
-        None => return CalleeClass::Unsupported,
-    };
-    if entry.instructions.len() > MAX_INLINE_INSTS {
-        return CalleeClass::TooLarge;
-    }
-    // Inspect every instruction for shapes we don't yet support.
-    for inst in &entry.instructions {
-        match inst {
-            HirInstruction::Call { .. }
-            | HirInstruction::IndirectCall { .. }
-            | HirInstruction::Alloca { .. }
-            | HirInstruction::Atomic { .. }
-            | HirInstruction::Fence { .. } => return CalleeClass::Unsupported,
-            _ => {}
+
+    // Universal per-instruction safety check across every block.
+    let mut total_insts = 0usize;
+    for block in callee.blocks.values() {
+        total_insts += block.instructions.len();
+        for inst in &block.instructions {
+            match inst {
+                HirInstruction::Call { .. }
+                | HirInstruction::IndirectCall { .. }
+                | HirInstruction::Alloca { .. }
+                | HirInstruction::Atomic { .. }
+                | HirInstruction::Fence { .. } => return CalleeClass::Unsupported,
+                _ => {}
+            }
         }
     }
-    // Terminator must be Return (with ≤ 1 value).
-    match &entry.terminator {
-        HirTerminator::Return { values } if values.len() <= 1 => {}
-        _ => return CalleeClass::Unsupported,
+
+    // Universal terminator-safety check.
+    for block in callee.blocks.values() {
+        match &block.terminator {
+            HirTerminator::Return { values } if values.len() <= 1 => {}
+            HirTerminator::Branch { .. }
+            | HirTerminator::CondBranch { .. }
+            | HirTerminator::Switch { .. } => {}
+            _ => return CalleeClass::Unsupported,
+        }
     }
-    // Phis at the entry block don't make sense (no preds), but
-    // defensive: skip if any are present.
-    if !entry.phis.is_empty() {
-        return CalleeClass::Unsupported;
+
+    // Single-block (leaf) path — preserves the original tight cost
+    // gate and avoids the CFG-splice machinery.
+    if callee.blocks.len() == 1 {
+        let entry = match callee.blocks.get(&callee.entry_block) {
+            Some(b) => b,
+            None => return CalleeClass::Unsupported,
+        };
+        if entry.instructions.len() > MAX_INLINE_INSTS {
+            return CalleeClass::TooLarge;
+        }
+        if !entry.phis.is_empty() {
+            return CalleeClass::Unsupported;
+        }
+        return CalleeClass::OkLeaf;
     }
-    CalleeClass::Ok
+
+    // Multi-block path — larger cost gate, supports CFG splicing.
+    if total_insts > MAX_INLINE_INSTS_MULTI_BLOCK {
+        return CalleeClass::TooLarge;
+    }
+    CalleeClass::OkMultiBlock
 }
 
 /// Splice the callee's single-block body into the caller's
@@ -412,6 +444,293 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
         // Remove the now-orphaned call_result from the caller's
         // values (its defining instruction is gone).
         caller.values.shift_remove(&call_result);
+    }
+}
+
+/// Multi-block inliner. Splices the callee's whole CFG into the
+/// caller around the call site:
+///
+///   * The caller's block containing the Call is split into
+///     `pre_block` (instructions BEFORE the Call) and `post_block`
+///     (instructions AFTER the Call + the original terminator).
+///   * Every callee block is cloned with a fresh `HirId`. Param
+///     values map to the caller's argument ids; every other callee
+///     value gets a fresh id with its `HirValue` cloned into the
+///     caller.
+///   * Cloned terminators get their block targets rewritten through
+///     the block-id map. `Return` terminators become a `Branch` to
+///     the new `post_block`, and their return values are accumulated
+///     for the return-site phi.
+///   * If the callee has more than one `Return`, a fresh `HirPhi` is
+///     installed at the top of `post_block` joining each Return's
+///     value. If exactly one `Return`, we substitute the call result
+///     for the return value directly (no phi needed).
+///   * Predecessors are rebuilt across the whole function at the end —
+///     the cheapest way to keep `block.predecessors` consistent after
+///     splicing in N blocks and splitting one.
+fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction) {
+    // ─── 1. Mint fresh block ids for every callee block.
+    let mut block_id_map: HashMap<HirId, HirId> = HashMap::new();
+    for &cid in callee.blocks.keys() {
+        block_id_map.insert(cid, HirId::new());
+    }
+    let post_block_id = HirId::new();
+
+    // ─── 2. Build value substitutions (params → args, locals → fresh).
+    let mut subs: HashMap<HirId, HirId> = HashMap::new();
+    let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
+
+    // Params → caller args, by ordinal.
+    for (i, param) in callee.signature.params.iter().enumerate() {
+        if let Some(&arg) = job.args.get(i) {
+            subs.insert(param.id, arg);
+        }
+    }
+    for (id, val) in &callee.values {
+        if let HirValueKind::Parameter(idx) = val.kind {
+            if let Some(&arg) = job.args.get(idx as usize) {
+                subs.insert(*id, arg);
+            }
+            continue;
+        }
+        if subs.contains_key(id) {
+            continue;
+        }
+        let new_id = HirId::new();
+        let new_val = HirValue {
+            id: new_id,
+            ty: val.ty.clone(),
+            kind: match &val.kind {
+                HirValueKind::Constant(c) => HirValueKind::Constant(c.clone()),
+                HirValueKind::Global(g) => HirValueKind::Global(*g),
+                HirValueKind::Undef => HirValueKind::Undef,
+                HirValueKind::Instruction => HirValueKind::Instruction,
+                HirValueKind::Parameter(_) => continue,
+            },
+            uses: HashSet::new(),
+            span: None,
+        };
+        subs.insert(*id, new_id);
+        new_values.push((new_id, new_val));
+    }
+    for (id, val) in new_values {
+        caller.values.insert(id, val);
+    }
+
+    // ─── 3. Split the caller's call block into pre + post halves.
+    let (pre_insts, post_insts, post_term, post_phis_original) =
+        match caller.blocks.get(&job.block_id) {
+            Some(blk) => {
+                let pre = blk.instructions[..job.inst_idx].to_vec();
+                let post = blk.instructions[job.inst_idx + 1..].to_vec();
+                let term = blk.terminator.clone();
+                let phis = blk.phis.clone();
+                (pre, post, term, phis)
+            }
+            None => return,
+        };
+
+    // ─── 4. Rewrite the caller's pre-block in place: keep the
+    //         pre-call instructions + original phis, jump to the
+    //         cloned callee entry.
+    let cloned_entry = block_id_map[&callee.entry_block];
+    if let Some(blk) = caller.blocks.get_mut(&job.block_id) {
+        blk.instructions = pre_insts;
+        blk.terminator = HirTerminator::Branch {
+            target: cloned_entry,
+        };
+        // Phis stay — they came from this block's original
+        // predecessors and are still valid after the split.
+        blk.phis = post_phis_original.clone();
+    }
+
+    // ─── 5. Clone callee blocks, rewriting all ids in instructions,
+    //         phis, and terminators. Accumulate Return-block ids +
+    //         their return-value ids for the post-block phi.
+    let mut return_incoming: Vec<(HirId, HirId)> = Vec::new();
+    for (callee_block_id, callee_block) in &callee.blocks {
+        let new_block_id = block_id_map[callee_block_id];
+        let mut new_block = crate::hir::HirBlock::new(new_block_id);
+
+        // Clone instructions, substituting operands.
+        for inst in &callee_block.instructions {
+            let mut new_inst = inst.clone();
+            substitute_operands(&mut new_inst, &subs);
+            new_block.instructions.push(new_inst);
+        }
+
+        // Clone phis. Both the result HirId and the per-incoming
+        // (value, source_block) tuples need rewriting.
+        for phi in &callee_block.phis {
+            let new_result = subs.get(&phi.result).copied().unwrap_or(phi.result);
+            let new_incoming = phi
+                .incoming
+                .iter()
+                .map(|(v, b)| {
+                    (
+                        subs.get(v).copied().unwrap_or(*v),
+                        block_id_map.get(b).copied().unwrap_or(*b),
+                    )
+                })
+                .collect();
+            new_block.phis.push(crate::hir::HirPhi {
+                result: new_result,
+                ty: phi.ty.clone(),
+                incoming: new_incoming,
+            });
+        }
+
+        // Rewrite the terminator.
+        let new_terminator = match &callee_block.terminator {
+            HirTerminator::Return { values } => {
+                if let Some(rv) = values.first() {
+                    let mapped = subs.get(rv).copied().unwrap_or(*rv);
+                    return_incoming.push((mapped, new_block_id));
+                }
+                HirTerminator::Branch {
+                    target: post_block_id,
+                }
+            }
+            HirTerminator::Branch { target } => HirTerminator::Branch {
+                target: block_id_map.get(target).copied().unwrap_or(*target),
+            },
+            HirTerminator::CondBranch {
+                condition,
+                true_target,
+                false_target,
+            } => HirTerminator::CondBranch {
+                condition: subs.get(condition).copied().unwrap_or(*condition),
+                true_target: block_id_map
+                    .get(true_target)
+                    .copied()
+                    .unwrap_or(*true_target),
+                false_target: block_id_map
+                    .get(false_target)
+                    .copied()
+                    .unwrap_or(*false_target),
+            },
+            HirTerminator::Switch {
+                value,
+                default,
+                cases,
+            } => HirTerminator::Switch {
+                value: subs.get(value).copied().unwrap_or(*value),
+                default: block_id_map.get(default).copied().unwrap_or(*default),
+                cases: cases
+                    .iter()
+                    .map(|(c, b)| (c.clone(), block_id_map.get(b).copied().unwrap_or(*b)))
+                    .collect(),
+            },
+            other => other.clone(),
+        };
+        new_block.terminator = new_terminator;
+
+        caller.blocks.insert(new_block_id, new_block);
+    }
+
+    // ─── 6. Build the post block (where control resumes after the
+    //         callee). If the callee had multiple Return blocks we
+    //         install a phi to merge their values.
+    let mut post_block = crate::hir::HirBlock::new(post_block_id);
+    post_block.instructions = post_insts;
+    post_block.terminator = post_term;
+
+    let final_call_substitution = if let Some(call_result) = job.call_result {
+        if return_incoming.len() == 1 {
+            // Single return — just substitute the call_result with
+            // the return value across the function. No phi needed.
+            let (ret_val, _) = return_incoming[0];
+            Some((call_result, ret_val))
+        } else if return_incoming.len() > 1 {
+            // Multiple Returns — synthesise a phi at the head of
+            // post_block joining each return value.
+            let phi_result = HirId::new();
+            let ret_ty = callee
+                .signature
+                .returns
+                .first()
+                .cloned()
+                .unwrap_or(crate::hir::HirType::I64);
+            caller.values.insert(
+                phi_result,
+                HirValue {
+                    id: phi_result,
+                    ty: ret_ty.clone(),
+                    kind: HirValueKind::Instruction,
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+            post_block.phis.push(crate::hir::HirPhi {
+                result: phi_result,
+                ty: ret_ty,
+                incoming: return_incoming.clone(),
+            });
+            Some((call_result, phi_result))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    caller.blocks.insert(post_block_id, post_block);
+
+    // ─── 7. Substitute call_result → return-value across the function.
+    if let Some((from, to)) = final_call_substitution {
+        let mut s = HashMap::new();
+        s.insert(from, to);
+        replace_uses_across_function(caller, &s);
+        caller.values.shift_remove(&from);
+    }
+
+    // ─── 8. Rebuild predecessors + successors across the whole
+    //         function. After splicing in N blocks and splitting one,
+    //         the cheapest correct approach is a full sweep.
+    rebuild_cfg_edges(caller);
+}
+
+/// Rewalk every block's terminator + phi list and rebuild the
+/// `successors` / `predecessors` fields from scratch. Called after
+/// CFG splicing where doing incremental maintenance would be more
+/// error-prone than re-derivation.
+fn rebuild_cfg_edges(func: &mut HirFunction) {
+    // Successors first — per-block, derived from each terminator.
+    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (&id, block) in &func.blocks {
+        let succs = match &block.terminator {
+            HirTerminator::Branch { target } => vec![*target],
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => vec![*true_target, *false_target],
+            HirTerminator::Switch { default, cases, .. } => {
+                let mut v = vec![*default];
+                for (_, t) in cases {
+                    v.push(*t);
+                }
+                v
+            }
+            HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+            HirTerminator::PatternMatch { .. }
+            | HirTerminator::Return { .. }
+            | HirTerminator::Unreachable => vec![],
+        };
+        succ_map.insert(id, succs);
+    }
+
+    // Predecessors derived from successors.
+    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (&src, succs) in &succ_map {
+        for &t in succs {
+            pred_map.entry(t).or_default().push(src);
+        }
+    }
+
+    for (id, block) in func.blocks.iter_mut() {
+        block.successors = succ_map.remove(id).unwrap_or_default();
+        block.predecessors = pred_map.remove(id).unwrap_or_default();
     }
 }
 
@@ -816,6 +1135,104 @@ mod tests {
         let stats = run_module(&mut module);
         assert_eq!(stats.inlined, 0);
         assert_eq!(stats.skipped_unsupported, 1);
+    }
+
+    /// Build `max(a: i64, b: i64): i64 { if a > b { return a } else { return b } }`
+    /// — three blocks (entry, then_blk, else_blk), each terminates in
+    /// Return.
+    fn build_max_callee() -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("max"),
+            sig(vec![HirType::I64, HirType::I64], HirType::I64),
+        );
+        let entry = HirId::new();
+        let then_blk = HirId::new();
+        let else_blk = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        f.blocks.insert(then_blk, HirBlock::new(then_blk));
+        f.blocks.insert(else_blk, HirBlock::new(else_blk));
+
+        let a = add_value_for_param(&mut f, 0, HirType::I64);
+        let b = add_value_for_param(&mut f, 1, HirType::I64);
+        let cmp = add_inst(&mut f, HirType::Bool);
+
+        let entry_blk_ref = f.blocks.get_mut(&entry).unwrap();
+        entry_blk_ref.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Gt,
+            result: cmp,
+            ty: HirType::I64,
+            left: a,
+            right: b,
+        });
+        entry_blk_ref.terminator = HirTerminator::CondBranch {
+            condition: cmp,
+            true_target: then_blk,
+            false_target: else_blk,
+        };
+        f.blocks.get_mut(&then_blk).unwrap().terminator = HirTerminator::Return { values: vec![a] };
+        f.blocks.get_mut(&else_blk).unwrap().terminator = HirTerminator::Return { values: vec![b] };
+        f
+    }
+
+    #[test]
+    fn inlines_multi_block_max_callee() {
+        let mut callee = build_max_callee();
+        let callee_id = HirId::new();
+        callee.id = callee_id;
+
+        // caller(): i64 { return max(7, 3) }
+        let mut caller = HirFunction::new(
+            InternedString::new_global("caller"),
+            sig(vec![], HirType::I64),
+        );
+        let entry = HirId::new();
+        caller.entry_block = entry;
+        caller.blocks.clear();
+        caller.blocks.insert(entry, HirBlock::new(entry));
+        let seven = add_const(&mut caller, HirType::I64, HirConstant::I64(7));
+        let three = add_const(&mut caller, HirType::I64, HirConstant::I64(3));
+        let r = add_inst(&mut caller, HirType::I64);
+        let blk = caller.blocks.get_mut(&entry).unwrap();
+        blk.instructions.push(HirInstruction::Call {
+            result: Some(r),
+            callee: HirCallable::Function(callee_id),
+            args: vec![seven, three],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        blk.terminator = HirTerminator::Return { values: vec![r] };
+
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(callee_id, callee);
+        module.functions.insert(caller.id, caller);
+
+        let stats = run_module(&mut module);
+        assert_eq!(stats.inlined, 1, "{stats:?}");
+
+        // After inlining the caller should have NO Call instructions
+        // anywhere — every block is either pre-split (no call), post-
+        // split (the resumption block with a phi or substituted
+        // return value), or cloned from the callee.
+        let caller_after = module
+            .functions
+            .values()
+            .find(|f| f.name.resolve_global().as_deref() == Some("caller"))
+            .unwrap();
+        for block in caller_after.blocks.values() {
+            assert!(
+                !block
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i, HirInstruction::Call { .. })),
+                "no Call should remain after multi-block inline"
+            );
+        }
+        // There should be > 1 block (we spliced in the callee's CFG)
+        // — pre, then-clone, else-clone, post.
+        assert!(caller_after.blocks.len() >= 3);
     }
 
     #[test]

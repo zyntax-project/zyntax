@@ -59,17 +59,28 @@ pub fn run(func: &mut HirFunction) -> LoadCseStats {
                     }
                 }
                 // Memory-killing ops invalidate everything we
-                // believe about memory contents. We can be smarter
-                // here (track only the pointer that was actually
-                // stored to, do a no-alias check), but
-                // conservatively clearing is correct and matches
-                // what most early alias-aware CSE implementations
-                // do before they grow up.
+                // believe about memory contents. Conservative
+                // clearing matches what most early alias-aware CSE
+                // implementations do before they grow up.
+                //
+                // `AsyncSaveSlot` writes to the SM frame so a Load
+                // before it and a Load after it of an
+                // overlapping-frame pointer can legitimately read
+                // different values. Treat it as a memory barrier
+                // (otherwise the krio-emitted state-machine poll-fn
+                // re-uses a stale state Load between yields and
+                // the SM keeps re-parking instead of advancing).
+                //
+                // `CreateClosure` may capture by reference to a
+                // mutable environment; conservatively treat as a
+                // barrier.
                 HirInstruction::Store { .. }
                 | HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
-                | HirInstruction::Fence { .. } => {
+                | HirInstruction::Fence { .. }
+                | HirInstruction::AsyncSaveSlot { .. }
+                | HirInstruction::CreateClosure { .. } => {
                     available.clear();
                 }
                 _ => {}
