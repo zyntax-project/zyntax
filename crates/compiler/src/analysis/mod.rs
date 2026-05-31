@@ -3,6 +3,10 @@
 //! Provides analysis passes that work on the HIR representation.
 //! These analyses are used by both backends for optimization and code generation.
 
+pub mod dominators;
+
+pub use dominators::DominatorTree;
+
 use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue};
 use crate::CompilerResult;
 use std::collections::{HashMap, HashSet};
