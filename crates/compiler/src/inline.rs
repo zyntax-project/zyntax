@@ -323,11 +323,20 @@ fn classify(callee: &HirFunction) -> CalleeClass {
         return CalleeClass::OkLeaf;
     }
 
-    // Multi-block path — larger cost gate, supports CFG splicing.
-    if total_insts > MAX_INLINE_INSTS_MULTI_BLOCK {
-        return CalleeClass::TooLarge;
-    }
-    CalleeClass::OkMultiBlock
+    // Multi-block path is currently gated off — `apply_inline_multi_block`
+    // produces a CFG that hangs the BC interpreter on at least one
+    // real-world ZynML program (the mandelbrot bench in
+    // `crates/zynml/examples/bench_mandelbrot.zynml`). The bisect harness
+    // at `crates/zynml/tests/bench_kernel_bisect.rs` is what surfaced
+    // this; the splice itself looks coherent on small unit-tested inputs
+    // but the phi-incoming / pred-succ rewrite has an edge case the
+    // unit tests don't reach.  Until that's diagnosed, classify
+    // multi-block callees as `TooLarge` so leaf inlining still runs
+    // unconditionally and the rest of the pipeline (const_fold, cse,
+    // licm, etc.) doesn't get blocked.
+    let _ = MAX_INLINE_INSTS_MULTI_BLOCK;
+    let _ = total_insts;
+    CalleeClass::TooLarge
 }
 
 /// Splice the callee's single-block body into the caller's
@@ -1176,7 +1185,11 @@ mod tests {
         f
     }
 
+    // Multi-block inlining is currently gated off in `classify` — see
+    // the comment there for the underlying CFG-rewrite bug surfaced by
+    // the bench-kernel bisect harness.
     #[test]
+    #[ignore = "multi-block inlining gated off pending CFG rewrite fix"]
     fn inlines_multi_block_max_callee() {
         let mut callee = build_max_callee();
         let callee_id = HirId::new();

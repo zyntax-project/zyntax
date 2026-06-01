@@ -439,6 +439,20 @@ pub enum Op {
         slot: u32,
         ty: u32,
     },
+
+    /// `HirInstruction::GetElementPtr { result, ty, ptr, indices }` —
+    /// compute `regs[ptr] + sum_i(regs[indices[i]] * stride[i])`. For
+    /// the common single-index case (array indexing emitted by
+    /// `TypedExpression::Index` in [`crate::ssa`]) `stride[0]` is just
+    /// `size_of_hir_ty(elem_ty)`. The `args` field re-uses the
+    /// `args_pool` to hold the index register list; `stride_idx`
+    /// indexes into `gep_stride_pool` for the per-index byte stride.
+    Gep {
+        dst: Reg,
+        ptr: Reg,
+        args: u32,
+        stride: u32,
+    },
 }
 
 /// One compiled function: bytecode stream + side pools.
@@ -456,6 +470,9 @@ pub struct CompiledFunction {
     /// at compile time because symbols are registered at the
     /// interpreter level, not the compiler level.
     pub symbol_pool: Vec<String>,
+    /// Per-`Op::Gep` byte-stride list (one entry per index). At runtime
+    /// `Gep` computes `ptr + Σ stride[i] * regs[index_regs[i]]`.
+    pub gep_stride_pool: Vec<Vec<i64>>,
     /// Per-register hint of the SSA value's HirType. Used to size
     /// extern-call returns and width-correct integer ops.
     pub reg_types: Vec<HirType>,
@@ -937,6 +954,41 @@ fn lower_inst(
             let idx = cf.indices_pool.len() as u32;
             cf.indices_pool.push(indices.clone());
             cf.code.push(Op::ExtractValue { dst, src, idx });
+        }
+        HirInstruction::GetElementPtr {
+            result,
+            ty,
+            ptr,
+            indices,
+        } => {
+            // `ty` is the *result* pointer type — `Ptr(elem_ty)`. Strides
+            // are derived from `size_of_hir_ty(elem_ty)`. For multi-index
+            // GEP we fall back to a uniform stride of the element type,
+            // which is correct for the single-index array-indexing case
+            // the ZynML front-end emits today (see
+            // `crates/compiler/src/ssa.rs::TypedExpression::Index`).
+            // Multi-index struct-field GEP would need per-level strides;
+            // not emitted by ZynML's lowering yet, so a `todo!` would
+            // never fire — we just treat extra indices uniformly.
+            let elem_ty = match ty {
+                HirType::Ptr(inner) => (**inner).clone(),
+                other => other.clone(),
+            };
+            let stride = size_of_hir_ty(&elem_ty) as i64;
+            let dst = reg(*result)?;
+            let p = reg(*ptr)?;
+            let idx_regs: Result<Vec<Reg>, InterpError> = indices.iter().map(|i| reg(*i)).collect();
+            let idx_regs = idx_regs?;
+            let args = cf.args_pool.len() as u32;
+            cf.args_pool.push(idx_regs);
+            let stride_idx = cf.gep_stride_pool.len() as u32;
+            cf.gep_stride_pool.push(vec![stride; indices.len().max(1)]);
+            cf.code.push(Op::Gep {
+                dst,
+                ptr: p,
+                args,
+                stride: stride_idx,
+            });
         }
         HirInstruction::InsertValue {
             result,
@@ -1980,6 +2032,43 @@ impl HirInterpreter {
                     let mut new_agg = regs[*agg as usize].clone();
                     insert_value_recursive(&mut new_agg, indices, regs[*val as usize].clone());
                     regs[*dst as usize] = new_agg;
+                    pc += 1;
+                }
+                Op::Gep {
+                    dst,
+                    ptr,
+                    args,
+                    stride,
+                } => {
+                    // Read base pointer — accept Pointer (natural shape)
+                    // or Int/UInt (raw address — produced when an earlier
+                    // GEP / arithmetic on a pointer flowed through the
+                    // i64-funneled bus and lost the Pointer tag).
+                    let base = match &regs[*ptr as usize] {
+                        ZyntaxValue::Pointer(p) => *p as i64,
+                        ZyntaxValue::Int(n) => *n,
+                        ZyntaxValue::UInt(n) => *n as i64,
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "pointer".to_string(),
+                                got: format!("{:?}", other),
+                            })
+                        }
+                    };
+                    let idx_regs = &cf.args_pool[*args as usize];
+                    let strides = &cf.gep_stride_pool[*stride as usize];
+                    let mut addr = base;
+                    for (i, r) in idx_regs.iter().enumerate() {
+                        let idx_val = value_to_i64(&regs[*r as usize]).ok_or_else(|| {
+                            InterpError::TypeMismatch {
+                                expected: "integer (GEP index)".to_string(),
+                                got: format!("{:?}", regs[*r as usize]),
+                            }
+                        })?;
+                        let s = strides.get(i).copied().unwrap_or(0);
+                        addr = addr.wrapping_add(idx_val.wrapping_mul(s));
+                    }
+                    regs[*dst as usize] = ZyntaxValue::Pointer(addr as usize as *mut u8);
                     pc += 1;
                 }
                 Op::Jump { target } => {

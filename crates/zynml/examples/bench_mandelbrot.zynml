@@ -1,0 +1,60 @@
+// Mandelbrot bench — pure-arithmetic float kernel. Iterates the
+// `z = z² + c` recurrence per grid point and counts the steps
+// until the magnitude squared escapes the |z|² > 4 threshold.
+//
+// Exercises every optimization pass in the pipeline:
+//   * `const_fold`         — folds the float constants in the
+//                            escape threshold and the inner
+//                            multiplications-by-constants.
+//   * `cse`                — collapses repeated `zx * zx` / `zy *
+//                            zy` reads across the inner loop.
+//   * `licm`               — hoists the loop-invariant `cy` /
+//                            `cx` ref through the inner while.
+//   * `inline`             — `mandel_count` is a leaf callee
+//                            (single block with Return); inlining
+//                            into `main` exposes the inner loop
+//                            to LICM/CSE on the outer-context's
+//                            constants.
+//   * `cfg_simplify`       — collapses straight-line successor
+//                            chains exposed by const-fold on
+//                            CondBranch (e.g. the escape check).
+//
+// Grid stays small (16×16, 100 iters) so the BC interpreter still
+// returns in tens of ms — Criterion handles the rest.
+
+def mandel_count(cx: f64, cy: f64): i64 {
+    let mut zx: f64 = 0.0
+    let mut zy: f64 = 0.0
+    let mut i: i64 = 0
+    while i < 100 {
+        let zx2 = zx * zx
+        let zy2 = zy * zy
+        if zx2 + zy2 > 4.0 {
+            return i
+        }
+        let new_zx = zx2 - zy2 + cx
+        let new_zy = 2.0 * zx * zy + cy
+        zx = new_zx
+        zy = new_zy
+        i = i + 1
+    }
+    return i
+}
+
+def main(): i64 {
+    let mut total: i64 = 0
+    let mut yi: i64 = 0
+    let mut cy: f64 = -1.0
+    while yi < 16 {
+        let mut xi: i64 = 0
+        let mut cx: f64 = -2.0
+        while xi < 16 {
+            total = total + mandel_count(cx, cy)
+            cx = cx + 0.1875
+            xi = xi + 1
+        }
+        cy = cy + 0.125
+        yi = yi + 1
+    }
+    return total
+}

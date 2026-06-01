@@ -3240,7 +3240,36 @@ impl SsaBuilder {
                 let right_val = self.translate_expression(block_id, right)?;
                 let result_type = self.convert_type(&expr.ty);
 
-                let hir_op = self.convert_binary_op(op, &left_with_type.ty);
+                // First-pass: pick the HIR op from the typed-AST operand
+                // type. Then double-check against the *actual* lowered
+                // SSA-value type — the typed AST sometimes infers e.g.
+                // `Type::Int` for a sum-of-floats whose lowered HIR is
+                // f64, and `convert_binary_op` would pick the integer
+                // opcode in that case. Promote to the float opcode when
+                // the operand register is actually f32 / f64.
+                let mut hir_op = self.convert_binary_op(op, &left_with_type.ty);
+                let lhs_hir_ty = self.function.values.get(&left_val).map(|v| v.ty.clone());
+                let rhs_hir_ty = self.function.values.get(&right_val).map(|v| v.ty.clone());
+                let lhs_is_float =
+                    matches!(lhs_hir_ty.as_ref(), Some(HirType::F32) | Some(HirType::F64));
+                let rhs_is_float =
+                    matches!(rhs_hir_ty.as_ref(), Some(HirType::F32) | Some(HirType::F64));
+                if lhs_is_float || rhs_is_float {
+                    hir_op = match hir_op {
+                        crate::hir::BinaryOp::Add => crate::hir::BinaryOp::FAdd,
+                        crate::hir::BinaryOp::Sub => crate::hir::BinaryOp::FSub,
+                        crate::hir::BinaryOp::Mul => crate::hir::BinaryOp::FMul,
+                        crate::hir::BinaryOp::Div => crate::hir::BinaryOp::FDiv,
+                        crate::hir::BinaryOp::Rem => crate::hir::BinaryOp::FRem,
+                        crate::hir::BinaryOp::Eq => crate::hir::BinaryOp::FEq,
+                        crate::hir::BinaryOp::Ne => crate::hir::BinaryOp::FNe,
+                        crate::hir::BinaryOp::Lt => crate::hir::BinaryOp::FLt,
+                        crate::hir::BinaryOp::Le => crate::hir::BinaryOp::FLe,
+                        crate::hir::BinaryOp::Gt => crate::hir::BinaryOp::FGt,
+                        crate::hir::BinaryOp::Ge => crate::hir::BinaryOp::FGe,
+                        other => other,
+                    };
+                }
 
                 // For comparisons, use the operand type (not Bool result type) for the instruction
                 let inst_type = match hir_op {
@@ -3254,6 +3283,76 @@ impl SsaBuilder {
                         self.convert_type(&left.ty)
                     }
                     _ => result_type.clone(),
+                };
+
+                // Float-op + integer-result-type mismatch: the typed AST
+                // sometimes leaves `expr.ty` as `Type::Int` for arithmetic
+                // expressions whose operands are floats (e.g.
+                // `let r = 0.5 + 0.25` with no type annotation gets
+                // `expr.ty = Type::Int`). `convert_binary_op` already
+                // picked the float opcode from the left operand type
+                // (FAdd / FSub / FMul / FDiv / FCmp*), but `inst_type`
+                // came from `expr.ty` and stays I64. Downstream
+                // dispatch in `crates/compiler/src/hir_interp.rs`
+                // selects integer vs float by looking at `inst.ty`, so
+                // a float op tagged I64 silently falls back to integer
+                // arithmetic on the operand bit-patterns and truncates
+                // the result. Patch up the type tag to match the
+                // operand width so the op/type pair is internally
+                // consistent.
+                let is_float_op = matches!(
+                    hir_op,
+                    crate::hir::BinaryOp::FAdd
+                        | crate::hir::BinaryOp::FSub
+                        | crate::hir::BinaryOp::FMul
+                        | crate::hir::BinaryOp::FDiv
+                        | crate::hir::BinaryOp::FRem
+                        | crate::hir::BinaryOp::FEq
+                        | crate::hir::BinaryOp::FNe
+                        | crate::hir::BinaryOp::FLt
+                        | crate::hir::BinaryOp::FLe
+                        | crate::hir::BinaryOp::FGt
+                        | crate::hir::BinaryOp::FGe
+                );
+                let is_int_inst_ty =
+                    !matches!(inst_type, HirType::F32 | HirType::F64 | HirType::Vector(..));
+                let inst_type = if is_float_op && is_int_inst_ty {
+                    let lhs_ty = self.convert_type(&left_with_type.ty);
+                    match lhs_ty {
+                        HirType::F32 | HirType::F64 => lhs_ty,
+                        _ => {
+                            let rhs_ty = self.convert_type(&right_with_type.ty);
+                            match rhs_ty {
+                                HirType::F32 | HirType::F64 => rhs_ty,
+                                _ => HirType::F64,
+                            }
+                        }
+                    }
+                } else {
+                    inst_type
+                };
+
+                // Same fix on the result-value's recorded type — for
+                // non-comparison float ops the result is f64/f32 too.
+                // Comparisons keep their Bool result type (they only had
+                // the `inst.ty` tag corrected above).
+                let result_type = if is_float_op
+                    && !matches!(
+                        hir_op,
+                        crate::hir::BinaryOp::FEq
+                            | crate::hir::BinaryOp::FNe
+                            | crate::hir::BinaryOp::FLt
+                            | crate::hir::BinaryOp::FLe
+                            | crate::hir::BinaryOp::FGt
+                            | crate::hir::BinaryOp::FGe
+                    )
+                    && !matches!(
+                        result_type,
+                        HirType::F32 | HirType::F64 | HirType::Vector(..)
+                    ) {
+                    inst_type.clone()
+                } else {
+                    result_type
                 };
 
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
@@ -4161,28 +4260,136 @@ impl SsaBuilder {
                 let object_val = self.translate_expression(block_id, object)?;
                 let index_val = self.translate_expression(block_id, index)?;
 
-                // Create GEP instruction
-                let result_type = HirType::Ptr(Box::new(self.convert_type(&expr.ty)));
+                let elem_hir_ty = self.convert_type(&expr.ty);
+
+                // For `List<T>` indexing, `object_val` is a pointer to a
+                // `List<T>` struct `{ i64 data, i64 len, i64 cap }` (built by
+                // `TypedExpression::Array` above). GEP'ing straight off that
+                // pointer treats its first 8 bytes (the data pointer field)
+                // as if they were the element buffer — `xs[0]` then returns
+                // the high-half of the data-ptr address and `xs[1]` returns
+                // the `len` field, etc. Load the data pointer first, then
+                // GEP relative to that. For non-list types (raw arrays,
+                // tuples, etc.) we keep the old direct-GEP path. Detection
+                // works at the HIR-type level since the front-end may type
+                // `xs` as either `Type::Array { .. }` (raw array literal)
+                // or `Type::Named { .. }` (when it resolves the type alias
+                // back to the `List` prelude struct).
+                let object_hir_ty = self.function.values.get(&object_val).map(|v| v.ty.clone());
+                // Three HIR shapes count as "List-typed" here:
+                //   * `Ptr(Struct{i64, i64, i64})` — what
+                //     `TypedExpression::Array` produces locally when
+                //     it constructs the List struct in-place.
+                //   * `Struct(name = "List" | "Array", …)` — what a
+                //     value of List<T> looks like as a function-call
+                //     return tag. The type registry pre-registers
+                //     `List` with 0 fields and the declaration walker
+                //     may not have re-flowed the real fields back, so
+                //     we accept any field count and match on the
+                //     name. (See memory snapshot "Generic Struct
+                //     Field Access (List<T>)" for the ordering
+                //     quirk.)
+                //   * `Ptr(Struct{name = "List" | "Array"})` — same
+                //     situation as the previous bullet but wrapped
+                //     in a Ptr.
+                let extract_struct = |ty: &HirType| -> Option<crate::hir::HirStructType> {
+                    match ty {
+                        HirType::Struct(s) => Some(s.clone()),
+                        HirType::Ptr(inner) => match inner.as_ref() {
+                            HirType::Struct(s) => Some(s.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                };
+                let is_list_shape_hir = object_hir_ty
+                    .as_ref()
+                    .and_then(extract_struct)
+                    .map(|s| {
+                        let three_i64s = s.fields.len() == 3
+                            && matches!(s.fields[0], HirType::I64)
+                            && matches!(s.fields[1], HirType::I64)
+                            && matches!(s.fields[2], HirType::I64);
+                        let named_list_or_array = s
+                            .name
+                            .and_then(|n| n.resolve_global())
+                            .map(|n| n == "List" || n == "Array")
+                            .unwrap_or(false);
+                        three_i64s || named_list_or_array
+                    })
+                    .unwrap_or(false);
+                // Cross-call-boundary case: the typed AST sees `xs`
+                // as `Type::Named { id: TypeId(_) }` (with no field
+                // path through to the underlying struct) and
+                // `convert_type` lowers that to an HIR `Opaque` (the
+                // prelude alias path), which the HIR-shape check
+                // above can't recognise. Fall back to the
+                // type-registry name lookup — "Array" and "List"
+                // both refer to the same `List<T>` struct layout
+                // `{i64 data, i64 len, i64 cap}`.
+                let is_list_shape_named = if let Type::Named { id, .. } = &object.ty {
+                    self.type_registry
+                        .get_type_by_id(*id)
+                        .and_then(|td| td.name.resolve_global())
+                        .map(|n| n == "Array" || n == "List")
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let gep_base = if matches!(object.ty, Type::Array { .. })
+                    || is_list_shape_hir
+                    || is_list_shape_named
+                {
+                    let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Load {
+                            result: data_as_i64,
+                            ty: HirType::I64,
+                            ptr: object_val,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
+                    self.add_use(object_val, data_as_i64);
+                    let data_ptr_ty = HirType::Ptr(Box::new(elem_hir_ty.clone()));
+                    let data_ptr =
+                        self.create_value(data_ptr_ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Cast {
+                            result: data_ptr,
+                            ty: data_ptr_ty,
+                            operand: data_as_i64,
+                            op: crate::hir::CastOp::IntToPtr,
+                        },
+                    );
+                    self.add_use(data_as_i64, data_ptr);
+                    data_ptr
+                } else {
+                    object_val
+                };
+
+                let result_type = HirType::Ptr(Box::new(elem_hir_ty.clone()));
                 let gep_result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let gep_inst = HirInstruction::GetElementPtr {
                     result: gep_result,
                     ty: result_type,
-                    ptr: object_val,
+                    ptr: gep_base,
                     indices: vec![index_val],
                 };
 
                 self.add_instruction(block_id, gep_inst);
-                self.add_use(object_val, gep_result);
+                self.add_use(gep_base, gep_result);
                 self.add_use(index_val, gep_result);
 
                 // Load the value
-                let load_result =
-                    self.create_value(self.convert_type(&expr.ty), HirValueKind::Instruction);
+                let load_result = self.create_value(elem_hir_ty.clone(), HirValueKind::Instruction);
 
                 let load_inst = HirInstruction::Load {
                     result: load_result,
-                    ty: self.convert_type(&expr.ty),
+                    ty: elem_hir_ty,
                     ptr: gep_result,
                     // NOTE: Proper alignment calculation requires type layout information.
                     // Need TypeRegistry or TargetData to compute alignment from type.

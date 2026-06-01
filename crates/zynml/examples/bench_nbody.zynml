@@ -1,0 +1,106 @@
+// N-body bench — array-of-bodies pair-distance summary.
+//
+// Six 2D bodies stored as parallel arrays `xs[]` / `ys[]`. The
+// outer time-step loop reads every body's `xs[i]` / `ys[i]`
+// position, computes the squared distance² (with softening)
+// from body 0 to each of bodies 1..5, sums those five r²
+// values into a per-step `total`, and increments a fence-post
+// counter once per step. The bodies don't actually move — the
+// inner work is the load-bearing array-read + float-arith
+// workload, repeated under the outer integration counter.
+//
+// Why static bodies + a flat per-step path:
+//
+//   * ZynML's lowering of `xs[i] = value` (index-assignment)
+//     errors at lowering time today ("Cannot index into
+//     non-array type" — the typed-AST treats `xs` as
+//     `Type::Named(List<T>)` rather than `Type::Array`), so the
+//     bodies can't be mutated in-place. Once that's fixed, this
+//     kernel can be upgraded to a full integrator.
+//
+//   * Nested `while` blocks that read from a List<T> array trip
+//     "type mismatch: expected pointer, got Undef" in the BC
+//     interpreter — even one nested `while xs[i]` pattern
+//     fails. The bisect harness at
+//     `crates/zynml/tests/bench_kernel_bisect.rs` is what
+//     surfaced this. We sidestep by hand-flattening the
+//     pair walk under a single outer loop.
+//
+//   * Multiple `if cond { counter += 1 }` blocks inside the
+//     same outer-loop body trip the Cranelift backend with
+//     "no entry found for key" at codegen time. We fuse the
+//     per-pair `if r²_k < thresh` checks into a single
+//     post-sum check on `total`.
+//
+// Reads through `xs[i]` go through the BC interpreter's new
+// `Op::Gep` opcode (added alongside this bench) — before, the
+// BC interp errored with "interpreter does not yet support:
+// Discriminant(5)" on any array indexing.
+//
+// Returns i64 (close-encounter count) on purpose: a separate
+// ZynML bug truncates `let r = 0.5 + 0.25; return r` to
+// `Int(0)` because the Binary lowering picks integer ops when
+// the operand type isn't anchored at the use site, so returning
+// a raw f64 from a `let`-bound arithmetic expression would
+// silently corrupt the bench result.
+//
+// Exercises:
+//   * `const_fold`     — folds `softening`, the loop bounds,
+//                        and the literal arithmetic in the
+//                        pair walk.
+//   * `cse`            — collapses repeated reads of `x0` /
+//                        `y0` across the five unrolled pair
+//                        computations.
+//   * `licm`           — hoists the data-pointer load from the
+//                        `xs` / `ys` List<T> structs out of the
+//                        outer time-step loop entirely.
+//   * `load_cse`       — collapses redundant `List<T>.data`
+//                        pointer-loads across consecutive
+//                        `xs[i]` reads inside one iteration.
+
+def main(): i64 {
+    let xs = [0.0, 1.0, 0.5, 2.5, 1.8, 0.3]
+    let ys = [0.0, 0.2, 0.866, 1.1, 2.4, 1.9]
+    let softening: f64 = 0.01
+
+    let mut close_count: i64 = 0
+    let mut t: i64 = 0
+    while t < 100 {
+        let x0 = xs[0]
+        let y0 = ys[0]
+
+        let dx1 = xs[1] - x0
+        let dy1 = ys[1] - y0
+        let r2_1 = dx1 * dx1 + dy1 * dy1 + softening
+
+        let dx2 = xs[2] - x0
+        let dy2 = ys[2] - y0
+        let r2_2 = dx2 * dx2 + dy2 * dy2 + softening
+
+        let dx3 = xs[3] - x0
+        let dy3 = ys[3] - y0
+        let r2_3 = dx3 * dx3 + dy3 * dy3 + softening
+
+        let dx4 = xs[4] - x0
+        let dy4 = ys[4] - y0
+        let r2_4 = dx4 * dx4 + dy4 * dy4 + softening
+
+        let dx5 = xs[5] - x0
+        let dy5 = ys[5] - y0
+        let r2_5 = dx5 * dx5 + dy5 * dy5 + softening
+
+        // Sum exists so a downstream pass that DCE'd the per-pair
+        // r²_k stays honest — the optimization passes can't fold
+        // the work away if `total` feeds into the counted-branch.
+        let total = r2_1 + r2_2 + r2_3 + r2_4 + r2_5
+
+        // 100.0 keeps the branch unconditionally true regardless
+        // of float-precision quirks in the BC interpreter — gives
+        // a deterministic `Int(100)` return that can be smoke-
+        // checked end-to-end.
+        if total < 100.0 { close_count = close_count + 1 }
+
+        t = t + 1
+    }
+    return close_count
+}
