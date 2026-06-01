@@ -47,6 +47,7 @@ pub mod memory_pass;
 pub mod monomorphize;
 pub mod optimization;
 pub mod pattern_matching;
+pub mod reduction_vectorize;
 pub mod runtime;
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
@@ -1661,6 +1662,7 @@ pub struct InterpOptStats {
     pub licm: licm::LicmStats,
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
+    pub reduction_vectorize: reduction_vectorize::ReductionStats,
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
 }
 
@@ -1713,6 +1715,10 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         let il = inline::run_module(module);
         let lc = licm::run_module(module);
         let lv = loop_vectorize::run_module(module);
+        // Reduction vectorization runs alongside loop_vectorize; the
+        // two recognise disjoint patterns (store-to-array vs.
+        // accumulator) so they can't double-fire on the same loop.
+        let rv = reduction_vectorize::run_module(module);
         // cfg_simplify runs last in the round — `const_fold`'s
         // CondBranch-on-known-Bool collapse routinely turns
         // conditional branches into unconditional ones, which makes
@@ -1726,6 +1732,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
             || il.inlined > 0
             || lc.hoisted > 0
             || lv.vectorized > 0
+            || rv.vectorized > 0
             || cs_cfg.merged > 0;
 
         // Accumulate stats from this round.
@@ -1748,6 +1755,10 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.loop_vectorize.skipped_shape += lv.skipped_shape;
         stats.loop_vectorize.skipped_no_induction += lv.skipped_no_induction;
         stats.loop_vectorize.skipped_op_unsupported += lv.skipped_op_unsupported;
+        stats.reduction_vectorize.vectorized += rv.vectorized;
+        stats.reduction_vectorize.loops_visited += rv.loops_visited;
+        stats.reduction_vectorize.skipped_shape += rv.skipped_shape;
+        stats.reduction_vectorize.skipped_op_unsupported += rv.skipped_op_unsupported;
         stats.cfg_simplify.merged += cs_cfg.merged;
 
         if !made_progress {
