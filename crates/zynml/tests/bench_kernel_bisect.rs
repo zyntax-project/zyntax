@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_compiler::{
-    cfg_simplify, const_fold, cse, hir::HirModule, inline, licm, load_cse, loop_vectorize,
-    reduction_vectorize,
+    alloca_promote, cfg_simplify, const_fold, cse, drop_insert, hir::HirModule, inline, licm,
+    load_cse, loop_vectorize, reduction_vectorize,
 };
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
@@ -51,6 +51,9 @@ fn bisect(source: &str, label: &str) {
 
     // Per-pass: apply ONE pass, then run with a tight budget.
     let passes: &[(&str, fn(&mut HirModule))] = &[
+        ("alloca_promote", |m| {
+            let _ = alloca_promote::run_module(m);
+        }),
         ("const_fold", |m| {
             let _ = const_fold::fold_module(m);
         }),
@@ -74,6 +77,9 @@ fn bisect(source: &str, label: &str) {
         }),
         ("cfg_simplify", |m| {
             let _ = cfg_simplify::run_module(m);
+        }),
+        ("drop_insert", |m| {
+            let _ = drop_insert::run_module(m);
         }),
     ];
 

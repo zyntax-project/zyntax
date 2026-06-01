@@ -19,6 +19,7 @@
 //! - Type information preserved for optimization opportunities
 //! - Memory safety validated before code generation
 
+pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
 pub mod analysis;
 pub mod associated_type_resolver; // Associated type resolution for trait dispatch
 pub mod async_support;
@@ -29,6 +30,7 @@ pub mod cfg_simplify;
 pub mod const_eval;
 pub mod const_fold;
 pub mod cse;
+pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-escaping mallocs
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
 pub mod effect_handler_resolution; // Handler resolution for effect dispatch
@@ -1656,6 +1658,7 @@ pub fn compile_to_hir(
 /// `--print-opt-stats` style debugging surfaces.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct InterpOptStats {
+    pub alloca_promote: alloca_promote::PromoteStats,
     pub const_fold: const_fold::FoldStats,
     pub cse: cse::CseStats,
     pub load_cse: load_cse::LoadCseStats,
@@ -1664,6 +1667,7 @@ pub struct InterpOptStats {
     pub loop_vectorize: loop_vectorize::VectorizeStats,
     pub reduction_vectorize: reduction_vectorize::ReductionStats,
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
+    pub drop_insert: drop_insert::DropStats,
 }
 
 /// Run the subset of HIR optimization passes that are safe for the
@@ -1696,6 +1700,23 @@ pub struct InterpOptStats {
 /// was done.
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
+
+    // Alloca → Malloc promotion runs ONCE up front, before the
+    // fixed-point sweep. Two reasons it goes here:
+    //   * Promoting an escaping Alloca to a `Call(Intrinsic::Malloc)`
+    //     introduces a new call boundary that CSE / LICM treat as a
+    //     memory barrier. Doing it before the fixed-point means
+    //     subsequent passes see the final allocation shape and can
+    //     reason about it consistently (rather than re-deriving
+    //     across each round).
+    //   * The promotion is idempotent — a single pass identifies
+    //     every escaping Alloca and rewrites it. Running again would
+    //     find zero work; no benefit to iterating.
+    let ap = alloca_promote::run_module(module);
+    stats.alloca_promote.allocas_scanned += ap.allocas_scanned;
+    stats.alloca_promote.promoted += ap.promoted;
+    stats.alloca_promote.kept_on_stack += ap.kept_on_stack;
+    stats.alloca_promote.skipped_unsupported += ap.skipped_unsupported;
 
     // Outer fixed-point: keeps iterating the whole sweep until none
     // of the passes report new work. Compounding example: inline
@@ -1765,6 +1786,25 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
             break;
         }
     }
+
+    // Drop-site insertion runs *after* the optimization fixed-point.
+    // Order matters two ways:
+    //   * Inserting Free calls earlier would create new memory
+    //     barriers that load_cse would have to treat conservatively,
+    //     suppressing legitimate redundancy elimination.
+    //   * Running drop-insert on the *optimised* IR is what gives
+    //     speculative drop-site analysis its precision: const_fold
+    //     and cse may have replaced uses, eliminating spurious
+    //     "use" sites that would otherwise extend the live-range
+    //     past the real last use. Running it once at the end means
+    //     each malloc gets its tightest legal drop position.
+    let di = drop_insert::run_module(module);
+    stats.drop_insert.mallocs_scanned += di.mallocs_scanned;
+    stats.drop_insert.frees_inserted += di.frees_inserted;
+    stats.drop_insert.escapes_skipped += di.escapes_skipped;
+    stats.drop_insert.multi_block_skipped += di.multi_block_skipped;
+    stats.drop_insert.no_use_skipped += di.no_use_skipped;
+
     stats
 }
 
