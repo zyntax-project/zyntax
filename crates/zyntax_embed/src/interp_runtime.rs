@@ -68,7 +68,9 @@ use std::sync::Arc;
 
 use beadie::{Bead, TieredAdapter, TieredBound};
 use zyntax_compiler::hir::{HirId, HirModule};
-use zyntax_compiler::hir_interp::{HirInterpreter, InterpError, JitDispatch, ProfileSample};
+use zyntax_compiler::hir_interp::{
+    jit_dispatch_supported, jit_float_mask, HirInterpreter, InterpError, JitDispatch, ProfileSample,
+};
 #[cfg(feature = "native")]
 use zyntax_compiler::tiered_backend::{make_policies, TieredConfig};
 use zyntax_compiler::{CompilationConfig, CompilerError};
@@ -483,6 +485,13 @@ impl InterpRuntime {
                     Some(JitDispatch {
                         ptr: code as *const u8,
                         n_params,
+                        // Generic seam: no signature info available
+                        // here. Assume all-i64 — callers wiring
+                        // f64-arg functions through this seam must
+                        // use the typed install path
+                        // (`install_jit_with`) instead.
+                        float_mask: 0,
+                        ret_is_float: false,
                     })
                 }),
             );
@@ -724,6 +733,33 @@ impl InterpRuntime {
             let cranelift_compile = cranelift_compile.clone();
             let n_params = self.param_count_for(func_id);
 
+            // Pre-compute the FFI-bridge dispatch shape for this
+            // function so the hot path doesn't re-derive it from the
+            // signature on every invocation. If the signature falls
+            // outside the bridge's supported matrix (>4-arg with
+            // mixed f64/i64, or struct returns), `supported` is
+            // false and the tick-callback returns None — that
+            // function stays in BC interp instead of crashing at
+            // the bridge.
+            let (float_mask, ret_is_float, jit_supported) =
+                if let Some((func_arc, _)) = func_arcs.get(&func_id) {
+                    let p = &func_arc.signature.params;
+                    let ret = func_arc
+                        .signature
+                        .returns
+                        .first()
+                        .cloned()
+                        .unwrap_or(zyntax_compiler::hir::HirType::Void);
+                    let param_tys: Vec<_> = p.iter().map(|hp| hp.ty.clone()).collect();
+                    (
+                        jit_float_mask(&param_tys),
+                        matches!(ret, zyntax_compiler::hir::HirType::F64),
+                        jit_dispatch_supported(&param_tys, &ret),
+                    )
+                } else {
+                    (0, false, false)
+                };
+
             #[cfg(feature = "llvm-backend")]
             let llvm_state = Arc::clone(&llvm_state);
             #[cfg(feature = "llvm-backend")]
@@ -788,9 +824,17 @@ impl InterpRuntime {
                     if code.is_null() {
                         return None;
                     }
+                    if !jit_supported {
+                        // Signature outside the FFI-bridge matrix —
+                        // never hand a dispatch back, the function
+                        // keeps running in BC interp.
+                        return None;
+                    }
                     Some(JitDispatch {
                         ptr: code as *const u8,
                         n_params,
+                        float_mask,
+                        ret_is_float,
                     })
                 }),
             );
