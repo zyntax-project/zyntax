@@ -702,28 +702,44 @@ impl InterpRuntime {
             Ok(())
         })?;
 
-        // beadie's `on_invoke` returns the JIT pointer only via the
-        // fast path `bead.compiled().is_some()`. On the first call
-        // it ticks the bead, queues the compile on the broker, and
-        // returns `None` — BC interp runs the entry function in
-        // full while the broker compiles in the background. For
-        // long-running entry functions (rayzor-scale nbody's 10 M
-        // `advance()` loop is ~hours in BC interp) the second call
-        // never arrives, so the JIT'd code never dispatches.
+        // Prime the JIT for every function: ticking each bead via
+        // `on_invoke` submits a broker compile, and we then wait
+        // briefly for the broker to finish so the bead transitions
+        // Interpreted → Queued → Compiling → Compiled. After this
+        // loop every bead's `compiled()` fast path returns Some, so
+        // the very first user call (BC interp's `call_by_id` →
+        // `tick_callback` → `on_invoke`) dispatches JIT'd code
+        // instead of running the entry function in BC interp.
         //
-        // Since we've already pre-compiled every function above and
-        // hold valid function pointers, swap each bead's
-        // `compiled` slot now. First call hits the fast path and
-        // dispatches JIT'd code immediately — no broker round-trip.
-        cranelift.with_lock(|be| {
-            for (func_id, bound) in &self.bounds {
-                if let Some(ptr) = be.get_function_ptr(*func_id) {
-                    if !ptr.is_null() {
-                        bound.bead().swap_compiled(ptr as *mut ());
-                    }
-                }
+        // Without this, a rayzor-scale n-body kernel's main runs
+        // the entire 10 M `advance()` loop in BC interp before the
+        // second call ever arrives — the broker can't tier-up an
+        // entry function while that function's first invocation is
+        // still on the call stack.
+        let cranelift_for_prime = Arc::clone(&cranelift);
+        for (func_id, bound) in &self.bounds {
+            let func_id = *func_id;
+            let cranelift_for_closure = Arc::clone(&cranelift_for_prime);
+            self.tiered.on_invoke(bound, move |_tier, _bead| {
+                cranelift_for_closure
+                    .with_lock(|be| be.get_function_ptr(func_id))
+                    .map(|p| p as *mut ())
+                    .unwrap_or(std::ptr::null_mut())
+            });
+        }
+        // Beadie's broker is single-threaded and processes jobs in
+        // FIFO. Poll each bead until its state reaches Compiled or
+        // we hit a deadline — handful-of-ms latency in practice,
+        // capped at 5 s to avoid hanging an interactive runtime if
+        // something is wrong.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for bound in self.bounds.values() {
+            while bound.bead().compiled().is_none()
+                && std::time::Instant::now() < deadline
+            {
+                std::hint::spin_loop();
             }
-        });
+        }
 
         // Cranelift dispatch closure (tier 0, beadie-driven). With
         // the module pre-compiled above the closure just looks up
