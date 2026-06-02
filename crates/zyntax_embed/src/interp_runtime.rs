@@ -702,6 +702,29 @@ impl InterpRuntime {
             Ok(())
         })?;
 
+        // beadie's `on_invoke` returns the JIT pointer only via the
+        // fast path `bead.compiled().is_some()`. On the first call
+        // it ticks the bead, queues the compile on the broker, and
+        // returns `None` — BC interp runs the entry function in
+        // full while the broker compiles in the background. For
+        // long-running entry functions (rayzor-scale nbody's 10 M
+        // `advance()` loop is ~hours in BC interp) the second call
+        // never arrives, so the JIT'd code never dispatches.
+        //
+        // Since we've already pre-compiled every function above and
+        // hold valid function pointers, swap each bead's
+        // `compiled` slot now. First call hits the fast path and
+        // dispatches JIT'd code immediately — no broker round-trip.
+        cranelift.with_lock(|be| {
+            for (func_id, bound) in &self.bounds {
+                if let Some(ptr) = be.get_function_ptr(*func_id) {
+                    if !ptr.is_null() {
+                        bound.bead().swap_compiled(ptr as *mut ());
+                    }
+                }
+            }
+        });
+
         // Cranelift dispatch closure (tier 0, beadie-driven). With
         // the module pre-compiled above the closure just looks up
         // the function pointer — no recompilation per tier-up.
