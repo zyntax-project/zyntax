@@ -492,17 +492,26 @@
       'zyntax-interp': 'interp · no opts',
       'zyntax-interp-opt': 'interp · opt',
       'zyntax-tiered': 'interp → Cranelift tier-up',
+      'zyntax-tiered-llvm': 'interp → Cranelift → LLVM full tier',
     };
-    const TARGET_ORDER = ['zyntax-interp', 'zyntax-interp-opt', 'zyntax-tiered'];
+    const TARGET_ORDER = [
+      'zyntax-interp',
+      'zyntax-interp-opt',
+      'zyntax-tiered',
+      'zyntax-tiered-llvm',
+    ];
 
     function buildKernel(name, results) {
       const title = KERNEL_TITLES[name] || name;
       // Render only rows whose tier (a) produced a result and (b)
-      // agrees with the majority. Failures and diverging-result
-      // rows stay in the JSON (the dev harness can find them) but
-      // don't show on the public page. If no tier survives the
-      // agreement check, the kernel is dropped entirely.
-      const ok = TARGET_ORDER.filter(t => results[t] && !results[t].error);
+      // agrees with the majority. Failures, diverging-result rows,
+      // and explicitly-skipped rows stay in the JSON (the dev
+      // harness can find them) but don't show on the public page.
+      // If no tier survives the agreement check, the kernel is
+      // dropped entirely.
+      const ok = TARGET_ORDER.filter(
+        t => results[t] && !results[t].error && !results[t].skipped
+      );
       const tally = {};
       for (const t of ok) {
         const k = results[t].result;
