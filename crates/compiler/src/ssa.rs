@@ -5528,14 +5528,27 @@ impl SsaBuilder {
                 }
 
                 if let Some(val) = found_value {
-                    // Found a real value - update definition to use it
+                    // Found a real value - update definition to use it.
                     self.write_variable(var, block, val);
+                    // The recursive `read_variable(pred)` calls above
+                    // may have observed `placeholder` on a CFG back-
+                    // edge (loop header → body → header) and threaded
+                    // it into an instruction operand or phi-incoming
+                    // by the time we determined the real value. Those
+                    // references would otherwise dangle — the
+                    // placeholder HirId has no defining instruction
+                    // or phi anywhere, so the final SSA validator
+                    // fails with "Use has undefined definition". A
+                    // global substitution of placeholder→val
+                    // patches up every consumer in one sweep.
+                    self.substitute_value(placeholder, val);
                     return val;
                 }
 
                 // All predecessors returned undef or placeholder - variable is truly undefined
                 let undef = self.create_undef(ty);
                 self.write_variable(var, block, undef);
+                self.substitute_value(placeholder, undef);
                 return undef;
             }
 
@@ -5602,14 +5615,19 @@ impl SsaBuilder {
                     .collect();
 
                 if unique_vals.len() == 1 {
-                    // All predecessors have same value - no phi needed
+                    // All predecessors have same value - no phi needed.
+                    // Sweep `phi_val` from any operand that observed
+                    // it during the recursive predecessor probe
+                    // before we resolved to `single_val`.
                     let single_val = **unique_vals.iter().next().unwrap();
                     self.write_variable(var, block, single_val);
+                    self.substitute_value(phi_val, single_val);
                     return single_val;
                 } else if unique_vals.is_empty() {
-                    // All predecessors returned undef or just this phi
+                    // All predecessors returned undef or just this phi.
                     let undef = self.create_undef(ty);
                     self.write_variable(var, block, undef);
+                    self.substitute_value(phi_val, undef);
                     return undef;
                 } else {
                     // Need a real phi node
@@ -5657,13 +5675,18 @@ impl SsaBuilder {
                 .collect();
 
             if non_phi_vals.len() == 1 {
-                // Trivial phi - replace with the single value
+                // Trivial phi - replace with the single value, then
+                // sweep `phi_val` from any operand that observed it
+                // during the recursive predecessor probe.
                 let single_val = **non_phi_vals.iter().next().unwrap();
                 self.write_variable(var, block, single_val);
+                self.substitute_value(phi_val, single_val);
                 single_val
             } else if non_phi_vals.is_empty() {
-                // All inputs are this phi - undefined
-                self.create_undef(ty)
+                // All inputs are this phi - undefined.
+                let undef = self.create_undef(ty);
+                self.substitute_value(phi_val, undef);
+                undef
             } else {
                 // Non-trivial phi
                 self.function
@@ -5679,6 +5702,39 @@ impl SsaBuilder {
                 phi_val
             }
         }
+    }
+
+    /// Substitute every reference to `from` with `to` across all
+    /// instructions, terminators, and phi incomings in the function.
+    /// Used by `read_variable_recursive` after a placeholder HirId
+    /// resolves to its real value — without this sweep the
+    /// placeholder remains dangling in any operand that observed it
+    /// before resolution finished (typically the loop header → body
+    /// → header back-edge case).
+    fn substitute_value(&mut self, from: HirId, to: HirId) {
+        if from == to {
+            return;
+        }
+        let mut map: IndexMap<HirId, HirId> = IndexMap::new();
+        map.insert(from, to);
+        for block in self.function.blocks.values_mut() {
+            for inst in &mut block.instructions {
+                inst.replace_uses(&map);
+            }
+            block.terminator.replace_uses(&map);
+            for phi in &mut block.phis {
+                for (incoming, _) in &mut phi.incoming {
+                    if *incoming == from {
+                        *incoming = to;
+                    }
+                }
+            }
+        }
+        // The SsaForm's def-use chain is rebuilt from instructions
+        // after construction (see `build_def_use_chains`), so
+        // rewriting the operands above is enough — the chain
+        // recomputed against the fixed-up instructions sees `to`
+        // everywhere `from` used to live.
     }
 
     /// Seal a block (all predecessors known)

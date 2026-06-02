@@ -1878,6 +1878,9 @@ impl LoweringContext {
                             func_name,
                             e,
                         );
+                        if std::env::var("ZYNTAX_TRACE_LOWERING_DROP").is_ok() {
+                            eprintln!("[LOWERING-DROP] '{func_name}': {e}");
+                        }
                         self.symbols.functions.remove(&func.name);
                     } else {
                         return Err(e);

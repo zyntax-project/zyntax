@@ -240,10 +240,10 @@ def main(): i64 {
 "#,
     );
 
-    // ── Slice 9: nested while with index-assign + cross-iteration
-    //    mutables (advance-shaped).
+    // ── Slice 9: TWO nested whiles + index-assign with dynamic
+    //    index inside the inner loop.
     try_run(
-        "9-nested-while-index-assign",
+        "9-two-nested-while",
         r#"
 struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
 
@@ -251,23 +251,97 @@ def main(): i64 {
     let a = Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
     let b = Body { x: 1.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
     let bodies = [a, b]
-    let mut t: i64 = 0
-    while t < 3 {
-        let mut i: i64 = 0
-        while i < 2 {
-            let mut x = bodies[i]
-            let mut j: i64 = i + 1
-            while j < 2 {
-                let mut y = bodies[j]
-                x.x = x.x + y.x
-                y.x = y.x - 1.0
-                bodies[j] = y
-                j = j + 1
-            }
-            bodies[i] = x
-            i = i + 1
+    let mut i: i64 = 0
+    while i < 2 {
+        let mut x = bodies[i]
+        x.x = x.x + 1.0
+        bodies[i] = x
+        i = i + 1
+    }
+    return 1
+}
+"#,
+    );
+
+    // ── Slice 10: same as 9 but with second nested while reading
+    //    a DIFFERENT array slot.
+    try_run(
+        "10-nested-while-bidir-update",
+        r#"
+struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+
+def main(): i64 {
+    let a = Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
+    let b = Body { x: 1.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
+    let bodies = [a, b]
+    let mut i: i64 = 0
+    while i < 2 {
+        let mut x = bodies[i]
+        let mut j: i64 = i + 1
+        while j < 2 {
+            let mut y = bodies[j]
+            x.x = x.x + y.x
+            y.x = y.x - 1.0
+            bodies[j] = y
+            j = j + 1
         }
-        t = t + 1
+        bodies[i] = x
+        i = i + 1
+    }
+    return 1
+}
+"#,
+    );
+
+    // ── Slice 11: nested while, no `let mut y` inner, just modify
+    //    outer x using a fresh inner read each iter.
+    try_run(
+        "11-nested-while-no-inner-mut",
+        r#"
+struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+
+def main(): i64 {
+    let a = Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
+    let b = Body { x: 1.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
+    let bodies = [a, b]
+    let mut i: i64 = 0
+    while i < 2 {
+        let mut x = bodies[i]
+        let mut j: i64 = i + 1
+        while j < 2 {
+            let y = bodies[j]
+            x.x = x.x + y.x
+            j = j + 1
+        }
+        bodies[i] = x
+        i = i + 1
+    }
+    return 1
+}
+"#,
+    );
+
+    // ── Slice 12: nested while WITH inner mut + inner index-assign,
+    //    but no outer write.
+    try_run(
+        "12-nested-while-inner-only",
+        r#"
+struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+
+def main(): i64 {
+    let a = Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
+    let b = Body { x: 1.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 1.0 }
+    let bodies = [a, b]
+    let mut i: i64 = 0
+    while i < 2 {
+        let mut j: i64 = i + 1
+        while j < 2 {
+            let mut y = bodies[j]
+            y.x = y.x - 1.0
+            bodies[j] = y
+            j = j + 1
+        }
+        i = i + 1
     }
     return 1
 }
