@@ -37,12 +37,33 @@ pub(crate) fn process_imports_for_traits(
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
-    // Use thread-local storage to track processed imports for circular dependency detection
-    thread_local! {
-        static PROCESSED_IMPORTS: std::cell::RefCell<std::collections::HashSet<String>> =
-            std::cell::RefCell::new(std::collections::HashSet::new());
-    }
+    // Track imports processed during *this* lowering. Previously
+    // lived in a thread-local — that caused a silent bug where the
+    // second lowering on the same thread (e.g. successive bench
+    // iterations) would find "prelude" already cached, skip the
+    // merge entirely, and leave the new program with no prelude
+    // declarations. A fresh set per top-level call still gives
+    // circular-import detection (recursive calls below thread the
+    // same set) without leaking state across lowerings.
+    let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    process_imports_inner(
+        grammars,
+        plugin_signatures,
+        import_resolvers,
+        program,
+        type_registry,
+        &mut processed,
+    )
+}
 
+fn process_imports_inner(
+    grammars: &std::collections::HashMap<String, std::sync::Arc<crate::grammar::LanguageGrammar>>,
+    plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
+    import_resolvers: &[crate::runtime::ImportResolverCallback],
+    program: &mut zyntax_typed_ast::TypedProgram,
+    type_registry: &mut zyntax_typed_ast::TypeRegistry,
+    processed: &mut std::collections::HashSet<String>,
+) -> RuntimeResult<()> {
     use zyntax_typed_ast::typed_ast::TypedDeclaration;
 
     // Collect imports to process (can't mutate while iterating)
@@ -61,14 +82,13 @@ pub(crate) fn process_imports_for_traits(
     // Process each import
     for module_name in imports_to_process {
         // Skip if already processed (circular import detection)
-        let already_processed = PROCESSED_IMPORTS.with(|set| set.borrow().contains(&module_name));
-        if already_processed {
+        if processed.contains(&module_name) {
             log::debug!("Skipping already processed import: {}", module_name);
             continue;
         }
 
         // Mark as processed BEFORE recursive processing
-        PROCESSED_IMPORTS.with(|set| set.borrow_mut().insert(module_name.clone()));
+        processed.insert(module_name.clone());
 
         // Try to resolve the import using our import resolvers
         if let Ok(Some(source)) = resolve_import_with(import_resolvers, &module_name) {
@@ -90,12 +110,13 @@ pub(crate) fn process_imports_for_traits(
                 // IMPORTANT: Recursively process imports from the imported module FIRST
                 // This ensures transitive dependencies (e.g., tensor -> prelude) are loaded
                 // before we process the imported module's declarations
-                process_imports_for_traits(
+                process_imports_inner(
                     grammars,
                     plugin_signatures,
                     import_resolvers,
                     &mut imported_program,
                     type_registry,
+                    processed,
                 )?;
 
                 // First, merge the TypeRegistry from the imported module
