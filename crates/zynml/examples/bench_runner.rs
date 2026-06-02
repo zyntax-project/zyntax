@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use zynml::{Grammar2, ZYNML_GRAMMAR};
+use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_TENSOR};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
 use zyntax_compiler::{run_interp_safe_opts, HirModule};
@@ -79,6 +79,14 @@ struct TargetResult {
     /// kernel breaks on, rather than silently dropping the row.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// True when the target's `skip_kernels` list opted out of this
+    /// kernel (e.g. mandelbrot on the BC-interp-only tiers, which
+    /// take 30+ minutes per iteration). Lets the page render
+    /// "skipped" instead of "FAILED" — the kernel is not broken on
+    /// this tier, the harness just declined to run it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
+    skipped: bool,
 }
 
 /// Per-kernel collection of target results.
@@ -127,18 +135,44 @@ const TARGETS: &[Target] = &[
         label: "Zyntax · BC interp",
         run_with_opts: false,
         install_jit: false,
+        install_llvm: false,
+        // Mandelbrot at rayzor's 875 × 500 / max_iter 1000 spends
+        // 30 + minutes in pure BC interp on a desktop CPU and
+        // nbody at rayzor's 20 × 500 000 iterations of advance() +
+        // Newton-iter sqrt is similarly heavy. The interp/opt
+        // tiers don't tell us anything the JIT tier doesn't tell
+        // us better at full kernel scale, so skip for those two.
+        skip_kernels: &["mandelbrot", "nbody"],
     },
     Target {
         key: "zyntax-interp-opt",
         label: "Zyntax · BC interp + opt",
         run_with_opts: true,
         install_jit: false,
+        install_llvm: false,
+        skip_kernels: &["mandelbrot", "nbody"],
     },
     Target {
         key: "zyntax-tiered",
         label: "Zyntax · BC interp → Cranelift tier-up",
         run_with_opts: true,
         install_jit: true,
+        install_llvm: false,
+        skip_kernels: &[],
+    },
+    // Full ladder: BC interp → Cranelift (tier 0) → LLVM (tier 1).
+    // Compiled in only when the `llvm-backend` cargo feature is on;
+    // otherwise the target's tick callback never escalates past
+    // Cranelift and `measure` records the same numbers as
+    // `zyntax-tiered`. Build with
+    // `cargo run --release --features llvm-backend …` to exercise it.
+    Target {
+        key: "zyntax-tiered-llvm",
+        label: "Zyntax · BC interp → Cranelift → LLVM full tier",
+        run_with_opts: true,
+        install_jit: true,
+        install_llvm: true,
+        skip_kernels: &[],
     },
 ];
 
@@ -161,6 +195,39 @@ struct Target {
     /// async compile to completion before timed iterations start
     /// dispatching through the JIT'd code.
     install_jit: bool,
+    /// Drive the ladder one tier higher — Cranelift → LLVM. Only
+    /// meaningful when `install_jit` is true and the binary was
+    /// built with the `llvm-backend` cargo feature; otherwise it
+    /// has no effect (the install path is gated on the same cfg).
+    install_llvm: bool,
+    /// Kernel pretty-names (the `bench_` prefix stripped) that this
+    /// target should skip — recorded in the JSON as a
+    /// `skipped: true` row so the page can render "skipped" instead
+    /// of zero ms. Used to keep heavy kernels (mandelbrot) out of
+    /// the BC-interp-only tiers where they would dominate runtime
+    /// without telling us anything useful.
+    skip_kernels: &'static [&'static str],
+}
+
+/// Build a fresh `ZyntaxRuntime` with the prelude + tensor stdlib
+/// import resolvers and the ZynML grammar registered, so
+/// `import prelude` in bench kernels actually pulls in the stdlib
+/// `abs` / `min` / `max` / List / Option / Result definitions.
+/// `lower_typed_program` walks imports through the registered
+/// grammar, so without `register_grammar` the resolver is loaded
+/// but never invoked.
+fn bench_runtime() -> Result<ZyntaxRuntime, String> {
+    use zyntax_embed::LanguageGrammar;
+    let mut rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
+    rt.add_import_resolver(Box::new(|module_name| match module_name {
+        "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
+        "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
+        _ => Ok(None),
+    }));
+    let lang_grammar =
+        LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).map_err(|e| format!("compile_zyn: {e:?}"))?;
+    rt.register_grammar("zynml", lang_grammar);
+    Ok(rt)
 }
 
 /// Custom `TieredConfig` for the JIT target — warm-threshold of 1
@@ -168,11 +235,18 @@ struct Target {
 /// compile. Without this, the default warm-threshold (100) would
 /// require hundreds of warmup iterations to trigger tier-up; we
 /// can't reasonably afford that per timed measurement.
-fn jit_tier_config() -> TieredConfig {
+///
+/// `install_llvm = false` parks the hot threshold at `u32::MAX`
+/// so the LLVM tier never fires even when the `llvm-backend` cargo
+/// feature is compiled in — that target stays pure Cranelift.
+/// `install_llvm = true` lowers it to 5 so LLVM kicks in after a
+/// handful of warmup calls (still only effective when the cargo
+/// feature is enabled; otherwise the install path is a no-op).
+fn jit_tier_config(install_llvm: bool) -> TieredConfig {
     let mut cfg = TieredConfig::default();
     cfg.profile_config = ProfileConfig {
         warm_threshold: 1,
-        hot_threshold: 5,
+        hot_threshold: if install_llvm { 5 } else { u32::MAX as u64 },
         ..ProfileConfig::default()
     };
     cfg
@@ -229,6 +303,11 @@ fn main() {
         eprintln!("==> kernel {pretty}");
         let mut per_kernel: KernelResults = BTreeMap::new();
         for target in TARGETS {
+            if target.skip_kernels.contains(&pretty) {
+                eprintln!("    {:<22} SKIPPED (per-target opt-out)", target.key);
+                per_kernel.insert(target.key.to_string(), skipped_result());
+                continue;
+            }
             let r = measure(&source, target, runs);
             if let Some(err) = r.error.as_ref() {
                 eprintln!("    {:<22} FAILED — {err}", target.key);
@@ -298,6 +377,7 @@ fn measure(source: &str, target: &Target, runs: usize) -> TargetResult {
         exec_ms: median_exec,
         result: last_result_str,
         error: None,
+        skipped: false,
     }
 }
 
@@ -308,6 +388,18 @@ fn failed_result(error: &str) -> TargetResult {
         exec_ms: 0.0,
         result: "—".to_string(),
         error: Some(error.to_string()),
+        skipped: false,
+    }
+}
+
+fn skipped_result() -> TargetResult {
+    TargetResult {
+        seconds: 0.0,
+        compile_ms: 0.0,
+        exec_ms: 0.0,
+        result: "—".to_string(),
+        error: None,
+        skipped: true,
     }
 }
 
@@ -338,7 +430,7 @@ fn one_iteration(source: &str, target: &Target) -> Result<(f64, f64, ZyntaxValue
     let program = grammar
         .parse_with_filename(source, "<bench>")
         .map_err(|e| format!("parse: {e:?}"))?;
-    let rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
+    let mut rt = bench_runtime()?;
     let builtins = rt
         .config()
         .builtins
@@ -351,11 +443,11 @@ fn one_iteration(source: &str, target: &Target) -> Result<(f64, f64, ZyntaxValue
     if target.run_with_opts {
         let _ = run_interp_safe_opts(&mut module);
     }
-    let mut rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
+    let mut rt = bench_runtime()?;
     rt.compile_module(&module)
         .map_err(|e| format!("compile_module: {e:?}"))?;
     if target.install_jit {
-        rt.install_interp_jit_with(jit_tier_config())
+        rt.install_interp_jit_with(jit_tier_config(target.install_llvm))
             .map_err(|e| format!("install_interp_jit: {e:?}"))?;
     }
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
