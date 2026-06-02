@@ -933,3 +933,69 @@ def last<T>(items: List<T>): ?T {
 def for_each<T>(items: List<T>, f: (T) => void) {
     items.into_iter().for_each(f)
 }
+
+// ============================================================================
+// Math primitives
+// ============================================================================
+// Bench code shouldn't have to hand-roll the obvious arithmetic
+// utilities. These are deliberately monomorphic — generic versions
+// land once the trait-bound dispatch layer (Ord, Neg) can handle
+// f64/i64 uniformly without runtime overhead.
+
+def abs(x: f64): f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+def abs_i64(x: i64): i64 {
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+def min(a: f64, b: f64): f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+def max(a: f64, b: f64): f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+def min_i64(a: i64, b: i64): i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+def max_i64(a: i64, b: i64): i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Square root via Newton-Raphson. Twelve iterations converge to
+// f64 precision from the seed `g0 = x * 0.5` for any positive `x`.
+// Returns 0.0 for non-positive input.
+def sqrt(x: f64): f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    let mut g: f64 = x * 0.5
+    let mut i: i64 = 0
+    while i < 12 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
