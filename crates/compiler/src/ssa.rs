@@ -4385,28 +4385,29 @@ impl SsaBuilder {
                         three_i64s || named_list_or_array
                     })
                     .unwrap_or(false);
-                // Cross-call-boundary case: the typed AST sees `xs`
-                // as `Type::Named { id: TypeId(_) }` (with no field
-                // path through to the underlying struct) and
-                // `convert_type` lowers that to an HIR `Opaque` (the
-                // prelude alias path), which the HIR-shape check
-                // above can't recognise. Fall back to the
-                // type-registry name lookup — "Array" and "List"
-                // both refer to the same `List<T>` struct layout
-                // `{i64 data, i64 len, i64 cap}`.
-                let is_list_shape_named = if let Type::Named { id, .. } = &object.ty {
-                    self.type_registry
+                // Cross-call-boundary / function-parameter case: the
+                // raw `object.ty` is `Type::Any` for a Variable
+                // expression (per the parser's literal-default), but
+                // `resolve_expr_type` chases through
+                // `var_typed_ast_types` to the registered type — the
+                // function parameter's full `Array<T>` / `List<T>` /
+                // `Named { id }` shape. Check there for the list
+                // shape: matches `Type::Array`, `Type::Named` whose
+                // registry name is `Array` / `List`, or any other
+                // type whose underlying HIR form is the same
+                // pointer-to-`{data,len,cap}` struct.
+                let resolved_object_ty = self.resolve_expr_type(object);
+                let is_list_shape_named = match &resolved_object_ty {
+                    Type::Array { .. } => true,
+                    Type::Named { id, .. } => self
+                        .type_registry
                         .get_type_by_id(*id)
                         .and_then(|td| td.name.resolve_global())
                         .map(|n| n == "Array" || n == "List")
-                        .unwrap_or(false)
-                } else {
-                    false
+                        .unwrap_or(false),
+                    _ => false,
                 };
-                let gep_base = if matches!(object.ty, Type::Array { .. })
-                    || is_list_shape_hir
-                    || is_list_shape_named
-                {
+                let gep_base = if is_list_shape_hir || is_list_shape_named {
                     let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
                     self.add_instruction(
                         block_id,
@@ -7856,21 +7857,61 @@ impl SsaBuilder {
                     }
                 }
 
+                // GEP base — mirror the read path: when the array is
+                // a `List<T>` struct (Type::Array / Named Array /
+                // Named List, all detected via `resolved_array_ty`
+                // above), the underlying `array_val` is a pointer to
+                // a `{i64 data, i64 len, i64 cap}` struct. We need to
+                // chase the data pointer first, otherwise the GEP
+                // lands inside the list struct's metadata (offset 8
+                // = `len`) and a Store there corrupts the list's
+                // bookkeeping and any adjacent stack memory.
+                let needs_data_load =
+                    matches!(&resolved_array_ty, Type::Array { .. } | Type::Named { .. });
+                let gep_base = if needs_data_load {
+                    let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Load {
+                            result: data_as_i64,
+                            ty: HirType::I64,
+                            ptr: array_val,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
+                    self.add_use(array_val, data_as_i64);
+                    let data_ptr_ty = HirType::Ptr(Box::new(element_type.clone()));
+                    let data_ptr =
+                        self.create_value(data_ptr_ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Cast {
+                            result: data_ptr,
+                            ty: data_ptr_ty,
+                            operand: data_as_i64,
+                            op: crate::hir::CastOp::IntToPtr,
+                        },
+                    );
+                    self.add_use(data_as_i64, data_ptr);
+                    data_ptr
+                } else {
+                    array_val
+                };
+
                 // Create GetElementPtr instruction to get pointer to element
-                // Note: ty should be the ARRAY type so Cranelift can calculate element size
-                let array_hir_type = self.convert_type(&array.ty);
                 let ptr_type = HirType::Ptr(Box::new(element_type.clone()));
-                let ptr = self.create_value(ptr_type, HirValueKind::Instruction);
+                let ptr = self.create_value(ptr_type.clone(), HirValueKind::Instruction);
 
                 let gep_inst = HirInstruction::GetElementPtr {
                     result: ptr,
-                    ptr: array_val,
+                    ptr: gep_base,
                     indices: vec![index_val],
-                    ty: array_hir_type, // Pass array type, not element type
+                    ty: ptr_type,
                 };
 
                 self.add_instruction(block_id, gep_inst);
-                self.add_use(array_val, ptr);
+                self.add_use(gep_base, ptr);
                 self.add_use(index_val, ptr);
 
                 // Store the value at the computed address
