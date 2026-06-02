@@ -2060,6 +2060,16 @@ impl LoweringContext {
             }
         }
 
+        // Collect parameter typed-AST types up-front so the SSA
+        // layer can see the un-stripped `Array<Body>` / `List<T>`
+        // shape rather than the HirType round-trip's
+        // `Named { type_args: [] }` (which drops the `<T>`).
+        let mut param_typed_ast_types: indexmap::IndexMap<InternedString, Type> =
+            indexmap::IndexMap::new();
+        for p in &func.params {
+            param_typed_ast_types.insert(p.name, p.ty.clone());
+        }
+
         // Convert to SSA form, processing TypedStatements to emit HIR instructions
         let ssa_builder = SsaBuilder::new(
             hir_func,
@@ -2072,7 +2082,8 @@ impl LoweringContext {
         .with_function_default_params(self.symbols.function_default_params.clone())
         .with_function_return_types(self.symbols.function_return_types.clone())
         .with_effect_op_map(effect_op_map)
-        .with_resume_param_names(resume_param_names);
+        .with_resume_param_names(resume_param_names)
+        .with_param_typed_ast_types(param_typed_ast_types);
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
         // Debug: check SSA result

@@ -2406,6 +2406,41 @@ unsafe fn read_typed(ptr: *mut u8, ty: &HirType) -> ZyntaxValue {
         HirType::U64 => ZyntaxValue::UInt(*(ptr as *const u64)),
         HirType::F64 => ZyntaxValue::Float(*(ptr as *const f64)),
         HirType::Ptr(_) => ZyntaxValue::Pointer(*(ptr as *const *mut u8)),
+        HirType::Struct(s) => {
+            // Read every field at its in-memory offset and assemble a
+            // tuple. The runtime treats a struct value as a tuple of
+            // its field values (see `ExtractValue` / `InsertValue`
+            // op handlers), so this is the natural read shape.
+            //
+            // Field offsets are computed as a running sum of field
+            // sizes — ZynML's structs are unpadded today (no explicit
+            // alignment requests beyond natural i64/f64 alignment),
+            // and `size_of_hir_ty` already returns the byte size
+            // each field occupies. If ZynML grows padded layouts the
+            // offset calculation here needs to track explicit
+            // alignment per field.
+            let mut fields = Vec::with_capacity(s.fields.len());
+            let mut offset = 0usize;
+            for field_ty in &s.fields {
+                let field_ptr = ptr.add(offset);
+                fields.push(read_typed(field_ptr, field_ty));
+                offset += size_of_hir_ty(field_ty);
+            }
+            ZyntaxValue::Tuple(fields)
+        }
+        HirType::Array(elem, n) => {
+            // Same shape as Struct: read each element into a tuple
+            // slot. Used when an array-of-T is loaded as a value
+            // (rare — most array accesses go through GEP + load of
+            // a single element), but covers the case cleanly.
+            let mut fields = Vec::with_capacity(*n as usize);
+            let elem_size = size_of_hir_ty(elem);
+            for i in 0..*n as usize {
+                let elem_ptr = ptr.add(i * elem_size);
+                fields.push(read_typed(elem_ptr, elem));
+            }
+            ZyntaxValue::Tuple(fields)
+        }
         _ => ZyntaxValue::Int(*(ptr as *const i64)),
     }
 }
@@ -2474,6 +2509,36 @@ unsafe fn write_typed(ptr: *mut u8, v: &ZyntaxValue, ty: &HirType) {
         HirType::Ptr(_) => {
             if let ZyntaxValue::Pointer(p) = v {
                 *(ptr as *mut *mut u8) = *p;
+            }
+        }
+        HirType::Struct(s) => {
+            // Symmetric to the Struct arm in `read_typed`: walk the
+            // tuple's fields and write each at its in-memory offset.
+            // Tolerant of i64/Int fall-back values too — if a caller
+            // hands us a scalar where we expected a tuple (e.g. from
+            // ExtractValue's pass-through path), write it into the
+            // first slot and zero-skip the rest rather than corrupting
+            // the layout silently.
+            if let ZyntaxValue::Tuple(fields) = v {
+                let mut offset = 0usize;
+                for (i, field_ty) in s.fields.iter().enumerate() {
+                    let field_ptr = ptr.add(offset);
+                    if let Some(field_val) = fields.get(i) {
+                        write_typed(field_ptr, field_val, field_ty);
+                    }
+                    offset += size_of_hir_ty(field_ty);
+                }
+            }
+        }
+        HirType::Array(elem, n) => {
+            if let ZyntaxValue::Tuple(items) = v {
+                let elem_size = size_of_hir_ty(elem);
+                for i in 0..*n as usize {
+                    if let Some(item) = items.get(i) {
+                        let elem_ptr = ptr.add(i * elem_size);
+                        write_typed(elem_ptr, item, elem);
+                    }
+                }
             }
         }
         _ => {

@@ -188,6 +188,14 @@ pub struct SsaBuilder {
     /// parameter — matching the `is_resumable` detection at
     /// `lowering.rs:2962`.
     resume_param_names: HashSet<InternedString>,
+
+    /// Original typed-AST parameter types, keyed by parameter name.
+    /// The HIR's `param.ty: HirType` strips generic type-args, so
+    /// `Array<Body>` arrives as a bare `Named` without `<Body>`. We
+    /// need the un-stripped form to chase element types through
+    /// `resolve_expr_type::Index`. The lowering layer fills this in
+    /// before `build_from_typed_cfg` runs; empty otherwise.
+    preset_param_typed_ast_types: IndexMap<InternedString, Type>,
 }
 
 /// Context for pattern matching
@@ -439,6 +447,7 @@ impl SsaBuilder {
             function_return_types: IndexMap::new(),
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
+            preset_param_typed_ast_types: IndexMap::new(),
         }
     }
 
@@ -479,6 +488,7 @@ impl SsaBuilder {
             function_return_types: IndexMap::new(),
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
+            preset_param_typed_ast_types: IndexMap::new(),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -561,6 +571,20 @@ impl SsaBuilder {
     /// `resume_param_names` field doc for details.
     pub fn with_resume_param_names(mut self, names: HashSet<InternedString>) -> Self {
         self.resume_param_names = names;
+        self
+    }
+
+    /// Register the original typed-AST type of every parameter, keyed
+    /// by name. The HIR-level `param.ty: HirType` already lives on
+    /// the function signature, but converting it back via
+    /// `hir_type_to_typed_ast_type` drops generic type-arg information
+    /// — `Array<Body>` arrives as `Named { id, type_args: vec![] }`
+    /// (the `<Body>` is gone) which trips the
+    /// `resolve_expr_type::Index` arm because there's no element
+    /// type to chase. Passing the original `param.ty` here keeps
+    /// the generic info intact for downstream lookups.
+    pub fn with_param_typed_ast_types(mut self, types: IndexMap<InternedString, Type>) -> Self {
+        self.preset_param_typed_ast_types = types;
         self
     }
 
@@ -653,8 +677,17 @@ impl SsaBuilder {
             // Store parameter type for SSA variable tracking
             self.var_types.insert(param.name, param.ty.clone());
 
-            // Also store typed AST type for binary op float detection
-            let typed_ast_type = self.hir_type_to_typed_ast_type(&param.ty);
+            // Also store typed AST type for binary op float detection.
+            // Prefer the lowering-supplied original typed-AST type when
+            // we have one — converting back from `HirType` loses
+            // generic type-args (`Array<Body>` becomes a bare
+            // `Named { id, type_args: vec![] }`), which then breaks
+            // `resolve_expr_type::Index`'s element-type chase.
+            let typed_ast_type = self
+                .preset_param_typed_ast_types
+                .get(&param.name)
+                .cloned()
+                .unwrap_or_else(|| self.hir_type_to_typed_ast_type(&param.ty));
             self.var_typed_ast_types.insert(param.name, typed_ast_type);
 
             // Define parameter in entry block so it's available to all code
@@ -7679,14 +7712,22 @@ impl SsaBuilder {
                 let object = &field_access.object;
                 let field_name = &field_access.field;
 
-                // Get the field index from the object's type
-                let field_index = self.get_field_index(&object.ty, field_name)?;
+                // Get the field index from the object's resolved type.
+                // The bare `object.ty` is the parser's literal-default
+                // (e.g. `Type::Any` for Variable expressions); the
+                // resolved type pulls from `var_typed_ast_types` and
+                // the surrounding context. Without this resolve,
+                // `b.x = ...` for `b: Body` fails with "Cannot access
+                // fields on non-struct type: Any" and the whole
+                // function gets silently dropped during lowering.
+                let resolved_object_ty = self.resolve_expr_type(object);
+                let field_index = self.get_field_index(&resolved_object_ty, field_name)?;
 
                 // Evaluate the object expression to get the struct value
                 let object_val = self.translate_expression(block_id, object)?;
 
                 // Create an InsertValue instruction to update the field
-                let result_type = self.convert_type(&object.ty);
+                let result_type = self.convert_type(&resolved_object_ty);
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let inst = HirInstruction::InsertValue {
@@ -7719,15 +7760,40 @@ impl SsaBuilder {
                 let array_val = self.translate_expression(block_id, array)?;
                 let index_val = self.translate_expression(block_id, index)?;
 
-                // Get element type and size from array type
-                let (element_type, array_size) = match &array.ty {
+                // Resolve through `var_typed_ast_types` so a variable
+                // bound to an array (e.g. `let bodies = [a]; bodies[i]
+                // = ...`) finds its `Type::Array` even when the
+                // parser left the Variable's `expr.ty` as `Any`.
+                let resolved_array_ty = self.resolve_expr_type(array);
+
+                // Get element type and size from array type. Accept
+                // both shapes the front-end uses:
+                //   * `Type::Array { element_type, size }`  — raw
+                //     array literal with a fixed-size annotation.
+                //   * `Type::Named { id, type_args }` where the
+                //     registry name is `List` or `Array` — the
+                //     prelude `List<T>` alias resolves to this shape
+                //     when the array flows through a let-binding or
+                //     a function parameter.
+                let (element_type, array_size) = match &resolved_array_ty {
                     Type::Array {
                         element_type, size, ..
                     } => (self.convert_type(element_type), size.clone()),
+                    Type::Named { id, type_args, .. }
+                        if self
+                            .type_registry
+                            .get_type_by_id(*id)
+                            .and_then(|td| td.name.resolve_global())
+                            .map(|n| n == "Array" || n == "List")
+                            .unwrap_or(false)
+                            && !type_args.is_empty() =>
+                    {
+                        (self.convert_type(&type_args[0]), None)
+                    }
                     _ => {
                         return Err(crate::CompilerError::Analysis(format!(
                             "Cannot index into non-array type: {:?}",
-                            array.ty
+                            resolved_array_ty
                         )))
                     }
                 };
