@@ -3162,7 +3162,20 @@ impl CraneliftBackend {
                             let mut current_type = ty.clone();
 
                             for index_id in indices {
-                                let index = self.value_map[index_id];
+                                let raw_index = self.value_map[index_id];
+                                // GEP index narrower than I64 (typically
+                                // I32 from integer literals or i32
+                                // arithmetic) needs sign-extending so
+                                // the subsequent `imul` against the
+                                // I64-typed elem_size constant doesn't
+                                // trip the Cranelift verifier with
+                                // "arg N has type i32, expected i64".
+                                let raw_ty = builder.func.dfg.value_type(raw_index);
+                                let index = if raw_ty.is_int() && raw_ty.bits() < 64 {
+                                    builder.ins().sextend(types::I64, raw_index)
+                                } else {
+                                    raw_index
+                                };
 
                                 match &current_type {
                                     HirType::Ptr(inner) => {

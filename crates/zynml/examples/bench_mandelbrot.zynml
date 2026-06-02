@@ -1,26 +1,7 @@
 // Mandelbrot bench — pure-arithmetic float kernel. Iterates the
 // `z = z² + c` recurrence per grid point and counts the steps
 // until the magnitude squared escapes the |z|² > 4 threshold.
-//
-// Exercises every optimization pass in the pipeline:
-//   * `const_fold`         — folds the float constants in the
-//                            escape threshold and the inner
-//                            multiplications-by-constants.
-//   * `cse`                — collapses repeated `zx * zx` / `zy *
-//                            zy` reads across the inner loop.
-//   * `licm`               — hoists the loop-invariant `cy` /
-//                            `cx` ref through the inner while.
-//   * `inline`             — `mandel_count` is a leaf callee
-//                            (single block with Return); inlining
-//                            into `main` exposes the inner loop
-//                            to LICM/CSE on the outer-context's
-//                            constants.
-//   * `cfg_simplify`       — collapses straight-line successor
-//                            chains exposed by const-fold on
-//                            CondBranch (e.g. the escape check).
-//
-// Grid stays small (16×16, 100 iters) so the BC interpreter still
-// returns in tens of ms — Criterion handles the rest.
+// Returns the sum of per-pixel iteration counts.
 
 def mandel_count(cx: f64, cy: f64): i64 {
     let mut zx: f64 = 0.0

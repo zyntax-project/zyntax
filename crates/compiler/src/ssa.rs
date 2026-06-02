@@ -5869,7 +5869,12 @@ impl SsaBuilder {
             .iter()
             .flat_map(|(bid, b)| b.phis.iter().map(move |p| (*bid, p.result)))
             .collect();
-        for _ in 0..8 {
+        // Pre-compute which value-ids belong to phi results so the
+        // type-derivation loop can skip them when they're still at
+        // the I64 fallback (otherwise a chained phi-of-phi sees its
+        // upstream phi's stale I64 type and bails out as "mixed").
+        let phi_result_ids: HashSet<HirId> = phi_locations.iter().map(|(_, p)| *p).collect();
+        for _ in 0..16 {
             let mut changed = false;
             for (bid, phi_result) in &phi_locations {
                 let (current_ty, incoming_vals) = {
@@ -5891,6 +5896,9 @@ impl SsaBuilder {
                     continue;
                 }
                 // Find the common type across non-Undef incomings.
+                // Skip phi-result incomings that are themselves still
+                // typed I64 — they're unresolved and would falsely
+                // appear as mixed against a concrete f64 sibling.
                 let mut common: Option<HirType> = None;
                 let mut any_undef = false;
                 let mut bail = false;
@@ -5910,11 +5918,16 @@ impl SsaBuilder {
                         any_undef = true;
                         continue;
                     }
+                    // Skip still-stale phi incomings.
+                    if phi_result_ids.contains(v) && matches!(value.ty, HirType::I64) {
+                        continue;
+                    }
                     match &common {
                         None => common = Some(value.ty.clone()),
                         Some(existing) if existing == &value.ty => {}
                         Some(_) => {
-                            // Mixed types — leave the phi alone.
+                            // Mixed concrete types — really mixed,
+                            // leave the phi alone.
                             bail = true;
                             break;
                         }
@@ -5939,9 +5952,9 @@ impl SsaBuilder {
                 if let Some(v) = self.function.values.get_mut(phi_result) {
                     v.ty = new_ty.clone();
                 }
-                // Promote any I64 Undef incoming so the Cranelift
-                // jump's arg type matches the (now-correct) block-
-                // param type. Only touches Undef values — non-Undef
+                // Promote I64 Undef incomings so the Cranelift jump's
+                // arg type matches the (now-correct) block-param
+                // type. Only touches Undef values — non-Undef
                 // operands keep their original types.
                 if any_undef {
                     for v in &incoming_vals {
