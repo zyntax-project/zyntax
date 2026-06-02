@@ -1147,6 +1147,35 @@ impl CraneliftBackend {
                         if let Ok(cranelift_ty) = self.translate_type(ty) {
                             type_cache.insert(ty.clone(), cranelift_ty);
                         }
+                        // Aggregate-typed Loads memcpy into a fresh
+                        // stack slot — seed `size_cache` so the
+                        // codegen path has the byte count without
+                        // borrowing &self while FunctionBuilder is live.
+                        if matches!(
+                            ty,
+                            HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
+                        ) {
+                            if let Ok(size) = self.type_size(ty) {
+                                size_cache.insert(ty.clone(), size);
+                            }
+                        }
+                    }
+                    HirInstruction::Store { value, .. } => {
+                        // Aggregate-valued Stores get rewritten to a
+                        // memcpy below — seed `size_cache` so that
+                        // code path can look up the struct's size
+                        // without borrowing &self while the
+                        // FunctionBuilder is live.
+                        if let Some(v) = function.values.get(value) {
+                            if matches!(
+                                v.ty,
+                                HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
+                            ) {
+                                if let Ok(size) = self.type_size(&v.ty) {
+                                    size_cache.insert(v.ty.clone(), size);
+                                }
+                            }
+                        }
                     }
                     HirInstruction::GetElementPtr { ty, .. } => {
                         // Pre-compute sizes for all types in GEP chain
@@ -3125,13 +3154,58 @@ impl CraneliftBackend {
                                     self.value_map.keys().collect::<Vec<_>>()
                                 ),
                             };
-                            let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
 
-                            // TODO: Properly handle volatile flag
-                            let flags = cranelift_codegen::ir::MemFlags::new();
+                            // Aggregate-typed Load: the loaded "value"
+                            // in Cranelift IR is a pointer to a fresh
+                            // copy of the struct's bytes (matching the
+                            // by-value SSA semantics where the load
+                            // result is consumed by ExtractValue /
+                            // InsertValue / Store as a struct, all of
+                            // which treat the aggregate as a pointer).
+                            // We allocate a stack slot, memcpy the
+                            // struct's bytes into it, and route the
+                            // result HirId at that slot's address.
+                            // Otherwise the scalar Load below would
+                            // only read the first 8 bytes — the bug
+                            // that surfaces as nbody's bodies[i] reads
+                            // returning a half-initialised Body.
+                            let is_aggregate = matches!(
+                                ty,
+                                HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
+                            );
+                            if is_aggregate {
+                                let size = size_cache.get(ty).copied().unwrap_or(0);
+                                if size > 0 {
+                                    let slot = builder.create_sized_stack_slot(
+                                        cranelift_codegen::ir::StackSlotData::new(
+                                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                            size as u32,
+                                        ),
+                                    );
+                                    let dst = builder.ins().stack_addr(pointer_type, slot, 0);
+                                    let size_val = builder.ins().iconst(types::I64, size as i64);
+                                    builder.call_memcpy(
+                                        self.module.target_config(),
+                                        dst,
+                                        ptr_val,
+                                        size_val,
+                                    );
+                                    self.value_map.insert(*result, dst);
+                                } else {
+                                    // Zero-sized aggregate: just route
+                                    // the source pointer (nothing to copy).
+                                    self.value_map.insert(*result, ptr_val);
+                                }
+                            } else {
+                                let cranelift_ty =
+                                    type_cache.get(ty).copied().unwrap_or(types::I64);
 
-                            let loaded = builder.ins().load(cranelift_ty, flags, ptr_val, 0);
-                            self.value_map.insert(*result, loaded);
+                                // TODO: Properly handle volatile flag
+                                let flags = cranelift_codegen::ir::MemFlags::new();
+
+                                let loaded = builder.ins().load(cranelift_ty, flags, ptr_val, 0);
+                                self.value_map.insert(*result, loaded);
+                            }
                         }
 
                         HirInstruction::Store {
@@ -3147,7 +3221,37 @@ impl CraneliftBackend {
                             // TODO: Properly handle volatile flag
                             let flags = cranelift_codegen::ir::MemFlags::new();
 
-                            builder.ins().store(flags, val, ptr_val, 0);
+                            // Aggregate-typed Stores need a memcpy, not a
+                            // scalar store. The InsertValue chain at line
+                            // 3795 represents the aggregate's "value" as
+                            // a pointer to a stack slot (`value_map[v]`
+                            // = stack_addr), so `val` here is a pointer
+                            // to source bytes. A plain `builder.store`
+                            // would copy just the pointer (8 bytes)
+                            // instead of the struct's contents — that's
+                            // the bug that surfaces as nbody's
+                            // `bodies[i]` reading null and segfaulting.
+                            let value_ty = value_type_cache.get(value);
+                            let is_aggregate = matches!(
+                                value_ty,
+                                Some(HirType::Struct(_))
+                                    | Some(HirType::Array(_, _))
+                                    | Some(HirType::Union(_))
+                            );
+                            if is_aggregate {
+                                let size = size_cache.get(value_ty.unwrap()).copied().unwrap_or(0);
+                                if size > 0 {
+                                    let size_val = builder.ins().iconst(types::I64, size as i64);
+                                    builder.call_memcpy(
+                                        self.module.target_config(),
+                                        ptr_val,
+                                        val,
+                                        size_val,
+                                    );
+                                }
+                            } else {
+                                builder.ins().store(flags, val, ptr_val, 0);
+                            }
                             // Store has no result value
                         }
 
