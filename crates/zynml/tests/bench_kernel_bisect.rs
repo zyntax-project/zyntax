@@ -83,12 +83,16 @@ fn bisect(source: &str, label: &str) {
         }),
     ];
 
+    // 60s budget per pass — the nbody kernel runs 50k advance()
+    // calls (≈ 2.5s release, an order of magnitude slower under
+    // the debug-build interp dispatch), so a tight 5s would fire
+    // false positives that aren't about a pass hanging.
     for (name, apply) in passes {
         let mut m = lower(source);
         apply(&mut m);
-        match run_with_timeout(m, 5) {
+        match run_with_timeout(m, 60) {
             Some(r) => eprintln!("[{label}] {name} OK = {r:?}"),
-            None => panic!("[{label}] {name} HUNG (>5s)"),
+            None => panic!("[{label}] {name} HUNG (>60s)"),
         }
     }
 }

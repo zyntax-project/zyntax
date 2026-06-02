@@ -5688,7 +5688,36 @@ impl SsaBuilder {
                 self.substitute_value(phi_val, undef);
                 undef
             } else {
-                // Non-trivial phi
+                // Non-trivial phi. The `ty` slot was filled from
+                // `var_types[var]` above, which falls back to `I64`
+                // when the variable hasn't been registered yet —
+                // typically when the let-binding lives INSIDE the
+                // loop body but IDF placed a phi at the loop header
+                // before that let was lowered. Re-derive the phi
+                // result type from the actual incoming values so
+                // Cranelift's IR verifier doesn't reject the
+                // function with "arg N has type f64, expected i64"
+                // (silently dropping it from the JIT'd module via
+                // the per-function skip path).
+                let derived_ty = incoming
+                    .iter()
+                    .find_map(|(val, _)| {
+                        self.function.values.get(val).and_then(|v| {
+                            if matches!(v.kind, HirValueKind::Undef) {
+                                None
+                            } else {
+                                Some(v.ty.clone())
+                            }
+                        })
+                    })
+                    .unwrap_or(ty);
+                let phi_ty = derived_ty;
+                // Update the phi_val's recorded type too so any
+                // downstream lookup against `function.values` sees
+                // the corrected type.
+                if let Some(v) = self.function.values.get_mut(&phi_val) {
+                    v.ty = phi_ty.clone();
+                }
                 self.function
                     .blocks
                     .get_mut(&block)
@@ -5696,7 +5725,7 @@ impl SsaBuilder {
                     .phis
                     .push(HirPhi {
                         result: phi_val,
-                        ty,
+                        ty: phi_ty,
                         incoming,
                     });
                 phi_val
@@ -5818,6 +5847,91 @@ impl SsaBuilder {
         let incomplete: Vec<_> = self.incomplete_phis.keys().cloned().collect();
         for (block, var) in incomplete {
             self.fill_incomplete_phi(block, var);
+        }
+    }
+
+    /// Iteratively re-derive phi result types from their
+    /// incoming values. The first pass through
+    /// `fill_incomplete_phi` set each phi's type from its
+    /// incomings, but when an incoming was itself a phi with a
+    /// still-stale type, the derived type inherited that
+    /// staleness. Each round of this loop promotes
+    /// `var_types`'s I64 fallback to the actual operand type as
+    /// the chain resolves.
+    fn propagate_phi_types(&mut self) {
+        let phi_locations: Vec<(HirId, HirId)> = self
+            .function
+            .blocks
+            .iter()
+            .flat_map(|(bid, b)| b.phis.iter().map(move |p| (*bid, p.result)))
+            .collect();
+        for _ in 0..8 {
+            let mut changed = false;
+            for (bid, phi_result) in &phi_locations {
+                // Pull the (currently recorded) phi entry.
+                let (current_ty, incoming_vals) = {
+                    let block = match self.function.blocks.get(bid) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    let phi = match block.phis.iter().find(|p| p.result == *phi_result) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    (
+                        phi.ty.clone(),
+                        phi.incoming.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+                    )
+                };
+                // Derive the best type from any non-self
+                // non-undef incoming.
+                let best_ty = incoming_vals.iter().find_map(|v| {
+                    if *v == *phi_result {
+                        return None;
+                    }
+                    let value = self.function.values.get(v)?;
+                    if matches!(value.kind, HirValueKind::Undef) {
+                        return None;
+                    }
+                    if matches!(value.ty, HirType::I64)
+                        && self
+                            .function
+                            .blocks
+                            .iter()
+                            .any(|(_, b)| b.phis.iter().any(|p| p.result == *v))
+                    {
+                        // Skip phis still typed as the I64
+                        // fallback — they'll resolve in a later
+                        // round once their own incomings are
+                        // promoted.
+                        let phi_is_i64_fallback = incoming_vals.iter().any(|iv| iv != v);
+                        if phi_is_i64_fallback {
+                            return None;
+                        }
+                    }
+                    Some(value.ty.clone())
+                });
+                if let Some(new_ty) = best_ty {
+                    if new_ty != current_ty {
+                        // Update both the phi entry and the
+                        // function.values entry for the result.
+                        if let Some(block) = self.function.blocks.get_mut(bid) {
+                            if let Some(phi) =
+                                block.phis.iter_mut().find(|p| p.result == *phi_result)
+                            {
+                                phi.ty = new_ty.clone();
+                            }
+                        }
+                        if let Some(v) = self.function.values.get_mut(phi_result) {
+                            v.ty = new_ty;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
         }
     }
 

@@ -131,8 +131,15 @@ def main(): i64 {
     bodies[0] = s
 
     let dt: f64 = 0.01
+    // 50_000 advance() calls — matches the order of magnitude of
+    // rayzor's `nbody.hx` benchmark (which runs 20 × 500_000 =
+    // 1e7 inner steps with 5-body interactions, native-compiled).
+    // We're a factor of 200 lower because BC-interp throughput
+    // is well below native; still enough to put the bench in
+    // the hundreds-of-ms range so the tiered-JIT payoff is
+    // measurable.
     let mut step: i64 = 0
-    while step < 200 {
+    while step < 50000 {
         advance(bodies, n, dt)
         step = step + 1
     }

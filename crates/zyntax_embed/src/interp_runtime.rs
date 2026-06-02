@@ -663,20 +663,46 @@ impl InterpRuntime {
 
         let _ = config.verbosity;
         let cranelift_for_closure = Arc::clone(&cranelift);
-        // Cranelift compile closure (tier 0, beadie-driven).
+
+        // Compile the WHOLE module up front into the tier-up
+        // backend so cross-function calls (e.g. `main` →
+        // `mandel_count`) resolve against the module-wide function
+        // table. The previous per-function `compile_function`
+        // shape used the legacy single-function entry that
+        // declares against an empty module — any inter-function
+        // Call inside the compiled body resolved to an unknown
+        // symbol, baking in the wrong (null/zero) target. The
+        // observable effect was the JIT'd mandelbrot main always
+        // returning `Int(0)` (mandel_count never actually ran)
+        // and naive-recursive fib doing the same for the same
+        // reason. Compiling the module once at install time fixes
+        // both with cross-function symbol resolution.
+        cranelift.with_lock(|be| -> Result<(), CompilerError> {
+            be.set_compile_tier(0);
+            be.compile_module(&module)
+                .map_err(|e| CompilerError::Backend(format!("tier-up compile: {e}")))?;
+            be.finalize_definitions()
+                .map_err(|e| CompilerError::Backend(format!("tier-up finalize: {e}")))?;
+            if std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok() {
+                for (fid, f) in &module.functions {
+                    let name = f.name.resolve_global().unwrap_or_default();
+                    let ptr = be.get_function_ptr(*fid);
+                    eprintln!("[TIER-UP-INSTALL] {name} {fid:?} -> {ptr:?}");
+                }
+            }
+            Ok(())
+        })?;
+
+        // Cranelift dispatch closure (tier 0, beadie-driven). With
+        // the module pre-compiled above the closure just looks up
+        // the function pointer — no recompilation per tier-up.
         let cranelift_compile = {
             let func_arcs = Arc::clone(&func_arcs);
             move |tier: usize, func_id: HirId| -> Option<(*const u8, u8)> {
-                let (func_arc, bead_id) = func_arcs.get(&func_id)?;
+                let (func_arc, _bead_id) = func_arcs.get(&func_id)?;
                 let n_params = func_arc.signature.params.len().min(255) as u8;
                 let _ = tier; // always tier 0 here
-                let ptr = cranelift_for_closure.with_lock(|be| {
-                    be.set_compile_tier(0);
-                    be.set_compile_bead_id(*bead_id);
-                    be.compile_function(func_id, func_arc).ok()?;
-                    be.finalize_definitions().ok()?;
-                    be.get_function_ptr(func_id)
-                })?;
+                let ptr = cranelift_for_closure.with_lock(|be| be.get_function_ptr(func_id))?;
                 Some((ptr, n_params))
             }
         };

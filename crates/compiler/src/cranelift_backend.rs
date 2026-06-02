@@ -490,7 +490,11 @@ impl CraneliftBackend {
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 if let Err(e) = self.compile_function_body(*id, function, module) {
                     CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+                    let name = function.name.resolve_global().unwrap_or_default();
                     log::debug!("[CRANELIFT] Skipping function '{}': {:?}", function.name, e);
+                    if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                        eprintln!("[CRANELIFT-SKIP] '{name}': {e:?}");
+                    }
                     // Remove from function_map to prevent later lookup failures
                     self.function_map.remove(id);
                 }
