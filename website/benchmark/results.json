@@ -1,69 +1,69 @@
 {
   "fib": {
     "zyntax-interp": {
-      "seconds": 4.163940791,
-      "compile_ms": 1.625416,
-      "exec_ms": 4162.315375,
+      "seconds": 4.005542875,
+      "compile_ms": 1.531,
+      "exec_ms": 4004.0118749999997,
       "result": "Int(832040)"
     },
     "zyntax-interp-opt": {
-      "seconds": 4.155095416999999,
-      "compile_ms": 1.664,
-      "exec_ms": 4153.431417,
+      "seconds": 4.003962209,
+      "compile_ms": 1.563792,
+      "exec_ms": 4002.3984170000003,
       "result": "Int(832040)"
     },
     "zyntax-tiered": {
-      "seconds": 0.005830332999999999,
-      "compile_ms": 1.7799999999999998,
-      "exec_ms": 4.050332999999999,
+      "seconds": 0.005521332,
+      "compile_ms": 1.605666,
+      "exec_ms": 3.915666,
       "result": "Int(832040)"
     }
   },
   "mandelbrot": {
     "zyntax-interp": {
-      "seconds": 0.008762084,
-      "compile_ms": 4.644042,
-      "exec_ms": 4.118042,
+      "seconds": 0.008240625,
+      "compile_ms": 4.3052079999999995,
+      "exec_ms": 3.935417,
       "result": "Int(8279)"
     },
     "zyntax-interp-opt": {
-      "seconds": 0.008283541,
-      "compile_ms": 4.304333,
-      "exec_ms": 3.979208,
+      "seconds": 0.008827082999999998,
+      "compile_ms": 4.65525,
+      "exec_ms": 4.1718329999999995,
       "result": "Int(8279)"
     },
     "zyntax-tiered": {
-      "seconds": 0.004728375,
-      "compile_ms": 4.72675,
-      "exec_ms": 0.001625,
-      "result": "Int(0)"
+      "seconds": 0.009084583,
+      "compile_ms": 4.91,
+      "exec_ms": 4.174583,
+      "result": "Int(8279)"
     }
   },
   "nbody": {
     "zyntax-interp": {
-      "seconds": 2.267070042,
-      "compile_ms": 14.677542,
-      "exec_ms": 2252.3925,
+      "seconds": 2.284022833,
+      "compile_ms": 14.446957999999999,
+      "exec_ms": 2269.575875,
       "result": "Int(50000)"
     },
     "zyntax-interp-opt": {
-      "seconds": 2.274336584,
-      "compile_ms": 15.112334,
-      "exec_ms": 2259.2242499999998,
+      "seconds": 1.8668049180000004,
+      "compile_ms": 15.482709000000002,
+      "exec_ms": 1851.3222090000002,
       "result": "Int(50000)"
     },
     "zyntax-tiered": {
-      "seconds": 2.338750708,
-      "compile_ms": 19.884417000000003,
-      "exec_ms": 2318.866291,
+      "seconds": 1.854365959,
+      "compile_ms": 16.518749999999997,
+      "exec_ms": 1837.847209,
       "result": "Int(50000)"
     }
   },
   "meta": {
-    "date": "2026-06-02T15:25:25Z",
-    "commit": "4506ef4",
+    "date": "2026-06-02T15:35:31Z",
+    "commit": "6d8c68b",
     "arch": "aarch64",
     "os": "macos",
-    "runs": 3
+    "runs": 9
   }
 }

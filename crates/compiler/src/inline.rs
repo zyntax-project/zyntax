@@ -336,24 +336,14 @@ fn classify(callee: &HirFunction) -> CalleeClass {
         return CalleeClass::OkLeaf;
     }
 
-    // Multi-block callees still hit a CFG-rewrite hang in
-    // `apply_inline_multi_block`: enabling it (with the bumped
-    // `MAX_INLINE_INSTS_MULTI_BLOCK = 256`) makes both
-    // mandelbrot's `main → mandel_count` and nbody's
-    // `main → advance` loop indefinitely under the BC
-    // interpreter. The SSA-builder fixes earlier in this
-    // session closed several adjacent placeholder-leak holes,
-    // but the splice still produces an unintended CFG cycle —
-    // likely the cloned-callee return-blocks branching back to
-    // a `post_block_id` whose phi for the return value picks up
-    // a placeholder from the inner loop's back-edge. Tracked
-    // for the next session; classify as `TooLarge` so the rest
-    // of the pipeline (const_fold, cse, licm, etc.) keeps
-    // running and the leaf inliner still fires on small
-    // helpers.
-    let _ = total_insts;
-    let _ = MAX_INLINE_INSTS_MULTI_BLOCK;
-    CalleeClass::TooLarge
+    // Multi-block callees — leaf-shaped numeric kernels with a
+    // loop or branch in their body (mandelbrot's mandel_count,
+    // nbody's advance, …). Cost-gated by
+    // `MAX_INLINE_INSTS_MULTI_BLOCK = 256`.
+    if total_insts > MAX_INLINE_INSTS_MULTI_BLOCK {
+        return CalleeClass::TooLarge;
+    }
+    CalleeClass::OkMultiBlock
 }
 
 /// Splice the callee's single-block body into the caller's
@@ -708,6 +698,34 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
         s.insert(from, to);
         replace_uses_across_function(caller, &s);
         caller.values.shift_remove(&from);
+    }
+
+    // ─── 7b. Rewrite every downstream phi-incoming that referenced
+    // the *original* call block to instead reference `post_block_id`.
+    // Before the splice, flow into the call block's terminator-
+    // successor blocks came from `job.block_id`. After the splice,
+    // that terminator now lives on `post_block` (the synthetic
+    // post-callee block), so every phi listing `(_, job.block_id)`
+    // in those successor blocks must be updated. Without this
+    // rewrite the BC interpreter sees phi-incoming source blocks
+    // that no longer dominate the phi, picks the wrong value, and
+    // the resulting control flow loops indefinitely. (Diagnosed by
+    // the `bench_kernel_bisect` mandelbrot / nbody hang on the
+    // first iteration with multi-block inlining enabled.)
+    for block in caller.blocks.values_mut() {
+        if block.id == post_block_id {
+            // post_block's own phis (for return-value merging)
+            // were just built with cloned-callee block ids — leave
+            // them alone.
+            continue;
+        }
+        for phi in &mut block.phis {
+            for (_, src) in &mut phi.incoming {
+                if *src == job.block_id {
+                    *src = post_block_id;
+                }
+            }
+        }
     }
 
     // ─── 8. Rebuild predecessors + successors across the whole
@@ -1202,11 +1220,7 @@ mod tests {
         f
     }
 
-    // Multi-block inlining is currently gated off in `classify` — see
-    // the comment there for the underlying CFG-rewrite hang surfaced
-    // by `cargo test --test bench_kernel_bisect`.
     #[test]
-    #[ignore = "multi-block inlining gated off pending CFG-rewrite fix"]
     fn inlines_multi_block_max_callee() {
         let mut callee = build_max_callee();
         let callee_id = HirId::new();
