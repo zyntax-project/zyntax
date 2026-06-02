@@ -148,7 +148,14 @@ pub fn next_bead_id() -> u64 {
 /// stale one (the latter returns null cleanly).
 #[no_mangle]
 pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
-    if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+    // `std::env::var_os` calls `getenv`, which on macOS takes a
+    // global lock per call (`os_unfair_lock` around the env
+    // table). JIT'd code emits an `osr_probe` call at every
+    // back-edge probe site — at rayzor-scale mandelbrot's
+    // ~100 M loop iterations that's 100 M getenv calls and ~50 %
+    // of total wall-clock. Resolve the trace gate once at process
+    // start instead.
+    if osr_trace_enabled() {
         eprintln!("[osr_probe] bead_id={} site=0x{:x}", bead_id, site);
     }
     let registry = bead_registry().read().unwrap();
@@ -156,6 +163,11 @@ pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
         Some(bead) => bead.osr_entry(site).unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
+}
+
+fn osr_trace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ZYNML_OSR_TRACE").is_some())
 }
 
 /// Symbol name JIT'd code uses to reference the probe. Registered with the
