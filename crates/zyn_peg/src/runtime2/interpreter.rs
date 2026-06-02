@@ -14,7 +14,8 @@ use crate::grammar::{ActionIR, CharClass, ExprIR, GrammarIR, PatternIR, RuleIR, 
 use log::{debug, trace};
 use std::collections::HashMap;
 use zyntax_typed_ast::typed_ast::{
-    TypedCatch, TypedComputeExpr, TypedComputeModifier, TypedKernelAttr, TypedNamedArg, TypedTry,
+    TypedCast, TypedCatch, TypedComputeExpr, TypedComputeModifier, TypedKernelAttr, TypedNamedArg,
+    TypedTry,
 };
 use zyntax_typed_ast::{
     type_registry::{
@@ -319,7 +320,8 @@ impl<'g> GrammarInterpreter<'g> {
             | ["SuffixMethod"]
             | ["SuffixCall"]
             | ["SuffixIndex"]
-            | ["SuffixSlice"] => self.construct_suffix(type_path, fields, state),
+            | ["SuffixSlice"]
+            | ["CastTarget"] => self.construct_suffix(type_path, fields, state),
             // Lambda parameter
             ["TypedLambdaParam"] => self.construct_lambda_param(fields, state, span),
             _ => Err(format!("unknown type path: {}", type_path)),
@@ -646,6 +648,17 @@ impl<'g> GrammarInterpreter<'g> {
                     operand: Box::new(operand),
                 })
             }
+            "Cast" => {
+                // `expr as Ty` — the right-hand operand is a type,
+                // not a value expression. The cast_expr grammar rule
+                // hands the type through the `target_type` field.
+                let expr = self.get_field_as_expr("expr", fields, state)?;
+                let target_type = self.get_field_as_type("target_type", fields, state)?;
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(expr),
+                    target_type,
+                })
+            }
             "Array" => {
                 let elements = self.get_field_as_expr_list("elements", fields, state)?;
                 TypedExpression::Array(elements)
@@ -918,6 +931,13 @@ impl<'g> GrammarInterpreter<'g> {
             // `resolve_expr_type` (in the SSA lowering) which knows
             // how to walk `Array<T>` / `List<T>` back to `T`.
             TypedExpression::Index(_) => Type::Unknown,
+            // `expr as Ty` — the outer node's type is the cast
+            // target. Without this the cast result defaults to Unit
+            // and the SSA layer's `convert_type` lowers it to Void,
+            // which breaks the FpToSi / SiToFp dispatch in
+            // `select_cast_op` (both sides need to be concrete prim
+            // types for it to pick the right CastOp).
+            TypedExpression::Cast(cast) => cast.target_type.clone(),
             _ => Type::Primitive(PrimitiveType::Unit),
         };
 
@@ -2217,6 +2237,69 @@ impl<'g> GrammarInterpreter<'g> {
                 let first = self.eval_expr(&args[0], state)?;
                 let second = self.eval_expr(&args[1], state)?;
                 Ok(ParsedValue::List(vec![first, second]))
+            }
+            "fold_cast" => {
+                // fold_cast(first, rest) - fold `as Ty` chains
+                // left-associatively. `rest` is a list of CastTarget
+                // suffixes, each carrying a `target_type` field. Each
+                // step wraps the accumulator in a TypedExpression::Cast.
+                if args.len() != 2 {
+                    return Err(
+                        "fold_cast() requires exactly 2 arguments (first, rest)".to_string()
+                    );
+                }
+                let first = self.eval_expr(&args[0], state)?;
+                let rest = self.eval_expr(&args[1], state)?;
+                let rest_list = match rest {
+                    ParsedValue::List(items) => items,
+                    ParsedValue::Optional(None) | ParsedValue::None => vec![],
+                    ParsedValue::Optional(Some(inner)) => match *inner {
+                        ParsedValue::List(items) => items,
+                        other => vec![other],
+                    },
+                    other => vec![other],
+                };
+                if rest_list.is_empty() {
+                    return Ok(first);
+                }
+                let mut acc_expr = self.parsed_value_to_expr(first, state)?;
+                for target in rest_list {
+                    let target_ty = match target {
+                        ParsedValue::Suffix { fields, .. } => match fields.get("target_type") {
+                            Some(boxed) => match boxed.as_ref() {
+                                ParsedValue::Type(t) => t.clone(),
+                                other => {
+                                    return Err(format!(
+                                        "fold_cast: expected Type in target_type, got {:?}",
+                                        other
+                                    ))
+                                }
+                            },
+                            None => {
+                                return Err(
+                                    "fold_cast: CastTarget missing target_type field".to_string()
+                                )
+                            }
+                        },
+                        ParsedValue::Type(t) => t,
+                        other => {
+                            return Err(format!(
+                                "fold_cast: unexpected cast target value: {:?}",
+                                other
+                            ))
+                        }
+                    };
+                    let cast_node = typed_node(
+                        TypedExpression::Cast(TypedCast {
+                            expr: Box::new(acc_expr),
+                            target_type: target_ty.clone(),
+                        }),
+                        target_ty,
+                        span,
+                    );
+                    acc_expr = cast_node;
+                }
+                Ok(ParsedValue::Expression(Box::new(acc_expr)))
             }
             "fold_left_ops" => {
                 // fold_left_ops(first, rest) - fold binary operations with left associativity

@@ -2424,11 +2424,20 @@ additive_op = @{ "+" | "-" }
 
 // Multiplication, division, modulo - binary left-associative using fold_left_ops
 // @ is matrix multiplication in ZynML (like Python/NumPy)
-multiplicative_expr = { first:unary_expr ~ rest:multiplicative_rest* }
+multiplicative_expr = { first:cast_expr ~ rest:multiplicative_rest* }
   -> fold_left_ops(first, rest)
 
-multiplicative_rest = { op:multiplicative_op ~ operand:unary_expr }
+multiplicative_rest = { op:multiplicative_op ~ operand:cast_expr }
   -> make_pair(op, operand)
+
+// Type cast: expr as Ty — binds tighter than * but looser than
+// unary prefix ops, matching Rust precedence. Chained casts like
+// `x as i64 as f64` parse as `((x as i64) as f64)` via fold_cast.
+cast_expr = { first:unary_expr ~ rest:cast_target* }
+  -> fold_cast(first, rest)
+
+cast_target = { "as" ~ ty:type_expr }
+  -> CastTarget { target_type: ty }
 
 // Note: "@" in quotes is a literal character, not the pest atomic rule marker
 multiplicative_op = @{ "@" | "*" | "/" | "%" }

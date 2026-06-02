@@ -4914,7 +4914,15 @@ impl SsaBuilder {
 
             TypedExpression::Cast(cast) => {
                 let operand_val = self.translate_expression(block_id, &cast.expr)?;
-                let source_ty = self.convert_type(&cast.expr.ty);
+                // The parser emits Variable expressions with
+                // `Type::Any` / `Type::Unknown`, which would collapse
+                // to `HirType::I64` in `convert_type` and force
+                // `select_cast_op` to pick `Bitcast` instead of the
+                // intended FpToSi / SiToFp. Resolve through the
+                // variable-type table first so int↔float casts get
+                // the right op.
+                let resolved_source = self.resolve_expr_type(&cast.expr);
+                let source_ty = self.convert_type(&resolved_source);
                 let target_ty = self.convert_type(&cast.target_type);
                 let result = self.create_value(target_ty.clone(), HirValueKind::Instruction);
                 let cast_op = self.select_cast_op(&source_ty, &target_ty);
