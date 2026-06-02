@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zyntax — Benchmarks</title>
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Zyntax Benchmarks">
+  <meta property="og:description" content="ZynML microbenchmark suite — mandelbrot, n-body, and Fibonacci measured through the BC interpreter, with and without the HIR optimization pipeline.">
+  <meta property="og:url" content="https://zyntax.org/benchmark/">
+  <meta property="og:image" content="https://zyntax.org/og-image.png">
+  <meta property="og:site_name" content="Zyntax">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zyntax Benchmarks">
+  <meta name="twitter:description" content="ZynML microbenchmark suite — mandelbrot, n-body, Fibonacci measured across BC interp ± opt pipeline.">
+  <meta name="twitter:image" content="https://zyntax.org/og-image.png">
+
+  <meta name="description" content="ZynML microbenchmark suite — mandelbrot, n-body, and Fibonacci measured through the BC interpreter, with and without the HIR optimization pipeline.">
+  <meta name="theme-color" content="#eaeaf2">
+  <link rel="canonical" href="https://zyntax.org/benchmark/">
+
+  <link rel="icon" href="/favicon.ico" sizes="32x32">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="32x32">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Unbounded:wght@200..900&display=swap" rel="stylesheet">
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-top: #eaeaf2;
+      --bg-bottom: #ccc8d8;
+      --text-primary: #111118;
+      --text-secondary: #555566;
+      --text-muted: #888899;
+      --accent: #1a1a1a;
+      --accent-hover: #333340;
+      --border: rgba(0, 0, 0, 0.08);
+      --rule: rgba(0, 0, 0, 0.10);
+      --card-bg: rgba(255, 255, 255, 0.55);
+      --card-bg-strong: rgba(255, 255, 255, 0.72);
+      --bar-compile: #5b5bd6;
+      --bar-exec: #1a1a1a;
+      --bar-track: rgba(0, 0, 0, 0.08);
+    }
+
+    html, body { overflow-x: hidden; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+      min-height: 100vh;
+      color: var(--text-primary);
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); }
+
+    /* ── Navigation (matches main site) ── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 0 clamp(1.5rem, 5vw, 4rem);
+      height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      background: rgba(234, 234, 242, 0.7);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-logo {
+      display: flex; align-items: center;
+      color: var(--text-primary);
+      font-family: 'Unbounded', sans-serif;
+      font-weight: 700;
+      font-size: 1.05rem;
+      letter-spacing: -0.01em;
+    }
+    .nav-links { display: flex; gap: 2rem; list-style: none; align-items: center; }
+    .nav-links a {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+      font-weight: 500;
+      transition: color 0.15s;
+    }
+    .nav-links a:hover { color: var(--text-primary); }
+    .nav-cta {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.45rem 0.85rem;
+      background: var(--accent); color: white !important;
+      border-radius: 0.5rem;
+      font-size: 0.825rem; font-weight: 600;
+    }
+    .nav-cta:hover { background: var(--accent-hover); }
+    .nav-cta svg { width: 14px; height: 14px; }
+
+    /* ── Page layout ── */
+    .container { max-width: 920px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 2rem); }
+
+    header.page-head {
+      padding-top: clamp(3rem, 8vh, 5rem);
+      padding-bottom: clamp(1.5rem, 4vh, 2rem);
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 0.55rem;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      background: var(--card-bg-strong);
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.75rem;
+      border-radius: 999px;
+      backdrop-filter: blur(8px);
+    }
+    .eyebrow .dot {
+      width: 7px; height: 7px;
+      background: #4ade80;
+      border-radius: 50%;
+      box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18);
+    }
+    h1 {
+      font-family: 'Unbounded', sans-serif;
+      font-weight: 700;
+      font-size: clamp(2.2rem, 5vw, 3.4rem);
+      letter-spacing: -0.025em;
+      line-height: 1.05;
+      margin-top: 1rem;
+      margin-bottom: 0.85rem;
+      max-width: 24ch;
+    }
+    h1 em { font-style: italic; color: var(--bar-compile); font-weight: 700; }
+    header.page-head p {
+      color: var(--text-secondary);
+      font-size: 1.02rem;
+      max-width: 56ch;
+    }
+    header.page-head a { color: var(--bar-compile); }
+
+    /* ── Methodology pill ── */
+    .method {
+      margin: 2rem 0 1.5rem;
+      padding: 1rem 1.4rem;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 0.85rem;
+      backdrop-filter: blur(10px);
+      display: flex; gap: 1.5rem; flex-wrap: wrap;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+    }
+    .method span { display: inline-flex; align-items: center; gap: 0.45rem; }
+    .method b { color: var(--text-primary); font-weight: 600; }
+    .method svg {
+      width: 14px; height: 14px;
+      flex: none;
+      stroke: var(--text-secondary);
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* ── Charts ── */
+    .chart-card {
+      background: var(--card-bg-strong);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      backdrop-filter: blur(10px);
+      padding: 1.4rem 1.6rem 1.5rem;
+      margin-bottom: 1.4rem;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.04);
+    }
+    .chart-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+      flex-wrap: wrap; gap: 0.5rem;
+      border-bottom: 1px dashed var(--rule);
+      padding-bottom: 0.85rem;
+      margin-bottom: 1rem;
+    }
+    .chart-head h2 {
+      font-family: 'Unbounded', sans-serif;
+      font-weight: 600;
+      font-size: 1.2rem;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+    }
+    .chart-head .key {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+    }
+    .chart-head .result {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+    .chart-head .result code {
+      background: rgba(0, 0, 0, 0.06);
+      padding: 0.1rem 0.4rem;
+      border-radius: 0.3rem;
+      color: var(--text-primary);
+    }
+    .chart { display: grid; gap: 0.6rem; }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      align-items: center;
+      gap: 1rem;
+      height: 30px;
+    }
+    .bar-label {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      text-align: right;
+      white-space: nowrap;
+    }
+    .bar-row.is-opt .bar-label { color: var(--text-primary); font-weight: 700; }
+    .bar-track {
+      position: relative;
+      height: 22px;
+      background: var(--bar-track);
+      border-radius: 5px;
+      overflow: visible;
+    }
+    .bar-stack {
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      display: flex;
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .bar-stack .compile { background: var(--bar-compile); }
+    .bar-stack .exec { background: var(--bar-exec); }
+    .bar-time {
+      position: absolute;
+      left: calc(var(--bar-pct) + 8px);
+      top: 50%;
+      transform: translateY(-50%);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.74rem;
+      color: var(--text-primary);
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .bar-row.is-opt .bar-time { font-weight: 700; }
+    .legend {
+      margin-top: 0.85rem;
+      display: flex; gap: 1.1rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+    }
+    .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+    .legend i {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 2px;
+    }
+    .legend .ci { background: var(--bar-compile); }
+    .legend .ei { background: var(--bar-exec); }
+
+    .loading {
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      font-style: italic;
+      padding: 2rem 0;
+    }
+
+    /* ── Footnote + meta ── */
+    .footnote {
+      margin: 1rem 0 0;
+      padding: 1.2rem 0 0;
+      border-top: 1px dashed var(--rule);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      line-height: 1.75;
+    }
+    .footnote strong { color: var(--text-primary); font-weight: 600; }
+    .meta {
+      margin-top: 1.1rem;
+      display: flex; flex-wrap: wrap; gap: 0.9rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+    .meta span { display: inline-flex; align-items: center; gap: 0.35rem; }
+    .meta code {
+      background: rgba(0, 0, 0, 0.06);
+      padding: 0.1rem 0.4rem;
+      border-radius: 0.3rem;
+      color: var(--text-primary);
+    }
+
+    /* ── Footer ── */
+    footer {
+      margin-top: 4rem;
+      background: rgba(255, 255, 255, 0.3);
+      border-top: 1px solid var(--border);
+      padding: 2.2rem 0 1.6rem;
+    }
+    footer .foot-inner {
+      max-width: 920px; margin: 0 auto;
+      padding: 0 clamp(1.5rem, 4vw, 2rem);
+      display: flex; flex-wrap: wrap; gap: 1.2rem;
+      justify-content: space-between; align-items: center;
+    }
+    footer .foot-brand {
+      font-family: 'Unbounded', sans-serif;
+      font-weight: 700; font-size: 1rem; color: var(--text-primary);
+    }
+    footer .foot-links {
+      display: flex; gap: 1.4rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+    }
+    footer .foot-links a { color: var(--text-secondary); }
+    footer .foot-links a:hover { color: var(--text-primary); }
+    footer .foot-bottom {
+      max-width: 920px;
+      margin: 1.4rem auto 0;
+      padding: 1rem clamp(1.5rem, 4vw, 2rem) 0;
+      border-top: 1px dashed var(--rule);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      display: flex; flex-wrap: wrap; gap: 0.5rem;
+      justify-content: space-between;
+    }
+
+    @media (max-width: 600px) {
+      .bar-row { grid-template-columns: 130px 1fr; gap: 0.6rem; }
+      .bar-label { font-size: 0.72rem; }
+      .nav-links a:nth-child(1) { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <nav role="navigation" aria-label="Main navigation">
+    <a href="/" class="nav-logo">zyntax</a>
+    <ul class="nav-links" role="list">
+      <li><a href="https://zyntax.org/book/">The Zyn Book</a></li>
+      <li><a href="/benchmark/">Benchmarks</a></li>
+      <li>
+        <a href="https://github.com/zyntax-project/zyntax" class="nav-cta" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+          GitHub
+        </a>
+      </li>
+    </ul>
+  </nav>
+
+  <header class="page-head container">
+    <span class="eyebrow"><span class="dot"></span>refreshed by <code style="font-family:inherit;background:transparent;padding:0;color:inherit;">cargo run --release --example bench_runner</code></span>
+    <h1>How fast does the <em>opt</em> pipeline lift?</h1>
+    <p>
+      A handful of ZynML microbenchmarks measured through the BC interpreter,
+      with and without the HIR optimization pipeline
+      (<code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">run_interp_safe_opts</code>).
+      Source for every kernel lives at
+      <a href="https://github.com/zyntax-project/zyntax/tree/main/crates/zynml/examples">crates/zynml/examples</a>.
+    </p>
+  </header>
+
+  <section class="container">
+    <div class="method">
+      <span><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><b>Median of 9</b> · 3 warmup runs discarded</span>
+      <span><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><b>Wall-clock</b> · compile + execute timed separately</span>
+      <span><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><b>Result pinned</b> · diverging output fails the run</span>
+      <span><svg viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg><b>BC interp</b> · interpreter-only path (no JIT tier-up)</span>
+    </div>
+  </section>
+
+  <main class="container" id="charts">
+    <p class="loading">Loading benchmark results…</p>
+  </main>
+
+  <section class="container">
+    <div id="meta-row"></div>
+    <p class="footnote">
+      <strong>Shorter bars are better.</strong>
+      <span class="legend" style="margin-top:0.4rem;">
+        <span><i class="ci"></i> compile</span>
+        <span><i class="ei"></i> execute</span>
+      </span>
+      Each kernel runs through the BC interpreter twice — once on the raw HIR and once
+      after the optimization pipeline. The pipeline includes const-folding, CSE,
+      load-CSE, leaf inlining, LICM, loop and reduction vectorization, CFG
+      simplification, alloca → malloc promotion, and drop-site insertion.
+      Output is pinned per run; a future optimisation that silently changes the
+      result fails this workflow loudly.
+    </p>
+  </section>
+
+  <footer>
+    <div class="foot-inner">
+      <div class="foot-brand">zyntax</div>
+      <div class="foot-links">
+        <a href="/">Home</a>
+        <a href="https://zyntax.org/book/">Book</a>
+        <a href="/benchmark/">Benchmarks</a>
+        <a href="https://github.com/zyntax-project/zyntax">GitHub</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 The Zyntax contributors · MIT licensed</span>
+      <span>microbenchmarks · refreshed by the bench-runner</span>
+    </div>
+  </footer>
+
+  <script>
+    const KERNEL_TITLES = {
+      mandelbrot: 'Mandelbrot',
+      nbody: 'N-body',
+      fib: 'Fibonacci',
+    };
+    const KERNEL_ORDER = ['mandelbrot', 'nbody'];
+
+    const TARGET_LABELS = {
+      'zyntax-interp': 'interp · no opts',
+      'zyntax-interp-opt': 'interp · opt',
+    };
+    const TARGET_ORDER = ['zyntax-interp', 'zyntax-interp-opt'];
+
+    function buildKernel(name, results) {
+      const title = KERNEL_TITLES[name] || name;
+      const targets = TARGET_ORDER.filter(t => results[t]);
+      if (targets.length === 0) return '';
+
+      const allTotals = targets.map(t => results[t].compile_ms + results[t].exec_ms);
+      const maxTotal = Math.max(...allTotals);
+
+      // Pin correctness: every target must return the same string.
+      const expected = results[targets[0]].result;
+      const allAgree = targets.every(t => results[t].result === expected);
+      const resultBadge = allAgree
+        ? `result <code>${expected}</code>`
+        : `<span style="color:#d33;">result diverges</span>`;
+
+      let rows = '';
+      for (const target of targets) {
+        const r = results[target];
+        const total = r.compile_ms + r.exec_ms;
+        const pct = (total / maxTotal) * 75;
+        const compilePct = (r.compile_ms / total) * pct;
+        const execPct = (r.exec_ms / total) * pct;
+        const isOpt = target === 'zyntax-interp-opt';
+        rows += `
+          <div class="bar-row ${isOpt ? 'is-opt' : ''}">
+            <div class="bar-label">${TARGET_LABELS[target] || target}</div>
+            <div class="bar-track">
+              <div class="bar-stack" style="width: ${pct}%;">
+                <div class="compile" style="width: ${(r.compile_ms / total) * 100}%;"></div>
+                <div class="exec" style="width: ${(r.exec_ms / total) * 100}%;"></div>
+              </div>
+              <span class="bar-time" style="--bar-pct: ${pct}%">${total.toFixed(2)}ms</span>
+            </div>
+          </div>`;
+      }
+
+      return `
+        <article class="chart-card">
+          <div class="chart-head">
+            <h2>${title}</h2>
+            <span class="result">${resultBadge}</span>
+            <span class="key">lower is faster</span>
+          </div>
+          <div class="chart">${rows}</div>
+        </article>`;
+    }
+
+    async function main() {
+      const container = document.getElementById('charts');
+      const metaEl = document.getElementById('meta-row');
+
+      let data = null;
+      try {
+        const resp = await fetch('results.json');
+        if (resp.ok) data = await resp.json();
+      } catch (_) {
+        container.innerHTML = `<p class="loading">Could not load results.json — run the benchmark workflow first.</p>`;
+        return;
+      }
+      if (!data) {
+        container.innerHTML = `<p class="loading">No results available yet.</p>`;
+        return;
+      }
+
+      let html = '';
+      for (const name of KERNEL_ORDER) {
+        if (data[name]) html += buildKernel(name, data[name]);
+      }
+      // Surface any unknown-named kernels too, so adding a new one
+      // works without page edits.
+      for (const name of Object.keys(data)) {
+        if (name === 'meta') continue;
+        if (KERNEL_ORDER.includes(name)) continue;
+        html += buildKernel(name, data[name]);
+      }
+      container.innerHTML = html || `<p class="loading">No kernels matched expected names.</p>`;
+
+      if (data.meta) {
+        const m = data.meta;
+        const date = (m.date || '—').replace('T', ' ').replace('Z', ' UTC');
+        metaEl.innerHTML = `
+          <div class="meta">
+            <span>updated <b style="color:var(--text-primary);">${date}</b></span>
+            <span>commit <code>${m.commit || '—'}</code></span>
+            <span>arch <code>${m.arch || '—'}</code></span>
+            <span>os <code>${m.os || '—'}</code></span>
+            <span>median of ${m.runs || 9} runs</span>
+          </div>`;
+      }
+    }
+
+    main();
+  </script>
+
+</body>
+</html>

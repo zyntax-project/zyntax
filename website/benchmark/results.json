@@ -1,0 +1,37 @@
+{
+  "mandelbrot": {
+    "zyntax-interp": {
+      "seconds": 0.00868325,
+      "compile_ms": 4.664375,
+      "exec_ms": 4.0188749999999995,
+      "result": "Int(8279)"
+    },
+    "zyntax-interp-opt": {
+      "seconds": 0.008062875,
+      "compile_ms": 4.262125,
+      "exec_ms": 3.80075,
+      "result": "Int(8279)"
+    }
+  },
+  "nbody": {
+    "zyntax-interp": {
+      "seconds": 0.005653459,
+      "compile_ms": 5.361292,
+      "exec_ms": 0.292167,
+      "result": "Int(100)"
+    },
+    "zyntax-interp-opt": {
+      "seconds": 0.005676875,
+      "compile_ms": 5.406083,
+      "exec_ms": 0.27079200000000003,
+      "result": "Int(100)"
+    }
+  },
+  "meta": {
+    "date": "2026-06-02T09:40:54Z",
+    "commit": "9bc97fa",
+    "arch": "aarch64",
+    "os": "macos",
+    "runs": 9
+  }
+}
