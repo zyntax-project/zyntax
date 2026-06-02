@@ -5730,6 +5730,19 @@ impl SsaBuilder {
                 }
             }
         }
+        // The per-block `definitions` map records what value each
+        // variable currently maps to. If `from` is sitting in that
+        // map as the current binding for some variable in some
+        // block, a future `read_variable` on that block returns
+        // the stale orphan instead of the resolved value. Patch
+        // those entries here too.
+        for block_defs in self.definitions.values_mut() {
+            for (_var, val) in block_defs.iter_mut() {
+                if *val == from {
+                    *val = to;
+                }
+            }
+        }
         // The SsaForm's def-use chain is rebuilt from instructions
         // after construction (see `build_def_use_chains`), so
         // rewriting the operands above is enough — the chain
@@ -9790,6 +9803,35 @@ impl SsaForm {
                     }
                 }
 
+                if std::env::var("ZYNTAX_TRACE_SSA_VALIDATE").is_ok() {
+                    let kind = self
+                        .function
+                        .values
+                        .get(def_id)
+                        .map(|v| format!("{:?} ty={:?}", v.kind, v.ty))
+                        .unwrap_or_else(|| "missing".to_string());
+                    eprintln!(
+                        "[SSA-VALIDATE] orphan def {:?} ({kind}) used by {:?}",
+                        def_id, use_id
+                    );
+                    // Dump full HIR text for diagnosis.
+                    eprintln!("=== full function HIR ===");
+                    eprintln!("entry: {:?}", self.function.entry_block);
+                    for (bid, block) in &self.function.blocks {
+                        eprintln!(
+                            "block {bid:?} preds={:?} succs={:?}",
+                            block.predecessors, block.successors
+                        );
+                        for phi in &block.phis {
+                            eprintln!("  phi {:?} = phi {:?}", phi.result, phi.incoming);
+                        }
+                        for inst in &block.instructions {
+                            eprintln!("  {inst:?}");
+                        }
+                        eprintln!("  term: {:?}", block.terminator);
+                    }
+                    eprintln!("=== end ===");
+                }
                 return Err(crate::CompilerError::Analysis(format!(
                     "Use {:?} has undefined definition {:?}",
                     use_id, def_id

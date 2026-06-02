@@ -1,70 +1,67 @@
 {
   "fib": {
     "zyntax-interp": {
-      "seconds": 4.145304625,
-      "compile_ms": 1.827333,
-      "exec_ms": 4143.477292,
+      "seconds": 4.1660224999999995,
+      "compile_ms": 1.5690840000000001,
+      "exec_ms": 4164.453415999999,
       "result": "Int(832040)"
     },
     "zyntax-interp-opt": {
-      "seconds": 4.1408292090000005,
-      "compile_ms": 1.659584,
-      "exec_ms": 4139.169625,
+      "seconds": 4.133606083,
+      "compile_ms": 1.605583,
+      "exec_ms": 4132.0005,
       "result": "Int(832040)"
     },
     "zyntax-tiered": {
-      "seconds": 0.0011901670000000002,
-      "compile_ms": 1.1900000000000002,
-      "exec_ms": 0.000167,
+      "seconds": 0.001323124,
+      "compile_ms": 1.3229579999999999,
+      "exec_ms": 0.000166,
       "result": "Int(0)"
     }
   },
   "mandelbrot": {
     "zyntax-interp": {
-      "seconds": 0.007995125,
-      "compile_ms": 4.162917,
-      "exec_ms": 3.832208,
+      "seconds": 0.010083792000000001,
+      "compile_ms": 6.011667,
+      "exec_ms": 4.072125000000001,
       "result": "Int(8279)"
     },
     "zyntax-interp-opt": {
-      "seconds": 0.007721916999999999,
-      "compile_ms": 3.943583,
-      "exec_ms": 3.778334,
+      "seconds": 0.010321832999999999,
+      "compile_ms": 6.204708,
+      "exec_ms": 4.117125,
       "result": "Int(8279)"
     },
     "zyntax-tiered": {
-      "seconds": 0.004046375,
-      "compile_ms": 4.044834,
-      "exec_ms": 0.0015409999999999998,
+      "seconds": 0.010352125,
+      "compile_ms": 10.350417,
+      "exec_ms": 0.001708,
       "result": "Int(0)"
     }
   },
   "nbody": {
     "zyntax-interp": {
-      "seconds": 0.0,
-      "compile_ms": 0.0,
-      "exec_ms": 0.0,
-      "result": "—",
-      "error": "lower: Execution(\"Lowering error: Lowering(\\\"Call to undefined function 'advance'. Declare it as `extern fn advance(...)` if it's host-provided, or define it in scope before this call. (1 known functions, 0 known externs.)\\\")\")"
+      "seconds": 0.031827792,
+      "compile_ms": 22.426917,
+      "exec_ms": 9.400875,
+      "result": "Int(200)"
     },
     "zyntax-interp-opt": {
-      "seconds": 0.0,
-      "compile_ms": 0.0,
-      "exec_ms": 0.0,
-      "result": "—",
-      "error": "lower: Execution(\"Lowering error: Lowering(\\\"Call to undefined function 'advance'. Declare it as `extern fn advance(...)` if it's host-provided, or define it in scope before this call. (1 known functions, 0 known externs.)\\\")\")"
+      "seconds": 0.029282708,
+      "compile_ms": 19.690583,
+      "exec_ms": 9.592125,
+      "result": "Int(200)"
     },
     "zyntax-tiered": {
-      "seconds": 0.0,
-      "compile_ms": 0.0,
-      "exec_ms": 0.0,
-      "result": "—",
-      "error": "lower: Execution(\"Lowering error: Lowering(\\\"Call to undefined function 'advance'. Declare it as `extern fn advance(...)` if it's host-provided, or define it in scope before this call. (1 known functions, 0 known externs.)\\\")\")"
+      "seconds": 0.027081499999999998,
+      "compile_ms": 17.858584,
+      "exec_ms": 9.222916,
+      "result": "Int(200)"
     }
   },
   "meta": {
-    "date": "2026-06-02T11:25:23Z",
-    "commit": "bf629bc",
+    "date": "2026-06-02T13:18:05Z",
+    "commit": "035b5bb",
     "arch": "aarch64",
     "os": "macos",
     "runs": 9

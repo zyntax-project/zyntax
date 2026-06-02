@@ -98,16 +98,7 @@ fn mandelbrot_bisect() {
     bisect(MANDEL, "mandelbrot");
 }
 
-// `bench_nbody.zynml` is currently in a partial-fix state — the
-// array-of-bodies rewrite (the version the public bench page wants)
-// exposes a layered set of type-propagation and index-assignment
-// bugs in the SSA lowering that aren't all resolved yet. The slice
-// harness `nbody_slice_bisect.rs` tracks the progression and the
-// public runner gracefully skips nbody when it fails. Once the
-// rewrite runs end-to-end through the BC interp, flip this back to
-// `#[test]`.
 #[test]
-#[ignore = "nbody kernel rewrite (array-of-bodies) is mid-fix; see nbody_slice_bisect.rs"]
 fn nbody_bisect() {
     bisect(NBODY, "nbody");
 }
