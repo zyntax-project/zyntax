@@ -5848,6 +5848,122 @@ impl SsaBuilder {
         for (block, var) in incomplete {
             self.fill_incomplete_phi(block, var);
         }
+        // Conservative phi-type fix-up: when a phi result is typed
+        // I64 (the `var_types[var].unwrap_or(I64)` fallback hit
+        // because the let-binding lived inside the loop body and
+        // hadn't been registered yet at IDF placement time) AND
+        // every non-Undef incoming value is uniformly some other
+        // primitive type T, promote the phi result to T. Skips
+        // phis whose recorded type was *not* I64 — async state-
+        // machine generation deliberately sets phi types from its
+        // own analysis and they must not be overwritten or the SM
+        // frame layout shifts (the AsyncSaveSlot / AsyncLoadSlot
+        // offsets are computed against the recorded phi types).
+        self.fix_fallback_phi_types();
+    }
+
+    fn fix_fallback_phi_types(&mut self) {
+        let phi_locations: Vec<(HirId, HirId)> = self
+            .function
+            .blocks
+            .iter()
+            .flat_map(|(bid, b)| b.phis.iter().map(move |p| (*bid, p.result)))
+            .collect();
+        for _ in 0..8 {
+            let mut changed = false;
+            for (bid, phi_result) in &phi_locations {
+                let (current_ty, incoming_vals) = {
+                    let block = match self.function.blocks.get(bid) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    let phi = match block.phis.iter().find(|p| p.result == *phi_result) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    (
+                        phi.ty.clone(),
+                        phi.incoming.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+                    )
+                };
+                // Only touch phis still at the I64 fallback.
+                if !matches!(current_ty, HirType::I64) {
+                    continue;
+                }
+                // Find the common type across non-Undef incomings.
+                let mut common: Option<HirType> = None;
+                let mut any_undef = false;
+                let mut bail = false;
+                for v in &incoming_vals {
+                    if *v == *phi_result {
+                        // Self-edge — ignore for type derivation.
+                        continue;
+                    }
+                    let value = match self.function.values.get(v) {
+                        Some(v) => v,
+                        None => {
+                            bail = true;
+                            break;
+                        }
+                    };
+                    if matches!(value.kind, HirValueKind::Undef) {
+                        any_undef = true;
+                        continue;
+                    }
+                    match &common {
+                        None => common = Some(value.ty.clone()),
+                        Some(existing) if existing == &value.ty => {}
+                        Some(_) => {
+                            // Mixed types — leave the phi alone.
+                            bail = true;
+                            break;
+                        }
+                    }
+                }
+                if bail {
+                    continue;
+                }
+                let new_ty = match common {
+                    Some(t) if t != current_ty => t,
+                    _ => continue,
+                };
+                if matches!(new_ty, HirType::Void) {
+                    continue;
+                }
+                // Update phi and value entries.
+                if let Some(block) = self.function.blocks.get_mut(bid) {
+                    if let Some(phi) = block.phis.iter_mut().find(|p| p.result == *phi_result) {
+                        phi.ty = new_ty.clone();
+                    }
+                }
+                if let Some(v) = self.function.values.get_mut(phi_result) {
+                    v.ty = new_ty.clone();
+                }
+                // Promote any I64 Undef incoming so the Cranelift
+                // jump's arg type matches the (now-correct) block-
+                // param type. Only touches Undef values — non-Undef
+                // operands keep their original types.
+                if any_undef {
+                    for v in &incoming_vals {
+                        let needs = self
+                            .function
+                            .values
+                            .get(v)
+                            .map(|val| matches!(val.kind, HirValueKind::Undef))
+                            .unwrap_or(false);
+                        if needs {
+                            if let Some(val) = self.function.values.get_mut(v) {
+                                val.ty = new_ty.clone();
+                            }
+                        }
+                    }
+                }
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     /// Iteratively re-derive phi result types from their
