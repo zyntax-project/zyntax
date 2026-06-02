@@ -265,8 +265,14 @@ fn bench_runtime() -> Result<ZyntaxRuntime, String> {
 fn jit_tier_config(install_llvm: bool) -> TieredConfig {
     let mut cfg = TieredConfig::default();
     cfg.profile_config = ProfileConfig {
-        warm_threshold: 1,
-        hot_threshold: if install_llvm { 5 } else { u32::MAX as u64 },
+        // `warm_threshold = 0` fires the Cranelift dispatch on the
+        // very first invocation. Without it, beadie's `on_invoke`
+        // returns `None` for the first call regardless of the
+        // pre-compiled function pointer being ready, and the BC
+        // interp runs the whole entry function — at rayzor-scale
+        // mandelbrot that's 30 + minutes per warmup iteration.
+        warm_threshold: 0,
+        hot_threshold: if install_llvm { 1 } else { u32::MAX as u64 },
         ..ProfileConfig::default()
     };
     cfg
