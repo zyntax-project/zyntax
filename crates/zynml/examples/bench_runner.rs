@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +53,14 @@ const RUNS: usize = 9;
 /// background Cranelift compile finishes before measurement
 /// starts. Uses a low warm-threshold ([`jit_tier_config`]), so 16
 /// calls is comfortably above the trigger point.
-const JIT_TIER_WARMUP_CALLS: usize = 16;
+// Warm enough to drive the bead past the warm threshold (1 in
+// `jit_tier_config`) and let the background Cranelift compile
+// finalise. Four calls covers both — going higher used to be a
+// safety margin when the threshold was higher, but at warm=1 it
+// just pays the BC-interp cost for the heavy kernels (rayzor-scale
+// mandelbrot is ~720 ms per call, nbody is ~16 s) before the timed
+// iteration even starts.
+const JIT_TIER_WARMUP_CALLS: usize = 4;
 
 /// One (kernel, target) measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,16 +224,28 @@ struct Target {
 /// `lower_typed_program` walks imports through the registered
 /// grammar, so without `register_grammar` the resolver is loaded
 /// but never invoked.
+// `LanguageGrammar::compile_zyn` parses + lowers the entire .zyn
+// grammar source (rule AST, action AST, Grammar2 internal IR).
+// That's ~600 ms on a desktop CPU — fine when ZynML's CLI does it
+// once at startup, ruinous when the bench harness runs
+// `bench_runtime()` twice per kernel iteration (once for the
+// lowering rt, once for the compile/runtime rt). Cache the result.
+static SHARED_LANG_GRAMMAR: OnceLock<Result<zyntax_embed::LanguageGrammar, String>> =
+    OnceLock::new();
+
 fn bench_runtime() -> Result<ZyntaxRuntime, String> {
-    use zyntax_embed::LanguageGrammar;
     let mut rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
     rt.add_import_resolver(Box::new(|module_name| match module_name {
         "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
         "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
         _ => Ok(None),
     }));
-    let lang_grammar =
-        LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).map_err(|e| format!("compile_zyn: {e:?}"))?;
+    let lang_grammar = SHARED_LANG_GRAMMAR
+        .get_or_init(|| {
+            use zyntax_embed::LanguageGrammar;
+            LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).map_err(|e| format!("compile_zyn: {e:?}"))
+        })
+        .clone()?;
     rt.register_grammar("zynml", lang_grammar);
     Ok(rt)
 }
