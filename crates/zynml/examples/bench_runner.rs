@@ -39,17 +39,27 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use zynml::{Grammar2, ZYNML_GRAMMAR};
+use zyntax_compiler::profiling::ProfileConfig;
+use zyntax_compiler::tiered_backend::TieredConfig;
 use zyntax_compiler::{run_interp_safe_opts, HirModule};
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
 const WARMUP: usize = 3;
 const RUNS: usize = 9;
 
+/// Extra in-loop warmup calls reserved for JIT targets — drives
+/// beadie's `TieredAdapter` past the warm-threshold so the
+/// background Cranelift compile finishes before measurement
+/// starts. Uses a low warm-threshold ([`jit_tier_config`]), so 16
+/// calls is comfortably above the trigger point.
+const JIT_TIER_WARMUP_CALLS: usize = 16;
+
 /// One (kernel, target) measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TargetResult {
     /// Median wall-clock time of `RUNS` measurement iterations,
     /// expressed in seconds — the unit the static page renders.
+    /// Zero when [`Self::error`] is set.
     seconds: f64,
     /// Median compile-only time (parse + lower + opt). Useful for
     /// pulling apart compile cost from execute cost in charts.
@@ -60,7 +70,15 @@ struct TargetResult {
     /// The value `main` returned, formatted via `Debug`. Tracking
     /// it pins correctness across runs — a future opt pass that
     /// silently changes the bench result fails the workflow loudly.
+    /// `"—"` when [`Self::error`] is set.
     result: String,
+    /// When the kernel fails to compile or execute on this target,
+    /// the error message goes here and the timings are zeroed. The
+    /// page renders these as a red "FAILED" badge instead of a
+    /// chart bar — the suite is explicit about which tier each
+    /// kernel breaks on, rather than silently dropping the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Per-kernel collection of target results.
@@ -100,15 +118,7 @@ struct Meta {
 /// Each benchmark source lives at
 /// `crates/zynml/examples/<name>.zynml` and gets run across every
 /// target listed in [`TARGETS`].
-///
-/// `bench_fib` is intentionally absent from the public suite right
-/// now: its result diverges between `zyntax-interp` (buggy doubling
-/// from a phi-rewrite issue in the SSA lowering of mutable locals
-/// inside a `while` loop) and `zyntax-interp-opt` (correct fib(46),
-/// because one of the opt passes happens to canonicalise the bad
-/// SSA shape). The kernel source still lives in `examples/` so the
-/// `bench_fib_probe` regression test can lock in the eventual fix.
-const KERNELS: &[&str] = &["bench_mandelbrot", "bench_nbody"];
+const KERNELS: &[&str] = &["bench_mandelbrot", "bench_nbody", "bench_fib"];
 
 /// Each target produces one [`TargetResult`] per kernel.
 const TARGETS: &[Target] = &[
@@ -116,11 +126,19 @@ const TARGETS: &[Target] = &[
         key: "zyntax-interp",
         label: "Zyntax · BC interp",
         run_with_opts: false,
+        install_jit: false,
     },
     Target {
         key: "zyntax-interp-opt",
         label: "Zyntax · BC interp + opt",
         run_with_opts: true,
+        install_jit: false,
+    },
+    Target {
+        key: "zyntax-tiered",
+        label: "Zyntax · BC interp → Cranelift tier-up",
+        run_with_opts: true,
+        install_jit: true,
     },
 ];
 
@@ -138,6 +156,26 @@ struct Target {
     /// vs `true`) gives the page a direct opt-pipeline payoff
     /// comparison per kernel.
     run_with_opts: bool,
+    /// Install the BC interp → Cranelift JIT tier ladder for this
+    /// target. Setup goes into `compile_ms`; warmup drives the
+    /// async compile to completion before timed iterations start
+    /// dispatching through the JIT'd code.
+    install_jit: bool,
+}
+
+/// Custom `TieredConfig` for the JIT target — warm-threshold of 1
+/// so the very first interpreter tick schedules the Cranelift
+/// compile. Without this, the default warm-threshold (100) would
+/// require hundreds of warmup iterations to trigger tier-up; we
+/// can't reasonably afford that per timed measurement.
+fn jit_tier_config() -> TieredConfig {
+    let mut cfg = TieredConfig::default();
+    cfg.profile_config = ProfileConfig {
+        warm_threshold: 1,
+        hot_threshold: 5,
+        ..ProfileConfig::default()
+    };
+    cfg
 }
 
 fn main() {
@@ -192,14 +230,18 @@ fn main() {
         let mut per_kernel: KernelResults = BTreeMap::new();
         for target in TARGETS {
             let r = measure(&source, target, runs);
-            eprintln!(
-                "    {:<22} compile={:>7.2}ms exec={:>9.2}ms total={:>9.2}ms  -> {}",
-                target.key,
-                r.compile_ms,
-                r.exec_ms,
-                r.seconds * 1000.0,
-                r.result,
-            );
+            if let Some(err) = r.error.as_ref() {
+                eprintln!("    {:<22} FAILED — {err}", target.key);
+            } else {
+                eprintln!(
+                    "    {:<22} compile={:>7.2}ms exec={:>9.2}ms total={:>9.2}ms  -> {}",
+                    target.key,
+                    r.compile_ms,
+                    r.exec_ms,
+                    r.seconds * 1000.0,
+                    r.result,
+                );
+            }
             per_kernel.insert(target.key.to_string(), r);
         }
         suite.kernels.insert(pretty.to_string(), per_kernel);
@@ -217,7 +259,11 @@ fn main() {
 }
 
 /// Parse + lower + (optionally) opt + run, repeated until we have
-/// `runs` timed iterations. Returns medians.
+/// `runs` timed iterations. Returns medians. If any iteration
+/// fails (parse error, compile error, runtime panic, etc.) the
+/// returned result has its `error` field populated and all
+/// timings zeroed — the suite is honest about which tier broke,
+/// rather than silently dropping the row.
 fn measure(source: &str, target: &Target, runs: usize) -> TargetResult {
     let mut compile_samples = Vec::with_capacity(runs);
     let mut exec_samples = Vec::with_capacity(runs);
@@ -225,15 +271,23 @@ fn measure(source: &str, target: &Target, runs: usize) -> TargetResult {
 
     // Warmup — toss the times, but the runs still mutate caches /
     // allocators / OS-page state so timed iters run on a steady
-    // baseline.
+    // baseline. A failure during warmup short-circuits straight
+    // to the `error` shape; no point spending the runs-loop's
+    // budget on something that's reliably broken.
     for _ in 0..WARMUP {
-        let (_compile, _exec, _r) = one_iteration(source, target);
+        if let Err(e) = one_iteration(source, target) {
+            return failed_result(&e);
+        }
     }
     for _ in 0..runs {
-        let (compile_ms, exec_ms, r) = one_iteration(source, target);
-        compile_samples.push(compile_ms);
-        exec_samples.push(exec_ms);
-        last_result_str = format!("{r:?}");
+        match one_iteration(source, target) {
+            Ok((compile_ms, exec_ms, r)) => {
+                compile_samples.push(compile_ms);
+                exec_samples.push(exec_ms);
+                last_result_str = format!("{r:?}");
+            }
+            Err(e) => return failed_result(&e),
+        }
     }
 
     let median_compile = median(&mut compile_samples);
@@ -243,39 +297,105 @@ fn measure(source: &str, target: &Target, runs: usize) -> TargetResult {
         compile_ms: median_compile,
         exec_ms: median_exec,
         result: last_result_str,
+        error: None,
+    }
+}
+
+fn failed_result(error: &str) -> TargetResult {
+    TargetResult {
+        seconds: 0.0,
+        compile_ms: 0.0,
+        exec_ms: 0.0,
+        result: "—".to_string(),
+        error: Some(error.to_string()),
     }
 }
 
 /// One full kernel run: lower from source, optionally apply the
-/// HIR opt pipeline, install into a fresh runtime, call `main`.
-/// Returns `(compile_ms, exec_ms, result)`.
-fn one_iteration(source: &str, target: &Target) -> (f64, f64, ZyntaxValue) {
-    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
+/// HIR opt pipeline, install into a fresh runtime, drive the JIT
+/// tier-up if requested, then call `main`. Returns
+/// `(compile_ms, exec_ms, result)`.
+///
+/// `compile_ms` is always the **cold-path setup**: parse + lower
+/// + optional HIR opts + `compile_module` + (for the tiered
+/// target) `install_interp_jit_with`. Tiered mode cold-starts
+/// with the BC interpreter, so its compile cost should look
+/// almost identical to the interp targets — the only delta is
+/// the tier-ladder install itself, which is cheap. The expensive
+/// part (the asynchronous Cranelift compile that beadie's
+/// `TieredAdapter` schedules) happens during the *warmup* calls
+/// below, NOT during `compile_ms`.
+///
+/// `exec_ms` is the single timed `main()` call. For the tiered
+/// target, warmup runs untimed before the measurement so that
+/// call dispatches through the JIT'd code rather than the cold
+/// BC interp loop. For non-JIT targets there's no warmup — the
+/// timed call IS the cold first call.
+fn one_iteration(source: &str, target: &Target) -> Result<(f64, f64, ZyntaxValue), String> {
+    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).map_err(|e| format!("grammar: {e:?}"))?;
 
     let compile_start = Instant::now();
     let program = grammar
         .parse_with_filename(source, "<bench>")
-        .expect("parse");
-    let rt = ZyntaxRuntime::new().expect("rt");
+        .map_err(|e| format!("parse: {e:?}"))?;
+    let rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
     let builtins = rt
         .config()
         .builtins
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let mut module: HirModule = rt.lower_typed_program(program, builtins).expect("lower");
+    let mut module: HirModule = rt
+        .lower_typed_program(program, builtins)
+        .map_err(|e| format!("lower: {e:?}"))?;
     if target.run_with_opts {
         let _ = run_interp_safe_opts(&mut module);
     }
-    let mut rt = ZyntaxRuntime::new().expect("rt");
-    rt.compile_module(&module).expect("compile");
+    let mut rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
+    rt.compile_module(&module)
+        .map_err(|e| format!("compile_module: {e:?}"))?;
+    if target.install_jit {
+        rt.install_interp_jit_with(jit_tier_config())
+            .map_err(|e| format!("install_interp_jit: {e:?}"))?;
+    }
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
 
+    if target.install_jit {
+        // Warm beadie's `TieredAdapter` past the threshold so the
+        // background Cranelift compile finishes and subsequent
+        // interp ticks dispatch to the JIT'd code. Run *untimed*
+        // — this isn't compile cost (the compile already
+        // happened above, only the install was synchronous), and
+        // it isn't part of the steady-state exec we want to
+        // measure either. The cost of getting to steady state is
+        // a separate axis the page doesn't currently report.
+        for _ in 0..JIT_TIER_WARMUP_CALLS {
+            rt.call_function_raw("main", vec![])
+                .map_err(|e| format!("jit warmup: {e:?}"))?;
+        }
+    }
+
+    // Wrap the timed call in `catch_unwind` so a panic inside the
+    // Cranelift backend (a known failure mode for some HIR shapes)
+    // surfaces as an `error` row on the bench page rather than
+    // aborting the whole suite.
     let exec_start = Instant::now();
-    let result = rt.call_function_raw("main", vec![]).expect("call main");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.call_function_raw("main", vec![])
+    }))
+    .map_err(|p| {
+        if let Some(s) = p.downcast_ref::<&str>() {
+            format!("panic: {s}")
+        } else if let Some(s) = p.downcast_ref::<String>() {
+            format!("panic: {s}")
+        } else {
+            "panic: <opaque>".to_string()
+        }
+    })?
+    .map_err(|e| format!("call: {e:?}"))?;
     let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
-    (compile_ms, exec_ms, result)
+    Ok((compile_ms, exec_ms, result))
 }
 
 fn median(samples: &mut [f64]) -> f64 {

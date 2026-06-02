@@ -1,45 +1,23 @@
-// Fibonacci bench — iterative integer Fibonacci with a synthetic
-// outer iteration count so a single run takes long enough to
-// dominate the runner's compile/install overhead. Pure i64
-// arithmetic + a single-block `while` loop; exercises the
-// const-fold + cse + cfg_simplify pipeline rather than the
-// memory-management passes.
+// Fibonacci bench — naive recursive Fibonacci, the classic
+// function-call-overhead microbenchmark from the Computer
+// Language Benchmarks Game lineage (used by wren_lift, rayzor,
+// and the original `wren` repo too).
 //
-// Iterative (not recursive) on purpose — ZynML's current SSA
-// lowering of recursion is fine but the function-call path is
-// expensive in the BC interpreter, so a deep recursion would
-// measure call-dispatch cost more than arithmetic. Iterative
-// matches the shape `rayzor` and `wren_lift` use in their
-// `fib` micro-benchmark too.
+// `fib(n)` makes `O(φⁿ)` calls — roughly 4.7 million calls for
+// `fib(30)`. That's the point: the bench measures function-call
+// dispatch and return overhead, not arithmetic. If the dispatch
+// is fast, the number drops; if it's slow, the number goes up
+// and we know where to look.
+//
+// Returns `fib(30)` = 832040.
+
+def fib(n: i64): i64 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
 
 def main(): i64 {
-    let mut iter: i64 = 0
-    let mut last: i64 = 0
-    while iter < 500 {
-        let mut a: i64 = 0
-        let mut b: i64 = 1
-        let mut i: i64 = 0
-        while i < 45 {
-            // Swap-via-temporary written longhand because
-            //   let t = a + b
-            //   a = b
-            //   b = t
-            // currently mis-lowers in the BC interpreter: the SSA
-            // phi merge at the inner-loop header sees `a` get the
-            // post-iter value of `b` *before* `t = a + b` is
-            // evaluated, so the recurrence collapses to doubling
-            // (`b ← 2·b`) instead of Fibonacci. Holding the
-            // pre-update values in two scratch SSA names sidesteps
-            // the issue by making each iteration's reads happen
-            // before any writes touch the named mutables.
-            let prev_a = a
-            let prev_b = b
-            a = prev_b
-            b = prev_a + prev_b
-            i = i + 1
-        }
-        last = b
-        iter = iter + 1
-    }
-    return last
+    return fib(30)
 }

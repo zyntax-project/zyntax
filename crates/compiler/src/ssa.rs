@@ -1771,7 +1771,22 @@ impl SsaBuilder {
                     // If let binding has no annotation (Type::Any/Unknown), resolve
                     // the actual type from the initializer expression so subsequent
                     // field access can find the struct type.
-                    let effective_ty = if matches!(let_stmt.ty, Type::Any | Type::Unknown) {
+                    // Re-resolve when the let's annotation is Any/Unknown
+                    // OR when it's an Array literal whose element_type
+                    // is itself Any/Unknown (the parser builds these
+                    // from the first element's `expr.ty`, which is Any
+                    // for Variable elements — see
+                    // `runtime2/interpreter.rs::construct_expression`).
+                    // Without this `let bodies = [a]` ships
+                    // `Array<Any>` and every `bodies[i].x` later loses
+                    // type information.
+                    let needs_resolve = matches!(let_stmt.ty, Type::Any | Type::Unknown)
+                        || matches!(
+                            &let_stmt.ty,
+                            Type::Array { element_type, .. }
+                                if matches!(**element_type, Type::Any | Type::Unknown)
+                        );
+                    let effective_ty = if needs_resolve {
                         self.resolve_expr_type(value)
                     } else {
                         let_stmt.ty.clone()
@@ -4260,7 +4275,26 @@ impl SsaBuilder {
                 let object_val = self.translate_expression(block_id, object)?;
                 let index_val = self.translate_expression(block_id, index)?;
 
-                let elem_hir_ty = self.convert_type(&expr.ty);
+                // The grammar layer assigns `Type::Unknown` to every
+                // Index expression (see
+                // `runtime2/interpreter.rs::construct_expression`),
+                // so `expr.ty` is rarely the actual element type.
+                // Fall back to the resolved element type derived from
+                // the object's type — the same chain the let-binding
+                // and array-literal lowering use. Without this, the
+                // load below picks up `HirType::I64` from
+                // `convert_type(Type::Unknown)` and the Load reads
+                // the wrong width.
+                let mut elem_hir_ty = self.convert_type(&expr.ty);
+                if matches!(elem_hir_ty, HirType::I64 | HirType::Void)
+                    && matches!(&expr.ty, Type::Any | Type::Unknown | Type::Primitive(_))
+                {
+                    let resolved_elem = self.resolve_expr_type(expr);
+                    let resolved_hir = self.convert_type(&resolved_elem);
+                    if !matches!(resolved_hir, HirType::Void) {
+                        elem_hir_ty = resolved_hir;
+                    }
+                }
 
                 // For `List<T>` indexing, `object_val` is a pointer to a
                 // `List<T>` struct `{ i64 data, i64 len, i64 cap }` (built by
@@ -4597,10 +4631,36 @@ impl SsaBuilder {
                 // Lower array literal as List<T> struct: { data: i64 (ptr), len: i64, capacity: i64 }
                 // This matches the List<T> struct definition in prelude.zynml and allows
                 // field access (shape.data, shape.len) via extractvalue to work correctly.
-                let elem_ty = if let Type::Array { element_type, .. } = &expr.ty {
-                    self.convert_type(element_type)
+                //
+                // Pull the element type from `expr.ty` when the parser
+                // managed to fill it in. If not (the typed-AST hands us
+                // `Array { element_type: Any, .. }` for any literal whose
+                // first element is a Variable expression, because
+                // `construct_expression` defaults Variable to `Type::Any`),
+                // re-resolve through the first element via the same
+                // `resolve_expr_type` walk the let-binding uses. Without
+                // this the alloca below is `[i64; n]` regardless of the
+                // actual element type, and storing `Body` struct values
+                // into i64 slots produces a verifier panic in Cranelift.
+                let resolved_elem_ty = match &expr.ty {
+                    Type::Array { element_type, .. }
+                        if !matches!(**element_type, Type::Any | Type::Unknown) =>
+                    {
+                        (**element_type).clone()
+                    }
+                    _ => {
+                        if let Some(first) = elements.first() {
+                            self.resolve_expr_type(first)
+                        } else {
+                            Type::Any
+                        }
+                    }
+                };
+                let elem_ty = self.convert_type(&resolved_elem_ty);
+                let elem_ty = if matches!(elem_ty, HirType::Void) {
+                    HirType::I64
                 } else {
-                    HirType::I64 // Fallback
+                    elem_ty
                 };
 
                 // Calculate element size based on type
@@ -7147,8 +7207,16 @@ impl SsaBuilder {
     ) -> Type {
         use zyntax_typed_ast::typed_ast::TypedExpression;
 
-        // If the parser already gave us a real type, use it
-        if !matches!(node.ty, Type::Any | Type::Unknown) {
+        // If the parser already gave us a real type, use it — but
+        // an `Array { element_type: Any|Unknown }` isn't a "real"
+        // type for our purposes; the per-variant code below
+        // re-resolves the element type from the actual elements.
+        let array_with_unknown_elem = matches!(
+            &node.ty,
+            Type::Array { element_type, .. }
+                if matches!(**element_type, Type::Any | Type::Unknown)
+        );
+        if !matches!(node.ty, Type::Any | Type::Unknown) && !array_with_unknown_elem {
             return node.ty.clone();
         }
 
@@ -7170,6 +7238,59 @@ impl SsaBuilder {
                     }
                 }
                 node.ty.clone()
+            }
+            TypedExpression::Index(index_expr) => {
+                // `xs[i]` produces an element of `xs`. The typed-AST
+                // construction at the grammar layer leaves `expr.ty`
+                // as `Unit` for the index expression (no special-case
+                // in `construct_expression`), so resolve from the
+                // object type here:
+                //   * `Type::Array { element_type, .. }` → element_type
+                //   * `Type::Named { id, type_args }` where the
+                //     registry name is "Array" or "List" → first
+                //     type argument
+                // Without this, `bodies[i].x` later trips
+                // `resolve_expr_type` on Type::Unit which fails the
+                // `Type::Named` match-arm in field-access lookup with
+                // "Cannot access fields on non-struct type" — and the
+                // whole function gets silently dropped by the
+                // analysis-error swallow in `lower_declaration`.
+                let object_ty = self.resolve_expr_type(&index_expr.object);
+                match &object_ty {
+                    Type::Array { element_type, .. }
+                        if !matches!(**element_type, Type::Any | Type::Unknown) =>
+                    {
+                        (**element_type).clone()
+                    }
+                    Type::Named { id, type_args, .. } => {
+                        let is_listlike = self
+                            .type_registry
+                            .get_type_by_id(*id)
+                            .and_then(|td| td.name.resolve_global())
+                            .map(|n| n == "Array" || n == "List")
+                            .unwrap_or(false);
+                        if is_listlike && !type_args.is_empty() {
+                            type_args[0].clone()
+                        } else {
+                            node.ty.clone()
+                        }
+                    }
+                    _ => node.ty.clone(),
+                }
+            }
+            // Array literal `[a, b, c]` — the parser fills `element_type`
+            // from the first element's `expr.ty`, but if the first
+            // element is a Variable expression the parser leaves its
+            // `expr.ty` as `Any`. Re-resolve through the variable's
+            // registered type here so `let bodies = [a]` records
+            // `Array<Body>` (where `a: Body`) rather than `Array<Any>`.
+            TypedExpression::Array(elements) if !elements.is_empty() => {
+                let resolved = self.resolve_expr_type(&elements[0]);
+                Type::Array {
+                    element_type: Box::new(resolved),
+                    size: Some(zyntax_typed_ast::ConstValue::Int(elements.len() as i64)),
+                    nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+                }
             }
             _ => node.ty.clone(),
         }

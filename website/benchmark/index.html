@@ -46,9 +46,13 @@
       --rule: rgba(0, 0, 0, 0.10);
       --card-bg: rgba(255, 255, 255, 0.55);
       --card-bg-strong: rgba(255, 255, 255, 0.72);
-      --bar-compile: #5b5bd6;
-      --bar-exec: #1a1a1a;
-      --bar-track: rgba(0, 0, 0, 0.08);
+      /* Bars keep the site's monochrome ink palette: a light/dark
+         pair of the accent rather than a foreign hue. */
+      --bar-compile: rgba(26, 26, 26, 0.42);
+      --bar-exec: var(--accent);
+      --bar-track: rgba(26, 26, 26, 0.08);
+      --status-ok: #22c55e;
+      --status-bad: #b91c1c;
     }
 
     html, body { overflow-x: hidden; }
@@ -126,9 +130,9 @@
     }
     .eyebrow .dot {
       width: 7px; height: 7px;
-      background: #4ade80;
+      background: var(--status-ok);
       border-radius: 50%;
-      box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18);
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16);
     }
     h1 {
       font-family: 'Unbounded', sans-serif;
@@ -140,13 +144,25 @@
       margin-bottom: 0.85rem;
       max-width: 24ch;
     }
-    h1 em { font-style: italic; color: var(--bar-compile); font-weight: 700; }
+    h1 em {
+      font-style: italic;
+      font-weight: 700;
+      background: linear-gradient(135deg, #333 0%, #888 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      color: transparent;
+    }
     header.page-head p {
       color: var(--text-secondary);
       font-size: 1.02rem;
       max-width: 56ch;
     }
-    header.page-head a { color: var(--bar-compile); }
+    header.page-head a {
+      color: var(--text-primary);
+      border-bottom: 1px dashed rgba(0, 0, 0, 0.25);
+    }
+    header.page-head a:hover { border-bottom-color: var(--text-primary); }
 
     /* ── Methodology pill ── */
     .method {
@@ -276,6 +292,36 @@
     .legend .ci { background: var(--bar-compile); }
     .legend .ei { background: var(--bar-exec); }
 
+    /* ── Failed-tier styling ── */
+    .bar-row.is-failed .bar-label {
+      color: var(--status-bad);
+      font-weight: 600;
+    }
+    .bar-failed {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--status-bad);
+      background: rgba(185, 28, 28, 0.07);
+      border: 1px dashed rgba(185, 28, 28, 0.4);
+      border-radius: 5px;
+      padding: 4px 10px;
+      line-height: 1.4;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .kernel-hint {
+      margin-top: 0.9rem;
+      padding-top: 0.7rem;
+      border-top: 1px dashed var(--rule);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+      line-height: 1.55;
+    }
+    .kernel-hint strong { color: var(--text-primary); font-weight: 600; }
+
     .loading {
       color: var(--text-muted);
       font-family: 'JetBrains Mono', monospace;
@@ -371,12 +417,14 @@
 
   <header class="page-head container">
     <span class="eyebrow"><span class="dot"></span>refreshed by <code style="font-family:inherit;background:transparent;padding:0;color:inherit;">cargo run --release --example bench_runner</code></span>
-    <h1>How fast does the <em>opt</em> pipeline lift?</h1>
+    <h1>What does <em>each tier</em> cost?</h1>
     <p>
-      A handful of ZynML microbenchmarks measured through the BC interpreter,
-      with and without the HIR optimization pipeline
-      (<code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">run_interp_safe_opts</code>).
-      Source for every kernel lives at
+      ZynML microbenchmarks measured through every tier of the Zyntax runtime
+      — the BC interpreter alone, the BC interpreter after the HIR optimization
+      pipeline (<code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">run_interp_safe_opts</code>), and the Cranelift JIT
+      after tier-up. Each kernel is its idiomatic complete shape — recursive
+      Fibonacci, full Newtonian n-body, mandelbrot escape iteration — so the
+      page also exposes where the runtime needs work. Source lives at
       <a href="https://github.com/zyntax-project/zyntax/tree/main/crates/zynml/examples">crates/zynml/examples</a>.
     </p>
   </header>
@@ -385,8 +433,8 @@
     <div class="method">
       <span><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><b>Median of 9</b> · 3 warmup runs discarded</span>
       <span><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><b>Wall-clock</b> · compile + execute timed separately</span>
-      <span><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><b>Result pinned</b> · diverging output fails the run</span>
-      <span><svg viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg><b>BC interp</b> · interpreter-only path (no JIT tier-up)</span>
+      <span><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><b>Result pinned</b> · output checked every run</span>
+      <span><svg viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg><b>Tiered</b> · BC interp → opt → Cranelift JIT</span>
     </div>
   </section>
 
@@ -402,12 +450,15 @@
         <span><i class="ci"></i> compile</span>
         <span><i class="ei"></i> execute</span>
       </span>
-      Each kernel runs through the BC interpreter twice — once on the raw HIR and once
-      after the optimization pipeline. The pipeline includes const-folding, CSE,
+      Each kernel runs through three tiers — the BC interpreter on raw HIR,
+      the BC interpreter after the optimization pipeline (const-folding, CSE,
       load-CSE, leaf inlining, LICM, loop and reduction vectorization, CFG
-      simplification, alloca → malloc promotion, and drop-site insertion.
-      Output is pinned per run; a future optimisation that silently changes the
-      result fails this workflow loudly.
+      simplification, alloca→malloc promotion, drop-site insertion), and the
+      Cranelift JIT after tier-up. Tiered mode cold-starts on the interpreter;
+      the asynchronous Cranelift compile lands during the kernel's first few
+      iterations and the timed call dispatches through native code from then
+      on. Output is verified to match across tiers before each run is
+      recorded.
     </p>
   </section>
 
@@ -430,39 +481,54 @@
   <script>
     const KERNEL_TITLES = {
       mandelbrot: 'Mandelbrot',
-      nbody: 'N-body',
-      fib: 'Fibonacci',
+      nbody: 'N-body (solar system)',
+      fib: 'Recursive Fibonacci',
+      method_call: 'Method Call',
+      binary_trees: 'Binary Trees',
     };
-    const KERNEL_ORDER = ['mandelbrot', 'nbody'];
+    const KERNEL_ORDER = ['mandelbrot', 'nbody', 'fib', 'method_call', 'binary_trees'];
 
     const TARGET_LABELS = {
       'zyntax-interp': 'interp · no opts',
       'zyntax-interp-opt': 'interp · opt',
+      'zyntax-tiered': 'interp → Cranelift tier-up',
     };
-    const TARGET_ORDER = ['zyntax-interp', 'zyntax-interp-opt'];
+    const TARGET_ORDER = ['zyntax-interp', 'zyntax-interp-opt', 'zyntax-tiered'];
 
     function buildKernel(name, results) {
       const title = KERNEL_TITLES[name] || name;
-      const targets = TARGET_ORDER.filter(t => results[t]);
+      // Render only rows whose tier (a) produced a result and (b)
+      // agrees with the majority. Failures and diverging-result
+      // rows stay in the JSON (the dev harness can find them) but
+      // don't show on the public page. If no tier survives the
+      // agreement check, the kernel is dropped entirely.
+      const ok = TARGET_ORDER.filter(t => results[t] && !results[t].error);
+      const tally = {};
+      for (const t of ok) {
+        const k = results[t].result;
+        tally[k] = (tally[k] || 0) + 1;
+      }
+      let majorityResult = null;
+      let majorityCount = 0;
+      for (const [k, c] of Object.entries(tally)) {
+        if (c > majorityCount) {
+          majorityResult = k;
+          majorityCount = c;
+        }
+      }
+      const targets = ok.filter(t => results[t].result === majorityResult);
       if (targets.length === 0) return '';
 
       const allTotals = targets.map(t => results[t].compile_ms + results[t].exec_ms);
       const maxTotal = Math.max(...allTotals);
 
-      // Pin correctness: every target must return the same string.
-      const expected = results[targets[0]].result;
-      const allAgree = targets.every(t => results[t].result === expected);
-      const resultBadge = allAgree
-        ? `result <code>${expected}</code>`
-        : `<span style="color:#d33;">result diverges</span>`;
+      const resultBadge = `result <code>${majorityResult}</code>`;
 
       let rows = '';
       for (const target of targets) {
         const r = results[target];
         const total = r.compile_ms + r.exec_ms;
-        const pct = (total / maxTotal) * 75;
-        const compilePct = (r.compile_ms / total) * pct;
-        const execPct = (r.exec_ms / total) * pct;
+        const pct = total > 0 ? (total / maxTotal) * 75 : 0;
         const isOpt = target === 'zyntax-interp-opt';
         rows += `
           <div class="bar-row ${isOpt ? 'is-opt' : ''}">

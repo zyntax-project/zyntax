@@ -899,6 +899,25 @@ impl<'g> GrammarInterpreter<'g> {
             // local reads back zero / the default of whatever the
             // load coerces to).
             TypedExpression::If(if_expr) => if_expr.then_branch.ty.clone(),
+            // Array literal `[a, b, c]` — element type from the first
+            // element, size from the count. Without this the array's
+            // `expr.ty` defaults to `Unit`, which then poisons every
+            // downstream `let xs = [...]` binding so that `xs[i]`
+            // can't infer its element type and silently kills the
+            // whole function during SSA lowering ("Cannot access
+            // fields on non-struct type: Unknown"). For an empty
+            // literal the element type is unknown; keep Unit there
+            // since the call site needs a concrete annotation anyway.
+            TypedExpression::Array(elements) if !elements.is_empty() => Type::Array {
+                element_type: Box::new(elements[0].ty.clone()),
+                size: Some(zyntax_typed_ast::ConstValue::Int(elements.len() as i64)),
+                nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+            },
+            // Index expression `xs[i]` — drop in a placeholder type
+            // here so subsequent let-bindings call into
+            // `resolve_expr_type` (in the SSA lowering) which knows
+            // how to walk `Array<T>` / `List<T>` back to `T`.
+            TypedExpression::Index(_) => Type::Unknown,
             _ => Type::Primitive(PrimitiveType::Unit),
         };
 

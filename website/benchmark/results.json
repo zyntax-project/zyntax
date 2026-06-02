@@ -1,35 +1,70 @@
 {
+  "fib": {
+    "zyntax-interp": {
+      "seconds": 4.013447458,
+      "compile_ms": 1.564875,
+      "exec_ms": 4011.882583,
+      "result": "Int(832040)"
+    },
+    "zyntax-interp-opt": {
+      "seconds": 4.020157917000001,
+      "compile_ms": 1.5885829999999999,
+      "exec_ms": 4018.5693340000003,
+      "result": "Int(832040)"
+    },
+    "zyntax-tiered": {
+      "seconds": 0.00124525,
+      "compile_ms": 1.245083,
+      "exec_ms": 0.000167,
+      "result": "Int(0)"
+    }
+  },
   "mandelbrot": {
     "zyntax-interp": {
-      "seconds": 0.00868325,
-      "compile_ms": 4.664375,
-      "exec_ms": 4.0188749999999995,
+      "seconds": 0.008894167,
+      "compile_ms": 4.835208,
+      "exec_ms": 4.058959,
       "result": "Int(8279)"
     },
     "zyntax-interp-opt": {
-      "seconds": 0.008062875,
-      "compile_ms": 4.262125,
-      "exec_ms": 3.80075,
+      "seconds": 0.008412916000000001,
+      "compile_ms": 4.413916,
+      "exec_ms": 3.999,
       "result": "Int(8279)"
+    },
+    "zyntax-tiered": {
+      "seconds": 0.004571542,
+      "compile_ms": 4.569959,
+      "exec_ms": 0.001583,
+      "result": "Int(0)"
     }
   },
   "nbody": {
     "zyntax-interp": {
-      "seconds": 0.005653459,
-      "compile_ms": 5.361292,
-      "exec_ms": 0.292167,
-      "result": "Int(100)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "error": "call: Execution(\"interp dispatch failed: unknown function 'main'\")"
     },
     "zyntax-interp-opt": {
-      "seconds": 0.005676875,
-      "compile_ms": 5.406083,
-      "exec_ms": 0.27079200000000003,
-      "result": "Int(100)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "error": "call: Execution(\"interp dispatch failed: unknown function 'main'\")"
+    },
+    "zyntax-tiered": {
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "error": "jit warmup: Execution(\"interp dispatch failed: unknown function 'main'\")"
     }
   },
   "meta": {
-    "date": "2026-06-02T09:40:54Z",
-    "commit": "9bc97fa",
+    "date": "2026-06-02T10:53:37Z",
+    "commit": "a4a6e6a",
     "arch": "aarch64",
     "os": "macos",
     "runs": 9
