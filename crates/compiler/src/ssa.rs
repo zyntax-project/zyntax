@@ -4914,15 +4914,20 @@ impl SsaBuilder {
 
             TypedExpression::Cast(cast) => {
                 let operand_val = self.translate_expression(block_id, &cast.expr)?;
-                // The parser emits Variable expressions with
-                // `Type::Any` / `Type::Unknown`, which would collapse
-                // to `HirType::I64` in `convert_type` and force
-                // `select_cast_op` to pick `Bitcast` instead of the
-                // intended FpToSi / SiToFp. Resolve through the
-                // variable-type table first so int↔float casts get
-                // the right op.
-                let resolved_source = self.resolve_expr_type(&cast.expr);
-                let source_ty = self.convert_type(&resolved_source);
+                // The parser leaves Variable / Binary / etc.
+                // expression types as `Type::Any` / `Type::Unknown`,
+                // which would collapse to `HirType::I64` in
+                // `convert_type` and force `select_cast_op` to pick
+                // `Bitcast` instead of the intended FpToSi / SiToFp.
+                // Use the actual HIR type of the just-translated
+                // operand HirValue — that's authoritative regardless
+                // of what the typed-AST node claims.
+                let source_ty = self
+                    .function
+                    .values
+                    .get(&operand_val)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or_else(|| self.convert_type(&self.resolve_expr_type(&cast.expr)));
                 let target_ty = self.convert_type(&cast.target_type);
                 let result = self.create_value(target_ty.clone(), HirValueKind::Instruction);
                 let cast_op = self.select_cast_op(&source_ty, &target_ty);
