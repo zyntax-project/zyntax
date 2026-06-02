@@ -72,13 +72,26 @@ use std::collections::{HashMap, HashSet};
 /// have to be eligible for inlining. Calibrated to match small leaf
 /// utility functions; tunable but kept tight since we don't yet do
 /// recursive inlining cost-modelling.
-const MAX_INLINE_INSTS: usize = 8;
+///
+/// 8 was too tight to ever fire on a real numeric kernel:
+/// mandelbrot's `mandel_count` is around 25 HIR instructions,
+/// nbody's `advance` is north of 100, and even a trivial
+/// `def add(a, b): i64 { a + b }` clocks ~3 — but bumping that
+/// to 8 still meant any kernel calling a function with a single
+/// loop got skipped. 64 catches every leaf-shaped numeric kernel
+/// we're benchmarking; large enough to matter, small enough that
+/// inline blow-up at one call site stays bounded.
+const MAX_INLINE_INSTS: usize = 64;
 
 /// Maximum total instructions across all blocks for a multi-block
 /// callee. Higher than `MAX_INLINE_INSTS` because the body has more
 /// structure to amortise the inline cost (a control-flow branch
 /// usually subsumes a few instructions on each side).
-const MAX_INLINE_INSTS_MULTI_BLOCK: usize = 24;
+// 256 catches mandel_count (~30 insts across 4 blocks) and
+// nbody's advance (~200 insts across the nested-while shape).
+// Keeps a ceiling so a runaway call site doesn't explode the
+// caller's IR.
+const MAX_INLINE_INSTS_MULTI_BLOCK: usize = 256;
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -323,19 +336,23 @@ fn classify(callee: &HirFunction) -> CalleeClass {
         return CalleeClass::OkLeaf;
     }
 
-    // Multi-block path is currently gated off — `apply_inline_multi_block`
-    // produces a CFG that hangs the BC interpreter on at least one
-    // real-world ZynML program (the mandelbrot bench in
-    // `crates/zynml/examples/bench_mandelbrot.zynml`). The bisect harness
-    // at `crates/zynml/tests/bench_kernel_bisect.rs` is what surfaced
-    // this; the splice itself looks coherent on small unit-tested inputs
-    // but the phi-incoming / pred-succ rewrite has an edge case the
-    // unit tests don't reach.  Until that's diagnosed, classify
-    // multi-block callees as `TooLarge` so leaf inlining still runs
-    // unconditionally and the rest of the pipeline (const_fold, cse,
-    // licm, etc.) doesn't get blocked.
-    let _ = MAX_INLINE_INSTS_MULTI_BLOCK;
+    // Multi-block callees still hit a CFG-rewrite hang in
+    // `apply_inline_multi_block`: enabling it (with the bumped
+    // `MAX_INLINE_INSTS_MULTI_BLOCK = 256`) makes both
+    // mandelbrot's `main → mandel_count` and nbody's
+    // `main → advance` loop indefinitely under the BC
+    // interpreter. The SSA-builder fixes earlier in this
+    // session closed several adjacent placeholder-leak holes,
+    // but the splice still produces an unintended CFG cycle —
+    // likely the cloned-callee return-blocks branching back to
+    // a `post_block_id` whose phi for the return value picks up
+    // a placeholder from the inner loop's back-edge. Tracked
+    // for the next session; classify as `TooLarge` so the rest
+    // of the pipeline (const_fold, cse, licm, etc.) keeps
+    // running and the leaf inliner still fires on small
+    // helpers.
     let _ = total_insts;
+    let _ = MAX_INLINE_INSTS_MULTI_BLOCK;
     CalleeClass::TooLarge
 }
 
@@ -1186,10 +1203,10 @@ mod tests {
     }
 
     // Multi-block inlining is currently gated off in `classify` — see
-    // the comment there for the underlying CFG-rewrite bug surfaced by
-    // the bench-kernel bisect harness.
+    // the comment there for the underlying CFG-rewrite hang surfaced
+    // by `cargo test --test bench_kernel_bisect`.
     #[test]
-    #[ignore = "multi-block inlining gated off pending CFG rewrite fix"]
+    #[ignore = "multi-block inlining gated off pending CFG-rewrite fix"]
     fn inlines_multi_block_max_callee() {
         let mut callee = build_max_callee();
         let callee_id = HirId::new();
