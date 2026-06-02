@@ -19,6 +19,7 @@
 //! - Type information preserved for optimization opportunities
 //! - Memory safety validated before code generation
 
+pub mod aggregate_split; // Replace struct round-trips with direct field Load/Store (HIR-level SROA)
 pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
 pub mod analysis;
 pub mod associated_type_resolver; // Associated type resolution for trait dispatch
@@ -1733,6 +1734,12 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
         let lcse = load_cse::run_module(module);
+        // aggregate_split runs after load_cse so the struct-typed
+        // Loads it targets are the canonical ones (load_cse may
+        // have collapsed sibling Loads of the same pointer).
+        // Eliminates the load-modify-store cycle on struct values
+        // produced by `let mut b = arr[i]; b.x = …; arr[i] = b`.
+        let ags = aggregate_split::run_module(module);
         let il = inline::run_module(module);
         let lc = licm::run_module(module);
         let lv = loop_vectorize::run_module(module);
@@ -1750,6 +1757,8 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         let made_progress = cf.folded > 0
             || cs.eliminated > 0
             || lcse.eliminated > 0
+            || ags.round_trips_removed > 0
+            || ags.field_reads_only > 0
             || il.inlined > 0
             || lc.hoisted > 0
             || lv.vectorized > 0
