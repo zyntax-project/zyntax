@@ -702,42 +702,40 @@ impl InterpRuntime {
             Ok(())
         })?;
 
-        // Prime the JIT for every function: ticking each bead via
-        // `on_invoke` submits a broker compile, and we then wait
-        // briefly for the broker to finish so the bead transitions
-        // Interpreted → Queued → Compiling → Compiled. After this
-        // loop every bead's `compiled()` fast path returns Some, so
-        // the very first user call (BC interp's `call_by_id` →
-        // `tick_callback` → `on_invoke`) dispatches JIT'd code
-        // instead of running the entry function in BC interp.
+        // Optional JIT priming for the entry function. beadie
+        // returns `None` from the first `on_invoke` regardless of
+        // whether the pre-compiled function pointer is ready —
+        // BC interp runs the entry function once before the bead
+        // transitions to `Compiled`. For short kernels that's
+        // fine; for rayzor-scale loops the first BC-interp run is
+        // ~hours per warmup iteration.
         //
-        // Without this, a rayzor-scale n-body kernel's main runs
-        // the entire 10 M `advance()` loop in BC interp before the
-        // second call ever arrives — the broker can't tier-up an
-        // entry function while that function's first invocation is
-        // still on the call stack.
-        let cranelift_for_prime = Arc::clone(&cranelift);
-        for (func_id, bound) in &self.bounds {
-            let func_id = *func_id;
-            let cranelift_for_closure = Arc::clone(&cranelift_for_prime);
-            self.tiered.on_invoke(bound, move |_tier, _bead| {
-                cranelift_for_closure
-                    .with_lock(|be| be.get_function_ptr(func_id))
-                    .map(|p| p as *mut ())
-                    .unwrap_or(std::ptr::null_mut())
-            });
-        }
-        // Beadie's broker is single-threaded and processes jobs in
-        // FIFO. Poll each bead until its state reaches Compiled or
-        // we hit a deadline — handful-of-ms latency in practice,
-        // capped at 5 s to avoid hanging an interactive runtime if
-        // something is wrong.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for bound in self.bounds.values() {
-            while bound.bead().compiled().is_none()
-                && std::time::Instant::now() < deadline
-            {
-                std::hint::spin_loop();
+        // Enable with `ZYNTAX_ENABLE_JIT_PRIME=1`. Disabled by
+        // default because it raises install latency and exposes
+        // pre-existing JIT codegen bugs that surface only when the
+        // first call dispatches JIT'd code (e.g. n-body's main
+        // hits a Cranelift `unreachable` trap when JIT-compiled
+        // standalone — a separate follow-up).
+        if std::env::var("ZYNTAX_ENABLE_JIT_PRIME").is_ok() {
+            if let Some(main_id) = module.functions.iter().find_map(|(id, f)| {
+                (f.name.resolve_global().as_deref() == Some("main")).then_some(*id)
+            }) {
+                if let Some(bound) = self.bounds.get(&main_id).cloned() {
+                    let cranelift_for_prime = Arc::clone(&cranelift);
+                    self.tiered.on_invoke(&bound, move |_tier, _bead| {
+                        cranelift_for_prime
+                            .with_lock(|be| be.get_function_ptr(main_id))
+                            .map(|p| p as *mut ())
+                            .unwrap_or(std::ptr::null_mut())
+                    });
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(500);
+                    while bound.bead().compiled().is_none()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::hint::spin_loop();
+                    }
+                }
             }
         }
 
