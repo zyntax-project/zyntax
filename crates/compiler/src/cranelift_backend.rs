@@ -276,6 +276,18 @@ pub struct CraneliftBackend {
     /// `compile_osr_layout`; consumed by `compile_function_body` in
     /// place of the usual `function_map` lookup.
     compile_osr_func_id: Option<FuncId>,
+    /// When `Some`, the compile-module loop skips function bodies whose
+    /// `HirId` is not in this set. Declarations are still emitted for every
+    /// function so cross-module symbol resolution stays correct; only the
+    /// (Cranelift-expensive) body compilation is skipped.
+    ///
+    /// Default `None` preserves the historical behaviour of compiling every
+    /// function in the module. Embedders that know the reachable closure of
+    /// their entry point (typically computed by
+    /// [`crate::dce::reachable_function_ids`]) can opt in via
+    /// [`Self::set_only_compile_reachable`] to shave the ~30-40 ms spent on
+    /// prelude helpers that a benchmark kernel never calls.
+    only_compile_reachable: Option<HashSet<HirId>>,
 }
 
 /// Hot-reload state management
@@ -396,6 +408,7 @@ impl CraneliftBackend {
             pending_osr_helpers: Vec::new(),
             compile_osr_layout: None,
             compile_osr_func_id: None,
+            only_compile_reachable: None,
         })
     }
 
@@ -439,6 +452,17 @@ impl CraneliftBackend {
     /// (~100 ms on the 100 M-iteration mandelbrot).
     pub fn set_emit_osr_probes(&mut self, enabled: bool) {
         self.emit_osr_probes = enabled;
+    }
+
+    /// Restrict subsequent [`Self::compile_module`] calls to only emit
+    /// bodies for functions whose `HirId` is in `allowed`. Pass `None` to
+    /// restore the default behaviour of compiling everything.
+    ///
+    /// Declarations are always emitted for every function in the module —
+    /// only function-body codegen is gated. This keeps cross-function
+    /// symbol resolution intact for the BC interpreter's lazy fallback.
+    pub fn set_only_compile_reachable(&mut self, allowed: Option<HashSet<HirId>>) {
+        self.only_compile_reachable = allowed;
     }
 
     /// Whether OSR back-edge probes will be emitted at tier 0.
@@ -517,6 +541,15 @@ impl CraneliftBackend {
         // Pass 2: Compile all function bodies
         for (id, function) in &module.functions {
             if !function.is_external {
+                // Reachability DCE: when a caller has restricted the set of
+                // functions we should compile, skip bodies outside that set.
+                // The BC interp keeps lazy compile available, so any
+                // unexpected call still works — just at interp speed.
+                if let Some(allowed) = &self.only_compile_reachable {
+                    if !allowed.contains(id) {
+                        continue;
+                    }
+                }
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 if let Err(e) = self.compile_function_body(*id, function, module) {
                     CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);

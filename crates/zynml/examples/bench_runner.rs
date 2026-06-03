@@ -40,10 +40,23 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_TENSOR};
+use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
 use zyntax_compiler::{run_interp_safe_opts, HirModule};
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
+
+/// Bumped manually when the compiler's HIR schema changes (new variants,
+/// field renames, layout shifts in `HirModule` / `HirFunction` / …).
+/// Mixed into the cache key so stale `.zbc` snapshots from an older
+/// schema cannot collide with a freshly produced module — a mismatch
+/// just looks like a miss and we recompile.
+///
+/// `crc32fast` already protects on-disk corruption, and postcard's
+/// schema mismatch is loud, but neither catches a *valid* old payload
+/// being deserialized into a subtly-incompatible new struct. The
+/// version byte makes that case impossible.
+const CACHE_SCHEMA_VERSION: u32 = 1;
 
 // One bench iteration = a fresh `lower + compile + install_jit +
 // JIT_TIER_WARMUP_CALLS calls + 1 timed call`. At rayzor-scale that
@@ -301,6 +314,7 @@ fn main() {
     // Parse command-line flags.
     let mut out_path: Option<PathBuf> = None;
     let mut runs_override: Option<usize> = None;
+    let mut cache_enabled = true;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -310,10 +324,13 @@ fn main() {
             "--runs" => {
                 runs_override = args.next().and_then(|s| s.parse().ok());
             }
+            "--no-cache" => {
+                cache_enabled = false;
+            }
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: bench_runner [--out <path>] [--runs <n>]\n\
-                     Defaults: out = website/benchmark/results.json, runs = {RUNS}"
+                    "Usage: bench_runner [--out <path>] [--runs <n>] [--no-cache]\n\
+                     Defaults: out = website/benchmark/results.json, runs = {RUNS}, cache = on"
                 );
                 return;
             }
@@ -353,7 +370,7 @@ fn main() {
                 per_kernel.insert(target.key.to_string(), skipped_result());
                 continue;
             }
-            let r = measure(&source, target, runs);
+            let r = measure(&source, target, runs, pretty, cache_enabled);
             if let Some(err) = r.error.as_ref() {
                 eprintln!("    {:<22} FAILED — {err}", target.key);
             } else {
@@ -388,7 +405,13 @@ fn main() {
 /// returned result has its `error` field populated and all
 /// timings zeroed — the suite is honest about which tier broke,
 /// rather than silently dropping the row.
-fn measure(source: &str, target: &Target, runs: usize) -> TargetResult {
+fn measure(
+    source: &str,
+    target: &Target,
+    runs: usize,
+    kernel: &str,
+    cache_enabled: bool,
+) -> TargetResult {
     let mut compile_samples = Vec::with_capacity(runs);
     let mut exec_samples = Vec::with_capacity(runs);
     let mut last_result_str = String::new();
@@ -399,12 +422,12 @@ fn measure(source: &str, target: &Target, runs: usize) -> TargetResult {
     // to the `error` shape; no point spending the runs-loop's
     // budget on something that's reliably broken.
     for _ in 0..WARMUP {
-        if let Err(e) = one_iteration(source, target) {
+        if let Err(e) = one_iteration(source, target, kernel, cache_enabled) {
             return failed_result(&e);
         }
     }
     for _ in 0..runs {
-        match one_iteration(source, target) {
+        match one_iteration(source, target, kernel, cache_enabled) {
             Ok((compile_ms, exec_ms, r)) => {
                 compile_samples.push(compile_ms);
                 exec_samples.push(exec_ms);
@@ -468,34 +491,146 @@ fn skipped_result() -> TargetResult {
 /// call dispatches through the JIT'd code rather than the cold
 /// BC interp loop. For non-JIT targets there's no warmup — the
 /// timed call IS the cold first call.
-fn one_iteration(source: &str, target: &Target) -> Result<(f64, f64, ZyntaxValue), String> {
-    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).map_err(|e| format!("grammar: {e:?}"))?;
+fn one_iteration(
+    source: &str,
+    target: &Target,
+    kernel: &str,
+    cache_enabled: bool,
+) -> Result<(f64, f64, ZyntaxValue), String> {
+    // Fine-grained instrumentation, enabled only when the
+    // `ZYNTAX_BENCH_TRACE_COMPILE` env var is set. The trace
+    // breaks `compile_ms` down into the individual pipeline
+    // phases so we can see which one to attack first when chasing
+    // sub-30 ms cold-start compile. Off by default — the env-var
+    // gate keeps normal bench runs clean.
+    let trace = env::var_os("ZYNTAX_BENCH_TRACE_COMPILE").is_some();
 
     let compile_start = Instant::now();
-    let program = grammar
-        .parse_with_filename(source, "<bench>")
-        .map_err(|e| format!("parse: {e:?}"))?;
-    let rt = bench_runtime()?;
-    let builtins = rt
-        .config()
-        .builtins
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let mut module: HirModule = rt
-        .lower_typed_program(program, builtins)
-        .map_err(|e| format!("lower: {e:?}"))?;
-    if target.run_with_opts {
-        let _ = run_interp_safe_opts(&mut module);
-    }
+
+    // ----- ZBC cache lookup ------------------------------------------------
+    // The cache key folds in every input that materially affects the
+    // produced `HirModule`: the source itself, both stdlib files
+    // (prelude, tensor), whether the opt pipeline will run, and a
+    // schema-version constant so a bumped HIR layout invalidates the
+    // whole cache without an `rm -rf` step. A hit lets us skip
+    // parse + bench_runtime_1 + lower + opts entirely; we still need
+    // a runtime for `compile_module` + `install_interp_jit_with`.
+    let cache_key = compute_cache_key(source, target.run_with_opts);
+    let cache_dir = bench_cache_dir();
+
+    let t_cache = Instant::now();
+    let cached_module: Option<HirModule> = if cache_enabled {
+        try_load_cached_hir(&cache_key, &cache_dir)
+    } else {
+        None
+    };
+    let cache_lookup_ms = t_cache.elapsed().as_secs_f64() * 1000.0;
+
+    let (module, parse_ms, bench_rt_1_ms, lower_ms, opts_ms): (HirModule, f64, f64, f64, f64) =
+        if let Some(m) = cached_module {
+            if trace {
+                eprintln!(
+                    "[BENCH-CACHE] HIT  key={key} kernel={kernel} target={t} (lookup={ms:.2} ms)",
+                    key = &cache_key[..cache_key.len().min(8)],
+                    t = target.key,
+                    ms = cache_lookup_ms,
+                );
+            }
+            (m, 0.0, 0.0, 0.0, 0.0)
+        } else {
+            if trace {
+                eprintln!(
+                    "[BENCH-CACHE] MISS key={key} kernel={kernel} target={t} (lookup={ms:.2} ms)",
+                    key = &cache_key[..cache_key.len().min(8)],
+                    t = target.key,
+                    ms = cache_lookup_ms,
+                );
+            }
+
+            let grammar =
+                Grammar2::from_source(ZYNML_GRAMMAR).map_err(|e| format!("grammar: {e:?}"))?;
+
+            let t0 = Instant::now();
+            let program = grammar
+                .parse_with_filename(source, "<bench>")
+                .map_err(|e| format!("parse: {e:?}"))?;
+            let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let t0 = Instant::now();
+            let rt = bench_runtime()?;
+            let builtins = rt
+                .config()
+                .builtins
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let bench_rt_1_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let t0 = Instant::now();
+            let mut module: HirModule = rt
+                .lower_typed_program(program, builtins)
+                .map_err(|e| format!("lower: {e:?}"))?;
+            let lower_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let t0 = Instant::now();
+            if target.run_with_opts {
+                let _ = run_interp_safe_opts(&mut module);
+            }
+            let opts_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            // Persist the cold-path module so the next iteration can
+            // skip everything above. Failures are non-fatal — a broken
+            // cache write just means the next run pays the cold-path
+            // cost again, not a benchmark failure.
+            if cache_enabled {
+                try_save_cached_hir(&module, &cache_key, &cache_dir);
+            }
+
+            (module, parse_ms, bench_rt_1_ms, lower_ms, opts_ms)
+        };
+
+    let t0 = Instant::now();
     let mut rt = bench_runtime()?;
+    let bench_rt_2_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let t0 = Instant::now();
     rt.compile_module(&module)
         .map_err(|e| format!("compile_module: {e:?}"))?;
+    let compile_module_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let t0 = Instant::now();
     if target.install_jit {
         rt.install_interp_jit_with(jit_tier_config(target.install_llvm))
             .map_err(|e| format!("install_interp_jit: {e:?}"))?;
     }
+    let install_jit_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+
+    if trace {
+        eprintln!(
+            "[BENCH-COMPILE] kernel={kernel} target={target_key}\n  \
+             cache_lookup = {cache:.2} ms\n  \
+             parse        = {parse:.2} ms\n  \
+             rt_build_1   = {rt1:.2} ms\n  \
+             lower        = {lower:.2} ms\n  \
+             opts         = {opts:.2} ms\n  \
+             rt_build_2   = {rt2:.2} ms\n  \
+             compile_mod  = {cm:.2} ms\n  \
+             install_jit  = {ij:.2} ms\n  \
+             TOTAL        = {total:.2} ms",
+            target_key = target.key,
+            cache = cache_lookup_ms,
+            parse = parse_ms,
+            rt1 = bench_rt_1_ms,
+            lower = lower_ms,
+            opts = opts_ms,
+            rt2 = bench_rt_2_ms,
+            cm = compile_module_ms,
+            ij = install_jit_ms,
+            total = compile_ms,
+        );
+    }
 
     if target.install_jit {
         // Warm beadie's `TieredAdapter` past the threshold so the
@@ -587,6 +722,118 @@ fn rfc3339_now() -> String {
         minute = minute,
         second = second
     )
+}
+
+// =========================================================================
+// ZBC HIR cache
+// -------------------------------------------------------------------------
+// A per-project filesystem cache keyed on the inputs that drive the
+// compiler frontend. On hit, `one_iteration` skips parse + lower + opts
+// and goes straight from the deserialized `HirModule` to `compile_module`
+// + JIT install. On miss, we run the cold path and atomically persist
+// the produced module via the bytecode crate's `serialize_module`.
+//
+// Why per-project (under `target/`) rather than `~/.cache/zyntax/`:
+//   - `target/` is already gitignored, no extra config to ship.
+//   - `cargo clean` nukes the cache as a side effect, which matches
+//     the cargo-style mental model — anyone debugging a stale cache
+//     will reach for that anyway.
+//   - No cross-workspace contamination: two checkouts of the repo
+//     at different commits keep their snapshots separate.
+// To clear manually: `rm -rf target/zynml-cache/`.
+
+/// Directory holding the `.zbc` snapshots. Resolved relative to the
+/// zynml crate's `CARGO_MANIFEST_DIR` so it lands at the workspace
+/// `target/` root regardless of the caller's `cwd`.
+fn bench_cache_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/zynml-cache/zbc")
+}
+
+/// Stable 64-bit FNV-1a hash. Deterministic across Rust versions
+/// (unlike `DefaultHasher`) and dependency-free — both properties
+/// matter for a filesystem cache key that has to survive toolchain
+/// upgrades. Collision probability at the corpus sizes we'll ever
+/// hit (a handful of kernels, four targets, ~3000-line prelude) is
+/// effectively zero, and a collision just means a wrong-HIR miss
+/// that postcard's schema check and crc32fast will catch.
+fn fnv1a_64_update(state: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = state;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Compose the cache key from every input that materially affects
+/// the produced `HirModule`. Includes both stdlib files because the
+/// resolver weaves them into lowering, the opt-pipeline flag because
+/// `run_interp_safe_opts` mutates the module in place, and a pair of
+/// version tags so a compiler-schema change or a workspace version
+/// bump invalidates the whole cache without any manual `rm` step.
+fn compute_cache_key(source: &str, run_with_opts: bool) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    let mut h = FNV_OFFSET;
+    // Domain separators between sections so e.g. swapping a byte
+    // between the source's tail and the prelude's head can't ever
+    // produce the same digest.
+    h = fnv1a_64_update(h, b"src\0");
+    h = fnv1a_64_update(h, source.as_bytes());
+    h = fnv1a_64_update(h, b"\0prelude\0");
+    h = fnv1a_64_update(h, ZYNML_STDLIB_PRELUDE.as_bytes());
+    h = fnv1a_64_update(h, b"\0tensor\0");
+    h = fnv1a_64_update(h, ZYNML_STDLIB_TENSOR.as_bytes());
+    h = fnv1a_64_update(h, b"\0opts\0");
+    h = fnv1a_64_update(h, &[u8::from(run_with_opts)]);
+    h = fnv1a_64_update(h, b"\0schema\0");
+    h = fnv1a_64_update(h, &CACHE_SCHEMA_VERSION.to_le_bytes());
+    h = fnv1a_64_update(h, b"\0pkg\0");
+    h = fnv1a_64_update(h, env!("CARGO_PKG_VERSION").as_bytes());
+    format!("{h:016x}")
+}
+
+/// Read a snapshot if it exists and deserializes cleanly. Any
+/// failure (missing file, IO error, postcard schema mismatch, CRC
+/// mismatch) silently returns `None` so the caller falls back to
+/// the cold path; corruption is self-healing on the next write.
+fn try_load_cached_hir(cache_key: &str, cache_dir: &Path) -> Option<HirModule> {
+    let path = cache_dir.join(format!("{cache_key}.zbc"));
+    let bytes = fs::read(&path).ok()?;
+    deserialize_module(&bytes).ok()
+}
+
+/// Persist a snapshot via write-to-tmp + atomic-rename. The tmp +
+/// rename pattern keeps concurrent readers from observing a half-
+/// written file (the harness is single-threaded today but a
+/// future parallel `--jobs N` bench would race on the same key).
+/// Failures here are logged but never fatal — a benchmark that
+/// can't write to disk should still produce timings.
+fn try_save_cached_hir(module: &HirModule, cache_key: &str, cache_dir: &Path) {
+    if let Err(e) = fs::create_dir_all(cache_dir) {
+        eprintln!(
+            "[BENCH-CACHE] WARN  mkdir {dir:?} failed: {e}",
+            dir = cache_dir,
+        );
+        return;
+    }
+    let final_path = cache_dir.join(format!("{cache_key}.zbc"));
+    let tmp_path = cache_dir.join(format!("{cache_key}.zbc.tmp"));
+    match serialize_module(module, Format::Postcard) {
+        Ok(bytes) => {
+            if let Err(e) = fs::write(&tmp_path, &bytes) {
+                eprintln!("[BENCH-CACHE] WARN  write {tmp_path:?} failed: {e}");
+                return;
+            }
+            if let Err(e) = fs::rename(&tmp_path, &final_path) {
+                eprintln!("[BENCH-CACHE] WARN  rename {tmp_path:?} -> {final_path:?} failed: {e}");
+                let _ = fs::remove_file(&tmp_path);
+            }
+        }
+        Err(e) => {
+            eprintln!("[BENCH-CACHE] WARN  serialize_module failed: {e}");
+        }
+    }
 }
 
 fn git_short_sha() -> String {

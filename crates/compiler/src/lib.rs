@@ -31,6 +31,7 @@ pub mod cfg_simplify;
 pub mod const_eval;
 pub mod const_fold;
 pub mod cse;
+pub mod dce; // Reachability-based dead-code elimination at the function level
 pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-escaping mallocs
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
@@ -97,6 +98,7 @@ pub use const_eval::{ConstEvalContext, ConstEvaluator};
 pub use cranelift_backend::{
     cranelift_skipped_function_count, reset_cranelift_skipped_function_count,
 };
+pub use dce::reachable_function_ids;
 pub use effect_analysis::{
     analyze_effects, analyze_effects_with_call_graph, get_function_effect_summary,
     has_effect_errors, EffectAnalyzer, EffectCallGraph, EffectError, EffectErrorKind,

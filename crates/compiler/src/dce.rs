@@ -1,0 +1,179 @@
+//! # Reachability-based Dead-Code Elimination for HIR functions
+//!
+//! Computes the set of [`HirId`]s for functions transitively callable from a
+//! set of entry-point names (typically `["main"]`). Used by the Cranelift
+//! backend to skip codegen for unreachable functions (e.g. the ~100 prelude
+//! helpers that a one-file benchmark kernel never invokes), shaving the
+//! per-install JIT-compile cost.
+//!
+//! ## Conservative handling of indirect calls
+//!
+//! - Direct calls ([`HirCallable::Function`]) are precise.
+//! - Function references that escape (via [`HirCallable::FuncRef`],
+//!   [`HirInstruction::CreateClosure`], or as members of a vtable that any
+//!   reachable function loads from) are treated as roots — their address is
+//!   observable.
+//! - If any reachable function performs an indirect call
+//!   ([`HirCallable::Indirect`], [`HirInstruction::IndirectCall`],
+//!   [`HirInstruction::CallClosure`], or [`HirInstruction::TraitMethodCall`])
+//!   AND we cannot statically resolve the target, we fall back to
+//!   "compile everything" by returning the full set of function ids.
+//!
+//! This preserves correctness in all current call patterns while still
+//! winning on the common kernels-of-known-callees case.
+
+use crate::hir::{HirCallable, HirConstant, HirId, HirInstruction, HirModule};
+use std::collections::HashSet;
+
+/// Compute the set of function [`HirId`]s reachable from the given entry-point
+/// names. Always includes extern function declarations (those have
+/// `is_external = true`) because they are registered as symbols and not
+/// compiled by Cranelift anyway.
+///
+/// If the analysis cannot prove indirect-call targets are safe to prune, it
+/// returns the full set of function ids (conservative).
+pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashSet<HirId> {
+    // Walk: collect direct calls, FuncRef-style escapes, and detect any
+    // indirect-call site. On indirect-call detection, fall back to "everything
+    // reachable" (the full function-id set).
+    let mut reachable: HashSet<HirId> = HashSet::new();
+    let mut worklist: Vec<HirId> = Vec::new();
+    // Roots: entry-point function ids matched by name.
+    for (id, function) in &module.functions {
+        if let Some(name) = function.name.resolve_global() {
+            if entry_names.iter().any(|e| *e == name) {
+                worklist.push(*id);
+            }
+        }
+    }
+
+    // If no entry-point function is present (e.g. embedded / test scenarios
+    // where the host calls arbitrary user-defined functions via
+    // `call_function_raw`), there is no safe basis for pruning — fall back
+    // to compiling every function in the module.
+    if worklist.is_empty() {
+        return all_function_ids(module);
+    }
+
+    // Function refs taken anywhere in the module (used to seed reachability
+    // for FuncRef'd functions even if no direct call reaches them).
+    let mut escaped_funcs: HashSet<HirId> = HashSet::new();
+    // Whether we've already seeded escapes (we do this once when we first
+    // detect an indirect call so we don't double-walk).
+    let mut seeded_escapes = false;
+
+    while let Some(fid) = worklist.pop() {
+        if !reachable.insert(fid) {
+            continue;
+        }
+        let func = match module.functions.get(&fid) {
+            Some(f) => f,
+            None => continue,
+        };
+        // External declarations have no body; nothing to walk.
+        if func.is_external {
+            continue;
+        }
+
+        for (_, block) in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    HirInstruction::Call { callee, .. } => match callee {
+                        HirCallable::Function(target) => {
+                            if !reachable.contains(target) {
+                                worklist.push(*target);
+                            }
+                        }
+                        HirCallable::FuncRef(target) => {
+                            // The address escapes — pessimistically assume it
+                            // may be invoked indirectly later.
+                            escaped_funcs.insert(*target);
+                            if !reachable.contains(target) {
+                                worklist.push(*target);
+                            }
+                        }
+                        HirCallable::Indirect(_) => {
+                            // Unknown target. Seed escape closure once, then
+                            // fall back to full set if escapes can't account
+                            // for it.
+                            return all_function_ids(module);
+                        }
+                        // Intrinsics & external symbols don't reach HIR
+                        // functions in this module.
+                        HirCallable::Intrinsic(_) | HirCallable::Symbol(_) => {}
+                    },
+                    HirInstruction::IndirectCall { .. }
+                    | HirInstruction::CallClosure { .. }
+                    | HirInstruction::TraitMethodCall { .. } => {
+                        // Same conservative fallback. TraitMethodCall could in
+                        // principle be resolved via vtables in globals, but
+                        // we keep it simple — these are rare in benchmark
+                        // kernels.
+                        return all_function_ids(module);
+                    }
+                    HirInstruction::CreateClosure { function, .. } => {
+                        // Closure body is a real function reachable through
+                        // the closure value.
+                        escaped_funcs.insert(*function);
+                        if !reachable.contains(function) {
+                            worklist.push(*function);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Seed escapes once we've processed the roots. A FuncRef taken inside
+        // a not-yet-reachable function would already be discovered when that
+        // function is walked; this just handles the case of vtables wired
+        // into globals.
+        if !seeded_escapes {
+            seeded_escapes = true;
+            for global in module.globals.values() {
+                if let Some(init) = &global.initializer {
+                    collect_vtable_funcs(init, &mut escaped_funcs);
+                }
+            }
+            for fid in &escaped_funcs {
+                if !reachable.contains(fid) {
+                    worklist.push(*fid);
+                }
+            }
+        }
+    }
+
+    // Always include external declarations — Cranelift's compile_module loop
+    // calls `declare_function` on them but skips bodies; including them in
+    // the reachable set is harmless and lets callers treat the set as
+    // "functions that may need declaration".
+    for (id, function) in &module.functions {
+        if function.is_external {
+            reachable.insert(*id);
+        }
+    }
+
+    reachable
+}
+
+/// Walk a HirConstant looking for VTable entries whose `function_id` fields
+/// are addresses of HIR functions that may escape.
+fn collect_vtable_funcs(c: &HirConstant, out: &mut HashSet<HirId>) {
+    match c {
+        HirConstant::VTable(vt) => {
+            for entry in &vt.methods {
+                out.insert(entry.function_id);
+            }
+        }
+        HirConstant::Array(items) | HirConstant::Struct(items) => {
+            for item in items {
+                collect_vtable_funcs(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn all_function_ids(module: &HirModule) -> HashSet<HirId> {
+    module.functions.keys().copied().collect()
+}

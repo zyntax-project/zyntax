@@ -696,7 +696,15 @@ impl InterpRuntime {
         // one-in-64 calls also hit `osr_probe → RwLock::read →
         // HashMap::get` on an empty OSR table. On a ~100 M-iteration
         // mandelbrot inner loop that's ~100 ms of pure overhead.
+        // Reachability DCE: restrict Cranelift body-compilation to functions
+        // transitively callable from `main`. `import prelude` pulls in ~100
+        // helpers; on the bench kernels (mandelbrot, nbody, naive-recursive
+        // fib) none of them are reached, so this skips ~30-40 ms of Cranelift
+        // codegen per install. Any unexpected call still works via the BC
+        // interp's lazy-compile fallback.
+        let reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
         cranelift.with_lock(|be| -> Result<(), CompilerError> {
+            be.set_only_compile_reachable(Some(reachable));
             be.set_emit_osr_probes(false);
             be.set_compile_tier(0);
             be.compile_module(&module)
