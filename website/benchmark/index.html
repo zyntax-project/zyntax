@@ -421,10 +421,15 @@
     <p>
       ZynML microbenchmarks measured through every tier of the Zyntax runtime
       — the BC interpreter alone, the BC interpreter after the HIR optimization
-      pipeline (<code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">run_interp_safe_opts</code>), and the Cranelift JIT
-      after tier-up. Each kernel is its idiomatic complete shape — recursive
-      Fibonacci, full Newtonian n-body, mandelbrot escape iteration — so the
-      page also exposes where the runtime needs work. Source lives at
+      pipeline (<code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">run_interp_safe_opts</code>), the Cranelift JIT after
+      tier-up, and the full ladder (Cranelift → LLVM) when built with the
+      <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">llvm-backend</code> feature. Each kernel matches its rayzor /
+      HaxeBenchmarks counterpart parameter-for-parameter — Mandelbrot is
+      875 × 500 / max_iter 1000 (reference checksum 112 798 515), n-body is
+      the five-body solar system over 20 × 500 000 = 10 M advance steps
+      returning <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">Std.int(energy · 1 000 000)</code>, fib is the naive recursive
+      <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">fib(30) = 832 040</code>. The page exposes where the runtime needs
+      work; source lives at
       <a href="https://github.com/zyntax-project/zyntax/tree/main/crates/zynml/examples">crates/zynml/examples</a>.
     </p>
   </header>
