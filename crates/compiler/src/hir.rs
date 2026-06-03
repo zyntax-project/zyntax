@@ -1804,6 +1804,10 @@ pub enum Intrinsic {
     // Math
     Sqrt,
     Fabs,
+    /// Fused multiply-add: `fma(a, b, c) = a * b + c` with a single
+    /// IEEE-754 round at the end. Emitted by the `fma_contract` pass
+    /// when it recognises an `fadd(fmul a b, c)` pattern.
+    Fma,
     Sin,
     Cos,
     Pow,

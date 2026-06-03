@@ -257,6 +257,18 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// `dst = a * b + c` — fused multiply-add, single round.
+    /// Emitted by the `fma_contract` HIR pass when it rewrites
+    /// `fadd(fmul a b, c)` to `Intrinsic::Fma`. Mirrors the
+    /// Cranelift backend's `builder.ins().fma(...)` lowering; the
+    /// interpreter computes via `f64::mul_add` so the rounding
+    /// semantics match a hardware FMA.
+    FMulAdd {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        c: Reg,
+    },
 
     // ── comparisons (result is Bool) ──
     ICmpEq {
@@ -1113,6 +1125,21 @@ fn lower_inst(
                         .unwrap_or(0);
                     cf.code.push(Op::FAbs { dst, src: src_reg });
                 }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Fma) => {
+                    // Three-arg math intrinsic — emitted by the
+                    // `fma_contract` HIR pass when it rewrites
+                    // `fadd(fmul a b, c)`. Mirror Cranelift's
+                    // hardware FMA via `f64::mul_add`.
+                    let arg_regs = cf
+                        .args_pool
+                        .get(args_idx as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let a = arg_regs.first().copied().unwrap_or(0);
+                    let b = arg_regs.get(1).copied().unwrap_or(0);
+                    let c = arg_regs.get(2).copied().unwrap_or(0);
+                    cf.code.push(Op::FMulAdd { dst, a, b, c });
+                }
                 HirCallable::Intrinsic(_) => {
                     return Err(InterpError::UnsupportedInstruction(
                         "intrinsic call".to_string(),
@@ -1919,6 +1946,13 @@ impl HirInterpreter {
                 Op::FAbs { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
                     regs[*dst as usize] = ZyntaxValue::Float(x.abs());
+                    pc += 1;
+                }
+                Op::FMulAdd { dst, a, b, c } => {
+                    let av = freg_f64(&regs[*a as usize])?;
+                    let bv = freg_f64(&regs[*b as usize])?;
+                    let cv = freg_f64(&regs[*c as usize])?;
+                    regs[*dst as usize] = ZyntaxValue::Float(av.mul_add(bv, cv));
                     pc += 1;
                 }
                 Op::ICmpEq { dst, lhs, rhs } => {

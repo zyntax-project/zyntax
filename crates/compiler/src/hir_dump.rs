@@ -336,6 +336,7 @@ fn fmt_intrinsic(i: &Intrinsic) -> &'static str {
         Intrinsic::Memmove => "memmove",
         Intrinsic::Sqrt => "sqrt",
         Intrinsic::Fabs => "fabs",
+        Intrinsic::Fma => "fma",
         Intrinsic::Sin => "sin",
         Intrinsic::Cos => "cos",
         Intrinsic::Pow => "pow",

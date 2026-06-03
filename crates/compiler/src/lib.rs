@@ -36,6 +36,7 @@ pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-es
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
 pub mod effect_handler_resolution; // Handler resolution for effect dispatch
+pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
@@ -1664,6 +1665,7 @@ pub struct InterpOptStats {
     pub alloca_promote: alloca_promote::PromoteStats,
     pub const_fold: const_fold::FoldStats,
     pub cse: cse::CseStats,
+    pub fma_contract: fma_contract::FmaStats,
     pub load_cse: load_cse::LoadCseStats,
     pub aggregate_split: aggregate_split::AggregateSplitStats,
     pub licm: licm::LicmStats,
@@ -1733,6 +1735,26 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     for _ in 0..8 {
         let cf = const_fold::fold_module(module);
         let cs = cse::eliminate_module(module);
+        // FMA contraction runs after const_fold + cse so we don't
+        // contract a pattern that CSE could have eliminated to a
+        // single value, and so const_fold has already collapsed any
+        // FMul-of-constants into a Constant (which then wouldn't
+        // match the FMul pattern). Sits before load_cse / aggregate_split
+        // because those are memory-oriented and operate on different
+        // instruction shapes — order between them is independent.
+        //
+        // Temporary investigation gate: `ZYNTAX_DISABLE_FMA=1` skips
+        // the pass entirely so before/after HIR can be diffed and
+        // exec-time effect measured on Apple-Silicon. Remove once the
+        // hot-loop FMA-helps/hurts question is closed.
+        let fma_disabled = std::env::var("ZYNTAX_DISABLE_FMA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let fma = if fma_disabled {
+            fma_contract::FmaStats::default()
+        } else {
+            fma_contract::run_module(module)
+        };
         // load_cse runs after value-cse so canonical pointer ids are
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
@@ -1759,6 +1781,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
 
         let made_progress = cf.folded > 0
             || cs.eliminated > 0
+            || fma.contracted > 0
             || lcse.eliminated > 0
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
@@ -1773,6 +1796,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.const_fold.iterations = stats.const_fold.iterations.max(cf.iterations);
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
+        stats.fma_contract.contracted += fma.contracted;
         stats.load_cse.eliminated += lcse.eliminated;
         stats.aggregate_split.round_trips_removed += ags.round_trips_removed;
         stats.aggregate_split.field_accesses_emitted += ags.field_accesses_emitted;

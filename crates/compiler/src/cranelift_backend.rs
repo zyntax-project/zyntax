@@ -2089,6 +2089,17 @@ impl CraneliftBackend {
                                                 continue; // Skip if no argument
                                             }
                                         }
+                                        Intrinsic::Fma => {
+                                            if arg_values.len() == 3 {
+                                                builder.ins().fma(
+                                                    arg_values[0],
+                                                    arg_values[1],
+                                                    arg_values[2],
+                                                )
+                                            } else {
+                                                continue; // Skip if wrong arity
+                                            }
+                                        }
                                         Intrinsic::Ctpop => {
                                             if let Some(&arg) = arg_values.first() {
                                                 builder.ins().popcnt(arg)
@@ -6208,6 +6219,21 @@ impl CraneliftBackend {
                                 } else {
                                     return Err(CompilerError::Backend(
                                         "fabs requires 1 argument".into(),
+                                    ));
+                                }
+                            }
+                            crate::hir::Intrinsic::Fma => {
+                                if args.len() == 3 {
+                                    let a = arg_vals[0];
+                                    let b = arg_vals[1];
+                                    let c = arg_vals[2];
+                                    let fma_val = builder.ins().fma(a, b, c);
+                                    if let Some(result_id) = result {
+                                        self.value_map.insert(*result_id, fma_val);
+                                    }
+                                } else {
+                                    return Err(CompilerError::Backend(
+                                        "fma requires 3 arguments".into(),
                                     ));
                                 }
                             }

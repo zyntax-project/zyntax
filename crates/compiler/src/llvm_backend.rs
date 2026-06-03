@@ -2950,6 +2950,42 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
 
+            Fma => {
+                // Fused multiply-add: `fma(a, b, c) = a * b + c` with a
+                // single IEEE-754 round. Emitted by the `fma_contract`
+                // HIR pass.
+                if args.len() != 3 {
+                    return Err(CompilerError::CodeGen(
+                        format!("fma expects 3 arguments, got {}", args.len())
+                    ));
+                }
+
+                let a = self.get_value(args[0])?;
+                let b = self.get_value(args[1])?;
+                let c = self.get_value(args[2])?;
+
+                let intrinsic_name = if a.is_float_value() {
+                    let float_val = a.into_float_value();
+                    if float_val.get_type() == self.context.f32_type() {
+                        "llvm.fma.f32"
+                    } else {
+                        "llvm.fma.f64"
+                    }
+                } else {
+                    return Err(CompilerError::CodeGen(
+                        "fma requires float arguments".to_string()
+                    ));
+                };
+
+                let fma_fn = self.get_or_declare_intrinsic_ternary(intrinsic_name, a.get_type())?;
+                let call_site = self.builder.build_call(fma_fn, &[a.into(), b.into(), c.into()], "fma")?;
+
+                match call_site.try_as_basic_value() {
+                    ValueKind::Basic(val) => Ok(val),
+                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen("fma returned void".to_string()))
+                }
+            }
+
             Sin | Cos | Log | Exp => {
                 if args.len() != 1 {
                     return Err(CompilerError::CodeGen(
@@ -3253,6 +3289,21 @@ impl<'ctx> LLVMBackend<'ctx> {
     ) -> CompilerResult<FunctionValue<'ctx>> {
         Ok(self.module.get_function(name).unwrap_or_else(|| {
             let fn_type = arg_type.fn_type(&[arg_type.into(), arg_type.into()], false);
+            self.module.add_function(name, fn_type, None)
+        }))
+    }
+
+    /// Helper to get or declare a ternary LLVM intrinsic with three
+    /// same-typed arguments and a same-typed return — e.g.
+    /// `llvm.fma.f64(f64, f64, f64) -> f64`.
+    fn get_or_declare_intrinsic_ternary(
+        &self,
+        name: &str,
+        arg_type: BasicTypeEnum<'ctx>,
+    ) -> CompilerResult<FunctionValue<'ctx>> {
+        Ok(self.module.get_function(name).unwrap_or_else(|| {
+            let fn_type =
+                arg_type.fn_type(&[arg_type.into(), arg_type.into(), arg_type.into()], false);
             self.module.add_function(name, fn_type, None)
         }))
     }
