@@ -515,6 +515,18 @@ impl TieredBackend {
         self.cranelift
             .with_lock(|be| be.register_symbol_signatures(symbols));
     }
+
+    /// Toggle emission of OSR back-edge probes in tier-0 code.
+    ///
+    /// The probes call `osr_sample_tick` on every loop back-edge and a
+    /// `RwLock::read → HashMap::get` on a 1-in-64 sample. The tier-up
+    /// consumer side is not wired on the production `TieredRuntime` path,
+    /// so the probes are pure overhead — disable them to match the
+    /// `interp_runtime.rs` tier-up install path.
+    pub fn set_emit_osr_probes(&mut self, enabled: bool) {
+        self.cranelift
+            .with_lock(|be| be.set_emit_osr_probes(enabled));
+    }
 }
 
 impl Drop for TieredBackend {

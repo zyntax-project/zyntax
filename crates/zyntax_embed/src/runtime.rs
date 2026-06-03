@@ -2987,6 +2987,12 @@ impl TieredRuntime {
             }
         }
 
+        // OSR back-edge probes fire on every loop header but the
+        // tier-up consumer side is not wired on this path. Until it
+        // is, they are pure overhead — disable them so the production
+        // tier matches the interp-jit path (see interp_runtime.rs).
+        self.backend.set_emit_osr_probes(false);
+
         // Compile the module (consumes it)
         self.backend.compile_module(module)?;
 
