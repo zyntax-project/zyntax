@@ -43,7 +43,7 @@ use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_TENSOR};
 use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
-use zyntax_compiler::{run_interp_safe_opts, HirModule};
+use zyntax_compiler::HirModule;
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
 /// Bumped manually when the compiler's HIR schema changes (new variants,
@@ -573,9 +573,11 @@ fn one_iteration(
             let lower_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             let t0 = Instant::now();
-            if target.run_with_opts {
-                let _ = run_interp_safe_opts(&mut module);
-            }
+            // run_interp_safe_opts now runs inside ZyntaxRuntime::compile_module
+            // (the production path), so the bench harness no longer drives it
+            // explicitly here. The opts_ms slot is retained as a zero so the
+            // cold-path timing table layout stays stable across runs.
+            let _ = &mut module;
             let opts_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             // Persist the cold-path module so the next iteration can

@@ -963,15 +963,27 @@ impl ZyntaxRuntime {
     /// If the module has extern declarations that match previously compiled functions,
     /// the backend will be rebuilt to include those symbols before compilation.
     pub fn compile_module(&mut self, module: &zyntax_compiler::HirModule) -> RuntimeResult<()> {
+        // Run interp-safe HIR opts before backend installation. Without this,
+        // user programs run through `compile_module` never get CSE / LICM /
+        // inline / const_fold / aggregate_split — the bench-only
+        // `run_interp_safe_opts` entry was the only place these fired,
+        // leaving production code unoptimised. (Skippable via
+        // `ZYNTAX_DISABLE_INTERP_OPTS=1` for the rare case where we want
+        // to bisect against the raw lowered HIR.)
+        let mut owned = module.clone();
+        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+            let _stats = zyntax_compiler::run_interp_safe_opts(&mut owned);
+        }
+
         // Check if we need to rebuild the backend for cross-module linking
-        if self.backend.needs_rebuild_for_module(module) {
+        if self.backend.needs_rebuild_for_module(&owned) {
             log::debug!("[Runtime] Rebuilding JIT for cross-module symbol resolution");
             self.backend.rebuild_with_accumulated_symbols()?;
         }
 
         // Store function name -> ID mapping (resolve InternedString to actual string)
         // Also track which functions are async and store their signatures
-        for (id, func) in &module.functions {
+        for (id, func) in &owned.functions {
             if let Some(name) = func.name.resolve_global() {
                 self.function_ids.insert(name.clone(), *id);
 
@@ -997,7 +1009,7 @@ impl ZyntaxRuntime {
         }
 
         // Compile the module
-        self.backend.compile_module(module)?;
+        self.backend.compile_module(&owned)?;
 
         // Finalize definitions to get function pointers
         self.backend.finalize_definitions()?;
@@ -1007,7 +1019,7 @@ impl ZyntaxRuntime {
         // delegates here; beadie's `TieredAdapter` inside the interp
         // drives the single tier-up loop.
         if let Ok(mut interp) = self.interp.lock() {
-            interp.compile_module(module.clone());
+            interp.compile_module(owned);
         }
 
         Ok(())
@@ -2953,7 +2965,17 @@ impl TieredRuntime {
     }
 
     /// Compile a HIR module into the tiered runtime
-    pub fn compile_module(&mut self, module: HirModule) -> RuntimeResult<()> {
+    pub fn compile_module(&mut self, mut module: HirModule) -> RuntimeResult<()> {
+        // Run interp-safe HIR opts before backend installation. Without this,
+        // user programs run through `TieredRuntime::compile_module` never get
+        // CSE / LICM / inline / const_fold / aggregate_split — the bench-only
+        // `run_interp_safe_opts` entry was the only place these fired,
+        // leaving production code unoptimised. (Skippable via
+        // `ZYNTAX_DISABLE_INTERP_OPTS=1`.)
+        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+            let _stats = zyntax_compiler::run_interp_safe_opts(&mut module);
+        }
+
         // Store function name -> ID mapping and signatures (resolve InternedString to actual string)
         for (id, func) in &module.functions {
             if let Some(name) = func.name.resolve_global() {
