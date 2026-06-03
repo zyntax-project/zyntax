@@ -686,7 +686,18 @@ impl InterpRuntime {
         // and naive-recursive fib doing the same for the same
         // reason. Compiling the module once at install time fixes
         // both with cross-function symbol resolution.
+        // OSR back-edge probes are useful only when a tier ≥ 1 backend
+        // installs OSR helpers via `swap_compiled_with_osr`. The
+        // Cranelift-only ladder never does (it uses plain
+        // `swap_compiled`), and the current `feature = "llvm-backend"`
+        // path also uses `swap_compiled`, not the OSR variant. Until a
+        // backend wires the OSR producer side, probes are pure
+        // overhead — every loop iteration calls `osr_sample_tick`, and
+        // one-in-64 calls also hit `osr_probe → RwLock::read →
+        // HashMap::get` on an empty OSR table. On a ~100 M-iteration
+        // mandelbrot inner loop that's ~100 ms of pure overhead.
         cranelift.with_lock(|be| -> Result<(), CompilerError> {
+            be.set_emit_osr_probes(false);
             be.set_compile_tier(0);
             be.compile_module(&module)
                 .map_err(|e| CompilerError::Backend(format!("tier-up compile: {e}")))?;
@@ -730,8 +741,7 @@ impl InterpRuntime {
                     });
                     let deadline =
                         std::time::Instant::now() + std::time::Duration::from_millis(500);
-                    while bound.bead().compiled().is_none()
-                        && std::time::Instant::now() < deadline
+                    while bound.bead().compiled().is_none() && std::time::Instant::now() < deadline
                     {
                         std::hint::spin_loop();
                     }

@@ -234,6 +234,19 @@ pub struct CraneliftBackend {
     /// Defaults to 0; set via [`Self::set_compile_tier`] before each
     /// `compile_function` call from the tiered runtime.
     compile_tier: usize,
+    /// When `false`, tier-0 codegen skips the back-edge OSR probe and
+    /// dispatch emission entirely — neither `__zyntax_osr_sample_tick`
+    /// nor `__zyntax_osr_probe` calls are inserted at loop headers.
+    ///
+    /// Defaults to `true` for backwards compatibility. Embedders that
+    /// know no tier ≥ 1 backend will ever install OSR helpers (e.g. the
+    /// Cranelift-only ladder without `feature = "llvm-backend"`, or any
+    /// runtime that drives tier-up via full recompile + `swap_compiled`)
+    /// should set this to `false` via [`Self::set_emit_osr_probes`] to
+    /// avoid the per-iteration tick-call + branch in every JIT'd loop.
+    /// On a ~100 M-iteration mandelbrot the unconditional probe stream
+    /// costs ~100 ms of pure overhead.
+    emit_osr_probes: bool,
     /// Bead id this function is registered under in the OSR registry.
     /// Embedded as a constant into probe call sites so the runtime can
     /// look up the bead without a global function-pointer table.
@@ -378,6 +391,7 @@ impl CraneliftBackend {
             inferred_extern_sigs: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
             compile_tier: 0,
+            emit_osr_probes: true,
             compile_bead_id: 0,
             pending_osr_helpers: Vec::new(),
             compile_osr_layout: None,
@@ -414,6 +428,22 @@ impl CraneliftBackend {
     /// can find the bead in the registry.
     pub fn set_compile_bead_id(&mut self, bead_id: u64) {
         self.compile_bead_id = bead_id;
+    }
+
+    /// Enable / disable OSR back-edge probe emission for subsequent
+    /// `compile_function` calls. Default `true` preserves the historical
+    /// behaviour where every loop header gets a `__zyntax_osr_sample_tick`
+    /// + (1/64) `__zyntax_osr_probe` pair. Set to `false` for runtimes
+    /// that don't ever wire a tier ≥ 1 OSR-helper consumer — the
+    /// per-iteration extern call dominates float-heavy inner loops
+    /// (~100 ms on the 100 M-iteration mandelbrot).
+    pub fn set_emit_osr_probes(&mut self, enabled: bool) {
+        self.emit_osr_probes = enabled;
+    }
+
+    /// Whether OSR back-edge probes will be emitted at tier 0.
+    pub fn emit_osr_probes(&self) -> bool {
+        self.emit_osr_probes
     }
 
     /// Tier currently configured for compilation.
@@ -1266,13 +1296,17 @@ impl CraneliftBackend {
 
             // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
             // emits OSR helpers (separate functions) and skips probes.
-            let osr_loop_headers: std::collections::HashSet<HirId> = if self.compile_tier == 0 {
-                crate::osr::find_loop_headers(function)
-                    .into_iter()
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
+            // Additionally suppress when `emit_osr_probes` is false — the
+            // embedder has declared no tier ≥ 1 backend will ever install
+            // OSR helpers, so the probe stream is pure overhead.
+            let osr_loop_headers: std::collections::HashSet<HirId> =
+                if self.compile_tier == 0 && self.emit_osr_probes {
+                    crate::osr::find_loop_headers(function)
+                        .into_iter()
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
             // Stable per-function block index (matches `osr::block_index_of`).
             let osr_block_index: HashMap<HirId, u64> = function
                 .blocks
@@ -1284,14 +1318,15 @@ impl CraneliftBackend {
             // Pre-resolve per-header layouts and the function's return
             // Cranelift type. Doing this before the FunctionBuilder is
             // created avoids re-borrowing `self` during emission.
-            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> = if self.compile_tier == 0 {
-                osr_loop_headers
-                    .iter()
-                    .filter_map(|h| crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l)))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
+                if self.compile_tier == 0 && self.emit_osr_probes {
+                    osr_loop_headers
+                        .iter()
+                        .filter_map(|h| crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l)))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
             let osr_return_clir: Option<cranelift_codegen::ir::Type> =
                 match function.signature.returns.as_slice() {
                     [] => None,
