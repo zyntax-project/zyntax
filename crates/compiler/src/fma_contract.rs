@@ -61,6 +61,9 @@ pub struct FmaStats {
 pub fn run_module(module: &mut HirModule) -> FmaStats {
     let mut stats = FmaStats::default();
     // Temporary regression-bisection gate (Phase 1 mandelbrot drift).
+    // Set ZYNTAX_DISABLE_FMA=1 to disable contraction when bisecting
+    // codegen-level IEEE-754 rounding divergences (e.g. mandelbrot
+    // checksum drift vs rayzor's HashLink reference).
     if std::env::var("ZYNTAX_DISABLE_FMA").is_ok() {
         return stats;
     }
