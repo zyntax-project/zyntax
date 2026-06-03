@@ -458,6 +458,10 @@ fn default_intrinsic_alias_map() -> IndexMap<InternedString, crate::hir::Intrins
         InternedString::new_global("sqrt"),
         crate::hir::Intrinsic::Sqrt,
     );
+    m.insert(
+        InternedString::new_global("abs"),
+        crate::hir::Intrinsic::Fabs,
+    );
     m
 }
 

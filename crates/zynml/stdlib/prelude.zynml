@@ -942,10 +942,14 @@ def for_each<T>(items: List<T>, f: (T) => void) {
 // land once the trait-bound dispatch layer (Ord, Neg) can handle
 // f64/i64 uniformly without runtime overhead.
 
+// abs is intrinsic-aliased: every call site is rewritten at SSA
+// construction time to a direct HIR `Intrinsic::Fabs`, which the
+// Cranelift backend lowers to a single hardware FABS instruction.
+// This body is therefore never lowered or executed; it exists only
+// so the typed-AST / signature layer sees a `def abs(x: f64): f64`
+// in scope. The stub returns x to keep the IR well-formed if the
+// frontend ever bypasses the intrinsic rewrite.
 def abs(x: f64): f64 {
-    if x < 0.0 {
-        return 0.0 - x
-    }
     return x
 }
 

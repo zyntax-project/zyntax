@@ -1803,6 +1803,7 @@ pub enum Intrinsic {
     Memmove,
     // Math
     Sqrt,
+    Fabs,
     Sin,
     Cos,
     Pow,

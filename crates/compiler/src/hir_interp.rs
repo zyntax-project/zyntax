@@ -249,6 +249,14 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// `dst = fabs(src)` — single-arg math intrinsic.
+    /// Emitted when the source-side `abs` name is routed through
+    /// `HirCallable::Intrinsic(Intrinsic::Fabs)`. Mirrors the
+    /// Cranelift backend's `builder.ins().fabs(...)` lowering.
+    FAbs {
+        dst: Reg,
+        src: Reg,
+    },
 
     // ── comparisons (result is Bool) ──
     ICmpEq {
@@ -1094,6 +1102,17 @@ fn lower_inst(
                         .unwrap_or(0);
                     cf.code.push(Op::FSqrt { dst, src: src_reg });
                 }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Fabs) => {
+                    // Single-arg math intrinsic — mirror Cranelift's
+                    // hardware FABS so source-side `abs(x)` works
+                    // through the BC interp too.
+                    let src_reg = cf
+                        .args_pool
+                        .get(args_idx as usize)
+                        .and_then(|args| args.first().copied())
+                        .unwrap_or(0);
+                    cf.code.push(Op::FAbs { dst, src: src_reg });
+                }
                 HirCallable::Intrinsic(_) => {
                     return Err(InterpError::UnsupportedInstruction(
                         "intrinsic call".to_string(),
@@ -1895,6 +1914,11 @@ impl HirInterpreter {
                 Op::FSqrt { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
                     regs[*dst as usize] = ZyntaxValue::Float(x.sqrt());
+                    pc += 1;
+                }
+                Op::FAbs { dst, src } => {
+                    let x = freg_f64(&regs[*src as usize])?;
+                    regs[*dst as usize] = ZyntaxValue::Float(x.abs());
                     pc += 1;
                 }
                 Op::ICmpEq { dst, lhs, rhs } => {

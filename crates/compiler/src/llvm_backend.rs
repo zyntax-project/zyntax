@@ -2920,6 +2920,36 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
 
+            Fabs => {
+                if args.len() != 1 {
+                    return Err(CompilerError::CodeGen(
+                        format!("fabs expects 1 argument, got {}", args.len())
+                    ));
+                }
+
+                let value = self.get_value(args[0])?;
+                let intrinsic_name = if value.is_float_value() {
+                    let float_val = value.into_float_value();
+                    if float_val.get_type() == self.context.f32_type() {
+                        "llvm.fabs.f32"
+                    } else {
+                        "llvm.fabs.f64"
+                    }
+                } else {
+                    return Err(CompilerError::CodeGen(
+                        "fabs requires float argument".to_string()
+                    ));
+                };
+
+                let fabs_fn = self.get_or_declare_intrinsic(intrinsic_name, value.get_type())?;
+                let call_site = self.builder.build_call(fabs_fn, &[value.into()], "fabs")?;
+
+                match call_site.try_as_basic_value() {
+                    ValueKind::Basic(val) => Ok(val),
+                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen("fabs returned void".to_string()))
+                }
+            }
+
             Sin | Cos | Log | Exp => {
                 if args.len() != 1 {
                     return Err(CompilerError::CodeGen(

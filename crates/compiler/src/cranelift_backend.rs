@@ -2082,6 +2082,13 @@ impl CraneliftBackend {
                                                 continue; // Skip if no argument
                                             }
                                         }
+                                        Intrinsic::Fabs => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                builder.ins().fabs(arg)
+                                            } else {
+                                                continue; // Skip if no argument
+                                            }
+                                        }
                                         Intrinsic::Ctpop => {
                                             if let Some(&arg) = arg_values.first() {
                                                 builder.ins().popcnt(arg)
@@ -6188,6 +6195,19 @@ impl CraneliftBackend {
                                 } else {
                                     return Err(CompilerError::Backend(
                                         "sqrt requires 1 argument".into(),
+                                    ));
+                                }
+                            }
+                            crate::hir::Intrinsic::Fabs => {
+                                if args.len() == 1 {
+                                    let val = arg_vals[0];
+                                    let abs_val = builder.ins().fabs(val);
+                                    if let Some(result_id) = result {
+                                        self.value_map.insert(*result_id, abs_val);
+                                    }
+                                } else {
+                                    return Err(CompilerError::Backend(
+                                        "fabs requires 1 argument".into(),
                                     ));
                                 }
                             }
