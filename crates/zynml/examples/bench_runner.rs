@@ -181,7 +181,7 @@ const TARGETS: &[Target] = &[
         // flow lowering for nested-while bodies. Tracked as a
         // follow-up; skip the tiered row for now so the rest of
         // the bench still produces useful numbers.
-        skip_kernels: &["nbody"],
+        skip_kernels: &[],
     },
     // Full ladder: BC interp → Cranelift (tier 0) → LLVM (tier 1).
     // Compiled in only when the `llvm-backend` cargo feature is on;
@@ -199,7 +199,7 @@ const TARGETS: &[Target] = &[
         // LLVM tier sits on top of the Cranelift tier so n-body
         // main hits the same trap before the LLVM compile ever
         // gets a chance to fire.
-        skip_kernels: &["nbody"],
+        skip_kernels: &[],
     },
 ];
 
@@ -475,7 +475,7 @@ fn one_iteration(source: &str, target: &Target) -> Result<(f64, f64, ZyntaxValue
     let program = grammar
         .parse_with_filename(source, "<bench>")
         .map_err(|e| format!("parse: {e:?}"))?;
-    let mut rt = bench_runtime()?;
+    let rt = bench_runtime()?;
     let builtins = rt
         .config()
         .builtins

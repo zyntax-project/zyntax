@@ -95,6 +95,26 @@ fn default_const_for(ty: &HirType) -> crate::hir::HirConstant {
     }
 }
 
+// Aggregate-aware size in bytes for an HIR type. Needed by array-literal
+// lowering: bench n-body `[sun, jupiter, ...]` allocates 5 × 56-byte `Body`
+// structs; without walking into `HirType::Struct`/`Array` the per-elem
+// stride falls back to 8, so each 56-byte memcpy overlaps the next slot
+// and Bodies 2..4 read uninitialised stack → NaN → `as i64` (fcvt_to_sint)
+// traps as UDF 0xc11f at runtime. Mirrors `size_of_hir_ty` in
+// `aggregate_split.rs`; kept local to avoid widening that module's API.
+fn hir_ty_size(ty: &HirType) -> usize {
+    match ty {
+        HirType::Bool | HirType::I8 | HirType::U8 => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Struct(s) => s.fields.iter().map(hir_ty_size).sum::<usize>().max(1),
+        HirType::Array(elem, n) => hir_ty_size(elem).saturating_mul(*n as usize),
+        _ => 8,
+    }
+}
+
 pub struct SsaBuilder {
     /// Current function being built
     function: HirFunction,
@@ -4697,15 +4717,9 @@ impl SsaBuilder {
                     elem_ty
                 };
 
-                // Calculate element size based on type
-                let elem_size = match &elem_ty {
-                    HirType::I8 | HirType::U8 | HirType::Bool => 1,
-                    HirType::I16 | HirType::U16 => 2,
-                    HirType::I32 | HirType::U32 | HirType::F32 => 4,
-                    HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
-                    HirType::I128 | HirType::U128 => 16,
-                    _ => 8, // Default for complex types
-                };
+                // Calculate element size, walking into aggregates so an array
+                // of N-byte structs gets stride N (not the catch-all 8).
+                let elem_size = hir_ty_size(&elem_ty);
                 let num_elements = elements.len();
 
                 // Step 1: Allocate element data buffer
