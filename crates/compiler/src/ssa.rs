@@ -216,6 +216,18 @@ pub struct SsaBuilder {
     /// `resolve_expr_type::Index`. The lowering layer fills this in
     /// before `build_from_typed_cfg` runs; empty otherwise.
     preset_param_typed_ast_types: IndexMap<InternedString, Type>,
+
+    /// Source-side names that should be rewritten to direct HIR
+    /// intrinsics at call-site lowering time. Populated at construction
+    /// with the stdlib intrinsic-aliased functions (e.g. `sqrt` →
+    /// `Intrinsic::Sqrt`). When the Call handler sees a callee
+    /// `Variable(name)` whose name is in this map, it emits
+    /// `HirCallable::Intrinsic(..)` instead of
+    /// `HirCallable::Function(..)`, so the body in `prelude.zynml`
+    /// (a stub returning the argument) is never lowered — every call
+    /// becomes a single Cranelift `fsqrt` (or libm-backed `sin`/`cos`)
+    /// instruction.
+    intrinsic_alias_map: IndexMap<InternedString, crate::hir::Intrinsic>,
 }
 
 /// Context for pattern matching
@@ -432,6 +444,23 @@ impl DominanceInfo {
     }
 }
 
+/// Build the default source-name → HIR-intrinsic alias map.
+///
+/// Names are interned through the *global* interner — the same one
+/// `func_name.resolve_global()` reads when the Call handler looks up
+/// `intrinsic_alias_map.get(func_name)`. This guarantees the
+/// stdlib-side `def sqrt(...)` call site, parsed through the typed-AST
+/// pipeline (which interns via `InternedString::new_global`), resolves
+/// to the same key inserted here.
+fn default_intrinsic_alias_map() -> IndexMap<InternedString, crate::hir::Intrinsic> {
+    let mut m = IndexMap::new();
+    m.insert(
+        InternedString::new_global("sqrt"),
+        crate::hir::Intrinsic::Sqrt,
+    );
+    m
+}
+
 impl SsaBuilder {
     pub fn new(
         function: HirFunction,
@@ -468,6 +497,7 @@ impl SsaBuilder {
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
+            intrinsic_alias_map: default_intrinsic_alias_map(),
         }
     }
 
@@ -509,6 +539,7 @@ impl SsaBuilder {
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
+            intrinsic_alias_map: default_intrinsic_alias_map(),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -3727,6 +3758,34 @@ impl SsaBuilder {
                             // External symbols start with '$' and are resolved at link time
                             (
                                 crate::hir::HirCallable::Symbol(name_str),
+                                None,
+                                Some(*func_name),
+                            )
+                        } else if let Some(&intrinsic) =
+                            self.intrinsic_alias_map.get(func_name).or_else(|| {
+                                // The callee may have been interned through
+                                // an arena distinct from the global interner
+                                // used at alias-map construction. Re-key the
+                                // probe through the resolved string so both
+                                // sides see the same identity.
+                                self.intrinsic_alias_map
+                                    .get(&InternedString::new_global(&name_str))
+                            })
+                        {
+                            // Route stdlib intrinsic-aliased fn (e.g. `sqrt`)
+                            // to a direct Cranelift intrinsic. The body in
+                            // `prelude.zynml` is a stub and never reached at
+                            // codegen — every call site is rewritten here
+                            // into `HirCallable::Intrinsic(..)`, which the
+                            // Cranelift backend lowers to a single hardware
+                            // instruction (FSQRT for Sqrt).
+                            log::debug!(
+                                "[SSA] Routed call '{}' to HIR intrinsic {:?}",
+                                name_str,
+                                intrinsic
+                            );
+                            (
+                                crate::hir::HirCallable::Intrinsic(intrinsic),
                                 None,
                                 Some(*func_name),
                             )

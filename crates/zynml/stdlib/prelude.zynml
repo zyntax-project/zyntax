@@ -984,18 +984,13 @@ def max_i64(a: i64, b: i64): i64 {
     return b
 }
 
-// Square root via Newton-Raphson. Twelve iterations converge to
-// f64 precision from the seed `g0 = x * 0.5` for any positive `x`.
-// Returns 0.0 for non-positive input.
+// sqrt is intrinsic-aliased: every call site is rewritten at SSA
+// construction time to a direct HIR `Intrinsic::Sqrt`, which the
+// Cranelift backend lowers to a single hardware FSQRT instruction.
+// This body is therefore never lowered or executed; it exists only
+// so the typed-AST / signature layer sees a `def sqrt(x: f64): f64`
+// in scope. The stub returns x to keep the IR well-formed if the
+// frontend ever bypasses the intrinsic rewrite.
 def sqrt(x: f64): f64 {
-    if x <= 0.0 {
-        return 0.0
-    }
-    let mut g: f64 = x * 0.5
-    let mut i: i64 = 0
-    while i < 12 {
-        g = 0.5 * (g + x / g)
-        i = i + 1
-    }
-    return g
+    return x
 }
