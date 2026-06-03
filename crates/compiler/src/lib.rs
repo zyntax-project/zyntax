@@ -1665,6 +1665,7 @@ pub struct InterpOptStats {
     pub const_fold: const_fold::FoldStats,
     pub cse: cse::CseStats,
     pub load_cse: load_cse::LoadCseStats,
+    pub aggregate_split: aggregate_split::AggregateSplitStats,
     pub licm: licm::LicmStats,
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
@@ -1773,6 +1774,9 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
         stats.load_cse.eliminated += lcse.eliminated;
+        stats.aggregate_split.round_trips_removed += ags.round_trips_removed;
+        stats.aggregate_split.field_accesses_emitted += ags.field_accesses_emitted;
+        stats.aggregate_split.field_reads_only += ags.field_reads_only;
         stats.inline.inlined += il.inlined;
         stats.inline.call_sites_visited += il.call_sites_visited;
         stats.inline.skipped_too_large += il.skipped_too_large;
