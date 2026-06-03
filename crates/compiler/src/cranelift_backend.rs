@@ -32,6 +32,64 @@ use crate::{CompilerError, CompilerResult};
 
 static CRANELIFT_SKIPPED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Maximum aggregate size (in bytes) for which inline scalar copy is
+/// emitted in place of a libc `memcpy` thunk. Above this threshold the
+/// per-byte amortised cost of the call/return is negligible and the
+/// inlined unrolled sequence would bloat code size for no gain.
+///
+/// 64 B covers the hot nbody `Body` struct (56 B = pos×3 + vel×3 + mass)
+/// without spilling code-cache.
+const INLINE_COPY_MAX_BYTES: u32 = 64;
+
+/// Emit an inline byte-by-byte aggregate copy using straight-line
+/// scalar loads/stores. Used in place of `call_memcpy` for small
+/// aggregates (`size <= INLINE_COPY_MAX_BYTES`) where the libc thunk's
+/// call/return overhead dominates the actual byte movement.
+///
+/// Strategy: greedy power-of-two chunking — 8 bytes (i64) while at
+/// least 8 bytes remain, then a single trailing i32 / i16 / i8 for
+/// the residual. Total emit cost is `(size+7)/8` load/store pairs
+/// (≤ 9 pairs for size=64), all `notrap` so the optimiser is free
+/// to fold or reorder.
+///
+/// Free function (not a `&self` method) so the call site can hold a
+/// `&mut FunctionBuilder` that already mutably borrows
+/// `self.codegen_context.func` without a re-borrow conflict.
+fn emit_inline_aggregate_copy(
+    builder: &mut cranelift_frontend::FunctionBuilder,
+    dst: Value,
+    src: Value,
+    size: u32,
+) {
+    let flags = cranelift_codegen::ir::MemFlags::new().with_notrap();
+    let mut offset: i32 = 0;
+    let size_i32 = size as i32;
+
+    // 8-byte chunks
+    while offset + 8 <= size_i32 {
+        let v = builder.ins().load(types::I64, flags, src, offset);
+        builder.ins().store(flags, v, dst, offset);
+        offset += 8;
+    }
+    // 4-byte tail
+    if offset + 4 <= size_i32 {
+        let v = builder.ins().load(types::I32, flags, src, offset);
+        builder.ins().store(flags, v, dst, offset);
+        offset += 4;
+    }
+    // 2-byte tail
+    if offset + 2 <= size_i32 {
+        let v = builder.ins().load(types::I16, flags, src, offset);
+        builder.ins().store(flags, v, dst, offset);
+        offset += 2;
+    }
+    // 1-byte tail
+    if offset + 1 <= size_i32 {
+        let v = builder.ins().load(types::I8, flags, src, offset);
+        builder.ins().store(flags, v, dst, offset);
+    }
+}
+
 /// Number of function bodies skipped by Cranelift due to recoverable codegen errors.
 pub fn cranelift_skipped_function_count() -> usize {
     CRANELIFT_SKIPPED_FUNCTIONS.load(Ordering::Relaxed)
@@ -3269,13 +3327,27 @@ impl CraneliftBackend {
                                         ),
                                     );
                                     let dst = builder.ins().stack_addr(pointer_type, slot, 0);
-                                    let size_val = builder.ins().iconst(types::I64, size as i64);
-                                    builder.call_memcpy(
-                                        self.module.target_config(),
-                                        dst,
-                                        ptr_val,
-                                        size_val,
-                                    );
+                                    // Inline scalar copy for small aggregates
+                                    // (≤ INLINE_COPY_MAX_BYTES) — avoids
+                                    // libc memcpy thunk overhead on hot
+                                    // struct-load paths (nbody's bodies[i]).
+                                    if (size as u32) <= INLINE_COPY_MAX_BYTES {
+                                        emit_inline_aggregate_copy(
+                                            &mut builder,
+                                            dst,
+                                            ptr_val,
+                                            size as u32,
+                                        );
+                                    } else {
+                                        let size_val =
+                                            builder.ins().iconst(types::I64, size as i64);
+                                        builder.call_memcpy(
+                                            self.module.target_config(),
+                                            dst,
+                                            ptr_val,
+                                            size_val,
+                                        );
+                                    }
                                     self.value_map.insert(*result, dst);
                                 } else {
                                     // Zero-sized aggregate: just route
@@ -3327,13 +3399,27 @@ impl CraneliftBackend {
                             if is_aggregate {
                                 let size = size_cache.get(value_ty.unwrap()).copied().unwrap_or(0);
                                 if size > 0 {
-                                    let size_val = builder.ins().iconst(types::I64, size as i64);
-                                    builder.call_memcpy(
-                                        self.module.target_config(),
-                                        ptr_val,
-                                        val,
-                                        size_val,
-                                    );
+                                    // Inline scalar copy for small aggregates
+                                    // (≤ INLINE_COPY_MAX_BYTES) — avoids
+                                    // libc memcpy thunk overhead on hot
+                                    // struct-store paths (nbody's bodies[i] =).
+                                    if (size as u32) <= INLINE_COPY_MAX_BYTES {
+                                        emit_inline_aggregate_copy(
+                                            &mut builder,
+                                            ptr_val,
+                                            val,
+                                            size as u32,
+                                        );
+                                    } else {
+                                        let size_val =
+                                            builder.ins().iconst(types::I64, size as i64);
+                                        builder.call_memcpy(
+                                            self.module.target_config(),
+                                            ptr_val,
+                                            val,
+                                            size_val,
+                                        );
+                                    }
                                 }
                             } else {
                                 builder.ins().store(flags, val, ptr_val, 0);
