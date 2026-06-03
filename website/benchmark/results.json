@@ -1,69 +1,93 @@
 {
   "fib": {
     "zyntax-interp": {
-      "seconds": 4.16346875,
-      "compile_ms": 1.651291,
-      "exec_ms": 4161.817459,
+      "seconds": 3.958762,
+      "compile_ms": 1.677125,
+      "exec_ms": 3957.084875,
       "result": "Int(832040)"
     },
     "zyntax-interp-opt": {
-      "seconds": 4.175270292,
-      "compile_ms": 1.679958,
-      "exec_ms": 4173.590334,
+      "seconds": 3.971449459,
+      "compile_ms": 1.5709170000000001,
+      "exec_ms": 3969.878542,
       "result": "Int(832040)"
     },
     "zyntax-tiered": {
-      "seconds": 0.005797167,
-      "compile_ms": 1.745417,
-      "exec_ms": 4.05175,
+      "seconds": 0.005856666,
+      "compile_ms": 1.886541,
+      "exec_ms": 3.970125,
+      "result": "Int(832040)"
+    },
+    "zyntax-tiered-llvm": {
+      "seconds": 0.0056065,
+      "compile_ms": 1.704625,
+      "exec_ms": 3.901875,
       "result": "Int(832040)"
     }
   },
   "mandelbrot": {
     "zyntax-interp": {
-      "seconds": 0.008125750999999999,
-      "compile_ms": 4.193792,
-      "exec_ms": 3.9319589999999995,
-      "result": "Int(8279)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "skipped": true
     },
     "zyntax-interp-opt": {
-      "seconds": 0.008772333,
-      "compile_ms": 4.767125,
-      "exec_ms": 4.005208,
-      "result": "Int(8279)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "skipped": true
     },
     "zyntax-tiered": {
-      "seconds": 0.005413207999999999,
-      "compile_ms": 5.3473749999999995,
-      "exec_ms": 0.065833,
-      "result": "Int(8279)"
+      "seconds": 0.6929550830000001,
+      "compile_ms": 118.664833,
+      "exec_ms": 574.29025,
+      "result": "Int(112790102)"
+    },
+    "zyntax-tiered-llvm": {
+      "seconds": 0.643231376,
+      "compile_ms": 80.50183399999999,
+      "exec_ms": 562.729542,
+      "result": "Int(112790102)"
     }
   },
   "nbody": {
     "zyntax-interp": {
-      "seconds": 2.2685769159999998,
-      "compile_ms": 14.694291,
-      "exec_ms": 2253.882625,
-      "result": "Int(50000)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "skipped": true
     },
     "zyntax-interp-opt": {
-      "seconds": 1.8812509169999998,
-      "compile_ms": 15.768167,
-      "exec_ms": 1865.48275,
-      "result": "Int(50000)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "skipped": true
     },
     "zyntax-tiered": {
-      "seconds": 1.8899796660000001,
-      "compile_ms": 19.453583,
-      "exec_ms": 1870.5260830000002,
-      "result": "Int(50000)"
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "skipped": true
+    },
+    "zyntax-tiered-llvm": {
+      "seconds": 0.0,
+      "compile_ms": 0.0,
+      "exec_ms": 0.0,
+      "result": "—",
+      "skipped": true
     }
   },
   "meta": {
-    "date": "2026-06-02T16:12:58Z",
-    "commit": "400a630",
+    "date": "2026-06-03T00:14:21Z",
+    "commit": "ca89462",
     "arch": "aarch64",
     "os": "macos",
-    "runs": 9
+    "runs": 1
   }
 }

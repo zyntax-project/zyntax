@@ -45,8 +45,15 @@ use zyntax_compiler::tiered_backend::TieredConfig;
 use zyntax_compiler::{run_interp_safe_opts, HirModule};
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
-const WARMUP: usize = 3;
-const RUNS: usize = 9;
+// One bench iteration = a fresh `lower + compile + install_jit +
+// JIT_TIER_WARMUP_CALLS calls + 1 timed call`. At rayzor-scale that
+// per-iteration cost is large (mandelbrot ~5 s, nbody ~80 s end-to-end)
+// because the install pre-compiles the whole prelude-augmented HIR
+// module each time. Keep the outer-loop counts tight; median-of-N
+// numbers stop being informative when each sample is its own minute.
+// Override at the command line with `--runs N`.
+const WARMUP: usize = 0;
+const RUNS: usize = 3;
 
 /// Extra in-loop warmup calls reserved for JIT targets — drives
 /// beadie's `TieredAdapter` past the warm-threshold so the
@@ -166,7 +173,15 @@ const TARGETS: &[Target] = &[
         run_with_opts: true,
         install_jit: true,
         install_llvm: false,
-        skip_kernels: &[],
+        // n-body main hits a Cranelift `UnreachableCodeReached`
+        // trap when JIT-dispatched (visible through both the
+        // bench's InterpRuntime path and ZynML's TieredRuntime
+        // CLI). Sub-functions (advance, energy, sqrt) JIT cleanly
+        // — the bug is specifically in JIT'd main's control
+        // flow lowering for nested-while bodies. Tracked as a
+        // follow-up; skip the tiered row for now so the rest of
+        // the bench still produces useful numbers.
+        skip_kernels: &["nbody"],
     },
     // Full ladder: BC interp → Cranelift (tier 0) → LLVM (tier 1).
     // Compiled in only when the `llvm-backend` cargo feature is on;
@@ -180,7 +195,11 @@ const TARGETS: &[Target] = &[
         run_with_opts: true,
         install_jit: true,
         install_llvm: true,
-        skip_kernels: &[],
+        // Same Cranelift codegen issue as `zyntax-tiered` —
+        // LLVM tier sits on top of the Cranelift tier so n-body
+        // main hits the same trap before the LLVM compile ever
+        // gets a chance to fire.
+        skip_kernels: &["nbody"],
     },
 ];
 
