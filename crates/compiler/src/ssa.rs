@@ -1147,18 +1147,30 @@ impl SsaBuilder {
             }
 
             TypedTerminator::Unreachable => {
-                // Handle implicit returns for functions without explicit return statements
-                match &self.original_return_type {
-                    Some(Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)) | None => {
-                        // Void/Unit return or no return type specified - implicit void return
-                        HirTerminator::Return { values: vec![] }
-                    }
-                    Some(_return_ty) => {
-                        // Non-void function: check if last statement in the block is an expression to implicitly return
-                        // We need to look at the TypedBasicBlock to see if there's an expression statement at the end
-                        // that we should implicitly return
-                        // For now, keep as Unreachable - the type checker should catch missing returns
-                        HirTerminator::Unreachable
+                // Handle implicit returns for functions without explicit return statements.
+                // BC interp errors on Op::Unreachable but in practice never reaches it
+                // (real returns elsewhere fire first); the Cranelift and LLVM backends
+                // emit a runtime trap for non-void functions which surfaces as a
+                // UnreachableCodeReached fault on otherwise-correct code (nbody's
+                // nested-while main was the first kernel to hit it). Synthesise a
+                // Return with zero-valued operands so the JIT matches BC interp's
+                // observable behaviour for paths the program never executes.
+                if self.function.signature.returns.is_empty() {
+                    HirTerminator::Return { values: vec![] }
+                } else {
+                    let zero_values: Vec<HirId> = self
+                        .function
+                        .signature
+                        .returns
+                        .clone()
+                        .into_iter()
+                        .map(|ret_ty| {
+                            let konst = default_const_for(&ret_ty);
+                            self.create_value(ret_ty, HirValueKind::Constant(konst))
+                        })
+                        .collect();
+                    HirTerminator::Return {
+                        values: zero_values,
                     }
                 }
             }

@@ -186,14 +186,6 @@ const TARGETS: &[Target] = &[
         run_with_opts: true,
         install_jit: true,
         install_llvm: false,
-        // n-body main hits a Cranelift `UnreachableCodeReached`
-        // trap when JIT-dispatched (visible through both the
-        // bench's InterpRuntime path and ZynML's TieredRuntime
-        // CLI). Sub-functions (advance, energy, sqrt) JIT cleanly
-        // — the bug is specifically in JIT'd main's control
-        // flow lowering for nested-while bodies. Tracked as a
-        // follow-up; skip the tiered row for now so the rest of
-        // the bench still produces useful numbers.
         skip_kernels: &[],
     },
     // Full ladder: BC interp → Cranelift (tier 0) → LLVM (tier 1).
@@ -208,10 +200,6 @@ const TARGETS: &[Target] = &[
         run_with_opts: true,
         install_jit: true,
         install_llvm: true,
-        // Same Cranelift codegen issue as `zyntax-tiered` —
-        // LLVM tier sits on top of the Cranelift tier so n-body
-        // main hits the same trap before the LLVM compile ever
-        // gets a chance to fire.
         skip_kernels: &[],
     },
 ];
