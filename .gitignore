@@ -28,3 +28,6 @@ docs/session-archive/
 
 output/
 test/output/
+
+# Rayzor BLADE/MIR caches — created if rayzor CLI is invoked from this directory
+.rayzor/
