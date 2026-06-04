@@ -249,6 +249,15 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// `dst = 1.0 / sqrt(src)` — single-arg math intrinsic.
+    /// Emitted when the source-side `rsqrt` name is routed through
+    /// `HirCallable::Intrinsic(Intrinsic::Rsqrt)`. Mirrors the
+    /// Cranelift backend's `fdiv(fconst 1.0, sqrt(x))` lowering and
+    /// LLVM's `fdiv(1.0, llvm.sqrt)` form.
+    FRsqrt {
+        dst: Reg,
+        src: Reg,
+    },
     /// `dst = fabs(src)` — single-arg math intrinsic.
     /// Emitted when the source-side `abs` name is routed through
     /// `HirCallable::Intrinsic(Intrinsic::Fabs)`. Mirrors the
@@ -1114,6 +1123,18 @@ fn lower_inst(
                         .unwrap_or(0);
                     cf.code.push(Op::FSqrt { dst, src: src_reg });
                 }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Rsqrt) => {
+                    // Single-arg reciprocal-square-root intrinsic —
+                    // mirror Cranelift's `fdiv(1.0, sqrt(x))` lowering
+                    // so source-side `rsqrt(x)` works through the BC
+                    // interp too.
+                    let src_reg = cf
+                        .args_pool
+                        .get(args_idx as usize)
+                        .and_then(|args| args.first().copied())
+                        .unwrap_or(0);
+                    cf.code.push(Op::FRsqrt { dst, src: src_reg });
+                }
                 HirCallable::Intrinsic(crate::hir::Intrinsic::Fabs) => {
                     // Single-arg math intrinsic — mirror Cranelift's
                     // hardware FABS so source-side `abs(x)` works
@@ -1941,6 +1962,11 @@ impl HirInterpreter {
                 Op::FSqrt { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
                     regs[*dst as usize] = ZyntaxValue::Float(x.sqrt());
+                    pc += 1;
+                }
+                Op::FRsqrt { dst, src } => {
+                    let x = freg_f64(&regs[*src as usize])?;
+                    regs[*dst as usize] = ZyntaxValue::Float(1.0 / x.sqrt());
                     pc += 1;
                 }
                 Op::FAbs { dst, src } => {

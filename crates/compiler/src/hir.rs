@@ -1803,6 +1803,13 @@ pub enum Intrinsic {
     Memmove,
     // Math
     Sqrt,
+    /// Reciprocal square root. Equivalent to `1.0 / sqrt(x)` but lowered
+    /// as a single intrinsic. Standard `math.h`-style operation used in
+    /// vector normalization (graphics, physics), attention scaling
+    /// (transformers), RMSNorm (LLMs), Adam/RMSprop optimizers,
+    /// Gaussian/chi-squared distributions, inverse-square potentials
+    /// (Coulomb, gravity), and any `1/||x||` normalization.
+    Rsqrt,
     Fabs,
     /// Fused multiply-add: `fma(a, b, c) = a * b + c` with a single
     /// IEEE-754 round at the end. Emitted by the `fma_contract` pass

@@ -2920,6 +2920,60 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
 
+            Rsqrt => {
+                // Reciprocal square root: `1.0 / sqrt(x)`. Lowered via
+                // `llvm.sqrt.{f32,f64}` + `fdiv`; LLVM's instruction
+                // selector can pattern-match this to `rsqrt`-style
+                // hardware (e.g. AArch64 FRSQRTE) under fast-math /
+                // unsafe-fp-math, while staying correct under the
+                // default IEEE-754 model.
+                if args.len() != 1 {
+                    return Err(CompilerError::CodeGen(
+                        format!("rsqrt expects 1 argument, got {}", args.len())
+                    ));
+                }
+
+                let value = self.get_value(args[0])?;
+
+                if !value.is_float_value() {
+                    return Err(CompilerError::CodeGen(
+                        "rsqrt requires float argument".to_string()
+                    ));
+                }
+
+                let float_val = value.into_float_value();
+                let is_f32 = float_val.get_type() == self.context.f32_type();
+                let intrinsic_name = if is_f32 {
+                    "llvm.sqrt.f32"
+                } else {
+                    "llvm.sqrt.f64"
+                };
+
+                let sqrt_fn = self.get_or_declare_intrinsic(intrinsic_name, value.get_type())?;
+                let sqrt_call = self.builder.build_call(sqrt_fn, &[value.into()], "sqrt")?;
+                let sqrt_val = match sqrt_call.try_as_basic_value() {
+                    ValueKind::Basic(val) => val,
+                    ValueKind::Instruction(_) => {
+                        return Err(CompilerError::CodeGen(
+                            "sqrt returned void".to_string()
+                        ));
+                    }
+                };
+
+                let one = if is_f32 {
+                    self.context.f32_type().const_float(1.0)
+                } else {
+                    self.context.f64_type().const_float(1.0)
+                };
+
+                let result = self.builder.build_float_div(
+                    one,
+                    sqrt_val.into_float_value(),
+                    "rsqrt",
+                )?;
+                Ok(result.into())
+            }
+
             Fabs => {
                 if args.len() != 1 {
                     return Err(CompilerError::CodeGen(

@@ -2140,6 +2140,26 @@ impl CraneliftBackend {
                                                 continue; // Skip if no argument
                                             }
                                         }
+                                        Intrinsic::Rsqrt => {
+                                            // Reciprocal square root, lowered as
+                                            // `1.0 / sqrt(x)`. Cranelift has no
+                                            // direct FRSQRTE op; this keeps the
+                                            // math correct on all targets.
+                                            // Hardware estimate + Newton
+                                            // refinement is a future optimisation.
+                                            if let Some(&arg) = arg_values.first() {
+                                                let sq = builder.ins().sqrt(arg);
+                                                let arg_ty = builder.func.dfg.value_type(arg);
+                                                let one = if arg_ty == types::F32 {
+                                                    builder.ins().f32const(1.0_f32)
+                                                } else {
+                                                    builder.ins().f64const(1.0_f64)
+                                                };
+                                                builder.ins().fdiv(one, sq)
+                                            } else {
+                                                continue; // Skip if no argument
+                                            }
+                                        }
                                         Intrinsic::Fabs => {
                                             if let Some(&arg) = arg_values.first() {
                                                 builder.ins().fabs(arg)
@@ -6292,6 +6312,30 @@ impl CraneliftBackend {
                                 } else {
                                     return Err(CompilerError::Backend(
                                         "sqrt requires 1 argument".into(),
+                                    ));
+                                }
+                            }
+                            crate::hir::Intrinsic::Rsqrt => {
+                                // Reciprocal square root, lowered as
+                                // `1.0 / sqrt(x)`. Cranelift has no direct
+                                // FRSQRTE op; hardware estimate + Newton
+                                // refinement is a future optimisation.
+                                if args.len() == 1 {
+                                    let val = arg_vals[0];
+                                    let sq = builder.ins().sqrt(val);
+                                    let arg_ty = builder.func.dfg.value_type(val);
+                                    let one = if arg_ty == types::F32 {
+                                        builder.ins().f32const(1.0_f32)
+                                    } else {
+                                        builder.ins().f64const(1.0_f64)
+                                    };
+                                    let rsqrt_val = builder.ins().fdiv(one, sq);
+                                    if let Some(result_id) = result {
+                                        self.value_map.insert(*result_id, rsqrt_val);
+                                    }
+                                } else {
+                                    return Err(CompilerError::Backend(
+                                        "rsqrt requires 1 argument".into(),
                                     ));
                                 }
                             }
