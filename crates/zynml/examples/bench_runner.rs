@@ -154,7 +154,13 @@ struct Meta {
 /// Each benchmark source lives at
 /// `crates/zynml/examples/<name>.zynml` and gets run across every
 /// target listed in [`TARGETS`].
-const KERNELS: &[&str] = &["bench_mandelbrot", "bench_nbody", "bench_fib"];
+const KERNELS: &[&str] = &[
+    "bench_mandelbrot",
+    "bench_nbody",
+    "bench_fib",
+    "bench_inlined_call",
+    "bench_free_function_call",
+];
 
 /// Each target produces one [`TargetResult`] per kernel.
 const TARGETS: &[Target] = &[

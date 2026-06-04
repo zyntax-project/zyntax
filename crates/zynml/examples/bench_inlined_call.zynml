@@ -1,0 +1,19 @@
+// Inlined-call baseline for the method-call latency microbench.
+//
+// Same arithmetic as `bench_method_call.zynml` but spelled directly
+// inline — no method dispatch, no function entry/exit. The
+// wall-clock delta between this kernel and `bench_method_call`
+// quantifies our per-call dispatch overhead at the JIT tier.
+//
+// Returns sum after 100M iterations.
+
+def main(): i64 {
+    let factor: f64 = 1.0
+    let mut sum: f64 = 0.0
+    let mut i: i64 = 0
+    while i < 100000000 {
+        sum = sum * factor + 1.0
+        i = i + 1
+    }
+    return sum as i64
+}

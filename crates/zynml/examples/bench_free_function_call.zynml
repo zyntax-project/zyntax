@@ -1,0 +1,24 @@
+// Free-function call latency microbench.
+//
+// Tracks the same arithmetic as `bench_method_call.zynml` but calls
+// a top-level `def` instead of a method on a struct. Lets us split
+// the dispatch tax into two components by comparing against
+// `bench_inlined_call.zynml` (baseline) and `bench_method_call`
+// (method dispatch on top of plain call entry/exit).
+//
+// Returns sum after 100M iterations.
+
+def step(x: f64, factor: f64): f64 {
+    return x * factor + 1.0
+}
+
+def main(): i64 {
+    let factor: f64 = 1.0
+    let mut sum: f64 = 0.0
+    let mut i: i64 = 0
+    while i < 100000000 {
+        sum = step(sum, factor)
+        i = i + 1
+    }
+    return sum as i64
+}
