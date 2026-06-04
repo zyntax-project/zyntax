@@ -2909,7 +2909,17 @@ pub struct TieredRuntime {
 impl TieredRuntime {
     /// Create a tiered runtime with the given configuration
     pub fn new(config: TieredConfig) -> RuntimeResult<Self> {
-        let backend = TieredBackend::new(config.clone())?;
+        let mut backend = TieredBackend::new(config.clone())?;
+
+        // OSR back-edge probes fire on every loop header but the
+        // tier-up consumer side is not wired on this path. Until it
+        // is, they are pure overhead — disable them so the production
+        // tier matches the interp-jit path (see interp_runtime.rs).
+        // Mirrors the gate in `compile_module`; applied at construction
+        // so consumers that reach the backend through other entry
+        // points (e.g. plugin loading before any `compile_module`
+        // call) also avoid the tax.
+        backend.set_emit_osr_probes(false);
 
         Ok(Self {
             backend,
