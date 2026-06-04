@@ -1831,6 +1831,19 @@ impl HirInterpreter {
             }
         }
 
+        // Pre-resolve `cf.symbol_pool` (Vec<String>) into a parallel
+        // `Vec<Option<SymbolEntry>>` once at the top of dispatch. The
+        // Op::CallSym hot path then indexes this Vec directly instead
+        // of cloning the name, hashing it, and probing
+        // `self.symbols: HashMap<String, _>` per call. Unresolved
+        // entries (rare — registration race or wasm dispatcher path)
+        // fall back to the HashMap at the dispatch site.
+        let resolved_symbols: Vec<Option<SymbolEntry>> = cf
+            .symbol_pool
+            .iter()
+            .map(|name| self.symbols.get(name).copied())
+            .collect();
+
         let mut pc: usize = 0;
         let code = &cf.code;
 
@@ -2263,14 +2276,15 @@ impl HirInterpreter {
                     let arg_regs = &cf.args_pool[*args as usize];
                     let arg_vals: Vec<ZyntaxValue> =
                         arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
-                    let name = cf.symbol_pool[*sym as usize].clone();
+                    let sym_idx = *sym as usize;
 
                     // Phase J.5 wasm32 escape hatch: route through the
                     // installed symbol-call dispatcher first. A `Some(v)`
                     // return short-circuits the transmute path; `None`
                     // falls through to the native transmute below.
                     let dispatched = if let Some(disp) = self.symbol_call_dispatcher.as_mut() {
-                        disp(&name, arg_vals.clone())?
+                        let name = &cf.symbol_pool[sym_idx];
+                        disp(name, arg_vals.clone())?
                     } else {
                         None
                     };
@@ -2278,11 +2292,20 @@ impl HirInterpreter {
                     let result_val = if let Some(v) = dispatched {
                         v
                     } else {
-                        let entry = self
-                            .symbols
-                            .get(&name)
-                            .copied()
-                            .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
+                        // Fast path: pre-resolved entry from `run()`
+                        // entry. Slow path: re-probe `self.symbols`
+                        // for symbols registered after this `run` started
+                        // (rare).
+                        let entry = match resolved_symbols.get(sym_idx).and_then(|e| *e) {
+                            Some(e) => e,
+                            None => {
+                                let name = &cf.symbol_pool[sym_idx];
+                                self.symbols
+                                    .get(name)
+                                    .copied()
+                                    .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?
+                            }
+                        };
                         let raw = call_extern_symbol(entry.ptr, &arg_vals);
                         let ty = &cf.type_pool[*ret_ty as usize];
                         value_from_i64_as(ty, raw)
