@@ -318,10 +318,14 @@ impl ZynML {
     }
 
     /// Call a function by name with no arguments
+    ///
+    /// The function's return value (if any) is discarded — the CLI just
+    /// wants to drive the program to completion. Use
+    /// [`Self::call_with_result`] if you need the value.
     pub fn call(&mut self, name: &str) -> Result<()> {
         match &self.runtime {
-            RuntimeEngine::Classic(rt) => rt.call::<()>(name, &[]),
-            RuntimeEngine::Tiered(rt) => rt.call::<()>(name, &[]),
+            RuntimeEngine::Classic(rt) => rt.call_raw(name, &[]).map(|_| ()),
+            RuntimeEngine::Tiered(rt) => rt.call_raw(name, &[]).map(|_| ()),
         }
         .with_context(|| format!("Failed to call function: {}", name))
     }

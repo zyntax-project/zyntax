@@ -1476,16 +1476,17 @@ impl ZyntaxRuntime {
             .get_function_ptr(name)
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
 
-        // Check if this is a void function using the stored signature
+        // If we have a recorded HIR-derived signature, the function uses the
+        // native scalar/pointer ABI (i64/f64/etc. returns), not the
+        // DynamicValue ABI. Dispatch through `call_native_with_signature` so
+        // scalar return values (e.g. `def main(): i64`) are decoded
+        // correctly. Without this, an i64 return value gets reinterpreted as
+        // a `DynamicValue { type_meta, value_ptr }` pair and the next
+        // dereference SIGSEGVs — see `bench_fib.zynml` and friends.
         if let Some(sig) = self.function_signatures.get(name) {
-            if sig.ret == NativeType::Void {
-                // For void functions, use the native calling convention
-                // SAFETY: We trust the function signature is correct
-                unsafe {
-                    call_native_with_signature(ptr, args, sig)?;
-                }
-                return Ok(ZyntaxValue::Void);
-            }
+            // SAFETY: We trust the function signature stored at load time
+            // matches the JIT-compiled function's actual signature.
+            return unsafe { call_native_with_signature(ptr, args, sig) };
         }
 
         // Convert arguments to DynamicValues
@@ -3050,16 +3051,16 @@ impl TieredRuntime {
             .get_function_pointer(*func_id)
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
 
-        // Check if this is a void function using the stored signature
+        // If we have a recorded HIR-derived signature, the function uses
+        // the native scalar/pointer ABI rather than the DynamicValue ABI.
+        // Dispatch through `call_native_with_signature` so scalar returns
+        // (e.g. `def main(): i64`) are decoded correctly. Without this,
+        // raw i64 returns get reinterpreted as a `DynamicValue` struct and
+        // the subsequent dereference SIGSEGVs.
         if let Some(sig) = self.function_signatures.get(name) {
-            if sig.ret == NativeType::Void {
-                // For void functions, use the native calling convention
-                // SAFETY: We trust the function signature is correct
-                unsafe {
-                    call_native_with_signature(ptr, args, sig)?;
-                }
-                return Ok(ZyntaxValue::Void);
-            }
+            // SAFETY: signature stored at load time matches the JIT
+            // function's actual signature.
+            return unsafe { call_native_with_signature(ptr, args, sig) };
         }
 
         // Convert arguments to DynamicValues
