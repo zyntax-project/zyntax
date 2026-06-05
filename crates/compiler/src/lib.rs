@@ -1732,7 +1732,16 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     // syntactically identical to another's). Capped at 8 outer
     // rounds — well above what real source needs but a guard against
     // pathological pass-feedback loops.
+    //
+    // Wall-clock circuit breaker: if any single round exceeds 5 s,
+    // bail out of further rounds. HIR is valid at any round boundary
+    // (every pass leaves a well-formed module), so this converts a
+    // potential hang into "slightly less-optimized code". Safety net
+    // for the relaxed inliner — the relaxations open new shapes the
+    // downstream passes haven't been audited against.
+    const ROUND_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     for _ in 0..8 {
+        let round_start = std::time::Instant::now();
         let cf = const_fold::fold_module(module);
         let cs = cse::eliminate_module(module);
         // FMA contraction runs after const_fold + cse so we don't
@@ -1807,6 +1816,11 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.inline.skipped_multi_block += il.skipped_multi_block;
         stats.inline.skipped_unsupported += il.skipped_unsupported;
         stats.inline.skipped_indirect += il.skipped_indirect;
+        stats.inline.inlined_multiblock_alloca += il.inlined_multiblock_alloca;
+        stats.inline.inlined_multiblock_intrinsic_call += il.inlined_multiblock_intrinsic_call;
+        stats.inline.skipped_caller_budget += il.skipped_caller_budget;
+        stats.inline.skipped_per_pass_cap += il.skipped_per_pass_cap;
+        stats.inline.skipped_post_inline_overflow += il.skipped_post_inline_overflow;
         stats.licm.hoisted += lc.hoisted;
         stats.licm.loops_visited += lc.loops_visited;
         stats.licm.loops_skipped_no_preheader += lc.loops_skipped_no_preheader;
@@ -1822,6 +1836,13 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.cfg_simplify.merged += cs_cfg.merged;
 
         if !made_progress {
+            break;
+        }
+
+        if round_start.elapsed() > ROUND_WALL_CLOCK_BUDGET {
+            // Round took too long — almost certainly a runaway loop
+            // in one of the relaxed passes. Stop iterating; the
+            // module is still well-formed.
             break;
         }
     }
