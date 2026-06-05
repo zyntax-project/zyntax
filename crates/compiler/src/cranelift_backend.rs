@@ -7,7 +7,16 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::entities::Value;
 use cranelift_codegen::ir::types;
-use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
+use cranelift_codegen::ir::{
+    AbiParam, BlockArg, MemFlagsData as MemFlags, Signature, UserFuncName,
+};
+
+/// Wraps `&[Value]` as `Vec<BlockArg>` for jump/brif calls.
+/// Cranelift 0.133+ requires `BlockArg` rather than raw `Value`.
+#[inline]
+fn ba(args: &[Value]) -> Vec<BlockArg> {
+    args.iter().map(|&v| BlockArg::Value(v)).collect()
+}
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_codegen::verify_function;
@@ -61,7 +70,7 @@ fn emit_inline_aggregate_copy(
     src: Value,
     size: u32,
 ) {
-    let flags = cranelift_codegen::ir::MemFlags::new().with_notrap();
+    let flags = cranelift_codegen::ir::MemFlagsData::new().with_notrap();
     let mut offset: i32 = 0;
     let size_i32 = size as i32;
 
@@ -1691,6 +1700,7 @@ impl CraneliftBackend {
                             cranelift_codegen::ir::StackSlotData::new(
                                 cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                 alloc_size,
+                                0,
                             ),
                         );
                         let ptr = builder.ins().stack_addr(pointer_type, slot, 0);
@@ -1726,7 +1736,7 @@ impl CraneliftBackend {
             // for its phis) consume these directly.
             if let Some(layout) = &osr_helper {
                 let header_block = block_map[&layout.header];
-                builder.ins().jump(header_block, &osr_phi_jump_args);
+                builder.ins().jump(header_block, &ba(&osr_phi_jump_args));
             }
 
             // Track which blocks can be sealed and which are already sealed
@@ -2462,8 +2472,7 @@ impl CraneliftBackend {
                                                     // Primitives: allocate stack slot and store pointer to it
                                                     let value_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                                                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                                        8,
-                                                    ));
+                                                        8, 0,));
                                                     let value_addr = builder.ins().stack_addr(
                                                         types::I64,
                                                         value_slot,
@@ -2480,7 +2489,7 @@ impl CraneliftBackend {
                                                                 .sextend(types::I64, arg_val)
                                                         }
                                                         types::F32 => {
-                                                            let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), arg_val);
+                                                            let as_i32 = builder.ins().bitcast(types::I32, cranelift_codegen::ir::MemFlagsData::new(), arg_val);
                                                             builder
                                                                 .ins()
                                                                 .uextend(types::I64, as_i32)
@@ -2488,7 +2497,7 @@ impl CraneliftBackend {
                                                         _ => arg_val,
                                                     };
                                                     builder.ins().store(
-                                                        cranelift_codegen::ir::MemFlags::new(),
+                                                        cranelift_codegen::ir::MemFlagsData::new(),
                                                         data_value,
                                                         value_addr,
                                                         0,
@@ -2499,15 +2508,14 @@ impl CraneliftBackend {
                                                 // Create DynamicBox on stack
                                                 let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                                                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                                    32,
-                                                ));
+                                                    32, 0,));
                                                 let box_addr =
                                                     builder.ins().stack_addr(types::I64, slot, 0);
                                                 let tag_val = builder
                                                     .ins()
                                                     .iconst(types::I32, tag_value as i64);
                                                 builder.ins().store(
-                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    cranelift_codegen::ir::MemFlagsData::new(),
                                                     tag_val,
                                                     box_addr,
                                                     0,
@@ -2516,13 +2524,13 @@ impl CraneliftBackend {
                                                     .ins()
                                                     .iconst(types::I32, size_value as i64);
                                                 builder.ins().store(
-                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    cranelift_codegen::ir::MemFlagsData::new(),
                                                     size_val,
                                                     box_addr,
                                                     4,
                                                 );
                                                 builder.ins().store(
-                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    cranelift_codegen::ir::MemFlagsData::new(),
                                                     data_ptr_value,
                                                     box_addr,
                                                     8,
@@ -2530,7 +2538,7 @@ impl CraneliftBackend {
                                                 let null_dropper =
                                                     builder.ins().iconst(types::I64, 0);
                                                 builder.ins().store(
-                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    cranelift_codegen::ir::MemFlagsData::new(),
                                                     null_dropper,
                                                     box_addr,
                                                     16,
@@ -2593,7 +2601,7 @@ impl CraneliftBackend {
                                                     builder.ins().iconst(types::I64, 0)
                                                 };
                                                 builder.ins().store(
-                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    cranelift_codegen::ir::MemFlagsData::new(),
                                                     display_fn_value,
                                                     box_addr,
                                                     24,
@@ -2854,8 +2862,7 @@ impl CraneliftBackend {
                                                 // Primitives: allocate stack space and store pointer to it
                                                 let value_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                                                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                                    8,
-                                                ));
+                                                    8, 0,));
                                                 let value_addr = builder.ins().stack_addr(
                                                     types::I64,
                                                     value_slot,
@@ -2877,7 +2884,7 @@ impl CraneliftBackend {
                                                         // Bitcast f32 to i32, then zero-extend to i64
                                                         let as_i32 = builder.ins().bitcast(
                                                             types::I32,
-                                                            cranelift_codegen::ir::MemFlags::new(),
+                                                            cranelift_codegen::ir::MemFlagsData::new(),
                                                             arg_val,
                                                         );
                                                         builder.ins().uextend(types::I64, as_i32)
@@ -2885,7 +2892,7 @@ impl CraneliftBackend {
                                                     _ => arg_val, // Already i64 or pointer
                                                 };
                                                 builder.ins().store(
-                                                    cranelift_codegen::ir::MemFlags::new(),
+                                                    cranelift_codegen::ir::MemFlagsData::new(),
                                                     data_value,
                                                     value_addr,
                                                     0,
@@ -2896,8 +2903,7 @@ impl CraneliftBackend {
                                             // Allocate stack space for DynamicBox (32 bytes on 64-bit)
                                             let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                                                 cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                                32,
-                                            ));
+                                                32, 0,));
                                             let box_addr =
                                                 builder.ins().stack_addr(types::I64, slot, 0);
 
@@ -2905,7 +2911,7 @@ impl CraneliftBackend {
                                             let tag_val =
                                                 builder.ins().iconst(types::I32, tag_value as i64);
                                             builder.ins().store(
-                                                cranelift_codegen::ir::MemFlags::new(),
+                                                cranelift_codegen::ir::MemFlagsData::new(),
                                                 tag_val,
                                                 box_addr,
                                                 0,
@@ -2915,7 +2921,7 @@ impl CraneliftBackend {
                                             let size_val =
                                                 builder.ins().iconst(types::I32, size_value as i64);
                                             builder.ins().store(
-                                                cranelift_codegen::ir::MemFlags::new(),
+                                                cranelift_codegen::ir::MemFlagsData::new(),
                                                 size_val,
                                                 box_addr,
                                                 4,
@@ -2923,7 +2929,7 @@ impl CraneliftBackend {
 
                                             // Set data - for opaque types this IS the pointer, for primitives it's pointer to value
                                             builder.ins().store(
-                                                cranelift_codegen::ir::MemFlags::new(),
+                                                cranelift_codegen::ir::MemFlagsData::new(),
                                                 data_ptr_value,
                                                 box_addr,
                                                 8,
@@ -2932,7 +2938,7 @@ impl CraneliftBackend {
                                             // Set dropper to null (0)
                                             let null_dropper = builder.ins().iconst(types::I64, 0);
                                             builder.ins().store(
-                                                cranelift_codegen::ir::MemFlags::new(),
+                                                cranelift_codegen::ir::MemFlagsData::new(),
                                                 null_dropper,
                                                 box_addr,
                                                 16,
@@ -3014,7 +3020,7 @@ impl CraneliftBackend {
                                                 }
                                             };
                                             builder.ins().store(
-                                                cranelift_codegen::ir::MemFlags::new(),
+                                                cranelift_codegen::ir::MemFlagsData::new(),
                                                 display_fn_value,
                                                 box_addr,
                                                 24,
@@ -3269,6 +3275,7 @@ impl CraneliftBackend {
                                     cranelift_codegen::ir::StackSlotData::new(
                                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                         64, // Fixed size for now
+                                        0,  // align_shift
                                     ),
                                 )
                             } else {
@@ -3293,6 +3300,7 @@ impl CraneliftBackend {
                                     cranelift_codegen::ir::StackSlotData::new(
                                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                         size,
+                                        0,
                                     ),
                                 )
                             };
@@ -3344,6 +3352,7 @@ impl CraneliftBackend {
                                         cranelift_codegen::ir::StackSlotData::new(
                                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                                             size as u32,
+                                            0,
                                         ),
                                     );
                                     let dst = builder.ins().stack_addr(pointer_type, slot, 0);
@@ -3379,7 +3388,7 @@ impl CraneliftBackend {
                                     type_cache.get(ty).copied().unwrap_or(types::I64);
 
                                 // TODO: Properly handle volatile flag
-                                let flags = cranelift_codegen::ir::MemFlags::new();
+                                let flags = cranelift_codegen::ir::MemFlagsData::new();
 
                                 let loaded = builder.ins().load(cranelift_ty, flags, ptr_val, 0);
                                 self.value_map.insert(*result, loaded);
@@ -3397,7 +3406,7 @@ impl CraneliftBackend {
                             let ptr_val = self.value_map[ptr];
 
                             // TODO: Properly handle volatile flag
-                            let flags = cranelift_codegen::ir::MemFlags::new();
+                            let flags = cranelift_codegen::ir::MemFlagsData::new();
 
                             // Aggregate-typed Stores need a memcpy, not a
                             // scalar store. The InsertValue chain at line
@@ -3591,6 +3600,7 @@ impl CraneliftBackend {
                             let union_slot = builder.create_sized_stack_slot(StackSlotData::new(
                                 StackSlotKind::ExplicitSlot,
                                 union_size,
+                                0,
                             ));
                             let union_ptr = builder.ins().stack_addr(ptr_ty, union_slot, 0);
 
@@ -3675,6 +3685,7 @@ impl CraneliftBackend {
                             let stack_slot = builder.create_sized_stack_slot(StackSlotData::new(
                                 StackSlotKind::ExplicitSlot,
                                 fat_ptr_size,
+                                0,
                             ));
 
                             // Get pointer to stack slot
@@ -3746,6 +3757,7 @@ impl CraneliftBackend {
                             let stack_slot = builder.create_sized_stack_slot(StackSlotData::new(
                                 StackSlotKind::ExplicitSlot,
                                 fat_ptr_size,
+                                0,
                             ));
 
                             // Get pointer to stack slot
@@ -3915,7 +3927,7 @@ impl CraneliftBackend {
                                 // Just load the value at the pointer
                                 let cranelift_ty =
                                     type_cache.get(ty).copied().unwrap_or(types::I64);
-                                let flags = cranelift_codegen::ir::MemFlags::new();
+                                let flags = cranelift_codegen::ir::MemFlagsData::new();
                                 let loaded =
                                     builder.ins().load(cranelift_ty, flags, current_ptr, 0);
                                 self.value_map.insert(*result, loaded);
@@ -3950,7 +3962,8 @@ impl CraneliftBackend {
                                                     .get(ty)
                                                     .copied()
                                                     .unwrap_or(types::I64);
-                                                let flags = cranelift_codegen::ir::MemFlags::new();
+                                                let flags =
+                                                    cranelift_codegen::ir::MemFlagsData::new();
                                                 let loaded = builder.ins().load(
                                                     cranelift_ty,
                                                     flags,
@@ -3998,7 +4011,7 @@ impl CraneliftBackend {
                                                             .copied()
                                                             .unwrap_or(types::I64);
                                                         let flags =
-                                                            cranelift_codegen::ir::MemFlags::new();
+                                                            cranelift_codegen::ir::MemFlagsData::new();
                                                         let loaded = builder.ins().load(
                                                             cranelift_ty,
                                                             flags,
@@ -4061,7 +4074,8 @@ impl CraneliftBackend {
                                                     .get(ty)
                                                     .copied()
                                                     .unwrap_or(types::I64);
-                                                let flags = cranelift_codegen::ir::MemFlags::new();
+                                                let flags =
+                                                    cranelift_codegen::ir::MemFlagsData::new();
                                                 let loaded = builder.ins().load(
                                                     cranelift_ty,
                                                     flags,
@@ -4135,7 +4149,7 @@ impl CraneliftBackend {
 
                             if indices.is_empty() {
                                 // No indices - just store at the pointer
-                                let flags = cranelift_codegen::ir::MemFlags::new();
+                                let flags = cranelift_codegen::ir::MemFlagsData::new();
                                 builder.ins().store(flags, val, current_ptr, 0);
                                 self.value_map.insert(*result, base_ptr);
                             } else {
@@ -4165,7 +4179,8 @@ impl CraneliftBackend {
                                                 let elem_ptr =
                                                     builder.ins().iadd(current_ptr, offset_val);
 
-                                                let flags = cranelift_codegen::ir::MemFlags::new();
+                                                let flags =
+                                                    cranelift_codegen::ir::MemFlagsData::new();
                                                 builder.ins().store(flags, val, elem_ptr, 0);
                                                 self.value_map.insert(*result, base_ptr);
                                             }
@@ -4204,7 +4219,7 @@ impl CraneliftBackend {
                                                             .iadd(current_ptr, offset_val);
 
                                                         let flags =
-                                                            cranelift_codegen::ir::MemFlags::new();
+                                                            cranelift_codegen::ir::MemFlagsData::new();
                                                         builder
                                                             .ins()
                                                             .store(flags, val, field_ptr, 0);
@@ -4325,7 +4340,7 @@ impl CraneliftBackend {
                                 // Unhandled effect - trap at runtime
                                 builder
                                     .ins()
-                                    .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
                                 if let Some(result_id) = result {
                                     self.value_map
                                         .insert(*result_id, builder.ins().iconst(types::I64, 0));
@@ -4875,7 +4890,7 @@ impl CraneliftBackend {
                                 vec![]
                             };
 
-                        builder.ins().jump(target_block, &args);
+                        builder.ins().jump(target_block, &ba(&args));
 
                         if let Some(count) = seal_tracker.get_mut(target) {
                             *count = count.saturating_sub(1);
@@ -4933,9 +4948,13 @@ impl CraneliftBackend {
                             vec![]
                         };
 
-                        builder
-                            .ins()
-                            .brif(cond, true_block, &true_args, false_block, &false_args);
+                        builder.ins().brif(
+                            cond,
+                            true_block,
+                            &ba(&true_args),
+                            false_block,
+                            &ba(&false_args),
+                        );
 
                         for target in [true_target, false_target] {
                             let target_block = self.block_map[target];
@@ -5112,7 +5131,7 @@ impl CraneliftBackend {
                         } else {
                             builder
                                 .ins()
-                                .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
                         }
                     }
 
@@ -5364,7 +5383,7 @@ impl CraneliftBackend {
                 // Same size: bitcast (e.g., i32 -> f32, i64 -> f64)
                 builder
                     .ins()
-                    .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+                    .bitcast(expected, cranelift_codegen::ir::MemFlagsData::new(), val)
             } else {
                 // Different sizes: signed int to float conversion (e.g., i64 -> f32)
                 // First narrow/widen the int to match the float's bit width if needed,
@@ -5385,7 +5404,7 @@ impl CraneliftBackend {
                 // Same size: bitcast (e.g., f32 -> i32, f64 -> i64)
                 builder
                     .ins()
-                    .bitcast(expected, cranelift_codegen::ir::MemFlags::new(), val)
+                    .bitcast(expected, cranelift_codegen::ir::MemFlagsData::new(), val)
             } else {
                 // Different sizes: float to signed int conversion (e.g., f32 -> i64)
                 let int_from_cvt = builder.ins().fcvt_to_sint_sat(types::I32, val);
@@ -6148,7 +6167,8 @@ impl CraneliftBackend {
                 } else {
                     size
                 };
-                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, alloc_size as u32);
+                let slot_data =
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, alloc_size as u32, 0);
                 let slot = builder.create_sized_stack_slot(slot_data);
                 let addr =
                     builder
@@ -6800,7 +6820,7 @@ impl CraneliftBackend {
                                 // Add unreachable to satisfy control flow
                                 builder
                                     .ins()
-                                    .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
                             }
 
                             crate::hir::Intrinsic::Abort => {
@@ -6833,7 +6853,7 @@ impl CraneliftBackend {
                                 builder.ins().call(abort_func_ref, &[]);
                                 builder
                                     .ins()
-                                    .trap(cranelift_codegen::ir::TrapCode::UnreachableCodeReached);
+                                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
                             }
 
                             // ZRTL Value Conversion Intrinsics
@@ -7273,6 +7293,7 @@ impl CraneliftBackend {
                 let union_slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     union_layout.total_size,
+                    0,
                 ));
                 let union_ptr = builder.ins().stack_addr(ptr_ty, union_slot, 0);
 
@@ -7338,6 +7359,7 @@ impl CraneliftBackend {
                 let closure_slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     closure_layout.total_size,
+                    0,
                 ));
                 let closure_ptr = builder.ins().stack_addr(ptr_ty, closure_slot, 0);
 
@@ -7821,7 +7843,7 @@ impl CraneliftBackend {
             HirTerminator::Branch { target } => {
                 let target_block = self.block_map[target];
                 let args = self.get_phi_args(*target, current_block, function);
-                builder.ins().jump(target_block, &args);
+                builder.ins().jump(target_block, &ba(&args));
 
                 // Update seal tracker
                 if let Some(count) = seal_tracker.get_mut(target) {
@@ -7847,9 +7869,13 @@ impl CraneliftBackend {
                 let false_args = self.get_phi_args(*false_target, current_block, function);
 
                 // Use brif instruction
-                builder
-                    .ins()
-                    .brif(cond, true_block, &true_args, false_block, &false_args);
+                builder.ins().brif(
+                    cond,
+                    true_block,
+                    &ba(&true_args),
+                    false_block,
+                    &ba(&false_args),
+                );
 
                 // Update seal tracker for both targets
                 for target in [true_target, false_target] {
@@ -8308,16 +8334,16 @@ fn bitcast_from_i64(
         let low = builder.ins().ireduce(types::I32, v);
         builder
             .ins()
-            .bitcast(types::F32, cranelift_codegen::ir::MemFlags::new(), low)
+            .bitcast(types::F32, cranelift_codegen::ir::MemFlagsData::new(), low)
     } else if target == types::F64 {
         builder
             .ins()
-            .bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), v)
+            .bitcast(types::F64, cranelift_codegen::ir::MemFlagsData::new(), v)
     } else {
         // Pointers / other 64-bit values — reinterpret directly.
         builder
             .ins()
-            .bitcast(target, cranelift_codegen::ir::MemFlags::new(), v)
+            .bitcast(target, cranelift_codegen::ir::MemFlagsData::new(), v)
     }
 }
 
@@ -8334,19 +8360,20 @@ fn marshal_to_i64(
         builder.ins().uextend(types::I64, v)
     } else if ty == types::F32 {
         // F32 → reinterpret as i32 → zero-extend.
-        let as_i32 = builder
-            .ins()
-            .bitcast(types::I32, cranelift_codegen::ir::MemFlags::new(), v);
+        let as_i32 =
+            builder
+                .ins()
+                .bitcast(types::I32, cranelift_codegen::ir::MemFlagsData::new(), v);
         builder.ins().uextend(types::I64, as_i32)
     } else if ty == types::F64 {
         builder
             .ins()
-            .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), v)
+            .bitcast(types::I64, cranelift_codegen::ir::MemFlagsData::new(), v)
     } else {
         // Pointers / other 64-bit values: reinterpret directly.
         builder
             .ins()
-            .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), v)
+            .bitcast(types::I64, cranelift_codegen::ir::MemFlagsData::new(), v)
     }
 }
 
