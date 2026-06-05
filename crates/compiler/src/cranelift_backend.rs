@@ -5178,6 +5178,24 @@ impl CraneliftBackend {
         // Debug: Uncomment to dump IR for all functions
         // self.dump_cranelift_ir(&function.name.to_string());
 
+        // CLIF dump gate: ZYNTAX_DUMP_CRANELIFT=<substring> dumps any
+        // function whose name contains <substring>. Useful for hot-loop
+        // audits — see WORKFLOW: re-audit nbody dominant cycle cost.
+        if let Ok(filter) = std::env::var("ZYNTAX_DUMP_CRANELIFT") {
+            let fname = function
+                .name
+                .resolve_global()
+                .unwrap_or_else(|| function.name.to_string());
+            if filter.is_empty() || fname.contains(&filter) {
+                eprintln!(
+                    "===== ZYNTAX_DUMP_CRANELIFT: {} =====\n{}\n===== end {} =====",
+                    fname,
+                    self.codegen_context.func.display(),
+                    fname
+                );
+            }
+        }
+
         // Compile the function
         log::debug!(
             "[Cranelift] About to call define_function for {:?}",

@@ -309,6 +309,8 @@ fn main() {
     let mut out_path: Option<PathBuf> = None;
     let mut runs_override: Option<usize> = None;
     let mut cache_enabled = true;
+    let mut kernel_filter: Option<String> = None;
+    let mut target_filter: Option<String> = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -320,6 +322,12 @@ fn main() {
             }
             "--no-cache" => {
                 cache_enabled = false;
+            }
+            "--filter" => {
+                kernel_filter = args.next();
+            }
+            "--target" => {
+                target_filter = args.next();
             }
             "--help" | "-h" => {
                 eprintln!(
@@ -351,6 +359,11 @@ fn main() {
 
     for kernel in KERNELS {
         let pretty = kernel.strip_prefix("bench_").unwrap_or(kernel);
+        if let Some(f) = &kernel_filter {
+            if !pretty.contains(f.as_str()) {
+                continue;
+            }
+        }
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("examples/{kernel}.zynml"));
         let source = fs::read_to_string(&source_path)
@@ -359,6 +372,11 @@ fn main() {
         eprintln!("==> kernel {pretty}");
         let mut per_kernel: KernelResults = BTreeMap::new();
         for target in TARGETS {
+            if let Some(tf) = &target_filter {
+                if !target.key.contains(tf.as_str()) {
+                    continue;
+                }
+            }
             if target.skip_kernels.contains(&pretty) {
                 eprintln!("    {:<22} SKIPPED (per-target opt-out)", target.key);
                 per_kernel.insert(target.key.to_string(), skipped_result());
