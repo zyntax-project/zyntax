@@ -82,18 +82,27 @@ pub struct BytecodeHeader {
 
 impl BytecodeHeader {
     const MAGIC: u32 = 0x5A424300; // "ZBC\0"
-    const CURRENT_MAJOR: u16 = 1;
+    // Bumped to 2 when HirId switched from Uuid(16B) → u32(4B). Old
+    // postcard payloads have the wrong layout for HirModule, so they
+    // must be rejected at the header level — the validator below trips
+    // VersionMismatch and the cache loader falls back to recompile.
+    const CURRENT_MAJOR: u16 = 2;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
     pub fn new(module: &HirModule, format: Format) -> Self {
+        // The on-disk header reserves a 16-byte slot historically named
+        // `module_id` (UUID). HirId is now u32; we zero-extend it into
+        // those 16 bytes so the wire format stays fixed-width.
+        let mut id_bytes = [0u8; 16];
+        id_bytes[..4].copy_from_slice(&module.id.as_u32().to_le_bytes());
         Self {
             magic: Self::MAGIC,
             major_version: Self::CURRENT_MAJOR,
             minor_version: Self::CURRENT_MINOR,
             format: format.to_u8(),
             flags: 0,
-            module_id: *module.id.as_uuid(),
+            module_id: uuid::Uuid::from_bytes(id_bytes),
             payload_size: 0, // Will be filled in during serialization
             checksum: 0,     // Will be calculated during serialization
         }
@@ -135,18 +144,8 @@ impl Format {
     }
 }
 
-// Helper trait to expose UUID from HirId
-pub trait AsUuid {
-    fn as_uuid(&self) -> &uuid::Uuid;
-}
-
-impl AsUuid for crate::hir::HirId {
-    fn as_uuid(&self) -> &uuid::Uuid {
-        // HirId is a newtype around Uuid, so we can safely transmute
-        // This is safe because HirId(Uuid) has the same memory layout as Uuid
-        unsafe { &*(self as *const crate::hir::HirId as *const uuid::Uuid) }
-    }
-}
+// (The old AsUuid helper trait is gone; HirId is now u32 and we encode
+// it directly into the fixed-width header slot in `BytecodeHeader::new`.)
 
 /// Serialize header to raw 44-byte format (matches deserialize_raw_header)
 fn serialize_raw_header(header: &BytecodeHeader) -> Vec<u8> {

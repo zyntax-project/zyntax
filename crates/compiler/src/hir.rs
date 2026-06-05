@@ -16,7 +16,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use uuid::Uuid;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zyntax_typed_ast::{InternedString, Span, Type, TypeId};
 
 // ============================================================================
@@ -101,23 +101,32 @@ pub struct HirEffectHandlerImpl {
     pub is_resumable: bool,
 }
 
-/// Lifetime identifier for memory safety tracking
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LifetimeId(Uuid);
+/// Lifetime identifier for memory safety tracking.
+///
+/// A dense 32-bit counter rather than a UUID, for the same reasons as
+/// [`HirId`]: deterministic codegen across compiles and cheap hashing.
+/// Sentinels `0` (static) and `u32::MAX` (anonymous) are reserved; the
+/// monotonic counter starts at 1 and stops short of `u32::MAX`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct LifetimeId(u32);
+
+static LIFETIME_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 impl LifetimeId {
     pub fn new() -> Self {
-        LifetimeId(Uuid::new_v4())
+        LifetimeId(LIFETIME_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Static lifetime (lives for the entire program)
     pub fn static_lifetime() -> Self {
-        LifetimeId(Uuid::from_bytes([0; 16]))
+        LifetimeId(0)
     }
 
     /// Anonymous lifetime (inferred)
     pub fn anonymous() -> Self {
-        LifetimeId(Uuid::from_bytes([1; 16]))
+        LifetimeId(u32::MAX)
     }
 }
 
@@ -166,36 +175,55 @@ impl HirLifetime {
     }
 }
 
-/// Unique identifier for HIR entities
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HirId(Uuid);
+/// Unique identifier for HIR entities.
+///
+/// A dense 32-bit counter rather than a UUID. Two reasons:
+///
+/// 1. **Determinism.** With a UUID source, every compile minted fresh
+///    random IDs, which then participated in `IndexMap` iteration order
+///    inside Cranelift codegen → different optimization decisions across
+///    processes → wide spread in `exec_ms` for the same kernel.
+///    A monotonic `AtomicU32` makes IDs reproducible across compiles.
+/// 2. **Hash cost.** Hashing a `Uuid` runs SipHash13 over 16 bytes;
+///    hashing a `u32` is essentially free. `HirId` is a hot HashMap key
+///    throughout the compiler.
+///
+/// The counter starts at 1; `0` is reserved as a sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HirId(u32);
+
+static HIR_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 impl HirId {
     pub fn new() -> Self {
-        HirId(Uuid::new_v4())
+        HirId(HIR_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Hyphenless lowercase hex (32 chars) of the underlying UUID.
-    /// Used as a stable string identifier where one is needed —
-    /// e.g. encoding a cross-function reference into a wasm import
-    /// name (`internal.<hex>@<arity>`) so the host's per-import
-    /// dispatcher can route the call back to the right HIR function.
+    /// Construct a HirId from a raw u32. For deserialization /
+    /// reconstruction paths (e.g. bytecode round-trip).
+    pub fn from_raw(raw: u32) -> Self {
+        HirId(raw)
+    }
+
+    /// Get the underlying u32.
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Stable string form of the id. Used as a stable string identifier
+    /// where one is needed — e.g. encoding a cross-function reference
+    /// into a wasm import name (`internal.<id>@<arity>`) so the host's
+    /// per-import dispatcher can route the call back to the right HIR
+    /// function.
     pub fn to_hex(&self) -> String {
-        self.0.simple().to_string()
+        self.0.to_string()
     }
 
-    /// Folded 64-bit hash of the UUID, suitable as a runtime
-    /// "closure handle" baked into JIT'd wasm modules. UUIDs are
-    /// 128 bits; the WasmBackend's i64-funneled ABI carries one 64-bit
-    /// value through each register. xor-folding preserves entropy while
-    /// fitting the funnel — collisions across handles within a single
-    /// runtime are astronomically unlikely (the host maintains a
-    /// HashMap<i64, …> keyed by this value).
+    /// 64-bit "closure handle" baked into JIT'd wasm modules. The
+    /// WasmBackend's i64-funneled ABI carries one 64-bit value through
+    /// each register; the u32 id fits trivially.
     pub fn to_handle_hash(&self) -> i64 {
-        let b = self.0.as_bytes();
-        let lo = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-        let hi = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
-        (lo ^ hi) as i64
+        self.0 as i64
     }
 }
 
