@@ -904,7 +904,17 @@ impl ZyntaxRuntime {
 
     /// Create a new runtime with custom configuration
     pub fn with_config(config: CompilationConfig) -> RuntimeResult<Self> {
-        let backend = CraneliftBackend::new()?;
+        let mut backend = CraneliftBackend::new()?;
+
+        // OSR back-edge probes fire at every loop header but the tier-up
+        // consumer side isn't wired on this path. Until it is, they are
+        // pure overhead. The TieredRuntime::new path (line ~2933) and
+        // install_interp_jit_with (interp_runtime.rs:708) already gate
+        // probes off the same way; this site was missed when commits
+        // 5354662 / d81a7d6 landed, leaving ZyntaxRuntime consumers
+        // (bench harness, zynml CLI) paying ~22% CPU on probe tick + sample
+        // even though the consumer never reads them.
+        backend.set_emit_osr_probes(false);
 
         let mut runtime = Self {
             backend,
