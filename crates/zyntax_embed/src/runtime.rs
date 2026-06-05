@@ -1008,6 +1008,16 @@ impl ZyntaxRuntime {
             }
         }
 
+        // Filter Cranelift codegen to only functions transitively
+        // reachable from `main`. Without this, Cranelift loops through
+        // every prelude / stdlib / unused forward declaration in the
+        // module, paying full per-function compile cost even on code
+        // that never executes. Matches the filter installed at
+        // `install_interp_jit_with` time so the two paths see the
+        // same minimal set.
+        let reachable = zyntax_compiler::reachable_function_ids(&owned, &["main"]);
+        self.backend.set_only_compile_reachable(Some(reachable));
+
         // Compile the module
         self.backend.compile_module(&owned)?;
 
