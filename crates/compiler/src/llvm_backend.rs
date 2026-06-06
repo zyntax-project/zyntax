@@ -95,6 +95,29 @@ pub struct LLVMBackend<'ctx> {
     /// `self.functions[hir_id]` produces the LLVM `FunctionValue`.
     effect_handler_index:
         std::collections::HashMap<(HirId, zyntax_typed_ast::InternedString), (HirId, bool)>,
+
+    /// Per-function calling-convention selection, populated during
+    /// the declare-all walk in `compile_module`. Used at every direct
+    /// call site so the call-site cc matches the declared cc — LLVM's
+    /// verifier rejects mismatches.
+    ///
+    /// Keys are the callee's HirId; values are LLVM cc numbers
+    /// (0 = ccc, 8 = fastcc). Indirect / intrinsic / runtime-symbol
+    /// calls intentionally aren't represented — they stay on C cc.
+    func_cc: std::collections::HashMap<HirId, u32>,
+
+    /// Set of internal functions that are exported via dlsym for the
+    /// JIT host (entry point + named exports). Members stay on C cc
+    /// even though `is_external == false`, because the harness calls
+    /// them via `transmute<extern "C" fn(...)>` and would crash on
+    /// fastcc. Populated once at the top of `compile_module`.
+    dlsym_set: std::collections::HashSet<HirId>,
+
+    /// Set of functions that directly recurse (their body contains a
+    /// `HirCallable::Function` callee equal to their own id). Used to
+    /// gate `inlinehint`: a hint on a recursive function is at best
+    /// noise and at worst feeds the inliner into a loop.
+    self_recursive_set: std::collections::HashSet<HirId>,
 }
 
 /// Approximate byte size of a `HirType` for laying out union payloads
@@ -162,6 +185,9 @@ impl<'ctx> LLVMBackend<'ctx> {
             globals_map: IndexMap::new(),
             symbol_signatures: std::collections::HashMap::new(),
             effect_handler_index: std::collections::HashMap::new(),
+            func_cc: std::collections::HashMap::new(),
+            dlsym_set: std::collections::HashSet::new(),
+            self_recursive_set: std::collections::HashSet::new(),
         }
     }
 
@@ -223,6 +249,14 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
+        // Pre-pass: compute cc / attribute policy inputs.
+        // dlsym_set tells us which internals the JIT host will
+        // reach via `transmute<extern "C" fn(...)>`; those must
+        // stay on C cc. self_recursive_set gates `inlinehint`.
+        self.dlsym_set = Self::build_dlsym_set(hir_module);
+        self.self_recursive_set = Self::build_self_recursive_set(hir_module);
+        self.func_cc.clear();
+
         // Phase 1: Process globals first (including vtables) in deterministic sorted order
         let mut global_ids: Vec<_> = hir_module.globals.keys().cloned().collect();
         global_ids.sort_by_key(|id| format!("{:?}", id));
@@ -272,6 +306,132 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// since the execution engine takes ownership of the module.
     pub fn into_module(self) -> Module<'ctx> {
         self.module
+    }
+
+    /// Build the set of functions that will be dlsym'd by the JIT
+    /// host. Mirrors the export logic in
+    /// `LLVMJitBackend::get_function_symbols` (jit_backend.rs:366):
+    /// every emitted-with-body function gets exported. We use it to
+    /// keep those functions on the platform C calling convention so
+    /// the host's `transmute<extern "C" fn(...)>` is sound.
+    fn build_dlsym_set(hir_module: &HirModule) -> std::collections::HashSet<HirId> {
+        let mut set = std::collections::HashSet::new();
+        for (id, func) in &hir_module.functions {
+            if !func.is_external {
+                set.insert(*id);
+            }
+        }
+        set
+    }
+
+    /// Cheap direct-recursion pass: a function is "self-recursive"
+    /// when its body contains a `HirCallable::Function` callee equal
+    /// to its own id. Mutual recursion is intentionally not modelled;
+    /// the inliner has its own cycle safeguards.
+    fn build_self_recursive_set(hir_module: &HirModule) -> std::collections::HashSet<HirId> {
+        let mut set = std::collections::HashSet::new();
+        for (id, func) in &hir_module.functions {
+            if func.is_external {
+                continue;
+            }
+            'outer: for block in func.blocks.values() {
+                for instr in &block.instructions {
+                    if let HirInstruction::Call {
+                        callee: HirCallable::Function(callee_id),
+                        ..
+                    } = instr
+                    {
+                        if callee_id == id {
+                            set.insert(*id);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// Count the total HIR instructions in a function's body. Used
+    /// as a coarse "size" measure for `inlinehint` gating — we don't
+    /// want the inliner to pull `fib`-sized recursive bodies inline.
+    fn function_body_size(func: &HirFunction) -> usize {
+        func.blocks.values().map(|b| b.instructions.len()).sum()
+    }
+
+    /// Decide what LLVM cc to declare a function with.
+    ///
+    /// - External and dlsym'd internals stay on C cc (0) — the host
+    ///   reaches them via `transmute<extern "C" fn(...)>`.
+    /// - Everything else with `CallingConvention::Fast` becomes
+    ///   fastcc (8).
+    /// - Other HIR conventions (System, WebKit) keep the LLVM default.
+    fn function_calling_convention(
+        func: &HirFunction,
+        id: HirId,
+        dlsym_set: &std::collections::HashSet<HirId>,
+    ) -> u32 {
+        use crate::hir::CallingConvention;
+        if func.is_external {
+            return 0;
+        }
+        if dlsym_set.contains(&id) {
+            return 0;
+        }
+        match func.calling_convention {
+            CallingConvention::Fast => 8,
+            _ => 0,
+        }
+    }
+
+    /// Stamp the performance-relevant function attributes onto an
+    /// internal function. Externals are not handled here — the
+    /// caller must already have decided this is an internal that
+    /// matches the policy. `dlsym_exported` true means the function
+    /// is reachable from the host's symbol table, which restricts us
+    /// to attributes that don't surprise an external observer.
+    fn apply_internal_attributes(
+        &self,
+        fv: FunctionValue<'ctx>,
+        is_dlsym_exported: bool,
+        body_size: usize,
+        is_recursive: bool,
+    ) {
+        use inkwell::attributes::{Attribute, AttributeLoc};
+
+        let mut add = |name: &str| {
+            let kind = Attribute::get_named_enum_kind_id(name);
+            if kind == 0 {
+                // Unknown attribute — ignore rather than panic. Inkwell
+                // returns 0 for names LLVM doesn't recognise.
+                return;
+            }
+            let attr = self.context.create_enum_attribute(kind, 0);
+            fv.add_attribute(AttributeLoc::Function, attr);
+        };
+
+        // Always-safe attributes for both fastcc internals and the
+        // dlsym'd exports: we never emit `invoke` (effect-Resume is
+        // a plain call), and we want the inliner / loop-deleter to
+        // assume forward progress.
+        add("nounwind");
+        add("mustprogress");
+
+        if !is_dlsym_exported {
+            // nofree: we never emit free/realloc from internal HIR
+            // lowering — those are runtime calls, and the runtime
+            // funcs themselves stay on C cc with no attributes.
+            add("nofree");
+
+            // inlinehint: small + non-recursive only. The inliner
+            // has its own cycle safeguards but we don't want to pile
+            // on with recursive bodies, and large bodies just bloat
+            // the IR.
+            const INLINE_HINT_MAX_BODY: usize = 50;
+            if !is_recursive && body_size <= INLINE_HINT_MAX_BODY {
+                add("inlinehint");
+            }
+        }
     }
 
     /// Declare a function signature without compiling its body
@@ -335,6 +495,23 @@ impl<'ctx> LLVMBackend<'ctx> {
                 .get_nth_param(i as u32)
                 .unwrap()
                 .set_name(&param_name);
+        }
+
+        // Apply calling-convention + function attributes per the
+        // fastcc/attribute design. Externals stay on platform C cc
+        // with no attributes; dlsym'd internals get C cc but a
+        // conservative attribute set; other internals get fastcc
+        // and the full attribute set (gated on size/recursion).
+        let cc = Self::function_calling_convention(func, id, &self.dlsym_set);
+        if cc != 0 {
+            fn_value.set_call_conventions(cc);
+        }
+        self.func_cc.insert(id, cc);
+        if !func.is_external {
+            let is_dlsym_exported = self.dlsym_set.contains(&id);
+            let body_size = Self::function_body_size(func);
+            let is_recursive = self.self_recursive_set.contains(&id);
+            self.apply_internal_attributes(fn_value, is_dlsym_exported, body_size, is_recursive);
         }
 
         // Store for later reference
@@ -2064,6 +2241,15 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let call_site = self
                     .builder
                     .build_call(llvm_fn, &arg_values, "perform_effect")?;
+                // Mirror the handler-fn's declared cc at the call site
+                // so the verifier accepts the IR. The handler-fn is an
+                // internal HIR function, so it follows the same cc
+                // policy as any other internal direct call.
+                if let Some(&cc) = self.func_cc.get(&handler_fn_id) {
+                    if cc != 0 {
+                        call_site.set_call_convention(cc);
+                    }
+                }
                 if let Some(res_id) = result {
                     if let ValueKind::Basic(ret_val) = call_site.try_as_basic_value() {
                         self.value_map.insert(*res_id, ret_val);
@@ -2630,6 +2816,15 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                 // Build call
                 let call_site = self.builder.build_call(*function, &arg_values, "call")?;
+
+                // Mirror the callee's declared calling convention at
+                // the call site — LLVM's verifier rejects fastcc
+                // declarations being invoked with the default C cc.
+                if let Some(&cc) = self.func_cc.get(func_id) {
+                    if cc != 0 {
+                        call_site.set_call_convention(cc);
+                    }
+                }
 
                 // Return value (or void)
                 match call_site.try_as_basic_value() {
