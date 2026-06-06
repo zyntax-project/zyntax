@@ -82,10 +82,10 @@ pub struct BytecodeHeader {
 
 impl BytecodeHeader {
     const MAGIC: u32 = 0x5A424300; // "ZBC\0"
-    // Bumped to 2 when HirId switched from Uuid(16B) → u32(4B). Old
-    // postcard payloads have the wrong layout for HirModule, so they
-    // must be rejected at the header level — the validator below trips
-    // VersionMismatch and the cache loader falls back to recompile.
+                                   // Bumped to 2 when HirId switched from Uuid(16B) → u32(4B). Old
+                                   // postcard payloads have the wrong layout for HirModule, so they
+                                   // must be rejected at the header level — the validator below trips
+                                   // VersionMismatch and the cache loader falls back to recompile.
     const CURRENT_MAJOR: u16 = 2;
     const CURRENT_MINOR: u16 = 0;
 

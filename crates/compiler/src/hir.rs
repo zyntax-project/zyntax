@@ -15,8 +15,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use zyntax_typed_ast::{InternedString, Span, Type, TypeId};
 
 // ============================================================================
@@ -107,9 +107,7 @@ pub struct HirEffectHandlerImpl {
 /// [`HirId`]: deterministic codegen across compiles and cheap hashing.
 /// Sentinels `0` (static) and `u32::MAX` (anonymous) are reserved; the
 /// monotonic counter starts at 1 and stops short of `u32::MAX`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LifetimeId(u32);
 
 static LIFETIME_ID_COUNTER: AtomicU32 = AtomicU32::new(1);

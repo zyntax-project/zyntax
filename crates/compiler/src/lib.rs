@@ -54,6 +54,7 @@ pub mod optimization;
 pub mod pattern_matching;
 pub mod reduction_vectorize;
 pub mod runtime;
+pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
 pub mod trait_lowering; // Trait/interface lowering to HIR
@@ -1668,6 +1669,7 @@ pub struct InterpOptStats {
     pub fma_contract: fma_contract::FmaStats,
     pub load_cse: load_cse::LoadCseStats,
     pub aggregate_split: aggregate_split::AggregateSplitStats,
+    pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub licm: licm::LicmStats,
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
@@ -1774,6 +1776,16 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         // Eliminates the load-modify-store cycle on struct values
         // produced by `let mut b = arr[i]; b.x = …; arr[i] = b`.
         let ags = aggregate_split::run_module(module);
+        // scalar_replace_alloc runs after aggregate_split:
+        //   * aggregate_split has just rewritten any struct-typed
+        //     round-trips into direct GEP+Load/Store. That exposes the
+        //     malloc-result+GEP+Load/Store shape that this pass needs.
+        //   * Runs BEFORE drop_insert (which only fires after the
+        //     fixed-point), so eliminated mallocs never get a paired
+        //     Free synthesised.
+        // Cranelift's mem2reg cannot promote heap allocations
+        // (Call results are opaque); this is the HIR-only path.
+        let sra = scalar_replace_alloc::run_module(module);
         let il = inline::run_module(module);
         let lc = licm::run_module(module);
         let lv = loop_vectorize::run_module(module);
@@ -1794,6 +1806,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
             || lcse.eliminated > 0
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
+            || sra.mallocs_eliminated > 0
             || il.inlined > 0
             || lc.hoisted > 0
             || lv.vectorized > 0
@@ -1810,6 +1823,10 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         stats.aggregate_split.round_trips_removed += ags.round_trips_removed;
         stats.aggregate_split.field_accesses_emitted += ags.field_accesses_emitted;
         stats.aggregate_split.field_reads_only += ags.field_reads_only;
+        stats.scalar_replace_alloc.candidates_examined += sra.candidates_examined;
+        stats.scalar_replace_alloc.mallocs_eliminated += sra.mallocs_eliminated;
+        stats.scalar_replace_alloc.frees_eliminated += sra.frees_eliminated;
+        stats.scalar_replace_alloc.escapes_skipped += sra.escapes_skipped;
         stats.inline.inlined += il.inlined;
         stats.inline.call_sites_visited += il.call_sites_visited;
         stats.inline.skipped_too_large += il.skipped_too_large;

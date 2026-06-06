@@ -743,9 +743,11 @@ impl InterpRuntime {
         // `unreachable` trap — that bug was fixed by commit 432d017
         // (SSA Unreachable → synthesised Return). The gate is now
         // stale and the priming is always-on.
-        if let Some(main_id) = module.functions.iter().find_map(|(id, f)| {
-            (f.name.resolve_global().as_deref() == Some("main")).then_some(*id)
-        }) {
+        if let Some(main_id) = module
+            .functions
+            .iter()
+            .find_map(|(id, f)| (f.name.resolve_global().as_deref() == Some("main")).then_some(*id))
+        {
             if let Some(bound) = self.bounds.get(&main_id).cloned() {
                 let cranelift_for_prime = Arc::clone(&cranelift);
                 self.tiered.on_invoke(&bound, move |_tier, _bead| {
@@ -754,8 +756,7 @@ impl InterpRuntime {
                         .map(|p| p as *mut ())
                         .unwrap_or(std::ptr::null_mut())
                 });
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(500);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
                 while bound.bead().compiled().is_none() && std::time::Instant::now() < deadline {
                     std::hint::spin_loop();
                 }

@@ -141,11 +141,7 @@ pub struct InlineStats {
 /// Sum of all `block.instructions.len()` across a function. Used by
 /// the caller-budget check to predict post-inline size.
 fn count_insts(function: &HirFunction) -> usize {
-    function
-        .blocks
-        .values()
-        .map(|b| b.instructions.len())
-        .sum()
+    function.blocks.values().map(|b| b.instructions.len()).sum()
 }
 
 /// Inline every eligible direct call within `module`. Iterates a
@@ -1538,8 +1534,10 @@ mod tests {
         // insts plus the stat-field exists and accumulates correctly
         // covers the integration. The per-pass-cap test already
         // exercises the dispatch loop's bail-out path.
-        let f = HirFunction::new(InternedString::new_global("noop"), sig(vec![], HirType::I64));
+        let f = HirFunction::new(
+            InternedString::new_global("noop"),
+            sig(vec![], HirType::I64),
+        );
         assert_eq!(count_insts(&f), 0, "empty function has zero insts");
     }
-
 }
