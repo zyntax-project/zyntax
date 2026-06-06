@@ -763,3 +763,215 @@ fn has_memory_side_effect(inst: &HirInstruction) -> bool {
             | HirInstruction::CreateClosure { .. }
     )
 }
+
+// ─── tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::{
+        HirBlock, HirCallable, HirFunctionSignature, HirModule, HirTerminator, Intrinsic,
+    };
+    use indexmap::IndexMap;
+    use zyntax_typed_ast::{AstArena, InternedString};
+
+    fn sig() -> HirFunctionSignature {
+        HirFunctionSignature {
+            params: vec![],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        }
+    }
+
+    fn mk_func() -> (HirFunction, HirId) {
+        let mut f = HirFunction::new(InternedString::new_global("t"), sig());
+        let entry = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        (f, entry)
+    }
+
+    fn add_const_i64(f: &mut HirFunction, v: i64) -> HirId {
+        let id = HirId::new();
+        f.values.insert(
+            id,
+            HirValue {
+                id,
+                ty: HirType::I64,
+                kind: HirValueKind::Constant(HirConstant::I64(v)),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        id
+    }
+
+    fn add_const_u64(f: &mut HirFunction, v: u64) -> HirId {
+        let id = HirId::new();
+        f.values.insert(
+            id,
+            HirValue {
+                id,
+                ty: HirType::U64,
+                kind: HirValueKind::Constant(HirConstant::U64(v)),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        id
+    }
+
+    fn add_inst(f: &mut HirFunction, ty: HirType) -> HirId {
+        let id = HirId::new();
+        f.values.insert(
+            id,
+            HirValue {
+                id,
+                ty,
+                kind: HirValueKind::Instruction,
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        id
+    }
+
+    fn push(f: &mut HirFunction, entry: HirId, inst: HirInstruction) {
+        f.blocks.get_mut(&entry).unwrap().instructions.push(inst);
+    }
+
+    /// Validate that `aggregate_split` can eliminate a `CallDirect(malloc)`
+    /// whose returned pointer is fully consumed by a single field
+    /// `Store` / `Load` round-trip — i.e. the heap object never escapes.
+    ///
+    /// Shape built:
+    /// ```text
+    ///   ptr   = call Intrinsic::Malloc(size_u64)        ; *u8
+    ///   off   = const i64 0
+    ///   gep   = gep ptr u8, ptr, [off]
+    ///   v42   = const i64 42
+    ///   store v42, gep
+    ///   load  = load i64, gep
+    ///   return load
+    /// ```
+    /// The malloc result is never stored elsewhere, never returned, never
+    /// passed to any Call other than (potentially) `Intrinsic::Free`. A
+    /// rayzor-style scalar replacement pass would detect this and delete
+    /// the Call entirely.
+    ///
+    /// **Currently expected to FAIL** — aggregate_split only triggers on
+    /// struct-typed `Load` instructions, so a malloc'd byte buffer with
+    /// direct field GEP + Store/Load is invisible to it. This test
+    /// pins the gap; the fix is a separate scalar-replacement pass
+    /// (rayzor's `scalar_replacement.rs:1252-1793` is the reference).
+    /// Marked `#[ignore]` so CI stays green until that pass lands.
+    #[test]
+    #[ignore = "validates the gap that motivates a future scalar-replacement pass"]
+    fn eliminates_non_escaping_malloc() {
+        let _arena = AstArena::new(); // mirror builder-API usage / lifetime safety
+
+        let (mut f, entry) = mk_func();
+        let size = add_const_u64(&mut f, 8);
+        let malloc_ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let off = add_const_i64(&mut f, 0);
+        let gep = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let v42 = add_const_i64(&mut f, 42);
+        let loaded = add_inst(&mut f, HirType::I64);
+
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Call {
+                result: Some(malloc_ptr),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![size],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::GetElementPtr {
+                result: gep,
+                ty: HirType::U8,
+                ptr: malloc_ptr,
+                indices: vec![off],
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Store {
+                value: v42,
+                ptr: gep,
+                align: 8,
+                volatile: false,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Load {
+                result: loaded,
+                ty: HirType::I64,
+                ptr: gep,
+                align: 8,
+                volatile: false,
+            },
+        );
+        f.blocks.get_mut(&entry).unwrap().terminator =
+            HirTerminator::Return { values: vec![loaded] };
+
+        // Wrap in a module and run the pass.
+        let mut module = HirModule {
+            id: HirId::new(),
+            name: InternedString::new_global("test_mod"),
+            functions: IndexMap::new(),
+            globals: IndexMap::new(),
+            types: IndexMap::new(),
+            imports: vec![],
+            exports: vec![],
+            version: 0,
+            dependencies: HashSet::new(),
+            effects: IndexMap::new(),
+            handlers: IndexMap::new(),
+        };
+        let func_id = f.id;
+        module.functions.insert(func_id, f);
+
+        let _stats = run_module(&mut module);
+
+        // Verify the Call(Intrinsic::Malloc) has been removed.
+        let f = &module.functions[&func_id];
+        let blk = &f.blocks[&entry];
+        let malloc_calls_remaining = blk
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    HirInstruction::Call {
+                        callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                        ..
+                    }
+                )
+            })
+            .count();
+
+        assert_eq!(
+            malloc_calls_remaining, 0,
+            "aggregate_split should have eliminated the non-escaping Call(Intrinsic::Malloc); \
+             {} remained",
+            malloc_calls_remaining
+        );
+    }
+}
