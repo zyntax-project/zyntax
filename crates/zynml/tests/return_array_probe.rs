@@ -77,7 +77,6 @@ def main(): i64 {
 // cross-call path. Tracked as the next piece of nbody's
 // array-of-bodies work. Kept ignored rather than asserting the
 // wrong value.
-#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "cross-call array-return reads wrong element after recent type-prop fixes"]
 fn caller_indexes_into_returned_list_with_promotion() {

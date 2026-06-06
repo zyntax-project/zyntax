@@ -29,7 +29,6 @@ fn report(label: &str, source: &str) {
     eprintln!("inline stats: {stats:?}");
 }
 
-#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "diagnostic only"]
 fn inline_check_all_benches() {
