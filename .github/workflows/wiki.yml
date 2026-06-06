@@ -78,8 +78,23 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   benchmark:
-    name: Run ZynML benchmark suite
+    name: bench (${{ matrix.kernel }})
     runs-on: ubuntu-latest
+    # Matrix-per-kernel mirrors rayzor's CI shape: each kernel gets a
+    # fresh GHA runner so cumulative thermal/cache throttling from
+    # heavy earlier kernels (mandelbrot, nbody) doesn't bleed into the
+    # later light ones. `fail-fast: false` keeps one bad kernel from
+    # cancelling the rest of the sweep.
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          - mandelbrot
+          - nbody
+          - nbody_ref
+          - fib
+          - inlined_call
+          - free_function_call
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -99,19 +114,54 @@ jobs:
           sudo ./llvm.sh 21 all
           echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
 
-      - name: Run benchmarks
+      - name: Run benchmark (${{ matrix.kernel }})
         env:
           RUST_MIN_STACK: 134217728
-        # `--out` writes JSON the static page consumes; `--runs 3` takes the
-        # median of three trials per kernel/tier to dampen runner noise.
-        # `--features llvm-backend` exercises the full tier-up ladder so the
-        # `zyntax-tiered-llvm` column reflects honest LLVM-tier numbers.
+        # Median-of-3 + per-kernel runner = honest x86_64 numbers.
+        # `--filter` runs only this matrix entry's kernel; the JSON
+        # naturally ends up with just that kernel's data plus meta.
+        # `--features llvm-backend` exercises the full tier-up ladder
+        # so the `zyntax-tiered-llvm` column reflects honest LLVM-tier
+        # numbers.
         run: |
           mkdir -p bench-out
           cargo run --release --package zynml --example bench_runner --features llvm-backend -- \
-            --out bench-out/results.json --runs 3
+            --out bench-out/results-${{ matrix.kernel }}.json \
+            --filter ${{ matrix.kernel }} \
+            --runs 3
 
-      - name: Upload benchmark results
+      - name: Upload partial benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.kernel }}
+          path: bench-out/results-${{ matrix.kernel }}.json
+          retention-days: 90
+
+  benchmark-aggregate:
+    name: Aggregate benchmark results
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all per-kernel results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: bench-parts
+          merge-multiple: true
+
+      - name: Merge into single results.json
+        # jq deep-merge across all per-kernel partials. Each partial
+        # already carries the same `meta` block (same commit/date/os/
+        # arch), so the merge keeps whichever lands last — harmless.
+        # Per-kernel objects accumulate under their kernel name; the
+        # final results.json has the shape the static page expects.
+        run: |
+          ls -la bench-parts/
+          mkdir -p bench-out
+          jq -s 'reduce .[] as $x ({}; . * $x)' bench-parts/*.json > bench-out/results.json
+          cat bench-out/results.json | jq 'keys'
+
+      - name: Upload merged benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
@@ -119,7 +169,7 @@ jobs:
           retention-days: 90
 
   deploy-site:
-    needs: benchmark
+    needs: benchmark-aggregate
     runs-on: ubuntu-latest
     environment:
       name: github-pages
