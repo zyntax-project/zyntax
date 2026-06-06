@@ -3470,33 +3470,29 @@ impl SsaBuilder {
                     result_type
                 };
 
-                // Normalize int operand widths for comparison ops so
+                // Normalize int operand widths for every Binary op so
                 // backends never have to fix this up. Cranelift accepts
                 // mismatched widths (it inserts an implicit extension)
-                // but LLVM's verifier rejects icmp with operands of
-                // different bit widths, and adding a per-cmp sext at
-                // codegen time defeats LLVM's instruction-selection
-                // heuristics. Instead we emit an explicit HIR Cast
-                // here so both backends see consistent IR.
+                // but LLVM's verifier rejects every binary op — `icmp`,
+                // `add`, `sub`, `mul`, etc. — when operands differ in
+                // bit width. Patching that at the LLVM backend layer
+                // would mean an extra `sext`/`zext` per op that bypasses
+                // LLVM's instruction-selection heuristics. Emit the
+                // width-promoting Cast here so both backends see
+                // consistent IR and the HIR-level optimisers can hoist
+                // the cast out of loops when the narrower side is a
+                // loop invariant.
                 //
                 // Triggered when the typed AST lowered a literal as a
-                // narrower int than the variable it's compared against
+                // narrower int than the variable it interacts with
                 // (e.g. `let i: i64 = 0; while i < 100000000` — the
-                // literal gets typed as i32 by default).
-                let is_int_cmp = matches!(
-                    hir_op,
-                    crate::hir::BinaryOp::Lt
-                        | crate::hir::BinaryOp::Le
-                        | crate::hir::BinaryOp::Gt
-                        | crate::hir::BinaryOp::Ge
-                        | crate::hir::BinaryOp::Eq
-                        | crate::hir::BinaryOp::Ne
-                );
-                let (left_val, right_val) = if is_int_cmp {
-                    self.normalize_int_compare_operands(block_id, left_val, right_val)
-                } else {
-                    (left_val, right_val)
-                };
+                // literal lands as i32 by default — or `n = n * 2`
+                // where `n: i64` and the multiplier defaults to i32).
+                //
+                // Float ops are unaffected: the helper bails on the
+                // first non-int operand.
+                let (left_val, right_val) =
+                    self.normalize_int_binary_operands(block_id, left_val, right_val);
 
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
@@ -6800,20 +6796,22 @@ impl SsaBuilder {
     }
 
     /// Normalize a pair of integer-valued operands so they share the
-    /// same HIR bit-width before being handed to a comparison Binary.
+    /// same HIR bit-width before being handed to a Binary instruction.
     ///
-    /// LLVM's `icmp` requires both operands to be the same type, and
-    /// fixing this at codegen time (sext per cmp) prevents LLVM's
-    /// instruction-selection heuristics from folding the comparison
-    /// into the prior arithmetic. Emitting an explicit HIR Cast here
-    /// lets the backend see a uniformly-typed compare and lets the
+    /// LLVM's verifier rejects every binary integer op — `icmp`,
+    /// `add`, `sub`, `mul`, etc. — when the operands differ in width.
+    /// Fixing this at codegen time (per-op `sext`/`zext`) prevents
+    /// LLVM's instruction-selection heuristics from folding the cast
+    /// into the surrounding arithmetic. Emitting an explicit HIR Cast
+    /// here lets the backend see a uniformly-typed op and lets the
     /// HIR-level optimisation passes hoist the cast out of the loop
     /// when the narrower value is a loop invariant.
     ///
     /// Sign-extends signed source types, zero-extends unsigned source
     /// types. No-op when widths already match or either value isn't
-    /// a known fixed-width integer.
-    fn normalize_int_compare_operands(
+    /// a known fixed-width integer (floats / pointers / vectors fall
+    /// through unchanged).
+    fn normalize_int_binary_operands(
         &mut self,
         block_id: HirId,
         left: HirId,

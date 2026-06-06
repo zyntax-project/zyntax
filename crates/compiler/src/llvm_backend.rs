@@ -3557,8 +3557,18 @@ impl<'ctx> LLVMBackend<'ctx> {
             F64 => self.context.f64_type().into(),
             Bool => self.context.bool_type().into(),
             Ptr(inner) => {
-                let inner_ty = self.translate_type(inner)?;
-                inner_ty.ptr_type(AddressSpace::default()).into()
+                // `Ptr(Opaque(X))` and bare `Opaque(X)` both collapse to
+                // `opaque.X*` — the Opaque arm below already returns a
+                // pointer-to-opaque (opaque values have unknown size so
+                // they can never be materialised as first-class LLVM
+                // values). Avoid the extra `ptr_type()` wrap that would
+                // turn `Ptr(Opaque(X))` into `opaque.X**`.
+                if matches!(inner.as_ref(), Opaque(_)) {
+                    self.translate_type(inner)?
+                } else {
+                    let inner_ty = self.translate_type(inner)?;
+                    inner_ty.ptr_type(AddressSpace::default()).into()
+                }
             }
             Ref { pointee, .. } => {
                 // References are compiled as pointers
@@ -3640,6 +3650,27 @@ impl<'ctx> LLVMBackend<'ctx> {
                     )));
                 }
             },
+            Opaque(name) => {
+                // Opaque HIR types (forward declarations, prelude
+                // extern types like Tensor, `@reference class` types
+                // before the body is registered) lower to **a pointer
+                // to** a named opaque LLVM struct. Opaque values have
+                // unknown size so they can never appear as a first-
+                // class LLVM value — every use site already expects a
+                // pointer, whether the HIR source said `Opaque(X)`
+                // directly or `Ptr(Opaque(X))`. Materialising the
+                // opaque struct directly here panics downstream when
+                // the consumer (function entry block, call site,
+                // return slot) tries `into_pointer_value()`.
+                //
+                // Note this means `Ptr(Opaque(X))` lowers to `opaque.X*`
+                // not `opaque.X**` — both HIR shapes collapse to the
+                // same pointer-to-opaque, which matches how the runtime
+                // already treats them.
+                let name_str = format!("opaque.{:?}", name);
+                let opaque_struct = self.context.opaque_struct_type(&name_str);
+                opaque_struct.ptr_type(AddressSpace::default()).into()
+            }
             _ => {
                 return Err(CompilerError::CodeGen(format!(
                     "Type translation not yet implemented: {:?}",
