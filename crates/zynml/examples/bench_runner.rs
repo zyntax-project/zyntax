@@ -177,7 +177,14 @@ const TARGETS: &[Target] = &[
         // Newton-iter sqrt is similarly heavy. The interp/opt
         // tiers don't tell us anything the JIT tier doesn't tell
         // us better at full kernel scale, so skip for those two.
-        skip_kernels: &["mandelbrot", "nbody", "nbody_ref", "fib", "inlined_call", "free_function_call"],
+        skip_kernels: &[
+            "mandelbrot",
+            "nbody",
+            "nbody_ref",
+            "fib",
+            "inlined_call",
+            "free_function_call",
+        ],
     },
     Target {
         key: "zyntax-interp-opt",
@@ -185,7 +192,14 @@ const TARGETS: &[Target] = &[
         run_with_opts: true,
         install_jit: false,
         install_llvm: false,
-        skip_kernels: &["mandelbrot", "nbody", "nbody_ref", "fib", "inlined_call", "free_function_call"],
+        skip_kernels: &[
+            "mandelbrot",
+            "nbody",
+            "nbody_ref",
+            "fib",
+            "inlined_call",
+            "free_function_call",
+        ],
     },
     Target {
         key: "zyntax-tiered",
