@@ -24,6 +24,7 @@ pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations 
 pub mod analysis;
 pub mod associated_type_resolver; // Associated type resolution for trait dispatch
 pub mod async_support;
+pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cfg;
@@ -1674,6 +1675,7 @@ pub struct InterpOptStats {
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
     pub reduction_vectorize: reduction_vectorize::ReductionStats,
+    pub auto_vectorize: auto_vectorize::AutoVectorizeStats,
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
     pub drop_insert: drop_insert::DropStats,
 }
@@ -1863,6 +1865,23 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
             break;
         }
     }
+
+    // auto_vectorize runs ONCE after the fixed-point sweep terminates.
+    // Vectorization is not fixed-point-monotonic — vector instructions
+    // don't expose new const-fold/cse opportunities — so a single pass
+    // after const_fold/cse/inline/licm have all settled gives the
+    // cleanest IV/stride pattern matcher input. This is the generalised
+    // successor to `loop_vectorize` + `reduction_vectorize` which still
+    // run inside the sweep for now (transition period — see module
+    // docs).
+    let av = auto_vectorize::run_module(module);
+    stats.auto_vectorize.vectorized += av.vectorized;
+    stats.auto_vectorize.loops_visited += av.loops_visited;
+    stats.auto_vectorize.rejected_shape += av.rejected_shape;
+    stats.auto_vectorize.rejected_hazard += av.rejected_hazard;
+    stats.auto_vectorize.rejected_cost += av.rejected_cost;
+    stats.auto_vectorize.rejected_no_iv += av.rejected_no_iv;
+    stats.auto_vectorize.rejected_trip_count += av.rejected_trip_count;
 
     // Drop-site insertion runs *after* the optimization fixed-point.
     // Order matters two ways:
