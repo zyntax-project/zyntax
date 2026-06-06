@@ -7,6 +7,9 @@ on:
     paths:
       - 'book/**'
       - 'website/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.env.markflow'
       - '.github/workflows/wiki.yml'
   workflow_dispatch:
@@ -74,7 +77,49 @@ jobs:
           path: wiki/
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  benchmark:
+    name: Run ZynML benchmark suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-runner
+
+      - name: Install LLVM 21
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Run benchmarks
+        env:
+          RUST_MIN_STACK: 134217728
+        # `--out` writes JSON the static page consumes; `--runs 3` takes the
+        # median of three trials per kernel/tier to dampen runner noise.
+        # `--features llvm-backend` exercises the full tier-up ladder so the
+        # `zyntax-tiered-llvm` column reflects honest LLVM-tier numbers.
+        run: |
+          mkdir -p bench-out
+          cargo run --release --package zynml --example bench_runner --features llvm-backend -- \
+            --out bench-out/results.json --runs 3
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-out/results.json
+          retention-days: 90
+
   deploy-site:
+    needs: benchmark
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -82,6 +127,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-out
 
       - name: Install Markflow
         run: curl -sL https://raw.githubusercontent.com/darmie/markflow/main/install.sh | bash
@@ -105,8 +156,14 @@ jobs:
           # Build book docs with Markflow into /book subdirectory
           markflow build --prebake --source ./book --output ./site/book --config .env.markflow
 
+          # Publish benchmark page + CI-produced results.json
+          mkdir -p site/benchmark
+          cp website/benchmark/index.html site/benchmark/index.html
+          cp bench-out/results.json site/benchmark/results.json
+
           # Verify book output exists
           ls -la site/book/
+          ls -la site/benchmark/
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

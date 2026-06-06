@@ -31,3 +31,7 @@ test/output/
 
 # Rayzor BLADE/MIR caches — created if rayzor CLI is invoked from this directory
 .rayzor/
+
+# Benchmark results — published by CI (.github/workflows/wiki.yml).
+# Local bench_runner output is for development inspection only.
+website/benchmark/results.json

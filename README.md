@@ -2,7 +2,7 @@
 
 > A high-performance, multi-paradigm compiler infrastructure with advanced type system features, tiered JIT compilation, and async/await runtime support.
 
-[![Status: Production Ready](https://img.shields.io/badge/status-production%20ready-green)](./BACKLOG.md)
+[![CI](https://github.com/darmie/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-71%2F71%20Zig%20tests-brightgreen)](./crates/zyn_parser/tests)
 [![Test Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](./crates/zyn_parser/tests)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
