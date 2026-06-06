@@ -3,13 +3,16 @@
 // Language Benchmarks Game lineage (used by wren_lift, rayzor,
 // and the original `wren` repo too).
 //
-// `fib(n)` makes `O(φⁿ)` calls — roughly 4.7 million calls for
-// `fib(30)`. That's the point: the bench measures function-call
+// `fib(n)` makes `O(φⁿ)` calls — roughly 331 million calls for
+// `fib(40)`. That's the point: the bench measures function-call
 // dispatch and return overhead, not arithmetic. If the dispatch
 // is fast, the number drops; if it's slow, the number goes up
 // and we know where to look.
 //
-// Returns `fib(30)` = 832040.
+// Matches rayzor's `fib(40)` reference so the cross-runtime
+// comparison stays apples-to-apples.
+//
+// Returns `fib(40)` = 102334155.
 
 def fib(n: i64): i64 {
     if n < 2 {
@@ -19,5 +22,5 @@ def fib(n: i64): i64 {
 }
 
 def main(): i64 {
-    return fib(30)
+    return fib(40)
 }

@@ -177,7 +177,7 @@ const TARGETS: &[Target] = &[
         // Newton-iter sqrt is similarly heavy. The interp/opt
         // tiers don't tell us anything the JIT tier doesn't tell
         // us better at full kernel scale, so skip for those two.
-        skip_kernels: &["mandelbrot", "nbody", "nbody_ref"],
+        skip_kernels: &["mandelbrot", "nbody", "nbody_ref", "fib"],
     },
     Target {
         key: "zyntax-interp-opt",
@@ -185,7 +185,7 @@ const TARGETS: &[Target] = &[
         run_with_opts: true,
         install_jit: false,
         install_llvm: false,
-        skip_kernels: &["mandelbrot", "nbody", "nbody_ref"],
+        skip_kernels: &["mandelbrot", "nbody", "nbody_ref", "fib"],
     },
     Target {
         key: "zyntax-tiered",
@@ -302,6 +302,17 @@ fn jit_tier_config(install_llvm: bool) -> TieredConfig {
         hot_threshold: if install_llvm { 1 } else { u32::MAX as u64 },
         ..ProfileConfig::default()
     };
+    // Disable beadie's auto multi-tier promotion. The Cranelift compile
+    // closure at interp_runtime.rs:769 deliberately ignores the tier
+    // argument and always returns the Cranelift pointer (the LLVM tier
+    // is wired through a separate hand-rolled side-channel that calls
+    // `LLVMJitBackend::compile_function` directly). Leaving beadie's
+    // tier 2 promotion broker enabled means it races the side-channel:
+    // it submits a "tier 2" compile that re-fetches the Cranelift
+    // pointer and bumps generation 1 → 2 before LLVM gets a chance,
+    // and the side-channel's `generation() == 1` gate then misses.
+    // Disable here so only the side-channel can flip past tier 1.
+    cfg.enable_background_optimization = false;
     cfg
 }
 
