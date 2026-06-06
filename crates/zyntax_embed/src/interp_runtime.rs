@@ -721,38 +721,43 @@ impl InterpRuntime {
             Ok(())
         })?;
 
-        // Optional JIT priming for the entry function. beadie
-        // returns `None` from the first `on_invoke` regardless of
-        // whether the pre-compiled function pointer is ready —
-        // BC interp runs the entry function once before the bead
-        // transitions to `Compiled`. For short kernels that's
-        // fine; for rayzor-scale loops the first BC-interp run is
-        // ~hours per warmup iteration.
+        // JIT-prime the entry function so the first call dispatches
+        // compiled code. beadie returns `None` from the first
+        // `on_invoke` regardless of whether the pre-compiled function
+        // pointer is ready — without priming, BC interp runs the
+        // entry function once before the bead transitions to
+        // `Compiled`. For short kernels that doesn't matter; for
+        // rayzor-scale loops (nbody's 20×500K outer loop) the first
+        // BC-interp run is hundreds of times slower than steady state
+        // and either dominates wall-clock or trips the benchmark's
+        // sustained-load assumptions.
         //
-        // Enable with `ZYNTAX_ENABLE_JIT_PRIME=1`. Disabled by
-        // default because it raises install latency and exposes
-        // pre-existing JIT codegen bugs that surface only when the
-        // first call dispatches JIT'd code (e.g. n-body's main
-        // hits a Cranelift `unreachable` trap when JIT-compiled
-        // standalone — a separate follow-up).
-        if std::env::var("ZYNTAX_ENABLE_JIT_PRIME").is_ok() {
-            if let Some(main_id) = module.functions.iter().find_map(|(id, f)| {
-                (f.name.resolve_global().as_deref() == Some("main")).then_some(*id)
-            }) {
-                if let Some(bound) = self.bounds.get(&main_id).cloned() {
-                    let cranelift_for_prime = Arc::clone(&cranelift);
-                    self.tiered.on_invoke(&bound, move |_tier, _bead| {
-                        cranelift_for_prime
-                            .with_lock(|be| be.get_function_ptr(main_id))
-                            .map(|p| p as *mut ())
-                            .unwrap_or(std::ptr::null_mut())
-                    });
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(500);
-                    while bound.bead().compiled().is_none() && std::time::Instant::now() < deadline
-                    {
-                        std::hint::spin_loop();
-                    }
+        // Mirrors rayzor's `TierPreset::Benchmark` which uses
+        // `BailoutStrategy::Immediate` to leave the interpreter after
+        // ~10 instructions and re-enter the call in compiled code.
+        // We achieve the same end state by walking the entry pointer
+        // forward before any user call lands.
+        //
+        // Was gated behind `ZYNTAX_ENABLE_JIT_PRIME=1` because
+        // standalone JIT compilation of nbody's `main` hit a Cranelift
+        // `unreachable` trap — that bug was fixed by commit 432d017
+        // (SSA Unreachable → synthesised Return). The gate is now
+        // stale and the priming is always-on.
+        if let Some(main_id) = module.functions.iter().find_map(|(id, f)| {
+            (f.name.resolve_global().as_deref() == Some("main")).then_some(*id)
+        }) {
+            if let Some(bound) = self.bounds.get(&main_id).cloned() {
+                let cranelift_for_prime = Arc::clone(&cranelift);
+                self.tiered.on_invoke(&bound, move |_tier, _bead| {
+                    cranelift_for_prime
+                        .with_lock(|be| be.get_function_ptr(main_id))
+                        .map(|p| p as *mut ())
+                        .unwrap_or(std::ptr::null_mut())
+                });
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while bound.bead().compiled().is_none() && std::time::Instant::now() < deadline {
+                    std::hint::spin_loop();
                 }
             }
         }
