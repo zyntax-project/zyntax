@@ -4117,7 +4117,7 @@ impl ZyntaxPromise {
     ///
     /// Returns `Err` if the timeout is exceeded.
     pub fn await_with_timeout(&self, timeout: std::time::Duration) -> RuntimeResult<ZyntaxValue> {
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return Err(RuntimeError::Promise(format!(
@@ -4390,7 +4390,7 @@ impl PromiseAll {
         &mut self,
         timeout: std::time::Duration,
     ) -> RuntimeResult<Vec<ZyntaxValue>> {
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return Err(RuntimeError::Promise(format!(
@@ -4529,7 +4529,7 @@ impl PromiseRace {
         &mut self,
         timeout: std::time::Duration,
     ) -> RuntimeResult<(usize, ZyntaxValue)> {
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return Err(RuntimeError::Promise(format!(
@@ -4667,7 +4667,7 @@ impl PromiseAllSettled {
         &mut self,
         timeout: std::time::Duration,
     ) -> RuntimeResult<Vec<SettledResult>> {
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return Err(RuntimeError::Promise(format!(

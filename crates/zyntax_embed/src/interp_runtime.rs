@@ -756,8 +756,8 @@ impl InterpRuntime {
                         .map(|p| p as *mut ())
                         .unwrap_or(std::ptr::null_mut())
                 });
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                while bound.bead().compiled().is_none() && std::time::Instant::now() < deadline {
+                let deadline = web_time::Instant::now() + std::time::Duration::from_millis(500);
+                while bound.bead().compiled().is_none() && web_time::Instant::now() < deadline {
                     std::hint::spin_loop();
                 }
             }

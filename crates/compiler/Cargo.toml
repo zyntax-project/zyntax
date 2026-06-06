@@ -37,6 +37,11 @@ miette = "7.2.0"
 # Logging
 log = "0.4"
 
+# std::time::Instant panics on wasm32-unknown-unknown. web-time is
+# API-compatible with std::time on native and routes through
+# performance.now() on wasm.
+web-time = "1"
+
 # Utilities
 uuid = { workspace = true }
 tempfile = { workspace = true }

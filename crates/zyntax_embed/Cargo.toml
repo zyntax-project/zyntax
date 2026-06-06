@@ -39,6 +39,11 @@ pest_vm = "2.8"
 # the core orchestrator API (Beadie, Bead, ThresholdPolicy, on_invoke).
 beadie = { version = "0.3", default-features = false }
 
+# std::time::Instant panics on wasm32-unknown-unknown ("time not
+# implemented on this platform"). web-time is API-compatible with
+# std::time on native and routes through performance.now() on wasm.
+web-time = "1"
+
 [dev-dependencies]
 
 [features]

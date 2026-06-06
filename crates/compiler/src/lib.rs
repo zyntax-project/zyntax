@@ -1745,7 +1745,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     // downstream passes haven't been audited against.
     const ROUND_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     for _ in 0..8 {
-        let round_start = std::time::Instant::now();
+        let round_start = web_time::Instant::now();
         let cf = const_fold::fold_module(module);
         let cs = cse::eliminate_module(module);
         // FMA contraction runs after const_fold + cse so we don't
