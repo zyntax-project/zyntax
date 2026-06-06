@@ -113,12 +113,14 @@ fn bisect(source: &str, label: &str) {
 // earlier toy-sized kernels; `#[ignore]` keeps the harness around
 // for future bisection of opt-pass interactions on a downscaled
 // kernel without breaking `cargo test`.
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "kernels at rayzor parity — BC interp can't finish in bisect budget"]
 fn mandelbrot_bisect() {
     bisect(MANDEL, "mandelbrot");
 }
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "kernels at rayzor parity — BC interp can't finish in bisect budget"]
 fn nbody_bisect() {

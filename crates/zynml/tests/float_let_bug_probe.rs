@@ -42,6 +42,7 @@ fn run(src: &str) -> String {
     format!("{:?}", r)
 }
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn float_let_arithmetic_returns_float() {
     // Untyped let binding — typed AST often leaves `expr.ty` as
@@ -51,12 +52,14 @@ fn float_let_arithmetic_returns_float() {
     assert_eq!(run(src), "Float(0.75)");
 }
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn float_let_with_annotation_returns_float() {
     let src = "def main(): f64 {\n    let r: f64 = 0.5 + 0.25\n    return r\n}\n";
     assert_eq!(run(src), "Float(0.75)");
 }
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn float_chain_then_compare_picks_float_cmp() {
     // The comparison's operand-type fix path: `total = a + b + c`

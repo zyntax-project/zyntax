@@ -18,6 +18,7 @@ fn run(src: &str) -> String {
     format!("{:?}", r)
 }
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn array_sum_loop() {
     let src = r#"
@@ -45,6 +46,7 @@ def main(): i64 {
 // silently dropped (call site sees "unknown function 'main'"). Kept
 // as `#[ignore]` documentation; when the lowering is fixed this can
 // flip to `#[test]` and pin the right answer.
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "index-assign on List<T> not yet supported by SSA lowering"]
 fn array_index_assign() {

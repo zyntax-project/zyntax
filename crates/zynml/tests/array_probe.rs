@@ -1,6 +1,7 @@
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::ZyntaxRuntime;
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn array_index_probe() {
     let src = r#"

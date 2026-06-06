@@ -2,6 +2,7 @@ use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_compiler::hir_dump::dump_module;
 use zyntax_embed::ZyntaxRuntime;
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "diagnostic only — dumps slice-3 HIR to stderr"]
 fn dump_slice3_hir() {

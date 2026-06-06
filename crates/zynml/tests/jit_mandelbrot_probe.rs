@@ -7,6 +7,7 @@ use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
 use zyntax_embed::ZyntaxRuntime;
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 #[ignore = "diagnostic only — reports tier-up behavior call by call"]
 fn mandelbrot_tiered_call_sequence() {

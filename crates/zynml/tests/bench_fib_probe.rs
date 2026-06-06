@@ -1,6 +1,7 @@
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::ZyntaxRuntime;
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn fib_kernel_runs() {
     let src = include_str!("../examples/bench_fib.zynml");

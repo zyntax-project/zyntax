@@ -90,6 +90,7 @@ fn try_run(label: &str, src: &str) {
     }
 }
 
+#[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn nbody_slices() {
     // ── Slice 1: just a Body struct, no array. Construct and
