@@ -497,12 +497,24 @@
   <script>
     const KERNEL_TITLES = {
       mandelbrot: 'Mandelbrot',
-      nbody: 'N-body (solar system)',
+      nbody: 'N-body · value-type Body',
+      nbody_ref: 'N-body · @reference Body',
       fib: 'Recursive Fibonacci',
+      inlined_call: 'Inlined Call',
+      free_function_call: 'Free Function Call',
       method_call: 'Method Call',
       binary_trees: 'Binary Trees',
     };
-    const KERNEL_ORDER = ['mandelbrot', 'nbody', 'fib', 'method_call', 'binary_trees'];
+    const KERNEL_ORDER = [
+      'mandelbrot',
+      'nbody',
+      'nbody_ref',
+      'fib',
+      'inlined_call',
+      'free_function_call',
+      'method_call',
+      'binary_trees',
+    ];
 
     const TARGET_LABELS = {
       'zyntax-interp': 'interp · no opts',
