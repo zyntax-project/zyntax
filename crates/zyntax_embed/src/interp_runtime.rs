@@ -741,6 +741,29 @@ impl InterpRuntime {
         // earlier compile are cleared by the next compile_module call.
         #[cfg(feature = "llvm-backend")]
         {
+            // Feed every runtime FFI symbol from the BC interpreter
+            // into the LLVM backend before compile_module fires. The
+            // AOT-via-object path links a closed-world shared library
+            // — every named call from the .so must resolve against a
+            // trampoline stub that the linker emits. Symbols that
+            // aren't pre-registered here would otherwise show up as
+            // undefined-symbol link errors.
+            //
+            // Mirrors the wasm-JIT and Cranelift paths, which all
+            // pull from the same `symbol_table_snapshot()`.
+            let bc_symbols = self.interp.symbol_table_snapshot();
+            // Also include OSR runtime symbols so back-edge probes
+            // baked into the IR (when emitted) resolve correctly.
+            let osr_syms = osr::osr_runtime_symbols();
+            llvm.with_lock(|be| {
+                for (name, ptr, _arity) in &bc_symbols {
+                    be.register_symbol(name.clone(), *ptr);
+                }
+                for (name, ptr) in &osr_syms {
+                    be.register_symbol((*name).to_string(), *ptr);
+                }
+            });
+
             let llvm_install_result = llvm.with_lock(|be| be.compile_module(&module));
             match llvm_install_result {
                 Ok(()) => {
@@ -758,11 +781,18 @@ impl InterpRuntime {
                     // Soft failure: LLVM backend doesn't translate
                     // every HIR type yet (Opaque from @reference-class
                     // lowering, extern types like Tensor return
-                    // "Type translation not yet implemented"). Fall
-                    // back to a Cranelift-only ladder for this module
-                    // rather than poisoning the whole install — the
-                    // runtime still runs, the LLVM tier just doesn't
-                    // engage.
+                    // "Type translation not yet implemented"); or the
+                    // AOT-via-object path may have hit `NoLinker`
+                    // (no `cc`/`clang`/`gcc` in PATH) or a link/dlopen
+                    // failure. Fall back to a Cranelift-only ladder
+                    // for this module rather than poisoning the whole
+                    // install — the runtime still runs, the LLVM tier
+                    // just doesn't engage.
+                    if std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok()
+                        || std::env::var("ZYNTAX_TRACE_LLVM_AOT").is_ok()
+                    {
+                        eprintln!("[LLVM-AOT-FAIL] {e}");
+                    }
                     log::warn!(
                         "LLVM tier-up disabled for this module: eager compile_module failed ({e}). \
                          Cranelift tier-up will still drive the JIT path."

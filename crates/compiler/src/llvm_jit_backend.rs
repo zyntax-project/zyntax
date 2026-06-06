@@ -1,23 +1,37 @@
-//! # LLVM JIT Backend using MCJIT
+//! # LLVM AOT-via-Object JIT Backend
 //!
-//! This backend uses LLVM's Modern JIT (MCJIT) for dynamic compilation with maximum optimization.
-//! It's designed to be used as Tier 2 in the tiered compilation system for hot functions.
+//! This backend compiles HIR → LLVM IR, lowers to a position-
+//! independent object file, links it via the system linker into a
+//! shared object, and `dlopen`s the result. Function pointers are
+//! extracted with `dlsym`.
 //!
-//! ## Features
-//! - On-demand compilation with full LLVM optimizations
-//! - Function pointer retrieval for direct calls
-//! - Memory-efficient: only compiles functions that are actually hot
-//! - Uses LLVMBackend for HIR → LLVM IR translation
+//! ## Why not MCJIT?
+//! The previous incarnation used `module.create_jit_execution_engine(...)`
+//! (LLVM MCJIT). MCJIT runs into MAP_JIT cross-thread invalidation
+//! issues on Apple Silicon, and on x86_64 its TargetMachine selection
+//! is conservative compared to a host-tuned AOT compile.
+//!
+//! ## Pipeline
+//!
+//! 1. **Lower**: HIR → LLVM IR (via `LLVMBackend`).
+//! 2. **Verify + optimise**: pre-pass `module.verify()`, then
+//!    `default<O3>` (or matching level), then post-pass `verify()`.
+//! 3. **Emit**: `TargetMachine::write_to_file(FileType::Object)` to a
+//!    tempfile. Reloc mode `PIC`, code model `Default`.
+//! 4. **Trampolines**: synthesise an assembly file defining each
+//!    runtime symbol as a real function whose body loads the host
+//!    pointer and tail-jumps. Replaces MCJIT's `add_global_mapping`.
+//! 5. **Link**: shell out to `cc`/`clang`/`gcc` with `-shared` (Linux)
+//!    or `-dynamiclib` (macOS). See [`crate::llvm_link::link_to_dylib`].
+//! 6. **Load**: `dlopen(RTLD_NOW | RTLD_GLOBAL)` and `dlsym` each
+//!    function symbol into `function_pointers`.
 //!
 //! ## vs AOT LLVM Backend
-//! - AOT (`llvm_backend.rs`): Compiles entire program to object files/executables
-//! - JIT (this file): Compiles individual functions to memory at runtime
+//! - AOT (`llvm_backend.rs`): compile entire program to standalone exe.
+//! - JIT (this file): same lowering but loaded back into the running
+//!   process via dlopen. Suitable for tiered compilation.
 //!
-//! Both use the same HIR → LLVM IR translation logic.
-//!
-//! ## MCJIT Architecture Note
-//! MCJIT requires the module to be fully populated before the execution engine is created.
-//! We compile HIR → LLVM IR first, then create the execution engine from the populated module.
+//! Both share the HIR → LLVM IR translation logic.
 
 use crate::hir::{HirFunction, HirId, HirModule};
 use crate::llvm_backend::LLVMBackend;
@@ -25,59 +39,67 @@ use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
 use inkwell::{
     context::Context,
-    execution_engine::ExecutionEngine,
     passes::PassBuilderOptions,
-    targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine},
+    targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine},
     OptimizationLevel,
 };
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// LLVM JIT backend using MCJIT
+/// Monotonic counter for tempfile naming uniqueness within a process.
+static AOT_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// LLVM AOT-via-object JIT backend.
 ///
-/// This backend compiles HIR modules to native code using LLVM's MCJIT.
-/// The execution engine is created lazily after the module is compiled.
+/// Compiles HIR modules to native code by writing a PIC object,
+/// linking it into a shared library through the system linker, and
+/// `dlopen`-ing the result. Function pointers are read back via
+/// `dlsym` and indexed by `HirId`.
 pub struct LLVMJitBackend<'ctx> {
-    /// LLVM context reference
+    /// LLVM context reference.
     context: &'ctx Context,
 
-    /// Execution engine (MCJIT) - created after module compilation
-    execution_engine: Option<ExecutionEngine<'ctx>>,
+    /// Loaded shared object. Holding this `Library` keeps the mapped
+    /// code pages alive — dropping it would munmap them and any held
+    /// function pointer would dangle. Stored after a successful
+    /// `compile_module` so the runtime can keep dispatching.
+    loaded_lib: Option<libloading::Library>,
 
-    /// Function pointers cache (stored as usize for thread safety)
-    function_pointers: IndexMap<HirId, usize>,
+    /// Function pointers cache (stored as usize for thread safety).
+    pub(crate) function_pointers: IndexMap<HirId, usize>,
 
-    /// Optimization level
+    /// Optimization level.
     opt_level: OptimizationLevel,
 
-    /// Runtime symbols to register with the execution engine
-    /// Maps function name to function pointer address
-    runtime_symbols: IndexMap<String, usize>,
+    /// Runtime symbols available to JIT-compiled code. Each entry is a
+    /// host-side function pointer that will get baked into a
+    /// trampoline stub during link.
+    pub(crate) runtime_symbols: IndexMap<String, usize>,
 
-    /// Symbol signatures for auto-boxing (symbol name → signature)
+    /// Symbol signatures for auto-boxing (symbol name → signature).
     symbol_signatures: Vec<crate::zrtl::RuntimeSymbolInfo>,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
-    /// Create a new LLVM JIT backend with aggressive optimization
+    /// Create a new LLVM JIT backend with aggressive optimisation.
     pub fn new(context: &'ctx Context) -> CompilerResult<Self> {
         Self::with_opt_level(context, OptimizationLevel::Aggressive)
     }
 
-    /// Create with custom optimization level
+    /// Create with custom optimisation level.
     pub fn with_opt_level(
         context: &'ctx Context,
         opt_level: OptimizationLevel,
     ) -> CompilerResult<Self> {
-        // Initialize LLVM targets
+        // Initialise LLVM targets.
         Target::initialize_native(&InitializationConfig::default()).map_err(|e| {
-            CompilerError::Backend(format!("Failed to initialize LLVM target: {}", e))
+            CompilerError::Backend(format!("Failed to initialise LLVM target: {}", e))
         })?;
-
-        // Link in MCJIT
-        ExecutionEngine::link_in_mc_jit();
 
         Ok(Self {
             context,
-            execution_engine: None,
+            loaded_lib: None,
             function_pointers: IndexMap::new(),
             opt_level,
             runtime_symbols: IndexMap::new(),
@@ -85,19 +107,21 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         })
     }
 
-    /// Register symbol signatures for auto-boxing support
+    /// Register symbol signatures for auto-boxing support.
     pub fn register_symbol_signatures(&mut self, symbols: &[crate::zrtl::RuntimeSymbolInfo]) {
         self.symbol_signatures.extend(symbols.iter().cloned());
     }
 
-    /// Register a runtime symbol that will be available to JIT-compiled code
+    /// Register a runtime symbol callable from JIT-compiled code.
     ///
-    /// Call this before `compile_module` to make external functions available.
+    /// Call before `compile_module`. Each registered symbol becomes
+    /// a trampoline stub in the linked dylib, so the .so's calls to
+    /// `<name>` land on a thin shim that jumps to `ptr`.
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8) {
         self.runtime_symbols.insert(name.into(), ptr as usize);
     }
 
-    /// Register multiple runtime symbols at once
+    /// Register multiple runtime symbols at once.
     pub fn register_symbols(&mut self, symbols: &[(&str, *const u8)]) {
         for (name, ptr) in symbols {
             self.runtime_symbols
@@ -105,27 +129,22 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         }
     }
 
-    /// Build `PassBuilderOptions` for LLVM optimization passes.
+    /// Build `PassBuilderOptions` for LLVM optimisation passes.
     ///
-    /// Loop vectorization (LV) and SLP vectorization stay on — those
-    /// are the headline x86_64 wins for the numerical kernels, and
-    /// rayzor's tuning at compiler/src/codegen/llvm_jit_backend.rs:349
-    /// keeps them on as well. Both passes have their own trip-count
-    /// and cost gates, so they don't blow up on huge loops.
+    /// Loop vectorisation (LV) and SLP vectorisation stay on — those
+    /// are the headline x86_64 wins for the numerical kernels.
     ///
-    /// `set_loop_unrolling(true)` is deliberately NOT set. Under the
-    /// `default<O3>` pipeline, forcing unrolling on overrides LLVM's
-    /// own size/trip-count heuristic — on ZynML kernels with very
-    /// large trip counts (e.g. inlined_call's 100_000_000-iter loop
-    /// with an inlinable callee) the forced unroller tries to fully
-    /// unroll and the JIT pipeline hangs indefinitely. Without this
-    /// override, `default<O3>` still runs the standard unroller with
-    /// its built-in trip-count cap.
+    /// `set_loop_unrolling(true)` is deliberately NOT set: under
+    /// `default<O3>`, forcing it overrides LLVM's own size/trip-count
+    /// heuristic — on kernels with very large trip counts (e.g.
+    /// inlined_call's 100M-iter loop with an inlinable callee) the
+    /// forced unroller tries to fully unroll and the pipeline hangs.
+    /// Without this override, `default<O3>` still runs the standard
+    /// unroller with its built-in trip-count cap.
     ///
-    /// `set_loop_interleaving(true)` is also left off because it
-    /// composes with the unroller, and `merge_functions(true)` is on
-    /// because it's cheap and shrinks dispatch tables for
-    /// monomorphised generic code.
+    /// `set_loop_interleaving(true)` is left off because it composes
+    /// with the unroller. `merge_functions(true)` is on because it's
+    /// cheap and shrinks dispatch tables for monomorphised generics.
     fn create_pass_options() -> PassBuilderOptions {
         let opts = PassBuilderOptions::create();
         opts.set_loop_vectorization(true);
@@ -134,28 +153,110 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         opts
     }
 
-    /// Compile a full HIR module
+    /// Mangle a function-symbol name for export through the system
+    /// linker / dlsym pipeline.
     ///
-    /// Translates all functions to LLVM IR and JIT compiles them.
-    /// Function pointers become available via get_function_pointer().
+    /// The MCJIT-era naming scheme used `format!("func_{:?}", id)`
+    /// which produces `func_HirId(42)` — parens are linker-hostile
+    /// and the `,`/`<`/`>` chars from generic Debug formats would
+    /// also break ELF/Mach-O symbol parsers. This helper sanitises to
+    /// `[A-Za-z0-9_$]` (all of which are accepted by the system
+    /// linker on both ELF and Mach-O — `$` is widely supported, and
+    /// we already use it for handler-op names like `Console$info`).
+    pub fn mangle_function_name(name: &str) -> String {
+        let mut s = String::with_capacity(name.len());
+        for c in name.chars() {
+            match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$' => s.push(c),
+                '(' => s.push_str("_LP_"),
+                ')' => s.push_str("_RP_"),
+                '<' => s.push_str("_LT_"),
+                '>' => s.push_str("_GT_"),
+                ',' => s.push_str("_C_"),
+                ' ' => s.push_str("_S_"),
+                '-' => s.push_str("_D_"),
+                ':' => s.push_str("_K_"),
+                '.' => s.push_str("_P_"),
+                _ => {
+                    s.push_str(&format!("_X{:x}_", c as u32));
+                }
+            }
+        }
+        s
+    }
+
+    /// Compute the exported name a given function will carry in the
+    /// dylib. Mirrors `llvm_backend.rs:281`: external functions and
+    /// the `main` entry keep their original name; everything else
+    /// gets the mangled `func_<HirId>` form.
     ///
-    /// IMPORTANT: The execution engine is created AFTER compilation to ensure
-    /// MCJIT sees all functions in the module.
-    pub fn compile_module(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
-        // Step 1: Create backend and compile HIR → LLVM IR
+    /// We mangle the raw `HirId` Debug string (which contains
+    /// `HirId(<n>)` parens) so the dlsym side sees a valid symbol.
+    /// The LLVM IR emit side currently uses the raw Debug form; we
+    /// patch the IR-side naming to use the same mangled form in
+    /// [`Self::compile_module_to_ir`].
+    fn exported_name_for(func: &HirFunction, id: HirId) -> String {
+        let actual_name = func
+            .name
+            .resolve_global()
+            .unwrap_or_else(|| format!("{:?}", func.name));
+        if func.is_external || actual_name == "main" {
+            actual_name
+        } else {
+            Self::mangle_function_name(&format!("func_{:?}", id))
+        }
+    }
+
+    /// Patch the names of every internal (non-extern, non-main)
+    /// function in an already-lowered LLVM module to use the
+    /// `[A-Za-z0-9_$]` mangling. The HIR-lowering pass at
+    /// `llvm_backend.rs:285` emits `format!("func_{:?}", id)` which
+    /// contains parens. We rename in place so the symbols come out
+    /// of the linker with a name the loader will accept.
+    fn rename_mangled_functions(
+        backend: &LLVMBackend<'ctx>,
+        hir_module: &HirModule,
+    ) -> CompilerResult<()> {
+        for (id, func) in &hir_module.functions {
+            // Skip externs and `main` — they keep their actual name.
+            let actual_name = func
+                .name
+                .resolve_global()
+                .unwrap_or_else(|| format!("{:?}", func.name));
+            if func.is_external || actual_name == "main" {
+                continue;
+            }
+            let raw = format!("func_{:?}", id);
+            let mangled = Self::mangle_function_name(&raw);
+            if raw == mangled {
+                continue;
+            }
+            if let Some(fv) = backend.module().get_function(&raw) {
+                fv.as_global_value().set_name(&mangled);
+            }
+        }
+        Ok(())
+    }
+
+    /// Step (1)–(2) of the pipeline: lower HIR → LLVM IR, verify,
+    /// host-tune the target machine, run optimisation passes. The
+    /// resulting `LLVMBackend` owns a `Module` ready for object-file
+    /// emission via [`Self::compile_to_object_file`].
+    fn compile_module_to_ir(
+        &self,
+        hir_module: &HirModule,
+    ) -> CompilerResult<(LLVMBackend<'ctx>, TargetMachine)> {
+        // Step 1: Lower HIR → LLVM IR.
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
-
-        // Register symbol signatures for auto-boxing
         backend.register_symbol_signatures(&self.symbol_signatures);
-
         let _llvm_ir = backend.compile_module(hir_module)?;
 
-        // Step 2: Tune the module + MCJIT for the host CPU. Without this,
-        // MCJIT's internal TargetMachine uses generic x86_64 defaults
-        // (no FMA, no AVX2, conservative instruction scheduling). Setting
-        // the triple + data layout + host CPU/features and running an
-        // explicit pass pipeline before engine creation matches rayzor's
-        // JIT tuning at compiler/src/codegen/llvm_jit_backend.rs:216-357.
+        // Patch internal function names to a linker-safe mangling.
+        Self::rename_mangled_functions(&backend, hir_module)?;
+
+        // Step 2: Build a host-tuned TargetMachine. PIC reloc mode is
+        // required for `-shared` / `-dynamiclib`; default code model
+        // is correct for both x86_64 and aarch64.
         let target_triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&target_triple).map_err(|e| {
             CompilerError::Backend(format!("Failed to resolve target from triple: {}", e))
@@ -170,7 +271,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     .to_str()
                     .unwrap_or(""),
                 self.opt_level,
-                RelocMode::Default,
+                RelocMode::PIC,
                 CodeModel::Default,
             )
             .ok_or_else(|| CompilerError::Backend("Failed to create host target machine".into()))?;
@@ -179,20 +280,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             .module()
             .set_data_layout(&target_machine.get_target_data().get_data_layout());
 
-        // Step 3: Run an explicit optimization pipeline. While LLVM's
-        // `default<O3>` enables most of these by default, explicit flags
-        // ensure they fire on every host — the implicit defaults are more
-        // conservative on x86_64 Linux than on aarch64 macOS (per
-        // rayzor llvm_jit_backend.rs:346-348). Skipped at OptLevel::None
-        // so unoptimised builds stay fast.
-        // Pre-pass verification: catch HIR-to-LLVM-IR lowering bugs
-        // before they get amplified by O3 transforms. `Module::verify`
-        // returns a multi-line diagnostic if any function is malformed
-        // (wrong block terminators, type mismatches across calls,
-        // undefined values flowing into a phi, etc.). The runtime hang
-        // we hit on inlined_call's 100M FP loop made it clear we need
-        // this gate — a buggy IR may silently optimise into an
-        // infinite loop instead of crashing.
+        // Pre-pass verification — catches HIR→LLVM lowering bugs
+        // before the optimiser amplifies them.
         if let Err(msg) = backend.module().verify() {
             return Err(CompilerError::Backend(format!(
                 "LLVM module verification failed (pre-opt): {}",
@@ -200,7 +289,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             )));
         }
 
-        // Optional IR dump (pre-opt) for debugging codegen bugs.
         if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
             let ir = backend.module().print_to_string().to_string();
             let path = std::env::temp_dir().join("zyntax_llvm_ir_preopt.ll");
@@ -213,6 +301,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
+        // Step 3: Run the optimisation pipeline.
         if self.opt_level != OptimizationLevel::None {
             let passes = match self.opt_level {
                 OptimizationLevel::None => "default<O0>",
@@ -225,13 +314,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 .module()
                 .run_passes(passes, &target_machine, pass_options)
                 .map_err(|e| {
-                    CompilerError::Backend(format!("LLVM optimization passes failed: {}", e))
+                    CompilerError::Backend(format!("LLVM optimisation passes failed: {}", e))
                 })?;
 
-            // Post-pass verification: if the optimiser produced an
-            // invalid module (rare but real — happens when our IR has
-            // subtle UB the optimiser exploits), surface it here
-            // instead of handing broken code to MCJIT.
             if let Err(msg) = backend.module().verify() {
                 return Err(CompilerError::Backend(format!(
                     "LLVM module verification failed (post-opt): {}",
@@ -239,7 +324,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 )));
             }
 
-            // Optional post-opt IR dump.
             if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
                 let ir = backend.module().print_to_string().to_string();
                 let path = std::env::temp_dir().join("zyntax_llvm_ir_postopt.ll");
@@ -253,86 +337,140 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
-        // Step 4: Collect external function declarations from the module BEFORE consuming it
-        // We need the function values for add_global_mapping
-        let mut external_functions: Vec<(String, inkwell::values::FunctionValue<'ctx>)> =
-            Vec::new();
-        for (_, function) in &hir_module.functions {
-            if function.is_external {
-                if let Some(name) = function.name.resolve_global() {
-                    if let Some(llvm_func) = backend.module().get_function(&name) {
-                        external_functions.push((name, llvm_func));
-                    }
-                }
-            }
-        }
+        Ok((backend, target_machine))
+    }
 
-        // Step 5: Consume the module and create execution engine
-        let module = backend.into_module();
-        let execution_engine = module
-            .create_jit_execution_engine(self.opt_level)
-            .map_err(|e| {
-                CompilerError::Backend(format!("Failed to create JIT execution engine: {}", e))
-            })?;
+    /// Write the LLVM module to a position-independent object file.
+    ///
+    /// Mirrors rayzor's `compile_to_object_file` (rayzor
+    /// llvm_jit_backend.rs:1191). Uses the host-tuned TargetMachine
+    /// from [`Self::compile_module_to_ir`] for codegen options. The
+    /// resulting `.o` is ready for the system linker.
+    pub fn compile_to_object_file(
+        &self,
+        backend: &LLVMBackend<'ctx>,
+        target_machine: &TargetMachine,
+        output_path: &Path,
+    ) -> CompilerResult<()> {
+        target_machine
+            .write_to_file(backend.module(), FileType::Object, output_path)
+            .map_err(|e| CompilerError::Backend(format!("Failed to emit object file: {}", e)))
+    }
 
-        // Step 4: Register runtime symbols with the execution engine using add_global_mapping
-        for (name, llvm_func) in &external_functions {
-            if let Some(addr) = self.runtime_symbols.get(name) {
-                execution_engine.add_global_mapping(llvm_func, *addr);
-                log::debug!(
-                    "Registered runtime symbol '{}' at address 0x{:x}",
-                    name,
-                    addr
-                );
-            }
-        }
-
-        // Step 5: Extract function pointers from the execution engine
+    /// Enumerate every emitted-with-body function in the module as
+    /// `(HirId, exported-symbol-name)`. Externs are excluded — they
+    /// are call targets, not export targets.
+    ///
+    /// The returned names already use the mangled form, so callers
+    /// can feed them straight to dlsym.
+    pub fn get_function_symbols(&self, hir_module: &HirModule) -> BTreeMap<HirId, String> {
+        let mut map = BTreeMap::new();
         for (id, function) in &hir_module.functions {
-            // Skip external functions - they don't have compiled code in this module
             if function.is_external {
                 continue;
             }
+            map.insert(*id, Self::exported_name_for(function, *id));
+        }
+        map
+    }
 
-            // Must match naming logic in llvm_backend.rs:
-            // - Main function uses actual name for entry point
-            // - Other functions use mangled name with HirId
-            let actual_name = function
-                .name
-                .resolve_global()
-                .unwrap_or_else(|| format!("{:?}", function.name));
-            let fn_name = if actual_name == "main" {
-                actual_name
-            } else {
-                format!("func_{:?}", id)
-            };
+    /// Build a unique tempfile path with the supplied extension.
+    fn build_temp_path(extension: &str) -> std::path::PathBuf {
+        let counter = AOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!("zyntax_llvm_{nanos}_{pid}_{counter}.{extension}"));
+        p
+    }
 
-            // Get function address from JIT execution engine
-            let fn_ptr = execution_engine
-                .get_function_address(&fn_name)
-                .map_err(|e| {
-                    CompilerError::Backend(format!(
-                        "Failed to get function address for '{}': {:?}",
-                        fn_name, e
-                    ))
-                })?;
+    /// Compile a full HIR module via AOT-to-object + system linker +
+    /// dlopen. On success, `function_pointers` is populated and the
+    /// loaded library is pinned on the backend.
+    ///
+    /// Errors:
+    /// - HIR → LLVM IR lowering / verification / optimisation failure
+    ///   surface as `CompilerError::Backend`.
+    /// - No system linker found / link errors / dlopen errors surface
+    ///   as `CompilerError::Backend` too. The runtime's calling code
+    ///   treats any error as a soft-fail and stays on Cranelift.
+    pub fn compile_module(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
+        use crate::llvm_link::{link_to_dylib, load_dylib, Triple};
 
-            // Cache the pointer (stored as usize for thread safety)
-            self.function_pointers.insert(*id, fn_ptr as usize);
+        // Reset state from any previous compile.
+        self.function_pointers.clear();
+        self.loaded_lib = None;
+
+        // (1)–(3) Lower + optimise + build target machine.
+        let (backend, target_machine) = self.compile_module_to_ir(hir_module)?;
+
+        // (4) Write PIC object file to a tempfile.
+        let triple = Triple::host();
+        let obj_path = Self::build_temp_path("o");
+        let dylib_path = Self::build_temp_path(triple.dylib_ext());
+        self.compile_to_object_file(&backend, &target_machine, &obj_path)?;
+        // Module + TargetMachine are no longer needed; drop them so
+        // the LLVM resources are freed before the slow linker stage.
+        drop(backend);
+        drop(target_machine);
+
+        // (5) Synthesise trampolines + link to dylib. The runtime
+        // symbols list comes from `self.runtime_symbols` — populated
+        // by `register_symbol[s]` before this call.
+        let symbols: Vec<(String, usize)> = self
+            .runtime_symbols
+            .iter()
+            .map(|(n, p)| (n.clone(), *p))
+            .collect();
+        let link_result = link_to_dylib(&obj_path, &dylib_path, &symbols);
+        if let Err(e) = link_result {
+            let _ = std::fs::remove_file(&obj_path);
+            return Err(CompilerError::Backend(format!("link: {e}")));
         }
 
-        // Store execution engine (keeps JIT code alive)
-        self.execution_engine = Some(execution_engine);
+        // The .o is no longer needed once the .dylib exists.
+        let _ = std::fs::remove_file(&obj_path);
+
+        // (6) dlopen + dlsym every exported function symbol.
+        let func_syms = self.get_function_symbols(hir_module);
+        let names: Vec<String> = func_syms.values().cloned().collect();
+        let load_result = load_dylib(&dylib_path, &names);
+        let (lib, name_to_ptr) = match load_result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&dylib_path);
+                return Err(CompilerError::Backend(format!("load: {e}")));
+            }
+        };
+
+        // (7) Populate function_pointers from the dlsym results.
+        for (hir_id, name) in &func_syms {
+            if let Some(ptr) = name_to_ptr.get(name) {
+                self.function_pointers.insert(*hir_id, *ptr);
+            }
+        }
+
+        // (8) The mapping is now mmap'd; the inode can go. POSIX
+        // dlopen pins the inode + mapping past unlink so this is
+        // safe on macOS and Linux.
+        let _ = std::fs::remove_file(&dylib_path);
+
+        // Pin the library — dropping it would unmap the code pages
+        // and any held function pointer would dangle.
+        self.loaded_lib = Some(lib);
 
         Ok(())
     }
 
-    /// Compile a single function
-    ///
-    /// Note: For JIT use, prefer compile_module() which handles forward references correctly.
-    /// Single-function compilation may fail if the function references other functions.
+    /// Compile a single function. Kept as a thin wrapper around
+    /// `compile_module` for source compatibility with the older
+    /// MCJIT-era API. The single-function shape is incorrect in
+    /// general (any call to another function in the original module
+    /// dangles) — callers should prefer `compile_module`.
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
-        // Create a temporary module with just this function
         use std::collections::HashSet;
 
         let temp_module = HirModule {
@@ -348,28 +486,25 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             effects: IndexMap::new(),
             handlers: IndexMap::new(),
         };
-
-        // Compile it
         self.compile_module(&temp_module)?;
-
         Ok(())
     }
 
-    /// Get a function pointer
+    /// Get a function pointer for a HirId, if it was emitted and
+    /// dlsym'd successfully.
     pub fn get_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
         self.function_pointers
             .get(&func_id)
             .map(|&addr| addr as *const u8)
     }
 
-    /// Get optimization level
+    /// Get optimisation level.
     pub fn optimization_level(&self) -> OptimizationLevel {
         self.opt_level
     }
 }
 
-/// Function signature type for JIT-compiled functions
-/// This is a type alias for function pointers returned by the JIT
+/// Function signature type for JIT-compiled functions.
 pub type JitFunctionPointer = unsafe extern "C" fn() -> ();
 
 #[cfg(test)]
@@ -386,8 +521,6 @@ mod tests {
     #[test]
     fn test_llvm_jit_backend_opt_levels() {
         let context = Context::create();
-
-        // Test all optimization levels
         for opt_level in &[
             OptimizationLevel::None,
             OptimizationLevel::Less,
@@ -398,5 +531,143 @@ mod tests {
             assert!(backend.is_ok());
             assert_eq!(backend.unwrap().optimization_level(), *opt_level);
         }
+    }
+
+    #[test]
+    fn test_mangle_function_name_clean_pass_through() {
+        assert_eq!(LLVMJitBackend::mangle_function_name("foo"), "foo");
+        assert_eq!(LLVMJitBackend::mangle_function_name("a_b_c"), "a_b_c");
+        // `$` is preserved (used by handler-op names).
+        assert_eq!(
+            LLVMJitBackend::mangle_function_name("Console$info"),
+            "Console$info"
+        );
+    }
+
+    #[test]
+    fn test_mangle_function_name_parens_and_specials() {
+        // The MCJIT-era format produced "func_HirId(42)" — parens are
+        // linker-hostile.
+        let mangled = LLVMJitBackend::mangle_function_name("func_HirId(42)");
+        assert!(mangled.contains("_LP_"));
+        assert!(mangled.contains("_RP_"));
+        assert!(!mangled.contains('('));
+        assert!(!mangled.contains(')'));
+    }
+
+    /// End-to-end AOT-via-object pipeline test: build a tiny HIR
+    /// module containing `def add(a, b) { return a + b }`, run it
+    /// through the full lower→opt→object→link→dlopen pipeline, then
+    /// call the resulting function pointer and assert correctness.
+    ///
+    /// This is the single canonical proof that the AOT tier works
+    /// when LLVM lowering doesn't trip on the existing prelude opaque-
+    /// type issues that affect the bench kernels. Soft-falls if the
+    /// host has no system linker (CI containers).
+    #[test]
+    fn test_aot_end_to_end_add() {
+        use crate::hir::{
+            BinaryOp, HirBlock, HirFunction, HirFunctionSignature, HirInstruction, HirParam,
+            HirTerminator, HirType, HirValue, HirValueKind, ParamAttributes,
+        };
+        use std::collections::HashSet;
+        use zyntax_typed_ast::InternedString;
+
+        // Skip if there's no linker available — CI cells without a
+        // toolchain still need to pass.
+        if crate::llvm_link::find_linker().is_err() {
+            eprintln!("test_aot_end_to_end_add: no linker available, skipping");
+            return;
+        }
+
+        // Build `def add(a: i64, b: i64): i64 { return a + b }`.
+        let p0_id = HirId::new();
+        let p1_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: p0_id,
+                    name: InternedString::new_global("a"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: p1_id,
+                    name: InternedString::new_global("b"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("aot_add"), sig);
+        func.values.insert(
+            p0_id,
+            HirValue {
+                id: p0_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        func.values.insert(
+            p1_id,
+            HirValue {
+                id: p1_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(1),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let sum_id = HirId::new();
+        func.values.insert(
+            sum_id,
+            HirValue {
+                id: sum_id,
+                ty: HirType::I64,
+                kind: HirValueKind::Instruction,
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let entry_id = func.entry_block;
+        let entry: &mut HirBlock = func.blocks.get_mut(&entry_id).unwrap();
+        entry.instructions.push(HirInstruction::Binary {
+            result: sum_id,
+            op: BinaryOp::Add,
+            ty: HirType::I64,
+            left: p0_id,
+            right: p1_id,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![sum_id],
+        };
+
+        let mut module = HirModule::new(InternedString::new_global("aot_test"));
+        let func_id = func.id;
+        module.functions.insert(func_id, func);
+
+        // Drive the AOT pipeline.
+        let context = Context::create();
+        let mut backend = LLVMJitBackend::new(&context).expect("backend init");
+        backend
+            .compile_module(&module)
+            .expect("AOT compile_module should succeed for trivial add");
+
+        let ptr = backend
+            .get_function_pointer(func_id)
+            .expect("dlsym should produce a function pointer");
+        let f: unsafe extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+        let result = unsafe { f(7, 35) };
+        assert_eq!(result, 42, "AOT-linked add(7, 35) should return 42");
     }
 }

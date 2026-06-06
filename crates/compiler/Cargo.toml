@@ -50,7 +50,13 @@ fnv = "1.0.7"  # Fast hash function
 
 # Dynamic library loading for ZRTL plugins (native targets only).
 # Optional so the crate can build for wasm32, which has no dlopen.
+# Also used by the AOT LLVM tier (`llvm_link`) for dlopen+dlsym on
+# the linker-produced shared object.
 libloading = { version = "0.8", optional = true }
+
+# libc constants (RTLD_NOW, RTLD_GLOBAL) for the AOT LLVM tier's
+# dlopen flags. Optional; only the `llvm-backend` AOT path needs it.
+libc = { version = "0.2", optional = true }
 
 # Lazy initialization for global state
 once_cell = "1.19"
@@ -92,7 +98,7 @@ harness = false
 [features]
 default = ["cranelift-backend", "dynamic-plugins"]
 cranelift-backend = ["cranelift", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
-llvm-backend = ["inkwell"]
+llvm-backend = ["inkwell", "libloading", "libc"]
 # Wasm-emitting tier-1 JIT for hot HIR functions (Phase E). The
 # emitter itself works on any host; the consumer (wasm runtime)
 # turns the emitted bytes into an instantiated module.
