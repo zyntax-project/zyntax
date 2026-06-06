@@ -155,14 +155,14 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 TargetMachine::get_host_cpu_name()
                     .to_str()
                     .unwrap_or("generic"),
-                TargetMachine::get_host_cpu_features().to_str().unwrap_or(""),
+                TargetMachine::get_host_cpu_features()
+                    .to_str()
+                    .unwrap_or(""),
                 self.opt_level,
                 RelocMode::Default,
                 CodeModel::Default,
             )
-            .ok_or_else(|| {
-                CompilerError::Backend("Failed to create host target machine".into())
-            })?;
+            .ok_or_else(|| CompilerError::Backend("Failed to create host target machine".into()))?;
         backend.module().set_triple(&target_triple);
         backend
             .module()
