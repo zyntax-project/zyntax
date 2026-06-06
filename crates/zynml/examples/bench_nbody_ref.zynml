@@ -1,0 +1,183 @@
+import prelude
+
+// N-body bench — exact port of rayzor's
+// `compiler/benchmarks/haxe/BMNBodyCode.hx`, which itself is the
+// HaxeBenchmarks reference n-body. The reference does 20 × 500_000
+// = 10_000_000 calls to `advance(0.01)` and returns the system's
+// energy × 1_000_000 truncated to `int`.
+//
+// Algorithm parity is what makes this comparable to rayzor:
+//   * Newtonian gravity with `mag = dt / r³` (rayzor uses
+//     `Math.sqrt(d²) * d² = r³`, identical via the
+//     `r³ = r · r²` reformulation).
+//   * Five bodies with the standard `Sun + four outer planets`
+//     initial conditions, momentum-balanced via offsetMomentum.
+//   * `0.5 * 1e-6 * (v² · m - Σ pair-potential)` as the energy
+//     calculation, scaled by 1_000_000 and truncated.
+//
+// ZynML difference today: prelude's `sqrt` is a 12-iteration
+// Newton-Raphson rather than a hardware FSQRT, so a meaningful
+// chunk of the bench time is in `prelude::sqrt`. Wiring
+// `Intrinsic::Sqrt` from the Cranelift backend (already plumbed)
+// to the ZynML `sqrt` name is the natural follow-up — call sites
+// don't change.
+
+@reference
+struct Body {
+    x: f64,
+    y: f64,
+    z: f64,
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    mass: f64
+}
+
+def advance(bodies: Array<Body>, n: i64, dt: f64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        let mut a = bodies[i]
+        let mut j: i64 = i + 1
+        while j < n {
+            let mut b = bodies[j]
+            let dx = a.x - b.x
+            let dy = a.y - b.y
+            let dz = a.z - b.z
+            let d2 = dx * dx + dy * dy + dz * dz
+            let distance = sqrt(d2)
+            let mag = dt / (distance * distance * distance)
+
+            a.vx = a.vx - dx * b.mass * mag
+            a.vy = a.vy - dy * b.mass * mag
+            a.vz = a.vz - dz * b.mass * mag
+
+            b.vx = b.vx + dx * a.mass * mag
+            b.vy = b.vy + dy * a.mass * mag
+            b.vz = b.vz + dz * a.mass * mag
+
+            bodies[j] = b
+            j = j + 1
+        }
+        bodies[i] = a
+        i = i + 1
+    }
+
+    let mut k: i64 = 0
+    while k < n {
+        let mut body = bodies[k]
+        body.x = body.x + dt * body.vx
+        body.y = body.y + dt * body.vy
+        body.z = body.z + dt * body.vz
+        bodies[k] = body
+        k = k + 1
+    }
+    return n
+}
+
+def energy(bodies: Array<Body>, n: i64): f64 {
+    let mut e: f64 = 0.0
+    let mut i: i64 = 0
+    while i < n {
+        let a = bodies[i]
+        e = e + 0.5 * a.mass * (a.vx * a.vx + a.vy * a.vy + a.vz * a.vz)
+        let mut j: i64 = i + 1
+        while j < n {
+            let b = bodies[j]
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            let dz = b.z - a.z
+            let d2 = dx * dx + dy * dy + dz * dz
+            e = e - (a.mass * b.mass) / sqrt(d2)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return e
+}
+
+def main(): i64 {
+    let solar_mass: f64 = 39.478417604357434
+    let days_per_year: f64 = 365.24
+
+    let sun = Body {
+        x: 0.0, y: 0.0, z: 0.0,
+        vx: 0.0, vy: 0.0, vz: 0.0,
+        mass: solar_mass
+    }
+    let jupiter = Body {
+        x: 4.84143144246472,
+        y: -1.16032004402742,
+        z: -0.103622044471123,
+        vx: 0.00166007664274403 * days_per_year,
+        vy: 0.00769901118419740 * days_per_year,
+        vz: -0.0000690460016972 * days_per_year,
+        mass: 0.000954791938424 * solar_mass
+    }
+    let saturn = Body {
+        x: 8.34336671824458,
+        y: 4.12479856412430,
+        z: -0.403523417114321,
+        vx: -0.00276742510726862 * days_per_year,
+        vy: 0.00499852801234917 * days_per_year,
+        vz: 0.0000230417297573 * days_per_year,
+        mass: 0.000285885980666 * solar_mass
+    }
+    let uranus = Body {
+        x: 12.8943695621391,
+        y: -15.1111514016986,
+        z: -0.223307578892655,
+        vx: 0.00296460137564761 * days_per_year,
+        vy: 0.00237847173959480 * days_per_year,
+        vz: -0.0000296589568540 * days_per_year,
+        mass: 0.0000436624404335 * solar_mass
+    }
+    let neptune = Body {
+        x: 15.3796971148509,
+        y: -25.9193146099879,
+        z: 0.179258772950371,
+        vx: 0.00268067772490389 * days_per_year,
+        vy: 0.00162824170038242 * days_per_year,
+        vz: -0.0000951592254519 * days_per_year,
+        mass: 0.0000515138902046 * solar_mass
+    }
+
+    let bodies = [sun, jupiter, saturn, uranus, neptune]
+    let n: i64 = 5
+
+    // Offset the Sun's momentum so the system's centre of mass is
+    // stationary — without this the long-running integration error
+    // explodes as the COM drifts.
+    let mut px: f64 = 0.0
+    let mut py: f64 = 0.0
+    let mut pz: f64 = 0.0
+    let mut i: i64 = 0
+    while i < n {
+        let b = bodies[i]
+        px = px + b.vx * b.mass
+        py = py + b.vy * b.mass
+        pz = pz + b.vz * b.mass
+        i = i + 1
+    }
+    let mut s = bodies[0]
+    s.vx = 0.0 - px / solar_mass
+    s.vy = 0.0 - py / solar_mass
+    s.vz = 0.0 - pz / solar_mass
+    bodies[0] = s
+
+    let dt: f64 = 0.01
+    // 20 × 500_000 = 10_000_000 advance calls, matching rayzor's
+    // HaxeBenchmarks shape exactly.
+    let mut outer: i64 = 0
+    while outer < 20 {
+        let mut step: i64 = 0
+        while step < 500000 {
+            advance(bodies, n, dt)
+            step = step + 1
+        }
+        outer = outer + 1
+    }
+
+    // Return Std.int(energy * 1_000_000) — rayzor's checksum form.
+    let e: f64 = energy(bodies, n)
+    return (e * 1000000.0) as i64
+}
