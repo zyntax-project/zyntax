@@ -14,7 +14,11 @@ crate-type = ["cdylib", "rlib"]
 # don't drag in Cranelift / libloading / the native ZyntaxRuntime —
 # the wasm shim drives `InterpRuntime` directly. `parse-only` keeps
 # parser + TypedAST + the lowering passes available.
-zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only", "krio-async-backend"] }
+# `krio-async-backend` is added in the wasm32-only target section
+# below so it doesn't leak into native workspace test builds via
+# Cargo's feature unification (where it would un-ignore async tests
+# the krio path doesn't yet handle on x86_64-pc-windows-msvc).
+zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
 # Direct access to `compile_to_hir` + `CompilationConfig`. The
 # embed crate re-exports HirInterpreter but not the lowering API.
 zyntax_compiler = { path = "../compiler", default-features = false, features = ["wasm-jit"] }
@@ -30,6 +34,12 @@ serde-wasm-bindgen = "0.6"
 serde = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# wasm32 needs the krio-async captures-lift state machine: cooperative
+# yielding requires the krio path so `await` actually parks rather
+# than spin-polling the single-threaded wasm event loop. This extra
+# features entry composes with the base zyntax_embed entry above
+# (Cargo unions per-target features into the resolved feature set).
+zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only", "krio-async-backend"] }
 # Surface unhandled panics as `console.error` with a stack trace
 # instead of the bare `unreachable executed` wasm trap.
 console_error_panic_hook = "0.1"
