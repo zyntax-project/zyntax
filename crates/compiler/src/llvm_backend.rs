@@ -3635,8 +3635,35 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Use opaque struct if it has a name (for recursive types)
                 if let Some(name) = struct_ty.name {
                     let name_str = format!("struct.{:?}", name);
-                    let struct_type = self.context.opaque_struct_type(&name_str);
-                    struct_type.set_body(&field_types, struct_ty.packed);
+                    // Dedup named structs against the Context's own
+                    // table. Without this every translate_type call
+                    // for the same logical struct creates a fresh
+                    // opaque_struct_type + set_body; the second
+                    // declaration wins, but LLVM renames it with a
+                    // numeric suffix (`.249`, `.265`, …) when the
+                    // bodies aren't byte-identical. Everything
+                    // downstream that referenced the original name —
+                    // call sites, phi nodes, globals, returns —
+                    // then mismatches against the renamed body and
+                    // the verifier rejects the whole module.
+                    //
+                    // `Context::get_struct_type(name)` returns the
+                    // existing handle if any. If it already has a
+                    // body, reuse it as-is; if it's still opaque
+                    // (forward-declared somewhere), set the body
+                    // once. Otherwise create a fresh opaque struct
+                    // and set its body.
+                    let struct_type =
+                        if let Some(existing) = self.context.get_struct_type(&name_str) {
+                            if existing.is_opaque() {
+                                existing.set_body(&field_types, struct_ty.packed);
+                            }
+                            existing
+                        } else {
+                            let st = self.context.opaque_struct_type(&name_str);
+                            st.set_body(&field_types, struct_ty.packed);
+                            st
+                        };
                     struct_type.into()
                 } else {
                     // Anonymous struct
