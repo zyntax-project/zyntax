@@ -117,18 +117,22 @@ jobs:
       - name: Run benchmark (${{ matrix.kernel }})
         env:
           RUST_MIN_STACK: 134217728
-        # Median-of-3 + per-kernel runner = honest x86_64 numbers.
-        # `--filter` runs only this matrix entry's kernel; the JSON
-        # naturally ends up with just that kernel's data plus meta.
-        # `--features llvm-backend` exercises the full tier-up ladder
-        # so the `zyntax-tiered-llvm` column reflects honest LLVM-tier
-        # numbers.
+        # Median-of-9 + per-kernel runner = honest x86_64 numbers.
+        # 9 samples dampens GHA shared-tenant noise (variable CPU
+        # clock, neighbour load, thermal throttling) meaningfully
+        # below the typical 10-20% single-run drift; per-kernel
+        # matrix means the extra runs don't serialize with the rest
+        # of the sweep. `--filter` runs only this matrix entry's
+        # kernel; the JSON naturally ends up with just that kernel's
+        # data plus meta. `--features llvm-backend` exercises the
+        # full tier-up ladder so the `zyntax-tiered-llvm` column
+        # reflects honest LLVM-tier numbers.
         run: |
           mkdir -p bench-out
           cargo run --release --package zynml --example bench_runner --features llvm-backend -- \
             --out bench-out/results-${{ matrix.kernel }}.json \
             --filter ${{ matrix.kernel }} \
-            --runs 3
+            --runs 9
 
       - name: Upload partial benchmark result
         uses: actions/upload-artifact@v4
