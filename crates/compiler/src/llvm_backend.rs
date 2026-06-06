@@ -97,6 +97,48 @@ pub struct LLVMBackend<'ctx> {
         std::collections::HashMap<(HirId, zyntax_typed_ast::InternedString), (HirId, bool)>,
 }
 
+/// Approximate byte size of a `HirType` for laying out union payloads
+/// in the LLVM backend.
+///
+/// We only need this for the `Union` arm of `translate_type` — picking
+/// the widest non-Void variant's storage size so the payload slot can
+/// hold any of them. Goes through the fixed-width primitive sizes,
+/// recurses into composites by summing fields, and falls back to a
+/// conservative 8 bytes (one pointer's worth) for everything else
+/// (Opaque, named structs we haven't walked yet, function pointers,
+/// vectors with non-standard lane shapes). Conservative wins here:
+/// over-allocating the union payload is a layout no-op; under-
+/// allocating corrupts whichever variant is widest.
+fn hir_type_size_bytes(ty: &HirType) -> u32 {
+    match ty {
+        HirType::Void => 0,
+        HirType::Bool | HirType::I8 | HirType::U8 => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Ptr(_) | HirType::Ref { .. } => 8,
+        HirType::Array(elem, n) => hir_type_size_bytes(elem) * (*n as u32),
+        HirType::Struct(s) => s.fields.iter().map(hir_type_size_bytes).sum(),
+        HirType::Vector(elem, n) => hir_type_size_bytes(elem) * (*n),
+        HirType::Union(u) => {
+            let disc = hir_type_size_bytes(&u.discriminant_type);
+            let payload = u
+                .variants
+                .iter()
+                .map(|v| hir_type_size_bytes(&v.ty))
+                .max()
+                .unwrap_or(0);
+            disc + payload
+        }
+        // Conservative pointer-width fallback for variants whose
+        // layout we can't easily compute here (Function, Opaque,
+        // closures, named/forward types). Wider-than-needed payload
+        // is harmless; under-sized would corrupt.
+        _ => 8,
+    }
+}
+
 impl<'ctx> LLVMBackend<'ctx> {
     /// Create a new LLVM backend
     ///
@@ -3650,6 +3692,36 @@ impl<'ctx> LLVMBackend<'ctx> {
                     )));
                 }
             },
+            Union(union_ty) => {
+                // LLVM has no native tagged-union type. Lower a HIR
+                // Union as a struct of `{ discriminant_ty,
+                // [N x i8] }` where N is the widest non-Void variant's
+                // size in bytes. Backends store the discriminant
+                // first, then bitcast the payload bytes to the variant
+                // type they want. For C-style unions
+                // (`is_c_union: true`) the discriminant slot is still
+                // emitted but unused — codegen sites read/write only
+                // the payload.
+                //
+                // This shape covers Option<T>, Result<T, E>, ZynML
+                // enums with payloads, etc. — every kernel importing
+                // the prelude trips it before this arm landed.
+                let disc_ty = self.translate_type(&union_ty.discriminant_type)?;
+                let mut max_payload_bytes: u32 = 0;
+                for variant in &union_ty.variants {
+                    if matches!(variant.ty, HirType::Void) {
+                        continue;
+                    }
+                    let variant_bytes = hir_type_size_bytes(&variant.ty);
+                    if variant_bytes > max_payload_bytes {
+                        max_payload_bytes = variant_bytes;
+                    }
+                }
+                let payload_ty = self.context.i8_type().array_type(max_payload_bytes);
+                self.context
+                    .struct_type(&[disc_ty, payload_ty.into()], false)
+                    .into()
+            }
             Opaque(name) => {
                 // Opaque HIR types (forward declarations, prelude
                 // extern types like Tensor, `@reference class` types
