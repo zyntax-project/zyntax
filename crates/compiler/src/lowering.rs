@@ -2681,6 +2681,20 @@ impl LoweringContext {
                                 .map(|field| self.convert_type(&field.ty))
                                 .collect();
 
+                            // Strict V1 reference-class lowering: classes
+                            // annotated with `@reference` use heap layout —
+                            // instances are pointers to the struct rather
+                            // than value-typed aggregates.
+                            if type_def.metadata.is_reference {
+                                return HirType::Ptr(Box::new(HirType::Struct(
+                                    crate::hir::HirStructType {
+                                        name: Some(type_def.name),
+                                        fields: field_types,
+                                        packed: false,
+                                    },
+                                )));
+                            }
+
                             HirType::Struct(crate::hir::HirStructType {
                                 name: Some(type_def.name),
                                 fields: field_types,

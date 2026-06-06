@@ -1,0 +1,23 @@
+// Strict V1 reference-class lowering smoke test.
+//
+// The `@reference` annotation on `Point` switches its layout from
+// the default value-typed aggregate to a heap-allocated struct:
+// instantiation lowers to `Intrinsic::Malloc` + per-field GEP+Store,
+// field reads go through GEP + Load, and field writes through
+// GEP + Store. The scalar_replace_alloc pass recognises this exact
+// single-block, non-escaping shape and collapses the allocation
+// back to SSA registers, so the bench cost matches a value-typed
+// struct while the source semantics stay reference-like.
+//
+// Expected: `main` returns 30 (10 + 20).
+
+@reference
+struct Point {
+    x: i64,
+    y: i64
+}
+
+def main(): i64 {
+    let p = Point { x: 10, y: 20 }
+    return p.x + p.y
+}

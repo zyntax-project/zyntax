@@ -99,6 +99,7 @@ fn java_style_generics() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 100),
     };
 
@@ -141,6 +142,7 @@ fn csharp_style_generics() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 100),
     };
 
@@ -281,6 +283,7 @@ fn haxe_style_generics() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 100),
     };
 

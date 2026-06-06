@@ -764,6 +764,7 @@ impl WhirlwindAdapter {
                 visibility,
                 is_abstract: false,
                 is_final: false,
+                annotations: vec![],
                 span,
             }),
             Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),

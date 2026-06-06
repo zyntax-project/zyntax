@@ -887,6 +887,24 @@ pub(crate) fn register_struct_declarations(
             // Create TypeDefinition for the struct
             // Use existing ID if updating a placeholder, otherwise generate new
             let type_id = existing_id.unwrap_or_else(TypeId::next);
+
+            // Strict V1 reference-class lowering: a `@reference` annotation on
+            // the struct declaration switches the type's runtime layout to
+            // heap-allocated. The SSA builder consults
+            // `TypeMetadata::is_reference` when lowering struct literals
+            // and field accesses; the scalar_replace_alloc pass can later
+            // collapse non-escaping allocations back to SSA registers.
+            let is_reference = class_decl.annotations.iter().any(|ann| {
+                ann.name
+                    .resolve_global()
+                    .as_deref()
+                    .map(|n| n == "reference")
+                    .unwrap_or(false)
+            });
+
+            let mut metadata = TypeMetadata::default();
+            metadata.is_reference = is_reference;
+
             let type_def = TypeDefinition {
                 id: type_id,
                 name: class_decl.name,
@@ -899,7 +917,7 @@ pub(crate) fn register_struct_declarations(
                 fields,
                 methods: vec![],
                 constructors: vec![],
-                metadata: TypeMetadata::default(),
+                metadata,
                 span: decl.span,
             };
 

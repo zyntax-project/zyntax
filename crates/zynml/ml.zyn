@@ -783,10 +783,13 @@ type_alias = { "type" ~ name:identifier ~ "=" ~ target:type_expr }
   }
 
 // Struct type: type Point = { x: f32, y: f32 }
-type_struct = { "type" ~ name:identifier ~ "=" ~ "{" ~ fields:struct_fields ~ "}" }
+// Optional leading `@annotations` (e.g. `@reference`) thread into the
+// Class declaration so the lowering pipeline can pick reference layout.
+type_struct = { annotations:annotation* ~ "type" ~ name:identifier ~ "=" ~ "{" ~ fields:struct_fields ~ "}" }
   -> TypedDeclaration::Class {
       name: intern(name),
       fields: fields,
+      annotations: annotations,
   }
 
 // Helper rule for comma-separated struct fields (needed for binding accumulation)
@@ -928,35 +931,41 @@ struct_def = {
 // ========== Brace-style struct definitions ==========
 
 // struct List<T> { items: Vec, count: int }
-struct_def_generic_brace = { "struct" ~ name:identifier ~ type_params ~ "{" ~ fields:struct_field_list ~ "}" }
+// Optional leading `@annotations` (e.g. `@reference`) thread into the
+// Class declaration so the lowering pipeline can pick reference layout.
+struct_def_generic_brace = { annotations:annotation* ~ "struct" ~ name:identifier ~ type_params ~ "{" ~ fields:struct_field_list ~ "}" }
   -> TypedDeclaration::Class {
       name: intern(name),
       fields: fields,
+      annotations: annotations,
   }
 
 // struct Point { x: float, y: float }
-struct_def_brace = { "struct" ~ name:identifier ~ "{" ~ fields:struct_field_list ~ "}" }
+struct_def_brace = { annotations:annotation* ~ "struct" ~ name:identifier ~ "{" ~ fields:struct_field_list ~ "}" }
   -> TypedDeclaration::Class {
       name: intern(name),
       fields: fields,
+      annotations: annotations,
   }
 
 // ========== Colon-style struct definitions ==========
 
 // struct List<T>:
 //     ...
-struct_def_generic = { "struct" ~ name:identifier ~ type_params ~ ":" ~ fields:struct_def_fields }
+struct_def_generic = { annotations:annotation* ~ "struct" ~ name:identifier ~ type_params ~ ":" ~ fields:struct_def_fields }
   -> TypedDeclaration::Class {
       name: intern(name),
       fields: fields,
+      annotations: annotations,
   }
 
 // struct Point:
 //     ...
-struct_def_simple = { "struct" ~ name:identifier ~ ":" ~ fields:struct_def_fields }
+struct_def_simple = { annotations:annotation* ~ "struct" ~ name:identifier ~ ":" ~ fields:struct_def_fields }
   -> TypedDeclaration::Class {
       name: intern(name),
       fields: fields,
+      annotations: annotations,
   }
 
 struct_def_fields = { field:struct_def_field+ }

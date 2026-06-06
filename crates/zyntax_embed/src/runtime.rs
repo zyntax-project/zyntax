@@ -1174,6 +1174,22 @@ impl ZyntaxRuntime {
                             })
                             .collect();
 
+                        // Strict V1 reference-class lowering: propagate
+                        // `@reference` annotation through the
+                        // placeholder-update path so generic / pre-registered
+                        // types (e.g. `List<T>`) still pick up reference
+                        // semantics when annotated.
+                        let is_reference = class.annotations.iter().any(|ann| {
+                            ann.name
+                                .resolve_global()
+                                .as_deref()
+                                .map(|n| n == "reference")
+                                .unwrap_or(false)
+                        });
+                        let mut metadata: zyntax_typed_ast::type_registry::TypeMetadata =
+                            Default::default();
+                        metadata.is_reference = is_reference;
+
                         let type_def = TypeDefinition {
                             id: existing_id,
                             name: class.name,
@@ -1186,7 +1202,7 @@ impl ZyntaxRuntime {
                             fields: field_defs,
                             methods: vec![],
                             constructors: vec![],
-                            metadata: Default::default(),
+                            metadata,
                             span: class.span,
                         };
                         program.type_registry.register_type(type_def);
@@ -1231,6 +1247,19 @@ impl ZyntaxRuntime {
                     })
                     .collect();
 
+                // Strict V1 reference-class lowering: propagate `@reference`
+                // annotation on fresh registration.
+                let is_reference = class.annotations.iter().any(|ann| {
+                    ann.name
+                        .resolve_global()
+                        .as_deref()
+                        .map(|n| n == "reference")
+                        .unwrap_or(false)
+                });
+                let mut metadata: zyntax_typed_ast::type_registry::TypeMetadata =
+                    Default::default();
+                metadata.is_reference = is_reference;
+
                 let type_def = TypeDefinition {
                     id: type_id,
                     name: class.name,
@@ -1243,7 +1272,7 @@ impl ZyntaxRuntime {
                     fields: field_defs,
                     methods: vec![],
                     constructors: vec![],
-                    metadata: Default::default(),
+                    metadata,
                     span: class.span,
                 };
                 program.type_registry.register_type(type_def);
@@ -3512,6 +3541,20 @@ impl TieredRuntime {
                     })
                     .collect();
 
+                // Strict V1 reference-class lowering: propagate `@reference`
+                // annotation in the rebuild path that precedes
+                // `lower_typed_program`.
+                let is_reference = class.annotations.iter().any(|ann| {
+                    ann.name
+                        .resolve_global()
+                        .as_deref()
+                        .map(|n| n == "reference")
+                        .unwrap_or(false)
+                });
+                let mut metadata: zyntax_typed_ast::type_registry::TypeMetadata =
+                    Default::default();
+                metadata.is_reference = is_reference;
+
                 let type_def = TypeDefinition {
                     id: type_id,
                     name: class.name,
@@ -3524,7 +3567,7 @@ impl TieredRuntime {
                     fields: field_defs,
                     methods: vec![],
                     constructors: vec![],
-                    metadata: Default::default(),
+                    metadata,
                     span: class.span,
                 };
                 program.type_registry.register_type(type_def);

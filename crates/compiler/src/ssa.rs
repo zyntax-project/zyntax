@@ -4294,6 +4294,87 @@ impl SsaBuilder {
                 // Calculate field index
                 let field_index = self.get_field_index(&object_type, field)?;
 
+                // Strict V1 reference-class lowering: when the object's
+                // SSA value is typed `Ptr(Struct{..})` the field lives on
+                // the heap. Emit byte-offset GEP + Load (matching the
+                // shape SRA expects). This must run BEFORE the
+                // single-field-flatten / ExtractValue paths below — those
+                // operate on value-typed aggregates and produce wrong
+                // codegen for pointer-typed objects.
+                let object_hir_ty = self.function.values.get(&object_val).map(|v| v.ty.clone());
+                if let Some(HirType::Ptr(ref pointee)) = object_hir_ty {
+                    if let HirType::Struct(ref hir_struct) = **pointee {
+                        if let Some(field_ty) = hir_struct.fields.get(field_index as usize).cloned()
+                        {
+                            // Per-field natural-alignment offset, mirroring
+                            // the Struct-literal lowering above.
+                            let mut offset: u64 = 0;
+                            for (i, fty) in hir_struct.fields.iter().enumerate() {
+                                let sz = hir_ty_size(fty) as u64;
+                                let align = sz.max(1);
+                                if align > 1 {
+                                    let m = align - 1;
+                                    offset = (offset + m) & !m;
+                                }
+                                if i as u32 == field_index {
+                                    break;
+                                }
+                                offset += sz.max(1);
+                            }
+
+                            let offset_id = self.create_value(
+                                HirType::I64,
+                                HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
+                            );
+                            let gep_id = self.create_value(
+                                HirType::Ptr(Box::new(HirType::U8)),
+                                HirValueKind::Instruction,
+                            );
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::GetElementPtr {
+                                    result: gep_id,
+                                    ty: HirType::U8,
+                                    ptr: object_val,
+                                    indices: vec![offset_id],
+                                },
+                            );
+                            self.add_use(object_val, gep_id);
+                            self.add_use(offset_id, gep_id);
+
+                            let field_ptr = self.create_value(
+                                HirType::Ptr(Box::new(field_ty.clone())),
+                                HirValueKind::Instruction,
+                            );
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Cast {
+                                    result: field_ptr,
+                                    ty: HirType::Ptr(Box::new(field_ty.clone())),
+                                    op: crate::hir::CastOp::Bitcast,
+                                    operand: gep_id,
+                                },
+                            );
+                            self.add_use(gep_id, field_ptr);
+
+                            let load_result =
+                                self.create_value(field_ty.clone(), HirValueKind::Instruction);
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Load {
+                                    result: load_result,
+                                    ty: field_ty,
+                                    ptr: field_ptr,
+                                    align: 8,
+                                    volatile: false,
+                                },
+                            );
+                            self.add_use(field_ptr, load_result);
+                            return Ok(load_result);
+                        }
+                    }
+                }
+
                 // Single-field structs MAY be flattened by Cranelift's ABI at
                 // call/return boundaries (the struct value IS the field value,
                 // so an ExtractValue on the bare scalar is invalid). But inside
@@ -4719,6 +4800,138 @@ impl SsaBuilder {
                     struct_ty,
                     struct_lit.fields.len()
                 );
+
+                // Strict V1 reference-class lowering: when `convert_type`
+                // returns `Ptr(Struct{..})` the class is `@reference`. Emit
+                // a heap allocation (`Intrinsic::Malloc`) and write each
+                // field through a byte-offset GEP. `scalar_replace_alloc`
+                // recognises this exact shape — single-block malloc +
+                // tracked GEPs + Loads/Stores — and collapses the
+                // allocation back to SSA registers when it does not
+                // escape.
+                if let HirType::Ptr(ref inner) = struct_ty {
+                    if let HirType::Struct(ref hir_struct) = **inner {
+                        // Compute per-field offsets using natural alignment
+                        // (each field aligned to its own size, struct
+                        // padded to the largest field). This mirrors the
+                        // ABI Cranelift uses for value-typed structs and
+                        // keeps Loads/Stores aligned.
+                        let mut offsets: Vec<u64> = Vec::with_capacity(hir_struct.fields.len());
+                        let mut running: u64 = 0;
+                        let mut max_align: u64 = 1;
+                        for fty in &hir_struct.fields {
+                            let sz = hir_ty_size(fty) as u64;
+                            let align = sz.max(1);
+                            if align > max_align {
+                                max_align = align;
+                            }
+                            // Align the running offset up to the field's alignment.
+                            if align > 1 {
+                                let m = align - 1;
+                                running = (running + m) & !m;
+                            }
+                            offsets.push(running);
+                            running += sz.max(1);
+                        }
+                        // Round total size up to max alignment.
+                        if max_align > 1 {
+                            let m = max_align - 1;
+                            running = (running + m) & !m;
+                        }
+                        let total_size = running.max(1);
+
+                        // Size constant for malloc.
+                        let size_const = self.create_value(
+                            HirType::I64,
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(total_size as i64)),
+                        );
+
+                        // Emit `Call(Intrinsic::Malloc, [size])`. The
+                        // backend lowers Malloc to a libc call returning a
+                        // pointer; the SSA value is typed
+                        // `Ptr(Struct{..})` to match the struct's HIR
+                        // type.
+                        let malloc_result =
+                            self.create_value(struct_ty.clone(), HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::Call {
+                                result: Some(malloc_result),
+                                callee: crate::hir::HirCallable::Intrinsic(
+                                    crate::hir::Intrinsic::Malloc,
+                                ),
+                                args: vec![size_const],
+                                type_args: vec![],
+                                const_args: vec![],
+                                is_tail: false,
+                            },
+                        );
+                        self.add_use(size_const, malloc_result);
+
+                        // For each field: emit GEP (byte offset) + Store.
+                        // GEPs use HirType::U8 + a single i64 byte-offset
+                        // index, exactly the shape
+                        // `aggregate_split` / `scalar_replace_alloc`
+                        // expect.
+                        for (i, field) in struct_lit.fields.iter().enumerate() {
+                            let field_val = self.translate_expression(block_id, &field.value)?;
+                            let offset = offsets[i] as i64;
+                            let field_ty = hir_struct.fields[i].clone();
+
+                            let offset_id = self.create_value(
+                                HirType::I64,
+                                HirValueKind::Constant(crate::hir::HirConstant::I64(offset)),
+                            );
+                            let gep_id = self.create_value(
+                                HirType::Ptr(Box::new(HirType::U8)),
+                                HirValueKind::Instruction,
+                            );
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::GetElementPtr {
+                                    result: gep_id,
+                                    ty: HirType::U8,
+                                    ptr: malloc_result,
+                                    indices: vec![offset_id],
+                                },
+                            );
+                            self.add_use(malloc_result, gep_id);
+                            self.add_use(offset_id, gep_id);
+
+                            // Cast u8 ptr → field ptr so Store sees the
+                            // right pointee type. SRA tolerates the
+                            // pointer-typed Cast (`cast_iidxs`).
+                            let field_ptr = self.create_value(
+                                HirType::Ptr(Box::new(field_ty.clone())),
+                                HirValueKind::Instruction,
+                            );
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Cast {
+                                    result: field_ptr,
+                                    ty: HirType::Ptr(Box::new(field_ty.clone())),
+                                    op: crate::hir::CastOp::Bitcast,
+                                    operand: gep_id,
+                                },
+                            );
+                            self.add_use(gep_id, field_ptr);
+
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Store {
+                                    value: field_val,
+                                    ptr: field_ptr,
+                                    align: 8,
+                                    volatile: false,
+                                },
+                            );
+                            self.add_use(field_ptr, field_val);
+                        }
+
+                        log::trace!("[SSA STRUCT LIT REF] Returning heap-allocated struct pointer");
+                        return Ok(malloc_result);
+                    }
+                }
 
                 // Start with an undefined struct value
                 let mut current_struct = self.create_value(struct_ty.clone(), HirValueKind::Undef);
@@ -7097,6 +7310,20 @@ impl SsaBuilder {
                         .map(|field| self.convert_type(&field.ty))
                         .collect();
 
+                    // Strict V1 reference-class lowering: classes annotated
+                    // with `@reference` use heap layout — instances are
+                    // pointers to the struct, not value-typed aggregates.
+                    // Field access and struct-literal lowering branch on
+                    // this HirType shape in `TypedExpression::Struct` and
+                    // `TypedExpression::Field`.
+                    if type_def.metadata.is_reference {
+                        return HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                            name: Some(type_def.name),
+                            fields: hir_fields,
+                            packed: false,
+                        })));
+                    }
+
                     HirType::Struct(HirStructType {
                         name: Some(type_def.name),
                         fields: hir_fields,
@@ -8140,6 +8367,84 @@ impl SsaBuilder {
 
                 // Evaluate the object expression to get the struct value
                 let object_val = self.translate_expression(block_id, object)?;
+
+                // Strict V1 reference-class lowering: a heap-allocated
+                // class stores its fields through pointers — write the
+                // new value via GEP + Store rather than rebuilding the
+                // aggregate.
+                let object_hir_ty = self.function.values.get(&object_val).map(|v| v.ty.clone());
+                if let Some(HirType::Ptr(ref pointee)) = object_hir_ty {
+                    if let HirType::Struct(ref hir_struct) = **pointee {
+                        if let Some(field_ty) = hir_struct.fields.get(field_index as usize).cloned()
+                        {
+                            // Compute byte offset (natural alignment, same
+                            // as the Struct-literal / Field-read branch).
+                            let mut offset: u64 = 0;
+                            for (i, fty) in hir_struct.fields.iter().enumerate() {
+                                let sz = hir_ty_size(fty) as u64;
+                                let align = sz.max(1);
+                                if align > 1 {
+                                    let m = align - 1;
+                                    offset = (offset + m) & !m;
+                                }
+                                if i as u32 == field_index {
+                                    break;
+                                }
+                                offset += sz.max(1);
+                            }
+
+                            let offset_id = self.create_value(
+                                HirType::I64,
+                                HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
+                            );
+                            let gep_id = self.create_value(
+                                HirType::Ptr(Box::new(HirType::U8)),
+                                HirValueKind::Instruction,
+                            );
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::GetElementPtr {
+                                    result: gep_id,
+                                    ty: HirType::U8,
+                                    ptr: object_val,
+                                    indices: vec![offset_id],
+                                },
+                            );
+                            self.add_use(object_val, gep_id);
+                            self.add_use(offset_id, gep_id);
+
+                            let field_ptr = self.create_value(
+                                HirType::Ptr(Box::new(field_ty.clone())),
+                                HirValueKind::Instruction,
+                            );
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Cast {
+                                    result: field_ptr,
+                                    ty: HirType::Ptr(Box::new(field_ty.clone())),
+                                    op: crate::hir::CastOp::Bitcast,
+                                    operand: gep_id,
+                                },
+                            );
+                            self.add_use(gep_id, field_ptr);
+
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Store {
+                                    value,
+                                    ptr: field_ptr,
+                                    align: 8,
+                                    volatile: false,
+                                },
+                            );
+                            self.add_use(field_ptr, value);
+                            // No write-back to the variable: the heap
+                            // pointer is unchanged, only the storage at
+                            // the pointee was mutated.
+                            return Ok(());
+                        }
+                    }
+                }
 
                 // Create an InsertValue instruction to update the field
                 let result_type = self.convert_type(&resolved_object_ty);

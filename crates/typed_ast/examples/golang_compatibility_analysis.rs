@@ -90,6 +90,7 @@ fn golang_features_analysis() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 50),
     };
     println!("   ✅ Structs with public/private fields");
@@ -377,6 +378,7 @@ fn go_code_examples() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 35),
     };
     println!("   → TypedClass with public mutable fields ✅");
@@ -690,6 +692,7 @@ fn go_code_examples() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 50),
     };
     println!("   → TypedClass with generic type parameter ✅");
@@ -1163,6 +1166,7 @@ mod tests {
             visibility: Visibility::Public,
             is_abstract: false,
             is_final: false,
+            annotations: vec![],
             span: Span::new(0, 40),
         };
 

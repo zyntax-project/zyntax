@@ -60,6 +60,7 @@ fn test_class_declaration() {
         visibility: Visibility::Public,
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span: Span::new(0, 100),
     };
 
@@ -285,6 +286,7 @@ fn test_comprehensive_program_structure() {
                     visibility: Visibility::Public,
                     is_abstract: false,
                     is_final: false,
+                    annotations: vec![],
                     span: Span::new(25, 60),
                 }),
                 Type::Named {

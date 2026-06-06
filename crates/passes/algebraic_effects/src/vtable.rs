@@ -71,6 +71,7 @@ fn build_op_table(effect: &TypedEffect) -> TypedNode<TypedDeclaration> {
             visibility: Visibility::Public,
             is_abstract: false,
             is_final: true,
+            annotations: vec![],
             span,
         }),
         Type::Primitive(PrimitiveType::Unit),

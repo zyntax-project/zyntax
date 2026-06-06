@@ -37,6 +37,8 @@ env_logger = "0.11"
 criterion = "0.5"
 tempfile = "3.16"
 zyntax_compiler = { path = "../compiler" }
+zyntax_typed_ast = { path = "../typed_ast" }
+indexmap = "2.2"
 
 
 [[bench]]

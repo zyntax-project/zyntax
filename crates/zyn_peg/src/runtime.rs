@@ -2070,6 +2070,7 @@ impl AstHostFunctions for TypedAstBuilder {
             visibility: Visibility::Public,
             is_abstract: false,
             is_final: false,
+            annotations: vec![],
             span: self.default_span(),
         });
 
@@ -2269,6 +2270,7 @@ impl AstHostFunctions for TypedAstBuilder {
                 visibility: Visibility::Public,
                 is_abstract: false,
                 is_final: false,
+                annotations: vec![],
                 span: self.default_span(),
             })
         };
@@ -3167,6 +3169,7 @@ impl AstHostFunctions for TypedAstBuilder {
             visibility: Visibility::Public,
             is_abstract: false,
             is_final: false,
+            annotations: vec![],
             span,
         };
 
@@ -3314,6 +3317,7 @@ impl AstHostFunctions for TypedAstBuilder {
             visibility: Visibility::Public,
             is_abstract: false,
             is_final: false,
+            annotations: vec![],
             span,
         };
 

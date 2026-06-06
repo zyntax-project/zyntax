@@ -1461,6 +1461,10 @@ pub struct TypedClass {
     pub visibility: Visibility,
     pub is_abstract: bool,
     pub is_final: bool,
+    /// Annotations attached to the class/struct declaration (e.g. `@reference`).
+    /// Used by the lowering pipeline to decide layout (value vs. reference).
+    #[serde(default)]
+    pub annotations: Vec<TypedAnnotation>,
     pub span: Span,
 }
 

@@ -899,6 +899,17 @@ pub struct TypeMetadata {
     pub size_bytes: Option<usize>,
     /// Alignment requirements
     pub alignment: Option<usize>,
+    /// Whether the type uses **reference semantics**: instances are
+    /// allocated on the heap (via `Intrinsic::Malloc`) and field
+    /// access goes through GEP + Load/Store rather than
+    /// InsertValue/ExtractValue on a value-typed aggregate.
+    ///
+    /// Set by the lowering pipeline when it sees an `@reference`
+    /// annotation on the class/struct declaration. The scalar-replace
+    /// pass (`scalar_replace_alloc`) can later collapse the malloc
+    /// back to SSA registers when the allocation does not escape.
+    #[serde(default)]
+    pub is_reference: bool,
     /// Custom metadata (language-specific)
     pub custom: HashMap<InternedString, String>,
 }
@@ -913,6 +924,7 @@ impl Default for TypeMetadata {
             is_nullable: false,
             size_bytes: None,
             alignment: None,
+            is_reference: false,
             custom: HashMap::new(),
         }
     }

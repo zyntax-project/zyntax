@@ -340,6 +340,7 @@ pub fn class_decl(
         constructors: Vec::new(),
         is_abstract: false,
         is_final: false,
+        annotations: vec![],
         span,
     })
 }

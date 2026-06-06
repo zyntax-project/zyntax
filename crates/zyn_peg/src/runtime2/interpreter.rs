@@ -1082,6 +1082,11 @@ impl<'g> GrammarInterpreter<'g> {
             "Class" => {
                 let name = self.get_field_as_interned("name", fields, state)?;
                 let fields_list = self.get_field_as_field_list("fields", fields, state)?;
+                // Optional `annotations` field — `get_field_as_annotation_list`
+                // returns `vec![]` when the grammar action omitted the binding,
+                // so existing (non-decorated) struct rules stay backward-compatible.
+                let annotations =
+                    self.get_field_as_annotation_list("annotations", fields, state)?;
 
                 TypedDeclaration::Class(zyntax_typed_ast::TypedClass {
                     name,
@@ -1094,6 +1099,7 @@ impl<'g> GrammarInterpreter<'g> {
                     visibility: Visibility::Public,
                     is_abstract: false,
                     is_final: false,
+                    annotations,
                     span,
                 })
             }
