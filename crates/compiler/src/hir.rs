@@ -394,9 +394,9 @@ pub enum HirInstruction {
         result: Option<HirId>,
         callee: HirCallable,
         args: Vec<HirId>,
-        /// Type arguments for generic function calls (e.g., identity<i32>(42))
+        /// Type arguments for generic function calls (e.g., `identity<i32>(42)`)
         type_args: Vec<HirType>,
-        /// Const arguments for const generic calls (e.g., array<i32, 5>())
+        /// Const arguments for const generic calls (e.g., `array<i32, 5>()`)
         const_args: Vec<HirConstant>,
         is_tail: bool,
     },
@@ -510,7 +510,7 @@ pub enum HirInstruction {
     ///
     /// This performs the following operations:
     /// 1. Extract vtable pointer from trait object (fat pointer field 1)
-    /// 2. Load function pointer from vtable[method_index]
+    /// 2. Load function pointer from `vtable[method_index]`
     /// 3. Extract data pointer from trait object (fat pointer field 0)
     /// 4. Call function pointer with (self=data_ptr, ...args)
     TraitMethodCall {

@@ -10,7 +10,7 @@ use crate::hir::{BinaryOp, HirId, HirType, HirUnionVariant};
 /// ```
 use crate::hir_builder::HirBuilder;
 
-/// Builds the Option<T> type and its methods
+/// Builds the `Option<T>` type and its methods
 pub fn build_option_type(builder: &mut HirBuilder) {
     // Build generic Option<T> methods
     build_unwrap(builder);

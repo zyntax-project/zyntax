@@ -23,7 +23,9 @@
 //! Given a dominator tree, an edge `t → h` is a *back-edge* iff `h`
 //! dominates `t`. The natural loop of that back-edge is
 //!
-//!     L(h, t) = {h} ∪ { x : ∃ path t ← … ← x avoiding h }
+//! ```text
+//! L(h, t) = {h} ∪ { x : ∃ path t ← … ← x avoiding h }
+//! ```
 //!
 //! which equals the set of predecessor-reachable nodes from `t`
 //! stopping at `h`. The header `h` is by definition the only entry

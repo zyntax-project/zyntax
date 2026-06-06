@@ -215,7 +215,7 @@ pub enum RefinementExpr {
         field: InternedString,
     },
 
-    /// Array access: arr[index]
+    /// Array access: `arr[index]`
     Index {
         array: Box<RefinementExpr>,
         index: Box<RefinementExpr>,
@@ -820,7 +820,7 @@ impl DependentType {
         )
     }
 
-    /// Create a bounded array type: {a: Array<T> | 0 <= i < |a|}
+    /// Create a bounded array type: `{a: Array<T> | 0 <= i < |a|}`
     pub fn bounded_array(element_type: Type, span: Span) -> Self {
         let var = InternedString::from_symbol(string_interner::Symbol::try_from_usize(1).unwrap());
         DependentType::refinement(

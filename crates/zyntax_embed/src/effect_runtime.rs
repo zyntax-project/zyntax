@@ -233,7 +233,7 @@ struct Resume {
 
 /// Resume the suspended caller with `value`.
 ///
-/// Walks the Resume<T> struct passed by the handler:
+/// Walks the `Resume<T>` struct passed by the handler:
 ///   1. Stores `value` at `state_machine_ptr + result_slot_offset`
 ///      — this is the slot the caller's resume_entry block will
 ///      `AsyncLoadSlot` from.
@@ -382,7 +382,7 @@ pub extern "C" fn __zyntax_effect_abort(value: i64) -> i64 {
     value
 }
 
-/// Atomically increment the state machine's refcount, given a Resume<T>
+/// Atomically increment the state machine's refcount, given a `Resume<T>`
 /// pointer that lives inside the SM. Hosts that capture a Resume
 /// pointer for use AFTER the original `runtime.call_function` returns
 /// (the async-out-of-line pattern — see `phase_j3_async_out_of_line_resume`)
@@ -391,7 +391,7 @@ pub extern "C" fn __zyntax_effect_abort(value: i64) -> i64 {
 /// dangles. Pair every retain with a `__zyntax_runtime_release_sm`
 /// when the host is done with the pointer.
 ///
-/// The Resume<T> struct (laid out by
+/// The `Resume<T>` struct (laid out by
 /// `upgrade_resume_struct_at_perform_sites`) carries `state_machine_ptr`
 /// at offset 8 and `refcount_offset` at offset 32, so this helper can
 /// navigate without needing to know the SM's full layout.
@@ -409,7 +409,7 @@ pub unsafe extern "C" fn __zyntax_runtime_retain_sm(resume_struct: *mut u8) {
     (*refcount_ptr).fetch_add(1, Ordering::AcqRel);
 }
 
-/// Atomically decrement the state machine's refcount via a Resume<T>
+/// Atomically decrement the state machine's refcount via a `Resume<T>`
 /// pointer; free the SM if the count reaches zero. The complement of
 /// `__zyntax_runtime_retain_sm`. Hosts call this when they're done
 /// with a previously-retained Resume pointer.
@@ -440,7 +440,7 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm(resume_struct: *mut u8) {
 /// JIT-side release: decrement the SM's refcount, free if zero. Same
 /// behaviour as `__zyntax_runtime_release_sm` but takes the SM
 /// pointer + refcount byte-offset directly rather than navigating
-/// through a Resume<T> struct. Used by `generate_sync_entry`'s
+/// through a `Resume<T>` struct. Used by `generate_sync_entry`'s
 /// return path where there's no Resume pointer in scope but the
 /// JIT has both pieces of info as constants.
 #[no_mangle]

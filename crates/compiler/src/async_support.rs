@@ -1514,7 +1514,7 @@ impl AsyncCompiler {
         Ok(wrapper)
     }
 
-    /// Generate the async entry function that returns *Promise<T>
+    /// Generate the async entry function that returns `*Promise<T>`
     ///
     /// This creates a function with the ORIGINAL async function name that:
     /// 1. Allocates the state machine struct (via malloc)

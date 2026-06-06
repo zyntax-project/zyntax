@@ -1669,7 +1669,7 @@ impl HirInterpreter {
         self.tick_callbacks.insert(func_id, cb);
     }
 
-    /// Install the wasm-JIT compile hook. See [`Self::wasm_compile_hook`]
+    /// Install the wasm-JIT compile hook. See `Self::wasm_compile_hook`
     /// docs. Called at most once per function — the returned handle is
     /// cached for all subsequent calls.
     pub fn set_wasm_compile_hook(
@@ -1680,7 +1680,7 @@ impl HirInterpreter {
     }
 
     /// Install the wasm-JIT dispatch hook. Called every time a function
-    /// with a cached handle is invoked. See [`Self::wasm_dispatch_hook`]
+    /// with a cached handle is invoked. See `Self::wasm_dispatch_hook`
     /// docs.
     pub fn set_wasm_dispatch_hook(
         &mut self,

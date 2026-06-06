@@ -376,7 +376,7 @@ pub enum Type {
         nullability: NullabilityKind,
     },
 
-    /// Optional/Nullable type: T? or Option<T>
+    /// Optional/Nullable type: `T?` or `Option<T>`
     Optional(Box<Type>),
 
     /// Result/Error union type: Result<T, E> or !T (Zig)
@@ -416,7 +416,7 @@ pub enum Type {
         item: InternedString,
     },
 
-    /// Index type: T[K]
+    /// Index type: `T[K]`
     Index { base: Box<Type>, index: Box<Type> },
 
     /// The top type (any/unknown)
@@ -428,7 +428,7 @@ pub enum Type {
     /// Self type (for trait method definitions)
     SelfType,
 
-    /// Explicit nullable type: T? or Option<T>
+    /// Explicit nullable type: `T?` or `Option<T>`
     Nullable(Box<Type>),
 
     /// Explicit non-null type
@@ -1586,7 +1586,7 @@ impl TypeRegistry {
         )
     }
 
-    /// Register the built-in Option<T> enum type
+    /// Register the built-in `Option<T>` enum type
     ///
     /// Option is a generic enum with two variants:
     /// - Some(T): Contains a value of type T

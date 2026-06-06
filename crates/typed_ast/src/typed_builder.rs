@@ -1031,7 +1031,7 @@ impl TypedASTBuilder {
     ///
     /// # Arguments
     /// * `name` - The trait name (e.g., "Display", "Add")
-    /// * `type_params` - Type parameters for generic traits (e.g., <Rhs> in Add<Rhs>)
+    /// * `type_params` - Type parameters for generic traits (e.g., `<Rhs>` in `Add<Rhs>`)
     /// * `methods` - Trait method signatures
     /// * `associated_types` - Associated types (e.g., type Output)
     /// * `span` - Source span for error reporting
@@ -1072,7 +1072,7 @@ impl TypedASTBuilder {
     ///
     /// # Arguments
     /// * `trait_name` - The trait being implemented (e.g., "Add")
-    /// * `trait_type_args` - Type arguments for the trait (e.g., <Tensor> in Add<Tensor>)
+    /// * `trait_type_args` - Type arguments for the trait (e.g., `<Tensor>` in `Add<Tensor>`)
     /// * `for_type` - The type implementing the trait (e.g., Tensor)
     /// * `methods` - Method implementations
     /// * `associated_types` - Associated type definitions

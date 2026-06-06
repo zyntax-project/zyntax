@@ -9,7 +9,7 @@
 //! 1. **Runtime probe** (this module). A globally-registered C ABI function
 //!    `osr_probe(bead_id, site) -> *mut ()` that JIT'd code calls at
 //!    back-edges. It looks up the corresponding [`beadie::Bead`] and asks
-//!    for an [`OsrEntry`] matching the encoded site key.
+//!    for an `OsrEntry` matching the encoded site key.
 //!
 //! 2. **Tier-0 codegen** (cranelift_backend, increment 3). At each HIR loop
 //!    header, emit a sampling counter + probe call + indirect call to the

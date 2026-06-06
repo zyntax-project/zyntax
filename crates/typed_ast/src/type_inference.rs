@@ -63,7 +63,7 @@ pub enum Constraint {
     HasField(Type, InternedString, Type),
     /// Method constraint: T has method 'name'
     HasMethod(Type, InternedString, Vec<Type>, Type),
-    /// Indexable constraint: T[K] = V (T is indexable by K, yielding V)
+    /// Indexable constraint: `T[K] = V` (T is indexable by K, yielding V)
     Indexable(Type, Type, Type),
     /// Numeric constraint
     IsNumeric(Type),
@@ -847,7 +847,7 @@ impl InferenceContext {
         Ok(())
     }
 
-    /// Add an indexable constraint: container_type[index_type] = element_type
+    /// Add an indexable constraint: `container_type[index_type] = element_type`
     pub fn add_indexable_constraint(
         &mut self,
         container_type: Type,

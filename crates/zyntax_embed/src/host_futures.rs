@@ -13,15 +13,15 @@
 //!
 //! This module is the parking layer that breaks the spin-poll. When
 //! a state machine reaches an `await __builtin_host_*` site, the
-//! krio_adapter-emitted code calls [`register_future`] to stash the
+//! krio_adapter-emitted code calls `register_future` to stash the
 //! SM's resume info in a thread-local table, calls the host bridge
 //! (which kicks off a JS Promise and returns immediately), and
 //! returns `0` (Pending) from the poll fn. Control flows back to the
 //! wasm entry point, which returns to JS — the event loop now gets
 //! to run, the JS Promise settles, and the host-side shim calls
-//! [`resolve_future`] back into wasm to advance the SM by one step.
+//! `resolve_future` back into wasm to advance the SM by one step.
 //!
-//! Per-poll discipline: every call to [`resolve_future`] invokes the
+//! Per-poll discipline: every call to `resolve_future` invokes the
 //! parked SM's poll fn **exactly once**. If the SM reaches Ready,
 //! the value bubbles up to the top-level task and resolves the JS
 //! Promise. If the SM yields again (synchronously calls
@@ -34,7 +34,7 @@
 //!
 //! Native targets get the same surface — host bridges like
 //! `__zyntax_async_set_timeout` simply spawn an std::thread that
-//! does the work synchronously and calls [`resolve_future`] when
+//! does the work synchronously and calls `resolve_future` when
 //! done. The native InterpRuntime continues to drive the SM
 //! synchronously; `register_future` returns a handle but on native
 //! the caller can choose to ignore parking and spin-poll instead
@@ -49,14 +49,14 @@
 //! Phase H) holds the InterpRuntime + HIR module + SM allocation
 //! alive in a `RuntimeHolder` keyed by `task_id`. When a future
 //! resolves and the SM reaches Ready, the host invokes
-//! [`complete_task`], which the scheduler uses to drop its
+//! `complete_task`, which the scheduler uses to drop its
 //! RuntimeHolder entry.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Layout of a parked SM's resume info. Mirrors the field set of
-/// the Resume<T> struct in `effect_runtime.rs:226–232`, plus the
+/// the `Resume<T>` struct in `effect_runtime.rs:226–232`, plus the
 /// `task_id` linkage to the top-level Promise resolver.
 ///
 /// `result_slot_offset` and `refcount_offset` are byte offsets into
@@ -110,7 +110,7 @@ impl ResolveOutcome {
     ///   0 = ReParked, 1 = Ready, 2 = UnknownHandle
     ///
     /// `Ready` callers extract the value via a side channel
-    /// ([`complete_task`]); the wasm export only forwards the
+    /// (`complete_task`); the wasm export only forwards the
     /// outcome code. JS-side code keys off this for the rare case
     /// where it wants to distinguish "still pending" from "done."
     pub fn as_i32(self) -> i32 {
@@ -133,7 +133,7 @@ pub type WasmPollDispatcher = Box<dyn Fn(i64, *mut u8) -> i64>;
 
 thread_local! {
     /// All currently-parked futures. Keyed by the i64 handle returned
-    /// from [`register_future`]; cleared on [`resolve_future`] (one
+    /// from `register_future`; cleared on `resolve_future` (one
     /// way or another — the entry is removed before the poll runs so
     /// a re-park inside the poll fn doesn't collide with itself).
     static FUTURE_TABLE: RefCell<HashMap<i64, ParkedFuture>> =
@@ -177,7 +177,7 @@ pub fn set_complete_task_callback(cb: CompleteTaskFn) {
 /// Install the wasm32 poll dispatcher. The dispatcher takes a
 /// closure handle (i64) + SM ptr and returns the poll fn's i64
 /// result. Wasm32 hosts (zyntax_wasm) install this at runtime
-/// startup so [`resolve_future`] can drive parked SMs via the
+/// startup so `resolve_future` can drive parked SMs via the
 /// indirect-call dispatcher rather than the unavailable raw fn-ptr
 /// transmute. No-op on native (which uses the transmute path).
 pub fn set_wasm_poll_dispatcher(dispatch: WasmPollDispatcher) {
@@ -196,7 +196,7 @@ pub fn clear_complete_task_callback() {
 }
 
 /// Notify the scheduler that the SM behind `task_id` has reached
-/// Ready with `value`. Invoked by [`resolve_future`] when the
+/// Ready with `value`. Invoked by `resolve_future` when the
 /// post-resume poll returns non-zero; intentionally exposed so
 /// host bridges that complete synchronously (no parking step at
 /// all) can take the same code path.
@@ -210,7 +210,7 @@ pub fn complete_task(task_id: i64, value: i64) {
 
 /// Park `f` in the future table and return a fresh handle. The
 /// handle is what the host-side bridge shim ultimately threads to
-/// [`resolve_future`] when its JS Promise settles.
+/// `resolve_future` when its JS Promise settles.
 ///
 /// The handle is non-zero. Sequential calls produce increasing
 /// values; the counter is per-thread and wraps after 2^63 calls
@@ -369,7 +369,7 @@ pub fn clear_for_tests() {
 // sites. The SM passes its own offsets in; the runtime returns
 // the handle.
 
-/// C ABI wrapper for [`register_future`]. Receives the parked SM's
+/// C ABI wrapper for `register_future`. Receives the parked SM's
 /// info inline so the emitted code doesn't have to construct a
 /// `ParkedFuture` struct on the wasm side — every arg comes through
 /// as an i64 (or pointer-sized) value compatible with the krio_adapter
@@ -393,7 +393,7 @@ pub extern "C" fn __zyntax_register_future(
     })
 }
 
-/// C ABI wrapper for [`resolve_future`]. Returns the i32 outcome
+/// C ABI wrapper for `resolve_future`. Returns the i32 outcome
 /// code so callers that re-enter through the C boundary (e.g. the
 /// wasm-bindgen export, or a native test harness) can branch
 /// without re-parsing the enum.

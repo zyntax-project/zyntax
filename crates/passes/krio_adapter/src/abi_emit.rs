@@ -1123,11 +1123,11 @@ fn lower_host_bridge_await_site(
 ///      `Resume<T>` method dispatch: handler body's `k(v)` → call to
 ///      `__zyntax_effect_resume(k_ptr, v)`. That rewrite belongs in
 ///      the SSA builder (`crates/compiler/src/ssa.rs`), keyed on the
-///      param's Resume<T> type.
+///      param's `Resume<T>` type.
 ///
 /// The runtime symbols (`__zyntax_effect_*`) and per-thread handler
 /// stack already exist (`zyntax_embed::effect_runtime`); what's
-/// missing is (1) Resume<T> in the prelude as an opaque struct, and
+/// missing is (1) `Resume<T>` in the prelude as an opaque struct, and
 /// (2) the four lowering pieces above. Until then, this pass is a
 /// no-op for Tier 1 effects (skipped by the resumable-handler filter
 /// in `orchestrator::lower_async_module`) and structurally-ready for
@@ -1327,7 +1327,7 @@ pub fn lower_perform_effect_calls(
 /// Non-yield returns wrap their value in a cast to i64.
 ///
 /// Phase I.2: replace every `PerformEffect` site whose handler is
-/// resumable with explicit Resume<T> struct construction + a direct
+/// resumable with explicit `Resume<T>` struct construction + a direct
 /// call to the handler op fn.
 ///
 /// Before this pass (post-lower_perform_effect_calls, post-reshape):
@@ -1346,7 +1346,7 @@ pub fn lower_perform_effect_calls(
 ///
 ///   yield_block:
 ///     [pre-perform code]
-///     r_ptr = Alloca(i64 x 4)                       // 32-byte Resume<T>
+///     r_ptr = Alloca(i64 x 4)                       // 32-byte `Resume<T>`
 ///     r_poll_fn_ptr = CreateClosure(poll_fn_id)     // self-reference
 ///     Store r_ptr+0  ← r_poll_fn_ptr                // poll_fn_ptr
 ///     Store r_ptr+8  ← frame_ptr                    // state_machine_ptr

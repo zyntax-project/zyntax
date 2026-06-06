@@ -87,7 +87,7 @@ pub enum Constraint {
         span: Span,
     },
 
-    /// Index constraint for type families: F[args] = result_type
+    /// Index constraint for type families: `F[args] = result_type`
     TypeFamilyApplication {
         family: Type,
         indices: Vec<crate::dependent_types::DependentIndex>,

@@ -256,7 +256,7 @@ pub enum ModuleArchitecture {
     },
 
     /// Deno/URL style: Direct URL imports
-    /// https://deno.land/std/http/server.ts
+    /// `<https://deno.land/std/http/server.ts>`
     /// Supports caching and versioning
     UrlStyle {
         /// Local cache directory for downloaded modules

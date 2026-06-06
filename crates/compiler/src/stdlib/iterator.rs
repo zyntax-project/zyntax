@@ -8,7 +8,7 @@ use crate::hir::{BinaryOp, HirId, HirType};
 /// type registry integration.
 use crate::hir_builder::HirBuilder;
 
-/// Build: fn vec_for_each<T>(vec: *Vec<T>, f: fn(*T) -> void)
+/// Build: `fn vec_for_each<T>(vec: *Vec<T>, f: fn(*T) -> void)`
 /// Applies a function to each element in the vector
 ///
 /// The callback receives a pointer to each element (avoiding copies for large types)
@@ -91,7 +91,7 @@ pub fn build_vec_for_each(builder: &mut HirBuilder) {
     builder.ret(unit);
 }
 
-/// Build: fn vec_map<T,U>(vec: *Vec<T>, f: fn(*T) -> U) -> Vec<U>
+/// Build: `fn vec_map<T,U>(vec: *Vec<T>, f: fn(*T) -> U) -> Vec<U>`
 /// Maps a function over each element, creating a new vector
 ///
 /// The callback receives a pointer to each element and returns a new value
@@ -204,7 +204,7 @@ pub fn build_vec_map(builder: &mut HirBuilder) {
     builder.ret(result_vec);
 }
 
-/// Build: fn vec_filter<T>(vec: *Vec<T>, pred: fn(*T) -> bool) -> Vec<T>
+/// Build: `fn vec_filter<T>(vec: *Vec<T>, pred: fn(*T) -> bool) -> Vec<T>`
 /// Filters elements that satisfy the predicate
 ///
 /// The predicate receives a pointer to each element and returns true to keep it
@@ -328,7 +328,7 @@ pub fn build_vec_filter(builder: &mut HirBuilder) {
     builder.ret(result_vec);
 }
 
-/// Build: fn vec_fold<T,Acc>(vec: *Vec<T>, init: Acc, f: fn(Acc, *T) -> Acc) -> Acc
+/// Build: `fn vec_fold<T,Acc>(vec: *Vec<T>, init: Acc, f: fn(Acc, *T) -> Acc) -> Acc`
 /// Folds (reduces) a vector to a single value
 ///
 /// The callback receives the accumulator and a pointer to each element

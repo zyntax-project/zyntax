@@ -2,7 +2,7 @@
 //!
 //! Provides the core types needed for async/await:
 //! - Future trait (implemented via function-based API)
-//! - Poll<T> enum (simplified as opaque type with helper functions)
+//! - `Poll<T>` enum (simplified as opaque type with helper functions)
 //! - Context type
 //! - Waker type
 //!
@@ -42,10 +42,12 @@ use crate::hir_builder::HirBuilder;
 /// Build the Poll enum type (simplified as opaque for now)
 ///
 /// In the future this will be:
+/// ```text
 /// enum Poll<T> {
 ///     Ready(T),
 ///     Pending,
 /// }
+/// ```
 ///
 /// For now, we create helper functions that work with Poll values
 pub fn build_poll_helpers(builder: &mut HirBuilder) {
@@ -128,7 +130,7 @@ pub fn build_context_functions(builder: &mut HirBuilder) {
 /// Build all async runtime types and functions
 ///
 /// This builds the complete async runtime infrastructure:
-/// 1. Poll<T> helper functions
+/// 1. `Poll<T>` helper functions
 /// 2. Waker helper functions
 /// 3. Context helper functions
 ///

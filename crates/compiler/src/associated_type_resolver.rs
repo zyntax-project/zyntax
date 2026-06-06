@@ -82,7 +82,7 @@ impl AssociatedTypeResolver {
     /// # Arguments
     ///
     /// * `trait_id` - The trait containing the associated type
-    /// * `self_ty` - The implementing type (e.g., Vec<i32>)
+    /// * `self_ty` - The implementing type (e.g., `Vec<i32>`)
     /// * `assoc_name` - The associated type name (e.g., "Item")
     ///
     /// # Returns

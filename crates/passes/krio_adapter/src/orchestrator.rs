@@ -96,7 +96,7 @@ pub struct LowerResult {
     /// Used by the entry function to size the malloc. Computed as
     /// `max(captures_slot, state_slot, param_slots) + 1`.
     pub num_slots: u32,
-    /// Base slot index of the per-perform Resume<T> scratch region
+    /// Base slot index of the per-perform `Resume<T>` scratch region
     /// reserved near the END of the state machine. Each perform site
     /// owns 5 slots (= the 5 fields of `Resume<T>`: poll_fn_ptr,
     /// state_machine_ptr, result_slot_offset, next_state,
@@ -111,7 +111,7 @@ pub struct LowerResult {
     /// 1 at SM construction and calls
     /// `__zyntax_runtime_release_sm_by_offset(sm_ptr, refcount_slot * 8)`
     /// on its return path so the SM auto-frees on a sync call. Hosts
-    /// that capture a Resume<T> pointer for use after the original
+    /// that capture a `Resume<T>` pointer for use after the original
     /// `runtime.call_function` returns (the j3 async-out-of-line
     /// pattern) call `__zyntax_runtime_retain_sm(resume_ptr)` to
     /// pin the SM before the call returns, and the matching
@@ -125,7 +125,7 @@ pub enum LowerError {
     /// `krio_async::transform_to_state_machine` rejected the layout
     /// (currently krio's `TransformError` enum has no concrete
     /// variants — Phase 3 v2 covers everything we care about — but
-    /// it's #[non_exhaustive] so we keep the error path open).
+    /// it's `#[non_exhaustive]` so we keep the error path open).
     Transform,
 }
 

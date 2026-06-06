@@ -14,7 +14,7 @@ use crate::hir::{BinaryOp, CallingConvention, HirId, HirType};
 /// Initial capacity: 4 elements
 use crate::hir_builder::HirBuilder;
 
-/// Build Vec<T> type and all methods
+/// Build `Vec<T>` type and all methods
 pub fn build_vec_type(builder: &mut HirBuilder) {
     // Declare realloc from C library
     declare_c_realloc(builder);

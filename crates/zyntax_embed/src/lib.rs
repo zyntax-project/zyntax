@@ -73,7 +73,7 @@ mod import_chain;
 /// BC-interpreter-backed execution engine. On native it's internal
 /// scaffolding for [`runtime::ZyntaxRuntime`]; on wasm32 (where the
 /// native runtime is gated off) it's the primary execution entry
-/// point that the [`zyntax_wasm`] crate's wasm-bindgen shim wires
+/// point that the `zyntax_wasm` crate's wasm-bindgen shim wires
 /// up. Holds the `HirInterpreter`, beadie's `TieredAdapter` (tier 0
 /// only on wasm), and the FFI symbol table.
 pub mod interp_runtime;

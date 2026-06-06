@@ -50,9 +50,9 @@ pub struct TypeDeclarations {
 pub struct BuiltinMappings {
     /// Direct function mappings: name -> symbol
     pub functions: HashMap<String, String>,
-    /// Method mappings: method_name -> [possible_implementations]
+    /// Method mappings: `method_name -> [possible_implementations]`
     pub methods: HashMap<String, Vec<String>>,
-    /// Operator mappings: operator -> [possible_implementations]
+    /// Operator mappings: `operator -> [possible_implementations]`
     pub operators: HashMap<String, Vec<String>>,
 }
 

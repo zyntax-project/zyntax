@@ -120,7 +120,7 @@ pub enum PrimitiveSize {
 }
 
 /// Type tag - 32-bit packed type identifier
-/// Layout: [flags:8][type_id:16][category:8]
+/// Layout: `[flags:8][type_id:16][category:8]`
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct TypeTag(pub u32);
@@ -643,14 +643,14 @@ impl GenericTypeArgs {
         }
     }
 
-    /// Create for Array<T>
+    /// Create for `Array<T>`
     pub fn array(element_type: TypeId) -> Self {
         let mut args = Self::new(1);
         args.args[0] = element_type;
         args
     }
 
-    /// Create for Map<K, V>
+    /// Create for `Map<K, V>`
     pub fn map(key_type: TypeId, value_type: TypeId) -> Self {
         let mut args = Self::new(2);
         args.args[0] = key_type;
@@ -658,7 +658,7 @@ impl GenericTypeArgs {
         args
     }
 
-    /// Create for Optional<T>
+    /// Create for `Optional<T>`
     pub fn optional(inner_type: TypeId) -> Self {
         let mut args = Self::new(1);
         args.args[0] = inner_type;

@@ -169,7 +169,7 @@ pub struct SsaBuilder {
     /// that subsequent statements land in the correct block.
     simd_continue_block: Option<HirId>,
     /// Default parameter info for functions with optional parameters.
-    /// Maps function name -> Vec<TypedParameter> (for filling in defaults at call sites).
+    /// Maps function name -> `Vec<TypedParameter>` (for filling in defaults at call sites).
     function_default_params:
         IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
     /// Return types for user-defined functions.
@@ -194,7 +194,7 @@ pub struct SsaBuilder {
     /// and `name` is in this set, the call is rewritten to
     /// `HirCallable::Symbol("__zyntax_effect_resume")` taking
     /// `(callee_value, supplied_arg)`. The runtime symbol then walks
-    /// the Resume<T> struct to advance the caller's state machine.
+    /// the `Resume<T>` struct to advance the caller's state machine.
     ///
     /// Names rather than HirIds because the SSA builder mints fresh
     /// per-param HirIds at `build_from_typed_cfg` time (see
@@ -204,7 +204,7 @@ pub struct SsaBuilder {
     /// `Variable(name)` for the call.
     ///
     /// Populated by `LoweringContext::convert_function` for handler
-    /// functions whose source-level declaration includes a Resume<T>
+    /// functions whose source-level declaration includes a `Resume<T>`
     /// parameter — matching the `is_resumable` detection at
     /// `lowering.rs:2962`.
     resume_param_names: HashSet<InternedString>,

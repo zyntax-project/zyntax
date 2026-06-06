@@ -59,7 +59,7 @@
 //! When all four hold, the pass:
 //! 1. Computes the byte offset of each field referenced by an
 //!    ExtractValue or modified by an InsertValue, using
-//!    [`size_of_hir_ty`] for cumulative struct layout (every ZynML
+//!    `size_of_hir_ty` for cumulative struct layout (every ZynML
 //!    struct is unpadded so the running sum is exact).
 //! 2. For each ExtractValue, inserts `gep ptr, [offset]` + `load
 //!    field_ty` *at the ExtractValue's position* and substitutes the

@@ -331,7 +331,7 @@ pub trait AstHostFunctions {
     /// Get an expression node by handle (for extracting string literals, etc.)
     fn get_expr(&self, handle: NodeHandle) -> Option<TypedNode<TypedExpression>>;
 
-    /// Get the type name from a type node handle (for generic types like List<T> returns "List")
+    /// Get the type name from a type node handle (for generic types like `List<T>` returns "List")
     fn get_type_name(&self, handle: NodeHandle) -> Option<String>;
 
     /// Create a typed integer literal with explicit type annotation
@@ -1221,7 +1221,7 @@ impl ZpegModule {
 /// fluent API from zyntax_typed_ast to build TypedProgram directly.
 ///
 /// This approach:
-/// 1. Uses NodeHandle as a reference to stored TypedNode<TypedExpression> etc.
+/// 1. Uses NodeHandle as a reference to stored `TypedNode<TypedExpression>` etc.
 /// 2. Builds actual typed AST nodes using the fluent API
 /// 3. Serializes to JSON for pipeline integration (can also return TypedProgram directly)
 pub struct TypedAstBuilder {

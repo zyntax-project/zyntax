@@ -1106,7 +1106,7 @@ impl ZyntaxRuntime {
     ///
     /// Returns the lowered HIR ready for either the native JIT (via
     /// [`Self::compile_module`]) or the BC interpreter (via
-    /// [`crate::InterpRuntime::compile_module`]).
+    /// `crate::InterpRuntime::compile_module`).
     ///
     /// `builtins` is a name-keyed hint map for the SSA builder's
     /// `@builtin` extern resolution; pass an empty `IndexMap` when in
@@ -1825,7 +1825,7 @@ impl ZyntaxRuntime {
     /// Same as [`Self::register_function`] for the runtime symbol
     /// table, plus stores the signature on:
     ///
-    /// - `plugin_signatures`, so [`Grammar2::parse_with_signatures`]
+    /// - `plugin_signatures`, so `Grammar2::parse_with_signatures`
     ///   can use it for `@builtin` extern injection if the host opts
     ///   into that path.
     /// - The backend's `symbol_signatures` table, so call-site
@@ -1957,7 +1957,7 @@ impl ZyntaxRuntime {
     /// each entry into:
     /// - the native backend's runtime-symbol table (via
     ///   [`Self::register_function`]),
-    /// - `plugin_signatures` so [`Grammar2::parse_with_signatures`]
+    /// - `plugin_signatures` so `Grammar2::parse_with_signatures`
     ///   sees the same auto-boxing info that the dlopen path would,
     /// - the BC interpreter's FFI table so interpreter-mode dispatch
     ///   can call into the plugin too.
@@ -3787,7 +3787,7 @@ impl ZyntaxPromise {
         }
     }
 
-    /// Create a promise from a function that returns *Promise<T>
+    /// Create a promise from a function that returns `*Promise<T>`
     ///
     /// The new Promise-based async ABI:
     /// - `async fn foo(x: i32) -> i32` compiles to `fn foo(x: i32) -> *Promise<i32>`

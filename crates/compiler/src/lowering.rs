@@ -260,7 +260,7 @@ pub struct SymbolTable {
     /// e.g., "tensor_add" -> "$Tensor$add"
     pub extern_link_names: indexmap::IndexMap<InternedString, String>,
     /// Default parameter info for functions with optional parameters
-    /// Maps function name -> Vec<TypedParameter> (for filling in defaults at call sites)
+    /// Maps function name -> `Vec<TypedParameter>` (for filling in defaults at call sites)
     pub function_default_params:
         indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
     /// Return types for declared functions

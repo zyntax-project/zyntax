@@ -78,7 +78,7 @@ pub enum TypedDeclaration {
     /// External declaration - type defined outside the compilation unit
     /// whose methods are mapped to runtime symbols
     Extern(TypedExtern),
-    /// Algebraic effect declaration: effect Probabilistic { def sample<T>(...): T }
+    /// Algebraic effect declaration: `effect Probabilistic { def sample<T>(...): T }`
     Effect(TypedEffect),
     /// Effect handler declaration: handler MCMC for Probabilistic { ... }
     EffectHandler(TypedEffectHandler),
@@ -113,7 +113,7 @@ pub struct TypedExternClass {
     /// Runtime symbol prefix for method resolution
     /// e.g., "$haxe$String" -> method "length" becomes "$haxe$String$length"
     pub runtime_prefix: InternedString,
-    /// Type parameters for generic extern classes (e.g., Array<T>)
+    /// Type parameters for generic extern classes (e.g., `Array<T>`)
     #[serde(default)]
     pub type_params: Vec<TypedTypeParam>,
     /// Method signatures (the implementations are in the runtime)
@@ -250,7 +250,7 @@ pub enum TypedAnnotationValue {
 pub struct TypedEffect {
     /// Effect name (e.g., "Probabilistic", "State", "Async")
     pub name: InternedString,
-    /// Type parameters (e.g., State<S> has parameter S)
+    /// Type parameters (e.g., `State<S>` has parameter S)
     #[serde(default)]
     pub type_params: Vec<TypedTypeParam>,
     /// Effect operations (sample, observe, factor, etc.)
@@ -524,7 +524,7 @@ pub enum TypedExpression {
     Block(TypedBlock),
     /// List comprehension: [expr for var in iter if condition]
     ListComprehension(TypedListComprehension),
-    /// Slice expression: arr[start:end:step]
+    /// Slice expression: `arr[start:end:step]`
     Slice(TypedSlice),
     /// Import modifier expression: import loader("path") as Type
     ImportModifier(TypedImportModifier),
@@ -951,7 +951,7 @@ pub struct TypedListComprehension {
     pub condition: Option<Box<TypedNode<TypedExpression>>>,
 }
 
-/// Slice expression: arr[start:end:step]
+/// Slice expression: `arr[start:end:step]`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypedSlice {
     /// The object being sliced
@@ -1149,7 +1149,7 @@ pub enum TypedPattern {
     /// Array/Vec patterns: [x, y, z]
     Array(Vec<TypedNode<TypedPattern>>),
 
-    /// Slice patterns: [head, tail @ ..]
+    /// Slice patterns: `[head, tail @ ..]`
     Slice {
         prefix: Vec<TypedNode<TypedPattern>>,
         middle: Option<Box<TypedNode<TypedPattern>>>, // rest pattern: ..rest
@@ -1242,7 +1242,7 @@ pub enum TypedPattern {
     /// Async patterns: async pattern (for async/await contexts)
     Async(Box<TypedNode<TypedPattern>>),
 
-    /// Constructor patterns with type args: Vec<T>(pattern)
+    /// Constructor patterns with type args: `Vec<T>(pattern)`
     Constructor {
         constructor: Type,
         pattern: Box<TypedNode<TypedPattern>>,
@@ -1481,12 +1481,12 @@ pub struct TypedInterface {
 }
 
 /// Trait implementation block
-/// Represents: impl TraitName<TypeArgs> for TypeName { ... }
+/// Represents: `impl TraitName<TypeArgs> for TypeName { ... }`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypedTraitImpl {
-    /// The trait being implemented (e.g., "Add" in "impl Add<T> for Vec<T>")
+    /// The trait being implemented (e.g., "Add" in `impl Add<T> for Vec<T>`)
     pub trait_name: InternedString,
-    /// Type arguments for the trait (e.g., <Tensor> in "impl Add<Tensor> for Tensor")
+    /// Type arguments for the trait (e.g., `<Tensor>` in `impl Add<Tensor> for Tensor`)
     pub trait_type_args: Vec<Type>,
     /// The type implementing the trait (e.g., "Tensor" in "impl Add for Tensor")
     pub for_type: Type,
