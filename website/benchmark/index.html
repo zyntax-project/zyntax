@@ -234,10 +234,10 @@
     .chart { display: grid; gap: 0.6rem; }
     .bar-row {
       display: grid;
-      grid-template-columns: 180px 1fr;
+      grid-template-columns: 220px 1fr;
       align-items: center;
       gap: 1rem;
-      height: 30px;
+      min-height: 30px;
     }
     .bar-label {
       font-family: 'JetBrains Mono', monospace;
@@ -245,7 +245,13 @@
       font-weight: 500;
       color: var(--text-secondary);
       text-align: right;
-      white-space: nowrap;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    @media (max-width: 720px) {
+      .bar-row { grid-template-columns: 140px 1fr; gap: 0.65rem; }
+      .bar-label { font-size: 0.72rem; }
     }
     .bar-row.is-opt .bar-label { color: var(--text-primary); font-weight: 700; }
     .bar-track {
