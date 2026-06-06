@@ -20,6 +20,7 @@ A comprehensive guide to building language frontends with ZynPEG.
 14. [Runtime Plugins](./14-runtime-plugins.md) - ZRTL standard library plugins (I/O, FS, Net, Thread, etc.)
 15. [Building DSLs](./15-building-dsls.md) - Creating domain-specific languages with Zyntax
 16. [Tutorial: Image Pipeline DSL](./16-image-pipeline-dsl.md) - Step-by-step DSL tutorial with working example
+17. [Reference Types](./17-reference-types.md) - Value-type vs `@reference` classes, the bi-modal memory model, and when to use each
 
 ## Quick Start
 
