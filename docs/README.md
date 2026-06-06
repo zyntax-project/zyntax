@@ -15,6 +15,7 @@ This directory contains architectural and educational documentation for the Zynt
 ### Implementation Guides
 - **[HIR_BUILDER_EXAMPLE.md](HIR_BUILDER_EXAMPLE.md)** - HIR (High-level Intermediate Representation) builder examples
 - **[PATTERN_MATCHING.md](PATTERN_MATCHING.md)** - Pattern matching implementation and architecture
+- **[REFERENCE_TYPES.md](REFERENCE_TYPES.md)** - Value-type vs `@reference` class semantics, the bi-modal memory model, and lowering
 
 ### Language Integrations
 Located in [language-integrations/](language-integrations/) directory:
