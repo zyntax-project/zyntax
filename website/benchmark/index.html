@@ -280,8 +280,13 @@
       color: var(--text-primary);
       white-space: nowrap;
       font-variant-numeric: tabular-nums;
+      display: inline-flex; align-items: baseline; gap: 0.2rem;
     }
-    .bar-row.is-opt .bar-time { font-weight: 700; }
+    .bar-time .t-compile { color: var(--text-muted); }
+    .bar-time .t-sep     { color: var(--text-muted); opacity: 0.6; }
+    .bar-time .t-exec    { color: var(--text-primary); }
+    .bar-time .t-unit    { color: var(--text-muted); margin-left: 0.1rem; }
+    .bar-row.is-opt .bar-time .t-exec { font-weight: 700; }
     .legend {
       margin-top: 0.85rem;
       display: flex; gap: 1.1rem;
@@ -425,12 +430,12 @@
     <span class="eyebrow"><span class="dot"></span>refreshed by <code style="font-family:inherit;background:transparent;padding:0;color:inherit;">cargo run --release --example bench_runner</code></span>
     <h1>What does <em>each tier</em> cost?</h1>
     <p>
-      ZynML microbenchmarks measured through every tier of the Zyntax runtime
-      — the BC interpreter alone, the BC interpreter after the HIR optimization
+      ZynML microbenchmarks measured through every tier of the Zyntax runtime:
+      the BC interpreter alone, the BC interpreter after the HIR optimization
       pipeline (<code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">run_interp_safe_opts</code>), the Cranelift JIT after
       tier-up, and the full ladder (Cranelift → LLVM) when built with the
       <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">llvm-backend</code> feature. Each kernel matches its rayzor /
-      HaxeBenchmarks counterpart parameter-for-parameter — Mandelbrot is
+      HaxeBenchmarks counterpart parameter-for-parameter. Mandelbrot is
       875 × 500 / max_iter 1000 (reference checksum 112 798 515), n-body is
       the five-body solar system over 20 × 500 000 = 10 M advance steps
       returning <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">Std.int(energy · 1 000 000)</code>, fib is the naive recursive
@@ -461,7 +466,7 @@
         <span><i class="ci"></i> compile</span>
         <span><i class="ei"></i> execute</span>
       </span>
-      Each kernel runs through three tiers — the BC interpreter on raw HIR,
+      Each kernel runs through three tiers: the BC interpreter on raw HIR,
       the BC interpreter after the optimization pipeline (const-folding, CSE,
       load-CSE, leaf inlining, LICM, loop and reduction vectorization, CFG
       simplification, alloca→malloc promotion, drop-site insertion), and the
@@ -512,6 +517,15 @@
       'zyntax-tiered-llvm',
     ];
 
+    // Format a wall-clock number compactly: <1ms → 2 decimals, <10ms → 1
+    // decimal, ≥10ms → integer. Keeps long tiers from sprawling while
+    // tier-up sub-millisecond compile numbers still read precisely.
+    function formatMs(n) {
+      if (n < 1) return n.toFixed(2);
+      if (n < 10) return n.toFixed(1);
+      return n.toFixed(0);
+    }
+
     function buildKernel(name, results) {
       const title = KERNEL_TITLES[name] || name;
       // Render only rows whose tier (a) produced a result and (b)
@@ -558,7 +572,7 @@
                 <div class="compile" style="width: ${(r.compile_ms / total) * 100}%;"></div>
                 <div class="exec" style="width: ${(r.exec_ms / total) * 100}%;"></div>
               </div>
-              <span class="bar-time" style="--bar-pct: ${pct}%">${total.toFixed(2)}ms</span>
+              <span class="bar-time" style="--bar-pct: ${pct}%"><span class="t-compile" title="compile time">${formatMs(r.compile_ms)}</span><span class="t-sep">+</span><span class="t-exec" title="execution time">${formatMs(r.exec_ms)}</span><span class="t-unit">ms</span></span>
             </div>
           </div>`;
       }
