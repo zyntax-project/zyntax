@@ -788,11 +788,16 @@ impl InterpRuntime {
                     // for this module rather than poisoning the whole
                     // install — the runtime still runs, the LLVM tier
                     // just doesn't engage.
-                    if std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok()
-                        || std::env::var("ZYNTAX_TRACE_LLVM_AOT").is_ok()
-                    {
-                        eprintln!("[LLVM-AOT-FAIL] {e}");
-                    }
+                    // Surface the soft-fail cause unconditionally on
+                    // stderr. The bench harness and CI logs both
+                    // capture stderr but neither initialises
+                    // `env_logger`, so `log::warn!` is silent in
+                    // those contexts and we lost visibility into
+                    // genuine Linux-x86_64 codegen / linker
+                    // failures. eprintln is louder but the path is
+                    // a true install-time failure, not hot-loop
+                    // noise.
+                    eprintln!("[LLVM-AOT-DISABLED] {e}");
                     log::warn!(
                         "LLVM tier-up disabled for this module: eager compile_module failed ({e}). \
                          Cranelift tier-up will still drive the JIT path."
