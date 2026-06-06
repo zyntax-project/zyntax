@@ -26,7 +26,8 @@ use indexmap::IndexMap;
 use inkwell::{
     context::Context,
     execution_engine::ExecutionEngine,
-    targets::{InitializationConfig, Target},
+    passes::PassBuilderOptions,
+    targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine},
     OptimizationLevel,
 };
 
@@ -104,6 +105,24 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         }
     }
 
+    /// Build `PassBuilderOptions` tuned for x86_64 loop-heavy numerical
+    /// kernels. Explicitly enables loop vectorization, unrolling,
+    /// interleaving, SLP vectorization, and merge-functions. LLVM's
+    /// `default<O3>` enables most of these implicitly but the defaults
+    /// are more conservative on x86_64 Linux than on aarch64 macOS, so
+    /// setting them explicitly forces consistent codegen across hosts.
+    /// Mirrors rayzor's `llvm_jit_backend::create_pass_options` at
+    /// compiler/src/codegen/llvm_jit_backend.rs:349-357.
+    fn create_pass_options() -> PassBuilderOptions {
+        let opts = PassBuilderOptions::create();
+        opts.set_loop_vectorization(true);
+        opts.set_loop_unrolling(true);
+        opts.set_loop_interleaving(true);
+        opts.set_loop_slp_vectorization(true);
+        opts.set_merge_functions(true);
+        opts
+    }
+
     /// Compile a full HIR module
     ///
     /// Translates all functions to LLVM IR and JIT compiles them.
@@ -120,7 +139,58 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
         let _llvm_ir = backend.compile_module(hir_module)?;
 
-        // Step 2: Collect external function declarations from the module BEFORE consuming it
+        // Step 2: Tune the module + MCJIT for the host CPU. Without this,
+        // MCJIT's internal TargetMachine uses generic x86_64 defaults
+        // (no FMA, no AVX2, conservative instruction scheduling). Setting
+        // the triple + data layout + host CPU/features and running an
+        // explicit pass pipeline before engine creation matches rayzor's
+        // JIT tuning at compiler/src/codegen/llvm_jit_backend.rs:216-357.
+        let target_triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&target_triple).map_err(|e| {
+            CompilerError::Backend(format!("Failed to resolve target from triple: {}", e))
+        })?;
+        let target_machine = target
+            .create_target_machine(
+                &target_triple,
+                TargetMachine::get_host_cpu_name()
+                    .to_str()
+                    .unwrap_or("generic"),
+                TargetMachine::get_host_cpu_features().to_str().unwrap_or(""),
+                self.opt_level,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| {
+                CompilerError::Backend("Failed to create host target machine".into())
+            })?;
+        backend.module().set_triple(&target_triple);
+        backend
+            .module()
+            .set_data_layout(&target_machine.get_target_data().get_data_layout());
+
+        // Step 3: Run an explicit optimization pipeline. While LLVM's
+        // `default<O3>` enables most of these by default, explicit flags
+        // ensure they fire on every host — the implicit defaults are more
+        // conservative on x86_64 Linux than on aarch64 macOS (per
+        // rayzor llvm_jit_backend.rs:346-348). Skipped at OptLevel::None
+        // so unoptimised builds stay fast.
+        if self.opt_level != OptimizationLevel::None {
+            let passes = match self.opt_level {
+                OptimizationLevel::None => "default<O0>",
+                OptimizationLevel::Less => "default<O1>",
+                OptimizationLevel::Default => "default<O2>",
+                OptimizationLevel::Aggressive => "default<O3>",
+            };
+            let pass_options = Self::create_pass_options();
+            backend
+                .module()
+                .run_passes(passes, &target_machine, pass_options)
+                .map_err(|e| {
+                    CompilerError::Backend(format!("LLVM optimization passes failed: {}", e))
+                })?;
+        }
+
+        // Step 4: Collect external function declarations from the module BEFORE consuming it
         // We need the function values for add_global_mapping
         let mut external_functions: Vec<(String, inkwell::values::FunctionValue<'ctx>)> =
             Vec::new();
@@ -134,7 +204,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
-        // Step 3: Consume the module and create execution engine
+        // Step 5: Consume the module and create execution engine
         let module = backend.into_module();
         let execution_engine = module
             .create_jit_execution_engine(self.opt_level)
