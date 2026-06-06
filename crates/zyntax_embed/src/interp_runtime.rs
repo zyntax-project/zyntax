@@ -721,6 +721,56 @@ impl InterpRuntime {
             Ok(())
         })?;
 
+        // LLVM eager module compile (mirrors the Cranelift pre-compile
+        // above). The per-function tier-up callback for LLVM previously
+        // called `LLVMJitBackend::compile_function`, which builds a
+        // temp single-function HirModule and fails as soon as the
+        // function calls any other (Cranelift IR refs an HirId not
+        // present in the temp module → "Function not found"). Pre-
+        // compiling the whole module here gives LLVM the full cross-
+        // function symbol table up front, so the tier-up swap is just
+        // a pointer lookup — no per-function recompile race.
+        //
+        // Soft failure: the LLVM backend currently doesn't translate
+        // every HIR type (Opaque types from `@reference class` lowering
+        // or extern types like Tensor return "Type translation not yet
+        // implemented"). If the eager compile errors out, fall back to
+        // a Cranelift-only ladder for this module rather than poisoning
+        // the whole install — the runtime still runs, the LLVM tier
+        // just doesn't engage. Cached function pointers from a partial
+        // earlier compile are cleared by the next compile_module call.
+        #[cfg(feature = "llvm-backend")]
+        {
+            let llvm_install_result = llvm.with_lock(|be| be.compile_module(&module));
+            match llvm_install_result {
+                Ok(()) => {
+                    if std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok() {
+                        llvm.with_lock(|be| {
+                            for (fid, f) in &module.functions {
+                                let name = f.name.resolve_global().unwrap_or_default();
+                                let ptr = be.get_function_pointer(*fid);
+                                eprintln!("[TIER-UP-INSTALL-LLVM] {name} {fid:?} -> {ptr:?}");
+                            }
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Soft failure: LLVM backend doesn't translate
+                    // every HIR type yet (Opaque from @reference-class
+                    // lowering, extern types like Tensor return
+                    // "Type translation not yet implemented"). Fall
+                    // back to a Cranelift-only ladder for this module
+                    // rather than poisoning the whole install — the
+                    // runtime still runs, the LLVM tier just doesn't
+                    // engage.
+                    log::warn!(
+                        "LLVM tier-up disabled for this module: eager compile_module failed ({e}). \
+                         Cranelift tier-up will still drive the JIT path."
+                    );
+                }
+            }
+        }
+
         // JIT-prime the entry function so the first call dispatches
         // compiled code. beadie returns `None` from the first
         // `on_invoke` regardless of whether the pre-compiled function
@@ -845,6 +895,17 @@ impl InterpRuntime {
 
                     // Tier 1 (LLVM, this thread): synchronous to avoid
                     // the Apple Silicon cross-thread MAP_JIT issue.
+                    //
+                    // Gate generation: tier 0's broker uses beadie's
+                    // `install_compiled` (no generation bump), so right
+                    // after the initial Cranelift install the bead
+                    // reports `compiled() = Some(ptr)` AND `generation()
+                    // = 0`. The LLVM upgrade uses `swap_compiled` which
+                    // bumps to 1. So `generation() == 0` means "first
+                    // tier landed, ready for LLVM upgrade"; `== 1`
+                    // means LLVM has already fired and this gate must
+                    // not re-fire. The `llvm_state` flag enforces
+                    // once-per-function regardless.
                     #[cfg(feature = "llvm-backend")]
                     {
                         let count = bound.bead().invocation_count();
@@ -864,17 +925,16 @@ impl InterpRuntime {
                                 })
                                 .unwrap_or(false)
                         {
-                            if let Some((func_arc, _)) = func_arcs.get(&func_id) {
-                                let _ = &keepalive; // pin inkwell Context
-                                let llvm_ptr = llvm_for_closure.with_lock(|be| {
-                                    be.compile_function(func_id, func_arc).ok()?;
-                                    be.get_function_pointer(func_id)
-                                });
-                                if let Some(ptr) = llvm_ptr {
-                                    // swap_compiled bumps generation 0 → 1
-                                    // and atomically publishes the new ptr.
-                                    bound.bead().swap_compiled(ptr as *mut ());
-                                }
+                            let _ = &keepalive; // pin inkwell Context
+                                                // LLVM was pre-compiled at install time over
+                                                // the whole module, so this is just a
+                                                // pointer lookup — no per-function recompile.
+                            let llvm_ptr =
+                                llvm_for_closure.with_lock(|be| be.get_function_pointer(func_id));
+                            if let Some(ptr) = llvm_ptr {
+                                // swap_compiled bumps generation 0 → 1
+                                // and atomically publishes the new ptr.
+                                bound.bead().swap_compiled(ptr as *mut ());
                             }
                         }
                     }

@@ -105,19 +105,30 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         }
     }
 
-    /// Build `PassBuilderOptions` tuned for x86_64 loop-heavy numerical
-    /// kernels. Explicitly enables loop vectorization, unrolling,
-    /// interleaving, SLP vectorization, and merge-functions. LLVM's
-    /// `default<O3>` enables most of these implicitly but the defaults
-    /// are more conservative on x86_64 Linux than on aarch64 macOS, so
-    /// setting them explicitly forces consistent codegen across hosts.
-    /// Mirrors rayzor's `llvm_jit_backend::create_pass_options` at
-    /// compiler/src/codegen/llvm_jit_backend.rs:349-357.
+    /// Build `PassBuilderOptions` for LLVM optimization passes.
+    ///
+    /// Loop vectorization (LV) and SLP vectorization stay on — those
+    /// are the headline x86_64 wins for the numerical kernels, and
+    /// rayzor's tuning at compiler/src/codegen/llvm_jit_backend.rs:349
+    /// keeps them on as well. Both passes have their own trip-count
+    /// and cost gates, so they don't blow up on huge loops.
+    ///
+    /// `set_loop_unrolling(true)` is deliberately NOT set. Under the
+    /// `default<O3>` pipeline, forcing unrolling on overrides LLVM's
+    /// own size/trip-count heuristic — on ZynML kernels with very
+    /// large trip counts (e.g. inlined_call's 100_000_000-iter loop
+    /// with an inlinable callee) the forced unroller tries to fully
+    /// unroll and the JIT pipeline hangs indefinitely. Without this
+    /// override, `default<O3>` still runs the standard unroller with
+    /// its built-in trip-count cap.
+    ///
+    /// `set_loop_interleaving(true)` is also left off because it
+    /// composes with the unroller, and `merge_functions(true)` is on
+    /// because it's cheap and shrinks dispatch tables for
+    /// monomorphised generic code.
     fn create_pass_options() -> PassBuilderOptions {
         let opts = PassBuilderOptions::create();
         opts.set_loop_vectorization(true);
-        opts.set_loop_unrolling(true);
-        opts.set_loop_interleaving(true);
         opts.set_loop_slp_vectorization(true);
         opts.set_merge_functions(true);
         opts
@@ -174,6 +185,34 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // conservative on x86_64 Linux than on aarch64 macOS (per
         // rayzor llvm_jit_backend.rs:346-348). Skipped at OptLevel::None
         // so unoptimised builds stay fast.
+        // Pre-pass verification: catch HIR-to-LLVM-IR lowering bugs
+        // before they get amplified by O3 transforms. `Module::verify`
+        // returns a multi-line diagnostic if any function is malformed
+        // (wrong block terminators, type mismatches across calls,
+        // undefined values flowing into a phi, etc.). The runtime hang
+        // we hit on inlined_call's 100M FP loop made it clear we need
+        // this gate — a buggy IR may silently optimise into an
+        // infinite loop instead of crashing.
+        if let Err(msg) = backend.module().verify() {
+            return Err(CompilerError::Backend(format!(
+                "LLVM module verification failed (pre-opt): {}",
+                msg.to_string()
+            )));
+        }
+
+        // Optional IR dump (pre-opt) for debugging codegen bugs.
+        if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
+            let ir = backend.module().print_to_string().to_string();
+            let path = std::env::temp_dir().join("zyntax_llvm_ir_preopt.ll");
+            if std::fs::write(&path, &ir).is_ok() {
+                eprintln!(
+                    "[LLVM-IR] pre-opt IR written to {} ({} bytes)",
+                    path.display(),
+                    ir.len()
+                );
+            }
+        }
+
         if self.opt_level != OptimizationLevel::None {
             let passes = match self.opt_level {
                 OptimizationLevel::None => "default<O0>",
@@ -188,6 +227,30 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 .map_err(|e| {
                     CompilerError::Backend(format!("LLVM optimization passes failed: {}", e))
                 })?;
+
+            // Post-pass verification: if the optimiser produced an
+            // invalid module (rare but real — happens when our IR has
+            // subtle UB the optimiser exploits), surface it here
+            // instead of handing broken code to MCJIT.
+            if let Err(msg) = backend.module().verify() {
+                return Err(CompilerError::Backend(format!(
+                    "LLVM module verification failed (post-opt): {}",
+                    msg.to_string()
+                )));
+            }
+
+            // Optional post-opt IR dump.
+            if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
+                let ir = backend.module().print_to_string().to_string();
+                let path = std::env::temp_dir().join("zyntax_llvm_ir_postopt.ll");
+                if std::fs::write(&path, &ir).is_ok() {
+                    eprintln!(
+                        "[LLVM-IR] post-opt IR written to {} ({} bytes)",
+                        path.display(),
+                        ir.len()
+                    );
+                }
+            }
         }
 
         // Step 4: Collect external function declarations from the module BEFORE consuming it

@@ -3470,6 +3470,34 @@ impl SsaBuilder {
                     result_type
                 };
 
+                // Normalize int operand widths for comparison ops so
+                // backends never have to fix this up. Cranelift accepts
+                // mismatched widths (it inserts an implicit extension)
+                // but LLVM's verifier rejects icmp with operands of
+                // different bit widths, and adding a per-cmp sext at
+                // codegen time defeats LLVM's instruction-selection
+                // heuristics. Instead we emit an explicit HIR Cast
+                // here so both backends see consistent IR.
+                //
+                // Triggered when the typed AST lowered a literal as a
+                // narrower int than the variable it's compared against
+                // (e.g. `let i: i64 = 0; while i < 100000000` — the
+                // literal gets typed as i32 by default).
+                let is_int_cmp = matches!(
+                    hir_op,
+                    crate::hir::BinaryOp::Lt
+                        | crate::hir::BinaryOp::Le
+                        | crate::hir::BinaryOp::Gt
+                        | crate::hir::BinaryOp::Ge
+                        | crate::hir::BinaryOp::Eq
+                        | crate::hir::BinaryOp::Ne
+                );
+                let (left_val, right_val) = if is_int_cmp {
+                    self.normalize_int_compare_operands(block_id, left_val, right_val)
+                } else {
+                    (left_val, right_val)
+                };
+
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let inst = HirInstruction::Binary {
@@ -6769,6 +6797,94 @@ impl SsaBuilder {
     /// Create a new SSA value
     fn create_value(&mut self, ty: HirType, kind: HirValueKind) -> HirId {
         self.function.create_value(ty, kind)
+    }
+
+    /// Normalize a pair of integer-valued operands so they share the
+    /// same HIR bit-width before being handed to a comparison Binary.
+    ///
+    /// LLVM's `icmp` requires both operands to be the same type, and
+    /// fixing this at codegen time (sext per cmp) prevents LLVM's
+    /// instruction-selection heuristics from folding the comparison
+    /// into the prior arithmetic. Emitting an explicit HIR Cast here
+    /// lets the backend see a uniformly-typed compare and lets the
+    /// HIR-level optimisation passes hoist the cast out of the loop
+    /// when the narrower value is a loop invariant.
+    ///
+    /// Sign-extends signed source types, zero-extends unsigned source
+    /// types. No-op when widths already match or either value isn't
+    /// a known fixed-width integer.
+    fn normalize_int_compare_operands(
+        &mut self,
+        block_id: HirId,
+        left: HirId,
+        right: HirId,
+    ) -> (HirId, HirId) {
+        fn int_width(ty: &HirType) -> Option<(u8, bool)> {
+            // Returns (bit_width, is_signed) for fixed-width integer
+            // types; None for non-int / Bool / Ptr / variable-width.
+            match ty {
+                HirType::I8 => Some((8, true)),
+                HirType::I16 => Some((16, true)),
+                HirType::I32 => Some((32, true)),
+                HirType::I64 => Some((64, true)),
+                HirType::I128 => Some((128, true)),
+                HirType::U8 => Some((8, false)),
+                HirType::U16 => Some((16, false)),
+                HirType::U32 => Some((32, false)),
+                HirType::U64 => Some((64, false)),
+                HirType::U128 => Some((128, false)),
+                _ => None,
+            }
+        }
+
+        let lhs_ty = match self.function.values.get(&left).map(|v| v.ty.clone()) {
+            Some(t) => t,
+            None => return (left, right),
+        };
+        let rhs_ty = match self.function.values.get(&right).map(|v| v.ty.clone()) {
+            Some(t) => t,
+            None => return (left, right),
+        };
+        let (lw, l_signed) = match int_width(&lhs_ty) {
+            Some(w) => w,
+            None => return (left, right),
+        };
+        let (rw, r_signed) = match int_width(&rhs_ty) {
+            Some(w) => w,
+            None => return (left, right),
+        };
+
+        if lw == rw {
+            return (left, right);
+        }
+
+        let (narrow, narrow_signed, target_ty) = if lw < rw {
+            (left, l_signed, rhs_ty)
+        } else {
+            (right, r_signed, lhs_ty)
+        };
+
+        let cast_op = if narrow_signed {
+            crate::hir::CastOp::SExt
+        } else {
+            crate::hir::CastOp::ZExt
+        };
+
+        let widened = self.create_value(target_ty.clone(), HirValueKind::Instruction);
+        let cast_inst = HirInstruction::Cast {
+            op: cast_op,
+            result: widened,
+            ty: target_ty,
+            operand: narrow,
+        };
+        self.add_instruction(block_id, cast_inst);
+        self.add_use(narrow, widened);
+
+        if lw < rw {
+            (widened, right)
+        } else {
+            (left, widened)
+        }
     }
 
     /// Create an undefined value
