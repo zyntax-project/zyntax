@@ -190,6 +190,11 @@ const KERNELS: &[(&str, &str)] = &[
     ("bench_fib", "Int(102334155)"),
     ("bench_inlined_call", "Int(100000000)"),
     ("bench_free_function_call", "Int(100000000)"),
+    // diagnostic-only — kept out of CI publish surface but used for
+    // tracing operator-overload lowering. Expected: a + b * 10M with
+    // a=(1,2,3), b=(4,5,6) → acc = (50000000, 70000000, 90000000)
+    // → sum 210000000.
+    ("bench_op_overload", "Int(210000000)"),
 ];
 
 /// Each target produces one [`TargetResult`] per kernel.
