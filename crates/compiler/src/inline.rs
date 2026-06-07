@@ -336,9 +336,91 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             stats.self_calls_inlined += 1;
         }
         rebuild_cfg_edges(live);
+        // The LLVM backend processes blocks in `func.blocks.iter()`
+        // order (IndexMap insertion order) and falls back to
+        // `const_zero` placeholders in `value_map` for any HirValue
+        // it hasn't yet defined. When recursive inlining splits the
+        // original call block twice, the post-block of the LATER
+        // inline ends up holding instructions used by the cloned
+        // blocks of the EARLIER inline — but the earlier inline's
+        // blocks were inserted first, so they're compiled before
+        // those instructions exist. Reorder the IndexMap so every
+        // block follows its predecessors in iteration order; SSA
+        // dominance then guarantees value_map is populated before
+        // any use. Without this, fib(40)'s `Lt(n - 2, 2)` cond
+        // folds to `Lt(0, 2) = true`, the body collapses to
+        // `return n - 2`, and main() returns 38 instead of
+        // 102334155.
+        reorder_blocks_by_cfg(live);
     }
 
     stats
+}
+
+/// Rebuild `func.blocks` (an `IndexMap` whose iteration order the
+/// LLVM backend honours) so every block appears AFTER all of its
+/// predecessors. A DFS pre-order from the entry block produces
+/// such an ordering: SSA dominance means dominators are visited
+/// before dominated blocks.
+///
+/// Used at the end of [`run_module_recursive`] — the apply order
+/// (reverse-inst-idx so earlier indices stay valid as splicing
+/// inserts content) puts the LATER inline's blocks AFTER the
+/// EARLIER inline's blocks in insertion order, even though
+/// execution flows the other way. The downstream LLVM backend's
+/// value_map then gets `const_zero` placeholders for any
+/// instruction it hasn't yet processed, masking the mis-ordering
+/// as a silent miscompile.
+fn reorder_blocks_by_cfg(func: &mut HirFunction) {
+    use indexmap::IndexMap;
+
+    let entry = func.entry_block;
+    if !func.blocks.contains_key(&entry) {
+        return;
+    }
+    let mut visited: HashSet<HirId> = HashSet::new();
+    let mut order: Vec<HirId> = Vec::with_capacity(func.blocks.len());
+    let mut stack: Vec<HirId> = vec![entry];
+    while let Some(bid) = stack.pop() {
+        if !visited.insert(bid) {
+            continue;
+        }
+        order.push(bid);
+        if let Some(block) = func.blocks.get(&bid) {
+            // Push successors in reverse so the DFS visits them
+            // in declaration order — keeps the diff against the
+            // pre-pass ordering minimal when nothing has changed.
+            let mut succs: Vec<HirId> = block.successors.clone();
+            succs.reverse();
+            for s in succs {
+                if !visited.contains(&s) {
+                    stack.push(s);
+                }
+            }
+        }
+    }
+    // Blocks unreachable from `entry` — orphans created mid-pass,
+    // dead branches whose CFG edges were rebuilt out — go at the
+    // tail so we don't lose anything the rest of the pipeline
+    // might still touch.
+    let tail: Vec<HirId> = func
+        .blocks
+        .keys()
+        .copied()
+        .filter(|b| !visited.contains(b))
+        .collect();
+    for bid in tail {
+        order.push(bid);
+    }
+
+    let mut new_blocks: IndexMap<HirId, crate::hir::HirBlock> =
+        IndexMap::with_capacity(func.blocks.len());
+    for bid in &order {
+        if let Some(blk) = func.blocks.shift_remove(bid) {
+            new_blocks.insert(*bid, blk);
+        }
+    }
+    func.blocks = new_blocks;
 }
 
 /// Recursive-inline classifier. Allows direct self-`Call`s inside the
@@ -1200,6 +1282,51 @@ fn replace_uses_across_function(func: &mut HirFunction, subs: &HashMap<HirId, Hi
 }
 
 fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) {
+    // Substitute the instruction's RESULT (defining HirId) as well as
+    // its operands. Both are necessary for cloned instructions: the
+    // subs map's image (`fresh_id`s minted up-front) is what the
+    // caller's `values` table was populated with, so the cloned
+    // instruction's result has to land at the fresh id to match.
+    //
+    // For the standard inliner this is a no-op-equivalent — the
+    // callee's HirIds are disjoint from the caller's, so the result
+    // gets a fresh id either way (the difference was invisible
+    // because downstream codegen iterates instructions in
+    // declaration order and didn't notice the duplicate caller-side
+    // HirId).
+    //
+    // For the recursive inliner this is load-bearing: the snapshot
+    // shares every HirId with the live function (it IS a clone), so
+    // without result-substitution the cloned instructions land in
+    // the caller carrying the live function's HirIds — duplicate
+    // SSA defs. The LLVM backend's value_map keyed on HirId then
+    // overwrites the live definition with the cloned one, every
+    // operand referencing the original now resolves to the cloned
+    // value, and fib(40) returns Int(38) instead of Int(102334155).
+    let map_result = |id: &mut HirId| {
+        if let Some(&new) = subs.get(id) {
+            *id = new;
+        }
+    };
+    match inst {
+        HirInstruction::Binary { result, .. }
+        | HirInstruction::Unary { result, .. }
+        | HirInstruction::Cast { result, .. }
+        | HirInstruction::Load { result, .. }
+        | HirInstruction::GetElementPtr { result, .. }
+        | HirInstruction::ExtractValue { result, .. }
+        | HirInstruction::InsertValue { result, .. }
+        | HirInstruction::Alloca { result, .. }
+        | HirInstruction::Select { result, .. }
+        | HirInstruction::Atomic { result, .. } => map_result(result),
+        HirInstruction::Call { result, .. } | HirInstruction::IndirectCall { result, .. } => {
+            if let Some(r) = result {
+                map_result(r);
+            }
+        }
+        _ => {}
+    }
+
     let map = |id: &mut HirId| {
         if let Some(&new) = subs.get(id) {
             *id = new;
