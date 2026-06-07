@@ -343,6 +343,7 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
     // through GEP+Cast chains; if we can't trace the chain to a clean
     // (root, const_offset), the location is conservatively `None`
     // (treat as may-alias).
+    let addr_index = build_addr_index(func);
     let store_locs: Vec<MemLoc> = lp
         .body
         .iter()
@@ -350,10 +351,10 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
         .flat_map(|b| b.instructions.iter())
         .filter_map(|inst| match inst {
             HirInstruction::Store { ptr, value, .. } => Some(extract_mem_loc(
-                func,
                 *ptr,
                 value_byte_size(func, *value),
                 &identity_subst,
+                &addr_index,
             )),
             _ => None,
         })
@@ -397,7 +398,7 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
                 // every Store, then ask whether ranges may overlap.
                 if let HirInstruction::Load { ptr, ty, .. } = inst {
                     let load_loc =
-                        extract_mem_loc(func, *ptr, hir_ty_byte_size(ty), &identity_subst);
+                        extract_mem_loc(*ptr, hir_ty_byte_size(ty), &identity_subst, &addr_index);
                     // A Load with an entirely opaque root (no GEP+Cast
                     // chain we can trace) can't be disambiguated from
                     // any in-loop Store. Skip it.
@@ -562,79 +563,95 @@ impl MemLoc {
     }
 }
 
+/// Compact representation of the GEP/Cast chain we need to chase.
+/// Owning copies of operands/indices keep us from holding a borrow on
+/// `func.blocks` while the alias check runs.
+enum AddrLink {
+    /// Bitcast — chase to the operand verbatim.
+    Cast(HirId),
+    /// GEP — chase to `base`, optionally with constant byte-offset
+    /// contribution from the indices (`None` if any index was
+    /// non-constant).
+    Gep {
+        base: HirId,
+        const_offset: Option<u64>,
+    },
+}
+
+/// Build a `HirId → AddrLink` lookup over every `Cast` / `GEP`
+/// instruction in `func`. Built once per `hoist_loop` call and
+/// shared across the per-Load and per-Store alias-check chases.
+/// Without this index every chase step walked `func.blocks ×
+/// instructions` looking for the defining instruction — for a
+/// function with N instructions and K Loads we paid O(N²·K).
+fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
+    let mut idx: HashMap<HirId, AddrLink> = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            match inst {
+                HirInstruction::Cast {
+                    result, operand, ..
+                } => {
+                    idx.insert(*result, AddrLink::Cast(*operand));
+                }
+                HirInstruction::GetElementPtr {
+                    result,
+                    ptr: base,
+                    indices,
+                    ..
+                } => {
+                    let mut const_offset: Option<u64> = Some(0);
+                    for &id in indices {
+                        if let Some(off) = const_offset {
+                            if let Some(v) = constant_i64_value(func, id) {
+                                const_offset = Some(off.saturating_add(v as u64));
+                            } else {
+                                const_offset = None;
+                            }
+                        }
+                    }
+                    idx.insert(
+                        *result,
+                        AddrLink::Gep {
+                            base: *base,
+                            const_offset,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    idx
+}
+
 /// Walk back through GEP+Cast chains starting at `ptr` to extract a
-/// `MemLoc { root, offset, size }`. Stops at the first non-trivial
-/// step (non-constant GEP index, ExtractValue, etc.) and returns
-/// whatever it can. `size` is taken from the caller (the byte width
-/// of the Load/Store's value type).
+/// `MemLoc { root, offset, size }`. `size` comes from the caller
+/// (byte width of the Load/Store's value type). The chain step
+/// lookup is O(1) via the pre-built `addr_index`.
 fn extract_mem_loc(
-    func: &HirFunction,
     ptr: HirId,
     size: u32,
     identity_subst: &indexmap::IndexMap<HirId, HirId>,
+    addr_index: &HashMap<HirId, AddrLink>,
 ) -> MemLoc {
-    // Cap the chase depth so a circular SSA graph (shouldn't happen in
-    // valid HIR but defence-in-depth) can't lock up.
     let mut current = identity_subst.get(&ptr).copied().unwrap_or(ptr);
     let mut total_offset: u64 = 0;
     let mut offset_known = true;
+    // Cap the chase depth so a malformed SSA graph can't lock up.
     for _ in 0..32 {
-        // Find the defining instruction for `current`. We walk every
-        // block; loop bodies are small and this is called per-Load,
-        // so the cost is in the noise.
-        let mut found = None;
-        'outer: for block in func.blocks.values() {
-            for inst in &block.instructions {
-                match inst {
-                    HirInstruction::GetElementPtr { result, .. }
-                    | HirInstruction::Cast { result, .. }
-                        if *result == current =>
-                    {
-                        found = Some(inst);
-                        break 'outer;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let Some(def) = found else {
-            // Base reached: either a Param / Phi result / Alloca /
-            // Call result. Use the current SSA id as the root.
-            return MemLoc {
-                root: Some(current),
-                offset: if offset_known {
-                    Some(total_offset)
-                } else {
-                    None
-                },
-                size,
-            };
-        };
-        match def {
-            HirInstruction::Cast { operand, .. } => {
-                // Treat ptr-bitcasts as transparent.
+        match addr_index.get(&current) {
+            Some(AddrLink::Cast(operand)) => {
                 current = identity_subst.get(operand).copied().unwrap_or(*operand);
             }
-            HirInstruction::GetElementPtr {
-                ptr: base, indices, ..
-            } => {
-                // Try to fold each index into the running constant
-                // offset. Single-index byte-offset GEPs (`ty: U8`)
-                // are the common ref-class field-access shape; we
-                // handle those + simple struct-index pairs.
-                for &idx in indices {
-                    match constant_i64_value(func, idx) {
-                        Some(v) => {
-                            total_offset = total_offset.saturating_add(v as u64);
-                        }
-                        None => {
-                            offset_known = false;
-                        }
-                    }
+            Some(AddrLink::Gep { base, const_offset }) => {
+                match const_offset {
+                    Some(v) => total_offset = total_offset.saturating_add(*v),
+                    None => offset_known = false,
                 }
                 current = identity_subst.get(base).copied().unwrap_or(*base);
             }
-            _ => break,
+            None => break,
         }
     }
     MemLoc {
