@@ -2953,15 +2953,28 @@ impl<'ctx> LLVMBackend<'ctx> {
                 )?
                 .into(),
 
-            // Integer to pointer
-            IntToPtr => self
-                .builder
-                .build_int_to_ptr(
-                    operand.into_int_value(),
-                    target_ty.into_pointer_type(),
-                    "inttoptr",
-                )?
-                .into(),
+            // Integer to pointer.
+            //
+            // After the List<T>.data layout change (i64 → typed ptr), some
+            // HIR Cast{op: IntToPtr} nodes that used to consume an i64
+            // value now see a ptr — typically a leftover cast emitted by
+            // an opt pass that was canonicalising address arithmetic.
+            // When the operand is already a pointer, the cast is a no-op:
+            // just return it as the target ptr type (LLVM opaque pointers
+            // are typeless so no real conversion is needed).
+            IntToPtr => {
+                if operand.is_pointer_value() {
+                    operand
+                } else {
+                    self.builder
+                        .build_int_to_ptr(
+                            operand.into_int_value(),
+                            target_ty.into_pointer_type(),
+                            "inttoptr",
+                        )?
+                        .into()
+                }
+            }
 
             // Bitcast (reinterpret bits as different type)
             Bitcast => self

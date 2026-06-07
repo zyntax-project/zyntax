@@ -2892,29 +2892,25 @@ impl SsaBuilder {
         list_ptr: HirId,
         elem_ty: &HirType,
     ) -> CompilerResult<HirId> {
-        // Load i64 from the start of the List struct (field 0 = data pointer).
-        let data_ptr_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
-        self.add_instruction(
-            block_id,
-            HirInstruction::Load {
-                result: data_ptr_i64,
-                ty: HirType::I64,
-                ptr: list_ptr,
-                align: 8,
-                volatile: false,
-            },
-        );
-
-        // Cast i64 → *mut elem_ty.
+        // Load the data pointer directly as `Ptr(elem_ty)` from field 0 of
+        // the List struct. The List struct's field-0 slot is still 8 bytes
+        // (i64-sized in the HIR struct declaration) — at the Load instruction
+        // level we ask for a pointer value, which is what backends produce
+        // anyway. The previous Load{ty: I64} + IntToPtr cast chain blocked
+        // LLVM's alias analysis past the inttoptr boundary, defeating LICM
+        // of loop-invariant field reads in hot loops (see the nbody_ref
+        // perf gap memory note). Cranelift treats Ptr and I64 identically at
+        // the lowered-IR level on 64-bit targets, so no codegen change there.
         let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
         let data_ptr = self.create_value(ptr_ty.clone(), HirValueKind::Instruction);
         self.add_instruction(
             block_id,
-            HirInstruction::Cast {
+            HirInstruction::Load {
                 result: data_ptr,
                 ty: ptr_ty,
-                operand: data_ptr_i64,
-                op: CastOp::IntToPtr,
+                ptr: list_ptr,
+                align: 8,
+                volatile: false,
             },
         );
         Ok(data_ptr)
@@ -4608,31 +4604,23 @@ impl SsaBuilder {
                     _ => false,
                 };
                 let gep_base = if is_list_shape_hir || is_list_shape_named {
-                    let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
-                    self.add_instruction(
-                        block_id,
-                        HirInstruction::Load {
-                            result: data_as_i64,
-                            ty: HirType::I64,
-                            ptr: object_val,
-                            align: 8,
-                            volatile: false,
-                        },
-                    );
-                    self.add_use(object_val, data_as_i64);
+                    // Load the data pointer directly as `Ptr(elem)` — see
+                    // `emit_list_data_ptr` for the AA rationale (the previous
+                    // I64 + IntToPtr round-trip blocked LICM in hot loops).
                     let data_ptr_ty = HirType::Ptr(Box::new(elem_hir_ty.clone()));
                     let data_ptr =
                         self.create_value(data_ptr_ty.clone(), HirValueKind::Instruction);
                     self.add_instruction(
                         block_id,
-                        HirInstruction::Cast {
+                        HirInstruction::Load {
                             result: data_ptr,
                             ty: data_ptr_ty,
-                            operand: data_as_i64,
-                            op: crate::hir::CastOp::IntToPtr,
+                            ptr: object_val,
+                            align: 8,
+                            volatile: false,
                         },
                     );
-                    self.add_use(data_as_i64, data_ptr);
+                    self.add_use(object_val, data_ptr);
                     data_ptr
                 } else {
                     object_val
@@ -5105,21 +5093,16 @@ impl SsaBuilder {
                     },
                 );
 
-                // Store data pointer (field 0) — cast ptr to i64 for storage
-                let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
-                self.add_instruction(
-                    block_id,
-                    HirInstruction::Cast {
-                        result: data_as_i64,
-                        ty: HirType::I64,
-                        operand: data_ptr,
-                        op: crate::hir::CastOp::PtrToInt,
-                    },
-                );
+                // Store the data pointer (field 0) directly as a pointer
+                // value. Symmetric to the load side: the previous PtrToInt
+                // cast funneled the address through an i64 round-trip that
+                // blocks LLVM AA. Same 8 bytes of memory either way; the
+                // backends see only Load/Store types, not the struct field
+                // declaration.
                 self.add_instruction(
                     block_id,
                     HirInstruction::Store {
-                        value: data_as_i64,
+                        value: data_ptr,
                         ptr: list_alloc,
                         align: 8,
                         volatile: false,
@@ -8735,31 +8718,23 @@ impl SsaBuilder {
                 let needs_data_load =
                     matches!(&resolved_array_ty, Type::Array { .. } | Type::Named { .. });
                 let gep_base = if needs_data_load {
-                    let data_as_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
-                    self.add_instruction(
-                        block_id,
-                        HirInstruction::Load {
-                            result: data_as_i64,
-                            ty: HirType::I64,
-                            ptr: array_val,
-                            align: 8,
-                            volatile: false,
-                        },
-                    );
-                    self.add_use(array_val, data_as_i64);
+                    // Direct Ptr-typed load — matches the read-side change
+                    // in the Index lowering and `emit_list_data_ptr` (AA
+                    // can track the data pointer without inttoptr).
                     let data_ptr_ty = HirType::Ptr(Box::new(element_type.clone()));
                     let data_ptr =
                         self.create_value(data_ptr_ty.clone(), HirValueKind::Instruction);
                     self.add_instruction(
                         block_id,
-                        HirInstruction::Cast {
+                        HirInstruction::Load {
                             result: data_ptr,
                             ty: data_ptr_ty,
-                            operand: data_as_i64,
-                            op: crate::hir::CastOp::IntToPtr,
+                            ptr: array_val,
+                            align: 8,
+                            volatile: false,
                         },
                     );
-                    self.add_use(data_as_i64, data_ptr);
+                    self.add_use(array_val, data_ptr);
                     data_ptr
                 } else {
                     array_val
