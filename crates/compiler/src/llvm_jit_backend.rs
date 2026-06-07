@@ -353,7 +353,11 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
             if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
                 let ir = backend.module().print_to_string().to_string();
-                let path = std::env::temp_dir().join("zyntax_llvm_ir_postopt.ll");
+                static POSTOPT_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = POSTOPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let fname = format!("zyntax_llvm_ir_postopt_{n:04}.ll");
+                let path = std::env::temp_dir().join(fname);
                 if std::fs::write(&path, &ir).is_ok() {
                     eprintln!(
                         "[LLVM-IR] post-opt IR written to {} ({} bytes)",

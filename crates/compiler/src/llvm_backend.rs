@@ -584,8 +584,14 @@ impl<'ctx> LLVMBackend<'ctx> {
             self.type_map.insert(param.id, param.ty.clone());
         }
 
-        // Map constant values, parameters, and special instruction values to LLVM values
+        // Map constant values, parameters, and special instruction values to LLVM values.
+        //
+        // Populate `type_map` for *every* value so backend peepholes that
+        // need to recover the HIR-level pointee type (the field-access
+        // struct-GEP rewrite, the ExtractValue/InsertValue ptr arms) can
+        // do so for instruction-produced values too, not just parameters.
         for (value_id, value) in &func.values {
+            self.type_map.insert(*value_id, value.ty.clone());
             match &value.kind {
                 HirValueKind::Constant(constant) => {
                     let llvm_constant = self.compile_constant(constant)?;
