@@ -27,6 +27,7 @@ pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
 pub mod bytecode; // HIR bytecode serialization/deserialization
+pub mod cast_classify; // Pure classification of source/target coercions → CastKind
 pub mod cfg;
 pub mod cfg_simplify;
 pub mod const_eval;

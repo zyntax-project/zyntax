@@ -197,6 +197,7 @@ const KERNELS: &[(&str, &str)] = &[
     ("bench_op_overload", "Int(210000000)"),
     ("bench_op_overload_ref", "Int(21000000)"),
     ("bench_any_field", "Int(1500000)"),
+    ("bench_any_cast", "Int(2500000)"),
 ];
 
 /// Each target produces one [`TargetResult`] per kernel.

@@ -1,0 +1,23 @@
+// Type::Any explicit `as` cast roundtrip — proves the unified cast
+// classifier routes UpcastBox (T → Any) and DowncastUnbox (Any → T)
+// through the same `zyntax_box_*` runtime as Any-field stores/reads.
+//
+// `2.5 as Any` upcasts via `zyntax_box_f64`; `boxed as f64`
+// downcasts via `zyntax_box_get_f64`. The final `sum as i64` is a
+// plain numeric conversion (Convert kind) and falls through to the
+// standard `HirInstruction::Cast` emitter.
+//
+// 1M iterations × 2.5 = 2_500_000. A wrong unbox path produces
+// either a crash or a wildly wrong number (raw pointer bits).
+
+def main(): i64 {
+    let mut sum: f64 = 0.0
+    let mut i: i64 = 0
+    while i < 1000000 {
+        let boxed: Any = 2.5 as Any
+        let v: f64 = boxed as f64
+        sum = sum + v
+        i = i + 1
+    }
+    return sum as i64
+}

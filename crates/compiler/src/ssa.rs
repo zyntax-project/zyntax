@@ -5378,20 +5378,38 @@ impl SsaBuilder {
 
             TypedExpression::Cast(cast) => {
                 let operand_val = self.translate_expression(block_id, &cast.expr)?;
-                // The parser leaves Variable / Binary / etc.
-                // expression types as `Type::Any` / `Type::Unknown`,
-                // which would collapse to `HirType::I64` in
-                // `convert_type` and force `select_cast_op` to pick
-                // `Bitcast` instead of the intended FpToSi / SiToFp.
-                // Use the actual HIR type of the just-translated
-                // operand HirValue — that's authoritative regardless
-                // of what the typed-AST node claims.
+
+                // Route the cast through the universal coercion
+                // funnel first. For Any↔T pairs the classifier picks
+                // UpcastBox / DowncastUnbox and emits the right
+                // `zyntax_box_X` / `zyntax_box_get_X` call. The
+                // funnel's HIR-type guard suppresses double-unboxing
+                // when an earlier coercion site already widened the
+                // value. For Identity / Convert the funnel returns
+                // the input unchanged and we fall through to the
+                // standard `HirInstruction::Cast` path below.
+                let typed_source = self.resolve_expr_type(&cast.expr);
+                let coerced =
+                    self.emit_coercion(block_id, operand_val, &typed_source, &cast.target_type);
+                if coerced != operand_val {
+                    return Ok(coerced);
+                }
+
+                // Standard numeric/pointer conversion. The parser
+                // leaves Variable / Binary / etc. expression types as
+                // `Type::Any` / `Type::Unknown`, which would collapse
+                // to `HirType::I64` in `convert_type` and force
+                // `select_cast_op` to pick `Bitcast` instead of the
+                // intended FpToSi / SiToFp. Use the actual HIR type
+                // of the just-translated operand HirValue — that's
+                // authoritative regardless of what the typed-AST
+                // node claims.
                 let source_ty = self
                     .function
                     .values
                     .get(&operand_val)
                     .map(|v| v.ty.clone())
-                    .unwrap_or_else(|| self.convert_type(&self.resolve_expr_type(&cast.expr)));
+                    .unwrap_or_else(|| self.convert_type(&typed_source));
                 let target_ty = self.convert_type(&cast.target_type);
                 let result = self.create_value(target_ty.clone(), HirValueKind::Instruction);
                 let cast_op = self.select_cast_op(&source_ty, &target_ty);
@@ -7469,32 +7487,66 @@ impl SsaBuilder {
         Some(type_def.fields.iter().map(|f| f.ty.clone()).collect())
     }
 
-    /// Wrap `value` in a heap-allocated `DynamicBox` via the
-    /// appropriate `zyntax_box_X` runtime symbol so it can be stored
-    /// into a `Type::Any` field slot. The slot is `HirType::I64`
-    /// (pointer-sized); the box call returns a `*mut DynamicBoxRepr`
-    /// which is i64-shaped on the platforms we support.
+    /// Public funnel for every coercion site. Classifies the
+    /// `source_ty → target_ty` pair via [`crate::cast_classify`] and
+    /// dispatches:
     ///
-    /// Values that are already i64-shaped (`I64`, `U64`, any `Ptr(_)`)
-    /// pass through unchanged — the slot will hold the raw value /
-    /// pointer directly. Box pointers, plain `i64`, and pointers all
-    /// alias the same shape and can be stored verbatim.
+    /// * `UpcastBox` (concrete → `Any`) — emits `zyntax_box_X`
+    /// * `DowncastUnbox` (`Any` → concrete) — emits `zyntax_box_get_X`
+    ///   with an HIR-type guard that prevents double-unboxing a value
+    ///   that was already widened by an earlier coercion site
+    /// * Everything else — returns `value` unchanged; the caller is
+    ///   expected to either be content with a no-op (Identity) or to
+    ///   emit its own `HirInstruction::Cast` (Convert)
     ///
-    /// Unsupported value types fall through; downstream codegen may
-    /// reject them. The current bench surface only stores i32, i64,
-    /// f32, f64, bool, and pointers — all covered.
-    fn maybe_box_for_any_field(&mut self, block_id: HirId, value: HirId) -> HirId {
-        let value_ty = match self.function.values.get(&value).map(|v| v.ty.clone()) {
-            Some(t) => t,
-            None => return value,
-        };
+    /// The classifier is frontend-agnostic, so this funnel is the
+    /// right entry point for *any* frontend that lowers to Zyntax
+    /// TypedAST — not just ZynML. As new variants (class hierarchy
+    /// widening / narrowing, union variant wrap / extract) are wired
+    /// into the classifier, the matching emitters land here and every
+    /// existing coercion site picks them up for free.
+    pub(crate) fn emit_coercion(
+        &mut self,
+        block_id: HirId,
+        value: HirId,
+        source_ty: &Type,
+        target_ty: &Type,
+    ) -> HirId {
+        use crate::cast_classify::{classify_cast, CastKind};
+        match classify_cast(source_ty, target_ty, &self.type_registry) {
+            CastKind::UpcastBox => self.emit_box_to_any(block_id, value).unwrap_or(value),
+            CastKind::DowncastUnbox => self
+                .emit_unbox_from_any(block_id, value, target_ty)
+                .unwrap_or(value),
+            CastKind::Identity
+            | CastKind::Convert
+            | CastKind::UpcastWiden
+            | CastKind::DowncastChecked
+            | CastKind::UpcastVariant
+            | CastKind::DowncastVariant
+            | CastKind::Incompatible => value,
+        }
+    }
+
+    /// Low-level box emitter. Wraps `value` in a heap-allocated
+    /// `DynamicBox` via the appropriate `zyntax_box_X` runtime symbol
+    /// so it can flow into a `Type::Any` slot. The result is
+    /// `HirType::I64` (a `*mut DynamicBoxRepr` stored pointer-sized).
+    ///
+    /// Returns `None` when the value's HIR type has no matching box
+    /// helper (pointers, aggregates, vectors) — the caller falls
+    /// through to passing the value through unchanged, which is sound
+    /// for already-i64-shaped values that are themselves box pointers
+    /// from a prior boxing.
+    fn emit_box_to_any(&mut self, block_id: HirId, value: HirId) -> Option<HirId> {
+        let value_ty = self.function.values.get(&value).map(|v| v.ty.clone())?;
         let box_symbol = match value_ty {
             HirType::I8 | HirType::U8 | HirType::Bool => "zyntax_box_bool",
             HirType::I16 | HirType::U16 | HirType::I32 | HirType::U32 => "zyntax_box_i32",
+            HirType::I64 | HirType::U64 => "zyntax_box_i64",
             HirType::F32 => "zyntax_box_f32",
             HirType::F64 => "zyntax_box_f64",
-            HirType::I64 | HirType::U64 | HirType::Ptr(_) => return value,
-            _ => return value,
+            _ => return None,
         };
         let boxed = self.create_value(HirType::I64, HirValueKind::Instruction);
         self.add_instruction(
@@ -7509,15 +7561,68 @@ impl SsaBuilder {
             },
         );
         self.add_use(value, boxed);
-        boxed
+        Some(boxed)
     }
 
-    /// Counterpart to [`maybe_box_for_any_field`]: when reading a
-    /// field whose DECLARED type is `Type::Any` and the use-site's
-    /// inferred type (`use_site_ty`) is a concrete primitive, emit a
-    /// `zyntax_box_get_X` call to unwrap the box pointer. Leaves
-    /// boxes intact when the use-site is also `Type::Any` (the box
-    /// pointer flows through as-is to whatever next consumes it).
+    /// Low-level unbox emitter with a guard against double-unboxing.
+    ///
+    /// The typed-AST source type may say `Type::Any` while the HIR
+    /// value has already been widened to its concrete form by an
+    /// earlier coercion site (e.g. a let-binding with a concrete
+    /// annotation that fired the unbox at field-load time). Without
+    /// the guard, a second `zyntax_box_get_X` call would dereference
+    /// a non-box value and produce garbage.
+    ///
+    /// Guard: the value's HIR type must look like a box pointer
+    /// (`I64` / `U64` / `Ptr(_)`) for us to emit an unbox. If it has
+    /// already been narrowed to a concrete scalar type, return `None`
+    /// — the caller falls through and uses the value as-is.
+    fn emit_unbox_from_any(
+        &mut self,
+        block_id: HirId,
+        boxed_value: HirId,
+        target_ty: &Type,
+    ) -> Option<HirId> {
+        let value_hir_ty = self
+            .function
+            .values
+            .get(&boxed_value)
+            .map(|v| v.ty.clone())?;
+        if !matches!(value_hir_ty, HirType::I64 | HirType::U64 | HirType::Ptr(_)) {
+            return None;
+        }
+        self.try_emit_any_downcast(block_id, boxed_value, target_ty)
+    }
+
+    /// Backward-compatible field-store helper. Routes through
+    /// [`Self::emit_coercion`] with a synthetic `source_ty` derived
+    /// from the value's HIR type — frontends storing into Any fields
+    /// don't surface a typed-AST source so we infer one from the
+    /// already-emitted HIR. Future call sites should prefer
+    /// `emit_coercion` directly with the typed source.
+    fn maybe_box_for_any_field(&mut self, block_id: HirId, value: HirId) -> HirId {
+        // Synthesize a concrete typed source from the HIR shape so
+        // the classifier picks UpcastBox. The exact concrete spelling
+        // doesn't matter — only that it's NOT Any.
+        use zyntax_typed_ast::PrimitiveType;
+        let source_ty = match self.function.values.get(&value).map(|v| v.ty.clone()) {
+            Some(HirType::I8) | Some(HirType::U8) | Some(HirType::Bool) => {
+                Type::Primitive(PrimitiveType::Bool)
+            }
+            Some(HirType::I16) | Some(HirType::U16) | Some(HirType::I32) | Some(HirType::U32) => {
+                Type::Primitive(PrimitiveType::I32)
+            }
+            Some(HirType::I64) | Some(HirType::U64) => Type::Primitive(PrimitiveType::I64),
+            Some(HirType::F32) => Type::Primitive(PrimitiveType::F32),
+            Some(HirType::F64) => Type::Primitive(PrimitiveType::F64),
+            _ => return value,
+        };
+        self.emit_coercion(block_id, value, &source_ty, &Type::Any)
+    }
+
+    /// Backward-compatible field-load helper. Checks the *declared*
+    /// field type (must be `Type::Any`) and the use-site type, then
+    /// routes through [`Self::emit_coercion`].
     fn maybe_unbox_for_any_field(
         &mut self,
         block_id: HirId,
@@ -7534,16 +7639,15 @@ impl SsaBuilder {
         if !field_is_any {
             return boxed_value;
         }
-        self.try_emit_any_downcast(block_id, boxed_value, use_site_ty)
-            .unwrap_or(boxed_value)
+        self.emit_coercion(block_id, boxed_value, &Type::Any, use_site_ty)
     }
 
     /// Emit a `zyntax_box_get_X` call to downcast a `*mut DynamicBox`
     /// (HIR i64) to the requested concrete primitive type. Returns
     /// `Some(unboxed)` when the target type has a matching getter,
     /// `None` otherwise (caller falls through to whatever default
-    /// it had). Shared between the Field-load unbox path and the
-    /// explicit-cast (`X as T`) unbox path.
+    /// it had). Used by [`Self::emit_unbox_from_any`] under the
+    /// double-unbox guard.
     fn try_emit_any_downcast(
         &mut self,
         block_id: HirId,
@@ -7713,6 +7817,19 @@ impl SsaBuilder {
                     // for the design note.
                     if type_def.name.resolve_global().as_deref() == Some("Resume") {
                         return HirType::Ptr(Box::new(HirType::U8));
+                    }
+
+                    // Universal top type — frontends commonly register
+                    // `Any` as a Named-atomic via the type registry
+                    // before the typed AST reaches the compiler. The
+                    // runtime backs it with a `*mut DynamicBoxRepr`,
+                    // which is i64-shaped on every target we support.
+                    // Mapping it to `HirType::I64` keeps the slot the
+                    // right width and lets the `cast_classify` funnel's
+                    // box/unbox calls flow through value-precise BC
+                    // interp slots without losing the box pointer.
+                    if crate::cast_classify::is_any_type(ty, &self.type_registry) {
+                        return HirType::I64;
                     }
 
                     // Extern/opaque types (ZRTL-backed like Tensor) → Ptr(Opaque)
