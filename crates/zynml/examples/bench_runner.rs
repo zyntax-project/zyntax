@@ -174,14 +174,22 @@ struct Meta {
 
 /// Each benchmark source lives at
 /// `crates/zynml/examples/<name>.zynml` and gets run across every
-/// target listed in [`TARGETS`].
-const KERNELS: &[&str] = &[
-    "bench_mandelbrot",
-    "bench_nbody",
-    "bench_nbody_ref",
-    "bench_fib",
-    "bench_inlined_call",
-    "bench_free_function_call",
+/// target listed in [`TARGETS`]. The second tuple element is the
+/// expected `Debug`-formatted result; the bench harness asserts
+/// every successful iteration matches it and fails the run with a
+/// non-zero exit code on mismatch. Without this assertion, a
+/// miscompile that returns the wrong value (e.g. fib LLVM tier
+/// returning `Int(38)` instead of `Int(102334155)` after the
+/// recursive-inline pass landed broken) still reports a "green"
+/// CI workflow because the bench harness records the value but
+/// never validates it.
+const KERNELS: &[(&str, &str)] = &[
+    ("bench_mandelbrot", "Int(112789639)"),
+    ("bench_nbody", "Int(-169077)"),
+    ("bench_nbody_ref", "Int(-169077)"),
+    ("bench_fib", "Int(102334155)"),
+    ("bench_inlined_call", "Int(100000000)"),
+    ("bench_free_function_call", "Int(100000000)"),
 ];
 
 /// Each target produces one [`TargetResult`] per kernel.
@@ -409,7 +417,9 @@ fn main() {
         },
     };
 
-    for kernel in KERNELS {
+    let mut value_mismatches: Vec<String> = Vec::new();
+
+    for (kernel, expected) in KERNELS {
         let pretty = kernel.strip_prefix("bench_").unwrap_or(kernel);
         if let Some(f) = &kernel_filter {
             // Exact-match against the stripped kernel name. Substring
@@ -453,6 +463,27 @@ fn main() {
                     r.seconds * 1000.0,
                     r.result,
                 );
+                // Correctness gate: every successful tier on this
+                // kernel must return the canonical reference value.
+                // Without this, a miscompile that silently returns
+                // garbage (e.g. fib LLVM returning Int(38) after the
+                // recursive-inline pass landed broken) still shows
+                // as a "green" CI workflow because the bench harness
+                // only records the value, never validates it.
+                // Accumulate every mismatch across the run so one
+                // tier failing doesn't suppress visibility into
+                // other tiers; we surface them all + exit non-zero
+                // at the end.
+                if r.result != *expected {
+                    eprintln!(
+                        "    {:<22} VALUE MISMATCH — got {}, expected {}",
+                        target.key, r.result, expected
+                    );
+                    value_mismatches.push(format!(
+                        "{}/{}: got {}, expected {}",
+                        pretty, target.key, r.result, expected
+                    ));
+                }
             }
             per_kernel.insert(target.key.to_string(), r);
         }
@@ -468,6 +499,21 @@ fn main() {
     let json = serde_json::to_string_pretty(&suite).expect("serialize results");
     fs::write(&out_path, json).unwrap_or_else(|e| panic!("write {out_path:?}: {e}"));
     eprintln!("\nwrote {}", out_path.display());
+
+    // Fail the process AFTER writing results.json so the partial
+    // (still-real) data lands on disk for forensics, but the CI
+    // workflow still goes red on a miscompile. Filter-/target-
+    // restricted runs are exempt: a `--filter fib` invocation that
+    // only exercises one kernel isn't claiming to validate the
+    // whole suite, just to time that one. Anything that lists at
+    // least one mismatch fails.
+    if !value_mismatches.is_empty() {
+        eprintln!("\nVALUE MISMATCHES — bench will exit non-zero:");
+        for m in &value_mismatches {
+            eprintln!("  {m}");
+        }
+        std::process::exit(2);
+    }
 }
 
 /// Parse + lower + (optionally) opt + run, repeated until we have
