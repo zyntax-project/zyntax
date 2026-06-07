@@ -922,9 +922,16 @@ impl<'ctx> LLVMBackend<'ctx> {
         // Store the phi value in both maps:
         // - value_map: so other instructions can use it
         // - phi_map: so we can add incoming edges later (Phase 3)
+        // - type_map: so downstream ExtractValue / pointer-based loads
+        //   can recover the *aggregate* HIR type (the field type they
+        //   carry as `ty` is the result type, not the pointee). Without
+        //   this, ExtractValue on a ptr-typed phi falls back to using
+        //   the field type as the GEP element type and emits an invalid
+        //   two-index GEP off a scalar.
         self.value_map
             .insert(phi.result, phi_value.as_basic_value());
         self.phi_map.insert(phi.result, phi_value);
+        self.type_map.insert(phi.result, chosen);
 
         // Note: Incoming edges will be added in Phase 3 of compile_function
         // after all blocks are compiled and all values are available
@@ -1473,9 +1480,22 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
 
                 // Check if aggregate is a pointer (e.g., from Alloca)
-                // In this case, we use GEP + Store instead of InsertValue
+                // In this case, we use GEP + Store instead of InsertValue.
+                //
+                // `ty` is the HIR result type — typically the aggregate
+                // type itself (`Struct(Body)`) for value-type insertvalue
+                // emitted by SSA, or `Ptr(Struct(Body))` when the
+                // aggregate's annotated type is a pointer (reference-class
+                // lowering, or a phi we demoted from `Array<T,N>` to
+                // `Ptr(T)`). For the GEP element type we want the *pointee*
+                // — `Struct(Body)` — so a `[0, field_idx]` index pair lands
+                // on the right field. Unwrap one Ptr layer to match.
                 if current_agg.is_pointer_value() {
-                    let llvm_ty = self.translate_type(ty)?;
+                    let elem_hir = match ty {
+                        HirType::Ptr(inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    let llvm_ty = self.translate_type(elem_hir)?;
                     let ptr = current_agg.into_pointer_value();
 
                     // Build GEP indices: first index is always 0 to dereference the pointer

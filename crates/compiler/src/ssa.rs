@@ -6781,10 +6781,43 @@ impl SsaBuilder {
 
         match &expr.node {
             TypedExpression::Binary(bin) if matches!(bin.op, BinaryOp::Assign) => {
-                // Assignment: target = value
-                if let TypedExpression::Variable(name) = &bin.left.node {
-                    vars.insert(*name);
-                }
+                // Assignment: target = value. Walk the lvalue to find the
+                // root variable being mutated — a plain `Variable("a") =`,
+                // a field assignment `a.x =`, an index assignment `xs[i] =`,
+                // and any nested combination all mutate `a` / `xs`. Without
+                // this the IDF phi placement misses the redefinition: in
+                // a value-type struct lowering, `a.vx = expr` rebuilds `a`
+                // with InsertValue and re-binds the variable, but if `a`
+                // isn't in this block's write-set the phi-placement walk
+                // never inserts a phi for it at the enclosing loop
+                // header, and subsequent reads of `a` outside the
+                // assignment-block fall back to the value at function
+                // entry. That's the nbody `bodies[i] = a` bug where the
+                // write-back stores the original `bodies[i]` load instead
+                // of the j-loop's modified `a`.
+                Self::collect_lvalue_root(&bin.left, vars);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_lvalue_root(
+        target: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        vars: &mut HashSet<InternedString>,
+    ) {
+        use zyntax_typed_ast::typed_ast::TypedExpression;
+        match &target.node {
+            TypedExpression::Variable(name) => {
+                vars.insert(*name);
+            }
+            TypedExpression::Field(field) => {
+                Self::collect_lvalue_root(&field.object, vars);
+            }
+            TypedExpression::Index(idx) => {
+                Self::collect_lvalue_root(&idx.object, vars);
+            }
+            TypedExpression::Dereference(inner) => {
+                Self::collect_lvalue_root(inner, vars);
             }
             _ => {}
         }
