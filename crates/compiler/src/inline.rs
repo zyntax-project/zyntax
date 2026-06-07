@@ -101,6 +101,21 @@ const MAX_INLINE_INSTS_MULTI_BLOCK: usize = 256;
 /// `|insts|`, so an unbounded caller blows up compile time.
 const MAX_POST_INLINE_INSTS: usize = 2000;
 
+/// Recursive-inline body-size cap. Bodies above this size are
+/// skipped — depth-1 inlining roughly *triples* the IR size of the
+/// function (original body + 2 copies, one per self-call) so we
+/// hold the budget tighter than the regular inliner. 96 catches
+/// naive fib (~20 insts), tight tail-recursive accumulators, and
+/// most CPS-style state machines without admitting anything that
+/// would blow up to thousands of insts.
+const MAX_RECURSIVE_INLINE_INSTS: usize = 96;
+
+/// Per-function cap on the number of self-call sites we'll inline.
+/// Naive fib has 2; tail-recursive accumulators have 1; anything
+/// past 4 is an exotic mutual-recursion shape we don't want to
+/// triple-expand. Bounds worst-case IR growth.
+const MAX_RECURSIVE_INLINE_SITES: usize = 4;
+
 /// Per-pass-per-caller inlining cap. Resets each outer fixed-point
 /// round in `run_module` — intentional, so the next round can make a
 /// fresh decision under a fresh budget after any inlines from this
@@ -190,6 +205,215 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
     }
 
     total
+}
+
+/// Stats for the recursive-inline pass — kept separate from the
+/// regular [`InlineStats`] so the public optimisation summary can
+/// surface "this kernel got unrolled" without conflating it with
+/// the cross-function inlining number.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecursiveInlineStats {
+    /// Functions whose body was eligible (small + non-async +
+    /// non-external + non-effectful) and contained at least one
+    /// direct self-call.
+    pub functions_visited: usize,
+    /// Self-call sites we actually inlined (depth 1).
+    pub self_calls_inlined: usize,
+    /// Skipped because the body exceeded
+    /// [`MAX_RECURSIVE_INLINE_INSTS`].
+    pub skipped_too_large: usize,
+    /// Skipped because the function had more self-call sites than
+    /// [`MAX_RECURSIVE_INLINE_SITES`] — bounding IR growth.
+    pub skipped_too_many_sites: usize,
+    /// Skipped because the function's body has a shape the inliner
+    /// can't safely splice (async, effects, struct returns, etc.).
+    pub skipped_unsupported: usize,
+}
+
+/// Inline one level of direct self-recursive calls in each eligible
+/// function. Distinct from [`run_module`] in two ways:
+///
+/// 1. Operates on a **snapshot** of the function's body taken before
+///    any modification. The snapshot's own self-calls (which still
+///    reference the function id) become the depth-1 residual after
+///    inlining — no infinite expansion.
+/// 2. The classifier here permits **self-calls inside the callee
+///    body**; the standard [`classify`] treats any internal `Call`
+///    as `Unsupported`, which would reject every recursive function
+///    on the first instruction it sees.
+///
+/// For naive fib this turns `fib(n-1) + fib(n-2)` into a single
+/// frame that computes `(fib(n-3) + fib(n-2)) + (fib(n-2) + fib(n-3))`
+/// directly (mod base-case branches). The frame count at runtime
+/// approximately halves; per-frame work doubles; total work stays
+/// the same. LLVM's tail-recursion-elimination pass then runs over
+/// the larger body and folds more arms into the loop accumulator
+/// that fib(N+2) was already getting partially.
+pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
+    let mut stats = RecursiveInlineStats::default();
+
+    let func_ids: Vec<HirId> = module.functions.keys().copied().collect();
+    for fid in func_ids {
+        // Snapshot of the body BEFORE inlining starts. Cloned self-
+        // calls inside the snapshot still reference `fid`, so when
+        // `apply_inline_multi_block` clones the snapshot at one of
+        // the live function's self-call sites, the cloned blocks
+        // bottom out as real recursive calls (no further expansion).
+        let snapshot = match module.functions.get(&fid) {
+            Some(f) => f.clone(),
+            None => continue,
+        };
+        if snapshot.is_external || snapshot.signature.is_async {
+            continue;
+        }
+        if !snapshot.signature.effects.is_empty() {
+            continue;
+        }
+
+        if count_insts(&snapshot) > MAX_RECURSIVE_INLINE_INSTS {
+            stats.skipped_too_large += 1;
+            continue;
+        }
+
+        let kind = match classify_recursive(&snapshot, fid) {
+            CalleeClass::OkLeaf => InlineKind::Leaf,
+            CalleeClass::OkMultiBlock => InlineKind::MultiBlock,
+            _ => {
+                stats.skipped_unsupported += 1;
+                continue;
+            }
+        };
+
+        // Find self-call sites in the snapshot — the live function
+        // is structurally identical at this point so positions
+        // line up 1:1.
+        let mut jobs: Vec<InlineJob> = Vec::new();
+        for (block_id, block) in &snapshot.blocks {
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                if let HirInstruction::Call {
+                    result,
+                    callee: HirCallable::Function(callee_id),
+                    args,
+                    ..
+                } = inst
+                {
+                    if *callee_id == fid {
+                        jobs.push(InlineJob {
+                            block_id: *block_id,
+                            inst_idx: idx,
+                            call_result: *result,
+                            args: args.clone(),
+                            callee_id: fid,
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
+        if jobs.is_empty() {
+            continue;
+        }
+        if jobs.len() > MAX_RECURSIVE_INLINE_SITES {
+            stats.skipped_too_many_sites += 1;
+            continue;
+        }
+        stats.functions_visited += 1;
+
+        // Apply jobs latest-to-earliest within each block so earlier
+        // instruction indices remain valid as splicing inserts /
+        // removes content. Different blocks are independent.
+        jobs.sort_by_key(|j| std::cmp::Reverse((j.block_id, j.inst_idx)));
+
+        let live = match module.functions.get_mut(&fid) {
+            Some(f) => f,
+            None => continue,
+        };
+        for job in jobs {
+            match job.kind {
+                InlineKind::Leaf => apply_inline(live, &job, &snapshot),
+                InlineKind::MultiBlock => apply_inline_multi_block(live, &job, &snapshot),
+            }
+            stats.self_calls_inlined += 1;
+        }
+        rebuild_cfg_edges(live);
+    }
+
+    stats
+}
+
+/// Recursive-inline classifier. Allows direct self-`Call`s inside the
+/// body (those become the depth-1 residual after inlining), but
+/// still rejects every other Call kind (`IndirectCall`,
+/// `TraitMethodCall`, `Atomic`, `Fence`) and non-self direct calls —
+/// those would create new external dependencies in a function that
+/// otherwise didn't have them, and the existing infrastructure
+/// can't always splice them cleanly inside a multi-block clone.
+fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
+    if callee.signature.is_async || callee.is_external {
+        return CalleeClass::Unsupported;
+    }
+    if !callee.signature.effects.is_empty() {
+        return CalleeClass::Unsupported;
+    }
+
+    let mut total_insts = 0usize;
+    let mut has_alloca = false;
+    for block in callee.blocks.values() {
+        total_insts += block.instructions.len();
+        for inst in &block.instructions {
+            match inst {
+                HirInstruction::Call {
+                    callee: HirCallable::Function(fid),
+                    ..
+                } if *fid == self_id => {
+                    // Direct self-call — fine. Becomes the depth-1
+                    // residual after inlining.
+                }
+                HirInstruction::Call { .. }
+                | HirInstruction::IndirectCall { .. }
+                | HirInstruction::Atomic { .. }
+                | HirInstruction::Fence { .. } => return CalleeClass::Unsupported,
+                HirInstruction::Alloca { .. } => has_alloca = true,
+                _ => {}
+            }
+        }
+    }
+
+    // Same terminator-safety rules as the standard classifier.
+    for block in callee.blocks.values() {
+        match &block.terminator {
+            HirTerminator::Return { values } if values.len() <= 1 => {}
+            HirTerminator::Branch { .. }
+            | HirTerminator::CondBranch { .. }
+            | HirTerminator::Switch { .. } => {}
+            _ => return CalleeClass::Unsupported,
+        }
+    }
+
+    if callee.blocks.len() == 1 {
+        let entry = match callee.blocks.get(&callee.entry_block) {
+            Some(b) => b,
+            None => return CalleeClass::Unsupported,
+        };
+        if has_alloca {
+            // Leaf path doesn't tolerate Alloca; the multi-block
+            // path mints fresh ids for each cloned Alloca so it's
+            // safe there.
+            return CalleeClass::Unsupported;
+        }
+        if entry.instructions.len() > MAX_INLINE_INSTS {
+            return CalleeClass::TooLarge;
+        }
+        if !entry.phis.is_empty() {
+            return CalleeClass::Unsupported;
+        }
+        return CalleeClass::OkLeaf;
+    }
+
+    if total_insts > MAX_INLINE_INSTS_MULTI_BLOCK {
+        return CalleeClass::TooLarge;
+    }
+    CalleeClass::OkMultiBlock
 }
 
 fn inline_in_function(
@@ -1539,5 +1763,191 @@ mod tests {
             sig(vec![], HirType::I64),
         );
         assert_eq!(count_insts(&f), 0, "empty function has zero insts");
+    }
+
+    /// Build a fib-like self-recursive function:
+    ///   fn fib(n):
+    ///     if n < 2: return n
+    ///     else: return fib(n-1) + fib(n-2)
+    ///
+    /// The exact arithmetic doesn't matter for the inliner — what
+    /// matters is the shape: 2 self-Call sites, multi-block, no
+    /// effects / asyncs / non-self calls.
+    fn build_fib_like() -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("fib"),
+            sig(vec![HirType::I64], HirType::I64),
+        );
+        let n = add_value_for_param(&mut f, 0, HirType::I64);
+
+        let entry = HirId::new();
+        let then_block = HirId::new();
+        let else_block = HirId::new();
+        f.blocks.clear();
+        f.entry_block = entry;
+        f.blocks.insert(entry, HirBlock::new(entry));
+        f.blocks.insert(then_block, HirBlock::new(then_block));
+        f.blocks.insert(else_block, HirBlock::new(else_block));
+
+        // entry: %cond = n < 2; br cond, then, else
+        let two = add_const(&mut f, HirType::I64, HirConstant::I64(2));
+        let cond = add_inst(&mut f, HirType::Bool);
+        f.blocks
+            .get_mut(&entry)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: cond,
+                ty: HirType::Bool,
+                left: n,
+                right: two,
+            });
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::CondBranch {
+            condition: cond,
+            true_target: then_block,
+            false_target: else_block,
+        };
+
+        // then: return n
+        f.blocks.get_mut(&then_block).unwrap().terminator =
+            HirTerminator::Return { values: vec![n] };
+
+        // else: %a = fib(n-1); %b = fib(n-2); %c = a + b; return c
+        let one = add_const(&mut f, HirType::I64, HirConstant::I64(1));
+        let nm1 = add_inst(&mut f, HirType::I64);
+        let nm2 = add_inst(&mut f, HirType::I64);
+        let a = add_inst(&mut f, HirType::I64);
+        let b = add_inst(&mut f, HirType::I64);
+        let c = add_inst(&mut f, HirType::I64);
+        let self_id = f.id;
+        let else_b = f.blocks.get_mut(&else_block).unwrap();
+        else_b.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Sub,
+            result: nm1,
+            ty: HirType::I64,
+            left: n,
+            right: one,
+        });
+        else_b.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Sub,
+            result: nm2,
+            ty: HirType::I64,
+            left: n,
+            right: two,
+        });
+        else_b.instructions.push(HirInstruction::Call {
+            result: Some(a),
+            callee: HirCallable::Function(self_id),
+            args: vec![nm1],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        else_b.instructions.push(HirInstruction::Call {
+            result: Some(b),
+            callee: HirCallable::Function(self_id),
+            args: vec![nm2],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        else_b.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Add,
+            result: c,
+            ty: HirType::I64,
+            left: a,
+            right: b,
+        });
+        else_b.terminator = HirTerminator::Return { values: vec![c] };
+
+        f
+    }
+
+    #[test]
+    fn recursive_inline_unrolls_fib_one_level() {
+        let func = build_fib_like();
+        let self_id = func.id;
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(self_id, func);
+
+        let stats = run_module_recursive(&mut module);
+
+        // Both self-call sites inlined.
+        assert_eq!(stats.self_calls_inlined, 2, "{stats:?}");
+        assert_eq!(stats.functions_visited, 1, "{stats:?}");
+
+        // After depth-1 inline the live function must still contain
+        // self-calls (the snapshot copies' own recursive calls) so
+        // recursion still terminates at runtime.
+        let live = module.functions.values().find(|f| f.id == self_id).unwrap();
+        let mut self_calls = 0;
+        for blk in live.blocks.values() {
+            for inst in &blk.instructions {
+                if let HirInstruction::Call {
+                    callee: HirCallable::Function(target),
+                    ..
+                } = inst
+                {
+                    if *target == self_id {
+                        self_calls += 1;
+                    }
+                }
+            }
+        }
+        // Original had 2 self-calls; each inlined site brought in 2
+        // more from the snapshot, replacing the original Call. So
+        // total = 2 * 2 = 4 self-calls after one round.
+        assert_eq!(self_calls, 4, "expected 4 self-calls post-inline");
+    }
+
+    #[test]
+    fn recursive_inline_skips_non_self_recursive() {
+        // Function with no self-calls — pass should leave it alone.
+        let mut f = HirFunction::new(InternedString::new_global("g"), sig(vec![], HirType::I64));
+        let entry = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        let r = add_const(&mut f, HirType::I64, HirConstant::I64(42));
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return { values: vec![r] };
+
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(f.id, f);
+
+        let stats = run_module_recursive(&mut module);
+        assert_eq!(stats.self_calls_inlined, 0);
+        assert_eq!(stats.functions_visited, 0);
+    }
+
+    #[test]
+    fn recursive_inline_respects_size_budget() {
+        // Build a fib-like, but inflate its body past
+        // MAX_RECURSIVE_INLINE_INSTS so the size gate fires.
+        let mut f = build_fib_like();
+        // Stuff the entry block with no-op binaries until we blow
+        // past the cap. Each binary is one inst; we need >96.
+        let entry = f.entry_block;
+        let two = add_const(&mut f, HirType::I64, HirConstant::I64(2));
+        for _ in 0..120 {
+            let r = add_inst(&mut f, HirType::I64);
+            f.blocks.get_mut(&entry).unwrap().instructions.insert(
+                0,
+                HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: r,
+                    ty: HirType::I64,
+                    left: two,
+                    right: two,
+                },
+            );
+        }
+        let self_id = f.id;
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(self_id, f);
+
+        let stats = run_module_recursive(&mut module);
+        assert_eq!(stats.skipped_too_large, 1, "{stats:?}");
+        assert_eq!(stats.self_calls_inlined, 0);
     }
 }

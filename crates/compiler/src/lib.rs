@@ -1683,6 +1683,7 @@ pub struct InterpOptStats {
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
     pub drop_insert: drop_insert::DropStats,
     pub tco: tco::TcoStats,
+    pub recursive_inline: inline::RecursiveInlineStats,
 }
 
 /// Run the subset of HIR optimization passes that are safe for the
@@ -1887,6 +1888,29 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     stats.auto_vectorize.rejected_cost += av.rejected_cost;
     stats.auto_vectorize.rejected_no_iv += av.rejected_no_iv;
     stats.auto_vectorize.rejected_trip_count += av.rejected_trip_count;
+
+    // Recursive inlining runs ONCE after the fixed-point sweep.
+    // Trying to put it inside the fixed-point would invite divergence
+    // — the regular inliner's iterative budget cap interacts badly
+    // with a pass that's deliberately tripling IR size in one shot.
+    // Two ordering reasons for placing it here:
+    //   * After the fixed-point: const_fold + cse + cfg_simplify have
+    //     already canonicalised the body, so the snapshot the
+    //     recursive inliner clones is the smallest legal version.
+    //     The post-inline IR is correspondingly cleaner — fewer
+    //     redundant phis, no dead branches threaded through the
+    //     copies.
+    //   * Before tco / drop_insert: inlining can convert a previously
+    //     non-tail Call into a tail-position one (the inlined Return
+    //     becomes the caller's Return), so tco runs after and catches
+    //     the new shapes. drop_insert needs to see the final post-
+    //     inline body to place Frees at the correct life-range ends.
+    let ri = inline::run_module_recursive(module);
+    stats.recursive_inline.functions_visited += ri.functions_visited;
+    stats.recursive_inline.self_calls_inlined += ri.self_calls_inlined;
+    stats.recursive_inline.skipped_too_large += ri.skipped_too_large;
+    stats.recursive_inline.skipped_too_many_sites += ri.skipped_too_many_sites;
+    stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
 
     // Tail-call marker runs after the fixed-point sweep but before
     // drop_insert. Two ordering reasons:
