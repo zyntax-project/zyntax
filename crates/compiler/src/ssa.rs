@@ -6471,7 +6471,38 @@ impl SsaBuilder {
                 match &stmt.node {
                     // Let statements have type annotations
                     TypedStatement::Let(let_stmt) => {
-                        let hir_type = self.convert_type(&let_stmt.ty);
+                        // Mirror the resolve-on-Any/Unknown logic the
+                        // let-translation uses. Without it the scan
+                        // records `Type::Any → HirType::I64` for
+                        // unannotated bindings like `let mut a =
+                        // bodies[i]`, which is the type used when IDF
+                        // places phis for `a`. The let-statement
+                        // translation later re-resolves the initialiser
+                        // and updates `var_types`, but the IDF phi was
+                        // already created with the wrong type. Result:
+                        // every read of `a` inside the loop body
+                        // returns a phi typed `I64` instead of the
+                        // initialiser's real type (e.g. `Ptr<Body>`),
+                        // which makes the ref-class field-assign
+                        // Ptr<Struct> guard miss and forces the
+                        // value-type InsertValue fallback to fire even
+                        // for `@reference` structs.
+                        let needs_resolve = matches!(let_stmt.ty, Type::Any | Type::Unknown)
+                            || matches!(
+                                &let_stmt.ty,
+                                Type::Array { element_type, .. }
+                                    if matches!(**element_type, Type::Any | Type::Unknown)
+                            );
+                        let effective_ty = if needs_resolve {
+                            if let Some(init) = &let_stmt.initializer {
+                                self.resolve_expr_type(init)
+                            } else {
+                                let_stmt.ty.clone()
+                            }
+                        } else {
+                            let_stmt.ty.clone()
+                        };
+                        let hir_type = self.convert_type(&effective_ty);
                         self.var_types.insert(let_stmt.name, hir_type);
                     }
                     _ => {}
