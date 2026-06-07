@@ -4912,8 +4912,15 @@ impl SsaBuilder {
                         // index, exactly the shape
                         // `aggregate_split` / `scalar_replace_alloc`
                         // expect.
+                        let field_typed_types = self.get_field_typed_types(&expr.ty);
                         for (i, field) in struct_lit.fields.iter().enumerate() {
-                            let field_val = self.translate_expression(block_id, &field.value)?;
+                            let mut field_val =
+                                self.translate_expression(block_id, &field.value)?;
+                            if let Some(types) = field_typed_types.as_ref() {
+                                if matches!(types.get(i), Some(Type::Any)) {
+                                    field_val = self.maybe_box_for_any_field(block_id, field_val);
+                                }
+                            }
                             let offset = offsets[i] as i64;
                             let field_ty = hir_struct.fields[i].clone();
 
@@ -4972,12 +4979,27 @@ impl SsaBuilder {
                     }
                 }
 
+                // For `Any` field autoboxing — when a field is declared
+                // `Type::Any`, the slot is `HirType::I64` (pointer-sized,
+                // intended to hold a `DynamicBox*`). If the value being
+                // stored isn't already i64-shaped, we have to wrap it
+                // through `zyntax_box_X(value)` so the slot ends up with
+                // a real box pointer rather than a raw bit-pattern
+                // (which currently crashes the LLVM backend at the
+                // `bitcast i32 to i64` step).
+                let field_typed_types = self.get_field_typed_types(&expr.ty);
+
                 // Start with an undefined struct value
                 let mut current_struct = self.create_value(struct_ty.clone(), HirValueKind::Undef);
 
                 // Insert each field value into the struct
                 for (i, field) in struct_lit.fields.iter().enumerate() {
-                    let field_val = self.translate_expression(block_id, &field.value)?;
+                    let mut field_val = self.translate_expression(block_id, &field.value)?;
+                    if let Some(types) = field_typed_types.as_ref() {
+                        if matches!(types.get(i), Some(Type::Any)) {
+                            field_val = self.maybe_box_for_any_field(block_id, field_val);
+                        }
+                    }
 
                     log::trace!("[SSA STRUCT LIT] Inserting field {}", i);
 
@@ -7398,6 +7420,65 @@ impl SsaBuilder {
             "Method '{}' not found for type '{:?}'",
             method_name_str, receiver_type
         )))
+    }
+
+    /// For a struct-typed expression, return the per-field `Type` from
+    /// the [`type_registry`] in declaration order. Used by struct
+    /// literal lowering to detect `Type::Any` fields that need
+    /// autoboxing via `zyntax_box_X` before the field value is stored.
+    /// Returns `None` if the struct's type can't be resolved (the
+    /// field-store path then falls through to the standard raw-coerce
+    /// behaviour, which is what every non-Any field already does).
+    fn get_field_typed_types(&self, expr_ty: &Type) -> Option<Vec<Type>> {
+        let type_def = match expr_ty {
+            Type::Named { id, .. } => self.type_registry.get_type_by_id(*id)?,
+            Type::Unresolved(name) => self.type_registry.get_type_by_name(*name)?,
+            _ => return None,
+        };
+        Some(type_def.fields.iter().map(|f| f.ty.clone()).collect())
+    }
+
+    /// Wrap `value` in a heap-allocated `DynamicBox` via the
+    /// appropriate `zyntax_box_X` runtime symbol so it can be stored
+    /// into a `Type::Any` field slot. The slot is `HirType::I64`
+    /// (pointer-sized); the box call returns a `*mut DynamicBoxRepr`
+    /// which is i64-shaped on the platforms we support.
+    ///
+    /// Values that are already i64-shaped (`I64`, `U64`, any `Ptr(_)`)
+    /// pass through unchanged — the slot will hold the raw value /
+    /// pointer directly. Box pointers, plain `i64`, and pointers all
+    /// alias the same shape and can be stored verbatim.
+    ///
+    /// Unsupported value types fall through; downstream codegen may
+    /// reject them. The current bench surface only stores i32, i64,
+    /// f32, f64, bool, and pointers — all covered.
+    fn maybe_box_for_any_field(&mut self, block_id: HirId, value: HirId) -> HirId {
+        let value_ty = match self.function.values.get(&value).map(|v| v.ty.clone()) {
+            Some(t) => t,
+            None => return value,
+        };
+        let box_symbol = match value_ty {
+            HirType::I8 | HirType::U8 | HirType::Bool => "zyntax_box_bool",
+            HirType::I16 | HirType::U16 | HirType::I32 | HirType::U32 => "zyntax_box_i32",
+            HirType::F32 => "zyntax_box_f32",
+            HirType::F64 => "zyntax_box_f64",
+            HirType::I64 | HirType::U64 | HirType::Ptr(_) => return value,
+            _ => return value,
+        };
+        let boxed = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Call {
+                result: Some(boxed),
+                callee: crate::hir::HirCallable::Symbol(box_symbol.to_string()),
+                args: vec![value],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        self.add_use(value, boxed);
+        boxed
     }
 
     /// Convert frontend type to HIR type
