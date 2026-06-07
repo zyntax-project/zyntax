@@ -1,0 +1,29 @@
+// Type::Any field roundtrip — autobox-on-store + unbox-on-read.
+//
+// Stores an f64 into an `Any` field via `zyntax_box_f64`, then reads
+// it back with use-site type `f64` (the let binding annotation) so
+// the lowering inserts `zyntax_box_get_f64`. A clean round-trip
+// gets you the stored value; a broken pipeline either crashes at
+// codegen (the i32 case used to LLVM-panic on bitcast i32→i64) or
+// silently returns the box pointer cast to i64.
+//
+// The loop body re-creates the box and unboxes 1M times — a noisy
+// per-iteration heap allocation, so this benchmarks malloc churn
+// more than arithmetic. The point isn't the number, it's the
+// correctness gate.
+
+struct Bag {
+    payload: Any
+}
+
+def main(): i64 {
+    let mut sum: f64 = 0.0
+    let mut i: i64 = 0
+    while i < 1000000 {
+        let bag = Bag { payload: 1.5 }
+        let v: f64 = bag.payload
+        sum = sum + v
+        i = i + 1
+    }
+    return sum as i64
+}

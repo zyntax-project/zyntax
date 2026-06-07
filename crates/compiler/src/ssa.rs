@@ -4405,7 +4405,17 @@ impl SsaBuilder {
                                 },
                             );
                             self.add_use(field_ptr, load_result);
-                            return Ok(load_result);
+                            // Unbox if the field is `Type::Any` and the
+                            // use-site has a concrete target type. See
+                            // `maybe_unbox_for_any_field` for the
+                            // `zyntax_box_get_X` selection table.
+                            return Ok(self.maybe_unbox_for_any_field(
+                                block_id,
+                                load_result,
+                                &object_type,
+                                field_index as usize,
+                                &expr.ty,
+                            ));
                         }
                     }
                 }
@@ -4510,7 +4520,15 @@ impl SsaBuilder {
                 self.add_instruction(block_id, inst);
                 self.add_use(object_val, result);
 
-                Ok(result)
+                // Unbox if the declared field type is `Type::Any` and
+                // the use-site has a concrete target type.
+                Ok(self.maybe_unbox_for_any_field(
+                    block_id,
+                    result,
+                    &object_type,
+                    field_index as usize,
+                    &expr.ty,
+                ))
             }
 
             TypedExpression::Index(index_expr) => {
@@ -7479,6 +7497,68 @@ impl SsaBuilder {
         );
         self.add_use(value, boxed);
         boxed
+    }
+
+    /// Counterpart to [`maybe_box_for_any_field`]: when reading a
+    /// field whose DECLARED type is `Type::Any` and the use-site's
+    /// inferred type (`use_site_ty`) is a concrete primitive, emit a
+    /// `zyntax_box_get_X` call to unwrap the box pointer. Leaves
+    /// boxes intact when the use-site is also `Type::Any` (the box
+    /// pointer flows through as-is to whatever next consumes it).
+    ///
+    /// Pairs with the autobox-on-store rule so that
+    /// `let x: f64 = b.value` round-trips a stored f64 cleanly
+    /// instead of leaving the user holding a raw `*mut DynamicBox`.
+    fn maybe_unbox_for_any_field(
+        &mut self,
+        block_id: HirId,
+        boxed_value: HirId,
+        object_ty: &Type,
+        field_index: usize,
+        use_site_ty: &Type,
+    ) -> HirId {
+        // Field-side gate: only act on fields declared `Type::Any`.
+        let field_is_any = self
+            .get_field_typed_types(object_ty)
+            .and_then(|fs| fs.get(field_index).cloned())
+            .map(|t| matches!(t, Type::Any))
+            .unwrap_or(false);
+        if !field_is_any {
+            return boxed_value;
+        }
+        // Use-site gate: only unbox when there's a concrete target
+        // type. If the surrounding context also wants `Any`, the box
+        // pointer is exactly the right thing to forward unchanged.
+        use zyntax_typed_ast::PrimitiveType;
+        let (get_symbol, result_hir_ty) = match use_site_ty {
+            Type::Primitive(PrimitiveType::I8)
+            | Type::Primitive(PrimitiveType::I16)
+            | Type::Primitive(PrimitiveType::I32)
+            | Type::Primitive(PrimitiveType::U8)
+            | Type::Primitive(PrimitiveType::U16)
+            | Type::Primitive(PrimitiveType::U32) => ("zyntax_box_get_i32", HirType::I32),
+            Type::Primitive(PrimitiveType::I64) | Type::Primitive(PrimitiveType::U64) => {
+                ("zyntax_box_get_i64", HirType::I64)
+            }
+            Type::Primitive(PrimitiveType::F32) => ("zyntax_box_get_f32", HirType::F32),
+            Type::Primitive(PrimitiveType::F64) => ("zyntax_box_get_f64", HirType::F64),
+            Type::Primitive(PrimitiveType::Bool) => ("zyntax_box_get_bool", HirType::Bool),
+            _ => return boxed_value,
+        };
+        let unboxed = self.create_value(result_hir_ty, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Call {
+                result: Some(unboxed),
+                callee: crate::hir::HirCallable::Symbol(get_symbol.to_string()),
+                args: vec![boxed_value],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        self.add_use(boxed_value, unboxed);
+        unboxed
     }
 
     /// Convert frontend type to HIR type

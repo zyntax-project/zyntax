@@ -1587,6 +1587,64 @@ pub unsafe extern "C" fn zyntax_box_get_i64(boxed: *const DynamicBoxRepr) -> i64
     }
 }
 
+/// Get the value from a DynamicBox as i32. Reads through the box's
+/// `data` pointer using the recorded `size` so source values stored
+/// as i8/i16 widen losslessly. Returns 0 on null box.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_get_i32(boxed: *const DynamicBoxRepr) -> i32 {
+    if boxed.is_null() || (*boxed).data.is_null() {
+        return 0;
+    }
+    match (*boxed).size {
+        1 => *((*boxed).data as *const i8) as i32,
+        2 => *((*boxed).data as *const i16) as i32,
+        4 => *((*boxed).data as *const i32),
+        _ => 0,
+    }
+}
+
+/// Get the value from a DynamicBox as f32. Source f64 narrows.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_get_f32(boxed: *const DynamicBoxRepr) -> f32 {
+    if boxed.is_null() || (*boxed).data.is_null() {
+        return 0.0;
+    }
+    match (*boxed).size {
+        4 => *((*boxed).data as *const f32),
+        8 => *((*boxed).data as *const f64) as f32,
+        _ => 0.0,
+    }
+}
+
+/// Get the value from a DynamicBox as f64. Source f32 widens.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_get_f64(boxed: *const DynamicBoxRepr) -> f64 {
+    if boxed.is_null() || (*boxed).data.is_null() {
+        return 0.0;
+    }
+    match (*boxed).size {
+        4 => *((*boxed).data as *const f32) as f64,
+        8 => *((*boxed).data as *const f64),
+        _ => 0.0,
+    }
+}
+
+/// Get the value from a DynamicBox as bool (returned as i32 for FFI).
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_get_bool(boxed: *const DynamicBoxRepr) -> i32 {
+    if boxed.is_null() || (*boxed).data.is_null() {
+        return 0;
+    }
+    if (*boxed).size == 0 {
+        return 0;
+    }
+    if *((*boxed).data as *const u8) != 0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// Get the TypeTag from a DynamicBox
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_get_tag(boxed: *const DynamicBoxRepr) -> u32 {
