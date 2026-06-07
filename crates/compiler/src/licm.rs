@@ -23,16 +23,21 @@
 //!   * `GetElementPtr`    — pure address arithmetic
 //!   * `ExtractValue`     — pure aggregate field read
 //!   * `Select`           — pure ternary
-//!   * `Load`             — **invariant-pointer** rule: a Load whose
-//!                          pointer operand is itself loop-invariant
-//!                          is hoistable even when the body contains
-//!                          Stores or Calls. This trusts the alias
-//!                          structure (different SSA pointers
-//!                          refer to different memory) rather than
-//!                          proving non-aliasing per-Load. Matches the
-//!                          aggressive shape sibling JIT-backed
-//!                          languages use; sound for normalised code
-//!                          where pointer aliasing is explicit.
+//!   * `Load`             — hoisted only when (a) its pointer operand
+//!                          is loop-invariant AND (b) a per-Load
+//!                          alias check proves no Store in the loop
+//!                          body can write to overlapping memory. The
+//!                          alias check walks back through GEP+Cast
+//!                          chains on both the Load's pointer and
+//!                          every Store's pointer to extract
+//!                          `(root_ssa, byte_offset, byte_size)`
+//!                          tuples, then disambiguates by root SSA
+//!                          (different SSA values ⇒ different memory)
+//!                          or by non-overlapping constant offsets on
+//!                          the same root. Without this gate the
+//!                          common ref-class hot loop where
+//!                          `body.vx` is both read and written each
+//!                          iteration silently deoptimises.
 //!
 //! ## What we don't touch
 //!
@@ -86,7 +91,9 @@
 //! (which dominates the loop body).
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
-use crate::hir::{BinaryOp, HirFunction, HirId, HirInstruction, HirTerminator};
+use crate::hir::{
+    BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Stats surfaced for callers / tests.
@@ -264,6 +271,94 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
         }
     }
 
+    // Identity-phi propagation. A loop-header phi shaped as
+    // `%p = phi T [%self, back-edge], [%init, preheader]` (every
+    // non-self incoming equals %init AND %init is loop-invariant) is
+    // a tautology — it always carries %init. Mark %p as invariant and
+    // record the substitution `%p → %init` so any hoisted instruction
+    // referencing %p gets rewritten to use %init (otherwise the
+    // hoisted inst would land in the preheader and reference a SSA
+    // value defined in the loop header — undefined at that point).
+    // We don't delete the phi; it stays in the loop header so any in-
+    // loop use of `%p` still works (the runtime phi value equals %init
+    // either way).
+    let mut identity_subst: indexmap::IndexMap<HirId, HirId> = indexmap::IndexMap::new();
+    for _ in 0..64 {
+        let mut changed = false;
+        for &block_id in &lp.body {
+            let Some(block) = func.blocks.get(&block_id) else {
+                continue;
+            };
+            for phi in &block.phis {
+                if invariant.contains(&phi.result) {
+                    continue;
+                }
+                let mut consensus: Option<HirId> = None;
+                let mut all_match = true;
+                for (val, _pred) in &phi.incoming {
+                    if *val == phi.result {
+                        continue;
+                    }
+                    if !invariant.contains(val) {
+                        all_match = false;
+                        break;
+                    }
+                    match consensus {
+                        None => consensus = Some(*val),
+                        Some(prev) if prev == *val => {}
+                        _ => {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                }
+                if all_match {
+                    if let Some(repl) = consensus {
+                        invariant.insert(phi.result);
+                        // Chase prior substitutions so the recorded
+                        // replacement always resolves to a value
+                        // defined outside the loop.
+                        let mut final_repl = repl;
+                        while let Some(&next) = identity_subst.get(&final_repl) {
+                            if next == final_repl {
+                                break;
+                            }
+                            final_repl = next;
+                        }
+                        identity_subst.insert(phi.result, final_repl);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Pre-compute every Store's memory location in the loop body.
+    // Used by the per-Load alias check below to decide whether a
+    // candidate Load is safe to hoist. A Store's "location" is the
+    // (root SSA pointer, byte offset) pair extracted by walking back
+    // through GEP+Cast chains; if we can't trace the chain to a clean
+    // (root, const_offset), the location is conservatively `None`
+    // (treat as may-alias).
+    let store_locs: Vec<MemLoc> = lp
+        .body
+        .iter()
+        .filter_map(|b| func.blocks.get(b))
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Store { ptr, value, .. } => Some(extract_mem_loc(
+                func,
+                *ptr,
+                value_byte_size(func, *value),
+                &identity_subst,
+            )),
+            _ => None,
+        })
+        .collect();
+
     // Iterate-to-fixed-point: each pass may unlock new candidates
     // because a hoisted instruction's result becomes invariant for
     // the next pass.
@@ -294,8 +389,29 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
                 if !operands_all_invariant(inst, &invariant) {
                     continue;
                 }
+                // Per-Load alias check: a Load with an invariant
+                // pointer can only be safely hoisted if no Store in
+                // the loop body might write to the same memory. We
+                // walk back through GEP+Cast chains to extract the
+                // (root, offset, size) tuple for the Load and for
+                // every Store, then ask whether ranges may overlap.
+                if let HirInstruction::Load { ptr, ty, .. } = inst {
+                    let load_loc =
+                        extract_mem_loc(func, *ptr, hir_ty_byte_size(ty), &identity_subst);
+                    // A Load with an entirely opaque root (no GEP+Cast
+                    // chain we can trace) can't be disambiguated from
+                    // any in-loop Store. Skip it.
+                    if load_loc.root.is_none() {
+                        continue;
+                    }
+                    if store_locs.iter().any(|s| load_loc.may_alias(s)) {
+                        continue;
+                    }
+                }
                 invariant.insert(res);
-                to_hoist.push((block_id, inst.clone()));
+                let mut cloned = inst.clone();
+                apply_subst(&mut cloned, &identity_subst);
+                to_hoist.push((block_id, cloned));
             }
         }
 
@@ -348,15 +464,12 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
         HirInstruction::Unary { .. } | HirInstruction::Cast { .. } => true,
         HirInstruction::GetElementPtr { .. } | HirInstruction::ExtractValue { .. } => true,
         HirInstruction::Select { .. } => true,
-        // `Load` is hoistable when its pointer operand is loop-
-        // invariant: rely on the SSA-level alias structure (different
-        // pointer SSA values refer to different memory) rather than
-        // proving non-aliasing per Load. The operand-invariance check
-        // in the caller already enforces "pointer is invariant"; this
-        // helper just says "the shape is safe to relocate". The body-
-        // wide gate that previously blocked every Load whenever the
-        // loop contained any Store / Call has been dropped — it was
-        // too coarse to be useful (every non-trivial loop has both).
+        // `Load` is shape-eligible — the actual hoist decision is
+        // gated on a per-Load alias check in `hoist_loop` that
+        // proves no Store in the loop body writes to overlapping
+        // memory. Returning `true` here just says "the instruction
+        // shape is hoistable in principle"; the caller does the
+        // soundness check.
         HirInstruction::Load { .. } => true,
         _ => false,
     }
@@ -388,6 +501,244 @@ fn operands_all_invariant(inst: &HirInstruction, invariant: &HashSet<HirId>) -> 
         _ => all_in = false,
     }
     all_in
+}
+
+/// Memory location of a Load/Store, used by the per-Load alias check.
+///
+/// `root` is the SSA value at the base of the GEP+Cast chain — for a
+/// typical ref-class field access this is the body-pointer load/phi.
+/// `offset` is the constant byte offset from that root (None if the
+/// chain has a non-constant index along the way). `size` is the
+/// byte width of the value being loaded/stored.
+#[derive(Debug, Clone, Copy)]
+struct MemLoc {
+    root: Option<HirId>,
+    offset: Option<u64>,
+    size: u32,
+}
+
+impl MemLoc {
+    /// May the regions described by `self` and `other` overlap?
+    ///
+    /// Returns `true` conservatively when we can't prove they don't.
+    /// The fast win: when both sides have a *known root* and the
+    /// roots differ, we rely on the SSA no-aliasing assumption
+    /// (distinct pointer SSA values refer to distinct memory) — that
+    /// case returns `false` even if one side has an unknown offset
+    /// or unknown size, because the roots already establish disjoint
+    /// allocations. Only when roots match (or one is unknown) do we
+    /// fall back to byte-range comparison.
+    fn may_alias(&self, other: &MemLoc) -> bool {
+        match (self.root, other.root) {
+            (Some(r1), Some(r2)) if r1 != r2 => {
+                // Different SSA roots: rely on the SSA-level
+                // no-aliasing assumption. Holds for the patterns ZynML
+                // emits — each malloc / alloca produces a fresh root,
+                // table reads through different indices produce
+                // different SSA values, etc.
+                false
+            }
+            (None, _) | (_, None) => {
+                // At least one side's root is opaque; can't reason.
+                true
+            }
+            _ => {
+                // Same root. Need byte-range info.
+                let (Some(o1), s1, Some(o2), s2) =
+                    (self.offset, self.size, other.offset, other.size)
+                else {
+                    // Same root but at least one offset/size is
+                    // unknown: must conservatively assume overlap.
+                    return true;
+                };
+                if s1 == 0 || s2 == 0 {
+                    return true;
+                }
+                let end1 = o1.saturating_add(s1 as u64);
+                let end2 = o2.saturating_add(s2 as u64);
+                !(end1 <= o2 || end2 <= o1)
+            }
+        }
+    }
+}
+
+/// Walk back through GEP+Cast chains starting at `ptr` to extract a
+/// `MemLoc { root, offset, size }`. Stops at the first non-trivial
+/// step (non-constant GEP index, ExtractValue, etc.) and returns
+/// whatever it can. `size` is taken from the caller (the byte width
+/// of the Load/Store's value type).
+fn extract_mem_loc(
+    func: &HirFunction,
+    ptr: HirId,
+    size: u32,
+    identity_subst: &indexmap::IndexMap<HirId, HirId>,
+) -> MemLoc {
+    // Cap the chase depth so a circular SSA graph (shouldn't happen in
+    // valid HIR but defence-in-depth) can't lock up.
+    let mut current = identity_subst.get(&ptr).copied().unwrap_or(ptr);
+    let mut total_offset: u64 = 0;
+    let mut offset_known = true;
+    for _ in 0..32 {
+        // Find the defining instruction for `current`. We walk every
+        // block; loop bodies are small and this is called per-Load,
+        // so the cost is in the noise.
+        let mut found = None;
+        'outer: for block in func.blocks.values() {
+            for inst in &block.instructions {
+                match inst {
+                    HirInstruction::GetElementPtr { result, .. }
+                    | HirInstruction::Cast { result, .. }
+                        if *result == current =>
+                    {
+                        found = Some(inst);
+                        break 'outer;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(def) = found else {
+            // Base reached: either a Param / Phi result / Alloca /
+            // Call result. Use the current SSA id as the root.
+            return MemLoc {
+                root: Some(current),
+                offset: if offset_known {
+                    Some(total_offset)
+                } else {
+                    None
+                },
+                size,
+            };
+        };
+        match def {
+            HirInstruction::Cast { operand, .. } => {
+                // Treat ptr-bitcasts as transparent.
+                current = identity_subst.get(operand).copied().unwrap_or(*operand);
+            }
+            HirInstruction::GetElementPtr {
+                ptr: base, indices, ..
+            } => {
+                // Try to fold each index into the running constant
+                // offset. Single-index byte-offset GEPs (`ty: U8`)
+                // are the common ref-class field-access shape; we
+                // handle those + simple struct-index pairs.
+                for &idx in indices {
+                    match constant_i64_value(func, idx) {
+                        Some(v) => {
+                            total_offset = total_offset.saturating_add(v as u64);
+                        }
+                        None => {
+                            offset_known = false;
+                        }
+                    }
+                }
+                current = identity_subst.get(base).copied().unwrap_or(*base);
+            }
+            _ => break,
+        }
+    }
+    MemLoc {
+        root: Some(current),
+        offset: if offset_known {
+            Some(total_offset)
+        } else {
+            None
+        },
+        size,
+    }
+}
+
+/// Constant i64 value of `id` if its SSA value is a `Constant::I64`
+/// (or a small-int constant promotable to i64). Returns `None` for
+/// non-constants.
+fn constant_i64_value(func: &HirFunction, id: HirId) -> Option<i64> {
+    let v = func.values.get(&id)?;
+    match &v.kind {
+        crate::hir::HirValueKind::Constant(c) => match c {
+            HirConstant::I8(x) => Some(*x as i64),
+            HirConstant::I16(x) => Some(*x as i64),
+            HirConstant::I32(x) => Some(*x as i64),
+            HirConstant::I64(x) => Some(*x),
+            HirConstant::U8(x) => Some(*x as i64),
+            HirConstant::U16(x) => Some(*x as i64),
+            HirConstant::U32(x) => Some(*x as i64),
+            HirConstant::U64(x) => Some(*x as i64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Byte size of an `HirType` for the purpose of alias-range checks.
+/// Conservative — returns 0 for shapes we don't model, which makes
+/// the alias check default to "may overlap".
+fn hir_ty_byte_size(ty: &HirType) -> u32 {
+    match ty {
+        HirType::I8 | HirType::U8 | HirType::Bool => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Ptr(_) | HirType::Ref { .. } => 8,
+        _ => 0,
+    }
+}
+
+/// Byte size of the value at `id`, derived from its HIR type.
+fn value_byte_size(func: &HirFunction, id: HirId) -> u32 {
+    func.values
+        .get(&id)
+        .map(|v| hir_ty_byte_size(&v.ty))
+        .unwrap_or(0)
+}
+
+/// Rewrite every operand of `inst` whose id matches a key in `subst`
+/// to the mapped value. Used at hoist time to replace identity-phi
+/// references with the phi's preheader incoming value, so the hoisted
+/// instruction in the preheader doesn't reference a SSA value defined
+/// in the loop header.
+fn apply_subst(inst: &mut HirInstruction, subst: &indexmap::IndexMap<HirId, HirId>) {
+    if subst.is_empty() {
+        return;
+    }
+    let r = |id: &mut HirId| {
+        if let Some(&v) = subst.get(id) {
+            *id = v;
+        }
+    };
+    match inst {
+        HirInstruction::Binary { left, right, .. } => {
+            r(left);
+            r(right);
+        }
+        HirInstruction::Unary { operand, .. } => r(operand),
+        HirInstruction::Cast { operand, .. } => r(operand),
+        HirInstruction::GetElementPtr { ptr, indices, .. } => {
+            r(ptr);
+            for i in indices.iter_mut() {
+                r(i);
+            }
+        }
+        HirInstruction::ExtractValue { aggregate, .. } => r(aggregate),
+        HirInstruction::InsertValue {
+            aggregate, value, ..
+        } => {
+            r(aggregate);
+            r(value);
+        }
+        HirInstruction::Load { ptr, .. } => r(ptr),
+        HirInstruction::Select {
+            condition,
+            true_val,
+            false_val,
+            ..
+        } => {
+            r(condition);
+            r(true_val);
+            r(false_val);
+        }
+        _ => {}
+    }
 }
 
 fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
@@ -691,21 +1042,16 @@ mod tests {
     }
 
     #[test]
-    fn hoists_load_with_invariant_ptr_even_when_body_has_store() {
-        // body: r = *p  (invariant ptr — both p and the Load are
-        //                hoist candidates)
+    fn does_not_hoist_load_when_body_stores_through_same_ptr() {
+        // body: r = *p
         //       store v -> p
         //
-        // The pass trusts the SSA alias structure: a Load whose
-        // pointer SSA value is loop-invariant gets hoisted even when
-        // the body contains a Store, including a Store to the same
-        // SSA pointer. The Store stays inside the loop and writes the
-        // new value on every iteration; only the load is moved.
-        // (The downstream hir_interp / Cranelift / LLVM passes still
-        // re-execute the load on every iteration after their own AA
-        // says it might alias — this pass is just the HIR-level
-        // hint.) See the module-level "Limits we currently accept"
-        // section.
+        // The Load reads what the Store wrote on the previous
+        // iteration — the per-Load alias check sees same root
+        // (param `p`), same offset (0), same size (8) and refuses
+        // to hoist. This is exactly the ref-class hot loop pattern
+        // (`body.vx = body.vx - …`) the alias check exists to
+        // protect.
         let (mut f, _entry, _header, body, _exit) = mk_func();
         let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
         let v = add_param(&mut f, HirType::I64, 1);
@@ -732,6 +1078,6 @@ mod tests {
                 volatile: false,
             });
         let stats = run(&mut f);
-        assert_eq!(stats.hoisted, 1, "invariant-ptr Load hoists past Store");
+        assert_eq!(stats.hoisted, 0, "same-ptr Store blocks Load hoist");
     }
 }
