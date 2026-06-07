@@ -1270,9 +1270,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                 args,
                 type_args: _,
                 const_args: _,
-                is_tail: _,
+                is_tail,
             } => {
-                let result_val = self.compile_call(callee, args)?;
+                let result_val = self.compile_call(callee, args, *is_tail)?;
                 if let Some(res_id) = result {
                     self.value_map.insert(*res_id, result_val);
                 }
@@ -2991,6 +2991,7 @@ impl<'ctx> LLVMBackend<'ctx> {
         &mut self,
         callee: &HirCallable,
         args: &[HirId],
+        is_tail: bool,
     ) -> CompilerResult<BasicValueEnum<'ctx>> {
         match callee {
             HirCallable::Function(func_id) => {
@@ -3015,6 +3016,17 @@ impl<'ctx> LLVMBackend<'ctx> {
                     if cc != 0 {
                         call_site.set_call_convention(cc);
                     }
+                }
+
+                // Tail-call hint. The HIR tco marker restricts
+                // `is_tail = true` to self-recursive direct calls, so
+                // by the time we get here the call is structurally a
+                // candidate for LLVM's sibling-call optimisation. The
+                // flag is purely advisory — LLVM ignores it when it
+                // can't prove TCO is safe — so it never causes a
+                // miscompile, only enables one when applicable.
+                if is_tail {
+                    call_site.set_tail_call(true);
                 }
 
                 // Return value (or void)
@@ -3122,6 +3134,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                     &arg_values,
                     "indirect_call",
                 )?;
+                if is_tail {
+                    call_site.set_tail_call(true);
+                }
 
                 // Return value (or void)
                 match call_site.try_as_basic_value() {

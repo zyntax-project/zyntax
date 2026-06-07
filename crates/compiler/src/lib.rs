@@ -58,6 +58,7 @@ pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
+pub mod tco; // Tail-call optimisation marker
 pub mod trait_lowering; // Trait/interface lowering to HIR
 pub mod typed_cfg; // New: TypedAST-aware CFG builder
 pub mod value; // Unified runtime value type (used by interp + embed)
@@ -1681,6 +1682,7 @@ pub struct InterpOptStats {
     pub auto_vectorize: auto_vectorize::AutoVectorizeStats,
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
     pub drop_insert: drop_insert::DropStats,
+    pub tco: tco::TcoStats,
 }
 
 /// Run the subset of HIR optimization passes that are safe for the
@@ -1885,6 +1887,23 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     stats.auto_vectorize.rejected_cost += av.rejected_cost;
     stats.auto_vectorize.rejected_no_iv += av.rejected_no_iv;
     stats.auto_vectorize.rejected_trip_count += av.rejected_trip_count;
+
+    // Tail-call marker runs after the fixed-point sweep but before
+    // drop_insert. Two ordering reasons:
+    //   * After the fixed-point: inlining can convert a non-tail Call
+    //     into a tail-shape one (the inlined return becomes the
+    //     caller's return), and const_fold / cse / cfg_simplify may
+    //     also clear away intervening instructions that were blocking
+    //     a tail shape. Running tco after all of those settle catches
+    //     every shape they enable.
+    //   * Before drop_insert: drop_insert places `Free` calls between
+    //     Call and Return for any non-escaping malloc, breaking the
+    //     "Call is the last instruction" precondition. Running tco
+    //     first marks every valid shape; the drop_insert pass can
+    //     then add Free calls without those marks getting lost.
+    let tc = tco::run_module(module);
+    stats.tco.candidates_visited += tc.candidates_visited;
+    stats.tco.marked += tc.marked;
 
     // Drop-site insertion runs *after* the optimization fixed-point.
     // Order matters two ways:

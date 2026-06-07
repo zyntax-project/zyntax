@@ -2126,7 +2126,7 @@ impl CraneliftBackend {
                             result,
                             callee,
                             args,
-                            is_tail,
+                            is_tail: _,
                             ..
                         } => {
                             let arg_values: Vec<Value> = args.iter()
@@ -6200,7 +6200,7 @@ impl CraneliftBackend {
                 callee,
                 args,
                 type_args,
-                is_tail,
+                is_tail: _,
                 ..
             } => {
                 let arg_vals: Vec<_> = args.iter().map(|arg| self.value_map[arg]).collect();
@@ -6212,11 +6212,17 @@ impl CraneliftBackend {
                             .module
                             .declare_func_in_func(cranelift_func, builder.func);
 
-                        let call = if *is_tail {
-                            builder.ins().return_call(func_ref, &arg_vals)
-                        } else {
-                            builder.ins().call(func_ref, &arg_vals)
-                        };
+                        // `return_call` is a Cranelift terminator. Our
+                        // block-level lowering still emits the HIR
+                        // block's Return terminator after the Call, so
+                        // a `return_call` here would leave the block
+                        // double-terminated and trip Cranelift's
+                        // verifier. The HIR tco marker still flips
+                        // `is_tail = true` for downstream backends
+                        // (LLVM gets the hint), but Cranelift falls
+                        // back to the standard call until the
+                        // terminator-skip plumbing lands.
+                        let call = builder.ins().call(func_ref, &arg_vals);
 
                         if let Some(result_id) = result {
                             let results = builder.inst_results(call);
@@ -6257,13 +6263,11 @@ impl CraneliftBackend {
                         // This is a simplified version - in reality we'd need to track function signatures
                         let sig_ref = builder.import_signature(self.module.make_signature());
 
-                        let call = if *is_tail {
-                            builder
-                                .ins()
-                                .return_call_indirect(sig_ref, ptr_val, &arg_vals)
-                        } else {
-                            builder.ins().call_indirect(sig_ref, ptr_val, &arg_vals)
-                        };
+                        // Same terminator-already-emitted concern as the
+                        // direct-call path above. Fall back to a
+                        // standard `call_indirect` until the lowering
+                        // can skip the trailing Return terminator.
+                        let call = builder.ins().call_indirect(sig_ref, ptr_val, &arg_vals);
 
                         if let Some(result_id) = result {
                             let results = builder.inst_results(call);
@@ -7068,11 +7072,10 @@ impl CraneliftBackend {
                             })?;
                         let func_ref = self.module.declare_func_in_func(func, builder.func);
 
-                        let call = if *is_tail {
-                            builder.ins().return_call(func_ref, &arg_vals)
-                        } else {
-                            builder.ins().call(func_ref, &arg_vals)
-                        };
+                        // Symbol calls share the same terminator-skip
+                        // concern as the direct-call arms above; fall
+                        // back to a standard `call` until that lands.
+                        let call = builder.ins().call(func_ref, &arg_vals);
 
                         if let Some(result_id) = result {
                             let results = builder.inst_results(call);
