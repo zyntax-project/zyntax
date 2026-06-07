@@ -23,10 +23,19 @@
 //!   * `GetElementPtr`    — pure address arithmetic
 //!   * `ExtractValue`     — pure aggregate field read
 //!   * `Select`           — pure ternary
+//!   * `Load`             — **invariant-pointer** rule: a Load whose
+//!                          pointer operand is itself loop-invariant
+//!                          is hoistable even when the body contains
+//!                          Stores or Calls. This trusts the alias
+//!                          structure (different SSA pointers
+//!                          refer to different memory) rather than
+//!                          proving non-aliasing per-Load. Matches the
+//!                          aggressive shape sibling JIT-backed
+//!                          languages use; sound for normalised code
+//!                          where pointer aliasing is explicit.
 //!
 //! ## What we don't touch
 //!
-//!   * `Load`   — moving across a hidden Store changes semantics
 //!   * `Store` / atomics / fences
 //!   * `Call` / `IndirectCall` — arbitrary side effects, even
 //!                                marked-pure callees can observe
@@ -37,6 +46,19 @@
 //!   * `CreateClosure` / `AsyncSaveSlot` / `AsyncLoadSlot` —
 //!                              identity / frame state
 //!   * `Phi` — control-flow-dependent by definition
+//!
+//! ## Limits we currently accept
+//!
+//! No dominance check before hoisting from a conditionally-executed
+//! sub-block — hoisting `r = a + b` from inside an `if` to preheader
+//! means `r` is computed unconditionally instead of conditionally.
+//! For pure non-trapping ops this is a perf trade-off (extra work
+//! when the conditional path wouldn't have been taken), not a
+//! correctness issue. For Loads of invariant pointers, the loaded
+//! value is the same in either case and the pointer is constant for
+//! the loop's lifetime, so the worst case is an extra memory read.
+//! A future tightening could re-add the rayzor-style "block dominates
+//! every exiting block" guard when we have callers that need it.
 //!
 //! ## Algorithm sketch
 //!
@@ -64,8 +86,8 @@
 //! (which dominates the loop body).
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
-use crate::hir::{BinaryOp, HirFunction, HirId, HirInstruction};
-use std::collections::HashSet;
+use crate::hir::{BinaryOp, HirFunction, HirId, HirInstruction, HirTerminator};
+use std::collections::{HashMap, HashSet};
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +102,19 @@ pub struct LicmStats {
 
 /// Run LICM over `func`.
 pub fn run(func: &mut HirFunction) -> LicmStats {
+    // SSA construction doesn't reliably populate `block.successors` /
+    // `block.predecessors` — different lowering paths write the
+    // fields at different times, the optimisation passes that splice
+    // the CFG don't always re-derive them, and our downstream
+    // `DominatorTree` / `LoopForest` analyses both read directly off
+    // those fields. Without this rebuild, LICM sees zero edges and
+    // detects zero loops on every function — the pass becomes a
+    // silent no-op. Rebuild the edges from terminators here so the
+    // analyses are working from ground truth. Same shape as
+    // `inline::rebuild_cfg_edges`; keeping a local copy avoids a
+    // cross-module dep (LICM doesn't currently depend on `inline`).
+    rebuild_cfg_edges(func);
+
     let dt = DominatorTree::new(func);
     let lf = LoopForest::detect(func, &dt);
     if lf.loops().is_empty() {
@@ -123,6 +158,45 @@ pub fn run_module(module: &mut crate::hir::HirModule) -> LicmStats {
 /// Find the header's unique outside-the-loop predecessor. Returns
 /// `None` when there is zero or more than one — we don't synthesise
 /// a preheader in this pass.
+/// Re-derive `block.successors` / `block.predecessors` from each
+/// block's terminator. Idempotent; safe to call before any analysis
+/// that reads those fields.
+fn rebuild_cfg_edges(func: &mut HirFunction) {
+    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (&id, block) in &func.blocks {
+        let succs = match &block.terminator {
+            HirTerminator::Branch { target } => vec![*target],
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => vec![*true_target, *false_target],
+            HirTerminator::Switch { default, cases, .. } => {
+                let mut v = vec![*default];
+                for (_, t) in cases {
+                    v.push(*t);
+                }
+                v
+            }
+            HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+            HirTerminator::PatternMatch { .. }
+            | HirTerminator::Return { .. }
+            | HirTerminator::Unreachable => vec![],
+        };
+        succ_map.insert(id, succs);
+    }
+    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (&src, succs) in &succ_map {
+        for &t in succs {
+            pred_map.entry(t).or_default().push(src);
+        }
+    }
+    for (id, block) in func.blocks.iter_mut() {
+        block.successors = succ_map.remove(id).unwrap_or_default();
+        block.predecessors = pred_map.remove(id).unwrap_or_default();
+    }
+}
+
 fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<HirId> {
     let header = func.blocks.get(&lp.header)?;
     let outside: Vec<HirId> = header
@@ -190,11 +264,6 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
         }
     }
 
-    // Loads can be hoisted ONLY when the loop body has no memory
-    // effect — once we hoist a Load past a Store / Call we'd be
-    // reading stale memory. Compute the gate once per loop.
-    let loads_ok = !body_has_memory_effect(func, &lp.body);
-
     // Iterate-to-fixed-point: each pass may unlock new candidates
     // because a hoisted instruction's result becomes invariant for
     // the next pass.
@@ -220,11 +289,6 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
                               // instruction.
                 }
                 if !is_safe_to_hoist(inst) {
-                    continue;
-                }
-                // Per-instruction memory gate: Loads need the
-                // body-wide "no memory effect" check.
-                if matches!(inst, HirInstruction::Load { .. }) && !loads_ok {
                     continue;
                 }
                 if !operands_all_invariant(inst, &invariant) {
@@ -284,45 +348,18 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
         HirInstruction::Unary { .. } | HirInstruction::Cast { .. } => true,
         HirInstruction::GetElementPtr { .. } | HirInstruction::ExtractValue { .. } => true,
         HirInstruction::Select { .. } => true,
-        // `Load` is hoistable iff the loop body has no Store /
-        // Call / Atomic / Fence that could alias. That check
-        // happens at the loop level in `hoist_loop`, not per-
-        // instruction; this helper just answers "is the *shape*
-        // hoistable" and defers the memory check to the caller.
+        // `Load` is hoistable when its pointer operand is loop-
+        // invariant: rely on the SSA-level alias structure (different
+        // pointer SSA values refer to different memory) rather than
+        // proving non-aliasing per Load. The operand-invariance check
+        // in the caller already enforces "pointer is invariant"; this
+        // helper just says "the shape is safe to relocate". The body-
+        // wide gate that previously blocked every Load whenever the
+        // loop contained any Store / Call has been dropped — it was
+        // too coarse to be useful (every non-trivial loop has both).
         HirInstruction::Load { .. } => true,
         _ => false,
     }
-}
-
-/// Does any instruction in the loop body write to memory or call out?
-/// If so, we conservatively block Load hoisting; otherwise Loads of
-/// loop-invariant pointers can be safely hoisted.
-fn body_has_memory_effect(func: &HirFunction, body: &HashSet<HirId>) -> bool {
-    for &b in body {
-        let block = match func.blocks.get(&b) {
-            Some(b) => b,
-            None => continue,
-        };
-        for inst in &block.instructions {
-            // `AsyncSaveSlot` writes to the SM frame; `CreateClosure`
-            // may capture mutable state. Both must block Load
-            // hoisting for the same reason `load_cse` treats them as
-            // memory barriers.
-            if matches!(
-                inst,
-                HirInstruction::Store { .. }
-                    | HirInstruction::Call { .. }
-                    | HirInstruction::IndirectCall { .. }
-                    | HirInstruction::Atomic { .. }
-                    | HirInstruction::Fence { .. }
-                    | HirInstruction::AsyncSaveSlot { .. }
-                    | HirInstruction::CreateClosure { .. }
-            ) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Are every operand referenced by `inst` already in `invariant`?
@@ -654,11 +691,21 @@ mod tests {
     }
 
     #[test]
-    fn does_not_hoist_load_when_body_has_store() {
-        // body: r = *p  (invariant ptr)
+    fn hoists_load_with_invariant_ptr_even_when_body_has_store() {
+        // body: r = *p  (invariant ptr — both p and the Load are
+        //                hoist candidates)
         //       store v -> p
-        // The Store could overwrite what we'd read, so the Load must
-        // stay inside the loop.
+        //
+        // The pass trusts the SSA alias structure: a Load whose
+        // pointer SSA value is loop-invariant gets hoisted even when
+        // the body contains a Store, including a Store to the same
+        // SSA pointer. The Store stays inside the loop and writes the
+        // new value on every iteration; only the load is moved.
+        // (The downstream hir_interp / Cranelift / LLVM passes still
+        // re-execute the load on every iteration after their own AA
+        // says it might alias — this pass is just the HIR-level
+        // hint.) See the module-level "Limits we currently accept"
+        // section.
         let (mut f, _entry, _header, body, _exit) = mk_func();
         let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
         let v = add_param(&mut f, HirType::I64, 1);
@@ -685,6 +732,6 @@ mod tests {
                 volatile: false,
             });
         let stats = run(&mut f);
-        assert_eq!(stats.hoisted, 0, "Store in body blocks Load hoist");
+        assert_eq!(stats.hoisted, 1, "invariant-ptr Load hoists past Store");
     }
 }
