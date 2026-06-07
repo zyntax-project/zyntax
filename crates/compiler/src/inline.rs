@@ -451,6 +451,13 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
                     // Direct self-call — fine. Becomes the depth-1
                     // residual after inlining.
                 }
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(i),
+                    ..
+                } if is_inline_safe_intrinsic(*i) => {
+                    // Inline-safe leaf intrinsics (Sqrt, Fabs, Fma,
+                    // …) — same rule as the standard classifier.
+                }
                 HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
@@ -748,12 +755,28 @@ fn classify(callee: &HirFunction) -> CalleeClass {
     }
 
     // Universal per-instruction safety check across every block.
+    // The `Call` arm permits one specific shape: direct calls into
+    // an inline-safe `Intrinsic` (`Sqrt`, `Fabs`, `Fma`, `Sin`,
+    // `Cos`, `Pow`, …) — these are leaf hardware-or-libm ops, not
+    // user functions, and admitting them is what lets the inliner
+    // take callees like `advance` from `bench_nbody_ref` (which
+    // calls `sqrt` in the hot loop). Without this admission,
+    // `main`'s 10 M-iteration `advance(...)` call site never
+    // inlines, the j-loop stays opaque to LICM / vectorisation,
+    // and Cranelift / LLVM eat the call-frame overhead 10 M times.
+    // Every other `Call` shape (free function, indirect, trait
+    // method) still bails because the callee body would need its
+    // own inlining or vtable resolution.
     let mut total_insts = 0usize;
     let mut callee_has_alloca = false;
     for block in callee.blocks.values() {
         total_insts += block.instructions.len();
         for inst in &block.instructions {
             match inst {
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(i),
+                    ..
+                } if is_inline_safe_intrinsic(*i) => {}
                 HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
