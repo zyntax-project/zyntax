@@ -38,6 +38,15 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
     // reachable" (the full function-id set).
     let mut reachable: HashSet<HirId> = HashSet::new();
     let mut worklist: Vec<HirId> = Vec::new();
+    // Track every extern symbol name observed in a `HirCallable::Symbol`
+    // call site so we can resolve them back to extern HirIds after the
+    // walk and add only the externs actually referenced. Without this,
+    // every extern in the module ends up in the reachable set even when
+    // the kernel never calls it — fine for Cranelift, but bloats the
+    // LLVM IR with hundreds of dead `declare` statements that `dlopen`
+    // (with RTLD_NOW) then pays to resolve, adding ~270 ms per install
+    // on macOS.
+    let mut called_extern_names: HashSet<String> = HashSet::new();
     // Roots: entry-point function ids matched by name.
     for (id, function) in &module.functions {
         if let Some(name) = function.name.resolve_global() {
@@ -98,9 +107,14 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
                             // for it.
                             return all_function_ids(module);
                         }
-                        // Intrinsics & external symbols don't reach HIR
-                        // functions in this module.
-                        HirCallable::Intrinsic(_) | HirCallable::Symbol(_) => {}
+                        // Intrinsics don't reach HIR functions in this module.
+                        HirCallable::Intrinsic(_) => {}
+                        // Symbol calls reference an extern function by name.
+                        // Record the name so we can resolve it back to a HirId
+                        // (and emit a declaration for it) after the walk.
+                        HirCallable::Symbol(name) => {
+                            called_extern_names.insert(name.clone());
+                        }
                     },
                     HirInstruction::IndirectCall { .. }
                     | HirInstruction::CallClosure { .. }
@@ -143,13 +157,25 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
         }
     }
 
-    // Always include external declarations — Cranelift's compile_module loop
-    // calls `declare_function` on them but skips bodies; including them in
-    // the reachable set is harmless and lets callers treat the set as
-    // "functions that may need declaration".
-    for (id, function) in &module.functions {
-        if function.is_external {
-            reachable.insert(*id);
+    // Include extern declarations only when they're actually referenced
+    // from reachable code — either by HirId (`HirCallable::Function`,
+    // already added during the walk) or by name (`HirCallable::Symbol`,
+    // resolved here from `called_extern_names`). Excluding the rest keeps
+    // the LLVM IR free of hundreds of dead `declare` statements that
+    // bloat the dlopen-with-RTLD_NOW resolution step.
+    if !called_extern_names.is_empty() {
+        for (id, function) in &module.functions {
+            if !function.is_external {
+                continue;
+            }
+            if reachable.contains(id) {
+                continue;
+            }
+            if let Some(name) = function.name.resolve_global() {
+                if called_extern_names.contains(name.as_str()) {
+                    reachable.insert(*id);
+                }
+            }
         }
     }
 
