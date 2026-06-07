@@ -647,6 +647,17 @@
       if (data.meta) {
         const m = data.meta;
         const date = (m.date || '—').replace('T', ' ').replace('Z', ' UTC');
+        // System info chips — rendered only when the corresponding
+        // field is non-empty in the JSON (older results.json files
+        // predate the probes and lack these keys).
+        const sysChips = [];
+        if (m.cpu) sysChips.push(`<span>cpu <code>${m.cpu}</code></span>`);
+        if (m.cpu_cores) sysChips.push(`<span>cores <code>${m.cpu_cores}</code></span>`);
+        if (m.ram_gb) sysChips.push(`<span>ram <code>${m.ram_gb} GiB</code></span>`);
+        if (m.host) sysChips.push(`<span>host <code>${m.host}</code></span>`);
+        const sysRow = sysChips.length
+          ? `<div class="meta" style="margin-top:0.4rem;">${sysChips.join('')}</div>`
+          : '';
         metaEl.innerHTML = `
           <div class="meta">
             <span>updated <b style="color:var(--text-primary);">${date}</b></span>
@@ -654,7 +665,7 @@
             <span>arch <code>${m.arch || '—'}</code></span>
             <span>os <code>${m.os || '—'}</code></span>
             <span>median of ${m.runs || 9} runs</span>
-          </div>`;
+          </div>${sysRow}`;
       }
     }
 

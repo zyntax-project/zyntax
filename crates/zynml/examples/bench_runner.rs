@@ -149,6 +149,27 @@ struct Meta {
     /// render "median of N" accurately if we ever change the
     /// constant.
     runs: usize,
+    /// CPU brand string (e.g. "Apple M1", "Intel(R) Xeon(R) Platinum
+    /// 8370C CPU @ 2.80GHz"). Empty string if probing failed.
+    /// Read from `sysctl -n machdep.cpu.brand_string` on macOS and
+    /// `/proc/cpuinfo` on Linux.
+    #[serde(default)]
+    cpu: String,
+    /// Logical CPU count (`thread::available_parallelism`). 0 if the
+    /// probe failed.
+    #[serde(default)]
+    cpu_cores: usize,
+    /// Total system RAM in GiB, integer-truncated. 0 if the probe
+    /// failed. Read from `sysctl -n hw.memsize` on macOS and
+    /// `/proc/meminfo` (MemTotal) on Linux.
+    #[serde(default)]
+    ram_gb: u64,
+    /// `hostname` output. Public CI runners (GitHub Actions) give
+    /// out unique-per-job names — useful for cross-referencing a
+    /// noisy bench result with the specific runner instance it
+    /// landed on.
+    #[serde(default)]
+    host: String,
 }
 
 /// Each benchmark source lives at
@@ -381,13 +402,24 @@ fn main() {
             arch: env::consts::ARCH.to_string(),
             os: env::consts::OS.to_string(),
             runs,
+            cpu: probe_cpu_brand(),
+            cpu_cores: probe_cpu_cores(),
+            ram_gb: probe_ram_gb(),
+            host: probe_hostname(),
         },
     };
 
     for kernel in KERNELS {
         let pretty = kernel.strip_prefix("bench_").unwrap_or(kernel);
         if let Some(f) = &kernel_filter {
-            if !pretty.contains(f.as_str()) {
+            // Exact-match against the stripped kernel name. Substring
+            // was the old default; it silently matched `nbody` against
+            // both `nbody` and `nbody_ref`, so the per-kernel GHA matrix
+            // ran nbody_ref twice — once alone, once chained behind
+            // nbody on the same runner — and the published number was
+            // the thermally-throttled second pass (~100 ms worse than
+            // the dedicated job).
+            if pretty != f.as_str() {
                 continue;
             }
         }
@@ -886,6 +918,95 @@ fn try_save_cached_hir(module: &HirModule, cache_key: &str, cache_dir: &Path) {
             eprintln!("[BENCH-CACHE] WARN  serialize_module failed: {e}");
         }
     }
+}
+
+/// Best-effort CPU brand string. macOS uses `sysctl`, Linux reads
+/// `/proc/cpuinfo`'s `model name` line. Falls back to "" so the
+/// page can render a single em-dash rather than a stack of probe
+/// errors.
+fn probe_cpu_brand() -> String {
+    use std::process::Command;
+    if cfg!(target_os = "macos") {
+        if let Ok(o) = Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+        {
+            if o.status.success() {
+                return String::from_utf8_lossy(&o.stdout).trim().to_string();
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        if let Ok(s) = fs::read_to_string("/proc/cpuinfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("model name") {
+                    if let Some(v) = rest.split(':').nth(1) {
+                        return v.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Logical CPU count via `std::thread::available_parallelism`. This
+/// honours cgroup CPU quotas (so a 4-CPU GHA runner reports 4, not
+/// the bare-metal hypervisor's higher count), which is the number
+/// the bench actually sees scheduling-wise.
+fn probe_cpu_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
+}
+
+/// Total system RAM in GiB, integer-truncated. macOS via `sysctl
+/// -n hw.memsize` (bytes), Linux via `/proc/meminfo`'s `MemTotal:
+/// <KiB> kB` line. Truncates rather than rounds so 15.6 GiB CI
+/// machines report 15, matching how rayzor's page renders.
+fn probe_ram_gb() -> u64 {
+    use std::process::Command;
+    if cfg!(target_os = "macos") {
+        if let Ok(o) = Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+            if o.status.success() {
+                if let Ok(bytes) = String::from_utf8_lossy(&o.stdout).trim().parse::<u64>() {
+                    return bytes / (1024 * 1024 * 1024);
+                }
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        if let Ok(s) = fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let kb: u64 = rest
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    return kb / (1024 * 1024);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Hostname via the `hostname` binary. Works on every CI runner we
+/// target and avoids pulling a libc-bindings crate into the bench
+/// example just for this.
+fn probe_hostname() -> String {
+    use std::process::Command;
+    Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn git_short_sha() -> String {
