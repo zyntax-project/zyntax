@@ -79,6 +79,13 @@ pub struct LLVMJitBackend<'ctx> {
 
     /// Symbol signatures for auto-boxing (symbol name → signature).
     symbol_signatures: Vec<crate::zrtl::RuntimeSymbolInfo>,
+
+    /// Optional reachable-from-`main` function filter passed through
+    /// to `LLVMBackend::set_only_compile_reachable` on every
+    /// `compile_module`. Set by the runtime via
+    /// `set_only_compile_reachable`; mirrors the Cranelift JIT path
+    /// that the runtime already gates on `reachable_function_ids`.
+    only_compile_reachable: Option<std::collections::HashSet<HirId>>,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
@@ -104,6 +111,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             opt_level,
             runtime_symbols: IndexMap::new(),
             symbol_signatures: Vec::new(),
+            only_compile_reachable: None,
         })
     }
 
@@ -117,6 +125,20 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// Call before `compile_module`. Each registered symbol becomes
     /// a trampoline stub in the linked dylib, so the .so's calls to
     /// `<name>` land on a thin shim that jumps to `ptr`.
+    /// Limit subsequent `compile_module` calls to the supplied
+    /// reachable-from-entry subset. Mirrors
+    /// `CraneliftBackend::set_only_compile_reachable` so the LLVM AOT
+    /// install pays the same scope as the Cranelift install. Without
+    /// this the LLVM backend lowers + verifies + O3s every prelude
+    /// helper (~100 functions on a typical bench), even when the
+    /// kernel reaches only a handful.
+    pub fn set_only_compile_reachable(
+        &mut self,
+        allowed: Option<std::collections::HashSet<HirId>>,
+    ) {
+        self.only_compile_reachable = allowed;
+    }
+
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8) {
         self.runtime_symbols.insert(name.into(), ptr as usize);
     }
@@ -249,6 +271,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // Step 1: Lower HIR → LLVM IR.
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
+        backend.set_only_compile_reachable(self.only_compile_reachable.clone());
         let _llvm_ir = backend.compile_module(hir_module)?;
 
         // Patch internal function names to a linker-safe mangling.
@@ -368,6 +391,11 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         for (id, function) in &hir_module.functions {
             if function.is_external {
                 continue;
+            }
+            if let Some(allowed) = &self.only_compile_reachable {
+                if !allowed.contains(id) {
+                    continue;
+                }
             }
             map.insert(*id, Self::exported_name_for(function, *id));
         }

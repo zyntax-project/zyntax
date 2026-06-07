@@ -755,6 +755,15 @@ impl InterpRuntime {
             // Also include OSR runtime symbols so back-edge probes
             // baked into the IR (when emitted) resolve correctly.
             let osr_syms = osr::osr_runtime_symbols();
+            // Same reachable-from-main filter the Cranelift install
+            // uses above. Without it LLVM lowers + O3s + verifies
+            // every prelude helper (Option<T>, Result<T,E>, List /
+            // Iterator / Tensor / etc.) and pays the codegen +
+            // verifier cost for ~100 functions the kernel never
+            // reaches. The single-kernel install measured 300-900 ms
+            // before this gate landed; with it the LLVM compile sees
+            // only the same subset Cranelift does.
+            let llvm_reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
             llvm.with_lock(|be| {
                 for (name, ptr, _arity) in &bc_symbols {
                     be.register_symbol(name.clone(), *ptr);
@@ -762,6 +771,7 @@ impl InterpRuntime {
                 for (name, ptr) in &osr_syms {
                     be.register_symbol((*name).to_string(), *ptr);
                 }
+                be.set_only_compile_reachable(Some(llvm_reachable));
             });
 
             let llvm_install_result = llvm.with_lock(|be| be.compile_module(&module));

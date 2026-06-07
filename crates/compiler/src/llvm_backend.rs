@@ -118,6 +118,20 @@ pub struct LLVMBackend<'ctx> {
     /// gate `inlinehint`: a hint on a recursive function is at best
     /// noise and at worst feeds the inliner into a loop.
     self_recursive_set: std::collections::HashSet<HirId>,
+
+    /// Optional reachable-function filter, mirroring Cranelift's
+    /// `set_only_compile_reachable`. When `Some`, `compile_module`
+    /// skips declaration + body emission for every function whose
+    /// HirId is not in the set. The runtime computes this from
+    /// `reachable_function_ids(&module, &["main"])` once per
+    /// install — the BC interp's lazy-compile fallback still covers
+    /// any unexpected reach at execution time. Without this filter
+    /// LLVM compiles every prelude helper (Option<T>, Result<T,E>,
+    /// List/Iterator/Tensor stdlib — ~100 functions on the bench
+    /// kernels) and pays 300-900 ms of codegen + verifier time per
+    /// install plus surfaces every type-translation gap the prelude
+    /// has.
+    only_compile_reachable: Option<std::collections::HashSet<HirId>>,
 }
 
 /// Approximate byte size of a `HirType` for laying out union payloads
@@ -188,6 +202,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             func_cc: std::collections::HashMap::new(),
             dlsym_set: std::collections::HashSet::new(),
             self_recursive_set: std::collections::HashSet::new(),
+            only_compile_reachable: None,
         }
     }
 
@@ -272,6 +287,11 @@ impl<'ctx> LLVMBackend<'ctx> {
         declare_ids.sort_by_key(|id| format!("{:?}", id));
 
         for id in &declare_ids {
+            if let Some(allowed) = &self.only_compile_reachable {
+                if !allowed.contains(id) {
+                    continue;
+                }
+            }
             if let Some(func) = hir_module.functions.get(id) {
                 self.declare_function(*id, func)?;
             }
@@ -282,6 +302,11 @@ impl<'ctx> LLVMBackend<'ctx> {
         function_ids.sort_by_key(|id| format!("{:?}", id));
 
         for id in &function_ids {
+            if let Some(allowed) = &self.only_compile_reachable {
+                if !allowed.contains(id) {
+                    continue;
+                }
+            }
             if let Some(func) = hir_module.functions.get(id) {
                 self.compile_function(*id, func)?;
             }
@@ -291,6 +316,21 @@ impl<'ctx> LLVMBackend<'ctx> {
         let ir = self.module.print_to_string().to_string();
         log::debug!("[LLVM] Generated LLVM IR:\n{}", ir);
         Ok(ir)
+    }
+
+    /// Limit `compile_module` to a specific reachable subset.
+    ///
+    /// Mirrors `CraneliftBackend::set_only_compile_reachable`. When
+    /// `Some`, the declare/body loops skip every HirId not in the set.
+    /// Call before `compile_module`. Globals + effect-handler index
+    /// are still walked in full because they're constant-time and
+    /// keeping them intact preserves cross-function symbol resolution
+    /// against any reachable site.
+    pub fn set_only_compile_reachable(
+        &mut self,
+        allowed: Option<std::collections::HashSet<HirId>>,
+    ) {
+        self.only_compile_reachable = allowed;
     }
 
     /// Get a reference to the compiled LLVM module
