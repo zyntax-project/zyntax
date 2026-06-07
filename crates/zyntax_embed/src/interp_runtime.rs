@@ -772,6 +772,7 @@ impl InterpRuntime {
             // only the same subset Cranelift does.
             let llvm_reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
             let llvm_cache_key = config.llvm_cache_key.clone();
+            let box_infos = crate::effect_runtime::box_runtime_symbol_infos();
             llvm.with_lock(|be| {
                 for (name, ptr, _arity) in &bc_symbols {
                     be.register_symbol(name.clone(), *ptr);
@@ -779,6 +780,12 @@ impl InterpRuntime {
                 for (name, ptr) in &osr_syms {
                     be.register_symbol((*name).to_string(), *ptr);
                 }
+                // Wire the `zyntax_box_*` signatures so LLVM emits
+                // the correct return / param types. Without this the
+                // backend defaults each `Call::Symbol` to
+                // `void(args) → i32 0`, then panics the moment
+                // an unboxed f64 / f32 / bool value is consumed.
+                be.register_symbol_signatures(&box_infos);
                 be.set_only_compile_reachable(Some(llvm_reachable));
                 be.set_cache_key(llvm_cache_key);
             });

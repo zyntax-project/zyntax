@@ -1760,6 +1760,32 @@ pub fn type_tag_for_hir_type(ty: &crate::hir::HirType) -> TypeTag {
     }
 }
 
+/// Return the list of `zyntax_box_*` runtime helpers as `(name, fn
+/// pointer, arity)` triples. The runtime (BC interp + Cranelift JIT
+/// + LLVM AOT) registers these by default so any module that
+/// reaches the autobox / autounbox code paths in SSA lowering finds
+/// the symbol resolved.
+///
+/// Mirrors the per-symbol `register_function_typed` shape that the
+/// effect-runtime registration uses, but flat — the box helpers are
+/// pure FFI with no effect bookkeeping needed.
+pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
+    vec![
+        ("zyntax_box_i32", zyntax_box_i32 as *const u8, 1),
+        ("zyntax_box_i64", zyntax_box_i64 as *const u8, 1),
+        ("zyntax_box_f32", zyntax_box_f32 as *const u8, 1),
+        ("zyntax_box_f64", zyntax_box_f64 as *const u8, 1),
+        ("zyntax_box_bool", zyntax_box_bool as *const u8, 1),
+        ("zyntax_box_free", zyntax_box_free as *const u8, 1),
+        ("zyntax_box_get_i32", zyntax_box_get_i32 as *const u8, 1),
+        ("zyntax_box_get_i64", zyntax_box_get_i64 as *const u8, 1),
+        ("zyntax_box_get_f32", zyntax_box_get_f32 as *const u8, 1),
+        ("zyntax_box_get_f64", zyntax_box_get_f64 as *const u8, 1),
+        ("zyntax_box_get_bool", zyntax_box_get_bool as *const u8, 1),
+        ("zyntax_box_get_tag", zyntax_box_get_tag as *const u8, 1),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

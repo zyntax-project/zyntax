@@ -548,6 +548,42 @@ const fn u64_tag() -> TypeTag {
     )
 }
 
+const fn i32_tag() -> TypeTag {
+    TypeTag::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    )
+}
+
+const fn i64_tag() -> TypeTag {
+    TypeTag::new(
+        TypeCategory::Int,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    )
+}
+
+const fn f32_tag() -> TypeTag {
+    TypeTag::new(
+        TypeCategory::Float,
+        PrimitiveSize::Bits32 as u16,
+        TypeFlags::NONE,
+    )
+}
+
+const fn f64_tag() -> TypeTag {
+    TypeTag::new(
+        TypeCategory::Float,
+        PrimitiveSize::Bits64 as u16,
+        TypeFlags::NONE,
+    )
+}
+
+const fn void_tag() -> TypeTag {
+    TypeTag::VOID
+}
+
 const fn empty_params() -> [TypeTag; MAX_PARAMS] {
     [TypeTag::VOID; MAX_PARAMS]
 }
@@ -742,6 +778,434 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             ),
         },
     );
+}
+
+/// Return the `(name, ptr, sig)` table for every `zyntax_box_*`
+/// helper the SSA-lowering autobox / autounbox path can emit. The
+/// list is consumed by `register_box_runtime_symbols` (mirrors to
+/// Cranelift backend + BC interp) and again at LLVM JIT install
+/// time so the LLVM backend sees the same per-symbol return / param
+/// shapes. Without LLVM-side signatures the backend defaults each
+/// `Call::Symbol` to `void(args)` returning `i32 0` and crashes the
+/// first time an unboxed value is consumed as anything other than
+/// `i32`.
+#[cfg(feature = "native")]
+pub fn box_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolInfo> {
+    use zyntax_compiler::zrtl::{RuntimeSymbolInfo, ZrtlSigFlags, ZrtlSymbolSig};
+    let no_flags = ZrtlSigFlags::NONE;
+    let entries: &[(&'static str, *const u8, ZrtlSymbolSig)] = &[
+        (
+            "zyntax_box_i32",
+            zyntax_compiler::zrtl::zyntax_box_i32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(i32_tag()),
+            },
+        ),
+        (
+            "zyntax_box_i64",
+            zyntax_compiler::zrtl::zyntax_box_i64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(i64_tag()),
+            },
+        ),
+        (
+            "zyntax_box_f32",
+            zyntax_compiler::zrtl::zyntax_box_f32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(f32_tag()),
+            },
+        ),
+        (
+            "zyntax_box_f64",
+            zyntax_compiler::zrtl::zyntax_box_f64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(f64_tag()),
+            },
+        ),
+        (
+            "zyntax_box_bool",
+            zyntax_compiler::zrtl::zyntax_box_bool as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(i32_tag()),
+            },
+        ),
+        (
+            "zyntax_box_free",
+            zyntax_compiler::zrtl::zyntax_box_free as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: void_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_i32",
+            zyntax_compiler::zrtl::zyntax_box_get_i32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_i64",
+            zyntax_compiler::zrtl::zyntax_box_get_i64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_f32",
+            zyntax_compiler::zrtl::zyntax_box_get_f32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: f32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_f64",
+            zyntax_compiler::zrtl::zyntax_box_get_f64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: f64_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_bool",
+            zyntax_compiler::zrtl::zyntax_box_get_bool as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_tag",
+            zyntax_compiler::zrtl::zyntax_box_get_tag as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+    ];
+    entries
+        .iter()
+        .map(|(name, ptr, sig)| RuntimeSymbolInfo {
+            name,
+            ptr: *ptr,
+            sig: Some(*sig),
+        })
+        .collect()
+}
+
+/// Register the `zyntax_box_*` runtime helpers used by the SSA
+/// lowering's autobox / autounbox path for `Type::Any` field stores
+/// and reads. Without this, modules that touch the autobox code path
+/// hit "unknown function 'zyntax_box_X'" at the BC interp tier and
+/// type-mismatch panics at the LLVM tier (the JIT defaults to
+/// `i32 0` for unresolved-signature symbols, then crashes when an
+/// unboxed value is consumed at a different type).
+///
+/// Mirrors `register_effect_runtime_symbols` in shape; called from
+/// `ZyntaxRuntime::with_config` and `with_symbols`.
+#[cfg(feature = "native")]
+pub fn register_box_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
+    use zyntax_compiler::zrtl::{RuntimeSymbolInfo, ZrtlSigFlags, ZrtlSymbolSig};
+    let no_flags = ZrtlSigFlags::NONE;
+
+    // Collect each (name, ptr, sig) tuple so we can hand the same
+    // set to the BC interp via `register_zrtl_symbols` after wiring
+    // the backend. `register_function_typed` registers with the
+    // backend + plugin signature table; it does NOT mirror into the
+    // interp's FFI table, so the interp would otherwise miss them.
+    let mut infos: Vec<RuntimeSymbolInfo> = Vec::new();
+
+    // Box constructors: take a primitive, return a *mut DynamicBox
+    // (pointer-sized — `ptr_tag()` in the runtime FFI surface).
+    runtime.register_function_typed(
+        "zyntax_box_i32",
+        zyntax_compiler::zrtl::zyntax_box_i32 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: ptr_tag(),
+            params: params1(i32_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_i64",
+        zyntax_compiler::zrtl::zyntax_box_i64 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: ptr_tag(),
+            params: params1(i64_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_f32",
+        zyntax_compiler::zrtl::zyntax_box_f32 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: ptr_tag(),
+            params: params1(f32_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_f64",
+        zyntax_compiler::zrtl::zyntax_box_f64 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: ptr_tag(),
+            params: params1(f64_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_bool",
+        zyntax_compiler::zrtl::zyntax_box_bool as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: ptr_tag(),
+            params: params1(i32_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_free",
+        zyntax_compiler::zrtl::zyntax_box_free as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: void_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+
+    // Box getters: take a *mut DynamicBox, return primitive.
+    runtime.register_function_typed(
+        "zyntax_box_get_i32",
+        zyntax_compiler::zrtl::zyntax_box_get_i32 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: i32_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_get_i64",
+        zyntax_compiler::zrtl::zyntax_box_get_i64 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: i64_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_get_f32",
+        zyntax_compiler::zrtl::zyntax_box_get_f32 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: f32_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_get_f64",
+        zyntax_compiler::zrtl::zyntax_box_get_f64 as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: f64_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_get_bool",
+        zyntax_compiler::zrtl::zyntax_box_get_bool as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: i32_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+    runtime.register_function_typed(
+        "zyntax_box_get_tag",
+        zyntax_compiler::zrtl::zyntax_box_get_tag as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: no_flags,
+            return_type: i32_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+
+    // Mirror to the BC interp's FFI table — `register_function_typed`
+    // only touches the backend + plugin-signature side. Without this
+    // the interp dispatch hits "unknown function 'zyntax_box_X'"
+    // the moment a hot path resolves through it.
+    let names_and_sigs: &[(&'static str, *const u8, ZrtlSymbolSig)] = &[
+        (
+            "zyntax_box_i32",
+            zyntax_compiler::zrtl::zyntax_box_i32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(i32_tag()),
+            },
+        ),
+        (
+            "zyntax_box_i64",
+            zyntax_compiler::zrtl::zyntax_box_i64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(i64_tag()),
+            },
+        ),
+        (
+            "zyntax_box_f32",
+            zyntax_compiler::zrtl::zyntax_box_f32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(f32_tag()),
+            },
+        ),
+        (
+            "zyntax_box_f64",
+            zyntax_compiler::zrtl::zyntax_box_f64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(f64_tag()),
+            },
+        ),
+        (
+            "zyntax_box_bool",
+            zyntax_compiler::zrtl::zyntax_box_bool as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params1(i32_tag()),
+            },
+        ),
+        (
+            "zyntax_box_free",
+            zyntax_compiler::zrtl::zyntax_box_free as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: void_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_i32",
+            zyntax_compiler::zrtl::zyntax_box_get_i32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_i64",
+            zyntax_compiler::zrtl::zyntax_box_get_i64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_f32",
+            zyntax_compiler::zrtl::zyntax_box_get_f32 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: f32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_f64",
+            zyntax_compiler::zrtl::zyntax_box_get_f64 as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: f64_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_bool",
+            zyntax_compiler::zrtl::zyntax_box_get_bool as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        (
+            "zyntax_box_get_tag",
+            zyntax_compiler::zrtl::zyntax_box_get_tag as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i32_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+    ];
+    for (name, ptr, sig) in names_and_sigs {
+        infos.push(RuntimeSymbolInfo {
+            name,
+            ptr: *ptr,
+            sig: Some(*sig),
+        });
+    }
+    runtime.register_zrtl_symbols(&infos);
 }
 
 /// Test-only helper: reset the per-thread handler stack to empty.

@@ -3235,19 +3235,71 @@ impl<'ctx> LLVMBackend<'ctx> {
                     })
                     .collect();
 
-                // Declare the function (assume void return for now)
-                let fn_type = self.context.void_type().fn_type(&param_types, false);
+                // Pick the return type from the registered signature
+                // when present. Without this the function declaration
+                // defaulted to `void(args)` and the caller — which had
+                // already typed the call result based on the SSA value
+                // type — would consume an "i32 0" dummy and panic the
+                // first time it tried to use the result as an f64 /
+                // f32 / bool. Mirrors `type_tag_to_cranelift_type` in
+                // the Cranelift backend.
+                let returns_void = sig_info
+                    .as_ref()
+                    .map(|s| matches!(s.return_type.category(), crate::zrtl::TypeCategory::Void))
+                    .unwrap_or(true);
+                let call_name = if returns_void { "" } else { symbol_name };
+                let fn_type = if let Some(ref sig) = sig_info {
+                    use crate::zrtl::{PrimitiveSize, TypeCategory};
+                    let bits = sig.return_type.type_id();
+                    match sig.return_type.category() {
+                        TypeCategory::Void => self.context.void_type().fn_type(&param_types, false),
+                        TypeCategory::Bool => self.context.bool_type().fn_type(&param_types, false),
+                        TypeCategory::Int | TypeCategory::UInt => {
+                            if bits == PrimitiveSize::Bits8 as u16 {
+                                self.context.i8_type().fn_type(&param_types, false)
+                            } else if bits == PrimitiveSize::Bits16 as u16 {
+                                self.context.i16_type().fn_type(&param_types, false)
+                            } else if bits == PrimitiveSize::Bits32 as u16 {
+                                self.context.i32_type().fn_type(&param_types, false)
+                            } else {
+                                self.context.i64_type().fn_type(&param_types, false)
+                            }
+                        }
+                        TypeCategory::Float => {
+                            if bits == PrimitiveSize::Bits32 as u16 {
+                                self.context.f32_type().fn_type(&param_types, false)
+                            } else {
+                                self.context.f64_type().fn_type(&param_types, false)
+                            }
+                        }
+                        // Pointers / opaques / closures: ptr return.
+                        _ => self
+                            .context
+                            .ptr_type(AddressSpace::default())
+                            .fn_type(&param_types, false),
+                    }
+                } else {
+                    self.context.void_type().fn_type(&param_types, false)
+                };
                 let func = self
                     .module
                     .get_function(symbol_name)
                     .unwrap_or_else(|| self.module.add_function(symbol_name, fn_type, None));
 
                 // Build call
-                self.builder
-                    .build_call(func, &final_arg_values, symbol_name)?;
-
-                // Return a dummy value (void functions don't return anything meaningful)
-                Ok(self.context.i32_type().const_zero().into())
+                let call_site = self
+                    .builder
+                    .build_call(func, &final_arg_values, call_name)?;
+                if returns_void {
+                    Ok(self.context.i32_type().const_zero().into())
+                } else {
+                    match call_site.try_as_basic_value() {
+                        ValueKind::Basic(val) => Ok(val),
+                        ValueKind::Instruction(_) => {
+                            Ok(self.context.i32_type().const_zero().into())
+                        }
+                    }
+                }
             }
             HirCallable::FuncRef(_) => Err(CompilerError::CodeGen(
                 "HirCallable::FuncRef is not callable directly — \

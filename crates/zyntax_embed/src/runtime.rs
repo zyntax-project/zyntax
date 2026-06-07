@@ -936,6 +936,12 @@ impl ZyntaxRuntime {
         // that references them links cleanly. No-op for modules that
         // don't (the JIT only resolves symbols the IR actually calls).
         crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        // Same idea for the `Type::Any` autobox / autounbox helpers.
+        // SSA lowering emits `Call::Symbol("zyntax_box_X")` /
+        // `..._get_X` for any module that stores into or reads from
+        // a `Type::Any` field — register them up front with typed
+        // signatures so the JIT picks the right param/return shape.
+        crate::effect_runtime::register_box_runtime_symbols(&mut runtime);
         runtime.finalize_runtime_symbols()?;
         Ok(runtime)
     }
@@ -962,6 +968,12 @@ impl ZyntaxRuntime {
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
         };
         crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        for (name, ptr, arity) in zyntax_compiler::zrtl::box_runtime_symbols() {
+            runtime.backend.register_runtime_symbol(name, ptr);
+            if let Ok(mut interp) = runtime.interp.lock() {
+                interp.register_symbol(name.to_string(), ptr, arity);
+            }
+        }
         runtime.finalize_runtime_symbols()?;
         Ok(runtime)
     }

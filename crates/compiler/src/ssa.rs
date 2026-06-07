@@ -4470,7 +4470,7 @@ impl SsaBuilder {
                     if let Some(field_hir_ty) = field_ty {
                         let object_hir_ty =
                             self.function.values.get(&object_val).map(|v| v.ty.clone());
-                        if object_hir_ty.as_ref() != Some(&field_hir_ty) {
+                        let raw = if object_hir_ty.as_ref() != Some(&field_hir_ty) {
                             // Rebind with the field's HirType via Bitcast.
                             let rebind =
                                 self.create_value(field_hir_ty.clone(), HirValueKind::Instruction);
@@ -4484,10 +4484,23 @@ impl SsaBuilder {
                                 },
                             );
                             self.add_use(object_val, rebind);
-                            return Ok(rebind);
-                        }
-                        // Types already match — no rebind needed.
-                        return Ok(object_val);
+                            rebind
+                        } else {
+                            object_val
+                        };
+                        // Even on the single-field shortcut, the field
+                        // may be declared `Type::Any` (box-pointer
+                        // slot) — apply the same autounbox the
+                        // ExtractValue path does so
+                        // `let v: f64 = b.payload` round-trips when
+                        // `b` is a single-field struct.
+                        return Ok(self.maybe_unbox_for_any_field(
+                            block_id,
+                            raw,
+                            &object_type,
+                            field_index as usize,
+                            &expr.ty,
+                        ));
                     }
                     // Fall through to ExtractValue when we couldn't resolve
                     // the field type.
@@ -7505,10 +7518,6 @@ impl SsaBuilder {
     /// `zyntax_box_get_X` call to unwrap the box pointer. Leaves
     /// boxes intact when the use-site is also `Type::Any` (the box
     /// pointer flows through as-is to whatever next consumes it).
-    ///
-    /// Pairs with the autobox-on-store rule so that
-    /// `let x: f64 = b.value` round-trips a stored f64 cleanly
-    /// instead of leaving the user holding a raw `*mut DynamicBox`.
     fn maybe_unbox_for_any_field(
         &mut self,
         block_id: HirId,
@@ -7517,7 +7526,6 @@ impl SsaBuilder {
         field_index: usize,
         use_site_ty: &Type,
     ) -> HirId {
-        // Field-side gate: only act on fields declared `Type::Any`.
         let field_is_any = self
             .get_field_typed_types(object_ty)
             .and_then(|fs| fs.get(field_index).cloned())
@@ -7526,11 +7534,24 @@ impl SsaBuilder {
         if !field_is_any {
             return boxed_value;
         }
-        // Use-site gate: only unbox when there's a concrete target
-        // type. If the surrounding context also wants `Any`, the box
-        // pointer is exactly the right thing to forward unchanged.
+        self.try_emit_any_downcast(block_id, boxed_value, use_site_ty)
+            .unwrap_or(boxed_value)
+    }
+
+    /// Emit a `zyntax_box_get_X` call to downcast a `*mut DynamicBox`
+    /// (HIR i64) to the requested concrete primitive type. Returns
+    /// `Some(unboxed)` when the target type has a matching getter,
+    /// `None` otherwise (caller falls through to whatever default
+    /// it had). Shared between the Field-load unbox path and the
+    /// explicit-cast (`X as T`) unbox path.
+    fn try_emit_any_downcast(
+        &mut self,
+        block_id: HirId,
+        boxed_value: HirId,
+        target_ty: &Type,
+    ) -> Option<HirId> {
         use zyntax_typed_ast::PrimitiveType;
-        let (get_symbol, result_hir_ty) = match use_site_ty {
+        let (symbol, result_hir_ty) = match target_ty {
             Type::Primitive(PrimitiveType::I8)
             | Type::Primitive(PrimitiveType::I16)
             | Type::Primitive(PrimitiveType::I32)
@@ -7543,14 +7564,14 @@ impl SsaBuilder {
             Type::Primitive(PrimitiveType::F32) => ("zyntax_box_get_f32", HirType::F32),
             Type::Primitive(PrimitiveType::F64) => ("zyntax_box_get_f64", HirType::F64),
             Type::Primitive(PrimitiveType::Bool) => ("zyntax_box_get_bool", HirType::Bool),
-            _ => return boxed_value,
+            _ => return None,
         };
         let unboxed = self.create_value(result_hir_ty, HirValueKind::Instruction);
         self.add_instruction(
             block_id,
             HirInstruction::Call {
                 result: Some(unboxed),
-                callee: crate::hir::HirCallable::Symbol(get_symbol.to_string()),
+                callee: crate::hir::HirCallable::Symbol(symbol.to_string()),
                 args: vec![boxed_value],
                 type_args: vec![],
                 const_args: vec![],
@@ -7558,7 +7579,7 @@ impl SsaBuilder {
             },
         );
         self.add_use(boxed_value, unboxed);
-        unboxed
+        Some(unboxed)
     }
 
     /// Convert frontend type to HIR type
