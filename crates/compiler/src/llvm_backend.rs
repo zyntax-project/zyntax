@@ -875,10 +875,46 @@ impl<'ctx> LLVMBackend<'ctx> {
         &mut self,
         phi: &HirPhi,
         _current_block: &HirId,
-        _function: &HirFunction,
+        function: &HirFunction,
     ) -> CompilerResult<()> {
-        // Translate the phi node's type
-        let llvm_ty = self.translate_type(&phi.ty)?;
+        // The phi-declared HIR type can disagree with the actual SSA-producer
+        // types when an array-literal binding was annotated `Array<T,N>` but
+        // the lowering produces a `Ptr<T>` (the Alloca / malloc result that
+        // backs heap-allocated array literals). Trust the producer if all
+        // non-self-reference incoming values agree on a single HIR type —
+        // that's the type the call sites and stores were emitted against.
+        let producer_ty = if phi.incoming.len() > 1 {
+            let mut consensus: Option<&HirType> = None;
+            let mut agree = true;
+            for (value_id, _) in &phi.incoming {
+                if *value_id == phi.result {
+                    continue;
+                }
+                if let Some(v) = function.values.get(value_id) {
+                    match consensus {
+                        None => consensus = Some(&v.ty),
+                        Some(prev) if prev == &v.ty => {}
+                        _ => {
+                            agree = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if agree {
+                consensus.cloned()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let chosen = match (&phi.ty, &producer_ty) {
+            (HirType::Array(_, _), Some(p @ HirType::Ptr(_))) => p.clone(),
+            _ => phi.ty.clone(),
+        };
+        let llvm_ty = self.translate_type(&chosen)?;
 
         // Create the phi node
         let phi_value = self.builder.build_phi(llvm_ty, "phi")?;
@@ -1288,7 +1324,18 @@ impl<'ctx> LLVMBackend<'ctx> {
                 indices,
             } => {
                 let ptr_val = self.get_value(*ptr)?;
-                let llvm_ty = self.translate_type(ty)?;
+                // `ty` is the HIR result type (typically `Ptr(elem)`). LLVM
+                // GEP's first operand is the *element* type being indexed —
+                // the type that sets the stride. Unwrap one Ptr layer so
+                // `Ptr(Body)` → `Body` (stride = sizeof(Body)) rather than
+                // `ptr` (stride = sizeof(ptr) = 8). For HIR shapes where
+                // `ty` is not `Ptr(_)` (rare; raw byte-offset GEPs from
+                // array-literal lowering use `HirType::U8`), fall through.
+                let elem_hir = match ty {
+                    HirType::Ptr(inner) => inner.as_ref(),
+                    other => other,
+                };
+                let llvm_ty = self.translate_type(elem_hir)?;
 
                 // Convert all index HIR values to LLVM values
                 let index_values: Vec<_> = indices

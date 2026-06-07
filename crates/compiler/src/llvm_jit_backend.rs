@@ -303,18 +303,13 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             .module()
             .set_data_layout(&target_machine.get_target_data().get_data_layout());
 
-        // Pre-pass verification — catches HIR→LLVM lowering bugs
-        // before the optimiser amplifies them.
-        if let Err(msg) = backend.module().verify() {
-            return Err(CompilerError::Backend(format!(
-                "LLVM module verification failed (pre-opt): {}",
-                msg.to_string()
-            )));
-        }
-
         if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
             let ir = backend.module().print_to_string().to_string();
-            let path = std::env::temp_dir().join("zyntax_llvm_ir_preopt.ll");
+            static DUMP_COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let fname = format!("zyntax_llvm_ir_preopt_{n:04}.ll");
+            let path = std::env::temp_dir().join(fname);
             if std::fs::write(&path, &ir).is_ok() {
                 eprintln!(
                     "[LLVM-IR] pre-opt IR written to {} ({} bytes)",
@@ -322,6 +317,15 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     ir.len()
                 );
             }
+        }
+
+        // Pre-pass verification — catches HIR→LLVM lowering bugs
+        // before the optimiser amplifies them.
+        if let Err(msg) = backend.module().verify() {
+            return Err(CompilerError::Backend(format!(
+                "LLVM module verification failed (pre-opt): {}",
+                msg.to_string()
+            )));
         }
 
         // Step 3: Run the optimisation pipeline.
