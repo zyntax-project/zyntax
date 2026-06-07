@@ -669,6 +669,13 @@ impl InterpRuntime {
         #[cfg(feature = "llvm-backend")]
         let (llvm, _llvm_context_keepalive) =
             zyntax_compiler::beadie_adapter::build_llvm_backend()?;
+        // Flips to `true` once the background LLVM compile thread (spawned
+        // below) finishes. The hot-path tick callback gates its tier-up
+        // attempt on this so it never blocks waiting for the BG thread's
+        // Mutex. Until the flag flips, functions stay on Cranelift.
+        #[cfg(feature = "llvm-backend")]
+        let llvm_ready: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let _ = config.verbosity;
         let cranelift_for_closure = Arc::clone(&cranelift);
@@ -776,46 +783,62 @@ impl InterpRuntime {
                 be.set_cache_key(llvm_cache_key);
             });
 
-            let llvm_install_result = llvm.with_lock(|be| be.compile_module(&module));
-            match llvm_install_result {
-                Ok(()) => {
-                    if std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok() {
-                        llvm.with_lock(|be| {
-                            for (fid, f) in &module.functions {
-                                let name = f.name.resolve_global().unwrap_or_default();
-                                let ptr = be.get_function_pointer(*fid);
-                                eprintln!("[TIER-UP-INSTALL-LLVM] {name} {fid:?} -> {ptr:?}");
+            // Background-thread compile. On the cold path
+            // `compile_module` runs the long-pole pipeline (lower → opt
+            // → link → dlopen, ~80-300 ms depending on platform);
+            // running it on the install thread blocks BC interp warmup
+            // for that entire window. Spawning a dedicated thread lets
+            // the BC interp start executing immediately and the
+            // per-function tick callback below polls `llvm_ready`
+            // before attempting a tier-up swap. Until the flag flips,
+            // the function stays on Cranelift — already fast enough
+            // for the first few invocations. The cached-dylib path
+            // returns in a few ms, so backgrounding is effectively a
+            // no-op there but costs nothing.
+            let llvm_for_bg = Arc::clone(&llvm);
+            let llvm_ready_for_bg = Arc::clone(&llvm_ready);
+            let module_for_bg = module.clone();
+            let trace = std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok();
+            std::thread::Builder::new()
+                .name("zyntax-llvm-tierup".to_string())
+                .spawn(move || {
+                    let r = llvm_for_bg.with_lock(|be| be.compile_module(&module_for_bg));
+                    match r {
+                        Ok(()) => {
+                            llvm_ready_for_bg.store(true, std::sync::atomic::Ordering::Release);
+                            if trace {
+                                llvm_for_bg.with_lock(|be| {
+                                    for (fid, f) in &module_for_bg.functions {
+                                        let name = f.name.resolve_global().unwrap_or_default();
+                                        let ptr = be.get_function_pointer(*fid);
+                                        eprintln!(
+                                            "[TIER-UP-INSTALL-LLVM] {name} {fid:?} -> {ptr:?}"
+                                        );
+                                    }
+                                });
                             }
-                        });
+                        }
+                        Err(e) => {
+                            // Soft failure: LLVM backend doesn't translate
+                            // every HIR type yet (Opaque from @reference-class
+                            // lowering, extern types like Tensor return
+                            // "Type translation not yet implemented"); or the
+                            // AOT-via-object path may have hit `NoLinker`
+                            // (no `cc`/`clang`/`gcc` in PATH) or a link/dlopen
+                            // failure. The runtime still runs; the LLVM tier
+                            // just never engages because `llvm_ready` stays
+                            // false. Surface the cause loudly: the bench
+                            // harness captures stderr but doesn't init
+                            // `env_logger`.
+                            eprintln!("[LLVM-AOT-DISABLED] {e}");
+                            log::warn!(
+                                "LLVM tier-up disabled for this module: eager compile_module failed ({e}). \
+                                 Cranelift tier-up will still drive the JIT path."
+                            );
+                        }
                     }
-                }
-                Err(e) => {
-                    // Soft failure: LLVM backend doesn't translate
-                    // every HIR type yet (Opaque from @reference-class
-                    // lowering, extern types like Tensor return
-                    // "Type translation not yet implemented"); or the
-                    // AOT-via-object path may have hit `NoLinker`
-                    // (no `cc`/`clang`/`gcc` in PATH) or a link/dlopen
-                    // failure. Fall back to a Cranelift-only ladder
-                    // for this module rather than poisoning the whole
-                    // install — the runtime still runs, the LLVM tier
-                    // just doesn't engage.
-                    // Surface the soft-fail cause unconditionally on
-                    // stderr. The bench harness and CI logs both
-                    // capture stderr but neither initialises
-                    // `env_logger`, so `log::warn!` is silent in
-                    // those contexts and we lost visibility into
-                    // genuine Linux-x86_64 codegen / linker
-                    // failures. eprintln is louder but the path is
-                    // a true install-time failure, not hot-loop
-                    // noise.
-                    eprintln!("[LLVM-AOT-DISABLED] {e}");
-                    log::warn!(
-                        "LLVM tier-up disabled for this module: eager compile_module failed ({e}). \
-                         Cranelift tier-up will still drive the JIT path."
-                    );
-                }
-            }
+                })
+                .expect("spawn zyntax-llvm-tierup thread");
         }
 
         // JIT-prime the entry function so the first call dispatches
@@ -924,6 +947,8 @@ impl InterpRuntime {
             let llvm_for_closure = Arc::clone(&llvm);
             #[cfg(feature = "llvm-backend")]
             let keepalive = Arc::clone(&_llvm_context_keepalive);
+            #[cfg(feature = "llvm-backend")]
+            let llvm_ready_for_closure = Arc::clone(&llvm_ready);
 
             self.interp.register_tick_callback(
                 func_id,
@@ -956,7 +981,14 @@ impl InterpRuntime {
                     #[cfg(feature = "llvm-backend")]
                     {
                         let count = bound.bead().invocation_count();
-                        if code.is_some()
+                        // The `llvm_ready` gate keeps the with_lock call
+                        // below from blocking on the background compile
+                        // thread's Mutex hold. Once the BG thread releases
+                        // the Mutex and stores `true`, the next hot tick
+                        // sees the flag, the CAS fires once, and the
+                        // pointer lookup is a few-ns hash hit.
+                        if llvm_ready_for_closure.load(std::sync::atomic::Ordering::Acquire)
+                            && code.is_some()
                             && bound.generation() == 0
                             && count >= hot
                             && llvm_state
@@ -973,9 +1005,9 @@ impl InterpRuntime {
                                 .unwrap_or(false)
                         {
                             let _ = &keepalive; // pin inkwell Context
-                                                // LLVM was pre-compiled at install time over
-                                                // the whole module, so this is just a
-                                                // pointer lookup — no per-function recompile.
+                                                // LLVM was pre-compiled in the BG thread, so
+                                                // this is just a pointer lookup — no per-
+                                                // function recompile.
                             let llvm_ptr =
                                 llvm_for_closure.with_lock(|be| be.get_function_pointer(func_id));
                             if let Some(ptr) = llvm_ptr {
