@@ -1,0 +1,25 @@
+import prelude
+
+@reference
+struct Vec3R {
+    x: f64, y: f64, z: f64
+}
+
+impl Add<Vec3R> for Vec3R {
+    def add(self, other: Vec3R): Vec3R {
+        return Vec3R { x: self.x + other.x, y: self.y + other.y, z: self.z + other.z }
+    }
+}
+
+def main(): i64 {
+    let mut acc = Vec3R { x: 0.0, y: 0.0, z: 0.0 }
+    let a = Vec3R { x: 1.0, y: 2.0, z: 3.0 }
+    let b = Vec3R { x: 4.0, y: 5.0, z: 6.0 }
+    let mut i: i64 = 0
+    while i < 1000000 {
+        acc = acc + a
+        acc = acc + b
+        i = i + 1
+    }
+    return (acc.x + acc.y + acc.z) as i64
+}

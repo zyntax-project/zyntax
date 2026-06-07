@@ -7542,6 +7542,25 @@ impl SsaBuilder {
                         .map(|field| self.convert_type(&field.ty))
                         .collect();
 
+                    // Same `@reference` heap-layout check the `Type::Named`
+                    // arm above performs — Unresolved arrived here because
+                    // an earlier resolution stage produced `Unresolved(name)`
+                    // instead of `Named(id)`, which happens for type
+                    // references inside `impl` method bodies (`Vec3R { ... }`
+                    // inside `impl Add<Vec3R> for Vec3R`). Without this
+                    // mirror, the constructor lowering builds a value-type
+                    // struct via `insertvalue` chains, the field-access
+                    // path then issues a GEP whose `ptr` operand is the
+                    // struct value, and the LLVM backend panics at
+                    // `into_pointer_value()` (llvm_backend.rs:1363).
+                    if type_def.metadata.is_reference {
+                        return HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                            name: Some(type_def.name),
+                            fields: hir_fields,
+                            packed: false,
+                        })));
+                    }
+
                     HirType::Struct(HirStructType {
                         name: Some(type_def.name),
                         fields: hir_fields,

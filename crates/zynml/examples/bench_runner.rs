@@ -195,6 +195,7 @@ const KERNELS: &[(&str, &str)] = &[
     // a=(1,2,3), b=(4,5,6) → acc = (50000000, 70000000, 90000000)
     // → sum 210000000.
     ("bench_op_overload", "Int(210000000)"),
+    ("bench_op_overload_ref", "Int(21000000)"),
 ];
 
 /// Each target produces one [`TargetResult`] per kernel.
