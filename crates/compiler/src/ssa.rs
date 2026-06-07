@@ -228,6 +228,19 @@ pub struct SsaBuilder {
     /// becomes a single Cranelift `fsqrt` (or libm-backed `sin`/`cos`)
     /// instruction.
     intrinsic_alias_map: IndexMap<InternedString, crate::hir::Intrinsic>,
+    /// When set, the next `@reference`-class struct literal that
+    /// gets lowered uses this pointer as its allocation site INSTEAD
+    /// of emitting a fresh `Malloc`. Used by the array-of-`@reference`
+    /// literal lowering to pool-allocate the N bodies into one
+    /// contiguous buffer: spatial locality on cache-bound architectures
+    /// (x86 GHA runners) gets you the value-type access pattern while
+    /// preserving the pointer-array semantics user code expects.
+    ///
+    /// Always `None` outside the array-of-`@reference` literal path.
+    /// The array lowering pushes a slot pointer before each element
+    /// expression and clears it immediately after, so nested struct
+    /// literals don't get accidentally placed.
+    array_pool_placement: Option<HirId>,
 }
 
 /// Context for pattern matching
@@ -502,6 +515,7 @@ impl SsaBuilder {
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
             intrinsic_alias_map: default_intrinsic_alias_map(),
+            array_pool_placement: None,
         }
     }
 
@@ -544,6 +558,7 @@ impl SsaBuilder {
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
             intrinsic_alias_map: default_intrinsic_alias_map(),
+            array_pool_placement: None,
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -4852,33 +4867,45 @@ impl SsaBuilder {
                         }
                         let total_size = running.max(1);
 
-                        // Size constant for malloc.
-                        let size_const = self.create_value(
-                            HirType::I64,
-                            HirValueKind::Constant(crate::hir::HirConstant::I64(total_size as i64)),
-                        );
-
-                        // Emit `Call(Intrinsic::Malloc, [size])`. The
-                        // backend lowers Malloc to a libc call returning a
-                        // pointer; the SSA value is typed
-                        // `Ptr(Struct{..})` to match the struct's HIR
-                        // type.
-                        let malloc_result =
-                            self.create_value(struct_ty.clone(), HirValueKind::Instruction);
-                        self.add_instruction(
-                            block_id,
-                            HirInstruction::Call {
-                                result: Some(malloc_result),
-                                callee: crate::hir::HirCallable::Intrinsic(
-                                    crate::hir::Intrinsic::Malloc,
-                                ),
-                                args: vec![size_const],
-                                type_args: vec![],
-                                const_args: vec![],
-                                is_tail: false,
-                            },
-                        );
-                        self.add_use(size_const, malloc_result);
+                        // Allocation site. Two modes:
+                        //   * Normal: emit `Call(Intrinsic::Malloc, [size])`
+                        //     and field-store through the returned pointer.
+                        //   * Pooled (`array_pool_placement = Some(ptr)`):
+                        //     skip the malloc entirely — the array literal
+                        //     lowering pre-allocated one big buffer for all
+                        //     N bodies and handed us a pointer to slot i.
+                        //     Field stores go directly to that slot, so the
+                        //     N bodies end up contiguous in memory. Spatial
+                        //     locality matches a value-type Array<Body> on
+                        //     cache-bound architectures (x86 GHA runners)
+                        //     while preserving the pointer-array surface
+                        //     the rest of the compiler expects.
+                        let malloc_result = if let Some(slot_ptr) = self.array_pool_placement {
+                            slot_ptr
+                        } else {
+                            let size_const = self.create_value(
+                                HirType::I64,
+                                HirValueKind::Constant(crate::hir::HirConstant::I64(
+                                    total_size as i64,
+                                )),
+                            );
+                            let r = self.create_value(struct_ty.clone(), HirValueKind::Instruction);
+                            self.add_instruction(
+                                block_id,
+                                HirInstruction::Call {
+                                    result: Some(r),
+                                    callee: crate::hir::HirCallable::Intrinsic(
+                                        crate::hir::Intrinsic::Malloc,
+                                    ),
+                                    args: vec![size_const],
+                                    type_args: vec![],
+                                    const_args: vec![],
+                                    is_tail: false,
+                                },
+                            );
+                            self.add_use(size_const, r);
+                            r
+                        };
 
                         // For each field: emit GEP (byte offset) + Store.
                         // GEPs use HirType::U8 + a single i64 byte-offset
@@ -5039,9 +5066,84 @@ impl SsaBuilder {
                     },
                 );
 
+                // Pool-allocation eligibility: `elem_ty` is `Ptr(Struct(..))`
+                // (every element is an `@reference` class) AND every
+                // `elem_expr` is a direct `TypedExpression::Struct`
+                // literal. When eligible, we allocate ONE buffer of
+                // `N * sizeof(Struct)` and hand each struct literal a
+                // pre-computed slot pointer instead of letting it emit
+                // its own `Malloc`. Bodies land contiguously in memory;
+                // the pointer-array (`data_ptr` slots) still holds
+                // distinct per-body pointers so identity semantics are
+                // preserved.
+                let pool_eligible = matches!(elem_ty, HirType::Ptr(ref inner) if matches!(**inner, HirType::Struct(_)))
+                    && elements
+                        .iter()
+                        .all(|e| matches!(e.node, TypedExpression::Struct(_)));
+                let (pool_buf_ptr, pool_slot_size) = if pool_eligible {
+                    if let HirType::Ptr(ref inner) = elem_ty {
+                        let slot_size = hir_ty_size(inner);
+                        let pool_total = elements.len() * slot_size;
+                        let size_const = self.create_value(
+                            HirType::I64,
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(pool_total as i64)),
+                        );
+                        let pool = self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::Call {
+                                result: Some(pool),
+                                callee: crate::hir::HirCallable::Intrinsic(
+                                    crate::hir::Intrinsic::Malloc,
+                                ),
+                                args: vec![size_const],
+                                type_args: vec![],
+                                const_args: vec![],
+                                is_tail: false,
+                            },
+                        );
+                        self.add_use(size_const, pool);
+                        (Some(pool), slot_size)
+                    } else {
+                        (None, 0)
+                    }
+                } else {
+                    (None, 0)
+                };
+
                 // Step 2: Store each element into the data buffer
                 for (i, elem_expr) in elements.iter().enumerate() {
+                    // For pooled `@reference` arrays: compute slot_i =
+                    // pool_buf + i*slot_size and hand it to the struct
+                    // literal lowering via `array_pool_placement`. The
+                    // struct literal will use this pointer instead of
+                    // mallocing — fields land at pool_buf+i*slot_size+
+                    // field_offset, exactly contiguous.
+                    if let Some(pool) = pool_buf_ptr {
+                        let offset = i * pool_slot_size;
+                        let offset_const = self.create_value(
+                            HirType::I64,
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
+                        );
+                        let slot_ptr =
+                            self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::GetElementPtr {
+                                result: slot_ptr,
+                                ty: HirType::U8,
+                                ptr: pool,
+                                indices: vec![offset_const],
+                            },
+                        );
+                        self.add_use(pool, slot_ptr);
+                        self.add_use(offset_const, slot_ptr);
+                        self.array_pool_placement = Some(slot_ptr);
+                    }
                     let elem_val = self.translate_expression(block_id, elem_expr)?;
+                    // Clear immediately so it doesn't leak into nested
+                    // struct literals inside subsequent elements.
+                    self.array_pool_placement = None;
 
                     let offset = i * elem_size;
                     let offset_const = self.create_value(
