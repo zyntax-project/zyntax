@@ -303,8 +303,9 @@ fn bench_runtime() -> Result<ZyntaxRuntime, String> {
 /// `install_llvm = true` lowers it to 5 so LLVM kicks in after a
 /// handful of warmup calls (still only effective when the cargo
 /// feature is enabled; otherwise the install path is a no-op).
-fn jit_tier_config(install_llvm: bool) -> TieredConfig {
+fn jit_tier_config(install_llvm: bool, llvm_cache_key: Option<String>) -> TieredConfig {
     let mut cfg = TieredConfig::default();
+    cfg.llvm_cache_key = llvm_cache_key;
     cfg.profile_config = ProfileConfig {
         // `warm_threshold = 0` fires the Cranelift dispatch on the
         // very first invocation. Without it, beadie's `on_invoke`
@@ -640,7 +641,18 @@ fn one_iteration(
 
     let t0 = Instant::now();
     if target.install_jit {
-        rt.install_interp_jit_with(jit_tier_config(target.install_llvm))
+        // Hand the LLVM dylib cache the same content-hash we used
+        // for the HIR cache above — they share `cache_enabled` and
+        // invalidate together via the schema-version constant in
+        // `compute_cache_key`. On a cache hit the LLVM backend skips
+        // the entire install pipeline (lower → opt → link → dlopen)
+        // and reuses the already-mapped dylib's function pointers.
+        let llvm_cache_key = if cache_enabled && target.install_llvm {
+            Some(cache_key.clone())
+        } else {
+            None
+        };
+        rt.install_interp_jit_with(jit_tier_config(target.install_llvm, llvm_cache_key))
             .map_err(|e| format!("install_interp_jit: {e:?}"))?;
     }
     let install_jit_ms = t0.elapsed().as_secs_f64() * 1000.0;

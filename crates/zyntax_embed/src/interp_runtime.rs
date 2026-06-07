@@ -764,6 +764,7 @@ impl InterpRuntime {
             // before this gate landed; with it the LLVM compile sees
             // only the same subset Cranelift does.
             let llvm_reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
+            let llvm_cache_key = config.llvm_cache_key.clone();
             llvm.with_lock(|be| {
                 for (name, ptr, _arity) in &bc_symbols {
                     be.register_symbol(name.clone(), *ptr);
@@ -772,6 +773,7 @@ impl InterpRuntime {
                     be.register_symbol((*name).to_string(), *ptr);
                 }
                 be.set_only_compile_reachable(Some(llvm_reachable));
+                be.set_cache_key(llvm_cache_key);
             });
 
             let llvm_install_result = llvm.with_lock(|be| be.compile_module(&module));

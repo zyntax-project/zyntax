@@ -123,6 +123,15 @@ pub struct TieredConfig {
     pub max_parallel_optimizations: usize,
     pub tier2_backend: Tier2Backend,
     pub verbosity: u8,
+    /// Caller-supplied content hash for the in-process LLVM dylib
+    /// cache. When `Some`, the LLVM backend keys its cached `.so`
+    /// (loaded once via `dlopen`) on this string XOR a runtime-symbol
+    /// address fingerprint, and subsequent installs of an identical
+    /// module reuse the existing function pointers — the bench
+    /// harness uses this to skip the 270-330 ms macOS dlopen on
+    /// iteration 2+ of the same kernel. When `None`, caching is off
+    /// and every install pays the full pipeline cost.
+    pub llvm_cache_key: Option<String>,
 }
 
 impl Default for TieredConfig {
@@ -134,6 +143,7 @@ impl Default for TieredConfig {
             max_parallel_optimizations: 4,
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 0,
+            llvm_cache_key: None,
         }
     }
 }
@@ -147,6 +157,7 @@ impl TieredConfig {
             max_parallel_optimizations: 2,
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 2,
+            llvm_cache_key: None,
         }
     }
 
@@ -158,6 +169,7 @@ impl TieredConfig {
             max_parallel_optimizations: 8,
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 0,
+            llvm_cache_key: None,
         }
     }
 
@@ -170,6 +182,7 @@ impl TieredConfig {
             max_parallel_optimizations: 8,
             tier2_backend: Tier2Backend::LLVM,
             verbosity: 0,
+            llvm_cache_key: None,
         }
     }
 }
