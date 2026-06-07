@@ -418,9 +418,20 @@ impl InterpRuntime {
     /// otherwise defaults to 0.
     pub fn register_zrtl_symbols(&mut self, symbols: &[zyntax_compiler::zrtl::RuntimeSymbolInfo]) {
         for sym in symbols {
-            let param_count = sym.sig.map(|s| s.param_count).unwrap_or(0);
-            self.interp
-                .register_symbol(sym.name.to_string(), sym.ptr, param_count);
+            // Prefer the typed registration path when a signature is
+            // present — that wires the BC interp's `Op::CallSym`
+            // marshalling through the platform float ABI so float
+            // params don't bit-truncate. The untyped fallback stays
+            // for symbols registered without a sig (legacy plugin
+            // surface).
+            match sym.sig {
+                Some(sig) => self
+                    .interp
+                    .register_symbol_typed(sym.name.to_string(), sym.ptr, sig),
+                None => self
+                    .interp
+                    .register_symbol(sym.name.to_string(), sym.ptr, 0),
+            }
         }
     }
 

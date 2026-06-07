@@ -1447,6 +1447,14 @@ impl Memory {
 pub struct SymbolEntry {
     pub ptr: *const u8,
     pub param_count: u8,
+    /// Optional ZRTL signature describing arg / return TypeTags. When
+    /// `Some`, `Op::CallSym` dispatches through a typed-marshalling
+    /// path that respects the platform's float ABI (float args ride
+    /// xmm/v registers, not the int register file). Required for any
+    /// FFI symbol whose signature includes f32 / f64 — without it,
+    /// `value_to_i64` truncates floats to integers and the callee
+    /// reads garbage.
+    pub sig: Option<crate::zrtl::ZrtlSymbolSig>,
 }
 
 unsafe impl Send for SymbolEntry {}
@@ -1638,8 +1646,35 @@ impl HirInterpreter {
     }
 
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
-        self.symbols
-            .insert(name.into(), SymbolEntry { ptr, param_count });
+        self.symbols.insert(
+            name.into(),
+            SymbolEntry {
+                ptr,
+                param_count,
+                sig: None,
+            },
+        );
+    }
+
+    /// Typed registration variant — stores a ZRTL signature alongside
+    /// the function pointer so the BC interp's `Op::CallSym` can
+    /// route float arguments through the platform float ABI instead
+    /// of bit-truncating them.
+    pub fn register_symbol_typed(
+        &mut self,
+        name: impl Into<String>,
+        ptr: *const u8,
+        sig: crate::zrtl::ZrtlSymbolSig,
+    ) {
+        let param_count = sig.param_count;
+        self.symbols.insert(
+            name.into(),
+            SymbolEntry {
+                ptr,
+                param_count,
+                sig: Some(sig),
+            },
+        );
     }
 
     /// Snapshot of every registered FFI symbol — name → `(ptr,
@@ -2306,9 +2341,25 @@ impl HirInterpreter {
                                     .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?
                             }
                         };
-                        let raw = call_extern_symbol(entry.ptr, &arg_vals);
-                        let ty = &cf.type_pool[*ret_ty as usize];
-                        value_from_i64_as(ty, raw)
+                        // Typed marshalling path. When the symbol was
+                        // registered with a ZRTL signature
+                        // (e.g. via `register_zrtl_symbols` for the
+                        // `zyntax_box_*` family) the dispatch routes
+                        // float args through the platform float ABI
+                        // and reads the return register matching the
+                        // declared return TypeTag. Without this, f64
+                        // args bit-truncate through `value_to_i64` —
+                        // `zyntax_box_f64(2.5)` would arrive at the
+                        // callee with `xmm0 == 0.0`, silently
+                        // poisoning every Any cast on the BC interp
+                        // tier.
+                        if let Some(sig) = entry.sig {
+                            call_extern_symbol_typed(entry.ptr, &arg_vals, &sig)
+                        } else {
+                            let raw = call_extern_symbol(entry.ptr, &arg_vals);
+                            let ty = &cf.type_pool[*ret_ty as usize];
+                            value_from_i64_as(ty, raw)
+                        }
                     };
 
                     if *has_dst {
@@ -2870,6 +2921,90 @@ pub fn jit_float_mask(params: &[HirType]) -> u8 {
         }
     }
     mask
+}
+
+/// Typed marshalling of an FFI symbol call.
+///
+/// Routes each argument through the correct register file based on
+/// its declared `TypeTag` — float categories take the float ABI
+/// (`f64` / `f32` register), everything else flows through the
+/// integer register file via `value_to_i64`. The return is decoded
+/// from the matching register according to `sig.return_type`.
+///
+/// Only the 1-arg shapes used by the `zyntax_box_*` family are
+/// covered today; broader shapes fall through to the legacy untyped
+/// path, which is fine because the only signatures currently
+/// registered typed are box constructors / unboxers (param_count = 1)
+/// plus the void `zyntax_box_free`.
+///
+/// Cross-frontend: any DSL that registers FFI symbols with float
+/// parameters benefits from this path automatically — there is no
+/// ZynML-specific logic here.
+fn call_extern_symbol_typed(
+    ptr: *const u8,
+    args: &[ZyntaxValue],
+    sig: &crate::zrtl::ZrtlSymbolSig,
+) -> ZyntaxValue {
+    use crate::hir::HirType;
+    use crate::zrtl::TypeCategory;
+
+    let pcount = sig.param_count as usize;
+    let arg_is_float = |i: usize| matches!(sig.params[i].category(), TypeCategory::Float);
+    let ret_cat = sig.return_type.category();
+    let ret_hir = match ret_cat {
+        TypeCategory::Void => HirType::Void,
+        TypeCategory::Bool => HirType::Bool,
+        TypeCategory::Int | TypeCategory::UInt => HirType::I64,
+        TypeCategory::Float => HirType::F64,
+        TypeCategory::Pointer | TypeCategory::Opaque => HirType::I64,
+        _ => HirType::I64,
+    };
+
+    // The supported shape (1 param, float-or-int → int-or-float).
+    // Everything else falls through to the integer-register path.
+    if pcount == 1 {
+        let a0_float = arg_is_float(0);
+        let raw_int = || value_to_i64(&args[0]).unwrap_or(0);
+        let raw_f64 = || value_to_f64(&args[0]).unwrap_or(0.0);
+        unsafe {
+            return match (a0_float, ret_cat) {
+                (false, TypeCategory::Void) => {
+                    let f: extern "C" fn(i64) = core::mem::transmute(ptr);
+                    f(raw_int());
+                    ZyntaxValue::Void
+                }
+                (false, TypeCategory::Float) => {
+                    let f: extern "C" fn(i64) -> f64 = core::mem::transmute(ptr);
+                    ZyntaxValue::Float(f(raw_int()))
+                }
+                (false, _) => {
+                    let f: extern "C" fn(i64) -> i64 = core::mem::transmute(ptr);
+                    value_from_i64_as(&ret_hir, f(raw_int()))
+                }
+                (true, TypeCategory::Void) => {
+                    let f: extern "C" fn(f64) = core::mem::transmute(ptr);
+                    f(raw_f64());
+                    ZyntaxValue::Void
+                }
+                (true, TypeCategory::Float) => {
+                    let f: extern "C" fn(f64) -> f64 = core::mem::transmute(ptr);
+                    ZyntaxValue::Float(f(raw_f64()))
+                }
+                (true, _) => {
+                    let f: extern "C" fn(f64) -> i64 = core::mem::transmute(ptr);
+                    value_from_i64_as(&ret_hir, f(raw_f64()))
+                }
+            };
+        }
+    }
+
+    // Fallback: integer-register marshalling. Safe as long as no
+    // parameter is `Float` — the caller is expected to only register
+    // typed signatures with shapes this fn can route, but the
+    // fallback keeps the call sound (no UB) even if a wider sig
+    // sneaks in.
+    let raw = call_extern_symbol(ptr, args);
+    value_from_i64_as(&ret_hir, raw)
 }
 
 fn call_extern_symbol(ptr: *const u8, args: &[ZyntaxValue]) -> i64 {
