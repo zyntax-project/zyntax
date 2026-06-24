@@ -272,6 +272,11 @@ pub struct SymbolTable {
     /// Return types for declared functions
     /// Maps function name -> return Type (for resolving call expression types in SSA)
     pub function_return_types: indexmap::IndexMap<InternedString, zyntax_typed_ast::Type>,
+    /// Names of `fiber def` functions (`signature.is_fiber == true`).
+    /// SSA's Call handler consults this to detect when a call
+    /// should construct a paused fiber (`FiberNew`) rather than
+    /// running the body synchronously.
+    pub fiber_fn_names: std::collections::HashSet<InternedString>,
 }
 
 /// Import metadata for debugging and error messages
@@ -1662,6 +1667,9 @@ impl LoweringContext {
                 TypedDeclaration::Function(func) => {
                     let func_id = crate::hir::HirId::new();
                     self.symbols.functions.insert(func.name, func_id);
+                    if func.is_fiber {
+                        self.symbols.fiber_fn_names.insert(func.name);
+                    }
                     // Record return type for call-site type resolution.
                     // If return_type is Unit (no annotation) but body has `return <expr>`,
                     // infer Dynamic — the return type will be evaluated at runtime.
@@ -2104,7 +2112,8 @@ impl LoweringContext {
         .with_function_return_types(self.symbols.function_return_types.clone())
         .with_effect_op_map(effect_op_map)
         .with_resume_param_names(resume_param_names)
-        .with_param_typed_ast_types(param_typed_ast_types);
+        .with_param_typed_ast_types(param_typed_ast_types)
+        .with_fiber_fn_names(self.symbols.fiber_fn_names.clone());
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
         // Debug: check SSA result

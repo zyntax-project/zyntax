@@ -262,6 +262,15 @@ pub struct SsaBuilder {
     /// before any compilation runs. Callers that don't need
     /// extensibility use `BuiltinRegistry::with_defaults`.
     builtin_registry: Arc<crate::builtin_class::BuiltinRegistry>,
+    /// Set of function names whose declaration was a `fiber def`
+    /// (signature.is_fiber == true). The Call handler consults this
+    /// to detect when a call should lower to `FiberNew` instead of
+    /// a regular `Call(Function)` — calling a fiber def constructs
+    /// a paused fiber rather than running the body synchronously.
+    ///
+    /// Populated by lowering before any body is processed (fiber
+    /// defs can be called from anywhere).
+    fiber_fn_names: HashSet<InternedString>,
 }
 
 /// Context for pattern matching
@@ -564,6 +573,7 @@ impl SsaBuilder {
             intrinsic_alias_map: default_intrinsic_alias_map(),
             array_pool_placement: None,
             builtin_registry,
+            fiber_fn_names: HashSet::new(),
         }
     }
 
@@ -608,6 +618,7 @@ impl SsaBuilder {
             intrinsic_alias_map: default_intrinsic_alias_map(),
             array_pool_placement: None,
             builtin_registry: Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
+            fiber_fn_names: HashSet::new(),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -653,6 +664,16 @@ impl SsaBuilder {
     /// Maps alias names (e.g., "tensor_add") to ZRTL symbols (e.g., "$Tensor$add")
     pub fn with_extern_link_names(mut self, link_names: IndexMap<InternedString, String>) -> Self {
         self.extern_link_names = link_names;
+        self
+    }
+
+    /// Set the set of function names whose declaration was a
+    /// `fiber def` (signature.is_fiber == true). The Call handler
+    /// uses this to detect when a call should lower to `FiberNew`
+    /// instead of a regular `Call(Function)` — calling a fiber def
+    /// constructs a paused fiber rather than running the body.
+    pub fn with_fiber_fn_names(mut self, names: HashSet<InternedString>) -> Self {
+        self.fiber_fn_names = names;
         self
     }
 
@@ -3826,6 +3847,61 @@ impl SsaBuilder {
                             self.add_instruction(block_id, inst);
                             return Ok(result.unwrap_or_else(|| self.create_undef(HirType::Void)));
                         }
+                    }
+                }
+
+                // Fiber-def call-site lowering. When the callee is a
+                // `fiber def` (signature.is_fiber == true), construct
+                // a paused fiber via `FiberNew` instead of running
+                // the body synchronously. The fiber-fn name set is
+                // populated by lowering before any body is processed
+                // so direct calls in either direction work.
+                //
+                // MVP placeholder: closure handle and stack size are
+                // zero — enough to surface the `FiberNew` op in the
+                // lowered HIR and let the call site type as
+                // `Fiber<T>`. Wiring the actual function pointer
+                // through `krio_fiber_new` is a follow-up slice.
+                if let TypedExpression::Variable(func_name) = &callee.node {
+                    let is_fiber_call = self.fiber_fn_names.contains(func_name) || {
+                        let resolved = func_name.resolve_global().unwrap_or_default();
+                        !resolved.is_empty()
+                            && self
+                                .fiber_fn_names
+                                .contains(&InternedString::new_global(&resolved))
+                    };
+                    if is_fiber_call {
+                        let zero_closure = self.create_value(
+                            HirType::I64,
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+                        );
+                        let zero_stack = self.create_value(
+                            HirType::I64,
+                            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+                        );
+                        // Result type is `Fiber<T>` where T is the
+                        // fiber def's declared return (yield) type —
+                        // read from the call expression's typed-AST
+                        // type if it's already `Fiber<_>`, otherwise
+                        // wrap it.
+                        let fiber_inner = match &expr.ty {
+                            Type::Fiber(inner) => inner.as_ref().clone(),
+                            other => other.clone(),
+                        };
+                        let fiber_hir_ty =
+                            HirType::Fiber(Box::new(self.convert_type(&fiber_inner)));
+                        let result =
+                            self.create_value(fiber_hir_ty.clone(), HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::FiberNew {
+                                result,
+                                ty: fiber_hir_ty,
+                                closure: zero_closure,
+                                stack_size: zero_stack,
+                            },
+                        );
+                        return Ok(result);
                     }
                 }
 
