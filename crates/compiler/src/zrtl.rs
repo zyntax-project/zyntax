@@ -1905,6 +1905,16 @@ pub unsafe extern "C" fn krio_fiber_cancel(fiber: *mut FiberRepr) {
     fiber_backend().fiber_cancel(fiber)
 }
 
+/// `krio_fiber_abort_with` — Wren-style abort from inside the
+/// fiber body. Stashes `err` and yields; the caller's next
+/// `krio_fiber_resume` sees the latch in the backend and returns
+/// a step with `FIBER_STEP_ERRORED` and `err` in the payload bits.
+/// Only valid from inside a running fiber.
+#[no_mangle]
+pub extern "C" fn krio_fiber_abort_with(err: i64) {
+    fiber_backend().fiber_abort_with(err)
+}
+
 /// Return the list of `krio_fiber_*` runtime helpers as `(name, fn
 /// pointer, arity)` triples. Same surface as
 /// [`box_runtime_symbols`]; the runtime registers these
@@ -1923,6 +1933,11 @@ pub fn fiber_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("krio_fiber_yield", krio_fiber_yield as *const u8, 1),
         ("krio_fiber_transfer", krio_fiber_transfer as *const u8, 2),
         ("krio_fiber_cancel", krio_fiber_cancel as *const u8, 1),
+        (
+            "krio_fiber_abort_with",
+            krio_fiber_abort_with as *const u8,
+            1,
+        ),
     ]
 }
 

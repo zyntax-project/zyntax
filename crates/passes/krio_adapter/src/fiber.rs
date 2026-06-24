@@ -21,11 +21,29 @@
 //! short-lived bench shapes, will move to explicit drop when the
 //! frontend wires lifetime tracking.
 
+use std::cell::Cell;
+
 use krio_fiber::{Fiber, FiberStep};
 use zyntax_compiler::fiber_backend::{
     self, FiberCfg, FIBER_STEP_DONE, FIBER_STEP_ERRORED, FIBER_STEP_YIELDED,
 };
 use zyntax_compiler::zrtl::FiberRepr;
+
+thread_local! {
+    /// Payload latched by [`Self::fiber_abort_with`] before yielding
+    /// the active fiber. Promoted to the encoded step's `Errored`
+    /// payload by `encode_step` on the way back out, and cleared on
+    /// take so a subsequent ordinary yield doesn't inherit it.
+    ///
+    /// We can't unwind through the Cranelift-generated frame above
+    /// the `krio_fiber_abort_with` call cleanly (DWARF info varies
+    /// by platform / opt level), so the abort is implemented as a
+    /// *deferred* one: stash payload, yield, then have the resume-
+    /// side encoder swap `Yielded` for `Errored`. The fiber stays
+    /// suspended at the abort point; the krio cancel flag is also
+    /// set so any later resume returns `Done`.
+    static ABORT_PAYLOAD: Cell<Option<i64>> = const { Cell::new(None) };
+}
 
 /// Default fiber backend backed by krio-fiber. Stateless — the
 /// per-fiber state lives inside each `Fiber` instance; this struct is
@@ -47,9 +65,25 @@ impl Default for KrioFiberBackend {
 }
 
 /// Convert a krio-fiber `FiberStep` to the packed (tag, payload) i64
-/// the C-ABI surface returns. `Yielded` carries the u64 the fiber body
-/// passed to `yield_u64`; `Done` / `Errored` carry no payload (zero).
+/// the C-ABI surface returns.
+///
+/// * `Yielded` — if `ABORT_PAYLOAD` is latched, the yield was
+///   actually a `Fiber.abort(err)`; surface `Errored` with `err`
+///   in the payload (and the fiber's already had its cancel flag
+///   set so any later resume returns `Done`). Otherwise the
+///   payload is the u64 the body passed to `yield_u64`.
+/// * `Done` — fiber returned normally; payload 0.
+/// * `Errored` — krio-fiber-side panic catch fired (user-code
+///   panic, not `abort_with`); payload 0.
 fn encode_step(step: FiberStep, fiber: &Fiber) -> i64 {
+    if let Some(err) = ABORT_PAYLOAD.with(|cell| cell.take()) {
+        // Drain whatever yield value the body pushed (it's the err
+        // value we passed through `yield_u64` below — but the
+        // payload of record is `err`, not the slot value, so we
+        // just clear it).
+        let _ = fiber.take_yield_u64();
+        return fiber_backend::pack_fiber_step(FIBER_STEP_ERRORED, err);
+    }
     match step {
         FiberStep::Yielded => {
             let payload = fiber.take_yield_u64().unwrap_or(0) as i64;
@@ -145,6 +179,22 @@ impl FiberCfg for KrioFiberBackend {
     unsafe fn fiber_cancel(&self, fiber: *mut FiberRepr) {
         let fiber = &*(fiber as *const Fiber);
         fiber.cancel();
+    }
+
+    fn fiber_abort_with(&self, err: i64) {
+        // Latch the payload, then yield. The caller-side resume
+        // (via `encode_step`) sees the latch and surfaces an
+        // `Errored` step with `err` instead of `Yielded`. We can't
+        // unwind through Cranelift / LLVM-emitted frames on every
+        // platform without coordinating DWARF info, so the abort
+        // is *deferred*: the fiber body suspends at the abort point
+        // rather than panicking through it. The body's
+        // post-abort statements DO run if the caller resumes
+        // again — `while let Some(x) = f.next()` won't do that
+        // (the `None` from Errored ends the loop), so the typical
+        // iterator pattern observes Wren-style semantics.
+        ABORT_PAYLOAD.with(|cell| cell.set(Some(err)));
+        let _ = krio_fiber::yield_u64(err as u64);
     }
 }
 

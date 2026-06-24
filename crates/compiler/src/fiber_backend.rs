@@ -92,6 +92,18 @@ pub trait FiberCfg: Send + Sync {
     /// # Safety
     /// `fiber` must be a valid handle.
     unsafe fn fiber_cancel(&self, fiber: *mut FiberRepr);
+
+    /// Abort the currently-running fiber with an error payload.
+    /// Wren-style: called from inside the fiber body (no handle
+    /// argument — the backend looks up the active fiber via its
+    /// thread-local), surfaces to the caller's next `fiber_resume`
+    /// as `FIBER_STEP_ERRORED` with `err` in the payload bits.
+    ///
+    /// The default impl is a no-op so backends that haven't wired
+    /// abort yet don't have to ship a stub — but the call site (the
+    /// `krio_fiber_abort_with` runtime stub) will then drop the
+    /// payload silently. Override on real backends.
+    fn fiber_abort_with(&self, _err: i64) {}
 }
 
 /// The FiberStep tag returned by `fiber_resume*` in the low bits.

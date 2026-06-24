@@ -1429,6 +1429,20 @@ impl ZyntaxRuntime {
         // Wrap program's type registry in Arc for sharing (it now includes registered traits and impls)
         let type_registry_arc = std::sync::Arc::new(program.type_registry.clone());
 
+        // Compiler-known built-in types route their static method
+        // calls through the same mangled-symbol path stdlib
+        // extern-struct methods do. For Fiber<T> the only
+        // intercepted static method today is `Fiber.abort(err)` —
+        // Wren-style abort from inside a fiber body — which maps to
+        // the `krio_fiber_abort_with` runtime stub. Inject the
+        // alias so the dot-static rewrite's
+        // `resolve_associated_function_to_mangled` finds
+        // `Fiber$abort` and emits a Call.
+        let mut builtins = builtins;
+        builtins
+            .entry("Fiber$abort".to_string())
+            .or_insert_with(|| "krio_fiber_abort_with".to_string());
+
         // Create LoweringConfig with builtins for extern call resolution
         let lowering_config = LoweringConfig {
             builtins,
@@ -3708,6 +3722,15 @@ impl TieredRuntime {
         let module_name = InternedString::new_global("main");
         // Use the type registry from the parsed program (now contains registered structs)
         let type_registry = std::sync::Arc::new(program.type_registry.clone());
+
+        // Fiber<T>'s `Fiber.abort(err)` static method maps to the
+        // `krio_fiber_abort_with` runtime stub (Wren-style abort
+        // from inside the fiber body). See the matching entry in
+        // `lower_typed_program`'s public entry point.
+        let mut builtins = builtins;
+        builtins
+            .entry("Fiber$abort".to_string())
+            .or_insert_with(|| "krio_fiber_abort_with".to_string());
 
         // Create LoweringConfig with builtins for extern call resolution
         let lowering_config = LoweringConfig {

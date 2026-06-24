@@ -98,3 +98,35 @@ fn fiber_cancel_stops_iteration() {
     let result = run_returning_int(src).expect("fiber program should execute");
     assert_eq!(result, 3, "1 + 2 should sum to 3 (cancel stops the rest)");
 }
+
+/// `Fiber.abort(err)` from inside the fiber body — Wren-style.
+/// The body yields a value, then aborts with an error payload;
+/// the caller's `f.next()` returns `None` (the iteration ends)
+/// instead of seeing the post-abort yields. Implemented as a
+/// deferred abort: the body suspends at the abort point, the
+/// resume side's `encode_step` swaps `Yielded` for `Errored`.
+#[test]
+fn fiber_abort_stops_iteration() {
+    let src = r#"
+        fiber def maybe_error(): i64 {
+            yield 10
+            Fiber.abort(99)
+            yield 20
+            yield 30
+        }
+
+        def main(): i64 {
+            let f = maybe_error()
+            let mut sum: i64 = 0
+            while let Some(x) = f.next() {
+                sum = sum + x
+            }
+            return sum
+        }
+    "#;
+    let result = run_returning_int(src).expect("fiber program should execute");
+    assert_eq!(
+        result, 10,
+        "yield 10 fires; Fiber.abort(99) stops the loop before yield 20 / yield 30"
+    );
+}
