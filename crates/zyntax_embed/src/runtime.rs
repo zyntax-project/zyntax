@@ -887,6 +887,14 @@ pub struct ZyntaxRuntime {
     /// to it. Wrapped in `Mutex` so `&self` methods can mutate the
     /// interp's per-call state.
     interp: std::sync::Mutex<crate::interp_runtime::InterpRuntime>,
+    /// Wrapper-class registry for compiler-known built-in types
+    /// (Fiber<T>, future SimdVector<T,N>, ...). Seeded with the
+    /// compiler's defaults at construction; embedders register
+    /// additional classes via `register_builtin_class` BEFORE any
+    /// compilation runs. Wrapped in `Arc<Mutex<_>>` so the
+    /// registration API can mutate while compilation reads a clone
+    /// of the `Arc<BuiltinRegistry>` snapshot.
+    builtin_registry: Arc<std::sync::Mutex<zyntax_compiler::builtin_class::BuiltinRegistry>>,
 }
 
 /// An external function that can be called from Zyntax code
@@ -939,6 +947,9 @@ impl ZyntaxRuntime {
             runtime_events: Vec::new(),
             event_sink: None,
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
+            builtin_registry: Arc::new(std::sync::Mutex::new(
+                zyntax_compiler::builtin_class::BuiltinRegistry::with_defaults(),
+            )),
         };
         // Register the algebraic-effects runtime symbols
         // (`__zyntax_effect_*`) up front so any module compiled later
@@ -984,6 +995,9 @@ impl ZyntaxRuntime {
             runtime_events: Vec::new(),
             event_sink: None,
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
+            builtin_registry: Arc::new(std::sync::Mutex::new(
+                zyntax_compiler::builtin_class::BuiltinRegistry::with_defaults(),
+            )),
         };
         crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
         for (name, ptr, arity) in zyntax_compiler::zrtl::box_runtime_symbols() {
@@ -1452,6 +1466,12 @@ impl ZyntaxRuntime {
             lowering_config,
         );
 
+        // Snapshot the runtime's wrapper-class registry (defaults +
+        // any embedder-registered classes) into the lowering ctx so
+        // every per-function SsaBuilder dispatches against the same
+        // built-in set.
+        lowering_ctx.set_builtin_registry(self.snapshot_builtin_registry());
+
         let mut hir_module = lowering_ctx
             .lower_program(&mut program)
             .map_err(|e| RuntimeError::Execution(format!("Lowering error: {:?}", e)))?;
@@ -1685,6 +1705,40 @@ impl ZyntaxRuntime {
         if let Ok(mut interp) = self.interp.lock() {
             interp.register_zrtl_symbols(symbols);
         }
+    }
+
+    /// Register an additional built-in wrapper class. Called before
+    /// any compilation runs; the registered class joins the
+    /// compiler's defaults (Fiber<T>, future SimdVector<T,N>, ...)
+    /// in the registry that `lower_typed_program` snapshots into
+    /// the lowering ctx.
+    ///
+    /// Embedders use this to surface host-specific built-in types
+    /// without modifying the compiler crate — same architectural
+    /// seam ZRTL symbols use for runtime functions.
+    pub fn register_builtin_class(
+        &self,
+        class: Arc<dyn zyntax_compiler::builtin_class::BuiltinClass + Send + Sync>,
+    ) {
+        if let Ok(mut reg) = self.builtin_registry.lock() {
+            reg.register(class);
+        }
+    }
+
+    /// Snapshot the current built-in registry into an
+    /// `Arc<BuiltinRegistry>` for the lowering ctx. Each call
+    /// produces a fresh registry that's a clone of the current
+    /// classes — `lower_typed_program` calls this once per
+    /// compilation so any classes registered AFTER the snapshot
+    /// won't apply until the next compilation.
+    fn snapshot_builtin_registry(&self) -> Arc<zyntax_compiler::builtin_class::BuiltinRegistry> {
+        let mut snapshot = zyntax_compiler::builtin_class::BuiltinRegistry::new();
+        if let Ok(reg) = self.builtin_registry.lock() {
+            for class in reg.classes() {
+                snapshot.register(class.clone());
+            }
+        }
+        Arc::new(snapshot)
     }
 
     /// Install the BC interp → Cranelift opt [→ LLVM] tier ladder for

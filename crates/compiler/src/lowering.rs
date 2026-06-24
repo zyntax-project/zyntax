@@ -241,6 +241,12 @@ pub struct LoweringContext {
     pub ownership_modes: HashMap<HirId, OwnershipMode>,
     /// Types that implement Copy trait (for deciding between move and copy semantics)
     pub copy_types: std::collections::HashSet<zyntax_typed_ast::TypeId>,
+    /// Wrapper-class registry for built-in types. Cloned into every
+    /// per-function `SsaBuilder` so the dispatch tables are
+    /// consistent across the whole module. Embedders populate this
+    /// via `ZyntaxRuntime::register_builtin_class` before
+    /// compilation runs.
+    pub builtin_registry: Arc<crate::builtin_class::BuiltinRegistry>,
 }
 
 /// Symbol table for name resolution
@@ -458,7 +464,18 @@ impl LoweringContext {
             resolved_module_cache: std::collections::HashMap::new(),
             ownership_modes: HashMap::new(),
             copy_types: std::collections::HashSet::new(),
+            builtin_registry: Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
         }
+    }
+
+    /// Replace the built-in wrapper-class registry. Called by
+    /// `zyntax_embed::ZyntaxRuntime::lower_typed_program` to inject
+    /// the runtime's registry (which may have embedder-registered
+    /// classes on top of the defaults). The registry is shared via
+    /// `Arc` so per-function `SsaBuilder` instances clone it
+    /// cheaply.
+    pub fn set_builtin_registry(&mut self, registry: Arc<crate::builtin_class::BuiltinRegistry>) {
+        self.builtin_registry = registry;
     }
 
     /// Set the ownership mode for a value
@@ -2074,11 +2091,12 @@ impl LoweringContext {
         }
 
         // Convert to SSA form, processing TypedStatements to emit HIR instructions
-        let ssa_builder = SsaBuilder::new(
+        let ssa_builder = SsaBuilder::with_builtin_registry(
             hir_func,
             self.type_registry.clone(),
             self.arena.clone(),
             self.symbols.functions.clone(),
+            self.builtin_registry.clone(),
         )
         .with_return_type(func.return_type.clone())
         .with_extern_link_names(self.symbols.extern_link_names.clone())

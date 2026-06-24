@@ -252,6 +252,16 @@ pub struct SsaBuilder {
     /// expression and clears it immediately after, so nested struct
     /// literals don't get accidentally placed.
     array_pool_placement: Option<HirId>,
+    /// Wrapper-class registry for compiler-known built-in types
+    /// (Fiber<T>, future SimdVector<T,N>, ...). The `MethodCall`
+    /// handler consults this before normal trait method resolution.
+    ///
+    /// `Arc` shared with the runtime so embedders
+    /// (`zyntax_embed::ZyntaxRuntime`) can register additional
+    /// built-in classes via `runtime.register_builtin_class(...)`
+    /// before any compilation runs. Callers that don't need
+    /// extensibility use `BuiltinRegistry::with_defaults`.
+    builtin_registry: Arc<crate::builtin_class::BuiltinRegistry>,
 }
 
 /// Context for pattern matching
@@ -490,11 +500,37 @@ fn default_intrinsic_alias_map() -> IndexMap<InternedString, crate::hir::Intrins
 }
 
 impl SsaBuilder {
+    /// Construct an `SsaBuilder` using the default built-in registry.
+    /// Most call sites use this — callers that need to register
+    /// additional `BuiltinClass` entries (typically `zyntax_embed`)
+    /// build a shared `Arc<BuiltinRegistry>` ahead of time and pass
+    /// it through [`Self::with_builtin_registry`].
     pub fn new(
         function: HirFunction,
         type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
         arena: Arc<std::sync::Mutex<zyntax_typed_ast::AstArena>>,
         function_symbols: IndexMap<InternedString, HirId>,
+    ) -> Self {
+        Self::with_builtin_registry(
+            function,
+            type_registry,
+            arena,
+            function_symbols,
+            Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
+        )
+    }
+
+    /// Like [`Self::new`] but with an externally-managed
+    /// `BuiltinRegistry`. The runtime owns the registry as an
+    /// `Arc<BuiltinRegistry>` populated with defaults plus any
+    /// embedder-registered classes, and clones the `Arc` into every
+    /// per-function builder.
+    pub fn with_builtin_registry(
+        function: HirFunction,
+        type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
+        arena: Arc<std::sync::Mutex<zyntax_typed_ast::AstArena>>,
+        function_symbols: IndexMap<InternedString, HirId>,
+        builtin_registry: Arc<crate::builtin_class::BuiltinRegistry>,
     ) -> Self {
         Self {
             function,
@@ -527,6 +563,7 @@ impl SsaBuilder {
             preset_param_typed_ast_types: IndexMap::new(),
             intrinsic_alias_map: default_intrinsic_alias_map(),
             array_pool_placement: None,
+            builtin_registry,
         }
     }
 
@@ -570,6 +607,7 @@ impl SsaBuilder {
             preset_param_typed_ast_types: IndexMap::new(),
             intrinsic_alias_map: default_intrinsic_alias_map(),
             array_pool_placement: None,
+            builtin_registry: Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -7722,12 +7760,14 @@ impl SsaBuilder {
         Some(unboxed)
     }
 
-    /// Built-in method dispatch. Receivers whose type is a
-    /// compiler-known first-class variant route through dedicated
-    /// HIR ops instead of normal trait method dispatch. Adding a
-    /// new built-in is one match arm here, not another `if
-    /// receiver_name == "..."` guard scattered through the
-    /// MethodCall path.
+    /// Built-in method dispatch. Receivers whose type matches a
+    /// registered `BuiltinClass` (see `builtin_class.rs`) route
+    /// through that class's `dispatch` table instead of normal
+    /// trait method resolution. Adding a new method to an existing
+    /// built-in is one arm in that class's `dispatch`; adding a
+    /// whole new built-in type is one `impl BuiltinClass` and one
+    /// entry in `BuiltinRegistry::default_classes`. The SSA
+    /// `MethodCall` handler stays unchanged.
     fn maybe_intercept_builtin_method_call(
         &mut self,
         block_id: HirId,
@@ -7741,15 +7781,23 @@ impl SsaBuilder {
             None => return Ok(None),
         };
 
-        match receiver_type {
-            Type::Fiber(_) => match method_name.as_str() {
-                "next" => self
-                    .emit_fiber_next(block_id, receiver_expr, result_ty)
-                    .map(Some),
-                _ => Ok(None),
-            },
-            _ => Ok(None),
-        }
+        // Clone the matching class out of the registry as an Arc —
+        // its lifetime is independent of `self`, so the subsequent
+        // `dispatch` call can take `&mut self` freely.
+        let class = match self.builtin_registry.class_for(receiver_type) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        class.dispatch(
+            self,
+            block_id,
+            method_name.as_str(),
+            receiver_expr,
+            receiver_type,
+            &[],
+            result_ty,
+        )
     }
 
     /// Emit the HIR for `Fiber<T>::next() -> Option<T>`. The prelude
@@ -7757,7 +7805,7 @@ impl SsaBuilder {
     /// a `FiberResume` plus an inline decode of the packed FiberStep
     /// into the `Option<T>` enum variants (Some on Yielded, None on
     /// Done / Errored).
-    fn emit_fiber_next(
+    pub(crate) fn emit_fiber_next(
         &mut self,
         block_id: HirId,
         receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
