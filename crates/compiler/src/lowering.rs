@@ -602,6 +602,14 @@ impl AstLowering for LoweringContext {
         // First pass: collect all declarations
         self.collect_declarations(program)?;
 
+        // Wrap typed-AST `Call(...)` expressions for fiber defs so
+        // their resolved type is `Fiber<T>` (what callers see) rather
+        // than the function's declared yield type T. The type checker
+        // doesn't know about `is_fiber` and would otherwise leave
+        // call.ty = T, which downstream method dispatch (`.next()`)
+        // can't dispatch against.
+        Self::wrap_fiber_call_types(program, &self.symbols.fiber_fn_names);
+
         // Second pass: lower each declaration
         for decl in &program.declarations {
             self.lower_declaration(decl)?;
@@ -1690,9 +1698,20 @@ impl LoweringContext {
                     } else {
                         func.return_type.clone()
                     };
+                    // `fiber def NAME(): T` declares T as the body's
+                    // yield type. Callers see `Fiber<T>` — wrap here
+                    // so the type checker, call-site type
+                    // resolution, and method dispatch all reason
+                    // about the call result as the first-class
+                    // `Type::Fiber(T)` variant.
+                    let publicly_visible_return = if func.is_fiber {
+                        zyntax_typed_ast::Type::Fiber(Box::new(effective_return_type))
+                    } else {
+                        effective_return_type
+                    };
                     self.symbols
                         .function_return_types
-                        .insert(func.name, effective_return_type);
+                        .insert(func.name, publicly_visible_return);
                     // Record default parameter info for functions with optional params
                     if func.params.iter().any(|p| p.default_value.is_some()) {
                         self.symbols
@@ -1836,6 +1855,190 @@ impl LoweringContext {
         }
 
         Ok(())
+    }
+
+    /// Walk the typed program and rewrite the `.ty` of every
+    /// `Call(callee=Variable(name))` expression where `name` is in
+    /// `fiber_fn_names` so it becomes `Type::Fiber(T)` — wrapping
+    /// the function's declared yield type T.
+    ///
+    /// The type checker doesn't know about `is_fiber`, so it leaves
+    /// the call expression typed as the function's declared return
+    /// (the yield type). This pass corrects that view AFTER type
+    /// checking but BEFORE SSA, so downstream method dispatch
+    /// (`f.next()`) sees the receiver as `Fiber<T>` and routes
+    /// through `FiberClass` rather than failing as a primitive.
+    fn wrap_fiber_call_types(
+        program: &mut TypedProgram,
+        fiber_fn_names: &std::collections::HashSet<InternedString>,
+    ) {
+        use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedStatement};
+        use zyntax_typed_ast::Type;
+
+        fn rewrite_expr(
+            node: &mut zyntax_typed_ast::TypedNode<TypedExpression>,
+            fns: &std::collections::HashSet<InternedString>,
+        ) {
+            // Pre-order: rewrite this node, then descend into children.
+            if let TypedExpression::Call(call) = &node.node {
+                if let TypedExpression::Variable(name) = &call.callee.node {
+                    let is_fiber_call = fns.contains(name) || {
+                        let resolved = name.resolve_global().unwrap_or_default();
+                        !resolved.is_empty() && fns.contains(&InternedString::new_global(&resolved))
+                    };
+                    if is_fiber_call {
+                        let inner = std::mem::take(&mut node.ty);
+                        node.ty = Type::Fiber(Box::new(inner));
+                    }
+                }
+            }
+            descend_expr(node, fns);
+        }
+
+        fn descend_expr(
+            node: &mut zyntax_typed_ast::TypedNode<TypedExpression>,
+            fns: &std::collections::HashSet<InternedString>,
+        ) {
+            match &mut node.node {
+                TypedExpression::Call(call) => {
+                    rewrite_expr(&mut call.callee, fns);
+                    for arg in &mut call.positional_args {
+                        rewrite_expr(arg, fns);
+                    }
+                    for named in &mut call.named_args {
+                        rewrite_expr(&mut named.value, fns);
+                    }
+                }
+                TypedExpression::MethodCall(mc) => {
+                    rewrite_expr(&mut mc.receiver, fns);
+                    for arg in &mut mc.positional_args {
+                        rewrite_expr(arg, fns);
+                    }
+                    for named in &mut mc.named_args {
+                        rewrite_expr(&mut named.value, fns);
+                    }
+                }
+                TypedExpression::Binary(b) => {
+                    rewrite_expr(&mut b.left, fns);
+                    rewrite_expr(&mut b.right, fns);
+                }
+                TypedExpression::Unary(u) => rewrite_expr(&mut u.operand, fns),
+                TypedExpression::Field(f) => rewrite_expr(&mut f.object, fns),
+                TypedExpression::Index(i) => {
+                    rewrite_expr(&mut i.object, fns);
+                    rewrite_expr(&mut i.index, fns);
+                }
+                TypedExpression::Array(elems) => {
+                    for e in elems {
+                        rewrite_expr(e, fns);
+                    }
+                }
+                TypedExpression::Tuple(elems) => {
+                    for e in elems {
+                        rewrite_expr(e, fns);
+                    }
+                }
+                TypedExpression::Block(b) => rewrite_block(b, fns),
+                TypedExpression::If(if_expr) => {
+                    rewrite_expr(&mut if_expr.condition, fns);
+                    rewrite_expr(&mut if_expr.then_branch, fns);
+                    rewrite_expr(&mut if_expr.else_branch, fns);
+                }
+                TypedExpression::Match(m) => {
+                    rewrite_expr(&mut m.scrutinee, fns);
+                    for arm in &mut m.arms {
+                        if let Some(g) = &mut arm.guard {
+                            rewrite_expr(g, fns);
+                        }
+                        rewrite_expr(&mut arm.body, fns);
+                    }
+                }
+                TypedExpression::Cast(c) => rewrite_expr(&mut c.expr, fns),
+                TypedExpression::Await(inner) => rewrite_expr(inner, fns),
+                TypedExpression::Try(inner) => rewrite_expr(inner, fns),
+                TypedExpression::Reference(r) => rewrite_expr(&mut r.expr, fns),
+                TypedExpression::Dereference(d) => rewrite_expr(d, fns),
+                TypedExpression::Range(r) => {
+                    if let Some(s) = &mut r.start {
+                        rewrite_expr(s, fns);
+                    }
+                    if let Some(e) = &mut r.end {
+                        rewrite_expr(e, fns);
+                    }
+                }
+                TypedExpression::Struct(s) => {
+                    for f in &mut s.fields {
+                        rewrite_expr(&mut f.value, fns);
+                    }
+                }
+                _ => {} // leaves: Literal, Variable, etc.
+            }
+        }
+
+        fn rewrite_stmt(
+            stmt: &mut zyntax_typed_ast::TypedNode<TypedStatement>,
+            fns: &std::collections::HashSet<InternedString>,
+        ) {
+            match &mut stmt.node {
+                TypedStatement::Expression(e) => rewrite_expr(e, fns),
+                TypedStatement::Let(let_stmt) => {
+                    if let Some(init) = &mut let_stmt.initializer {
+                        rewrite_expr(init, fns);
+                        // If the initializer is now `Fiber<T>` (the
+                        // pre-pass just wrapped a fiber-fn Call),
+                        // the let binding's recorded type must
+                        // match. The type checker had it as T
+                        // (gen's declared return); update to
+                        // Fiber<T> so the Let handler in SSA stores
+                        // the right thing in `var_typed_ast_types`.
+                        if let Type::Fiber(_) = &init.ty {
+                            let_stmt.ty = init.ty.clone();
+                        }
+                    }
+                }
+                TypedStatement::Return(Some(e)) => rewrite_expr(e, fns),
+                TypedStatement::Yield(e) => rewrite_expr(e, fns),
+                TypedStatement::If(if_stmt) => {
+                    rewrite_expr(&mut if_stmt.condition, fns);
+                    rewrite_block(&mut if_stmt.then_block, fns);
+                    if let Some(else_b) = &mut if_stmt.else_block {
+                        rewrite_block(else_b, fns);
+                    }
+                }
+                TypedStatement::While(w) => {
+                    rewrite_expr(&mut w.condition, fns);
+                    rewrite_block(&mut w.body, fns);
+                }
+                TypedStatement::For(f) => {
+                    rewrite_expr(&mut f.iterator, fns);
+                    rewrite_block(&mut f.body, fns);
+                }
+                TypedStatement::Match(m) => {
+                    rewrite_expr(&mut m.scrutinee, fns);
+                    for arm in &mut m.arms {
+                        rewrite_expr(&mut arm.body, fns);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn rewrite_block(
+            block: &mut zyntax_typed_ast::TypedBlock,
+            fns: &std::collections::HashSet<InternedString>,
+        ) {
+            for stmt in &mut block.statements {
+                rewrite_stmt(stmt, fns);
+            }
+        }
+
+        for decl in &mut program.declarations {
+            if let TypedDeclaration::Function(f) = &mut decl.node {
+                if let Some(body) = &mut f.body {
+                    rewrite_block(body, fiber_fn_names);
+                }
+            }
+        }
     }
 
     /// Lower a declaration

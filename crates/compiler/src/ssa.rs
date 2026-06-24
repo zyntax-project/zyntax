@@ -3857,11 +3857,11 @@ impl SsaBuilder {
                 // populated by lowering before any body is processed
                 // so direct calls in either direction work.
                 //
-                // MVP placeholder: closure handle and stack size are
-                // zero — enough to surface the `FiberNew` op in the
-                // lowered HIR and let the call site type as
-                // `Fiber<T>`. Wiring the actual function pointer
-                // through `krio_fiber_new` is a follow-up slice.
+                // The function pointer to the fiber body is
+                // materialised via `CreateClosure` with empty
+                // captures — the cranelift backend lowers that to a
+                // raw `func_addr`, which is exactly what
+                // `krio_fiber_new` needs as its first argument.
                 if let TypedExpression::Variable(func_name) = &callee.node {
                     let is_fiber_call = self.fiber_fn_names.contains(func_name) || {
                         let resolved = func_name.resolve_global().unwrap_or_default();
@@ -3871,19 +3871,53 @@ impl SsaBuilder {
                                 .contains(&InternedString::new_global(&resolved))
                     };
                     if is_fiber_call {
-                        let zero_closure = self.create_value(
-                            HirType::I64,
-                            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+                        // Look up the fiber body's HirFunction id.
+                        let fiber_fn_id = self
+                            .function_symbols
+                            .get(func_name)
+                            .copied()
+                            .or_else(|| {
+                                let resolved = func_name.resolve_global().unwrap_or_default();
+                                if resolved.is_empty() {
+                                    None
+                                } else {
+                                    self.function_symbols
+                                        .get(&InternedString::new_global(&resolved))
+                                        .copied()
+                                }
+                            })
+                            .ok_or_else(|| {
+                                crate::CompilerError::Lowering(format!(
+                                    "fiber def `{}` not found in function table",
+                                    func_name.resolve_global().unwrap_or_default()
+                                ))
+                            })?;
+
+                        // CreateClosure with no captures yields the
+                        // raw function pointer as an i64 — see the
+                        // backend's `func_addr` lowering for the op.
+                        let fn_ptr = self.create_value(HirType::I64, HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::CreateClosure {
+                                result: fn_ptr,
+                                closure_ty: HirType::I64,
+                                function: fiber_fn_id,
+                                captures: vec![],
+                            },
                         );
+
+                        // Stack size 0 → krio_fiber_new uses its
+                        // default. A future API surface can plumb
+                        // an explicit stack-size hint from a
+                        // `@stack_size(N)` annotation.
                         let zero_stack = self.create_value(
                             HirType::I64,
                             HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
                         );
+
                         // Result type is `Fiber<T>` where T is the
-                        // fiber def's declared return (yield) type —
-                        // read from the call expression's typed-AST
-                        // type if it's already `Fiber<_>`, otherwise
-                        // wrap it.
+                        // fiber def's declared return (yield) type.
                         let fiber_inner = match &expr.ty {
                             Type::Fiber(inner) => inner.as_ref().clone(),
                             other => other.clone(),
@@ -3897,7 +3931,7 @@ impl SsaBuilder {
                             HirInstruction::FiberNew {
                                 result,
                                 ty: fiber_hir_ty,
-                                closure: zero_closure,
+                                closure: fn_ptr,
                                 stack_size: zero_stack,
                             },
                         );
@@ -7981,11 +8015,14 @@ impl SsaBuilder {
         );
         self.add_use(payload_val, some_val);
 
-        // None has no payload — feed an empty-struct constant
-        // (same shape `TypedLiteral::Unit` lowers to).
+        // None has no payload — feed an i64 zero constant
+        // (CreateUnion's `value` slot accepts any HirId, and an
+        // empty-struct constant trips the Cranelift backend's
+        // `value_map[value]` lookup since constants aren't always
+        // pre-populated). i64(0) is well-supported.
         let unit_val = self.create_value(
-            HirType::Void,
-            HirValueKind::Constant(crate::hir::HirConstant::Struct(vec![])),
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
         );
         let none_val = self.create_value(option_hir_ty.clone(), HirValueKind::Instruction);
         self.add_instruction(
@@ -8873,6 +8910,38 @@ impl SsaBuilder {
                     }
                     _ => node.ty.clone(),
                 }
+            }
+            // Direct function call `f(args)` — the parser sets the
+            // expression type to `Type::Any` (see
+            // `runtime2/interpreter.rs::construct_expression`),
+            // so we recover the real return type from the
+            // callee's `function_return_types` entry. For
+            // `fiber def`, `collect_declarations` wraps the
+            // recorded type as `Type::Fiber(T)`, so the resolved
+            // call result already lands as `Fiber<T>` — which is
+            // what downstream method dispatch (`.next()`) needs to
+            // see for the receiver type.
+            TypedExpression::Call(call) => {
+                if let TypedExpression::Variable(func_name) = &call.callee.node {
+                    if let Some(ret_ty) = self
+                        .function_return_types
+                        .get(func_name)
+                        .cloned()
+                        .or_else(|| {
+                            let resolved = func_name.resolve_global().unwrap_or_default();
+                            if resolved.is_empty() {
+                                None
+                            } else {
+                                self.function_return_types
+                                    .get(&InternedString::new_global(&resolved))
+                                    .cloned()
+                            }
+                        })
+                    {
+                        return ret_ty;
+                    }
+                }
+                node.ty.clone()
             }
             // Array literal `[a, b, c]` — the parser fills `element_type`
             // from the first element's `expr.ty`, but if the first
