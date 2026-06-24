@@ -11200,6 +11200,13 @@ impl HirInstruction {
             // Async state-machine slot ops (Phase E1)
             HirInstruction::AsyncLoadSlot { result, .. } => Some(*result),
             HirInstruction::AsyncSaveSlot { .. } => None,
+
+            // First-class fiber ops
+            HirInstruction::FiberNew { result, .. }
+            | HirInstruction::FiberResume { result, .. }
+            | HirInstruction::FiberResumeWith { result, .. }
+            | HirInstruction::FiberTransfer { result, .. } => Some(*result),
+            HirInstruction::FiberYield { .. } | HirInstruction::FiberCancel { .. } => None,
         }
     }
 }

@@ -766,6 +766,94 @@ pub enum HirInstruction {
         frame: HirId,
         slot: u32,
     },
+
+    // ─────────────────────────────────────────────────────────────
+    // First-class fibers.
+    //
+    // Six ops that form the cross-frontend, cross-backend contract
+    // for stackful coroutines. Frontend syntax (`fiber def` in one
+    // DSL, `coro fn` in another) lowers to these; backend impls
+    // (native fiber runtime / wasm stack-switching proposal /
+    // stackless-emulation fallback) all see the same opcode set
+    // behind a common runtime trait.
+    //
+    // The HIR carries the abstraction so the choice of stackful vs
+    // stackless lives at the lowering pass, not at the frontend.
+    // ─────────────────────────────────────────────────────────────
+    /// Construct a paused fiber from a typed function reference.
+    ///
+    /// `closure` is the fiber body — an SSA value holding a callable
+    /// handle (function pointer, closure struct ptr, or capture-env
+    /// box, depending on backend). `stack_size` is the initial
+    /// per-fiber stack allocation in bytes; backends may round up to
+    /// platform page size. `result` is a `Ptr(Opaque("$Fiber"))` —
+    /// the opaque handle the rest of the fiber ops thread through.
+    ///
+    /// Lowers to `krio_fiber_new` on native, `cont.new` on wasm
+    /// stack-switching, or a state-machine lift on stackless.
+    FiberNew {
+        result: HirId,
+        ty: HirType,
+        closure: HirId,
+        stack_size: HirId,
+    },
+
+    /// Drive a paused fiber until its next yield or completion.
+    ///
+    /// `fiber` is the opaque handle returned by `FiberNew` (or
+    /// rebound by a prior `FiberResume*`). `result` is a tagged-union
+    /// value the backend marshals into the frontend's `FiberStep<T>`
+    /// shape — `Yielded(value)` / `Done(return)` / `Errored(e)`.
+    ///
+    /// Lowers to `krio_fiber_resume` / `resume` / state-machine
+    /// dispatch poll respectively.
+    FiberResume {
+        result: HirId,
+        ty: HirType,
+        fiber: HirId,
+    },
+
+    /// Resume a fiber, delivering a value to it as the result of
+    /// its currently-blocked `FiberYield`. The bidirectional form —
+    /// what `let r = yield expr` (expression-position yield) lowers
+    /// the receiving half to.
+    FiberResumeWith {
+        result: HirId,
+        ty: HirType,
+        fiber: HirId,
+        value: HirId,
+    },
+
+    /// Suspend the enclosing fiber, surfacing `value` to whoever
+    /// called the matching `FiberResume*`. Only valid inside a
+    /// fiber body. No `result` — the receive half of a bidirectional
+    /// yield is wired by the frontend lowering as a separate
+    /// `take_input`-style op or as a follow-on `Load` from a slot.
+    FiberYield { value: HirId },
+
+    /// Symmetric switch — abandon the caller and transfer to a peer
+    /// fiber with `value`. The current fiber's continuation is left
+    /// suspended; the peer's matching yield receives `value` and the
+    /// peer resumes. `result` is the value the current fiber will
+    /// see when somebody later transfers BACK to it.
+    ///
+    /// Not yet implemented in any backend — the HIR op exists so
+    /// frontends can target it now and the runtime impls can land
+    /// progressively. krio-fiber needs symmetric transfer added
+    /// upstream; wasm stack-switching has `resume` + `cont.bind`
+    /// that compose into the equivalent shape.
+    FiberTransfer {
+        result: HirId,
+        ty: HirType,
+        target: HirId,
+        value: HirId,
+    },
+
+    /// Cooperative cancel signal. Sets a flag the fiber polls via
+    /// the runtime helper (`is_cancelled` / `should_yield_early`);
+    /// the fiber is responsible for checking and exiting cleanly.
+    /// No-op if the fiber is already `Done` or `Errored`.
+    FiberCancel { fiber: HirId },
 }
 
 /// Block terminator instructions
@@ -1013,6 +1101,31 @@ impl HirInstruction {
             HirInstruction::AsyncLoadSlot { frame, .. } => {
                 replace(frame, replacements);
             }
+            HirInstruction::FiberNew {
+                closure,
+                stack_size,
+                ..
+            } => {
+                replace(closure, replacements);
+                replace(stack_size, replacements);
+            }
+            HirInstruction::FiberResume { fiber, .. } => {
+                replace(fiber, replacements);
+            }
+            HirInstruction::FiberResumeWith { fiber, value, .. } => {
+                replace(fiber, replacements);
+                replace(value, replacements);
+            }
+            HirInstruction::FiberYield { value } => {
+                replace(value, replacements);
+            }
+            HirInstruction::FiberTransfer { target, value, .. } => {
+                replace(target, replacements);
+                replace(value, replacements);
+            }
+            HirInstruction::FiberCancel { fiber } => {
+                replace(fiber, replacements);
+            }
         }
     }
 
@@ -1196,6 +1309,31 @@ impl HirInstruction {
             }
             HirInstruction::AsyncLoadSlot { frame, .. } => {
                 ops.push(*frame);
+            }
+            HirInstruction::FiberNew {
+                closure,
+                stack_size,
+                ..
+            } => {
+                ops.push(*closure);
+                ops.push(*stack_size);
+            }
+            HirInstruction::FiberResume { fiber, .. } => {
+                ops.push(*fiber);
+            }
+            HirInstruction::FiberResumeWith { fiber, value, .. } => {
+                ops.push(*fiber);
+                ops.push(*value);
+            }
+            HirInstruction::FiberYield { value } => {
+                ops.push(*value);
+            }
+            HirInstruction::FiberTransfer { target, value, .. } => {
+                ops.push(*target);
+                ops.push(*value);
+            }
+            HirInstruction::FiberCancel { fiber } => {
+                ops.push(*fiber);
             }
         }
         ops

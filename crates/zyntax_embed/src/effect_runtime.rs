@@ -1208,6 +1208,115 @@ pub fn register_box_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime)
     runtime.register_zrtl_symbols(&infos);
 }
 
+/// Build the typed-FFI signatures for the `krio_fiber_*` symbol
+/// family. Returned in the same `RuntimeSymbolInfo` shape as the box
+/// helpers; callers feed it to both the JIT backend and the BC
+/// interp's `register_zrtl_symbols`.
+///
+/// Scaffold: the function pointers are the panic-on-call stubs in
+/// `zyntax_compiler::zrtl::krio_fiber_*`. A future commit swaps them
+/// for the real krio-fiber backend impls behind the `FiberCfg`
+/// trait — same symbol names, same signatures, working bodies.
+pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolInfo> {
+    use zyntax_compiler::zrtl::{RuntimeSymbolInfo, ZrtlSigFlags, ZrtlSymbolSig};
+    let no_flags = ZrtlSigFlags::NONE;
+
+    let entries: &[(&'static str, *const u8, ZrtlSymbolSig)] = &[
+        // krio_fiber_new(closure: ptr, stack_size: i64) -> ptr
+        (
+            "krio_fiber_new",
+            zyntax_compiler::zrtl::krio_fiber_new as *const u8,
+            ZrtlSymbolSig {
+                param_count: 2,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params2(ptr_tag(), i64_tag()),
+            },
+        ),
+        // krio_fiber_resume(fiber: ptr) -> i64 (FiberStep tag)
+        (
+            "krio_fiber_resume",
+            zyntax_compiler::zrtl::krio_fiber_resume as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+        // krio_fiber_resume_with(fiber: ptr, value: i64) -> i64
+        (
+            "krio_fiber_resume_with",
+            zyntax_compiler::zrtl::krio_fiber_resume_with as *const u8,
+            ZrtlSymbolSig {
+                param_count: 2,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params2(ptr_tag(), i64_tag()),
+            },
+        ),
+        // krio_fiber_yield(value: i64) -> void
+        (
+            "krio_fiber_yield",
+            zyntax_compiler::zrtl::krio_fiber_yield as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: void_tag(),
+                params: params1(i64_tag()),
+            },
+        ),
+        // krio_fiber_transfer(target: ptr, value: i64) -> i64
+        (
+            "krio_fiber_transfer",
+            zyntax_compiler::zrtl::krio_fiber_transfer as *const u8,
+            ZrtlSymbolSig {
+                param_count: 2,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params2(ptr_tag(), i64_tag()),
+            },
+        ),
+        // krio_fiber_cancel(fiber: ptr) -> void
+        (
+            "krio_fiber_cancel",
+            zyntax_compiler::zrtl::krio_fiber_cancel as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: void_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
+    ];
+
+    entries
+        .iter()
+        .map(|(name, ptr, sig)| RuntimeSymbolInfo {
+            name,
+            ptr: *ptr,
+            sig: Some(*sig),
+        })
+        .collect()
+}
+
+/// Register the fiber runtime symbols on `runtime`'s Cranelift /
+/// LLVM backends + BC interp. Mirror of
+/// [`register_box_runtime_symbols`].
+///
+/// Scaffold: the registered fn pointers panic on call (see
+/// [`fiber_runtime_symbol_infos`] notes). Lowering passes can still
+/// emit `Call::Symbol("krio_fiber_*")` and link cleanly; the panic
+/// fires only if a fiber op actually executes before the real
+/// backend lands.
+pub fn register_fiber_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
+    let infos = fiber_runtime_symbol_infos();
+    for info in &infos {
+        runtime.register_function_typed(info.name, info.ptr, info.sig.unwrap());
+    }
+    runtime.register_zrtl_symbols(&infos);
+}
+
 /// Test-only helper: reset the per-thread handler stack to empty.
 /// Tests that exercise push/pop/lookup should call this at the start
 /// to isolate from leftover state when running in a shared test

@@ -38,6 +38,7 @@ pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-es
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
 pub mod effect_handler_resolution; // Handler resolution for effect dispatch
+pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
 pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction

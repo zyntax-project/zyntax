@@ -942,6 +942,12 @@ impl ZyntaxRuntime {
         // a `Type::Any` field — register them up front with typed
         // signatures so the JIT picks the right param/return shape.
         crate::effect_runtime::register_box_runtime_symbols(&mut runtime);
+        // First-class fiber HIR ops lower to `Call::Symbol("krio_fiber_*")`
+        // before the backend sees them. Register the typed signatures up
+        // front so link resolution is clean even when no fiber op fires.
+        // The current fn pointers panic on call — a future commit swaps
+        // them for the krio-fiber backend behind the `FiberCfg` trait.
+        crate::effect_runtime::register_fiber_runtime_symbols(&mut runtime);
         runtime.finalize_runtime_symbols()?;
         Ok(runtime)
     }

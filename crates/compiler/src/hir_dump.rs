@@ -1009,6 +1009,52 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
             let f = mapper.value(frame);
             format!("{}: {} = async_load {}, slot {}", r, fmt_type(ty), f, slot)
         }
+        HirInstruction::FiberNew {
+            result,
+            ty,
+            closure,
+            stack_size,
+        } => {
+            let r = mapper.value(result);
+            let c = mapper.value(closure);
+            let s = mapper.value(stack_size);
+            format!("{}: {} = fiber.new {}, stack {}", r, fmt_type(ty), c, s)
+        }
+        HirInstruction::FiberResume { result, ty, fiber } => {
+            let r = mapper.value(result);
+            let f = mapper.value(fiber);
+            format!("{}: {} = fiber.resume {}", r, fmt_type(ty), f)
+        }
+        HirInstruction::FiberResumeWith {
+            result,
+            ty,
+            fiber,
+            value,
+        } => {
+            let r = mapper.value(result);
+            let f = mapper.value(fiber);
+            let v = mapper.value(value);
+            format!("{}: {} = fiber.resume_with {}, {}", r, fmt_type(ty), f, v)
+        }
+        HirInstruction::FiberYield { value } => {
+            let v = mapper.value(value);
+            format!("fiber.yield {}", v)
+        }
+        HirInstruction::FiberTransfer {
+            result,
+            ty,
+            target,
+            value,
+        } => {
+            let r = mapper.value(result);
+            let t = mapper.value(target);
+            let v = mapper.value(value);
+            format!("{}: {} = fiber.transfer {}, {}", r, fmt_type(ty), t, v)
+        }
+        HirInstruction::FiberCancel { fiber } => {
+            let f = mapper.value(fiber);
+            format!("fiber.cancel {}", f)
+        }
     }
 }
 

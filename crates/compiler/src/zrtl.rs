@@ -1786,6 +1786,117 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
     ]
 }
 
+// ─────────────────────────────────────────────────────────────────
+// First-class fiber runtime symbols.
+//
+// Scaffold stubs. Each `krio_fiber_*` symbol panics with
+// `unimplemented!()` so that — until a backend impl is wired in —
+// an accidentally-emitted fiber op fails loudly with a localised
+// stack instead of running broken code.
+//
+// The eventual impls live behind a `FiberCfg` trait in the
+// `krio_adapter` fiber backend; the function pointers below get
+// swapped for the trait impl during runtime construction
+// (mirroring how krio-async wires into runtime today). On
+// platforms with no stack-switching support (browser wasm pre
+// stack-switching proposal) the runtime can substitute a stackless
+// emulation impl behind the same symbols.
+//
+// Signatures (the typed FFI marshalling path the BC interp now
+// uses respects these):
+//   krio_fiber_new(closure: *mut u8, stack_size: i64)
+//       -> *mut FiberRepr
+//   krio_fiber_resume(fiber: *mut FiberRepr) -> i64        (FiberStep tag)
+//   krio_fiber_resume_with(fiber: *mut FiberRepr, value: i64)
+//       -> i64                                              (FiberStep tag)
+//   krio_fiber_yield(value: i64)
+//   krio_fiber_transfer(target: *mut FiberRepr, value: i64) -> i64
+//   krio_fiber_cancel(fiber: *mut FiberRepr)
+//
+// `FiberRepr` is opaque to the compiler; the runtime owns its
+// layout. The HIR sees only `Ptr(Opaque("$Fiber"))`.
+// ─────────────────────────────────────────────────────────────────
+
+/// Opaque fiber handle. The runtime owns its layout; the compiler
+/// only threads `*mut FiberRepr` through the HIR.
+#[repr(C)]
+pub struct FiberRepr {
+    _opaque: [u8; 0],
+}
+
+/// `krio_fiber_new` — construct a paused fiber backed by `closure`
+/// with `stack_size` bytes of stack. Returns an opaque handle.
+///
+/// Scaffold: panics. Real impl is the upcoming krio-fiber backend
+/// in `krio_adapter`.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_new(_closure: *mut u8, _stack_size: i64) -> *mut FiberRepr {
+    unimplemented!("krio_fiber_new: fiber runtime not yet installed")
+}
+
+/// `krio_fiber_resume` — drive `fiber` until its next yield or
+/// completion. Returns the `FiberStep` tag (encoding details left
+/// to the backend; the HIR receives an i64 the lowering pass
+/// decodes).
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_resume(_fiber: *mut FiberRepr) -> i64 {
+    unimplemented!("krio_fiber_resume: fiber runtime not yet installed")
+}
+
+/// `krio_fiber_resume_with` — bidirectional resume. Delivers
+/// `value` to the suspended fiber as the result of its currently-
+/// blocked `FiberYield`.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_resume_with(_fiber: *mut FiberRepr, _value: i64) -> i64 {
+    unimplemented!("krio_fiber_resume_with: fiber runtime not yet installed")
+}
+
+/// `krio_fiber_yield` — suspend the enclosing fiber, surfacing
+/// `value` to whoever called the matching resume. Only valid from
+/// inside a fiber body.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_yield(_value: i64) {
+    unimplemented!("krio_fiber_yield: fiber runtime not yet installed")
+}
+
+/// `krio_fiber_transfer` — symmetric switch. Abandons the caller
+/// and transfers to `target` with `value`. Returns whatever value
+/// the current fiber later receives when somebody transfers BACK
+/// to it.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_transfer(_target: *mut FiberRepr, _value: i64) -> i64 {
+    unimplemented!("krio_fiber_transfer: fiber runtime not yet installed")
+}
+
+/// `krio_fiber_cancel` — cooperative cancel signal. Sets a flag
+/// the fiber polls; the fiber is responsible for exiting cleanly.
+/// No-op if already done or errored.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_cancel(_fiber: *mut FiberRepr) {
+    unimplemented!("krio_fiber_cancel: fiber runtime not yet installed")
+}
+
+/// Return the list of `krio_fiber_*` runtime helpers as `(name, fn
+/// pointer, arity)` triples. Same surface as
+/// [`box_runtime_symbols`]; the runtime registers these
+/// up-front so an HIR module that reaches a fiber op finds the
+/// symbol resolved (and panics with a clear message if it actually
+/// fires before the real backend is installed).
+pub fn fiber_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
+    vec![
+        ("krio_fiber_new", krio_fiber_new as *const u8, 2),
+        ("krio_fiber_resume", krio_fiber_resume as *const u8, 1),
+        (
+            "krio_fiber_resume_with",
+            krio_fiber_resume_with as *const u8,
+            2,
+        ),
+        ("krio_fiber_yield", krio_fiber_yield as *const u8, 1),
+        ("krio_fiber_transfer", krio_fiber_transfer as *const u8, 2),
+        ("krio_fiber_cancel", krio_fiber_cancel as *const u8, 1),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -497,6 +497,15 @@ impl AnalysisRunner {
             // Async state-machine slot ops: Load produces a result; Save is a side-effect.
             HirInstruction::AsyncLoadSlot { result, .. } => Some(*result),
             HirInstruction::AsyncSaveSlot { .. } => None,
+
+            // First-class fiber ops. New / Resume / ResumeWith /
+            // Transfer all produce a result (fiber handle or
+            // FiberStep); Yield / Cancel are side-effect-only.
+            HirInstruction::FiberNew { result, .. }
+            | HirInstruction::FiberResume { result, .. }
+            | HirInstruction::FiberResumeWith { result, .. }
+            | HirInstruction::FiberTransfer { result, .. } => Some(*result),
+            HirInstruction::FiberYield { .. } | HirInstruction::FiberCancel { .. } => None,
         }
     }
 
