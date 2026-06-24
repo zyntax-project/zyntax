@@ -456,6 +456,15 @@ pub(crate) fn resolve_in_expr(
     // Resolve the expression's type annotation
     resolve_in_type(&mut expr.ty, type_registry);
 
+    // Set when the MethodCall arm detects a static-method call
+    // shape (`TypeName.method(...)`). Applied after the match
+    // closes the borrow on `expr.node`.
+    let mut rewrite_static_method_call: Option<(
+        zyntax_typed_ast::InternedString,
+        zyntax_typed_ast::InternedString,
+        Type,
+    )> = None;
+
     // Recursively resolve types in sub-expressions
     match &mut expr.node {
         TypedExpression::Binary(bin) => {
@@ -541,29 +550,50 @@ pub(crate) fn resolve_in_expr(
                 resolve_in_type(type_arg, type_registry);
             }
 
-            // Try to resolve the return type of the method call
-            // For static calls (receiver is a type name), look up the type and method
+            // Try to resolve the return type of the method call.
+            // For static calls (`Tensor.arange(...)` where the
+            // receiver name is a registered type), rewrite the AST
+            // shape from `MethodCall(Variable(TypeName), method)`
+            // to `Call(Path([TypeName, method]))`. The downstream
+            // Path → mangled-symbol resolution path then fires and
+            // emits `$TypeName$method(...)`. ZynML's grammar uses
+            // `.` for both instance method calls and static type-
+            // qualified calls; this is where the disambiguation
+            // happens.
             if let TypedExpression::Variable(type_name) = &method_call.receiver.node {
-                // Check if this is a type name (static method call like Tensor::arange)
-                if let Some(type_def) = type_registry.get_type_by_name(*type_name) {
-                    // Look for the method in the type's methods
+                // Heuristic: ZynML follows the convention that type
+                // names are PascalCase and variables are
+                // camelCase / snake_case. When the receiver
+                // identifier starts with an uppercase letter, treat
+                // it as a static method call (`TypeName.method`)
+                // and rewrite into the Path form. The type may not
+                // be registered yet at this pass — downstream
+                // Path-based resolution uses the name string to
+                // mangle `$TypeName$method`, so registry presence
+                // isn't a precondition.
+                let looks_like_type = type_name
+                    .resolve_global()
+                    .and_then(|s| s.chars().next())
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false);
+                if looks_like_type {
+                    // Compute the return type up front so the
+                    // rewrite below has it. Avoid borrowing
+                    // `method_call` across the rewrite (which
+                    // mutates `expr.node`).
+                    let type_name = *type_name;
                     let method_name = method_call.method;
-                    for method in &type_def.methods {
-                        if method.name == method_name {
-                            // Found the method! Update the expression's type to the return type
-                            let mut return_type = method.return_type.clone();
-                            // If return type needs resolution, do it
-                            resolve_in_type(&mut return_type, type_registry);
-                            expr.ty = return_type;
-                            log::debug!(
-                                "[RESOLVE_TYPES] Resolved static method {}::{} return type to {:?}",
-                                type_name.resolve_global().unwrap_or_default(),
-                                method_name.resolve_global().unwrap_or_default(),
-                                expr.ty
-                            );
-                            break;
+                    let mut return_type = Type::Any;
+                    if let Some(type_def) = type_registry.get_type_by_name(type_name) {
+                        for method in &type_def.methods {
+                            if method.name == method_name {
+                                return_type = method.return_type.clone();
+                                resolve_in_type(&mut return_type, type_registry);
+                                break;
+                            }
                         }
                     }
+                    rewrite_static_method_call = Some((type_name, method_name, return_type));
                 }
             }
             // For instance method calls, we can try to resolve based on receiver type
@@ -685,6 +715,36 @@ pub(crate) fn resolve_in_expr(
         }
         _ => {
             // Other expression types (Variable, Literal, etc.) don't need nested resolution
+        }
+    }
+
+    // Apply the `TypeName.method(...)` → `Path([TypeName, method])`
+    // rewrite collected by the MethodCall arm above. Has to happen
+    // after the match closes the `&mut expr.node` borrow.
+    if let Some((type_name, method_name, return_type)) = rewrite_static_method_call {
+        if let TypedExpression::MethodCall(method_call) =
+            std::mem::replace(&mut expr.node, TypedExpression::Variable(type_name))
+        {
+            let path_node = zyntax_typed_ast::TypedNode {
+                node: TypedExpression::Path(zyntax_typed_ast::TypedPath {
+                    segments: vec![type_name, method_name],
+                }),
+                ty: Type::Any,
+                span: method_call.receiver.span,
+            };
+            expr.node = TypedExpression::Call(zyntax_typed_ast::TypedCall {
+                callee: Box::new(path_node),
+                positional_args: method_call.positional_args,
+                named_args: method_call.named_args,
+                type_args: method_call.type_args,
+            });
+            expr.ty = return_type;
+
+            log::debug!(
+                "[RESOLVE_TYPES] Rewrote `{}.{}` as static path call",
+                type_name.resolve_global().unwrap_or_default(),
+                method_name.resolve_global().unwrap_or_default(),
+            );
         }
     }
 }
