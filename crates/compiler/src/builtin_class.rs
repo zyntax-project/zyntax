@@ -212,11 +212,19 @@ impl BuiltinClass for FiberClass {
             // `cancel()` — signals the fiber to stop. Subsequent
             // `next()` calls return `None`. First piece of the
             // Wren-style abort surface: a caller-side cancel signal
-            // with no error payload. A future `abort_with(err)`
-            // (from inside the fiber body) will use the
-            // already-allocated `Errored` step tag (=2) to carry an
-            // error value back to the caller's `next()`.
+            // with no error payload.
             "cancel" => ssa.emit_fiber_cancel(block_id, receiver).map(Some),
+            // `error()` — returns `Option<FiberError<T>>` carrying
+            // the payload the fiber's `Fiber.abort(x)` passed
+            // (None if the fiber completed normally or never
+            // aborted). MVP: T is hardwired to String at the
+            // decoder. Arbitrary T support needs the per-fiber E
+            // inference pass; the runtime FFI already threads a
+            // variant tag through so the upgrade is decoder-side
+            // only when that pass lands.
+            "error" => ssa
+                .emit_fiber_error(block_id, receiver, result_ty)
+                .map(Some),
             _ => Ok(None),
         }
     }

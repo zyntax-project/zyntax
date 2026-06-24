@@ -282,6 +282,13 @@ struct MatchContext {
     discriminant_value: Option<HirId>,
     /// The union type being matched (if applicable)
     union_type: Option<Box<crate::hir::HirUnionType>>,
+    /// The scrutinee's typed-AST type — used by pattern binders to
+    /// recover the typed-AST type of an extracted variant payload
+    /// (e.g. `case Some(e) { e.method() }`: the HIR `e.ty` is the
+    /// variant's HirType, but downstream method dispatch needs the
+    /// typed-AST type, which only the scrutinee's `Type::Optional`
+    /// / `Type::Result` carries).
+    scrutinee_typed_ast_type: Option<Type>,
 }
 
 /// SSA form representation
@@ -1345,8 +1352,12 @@ impl SsaBuilder {
         use zyntax_typed_ast::typed_ast::TypedPattern;
 
         // Get the scrutinee value from match context
-        let (scrutinee_val, union_type) = if let Some(ctx) = &self.match_context {
-            (ctx.scrutinee_value, ctx.union_type.clone())
+        let (scrutinee_val, union_type, scrutinee_ast_ty) = if let Some(ctx) = &self.match_context {
+            (
+                ctx.scrutinee_value,
+                ctx.union_type.clone(),
+                ctx.scrutinee_typed_ast_type.clone(),
+            )
         } else {
             return Ok(()); // No match context, nothing to extract
         };
@@ -1407,6 +1418,31 @@ impl SsaBuilder {
 
                 self.write_variable(*name, block_id, extracted_id);
                 self.var_types.insert(*name, variant.ty.clone());
+
+                // Propagate the typed-AST payload type to the pattern
+                // binding so downstream method dispatch (e.g.
+                // `case Some(e) { e.to_string() }`) can resolve. The
+                // scrutinee's typed-AST type is the source of truth —
+                // `Type::Optional(T)`'s Some variant holds T;
+                // `Type::Result { ok_type, err_type }`'s Ok / Err hold
+                // the corresponding inner type. Other shapes are
+                // skipped (their typed-AST type isn't recoverable from
+                // the variant index alone).
+                if let Some(ast_ty) = &scrutinee_ast_ty {
+                    let payload_ast_ty = match ast_ty {
+                        Type::Optional(inner) if variant_index == 1 => Some(inner.as_ref().clone()),
+                        Type::Result { ok_type, .. } if variant_index == 0 => {
+                            Some(ok_type.as_ref().clone())
+                        }
+                        Type::Result { err_type, .. } if variant_index == 1 => {
+                            Some(err_type.as_ref().clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(ty) = payload_ast_ty {
+                        self.var_typed_ast_types.insert(*name, ty);
+                    }
+                }
 
                 log::debug!(
                     "[SSA] Extracted union value for pattern variable {:?}: val={:?}",
@@ -2121,6 +2157,7 @@ impl SsaBuilder {
                         scrutinee_value: scrutinee_val,
                         discriminant_value: Some(discriminant_id),
                         union_type: Some(union_type.clone()),
+                        scrutinee_typed_ast_type: Some(match_stmt.scrutinee.ty.clone()),
                     });
 
                     log::debug!(
@@ -2134,6 +2171,7 @@ impl SsaBuilder {
                         scrutinee_value: scrutinee_val,
                         discriminant_value: None,
                         union_type: None,
+                        scrutinee_typed_ast_type: Some(match_stmt.scrutinee.ty.clone()),
                     });
                     log::debug!("[SSA] Match on non-union type: {:?}", scrutinee_hir_type);
                 }
@@ -8116,6 +8154,214 @@ impl SsaBuilder {
             HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
         );
         Ok(unit_val)
+    }
+
+    /// Emit the HIR for `Fiber<T>::error() -> Option<FiberError<String>>`.
+    /// Reads the per-fiber error slot (populated by the krio backend
+    /// when `Fiber.abort` fires) and decodes the packed return:
+    ///   * bit 0      — present flag
+    ///   * bits 1-2   — variant tag (1 = Message, 2 = Custom)
+    ///   * bits 3-63  — payload (string pointer / numeric code)
+    ///
+    /// MVP: `T` is hardwired to `String` at the decoder. Arbitrary
+    /// `T` requires the per-fiber E inference pass — payload would
+    /// still come through as i64 from the FFI, but the
+    /// monomorphisation of `FiberError<T>` and the value
+    /// reconstruction depends on knowing the fiber's source-function
+    /// E. That's the next piece of work.
+    pub(crate) fn emit_fiber_error(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        _result_ty: &Type,
+    ) -> CompilerResult<HirId> {
+        let receiver_val = self.translate_expression(block_id, receiver_expr)?;
+
+        // Call `krio_fiber_take_error(fiber) -> i64`. The result is
+        // packed; bit 0 carries presence, bit 0=0 → None.
+        let take_error_sym = self
+            .arena
+            .lock()
+            .unwrap()
+            .intern_string("krio_fiber_take_error");
+        let packed_val = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Call {
+                result: Some(packed_val),
+                callee: crate::hir::HirCallable::Symbol(
+                    take_error_sym.resolve_global().unwrap_or_default(),
+                ),
+                args: vec![receiver_val],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        self.add_use(receiver_val, packed_val);
+
+        // present = packed & 1
+        let one_const = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(1)),
+        );
+        let present_val = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::And,
+                result: present_val,
+                ty: HirType::I64,
+                left: packed_val,
+                right: one_const,
+            },
+        );
+        self.add_use(packed_val, present_val);
+        self.add_use(one_const, present_val);
+
+        // is_present = (present == 1)
+        let is_present = self.create_value(HirType::Bool, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::Eq,
+                result: is_present,
+                ty: HirType::I64,
+                left: present_val,
+                right: one_const,
+            },
+        );
+        self.add_use(present_val, is_present);
+        self.add_use(one_const, is_present);
+
+        // payload = packed >> 3   (string pointer for Message variant)
+        let three_const = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(3)),
+        );
+        let payload_i64 = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::Shr,
+                result: payload_i64,
+                ty: HirType::I64,
+                left: packed_val,
+                right: three_const,
+            },
+        );
+        self.add_use(packed_val, payload_i64);
+        self.add_use(three_const, payload_i64);
+
+        // Construct `FiberError<String>{ payload: <string-ptr> }`.
+        // Strings round-trip as `HirType::Ptr(I8)` in the HIR
+        // (same as the rest of the language's `String` lowering),
+        // so the payload field's HIR type is `Ptr(I8)`.
+        let string_hir = HirType::Ptr(Box::new(HirType::I8));
+        let fiber_error_struct = self.arena.lock().unwrap().intern_string("FiberError");
+        let payload_field = self.arena.lock().unwrap().intern_string("payload");
+        let fiber_error_hir = HirType::Struct(crate::hir::HirStructType {
+            name: Some(fiber_error_struct),
+            fields: vec![string_hir.clone()],
+            packed: false,
+        });
+        let _ = payload_field; // field-name interning kept for clarity
+        let _ = string_hir; // shadowed by the field type above
+
+        // `Undef` aggregate + `InsertValue` per field — the same
+        // pattern `TypedExpression::Struct` uses for ordinary
+        // struct literals (no dedicated "create struct from
+        // fields" HIR op exists).
+        let fiber_error_undef = self.create_value(fiber_error_hir.clone(), HirValueKind::Undef);
+        let fiber_error_val = self.create_value(fiber_error_hir.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::InsertValue {
+                result: fiber_error_val,
+                ty: fiber_error_hir.clone(),
+                aggregate: fiber_error_undef,
+                value: payload_i64,
+                indices: vec![0],
+            },
+        );
+        self.add_use(fiber_error_undef, fiber_error_val);
+        self.add_use(payload_i64, fiber_error_val);
+
+        // Wrap in Option<FiberError<String>>. Build the union type
+        // directly here — the parser leaves `MethodCall`'s expr.ty
+        // as Unit for built-in dispatch, so we can't rely on
+        // result_ty (it would give HirType::Void). Some=variant 1,
+        // None=variant 0 by the convention in `Type::Optional` →
+        // `convert_type`.
+        let option_hir = {
+            use crate::hir::{HirUnionType, HirUnionVariant};
+            let mut arena = self.arena.lock().unwrap();
+            let none_name = arena.intern_string("None");
+            let some_name = arena.intern_string("Some");
+            drop(arena);
+            HirType::Union(Box::new(HirUnionType {
+                name: None,
+                variants: vec![
+                    HirUnionVariant {
+                        name: none_name,
+                        ty: HirType::Void,
+                        discriminant: 0,
+                    },
+                    HirUnionVariant {
+                        name: some_name,
+                        ty: fiber_error_hir.clone(),
+                        discriminant: 1,
+                    },
+                ],
+                discriminant_type: Box::new(HirType::U32),
+                is_c_union: false,
+            }))
+        };
+
+        let some_val = self.create_value(option_hir.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::CreateUnion {
+                result: some_val,
+                union_ty: option_hir.clone(),
+                variant_index: 1, // Some
+                value: fiber_error_val,
+            },
+        );
+        self.add_use(fiber_error_val, some_val);
+
+        let zero_const = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+        );
+        let none_val = self.create_value(option_hir.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::CreateUnion {
+                result: none_val,
+                union_ty: option_hir.clone(),
+                variant_index: 0, // None
+                value: zero_const,
+            },
+        );
+        self.add_use(zero_const, none_val);
+
+        let result = self.create_value(option_hir.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Select {
+                result,
+                ty: option_hir,
+                condition: is_present,
+                true_val: some_val,
+                false_val: none_val,
+            },
+        );
+        self.add_use(is_present, result);
+        self.add_use(some_val, result);
+        self.add_use(none_val, result);
+
+        Ok(result)
     }
 
     /// Convert frontend type to HIR type

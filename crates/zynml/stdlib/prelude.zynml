@@ -280,6 +280,44 @@ impl<T> Iterator for Fiber<T> {
     }
 }
 
+impl<T> Fiber<T> {
+    // `error()` — returns the abort payload latched by the fiber's
+    // `Fiber.abort(x)` call, or None if the fiber completed
+    // normally. MVP hardwires the wrapped payload type to String;
+    // arbitrary T (so `Fiber.abort(42)` rounds-trips as
+    // `FiberError<i64>`) needs the per-fiber E inference pass.
+    //
+    // SSA's FiberClass dispatch intercepts this — the stub body
+    // below never runs.
+    def error(self): Option<FiberError<String>> {
+        Option::None
+    }
+}
+
+// FiberError<T> — the error payload Fiber.abort surfaces and
+// f.error() returns. Single-shape generic over the payload type:
+// `T` is whatever the fiber body passes to `Fiber.abort(x)`.
+//
+//   Fiber.abort("oops")        → FiberError<String>{ payload: "oops" }
+//   Fiber.abort(my_err_struct) → FiberError<MyErr>{ payload: my_err_struct }
+//
+// The compiler infers `T` per fiber from the abort call site's
+// argument type (a "static value" — compile-time-known type).
+// `f.error() -> Option<FiberError<T>>` decodes the per-fiber
+// error slot the runtime populates on abort.
+struct FiberError<T> {
+    payload: T
+}
+
+// Display impl — `error().to_string()` delegates to T's Display.
+// `error()` consumers can write the same `f.error().to_string()`
+// regardless of which T the fiber chose.
+impl<T: Display> Display for FiberError<T> {
+    def to_string(self): String {
+        self.payload.to_string()
+    }
+}
+
 // ListIterator - iterator over a list
 struct ListIterator<T> {
     list_data: i64,   // Pointer to list data

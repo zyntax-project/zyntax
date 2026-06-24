@@ -21,7 +21,8 @@
 //! short-lived bench shapes, will move to explicit drop when the
 //! frontend wires lifetime tracking.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use krio_fiber::{Fiber, FiberStep};
 use zyntax_compiler::fiber_backend::{
@@ -29,20 +30,32 @@ use zyntax_compiler::fiber_backend::{
 };
 use zyntax_compiler::zrtl::FiberRepr;
 
+/// `(variant_tag, payload)` stashed by [`Self::fiber_abort_with`].
+/// The tag matches the prelude's `FiberError` enum (1 = Message,
+/// 2 = Custom). Payload is a pointer for both — `*const u8` to a
+/// `String` for Message, `*const u8` to a `DynamicBox` for Custom.
+type AbortInfo = (i64, i64);
+
 thread_local! {
-    /// Payload latched by [`Self::fiber_abort_with`] before yielding
-    /// the active fiber. Promoted to the encoded step's `Errored`
-    /// payload by `encode_step` on the way back out, and cleared on
-    /// take so a subsequent ordinary yield doesn't inherit it.
+    /// Payload latched by `fiber_abort_with` before yielding the
+    /// active fiber. Promoted to the per-fiber error map by
+    /// `encode_step` when it surfaces an `Errored` step.
     ///
-    /// We can't unwind through the Cranelift-generated frame above
-    /// the `krio_fiber_abort_with` call cleanly (DWARF info varies
-    /// by platform / opt level), so the abort is implemented as a
-    /// *deferred* one: stash payload, yield, then have the resume-
-    /// side encoder swap `Yielded` for `Errored`. The fiber stays
-    /// suspended at the abort point; the krio cancel flag is also
-    /// set so any later resume returns `Done`.
-    static ABORT_PAYLOAD: Cell<Option<i64>> = const { Cell::new(None) };
+    /// We can't unwind through the Cranelift / LLVM-generated frame
+    /// above the abort call cleanly (DWARF info varies by platform
+    /// / opt level), so the abort is implemented as a *deferred*
+    /// one: stash payload, yield, then have the resume-side encoder
+    /// swap `Yielded` for `Errored`. The fiber stays suspended at
+    /// the abort point.
+    static ABORT_PAYLOAD: Cell<Option<AbortInfo>> = const { Cell::new(None) };
+
+    /// Per-fiber error slot. Populated by `encode_step` when it
+    /// surfaces Errored, read+cleared by `fiber_take_error` from
+    /// the caller's side after iteration ends. Keyed by the fiber
+    /// handle's raw pointer cast to `usize` (the handle stays
+    /// thread-local so this map is safely accessible without
+    /// synchronisation).
+    static ERROR_MAP: RefCell<HashMap<usize, AbortInfo>> = RefCell::new(HashMap::new());
 }
 
 /// Default fiber backend backed by krio-fiber. Stateless — the
@@ -67,22 +80,32 @@ impl Default for KrioFiberBackend {
 /// Convert a krio-fiber `FiberStep` to the packed (tag, payload) i64
 /// the C-ABI surface returns.
 ///
+/// On Errored, the `(variant, payload)` from `ABORT_PAYLOAD` (or
+/// zeros for a non-abort panic) gets stashed in `ERROR_MAP` keyed
+/// by the fiber handle so the caller's later `fiber_take_error`
+/// can return a typed `FiberError`.
+///
 /// * `Yielded` — if `ABORT_PAYLOAD` is latched, the yield was
-///   actually a `Fiber.abort(err)`; surface `Errored` with `err`
-///   in the payload (and the fiber's already had its cancel flag
-///   set so any later resume returns `Done`). Otherwise the
-///   payload is the u64 the body passed to `yield_u64`.
+///   actually a `Fiber.abort(err)`; surface `Errored` and write
+///   the variant/payload to `ERROR_MAP`. Otherwise the payload
+///   is the u64 the body passed to `yield_u64`.
 /// * `Done` — fiber returned normally; payload 0.
 /// * `Errored` — krio-fiber-side panic catch fired (user-code
-///   panic, not `abort_with`); payload 0.
+///   panic, not `abort_with`); payload 0; map gets a `(0, 0)`
+///   placeholder so `f.error()` returns `None` (variant=0 is the
+///   absent marker).
 fn encode_step(step: FiberStep, fiber: &Fiber) -> i64 {
-    if let Some(err) = ABORT_PAYLOAD.with(|cell| cell.take()) {
-        // Drain whatever yield value the body pushed (it's the err
-        // value we passed through `yield_u64` below — but the
-        // payload of record is `err`, not the slot value, so we
-        // just clear it).
+    let key = fiber as *const Fiber as usize;
+    if let Some(info) = ABORT_PAYLOAD.with(|cell| cell.take()) {
+        // Drain whatever yield value the body pushed (the yield
+        // we used to suspend the body — not the payload of record).
         let _ = fiber.take_yield_u64();
-        return fiber_backend::pack_fiber_step(FIBER_STEP_ERRORED, err);
+        ERROR_MAP.with(|m| m.borrow_mut().insert(key, info));
+        // The packed step's i64 payload carries the variant tag in
+        // its low bits so callers that don't bother with
+        // `take_error` still see *something* indicative; the
+        // canonical retrieval is `take_error` though.
+        return fiber_backend::pack_fiber_step(FIBER_STEP_ERRORED, info.0);
     }
     match step {
         FiberStep::Yielded => {
@@ -90,7 +113,14 @@ fn encode_step(step: FiberStep, fiber: &Fiber) -> i64 {
             fiber_backend::pack_fiber_step(FIBER_STEP_YIELDED, payload)
         }
         FiberStep::Done => fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0),
-        FiberStep::Errored => fiber_backend::pack_fiber_step(FIBER_STEP_ERRORED, 0),
+        FiberStep::Errored => {
+            // User-code panic, not abort_with — no payload to
+            // record. Still mark the slot so a later
+            // `fiber_take_error` doesn't return stale data from
+            // an old fiber that reused the address.
+            ERROR_MAP.with(|m| m.borrow_mut().insert(key, (0, 0)));
+            fiber_backend::pack_fiber_step(FIBER_STEP_ERRORED, 0)
+        }
     }
 }
 
@@ -181,20 +211,38 @@ impl FiberCfg for KrioFiberBackend {
         fiber.cancel();
     }
 
-    fn fiber_abort_with(&self, err: i64) {
-        // Latch the payload, then yield. The caller-side resume
-        // (via `encode_step`) sees the latch and surfaces an
-        // `Errored` step with `err` instead of `Yielded`. We can't
-        // unwind through Cranelift / LLVM-emitted frames on every
-        // platform without coordinating DWARF info, so the abort
-        // is *deferred*: the fiber body suspends at the abort point
-        // rather than panicking through it. The body's
-        // post-abort statements DO run if the caller resumes
-        // again — `while let Some(x) = f.next()` won't do that
-        // (the `None` from Errored ends the loop), so the typical
-        // iterator pattern observes Wren-style semantics.
-        ABORT_PAYLOAD.with(|cell| cell.set(Some(err)));
-        let _ = krio_fiber::yield_u64(err as u64);
+    fn fiber_abort_with(&self, variant: i64, payload: i64) {
+        // Latch the (variant, payload), then yield. The caller-
+        // side resume (via `encode_step`) sees the latch, writes
+        // it to the per-fiber `ERROR_MAP`, and surfaces an
+        // `Errored` step. We can't unwind through Cranelift /
+        // LLVM-emitted frames cleanly enough across platforms to
+        // do a panic-based immediate abort, so the abort is
+        // *deferred*: the fiber body suspends at the abort point.
+        // The typical `while let Some(x) = f.next()` pattern then
+        // ends because Errored decodes to None.
+        ABORT_PAYLOAD.with(|cell| cell.set(Some((variant, payload))));
+        let _ = krio_fiber::yield_u64(payload as u64);
+    }
+
+    unsafe fn fiber_take_error(&self, fiber: *mut FiberRepr) -> i64 {
+        let key = fiber as usize;
+        let info = ERROR_MAP.with(|m| m.borrow_mut().remove(&key));
+        match info {
+            // No entry, or the sentinel for "panicked but no
+            // `abort_with` was called" — caller sees `None`.
+            None | Some((0, _)) => 0,
+            Some((variant, payload)) => {
+                // Packed shape: bit 0 = present, bits 1-2 = variant,
+                // bits 3-63 = payload. The variant fits in 2 bits
+                // (we only ever use 1 or 2). The payload's high
+                // bits get sign-extended on the SSA-side shr.
+                let present = 1i64;
+                let v_bits = (variant & 0b11) << 1;
+                let p_bits = payload << 3;
+                present | v_bits | p_bits
+            }
+        }
     }
 }
 

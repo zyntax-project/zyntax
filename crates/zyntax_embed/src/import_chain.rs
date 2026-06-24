@@ -725,6 +725,31 @@ pub(crate) fn resolve_in_expr(
         if let TypedExpression::MethodCall(method_call) =
             std::mem::replace(&mut expr.node, TypedExpression::Variable(type_name))
         {
+            // Special case: `Fiber.abort(x)` — the runtime stub
+            // `krio_fiber_abort_with` takes `(variant, payload)`,
+            // so we inject the variant tag based on the user
+            // argument's typed-AST type. String → Message (1),
+            // anything else → Custom (2). This rewrite runs before
+            // the Path-to-mangled-name resolver, so by the time
+            // SSA sees the Call it has the right arg count.
+            let type_name_str = type_name.resolve_global().unwrap_or_default();
+            let method_name_str = method_name.resolve_global().unwrap_or_default();
+            let mut positional_args = method_call.positional_args;
+            if type_name_str == "Fiber" && method_name_str == "abort" && positional_args.len() == 1
+            {
+                use zyntax_typed_ast::typed_ast::TypedLiteral;
+                use zyntax_typed_ast::PrimitiveType;
+                let user_arg = &positional_args[0];
+                let is_string = matches!(user_arg.ty, Type::Primitive(PrimitiveType::String));
+                let variant_tag: i128 = if is_string { 1 } else { 2 };
+                let variant_node = zyntax_typed_ast::TypedNode {
+                    node: TypedExpression::Literal(TypedLiteral::Integer(variant_tag)),
+                    ty: Type::Primitive(PrimitiveType::I64),
+                    span: user_arg.span,
+                };
+                positional_args.insert(0, variant_node);
+            }
+
             let path_node = zyntax_typed_ast::TypedNode {
                 node: TypedExpression::Path(zyntax_typed_ast::TypedPath {
                     segments: vec![type_name, method_name],
@@ -734,7 +759,7 @@ pub(crate) fn resolve_in_expr(
             };
             expr.node = TypedExpression::Call(zyntax_typed_ast::TypedCall {
                 callee: Box::new(path_node),
-                positional_args: method_call.positional_args,
+                positional_args,
                 named_args: method_call.named_args,
                 type_args: method_call.type_args,
             });

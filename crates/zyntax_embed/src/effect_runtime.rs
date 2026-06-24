@@ -1288,15 +1288,26 @@ pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolI
                 params: params1(ptr_tag()),
             },
         ),
-        // krio_fiber_abort_with(err: i64) -> void
+        // krio_fiber_abort_with(variant: i64, payload: i64) -> void
         (
             "krio_fiber_abort_with",
             zyntax_compiler::zrtl::krio_fiber_abort_with as *const u8,
             ZrtlSymbolSig {
-                param_count: 1,
+                param_count: 2,
                 flags: no_flags,
                 return_type: void_tag(),
-                params: params1(i64_tag()),
+                params: params2(i64_tag(), i64_tag()),
+            },
+        ),
+        // krio_fiber_take_error(fiber: ptr) -> i64 (packed)
+        (
+            "krio_fiber_take_error",
+            zyntax_compiler::zrtl::krio_fiber_take_error as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params1(ptr_tag()),
             },
         ),
     ];

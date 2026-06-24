@@ -97,14 +97,43 @@ pub trait FiberCfg: Send + Sync {
     /// Wren-style: called from inside the fiber body (no handle
     /// argument — the backend looks up the active fiber via its
     /// thread-local), surfaces to the caller's next `fiber_resume`
-    /// as `FIBER_STEP_ERRORED` with `err` in the payload bits.
+    /// as `FIBER_STEP_ERRORED`.
+    ///
+    /// The `variant` carries the `FiberError` enum tag (1 = Message,
+    /// 2 = Custom) and `payload` is the variant-typed payload (a
+    /// string pointer for Message, an arbitrary i64 for Custom).
+    /// The backend stashes both so the caller-side `fiber_take_error`
+    /// can return a typed value.
     ///
     /// The default impl is a no-op so backends that haven't wired
-    /// abort yet don't have to ship a stub — but the call site (the
-    /// `krio_fiber_abort_with` runtime stub) will then drop the
-    /// payload silently. Override on real backends.
-    fn fiber_abort_with(&self, _err: i64) {}
+    /// abort yet don't have to ship a stub. Override on real backends.
+    fn fiber_abort_with(&self, _variant: i64, _payload: i64) {}
+
+    /// Read and clear the abort payload for `fiber`. Returns a packed
+    /// i64:
+    ///   * bit 0: present (1 if the fiber aborted, 0 otherwise)
+    ///   * bits 1-2: variant tag (1 = Message, 2 = Custom)
+    ///   * bits 3-63: payload (i64 sign-extended back from the high
+    ///     bits after right shift)
+    ///
+    /// Returns 0 (present=0) for fibers that completed normally or
+    /// haven't been resumed yet. Default no-op for backends that
+    /// haven't wired abort yet.
+    ///
+    /// # Safety
+    /// `fiber` must be a valid handle.
+    unsafe fn fiber_take_error(&self, _fiber: *mut FiberRepr) -> i64 {
+        0
+    }
 }
+
+/// `FiberError` variant tags matching the prelude enum declaration:
+///   `enum FiberError { Message(String), Custom(i64) }`
+/// Message is variant 0, Custom is variant 1 — but the runtime
+/// adds 1 so the tag is non-zero (the `take_error` packing uses
+/// 0 to mean "no error present").
+pub const FIBER_ERROR_VARIANT_MESSAGE: i64 = 1;
+pub const FIBER_ERROR_VARIANT_CUSTOM: i64 = 2;
 
 /// The FiberStep tag returned by `fiber_resume*` in the low bits.
 pub const FIBER_STEP_YIELDED: i64 = 0;

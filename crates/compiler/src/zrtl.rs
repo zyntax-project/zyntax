@@ -1906,13 +1906,38 @@ pub unsafe extern "C" fn krio_fiber_cancel(fiber: *mut FiberRepr) {
 }
 
 /// `krio_fiber_abort_with` — Wren-style abort from inside the
-/// fiber body. Stashes `err` and yields; the caller's next
-/// `krio_fiber_resume` sees the latch in the backend and returns
-/// a step with `FIBER_STEP_ERRORED` and `err` in the payload bits.
-/// Only valid from inside a running fiber.
+/// fiber body. Stashes `(variant, payload)` and yields; the
+/// caller's next `krio_fiber_resume` returns a step with
+/// `FIBER_STEP_ERRORED` and the backend remembers the payload
+/// for later `krio_fiber_take_error` retrieval. Only valid from
+/// inside a running fiber.
+///
+/// `variant` is the `FiberError` enum tag:
+///   * 1 = Message — `payload` is a `String` pointer
+///   * 2 = Custom  — `payload` is a `DynamicBox` pointer
+///
+/// SSA-side dispatch picks the variant based on the argument
+/// type at the call site.
 #[no_mangle]
-pub extern "C" fn krio_fiber_abort_with(err: i64) {
-    fiber_backend().fiber_abort_with(err)
+pub extern "C" fn krio_fiber_abort_with(variant: i64, payload: i64) {
+    fiber_backend().fiber_abort_with(variant, payload)
+}
+
+/// `krio_fiber_take_error` — caller-side accessor. Reads the
+/// error payload latched by a prior `krio_fiber_abort_with` on
+/// `fiber`. Returns a packed i64:
+///   * bit 0       — present flag (1 if errored, 0 otherwise)
+///   * bits 1-2    — variant tag (1 = Message, 2 = Custom)
+///   * bits 3-63   — payload pointer (sign-extended back via shr)
+///
+/// The slot is cleared on read so `f.error()` is idempotent and
+/// the next call returns `None`.
+///
+/// # Safety
+/// `fiber` must be a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_take_error(fiber: *mut FiberRepr) -> i64 {
+    fiber_backend().fiber_take_error(fiber)
 }
 
 /// Return the list of `krio_fiber_*` runtime helpers as `(name, fn
@@ -1936,6 +1961,11 @@ pub fn fiber_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         (
             "krio_fiber_abort_with",
             krio_fiber_abort_with as *const u8,
+            2,
+        ),
+        (
+            "krio_fiber_take_error",
+            krio_fiber_take_error as *const u8,
             1,
         ),
     ]

@@ -130,3 +130,74 @@ fn fiber_abort_stops_iteration() {
         "yield 10 fires; Fiber.abort(99) stops the loop before yield 20 / yield 30"
     );
 }
+
+/// `f.error()` returns `Option<FiberError<String>>` reflecting
+/// whether the fiber aborted. Test encodes the variant into the
+/// return value:
+///   * 100 = `Some(_)` (fiber aborted)
+///   * 200 = `None` (fiber completed)
+/// Avoids printing the FiberError struct directly — Display
+/// dispatch on pattern-bound struct payloads needs type-resolver
+/// work that's pending (see project memory).
+#[test]
+fn fiber_error_detects_abort() {
+    let src = r#"
+        fiber def aborts(): i64 {
+            yield 1
+            Fiber.abort("oops")
+            yield 99
+        }
+
+        def main(): i64 {
+            let f = aborts()
+            while let Some(x) = f.next() {
+            }
+            match f.error() {
+                case Some(_) {
+                    return 100
+                }
+                case None() {
+                    return 200
+                }
+            }
+        }
+    "#;
+    let result = run_returning_int(src).expect("fiber program should execute");
+    assert_eq!(
+        result, 100,
+        "f.error() should be Some after Fiber.abort fired"
+    );
+}
+
+/// Companion test: a fiber that completes normally has
+/// `f.error() == None`. Verifies the slot is empty when no abort
+/// fired (and that the krio-side `take_error` doesn't leak state
+/// across fiber instances by always returning `Some`).
+#[test]
+fn fiber_error_none_on_normal_completion() {
+    let src = r#"
+        fiber def completes(): i64 {
+            yield 1
+            yield 2
+        }
+
+        def main(): i64 {
+            let f = completes()
+            while let Some(x) = f.next() {
+            }
+            match f.error() {
+                case Some(_) {
+                    return 100
+                }
+                case None() {
+                    return 200
+                }
+            }
+        }
+    "#;
+    let result = run_returning_int(src).expect("fiber program should execute");
+    assert_eq!(
+        result, 200,
+        "f.error() should be None after normal completion"
+    );
+}
