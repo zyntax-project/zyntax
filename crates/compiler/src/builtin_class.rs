@@ -209,6 +209,14 @@ impl BuiltinClass for FiberClass {
                 ssa.emit_fiber_next(block_id, receiver, &option_ty)
                     .map(Some)
             }
+            // `cancel()` — signals the fiber to stop. Subsequent
+            // `next()` calls return `None`. First piece of the
+            // Wren-style abort surface: a caller-side cancel signal
+            // with no error payload. A future `abort_with(err)`
+            // (from inside the fiber body) will use the
+            // already-allocated `Errored` step tag (=2) to carry an
+            // error value back to the caller's `next()`.
+            "cancel" => ssa.emit_fiber_cancel(block_id, receiver).map(Some),
             _ => Ok(None),
         }
     }

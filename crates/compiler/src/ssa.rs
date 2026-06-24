@@ -8088,6 +8088,36 @@ impl SsaBuilder {
         Ok(result)
     }
 
+    /// Emit the HIR for `Fiber<T>::cancel() -> ()`. The fiber is
+    /// signalled to exit on its next yield point; subsequent
+    /// `next()` calls return `None`. Returns an i64 constant 0 as
+    /// the unit placeholder so the SSA result slot is well-typed.
+    pub(crate) fn emit_fiber_cancel(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let receiver_val = self.translate_expression(block_id, receiver_expr)?;
+
+        self.add_instruction(
+            block_id,
+            HirInstruction::FiberCancel {
+                fiber: receiver_val,
+            },
+        );
+
+        // Unit-typed placeholder. The HIR's `FiberCancel` returns
+        // no value; downstream code reads `().` Use an i64(0)
+        // constant — the convention `emit_fiber_next`'s None branch
+        // already follows for the same reason (CreateUnion's
+        // value-slot mismatch with `HirConstant::Struct(vec![])`).
+        let unit_val = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+        );
+        Ok(unit_val)
+    }
+
     /// Convert frontend type to HIR type
     fn convert_type(&self, ty: &Type) -> HirType {
         use zyntax_typed_ast::PrimitiveType;

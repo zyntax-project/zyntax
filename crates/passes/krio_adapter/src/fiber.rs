@@ -98,12 +98,25 @@ impl FiberCfg for KrioFiberBackend {
 
     unsafe fn fiber_resume(&self, fiber: *mut FiberRepr) -> i64 {
         let fiber = &mut *(fiber as *mut Fiber);
+        // Honour cooperative cancel at the resume boundary: an
+        // auto-generated `fiber def` body has no chance to call
+        // `is_cancelled()` itself between yields, so the cancel flag
+        // would otherwise sit unobserved until the body finished
+        // naturally. Surfacing `Done` here matches the user-visible
+        // semantics of `Fiber::cancel()` ("subsequent `next()` ends
+        // the iteration").
+        if fiber.is_cancelled() {
+            return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
+        }
         let step = fiber.resume();
         encode_step(step, fiber)
     }
 
     unsafe fn fiber_resume_with(&self, fiber: *mut FiberRepr, value: i64) -> i64 {
         let fiber = &mut *(fiber as *mut Fiber);
+        if fiber.is_cancelled() {
+            return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
+        }
         let step = fiber.resume_with_u64(value as u64);
         encode_step(step, fiber)
     }

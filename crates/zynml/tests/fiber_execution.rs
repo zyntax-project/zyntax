@@ -61,3 +61,40 @@ fn fiber_yields_then_iterator_consume() {
     let result = run_returning_int(src).expect("fiber program should execute");
     assert_eq!(result, 6, "1 + 2 + 3 should sum to 6");
 }
+
+/// Cooperative cancel via `Fiber::cancel()` — the consumer asks the
+/// fiber to stop after two yields. The third+ values never reach the
+/// loop body because the cancel-aware krio resume returns Done at
+/// the next resume boundary.
+///
+/// 1 + 2 = 3 (cancel fires after the second iteration, third
+/// `f.next()` yields `None`). First piece of the Wren-style
+/// abort surface: a no-error-payload cancel signal from the caller.
+#[test]
+fn fiber_cancel_stops_iteration() {
+    let src = r#"
+        fiber def counter(): i64 {
+            yield 1
+            yield 2
+            yield 3
+            yield 4
+            yield 5
+        }
+
+        def main(): i64 {
+            let f = counter()
+            let mut sum: i64 = 0
+            let mut count: i64 = 0
+            while let Some(x) = f.next() {
+                sum = sum + x
+                count = count + 1
+                if count >= 2 {
+                    f.cancel()
+                }
+            }
+            return sum
+        }
+    "#;
+    let result = run_returning_int(src).expect("fiber program should execute");
+    assert_eq!(result, 3, "1 + 2 should sum to 3 (cancel stops the rest)");
+}
