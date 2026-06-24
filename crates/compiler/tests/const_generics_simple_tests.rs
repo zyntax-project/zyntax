@@ -39,6 +39,7 @@ fn test_const_generic_function_signature() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -172,6 +173,7 @@ fn test_monomorphization_context() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -224,6 +226,7 @@ fn test_module_monomorphization() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

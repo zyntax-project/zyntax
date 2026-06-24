@@ -2049,6 +2049,7 @@ pub fn generate_promise_entry(
         lifetime_params: original_signature.lifetime_params.clone(),
         is_variadic: false,
         is_async: false, // the entry IS the public face; no further async transform
+        is_fiber: false,
         effects: original_signature.effects.clone(),
         is_pure: false,
     };
@@ -2315,6 +2316,7 @@ pub fn generate_sync_entry(
         lifetime_params: original_signature.lifetime_params.clone(),
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: original_signature.effects.clone(),
         is_pure: false,
     };

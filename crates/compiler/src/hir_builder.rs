@@ -1205,6 +1205,7 @@ impl<'b, 'arena> FunctionBuilder<'b, 'arena> {
             lifetime_params: Vec::new(),
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: Vec::new(),
             is_pure: false,
         };

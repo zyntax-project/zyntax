@@ -164,6 +164,7 @@ fn create_test_add_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -227,6 +228,7 @@ fn create_test_f64_extern_function(
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -464,6 +466,7 @@ fn create_arithmetic_function(name: &str, op: BinaryOp) -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -520,6 +523,7 @@ fn create_comparison_function(name: &str, op: BinaryOp) -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -582,6 +586,7 @@ fn create_vector_arithmetic_function(
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -646,6 +651,7 @@ fn create_float_arithmetic_function(name: &str, op: BinaryOp, ty: HirType) -> Hi
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -693,6 +699,7 @@ fn create_control_flow_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -794,6 +801,7 @@ fn create_caller_function(callee_id: HirId) -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -879,6 +887,7 @@ fn create_select_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -948,6 +957,7 @@ fn create_extract_value_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1015,6 +1025,7 @@ fn create_insert_value_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1122,6 +1133,7 @@ fn create_sqrt_intrinsic_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1172,6 +1184,7 @@ fn create_ctpop_intrinsic_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1222,6 +1235,7 @@ fn create_malloc_intrinsic_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1275,6 +1289,7 @@ fn create_free_intrinsic_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1325,6 +1340,7 @@ fn create_incref_intrinsic_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1427,6 +1443,7 @@ fn create_union_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1494,6 +1511,7 @@ fn create_closure_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1548,6 +1566,7 @@ fn create_pattern_match_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1678,6 +1697,7 @@ fn create_alloca_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1725,6 +1745,7 @@ fn create_load_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1784,6 +1805,7 @@ fn create_store_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1842,6 +1864,7 @@ fn create_gep_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1901,6 +1924,7 @@ fn create_combined_memory_test_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -1981,6 +2005,7 @@ fn test_simple_struct_extract() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2048,6 +2073,7 @@ fn test_simple_struct_insert() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2108,6 +2134,7 @@ fn test_array_extract() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2168,6 +2195,7 @@ fn test_array_insert() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2235,6 +2263,7 @@ fn test_nested_struct() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2296,6 +2325,7 @@ fn test_array_of_structs() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2350,6 +2380,7 @@ fn test_2d_array() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2415,6 +2446,7 @@ fn test_mixed_struct_types() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2486,6 +2518,7 @@ fn test_deeply_nested_struct() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2554,6 +2587,7 @@ fn test_super_trait_upcast() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2687,6 +2721,7 @@ fn make_f32_to_f32_func(fn_name: &str) -> (HirFunction, HirId) {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2714,6 +2749,7 @@ fn make_i32_to_i32_func(fn_name: &str) -> (HirFunction, HirId) {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -2749,6 +2785,7 @@ fn make_f64f64_to_f64_func(fn_name: &str) -> (HirFunction, HirId, HirId) {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -3179,6 +3216,7 @@ fn make_ptr_to_f32_func(fn_name: &str) -> (HirFunction, HirId) {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -3347,6 +3385,7 @@ fn test_vector_store_f32x4_executes() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -3446,6 +3485,7 @@ fn test_emit_elementwise_simd_loop_f32_mul() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -3639,6 +3679,7 @@ fn create_effect_module() -> HirModule {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -3671,6 +3712,7 @@ fn create_module_with_perform_effect() -> HirModule {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![create_test_string("Logger")],
         is_pure: false,
     };
@@ -3714,6 +3756,7 @@ fn create_module_with_handle_effect() -> HirModule {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

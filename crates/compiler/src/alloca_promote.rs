@@ -347,6 +347,7 @@ mod tests {
             lifetime_params: Vec::new(),
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: Vec::new(),
             is_pure: false,
         }
@@ -536,6 +537,7 @@ mod tests {
             InternedString::new_global("async_fn"),
             HirFunctionSignature {
                 is_async: true,
+                is_fiber: false,
                 ..empty_sig(HirType::Ptr(Box::new(HirType::I64)))
             },
         );

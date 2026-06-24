@@ -1987,15 +1987,24 @@ impl SsaBuilder {
                 return Ok(current);
             }
             TypedStatement::Yield(expr) => {
-                if self.compute_yield_stack.is_empty() {
-                    return Err(crate::CompilerError::Analysis(
-                        "`yield` is only valid inside compute expression bodies".to_string(),
-                    ));
-                }
-
                 let yielded = self.translate_expression(block_id, expr)?;
-                if let Some(active_yields) = self.compute_yield_stack.last_mut() {
+
+                // Inside `fiber def NAME(...)` bodies, `yield expr`
+                // is a suspension point — emit `FiberYield(value)`
+                // which the fiber_lowering pass rewrites into a
+                // `Call::Symbol("krio_fiber_yield")`. Outside fibers,
+                // the legacy compute-reduction semantics apply:
+                // push the value onto the yield stack the
+                // surrounding `compute` block consumes.
+                if self.function.signature.is_fiber {
+                    self.add_instruction(block_id, HirInstruction::FiberYield { value: yielded });
+                } else if let Some(active_yields) = self.compute_yield_stack.last_mut() {
                     active_yields.push(yielded);
+                } else {
+                    return Err(crate::CompilerError::Analysis(
+                        "`yield` is only valid inside `fiber def` bodies or compute expression bodies"
+                            .to_string(),
+                    ));
                 }
             }
 
@@ -10524,6 +10533,7 @@ impl SsaBuilder {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };

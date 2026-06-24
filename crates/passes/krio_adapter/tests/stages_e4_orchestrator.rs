@@ -173,6 +173,7 @@ fn e4_orchestrator_no_op_for_non_async_function() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: true,
     };
@@ -257,6 +258,7 @@ fn generate_sync_entry_produces_poll_loop_with_original_signature() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

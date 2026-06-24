@@ -164,6 +164,7 @@ fn create_max_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -247,6 +248,7 @@ fn create_abs_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -337,6 +339,7 @@ fn create_countdown_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -431,6 +434,7 @@ fn create_factorial_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -542,6 +546,7 @@ fn create_sign_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

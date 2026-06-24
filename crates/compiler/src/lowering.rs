@@ -2350,6 +2350,7 @@ impl LoweringContext {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: func.is_async,
+            is_fiber: func.is_fiber,
             effects: func.effects.clone(),
             is_pure: func.is_pure,
         })
@@ -4184,6 +4185,7 @@ impl LoweringContext {
                     lifetime_params: Vec::new(),
                     is_variadic: false,
                     is_async: false,
+                    is_fiber: false,
                     effects: Vec::new(),
                     is_pure: false,
                 };
@@ -4294,6 +4296,7 @@ impl LoweringContext {
                                 lifetime_params: Vec::new(),
                                 is_variadic: false,
                                 is_async: false,
+                                is_fiber: false,
                                 effects: Vec::new(),
                                 is_pure: false,
                             };
@@ -4396,6 +4399,7 @@ impl LoweringContext {
                                 lifetime_params: Vec::new(),
                                 is_variadic: false,
                                 is_async: false,
+                                is_fiber: false,
                                 effects: Vec::new(),
                                 is_pure: false,
                             };

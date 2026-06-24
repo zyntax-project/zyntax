@@ -521,6 +521,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -581,6 +582,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -639,6 +641,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -695,6 +698,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -897,6 +901,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -993,6 +998,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -1027,6 +1033,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };

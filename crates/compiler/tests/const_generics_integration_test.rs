@@ -37,6 +37,7 @@ fn test_monomorphized_function_compilation() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -90,6 +91,7 @@ fn test_const_generic_array_compilation() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -214,6 +216,7 @@ fn test_nested_const_generics() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -246,6 +249,7 @@ fn test_const_generic_default_values() {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

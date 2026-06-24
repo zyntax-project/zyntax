@@ -55,6 +55,7 @@ fn create_simple_add_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -123,6 +124,7 @@ fn create_indirect_call_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -197,6 +199,7 @@ fn create_multi_level_extract_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -275,6 +278,7 @@ fn create_multi_level_insert_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -353,6 +357,7 @@ fn create_math_intrinsic_function(name: &str, intrinsic: Intrinsic) -> HirFuncti
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -421,6 +426,7 @@ fn create_pow_intrinsic_function() -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -492,6 +498,7 @@ fn create_bit_intrinsic_function(name: &str, intrinsic: Intrinsic) -> HirFunctio
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

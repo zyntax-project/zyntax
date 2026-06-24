@@ -53,6 +53,7 @@ pub fn make_async_function_with_one_await() -> AsyncFnFixture {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: true,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -192,6 +193,7 @@ pub fn make_effectful_function_with_one_perform() -> EffectfulFnFixture {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![InternedString::new_global("State")],
         is_pure: false,
     };
@@ -319,6 +321,7 @@ pub fn make_async_function_with_host_bridge_await(symbol_name: &str) -> AsyncFnF
         lifetime_params: vec![],
         is_variadic: false,
         is_async: true,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

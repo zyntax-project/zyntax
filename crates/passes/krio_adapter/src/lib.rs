@@ -1120,6 +1120,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: true,
         };
@@ -1266,6 +1267,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };
@@ -1618,6 +1620,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![InternedString::new_global("Log")],
             is_pure: false,
         };
@@ -1647,6 +1650,7 @@ mod tests {
             lifetime_params: vec![],
             is_variadic: false,
             is_async: false,
+            is_fiber: false,
             effects: vec![],
             is_pure: false,
         };

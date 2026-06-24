@@ -195,6 +195,7 @@ fn create_binary_op_function(name: &str, op: BinaryOp) -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };
@@ -258,6 +259,7 @@ fn create_float_binary_op_function(name: &str, op: BinaryOp) -> HirFunction {
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     };

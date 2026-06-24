@@ -67,6 +67,7 @@ fn create_test_signature() -> HirFunctionSignature {
         const_params: vec![],
         lifetime_params: vec![],
         is_async: false,
+        is_fiber: false,
         is_variadic: false,
         effects: vec![],
         is_pure: false,

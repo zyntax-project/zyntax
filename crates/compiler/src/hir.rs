@@ -274,6 +274,12 @@ pub struct HirFunctionSignature {
     pub lifetime_params: Vec<HirLifetime>,
     pub is_variadic: bool,
     pub is_async: bool,
+    /// `true` for `fiber def` functions. The lowering pass routes
+    /// `yield expr` inside the body to `HirInstruction::FiberYield`
+    /// instead of the compute-reduction yield-stack path; callers
+    /// wrap invocations in `FiberNew`. Mutually exclusive with
+    /// `is_async` — the grammar rejects `async fiber def` at parse.
+    pub is_fiber: bool,
     /// Effects this function may perform (algebraic effects)
     pub effects: Vec<InternedString>,
     /// Whether this function is pure (no effects, no side effects)
