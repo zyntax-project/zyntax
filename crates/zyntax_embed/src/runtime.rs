@@ -944,10 +944,13 @@ impl ZyntaxRuntime {
         crate::effect_runtime::register_box_runtime_symbols(&mut runtime);
         // First-class fiber HIR ops lower to `Call::Symbol("krio_fiber_*")`
         // before the backend sees them. Register the typed signatures up
-        // front so link resolution is clean even when no fiber op fires.
-        // The current fn pointers panic on call — a future commit swaps
-        // them for the krio-fiber backend behind the `FiberCfg` trait.
+        // front so link resolution is clean even when no fiber op fires,
+        // and install the default krio-fiber backed `FiberCfg` so that
+        // any op that does fire reaches a real implementation rather
+        // than the panic stub. `install` is set-once at the process
+        // level; subsequent runtimes share the same backend.
         crate::effect_runtime::register_fiber_runtime_symbols(&mut runtime);
+        let _ = krio_adapter::fiber::install();
         runtime.finalize_runtime_symbols()?;
         Ok(runtime)
     }

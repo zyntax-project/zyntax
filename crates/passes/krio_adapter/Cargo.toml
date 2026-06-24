@@ -20,6 +20,10 @@ zyntax_compiler  = { path = "../../compiler", default-features = false }
 krio-async     = { git = "https://github.com/darmie/krio.git", package = "krio-async",     rev = "1051689" }
 krio-stackless = { git = "https://github.com/darmie/krio.git", package = "krio-stackless", rev = "1051689" }
 krio-core      = { git = "https://github.com/darmie/krio.git", package = "krio-core",      rev = "1051689" }
+# Stackful fibers (per-fiber mmap stack + arch-specific context
+# switch). Drives the default `FiberCfg` impl for first-class fiber
+# HIR ops on native targets.
+krio-fiber     = { git = "https://github.com/darmie/krio.git", package = "krio-fiber",     rev = "1051689" }
 
 log = "0.4"
 indexmap = "2"

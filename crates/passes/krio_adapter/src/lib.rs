@@ -23,6 +23,7 @@ use krio_stackless::CoroCfg;
 
 pub mod abi_emit;
 pub mod emit;
+pub mod fiber; // krio-fiber backed `FiberCfg` impl for first-class fiber HIR ops
 pub mod orchestrator;
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,

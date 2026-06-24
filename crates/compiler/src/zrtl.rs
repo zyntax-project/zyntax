@@ -1824,56 +1824,84 @@ pub struct FiberRepr {
     _opaque: [u8; 0],
 }
 
+/// Look up the installed fiber backend or panic with a descriptive
+/// message. All `krio_fiber_*` extern stubs route through this
+/// helper, so a runtime that didn't install a backend fails loudly at
+/// the op site instead of silently corrupting state.
+#[inline(always)]
+fn fiber_backend() -> &'static dyn crate::fiber_backend::FiberCfg {
+    crate::fiber_backend::installed_fiber_backend().expect(
+        "fiber backend not installed — call `install_fiber_backend` (or a higher-\
+         level installer like `register_fiber_runtime_symbols`) during runtime \
+         construction before any fiber op runs",
+    )
+}
+
 /// `krio_fiber_new` — construct a paused fiber backed by `closure`
 /// with `stack_size` bytes of stack. Returns an opaque handle.
 ///
-/// Scaffold: panics. Real impl is the upcoming krio-fiber backend
-/// in `krio_adapter`.
+/// # Safety
+/// `closure` must be a pointer the installed backend can interpret
+/// (today: an `extern "C" fn()` pointer with no captured environment).
 #[no_mangle]
-pub unsafe extern "C" fn krio_fiber_new(_closure: *mut u8, _stack_size: i64) -> *mut FiberRepr {
-    unimplemented!("krio_fiber_new: fiber runtime not yet installed")
+pub unsafe extern "C" fn krio_fiber_new(closure: *mut u8, stack_size: i64) -> *mut FiberRepr {
+    fiber_backend().fiber_new(closure, stack_size)
 }
 
 /// `krio_fiber_resume` — drive `fiber` until its next yield or
-/// completion. Returns the `FiberStep` tag (encoding details left
-/// to the backend; the HIR receives an i64 the lowering pass
-/// decodes).
+/// completion. Returns a packed `FiberStep` (tag in the low
+/// `FIBER_STEP_TAG_BITS`, yielded payload in the upper bits).
+///
+/// # Safety
+/// `fiber` must be a handle returned by `krio_fiber_new` (or a
+/// previous `krio_fiber_resume*`) that hasn't been moved between
+/// threads.
 #[no_mangle]
-pub unsafe extern "C" fn krio_fiber_resume(_fiber: *mut FiberRepr) -> i64 {
-    unimplemented!("krio_fiber_resume: fiber runtime not yet installed")
+pub unsafe extern "C" fn krio_fiber_resume(fiber: *mut FiberRepr) -> i64 {
+    fiber_backend().fiber_resume(fiber)
 }
 
 /// `krio_fiber_resume_with` — bidirectional resume. Delivers
 /// `value` to the suspended fiber as the result of its currently-
-/// blocked `FiberYield`.
+/// blocked `FiberYield`. Same packed return shape as
+/// [`krio_fiber_resume`].
+///
+/// # Safety
+/// Same as [`krio_fiber_resume`].
 #[no_mangle]
-pub unsafe extern "C" fn krio_fiber_resume_with(_fiber: *mut FiberRepr, _value: i64) -> i64 {
-    unimplemented!("krio_fiber_resume_with: fiber runtime not yet installed")
+pub unsafe extern "C" fn krio_fiber_resume_with(fiber: *mut FiberRepr, value: i64) -> i64 {
+    fiber_backend().fiber_resume_with(fiber, value)
 }
 
 /// `krio_fiber_yield` — suspend the enclosing fiber, surfacing
 /// `value` to whoever called the matching resume. Only valid from
-/// inside a fiber body.
+/// inside a fiber body — the backend looks up the current fiber via
+/// a thread-local.
 #[no_mangle]
-pub unsafe extern "C" fn krio_fiber_yield(_value: i64) {
-    unimplemented!("krio_fiber_yield: fiber runtime not yet installed")
+pub unsafe extern "C" fn krio_fiber_yield(value: i64) {
+    fiber_backend().fiber_yield(value)
 }
 
 /// `krio_fiber_transfer` — symmetric switch. Abandons the caller
-/// and transfers to `target` with `value`. Returns whatever value
-/// the current fiber later receives when somebody transfers BACK
-/// to it.
+/// and transfers to `target` with `value`. Returns the value the
+/// current fiber later receives when somebody transfers BACK to it.
+///
+/// # Safety
+/// `target` must be a valid fiber handle on the calling thread.
 #[no_mangle]
-pub unsafe extern "C" fn krio_fiber_transfer(_target: *mut FiberRepr, _value: i64) -> i64 {
-    unimplemented!("krio_fiber_transfer: fiber runtime not yet installed")
+pub unsafe extern "C" fn krio_fiber_transfer(target: *mut FiberRepr, value: i64) -> i64 {
+    fiber_backend().fiber_transfer(target, value)
 }
 
 /// `krio_fiber_cancel` — cooperative cancel signal. Sets a flag
 /// the fiber polls; the fiber is responsible for exiting cleanly.
 /// No-op if already done or errored.
+///
+/// # Safety
+/// `fiber` must be a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn krio_fiber_cancel(_fiber: *mut FiberRepr) {
-    unimplemented!("krio_fiber_cancel: fiber runtime not yet installed")
+pub unsafe extern "C" fn krio_fiber_cancel(fiber: *mut FiberRepr) {
+    fiber_backend().fiber_cancel(fiber)
 }
 
 /// Return the list of `krio_fiber_*` runtime helpers as `(name, fn
