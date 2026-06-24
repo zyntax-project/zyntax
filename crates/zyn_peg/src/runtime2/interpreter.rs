@@ -323,6 +323,10 @@ impl<'g> GrammarInterpreter<'g> {
             | ["SuffixSlice"]
             | ["SuffixTry"]
             | ["CastTarget"] => self.construct_suffix(type_path, fields, state),
+            // `while let PATTERN = EXPR { body }` — desugars to
+            // `while true { match EXPR { case PATTERN { body } case _ { break } } }`
+            // so no new typed-AST variant is introduced.
+            ["WhileLet"] => self.construct_while_let(fields, state, span),
             // Lambda parameter
             ["TypedLambdaParam"] => self.construct_lambda_param(fields, state, span),
             _ => Err(format!("unknown type path: {}", type_path)),
@@ -382,6 +386,101 @@ impl<'g> GrammarInterpreter<'g> {
         };
 
         Ok(ParsedValue::Block(TypedBlock { statements, span }))
+    }
+
+    /// Desugar `while let PATTERN = SCRUTINEE { body }` at parse
+    /// time into:
+    ///
+    /// ```text
+    /// while true {
+    ///     match SCRUTINEE {
+    ///         case PATTERN { body }
+    ///         case _       { break }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Building the desugared shape here keeps `while let` out of the
+    /// typed-AST surface — no new `TypedStatement` variant, no
+    /// cascading match arms across the compiler. Downstream passes
+    /// see a plain `TypedStatement::While` and treat it normally.
+    fn construct_while_let<'a>(
+        &self,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        span: Span,
+    ) -> Result<ParsedValue, String> {
+        let pattern = self.get_field_as_pattern("pattern", fields, state)?;
+        let scrutinee = self.get_field_as_expr("scrutinee", fields, state)?;
+        let body = self.get_field_as_block("body", fields, state)?;
+
+        // Arm 1: `case PATTERN { body }` — the user's loop body. Match
+        // arms expect their body as an expression, so wrap the
+        // user-supplied block in a `TypedExpression::Block`.
+        let body_arm = TypedMatchArm {
+            pattern: Box::new(pattern),
+            guard: None,
+            body: Box::new(typed_node(
+                TypedExpression::Block(body),
+                Type::Primitive(PrimitiveType::Unit),
+                span,
+            )),
+        };
+
+        // Arm 2: `case _ { break }` — exits the surrounding `while`
+        // when the scrutinee no longer matches PATTERN. Same Block
+        // wrapping as arm 1.
+        let break_block = TypedBlock {
+            statements: vec![typed_node(
+                TypedStatement::Break(None),
+                Type::Primitive(PrimitiveType::Unit),
+                span,
+            )],
+            span,
+        };
+        let break_arm = TypedMatchArm {
+            pattern: Box::new(typed_node(TypedPattern::Wildcard, Type::Any, span)),
+            guard: None,
+            body: Box::new(typed_node(
+                TypedExpression::Block(break_block),
+                Type::Primitive(PrimitiveType::Unit),
+                span,
+            )),
+        };
+
+        let match_expr = typed_node(
+            TypedExpression::Match(zyntax_typed_ast::typed_ast::TypedMatchExpr {
+                scrutinee: Box::new(scrutinee),
+                arms: vec![body_arm, break_arm],
+            }),
+            Type::Primitive(PrimitiveType::Unit),
+            span,
+        );
+
+        let synthesized_body = TypedBlock {
+            statements: vec![typed_node(
+                TypedStatement::Expression(Box::new(match_expr)),
+                Type::Primitive(PrimitiveType::Unit),
+                span,
+            )],
+            span,
+        };
+
+        let true_lit = typed_node(
+            TypedExpression::Literal(TypedLiteral::Bool(true)),
+            Type::Primitive(PrimitiveType::Bool),
+            span,
+        );
+
+        Ok(ParsedValue::Statement(Box::new(typed_node(
+            TypedStatement::While(TypedWhile {
+                condition: Box::new(true_lit),
+                body: synthesized_body,
+                span,
+            }),
+            Type::Primitive(PrimitiveType::Unit),
+            span,
+        ))))
     }
 
     /// Construct a TypedStatement variant

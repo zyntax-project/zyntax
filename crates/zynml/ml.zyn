@@ -1988,6 +1988,7 @@ param_simple = { name:identifier }
 statement = {
     let_stmt |
     if_stmt |
+    while_let_stmt |
     while_stmt |
     for_stmt |
     try_stmt |
@@ -2141,6 +2142,19 @@ if_simple_stmt = { "if" ~ cond:expr ~ then_body:block }
       condition: cond,
       then_branch: then_body,
       else_branch: None,
+  }
+
+// while let PATTERN = expr { body } — iterates as long as `expr`
+// matches PATTERN, binding the destructured value(s) and re-running
+// the body. On a non-matching value (e.g. `None` after `Some(x)`),
+// the loop terminates without raising. Desugars at parse time to a
+// `while true { match expr { case PATTERN { body } case _ { break } } }`
+// shape so no new typed-AST variant is needed.
+while_let_stmt = { "while" ~ "let" ~ pat:pattern ~ "=" ~ scrut:expr ~ body:block }
+  -> WhileLet {
+      pattern: pat,
+      scrutinee: scrut,
+      body: body,
   }
 
 // while condition { ... }
