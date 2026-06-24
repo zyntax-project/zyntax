@@ -4890,6 +4890,53 @@ impl LoweringContext {
             return Some(inherent_name);
         }
 
+        // Inherent impl methods on extern structs registered via
+        // the runtime's extern-link-name map (ZRTL trait-impls
+        // forwarded from `LoweringConfig::builtins`, etc.). Same
+        // lookup shape as the inherent check above, but in the
+        // link-name table.
+        if self
+            .symbols
+            .extern_link_names
+            .contains_key(&inherent_interned)
+        {
+            return Some(inherent_name);
+        }
+
+        // Try the extern-type convention: ${Type}${method}. ZRTL
+        // plugins export their associated functions with a leading
+        // `$` (e.g. `$Tensor$arange`); some impls register the
+        // qualified key directly.
+        let extern_name = format!("${}${}", type_name, method_name);
+        let extern_interned = InternedString::new_global(&extern_name);
+        if self.symbols.functions.contains_key(&extern_interned) {
+            return Some(extern_name);
+        }
+        if self
+            .symbols
+            .extern_link_names
+            .contains_key(&extern_interned)
+        {
+            return Some(extern_name);
+        }
+
+        // Last attempt: stdlib `impl <Type> { extern def NAME ... }`
+        // blocks register their methods under the bare method name
+        // (e.g. `arange`) pointing at the ZRTL link (`$Tensor$arange`).
+        // That works for ordinary `arange(...)` calls but the dot-
+        // static rewrite (`Tensor.arange(...)`) tries the qualified
+        // forms first. Fall back to the bare method name when the
+        // link target's `$<Type>$` prefix confirms the binding
+        // really belongs to the requested type — otherwise we'd
+        // hijack a same-named global for a different type.
+        let bare_interned = InternedString::new_global(method_name);
+        if let Some(target) = self.symbols.extern_link_names.get(&bare_interned) {
+            let expected_prefix = format!("${}$", type_name);
+            if target.starts_with(&expected_prefix) {
+                return Some(method_name.to_string());
+            }
+        }
+
         // Search through all trait implementations to find the method
         for (_trait_id, impls) in self.type_registry.iter_implementations() {
             for impl_def in impls {
