@@ -254,28 +254,41 @@ impl Grammar2 {
                     Type::Any
                 };
 
-            // Get parameters from signature if available
-            let params: Vec<TypedParameter> = if let Some(sigs) = signatures {
-                if let Some(sig) = sigs.get(target_symbol.as_str()) {
-                    (0..sig.param_count)
-                        .map(|i| {
-                            let ty = Self::type_tag_to_type(&sig.params[i as usize]);
-                            TypedParameter {
-                                name: InternedString::new_global(&format!("p{}", i)),
-                                ty,
-                                mutability: Mutability::Immutable,
-                                kind: ParameterKind::Regular,
-                                default_value: None,
-                                attributes: vec![],
-                                span,
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
+            // Get parameters from signature if available.
+            //
+            // When the plugin signature is missing (e.g. on a fresh
+            // checkout where `plugins/target/zrtl/*.zrtl` hasn't been
+            // built yet), skip the alias entirely. A zero-param stub
+            // here clashes downstream with the real call site's
+            // multi-param signature (`IncompatibleSignature` panic in
+            // the Cranelift backend), which manifests as
+            // `hello_simple.zynml` and any other Tensor-using example
+            // crashing at first call. Skipping leaves the actual
+            // dispatch path to discover the real signature from the
+            // ZRTL call.
+            let sig_for_symbol = signatures.and_then(|s| s.get(target_symbol.as_str()));
+            let params: Vec<TypedParameter> = if let Some(sig) = sig_for_symbol {
+                (0..sig.param_count)
+                    .map(|i| {
+                        let ty = Self::type_tag_to_type(&sig.params[i as usize]);
+                        TypedParameter {
+                            name: InternedString::new_global(&format!("p{}", i)),
+                            ty,
+                            mutability: Mutability::Immutable,
+                            kind: ParameterKind::Regular,
+                            default_value: None,
+                            attributes: vec![],
+                            span,
+                        }
+                    })
+                    .collect()
             } else {
-                vec![]
+                log::debug!(
+                    "[Grammar2] No signature for builtin `{}` -> `{}`; skipping alias decl",
+                    source_name,
+                    target_symbol
+                );
+                continue;
             };
 
             // 1. Create alias extern (e.g., image_load -> links to $Image$load)

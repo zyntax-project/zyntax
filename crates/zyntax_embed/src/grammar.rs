@@ -541,30 +541,38 @@ impl LanguageGrammar {
                 Type::Any
             };
 
-            // Get parameters from signature if available
-            let params = if let Some(sigs) = signatures {
-                if let Some(sig) = sigs.get(target_symbol.as_str()) {
-                    // Convert ZRTL signature parameters to TypedParameter
-                    use zyntax_typed_ast::typed_ast::ParameterKind;
-                    (0..sig.param_count)
-                        .map(|i| {
-                            let ty = Self::type_tag_to_type(&sig.params[i as usize]);
-                            TypedParameter {
-                                name: InternedString::new_global(&format!("p{}", i)),
-                                ty,
-                                mutability: Mutability::Immutable,
-                                kind: ParameterKind::Regular,
-                                default_value: None,
-                                attributes: vec![],
-                                span: span,
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![] // No signature found - accept anything
-                }
+            // Get parameters from signature if available.
+            //
+            // When the plugin signature is missing (no `.zrtl` built
+            // for this symbol), skip the alias entirely. A
+            // zero-param stub here clashes downstream with the real
+            // call site's multi-param signature
+            // (`IncompatibleSignature` panic in the Cranelift
+            // backend) — same shape as the grammar2 path's guard.
+            use zyntax_typed_ast::typed_ast::ParameterKind;
+            let sig_for_symbol = signatures.and_then(|s| s.get(target_symbol.as_str()));
+            let params: Vec<TypedParameter> = if let Some(sig) = sig_for_symbol {
+                (0..sig.param_count)
+                    .map(|i| {
+                        let ty = Self::type_tag_to_type(&sig.params[i as usize]);
+                        TypedParameter {
+                            name: InternedString::new_global(&format!("p{}", i)),
+                            ty,
+                            mutability: Mutability::Immutable,
+                            kind: ParameterKind::Regular,
+                            default_value: None,
+                            attributes: vec![],
+                            span,
+                        }
+                    })
+                    .collect()
             } else {
-                vec![] // No signatures provided - accept anything
+                log::debug!(
+                    "[Grammar] No signature for builtin `{}` -> `{}`; skipping alias decl",
+                    source_name,
+                    target_symbol
+                );
+                continue;
             };
 
             // 1. Create alias extern (e.g., println -> links to $IO$println_dynamic)
