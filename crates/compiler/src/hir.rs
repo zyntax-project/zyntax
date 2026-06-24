@@ -1502,6 +1502,20 @@ pub enum HirType {
     /// ```
     Promise(Box<HirType>),
 
+    /// First-class fiber type — `Fiber<T>` — a stackful coroutine
+    /// that yields values of T. Symmetric to `Type::Fiber` at the
+    /// typed-AST layer. The HIR `FiberNew` op produces values of
+    /// this type; the SSA `MethodCall` handler matches on this
+    /// variant to intercept `.next()` and emit `FiberResume` plus
+    /// an `Option<T>` decode.
+    ///
+    /// At runtime, a fiber value is an opaque `*mut FiberRepr`
+    /// (pointer-sized i64 on the platforms we target). Backends
+    /// that don't need fiber-specific behaviour can treat this as
+    /// an `i64` handle for storage; only the SSA dispatch path
+    /// needs to know it's a fiber.
+    Fiber(Box<HirType>),
+
     /// Associated type projection
     /// Represents an associated type in a trait, e.g., `<T as Iterator>::Item`
     ///

@@ -5521,6 +5521,22 @@ impl SsaBuilder {
                         method_call.receiver.ty.clone()
                     };
 
+                // Built-in trait interception. Receivers whose type
+                // is a compiler-known first-class variant
+                // (e.g. `Type::Fiber(_)`) have their methods
+                // resolved at HIR, not via runtime trait dispatch.
+                // The interception dispatches on the type variant,
+                // not on type-name strings.
+                if let Some(intercepted) = self.maybe_intercept_builtin_method_call(
+                    block_id,
+                    &method_call.receiver,
+                    &receiver_type,
+                    method_call.method,
+                    &expr.ty,
+                )? {
+                    return Ok(intercepted);
+                }
+
                 // Resolve method to mangled function name
                 let mangled_name =
                     self.resolve_method_to_function(&receiver_type, method_call.method)?;
@@ -7706,6 +7722,177 @@ impl SsaBuilder {
         Some(unboxed)
     }
 
+    /// Built-in method dispatch. Receivers whose type is a
+    /// compiler-known first-class variant route through dedicated
+    /// HIR ops instead of normal trait method dispatch. Adding a
+    /// new built-in is one match arm here, not another `if
+    /// receiver_name == "..."` guard scattered through the
+    /// MethodCall path.
+    fn maybe_intercept_builtin_method_call(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        receiver_type: &Type,
+        method: zyntax_typed_ast::InternedString,
+        result_ty: &Type,
+    ) -> CompilerResult<Option<HirId>> {
+        let method_name = match method.resolve_global() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        match receiver_type {
+            Type::Fiber(_) => match method_name.as_str() {
+                "next" => self
+                    .emit_fiber_next(block_id, receiver_expr, result_ty)
+                    .map(Some),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Emit the HIR for `Fiber<T>::next() -> Option<T>`. The prelude
+    /// impl's stub body never runs — this lowering replaces it with
+    /// a `FiberResume` plus an inline decode of the packed FiberStep
+    /// into the `Option<T>` enum variants (Some on Yielded, None on
+    /// Done / Errored).
+    fn emit_fiber_next(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        result_ty: &Type,
+    ) -> CompilerResult<HirId> {
+        // Translate the receiver. After this, `receiver_val` holds
+        // a `HirType::Fiber(_)` value — really an opaque i64 handle
+        // wrapped in the HIR variant.
+        let receiver_val = self.translate_expression(block_id, receiver_expr)?;
+
+        // FiberResume(handle) -> packed i64. The `fiber` argument is
+        // expected to be a pointer-shaped value at the HIR layer;
+        // since `HirType::Fiber(_)` lowers to a pointer-sized
+        // handle, the receiver value works directly.
+        let step_val = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::FiberResume {
+                result: step_val,
+                ty: HirType::I64,
+                fiber: receiver_val,
+            },
+        );
+        self.add_use(receiver_val, step_val);
+
+        // tag = step & 3
+        let three_const = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(3)),
+        );
+        let tag_val = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::And,
+                result: tag_val,
+                ty: HirType::I64,
+                left: step_val,
+                right: three_const,
+            },
+        );
+        self.add_use(step_val, tag_val);
+        self.add_use(three_const, tag_val);
+
+        // is_yielded = (tag == 0)
+        let zero_const = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+        );
+        let is_yielded = self.create_value(HirType::Bool, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::Eq,
+                result: is_yielded,
+                ty: HirType::I64,
+                left: tag_val,
+                right: zero_const,
+            },
+        );
+        self.add_use(tag_val, is_yielded);
+        self.add_use(zero_const, is_yielded);
+
+        // payload = step >> 2 (arithmetic shift preserves sign)
+        let two_const = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(2)),
+        );
+        let payload_val = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::Shr,
+                result: payload_val,
+                ty: HirType::I64,
+                left: step_val,
+                right: two_const,
+            },
+        );
+        self.add_use(step_val, payload_val);
+        self.add_use(two_const, payload_val);
+
+        // Build Some(payload) and None unconditionally, then Select
+        // between them. Avoids splitting the basic block for a
+        // 1-bit dispatch.
+        let option_hir_ty = self.convert_type(result_ty);
+
+        let some_val = self.create_value(option_hir_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::CreateUnion {
+                result: some_val,
+                union_ty: option_hir_ty.clone(),
+                variant_index: 0, // Some
+                value: payload_val,
+            },
+        );
+        self.add_use(payload_val, some_val);
+
+        // None has no payload — feed an empty-struct constant
+        // (same shape `TypedLiteral::Unit` lowers to).
+        let unit_val = self.create_value(
+            HirType::Void,
+            HirValueKind::Constant(crate::hir::HirConstant::Struct(vec![])),
+        );
+        let none_val = self.create_value(option_hir_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::CreateUnion {
+                result: none_val,
+                union_ty: option_hir_ty.clone(),
+                variant_index: 1, // None
+                value: unit_val,
+            },
+        );
+        self.add_use(unit_val, none_val);
+
+        let result = self.create_value(option_hir_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Select {
+                result,
+                ty: option_hir_ty,
+                condition: is_yielded,
+                true_val: some_val,
+                false_val: none_val,
+            },
+        );
+        self.add_use(is_yielded, result);
+        self.add_use(some_val, result);
+        self.add_use(none_val, result);
+
+        Ok(result)
+    }
+
     /// Convert frontend type to HIR type
     fn convert_type(&self, ty: &Type) -> HirType {
         use zyntax_typed_ast::PrimitiveType;
@@ -7804,6 +7991,15 @@ impl SsaBuilder {
                     discriminant_type: Box::new(HirType::U32),
                     is_c_union: false,
                 }))
+            }
+            Type::Fiber(inner) => {
+                // Symmetric with `Type::Result` etc. — the typed-AST
+                // first-class type lowers to the HIR first-class
+                // variant. Backends that don't care about fibers
+                // treat `HirType::Fiber` as a pointer-sized handle;
+                // SSA dispatch matches the variant directly to
+                // intercept `Fiber<T>::next()`.
+                HirType::Fiber(Box::new(self.convert_type(inner)))
             }
             Type::Struct { fields, .. } => {
                 // Convert inline struct type to HirType::Struct

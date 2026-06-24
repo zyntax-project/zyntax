@@ -209,6 +209,7 @@ impl Substitution {
                 ok_type: Box::new(self.apply(ok_type)),
                 err_type: Box::new(self.apply(err_type)),
             },
+            Type::Fiber(inner) => Type::Fiber(Box::new(self.apply(inner))),
             Type::Union(types) => Type::Union(types.iter().map(|t| self.apply(t)).collect()),
             Type::Intersection(types) => {
                 Type::Intersection(types.iter().map(|t| self.apply(t)).collect())
@@ -2795,6 +2796,7 @@ impl ConstraintSolver {
                     self.format_type(err_type)
                 )
             }
+            Type::Fiber(inner) => format!("Fiber<{}>", self.format_type(inner)),
             Type::Union(types) => {
                 let type_strs: Vec<String> = types.iter().map(|t| self.format_type(t)).collect();
                 format!("{}", type_strs.join(" | "))
@@ -3658,6 +3660,9 @@ impl ConstraintSolver {
                 ok_type: Box::new(self.resolve_associated_types(ok_type, receiver_type)),
                 err_type: Box::new(self.resolve_associated_types(err_type, receiver_type)),
             },
+            Type::Fiber(inner) => Type::Fiber(Box::new(
+                self.resolve_associated_types(inner, receiver_type),
+            )),
             Type::Union(types) => Type::Union(
                 types
                     .iter()
@@ -3883,6 +3888,9 @@ impl ConstraintSolver {
                 ok_type: Box::new(self.substitute_self_type(ok_type, receiver_type)),
                 err_type: Box::new(self.substitute_self_type(err_type, receiver_type)),
             },
+            Type::Fiber(inner) => {
+                Type::Fiber(Box::new(self.substitute_self_type(inner, receiver_type)))
+            }
             Type::Union(types) => Type::Union(
                 types
                     .iter()

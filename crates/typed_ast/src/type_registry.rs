@@ -385,6 +385,15 @@ pub enum Type {
         err_type: Box<Type>,
     },
 
+    /// First-class fiber type: `Fiber<T>` — a stackful coroutine
+    /// that yields values of T. Constructed by calling a
+    /// `fiber def` function. Implements `Iterator<Item = T>` with
+    /// `.next()` dispatched at HIR (not via runtime FFI). Lowered
+    /// to `HirType::Fiber(_)` symmetric at the HIR layer; SSA's
+    /// MethodCall handler matches this variant directly to emit
+    /// `FiberResume` rather than a regular method call.
+    Fiber(Box<Type>),
+
     /// Union type: T1 | T2 | ... | Tn
     Union(Vec<Type>),
 

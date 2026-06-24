@@ -249,6 +249,37 @@ impl<T> List<T> {
     }
 }
 
+// ============================================================================
+// Fibers — first-class stackful coroutines
+// ============================================================================
+//
+// `Fiber<T>` is a compiler-known type — `Type::Fiber` at the typed
+// AST, `HirType::Fiber` at the HIR. Declared as `extern struct` to
+// match the pattern other compiler-/runtime-owned types use
+// (Tensor, etc.); the runtime owns the layout (opaque
+// `*mut FiberRepr` handle), the compiler owns the dispatch.
+//
+// Calling a `fiber def NAME(): T { ... }` constructs a `Fiber<T>`
+// via the `FiberNew` HIR op behind the scenes. The `.next()`
+// method dispatches through SSA's built-in interception (matching
+// on `Type::Fiber`, not the name "Fiber") and emits `FiberResume`
+// + a packed-step → `Option<T>` decoder inline.
+
+extern struct Fiber<T>
+
+impl<T> Iterator for Fiber<T> {
+    type Item = T
+
+    // Stub body. SSA's MethodCall handler intercepts
+    // `Fiber<T>::next` by matching on the `Type::Fiber` variant
+    // directly and emits the FiberResume + Option decode. This
+    // body never executes; the runtime contract stays below the
+    // HIR boundary.
+    def next(self): Option<T> {
+        Option::None
+    }
+}
+
 // ListIterator - iterator over a list
 struct ListIterator<T> {
     list_data: i64,   // Pointer to list data

@@ -180,6 +180,7 @@ fn fmt_type(ty: &HirType) -> String {
             format!("interface({}, {} methods)", kind, methods.len())
         }
         HirType::Promise(inner) => format!("promise<{}>", fmt_type(inner)),
+        HirType::Fiber(inner) => format!("fiber<{}>", fmt_type(inner)),
         HirType::AssociatedType {
             trait_id,
             self_ty,

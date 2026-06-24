@@ -5572,6 +5572,14 @@ impl CraneliftBackend {
                 // Treated as a pointer to the Promise struct
                 Ok(self.module.target_config().pointer_type())
             }
+            HirType::Fiber(_) => {
+                // Fiber is an opaque `*mut FiberRepr` handle. Same
+                // pointer-sized storage as any other handle; SSA
+                // intercepts the methods that actually need fiber-
+                // specific semantics, so codegen treats it as a
+                // bare pointer.
+                Ok(self.module.target_config().pointer_type())
+            }
             HirType::Continuation { .. } => {
                 // Continuations are represented as pointers to continuation frames
                 Ok(self.module.target_config().pointer_type())

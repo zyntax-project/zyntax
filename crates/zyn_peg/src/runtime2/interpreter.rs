@@ -1408,6 +1408,20 @@ impl<'g> GrammarInterpreter<'g> {
                     .unwrap_or_default();
                 let mut const_args = self.get_field_as_const_list("const_args", fields, state)?;
 
+                // Built-in `Fiber<T>` → `Type::Fiber(Box<Type>)`. The
+                // parser produces the structural shape; the inner is
+                // whatever the parser already built (typically a
+                // `Type::Unresolved` placeholder if T is a generic
+                // name, or a concrete `Type::Primitive(...)` if T is
+                // spelled directly). Type resolution happens later;
+                // the parser's job ends with the structural variant.
+                if let Some(name_str) = name.resolve_global() {
+                    if name_str == "Fiber" {
+                        let inner = type_args.into_iter().next().unwrap_or(Type::Any);
+                        return Ok(ParsedValue::Type(Type::Fiber(Box::new(inner))));
+                    }
+                }
+
                 // Tensor shape/dtype sugar from tensor[...] syntax.
                 let tensor_items =
                     self.get_field_as_interned_list("tensor_items", fields, state)?;
