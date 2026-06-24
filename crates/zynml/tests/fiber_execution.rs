@@ -21,8 +21,12 @@ fn run_returning_int(src: &str) -> Result<i64, String> {
         .map_err(|e| format!("parse: {e:?}"))?;
     rt.compile_typed_program(program)
         .map_err(|e| format!("compile: {e:?}"))?;
+    // Use the JIT path (`call_raw`) — same path the `zynml run` CLI
+    // takes. The BC interpreter path (`call_function_raw`) doesn't
+    // yet implement every HIR instruction the krio-fiber lowering
+    // produces (Discriminant variants for union ops).
     let result = rt
-        .call_function_raw("main", vec![])
+        .call_raw("main", &[])
         .map_err(|e| format!("call: {e:?}"))?;
     result
         .as_i64()
@@ -32,16 +36,11 @@ fn run_returning_int(src: &str) -> Result<i64, String> {
 /// The minimum-viable fiber run: a fiber that yields three integers,
 /// consumed via `while let Some(x) = f.next()`. Returns the sum.
 ///
-/// 1 + 2 + 3 = 6. Currently ignored — the structural chain
-/// (FiberNew → krio_fiber_new, FiberResume → krio_fiber_resume,
-/// FiberYield → krio_fiber_yield) compiles and runs end-to-end, but
-/// two pre-existing bugs in the match / while-let lowering produce
-/// wrong values: (1) `case Some(x)` binds `undef` instead of the
-/// extracted payload; (2) `while let` desugar generates a CFG
-/// that fails Cranelift verifier with a mismatched-arg jump.
-/// Re-enable once those land.
+/// 1 + 2 + 3 = 6. Exercises the full chain end-to-end: parser, typed
+/// AST, call-site lowering, BuiltinClass dispatch, krio fiber
+/// lowering, the runtime FFI marshalling into `krio_fiber_*`, the
+/// match-on-Option pattern binding, and the while-let CFG desugar.
 #[test]
-#[ignore = "blocked on match-on-Option pattern binding + while-let CFG bugs"]
 fn fiber_yields_then_iterator_consume() {
     let src = r#"
         fiber def yields_one_two_three(): i64 {

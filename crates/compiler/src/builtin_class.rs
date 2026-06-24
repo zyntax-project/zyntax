@@ -186,18 +186,29 @@ impl BuiltinClass for FiberClass {
         block_id: HirId,
         method: &str,
         receiver: &TypedNode<TypedExpression>,
-        _receiver_ty: &Type,
+        receiver_ty: &Type,
         _args: &[TypedNode<TypedExpression>],
         result_ty: &Type,
     ) -> CompilerResult<Option<HirId>> {
-        // Single class handles every `Fiber<T>` instantiation. The
-        // `next` emitter reads the resolved `result_ty` (which is
-        // `Option<T>` after substitution) for the payload type;
-        // future Fiber methods that depend on T (e.g. a typed
-        // `resume_with`) would inspect `_receiver_ty` to extract
-        // the inner T and branch on its representation.
+        // Single class handles every `Fiber<T>` instantiation. For
+        // `next`, the result type is `Option<T>` after substitution
+        // — but the parser defaults `TypedExpression::MethodCall`
+        // expr.ty to `Type::Primitive(Unit)` when it can't infer
+        // (which is most of the time for built-in dispatch), so we
+        // can't trust `result_ty` directly. Synthesize `Option<T>`
+        // from the receiver's `Fiber<T>` variant; fall back to
+        // `result_ty` only if the receiver wasn't a Fiber (which
+        // `matches()` should already preclude).
         match method {
-            "next" => ssa.emit_fiber_next(block_id, receiver, result_ty).map(Some),
+            "next" => {
+                let item_ty = match receiver_ty {
+                    Type::Fiber(inner) => inner.as_ref().clone(),
+                    _ => result_ty.clone(),
+                };
+                let option_ty = Type::Optional(Box::new(item_ty));
+                ssa.emit_fiber_next(block_id, receiver, &option_ty)
+                    .map(Some)
+            }
             _ => Ok(None),
         }
     }

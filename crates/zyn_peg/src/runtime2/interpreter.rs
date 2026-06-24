@@ -448,18 +448,21 @@ impl<'g> GrammarInterpreter<'g> {
             )),
         };
 
-        let match_expr = typed_node(
-            TypedExpression::Match(zyntax_typed_ast::typed_ast::TypedMatchExpr {
-                scrutinee: Box::new(scrutinee),
-                arms: vec![body_arm, break_arm],
-            }),
-            Type::Primitive(PrimitiveType::Unit),
-            span,
-        );
-
+        // Emit the desugared match as a `TypedStatement::Match`
+        // (NOT a `TypedExpression::Match` wrapped in
+        // `TypedStatement::Expression`) — only the statement form
+        // triggers the CFG builder's match-arm splitting, which is
+        // what gives each arm its own basic block and produces the
+        // discriminant-driven conditional branch. Wrapping a match
+        // in `Expression` makes it opaque to the CFG splitter and
+        // generates a malformed loop (no arm dispatch, type-mismatch
+        // verifier error on the loop back-edge).
         let synthesized_body = TypedBlock {
             statements: vec![typed_node(
-                TypedStatement::Expression(Box::new(match_expr)),
+                TypedStatement::Match(zyntax_typed_ast::typed_ast::TypedMatch {
+                    scrutinee: Box::new(scrutinee),
+                    arms: vec![body_arm, break_arm],
+                }),
                 Type::Primitive(PrimitiveType::Unit),
                 span,
             )],

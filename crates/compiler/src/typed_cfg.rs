@@ -1248,27 +1248,45 @@ impl TypedCfgBuilder {
 
                         // Body block - extract statements from the arm body
                         // If arm body is a Block expression, extract its statements
-                        // Otherwise, wrap it in an Expression statement
+                        // Otherwise, wrap it in an Expression statement.
+                        //
+                        // The last statement of the arm body can be a flow
+                        // terminator (Return / Break / Continue) — promote it
+                        // to a real CFG terminator so the merge edge is
+                        // omitted. This is what makes `while let Some(x) = ...
+                        // { ... }` (which desugars to `while true { match ... {
+                        // case _ { break } ... } }`) actually exit the loop:
+                        // the Break arm's terminator becomes
+                        // `Jump(loop_exit)`, not `Jump(merge)`.
                         let (body_stmts, body_terminator) = match &arm.body.node {
                             TypedExpression::Block(block) => {
-                                // Extract statements from the block
-                                // Last statement might be a return - if so, use it as terminator
                                 if let Some(last_stmt) = block.statements.last() {
-                                    if matches!(last_stmt.node, TypedStatement::Return(_)) {
-                                        let stmts =
-                                            block.statements[..block.statements.len() - 1].to_vec();
-                                        let ret_stmt =
-                                            &block.statements[block.statements.len() - 1];
-                                        let term = if let TypedStatement::Return(ret_expr) =
-                                            &ret_stmt.node
-                                        {
-                                            TypedTerminator::Return(ret_expr.clone())
-                                        } else {
-                                            TypedTerminator::Jump(merge_id)
-                                        };
-                                        (stmts, term)
-                                    } else {
-                                        (block.statements.clone(), TypedTerminator::Jump(merge_id))
+                                    let prefix =
+                                        block.statements[..block.statements.len() - 1].to_vec();
+                                    match &last_stmt.node {
+                                        TypedStatement::Return(ret_expr) => {
+                                            (prefix, TypedTerminator::Return(ret_expr.clone()))
+                                        }
+                                        TypedStatement::Break(_) => {
+                                            let target = self
+                                                .loop_stack
+                                                .last()
+                                                .map(|&(_h, e)| e)
+                                                .unwrap_or(merge_id);
+                                            (prefix, TypedTerminator::Jump(target))
+                                        }
+                                        TypedStatement::Continue => {
+                                            let target = self
+                                                .loop_stack
+                                                .last()
+                                                .map(|&(h, _e)| h)
+                                                .unwrap_or(merge_id);
+                                            (prefix, TypedTerminator::Jump(target))
+                                        }
+                                        _ => (
+                                            block.statements.clone(),
+                                            TypedTerminator::Jump(merge_id),
+                                        ),
                                     }
                                 } else {
                                     (vec![], TypedTerminator::Jump(merge_id))
@@ -1578,6 +1596,33 @@ impl TypedCfgBuilder {
                 })
             }
 
+            // Constructor patterns like `Some(x)` / `None()` / `Ok(v)`
+            // / `Err(e)` arrive here when the parser tagged them
+            // as `Constructor { constructor: Type::Unresolved(name), ... }`
+            // rather than as full `Enum` patterns (it can't resolve
+            // the enum context generically). Treat them the same
+            // way at this layer: derive the variant index by name.
+            TypedPattern::Constructor { constructor, .. } => {
+                // Only handle `Type::Unresolved(name)` here — the parser
+                // emits the constructor as an unresolved type because it
+                // doesn't know which enum the variant belongs to. For
+                // `Type::Named { id, .. }` cases (where the parser DID
+                // resolve the parent enum) we'd need a TypeRegistry
+                // lookup to get the name — not threaded here yet.
+                let name = match constructor {
+                    Type::Unresolved(name) => *name,
+                    _ => return None,
+                };
+                let variant_index = self.get_variant_index(&scrutinee.ty, &name)?;
+
+                Some(PatternCheckInfo {
+                    scrutinee: scrutinee.clone(),
+                    pattern: pattern.clone(),
+                    variant_index: Some(variant_index),
+                    false_target,
+                })
+            }
+
             // Struct/tuple/array patterns: SSA needs to extract bindings recursively.
             // variant_index is None — they aren't union variants.
             TypedPattern::Struct { .. } | TypedPattern::Tuple(_) | TypedPattern::Array(_) => {
@@ -1631,8 +1676,34 @@ impl TypedCfgBuilder {
                 }
             }
 
-            // TODO: Handle custom enums/unions from type registry
-            _ => None,
+            // Fallback for cases where the scrutinee's typed-AST `.ty`
+            // is `Any` / `Unresolved` (common when the parser can't
+            // infer a method-call's return type — e.g. built-in
+            // dispatch like `Fiber<T>::next() -> Option<T>`). The
+            // variant *name* uniquely identifies the union shape for
+            // language-defined unions (Option, Result), so it's
+            // safe to recognise them by name. A user-defined enum
+            // that re-uses one of these names would clash with the
+            // built-in anyway.
+            _ => {
+                let mut arena = zyntax_typed_ast::arena::AstArena::new();
+                let none = arena.intern_string("None");
+                let some = arena.intern_string("Some");
+                let ok = arena.intern_string("Ok");
+                let err = arena.intern_string("Err");
+
+                if variant_name == &none {
+                    Some(0)
+                } else if variant_name == &some {
+                    Some(1)
+                } else if variant_name == &ok {
+                    Some(0)
+                } else if variant_name == &err {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
         }
     }
 }

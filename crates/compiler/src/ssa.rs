@@ -1365,49 +1365,54 @@ impl SsaBuilder {
             None => return Ok(()), // Not a union type, no extraction needed
         };
 
-        // Extract bindings from the pattern
-        match &pattern.node {
-            TypedPattern::Enum { fields, .. } => {
-                // For patterns like Some(x), extract the inner value
-                if fields.len() == 1 {
-                    if let TypedPattern::Identifier { name, .. } = &fields[0].node {
-                        // Get the type of the variant's inner value
-                        let variant = union_type
-                            .variants
-                            .iter()
-                            .find(|v| v.discriminant == variant_index as u64)
-                            .ok_or_else(|| {
-                                crate::CompilerError::Analysis(format!(
-                                    "Variant with index {} not found",
-                                    variant_index
-                                ))
-                            })?;
+        // Extract bindings from the pattern. Both `Enum { fields }`
+        // and `Constructor { pattern }` shapes show up in practice
+        // for `Some(x)` / `Ok(v)` style binders, depending on how
+        // far the parser resolved the enum context — handle both.
+        let inner_pattern: Option<&zyntax_typed_ast::TypedNode<TypedPattern>> = match &pattern.node
+        {
+            TypedPattern::Enum { fields, .. } if fields.len() == 1 => Some(&fields[0]),
+            TypedPattern::Constructor { pattern, .. } => Some(pattern.as_ref()),
+            _ => None,
+        };
 
-                        // Generate ExtractUnionValue instruction
-                        let extracted_id = HirId::new();
-                        self.add_instruction(
-                            block_id,
-                            HirInstruction::ExtractUnionValue {
-                                result: extracted_id,
-                                union_val: scrutinee_val,
-                                variant_index,
-                                ty: variant.ty.clone(),
-                            },
-                        );
+        if let Some(inner) = inner_pattern {
+            if let TypedPattern::Identifier { name, .. } = &inner.node {
+                let variant = union_type
+                    .variants
+                    .iter()
+                    .find(|v| v.discriminant == variant_index as u64)
+                    .ok_or_else(|| {
+                        crate::CompilerError::Analysis(format!(
+                            "Variant with index {} not found",
+                            variant_index
+                        ))
+                    })?;
 
-                        // Bind the extracted value to the variable
-                        self.write_variable(*name, block_id, extracted_id);
+                // Register the extracted value in the SSA value map
+                // with the variant's payload type. Without this,
+                // downstream consumers (println's DynamicBox path,
+                // f-string formatters) can't look up the value's
+                // HIR type and fall back to opaque rendering.
+                let extracted_id = self.create_value(variant.ty.clone(), HirValueKind::Instruction);
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::ExtractUnionValue {
+                        result: extracted_id,
+                        union_val: scrutinee_val,
+                        variant_index,
+                        ty: variant.ty.clone(),
+                    },
+                );
 
-                        log::debug!(
-                            "[SSA] Extracted union value for pattern variable {:?}: val={:?}",
-                            name,
-                            extracted_id
-                        );
-                    }
-                }
-            }
-            _ => {
-                // Other patterns don't need extraction (for now)
+                self.write_variable(*name, block_id, extracted_id);
+                self.var_types.insert(*name, variant.ty.clone());
+
+                log::debug!(
+                    "[SSA] Extracted union value for pattern variable {:?}: val={:?}",
+                    name,
+                    extracted_id
+                );
             }
         }
 
@@ -2075,8 +2080,29 @@ impl SsaBuilder {
                 );
                 let scrutinee_val = self.translate_expression(block_id, &match_stmt.scrutinee)?;
 
-                // Check if scrutinee is a union type (Optional, Result, or custom union)
-                let scrutinee_hir_type = self.convert_type(&match_stmt.scrutinee.ty);
+                // Check if scrutinee is a union type. The typed AST
+                // `.ty` is the primary source — but it defaults to
+                // `Type::Primitive(Unit)` for `TypedExpression::MethodCall`
+                // when the parser can't infer the result type (the
+                // common case for built-in dispatch like
+                // `Fiber<T>::next() -> Option<T>`). Fall back to the
+                // SSA value's HIR type, which `emit_fiber_next` and
+                // friends populate with the actual union shape, so
+                // `match f.next() { ... }` correctly enters the
+                // union dispatch path.
+                let scrutinee_hir_type = {
+                    let from_typed_ast = self.convert_type(&match_stmt.scrutinee.ty);
+                    if matches!(from_typed_ast, HirType::Union(_)) {
+                        from_typed_ast
+                    } else {
+                        // Fall back to the SSA value's declared type.
+                        self.function
+                            .values
+                            .get(&scrutinee_val)
+                            .map(|v| v.ty.clone())
+                            .unwrap_or(from_typed_ast)
+                    }
+                };
 
                 if let HirType::Union(union_type) = &scrutinee_hir_type {
                     // Extract discriminant for pattern matching
@@ -8003,13 +8029,21 @@ impl SsaBuilder {
         // 1-bit dispatch.
         let option_hir_ty = self.convert_type(result_ty);
 
+        // `Type::Optional` -> `HirType::Union` convention from
+        // `convert_type`: variant 0 = None, variant 1 = Some. The
+        // discriminants embedded in the union descriptor are the
+        // source of truth for `GetUnionDiscriminant` / pattern
+        // dispatch, so we MUST match that ordering here. Earlier
+        // versions of this emitter had Some=0/None=1 inverted,
+        // causing `case Some(x)` to fire with `x = 0` (extracted
+        // from the actually-None payload slot).
         let some_val = self.create_value(option_hir_ty.clone(), HirValueKind::Instruction);
         self.add_instruction(
             block_id,
             HirInstruction::CreateUnion {
                 result: some_val,
                 union_ty: option_hir_ty.clone(),
-                variant_index: 0, // Some
+                variant_index: 1, // Some
                 value: payload_val,
             },
         );
@@ -8030,7 +8064,7 @@ impl SsaBuilder {
             HirInstruction::CreateUnion {
                 result: none_val,
                 union_ty: option_hir_ty.clone(),
-                variant_index: 1, // None
+                variant_index: 0, // None
                 value: unit_val,
             },
         );
