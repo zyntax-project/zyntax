@@ -2402,7 +2402,10 @@ pipe_call = { callee:identifier ~ "(" ~ args:call_args_list? ~ ")" }
 
 // Ternary conditional: condition ? true_expr : false_expr
 // Also: value_a if condition else value_b (Python-style)
-ternary_expr = { python_ternary | ternary_with_branches | null_coalesce_expr }
+// C-style `cond ? then : else` removed — conflicts with `?` postfix
+// (the Try operator on Option / Result). ZynML programs use the
+// Python-style `then if cond else else_val` form instead.
+ternary_expr = { python_ternary | null_coalesce_expr }
 
 // Python-style ternary: value_a if condition else value_b
 // Maps to TypedIfExpr (If in TypedExpression)
@@ -2547,7 +2550,8 @@ postfix_expr = { base:primary_expr ~ suffixes:postfix_suffix* }
 
 // Postfix suffix operations - order matters: method before field (to match `obj.method()` before `obj.method`)
 // Note: suffix_slice must come before suffix_index to match arr[1:2] before arr[1]
-postfix_suffix = { suffix_method | suffix_field | suffix_call | suffix_slice | suffix_index }
+// suffix_try (the `?` operator) goes last — single-char suffix, lowest precedence.
+postfix_suffix = { suffix_method | suffix_field | suffix_call | suffix_slice | suffix_index | suffix_try }
 
 // Method call suffix: .method(args)
 suffix_method = { "." ~ method:identifier ~ "(" ~ args:call_args_list? ~ ")" }
@@ -2573,6 +2577,14 @@ suffix_index = { "[" ~ index:expr ~ "]" }
   -> SuffixIndex {
       index: index,
   }
+
+// Try suffix: expr? — Rust-style propagation operator. Unwraps
+// `Some(v)` / `Ok(v)` to `v`; on `None` / `Err(e)` returns early from
+// the enclosing function with `None` / `Err(e)` respectively. Folds
+// into `TypedExpression::Try` and is lowered to an early-return
+// branch at SSA time.
+suffix_try = { "?" }
+  -> SuffixTry { }
 
 // Slice suffix: [start:end] or [start:end:step] or [:end] or [::step] etc.
 // Use explicit patterns without optional expressions before colons to avoid ambiguity

@@ -36,6 +36,17 @@ enum ComputeKernelType {
     Generic,
 }
 
+/// Classification of the type the `?` operator is applied to.
+/// Both forms compile to a CondBranch on the discriminant; they
+/// differ in what payload the error path's early return constructs.
+#[derive(Debug, Clone)]
+enum TryTarget {
+    /// `Result<T, E>` — early-return re-wraps the extracted Err value.
+    Result { ok: Type, err: Type },
+    /// `Option<T>` — early-return constructs a bare `None`.
+    Option { inner: Type },
+}
+
 /// Internal alias used when lowering `compute(...) { ... }` expressions.
 /// This must not collide with user code.
 const INTERNAL_COMPUTE_ALIAS: &str = "__internal_compute_dispatch";
@@ -9405,8 +9416,20 @@ impl SsaBuilder {
         let inner_result_val = self.translate_expression(block_id, try_expr)?;
         let inner_result_ty = &try_expr.ty;
 
-        // Check if the type is Result<T, E>
-        let (ok_ty, err_ty) = self.extract_result_type_args(inner_result_ty)?;
+        // Determine the target shape — Option<T> or Result<T, E>. Both
+        // are enum-like with two variants where index 0 carries the
+        // success payload and index 1 carries the error / none. The
+        // only structural difference: Option's None variant has no
+        // payload, so the early-return value is a bare None
+        // constructor instead of a re-wrapped Err(value).
+        let target = self.classify_try_target(inner_result_ty)?;
+        let (ok_ty, err_ty) = match &target {
+            TryTarget::Result { ok, err } => (ok.clone(), err.clone()),
+            TryTarget::Option { inner } => (
+                inner.clone(),
+                Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
+            ),
+        };
 
         // Convert types to HIR
         let hir_ok_ty = self.convert_type(&ok_ty);
@@ -9492,32 +9515,59 @@ impl SsaBuilder {
             false_target: err_block_id,
         };
 
-        // ERR BLOCK: Extract error and return early
-        let err_value = self.create_value(hir_err_ty.clone(), HirValueKind::Instruction);
-        self.add_instruction(
-            err_block_id,
-            HirInstruction::ExtractValue {
-                result: err_value,
-                ty: hir_err_ty.clone(), // Err value type (E)
-                aggregate: inner_result_val,
-                indices: vec![1], // Data field (contains the actual Ok/Err value)
-            },
-        );
-
-        // Construct a new Err(error) to return
-        // Create Result<T, E> union with variant_index = 1 (Err)
+        // ERR BLOCK: build the early-return value.
+        //
+        // Result<T, E> path: extract the Err payload from the inner
+        // value's data field and re-wrap as `Err(payload)` so the
+        // function returns the same Result type it received.
+        //
+        // Option<T> path: no payload on the None variant — construct
+        // `None` directly. The bare-variant constructor uses Unit as
+        // the value type to match Option's `None` arm.
         let return_err = self.create_value(hir_result_ty.clone(), HirValueKind::Instruction);
-        self.add_instruction(
-            err_block_id,
-            HirInstruction::CreateUnion {
-                result: return_err,
-                union_ty: hir_result_ty.clone(),
-                variant_index: 1, // Err variant
-                value: err_value,
-            },
-        );
+        match target {
+            TryTarget::Result { .. } => {
+                let err_value = self.create_value(hir_err_ty.clone(), HirValueKind::Instruction);
+                self.add_instruction(
+                    err_block_id,
+                    HirInstruction::ExtractValue {
+                        result: err_value,
+                        ty: hir_err_ty.clone(),
+                        aggregate: inner_result_val,
+                        indices: vec![1],
+                    },
+                );
+                self.add_instruction(
+                    err_block_id,
+                    HirInstruction::CreateUnion {
+                        result: return_err,
+                        union_ty: hir_result_ty.clone(),
+                        variant_index: 1, // Err
+                        value: err_value,
+                    },
+                );
+            }
+            TryTarget::Option { .. } => {
+                // None has no payload; CreateUnion still requires a
+                // value slot, so feed it an empty-struct constant
+                // (the same shape `TypedLiteral::Unit` lowers to).
+                let unit_val = self.create_value(
+                    HirType::Void,
+                    HirValueKind::Constant(crate::hir::HirConstant::Struct(vec![])),
+                );
+                self.add_instruction(
+                    err_block_id,
+                    HirInstruction::CreateUnion {
+                        result: return_err,
+                        union_ty: hir_result_ty.clone(),
+                        variant_index: 1, // None
+                        value: unit_val,
+                    },
+                );
+            }
+        }
 
-        // Early return with Err(error)
+        // Early return with the constructed Err / None
         self.function
             .blocks
             .get_mut(&err_block_id)
@@ -9542,6 +9592,53 @@ impl SsaBuilder {
 
         // Return the ok_value which was extracted in block_id
         Ok(ok_value)
+    }
+
+    /// Classify the target of a `?` operator. Supports both
+    /// `Option<T>` (1 type arg, None has no payload) and
+    /// `Result<T, E>` (2 type args, Err carries the value).
+    fn classify_try_target(&self, ty: &Type) -> CompilerResult<TryTarget> {
+        match ty {
+            Type::Result { ok_type, err_type } => Ok(TryTarget::Result {
+                ok: ok_type.as_ref().clone(),
+                err: err_type.as_ref().clone(),
+            }),
+            Type::Optional(inner) => Ok(TryTarget::Option {
+                inner: inner.as_ref().clone(),
+            }),
+            Type::Named { type_args, id, .. } => {
+                let name = self
+                    .type_registry
+                    .get_type_by_id(*id)
+                    .and_then(|t| t.name.resolve_global());
+                match (name.as_deref(), type_args.len()) {
+                    (Some("Option"), 1) => Ok(TryTarget::Option {
+                        inner: type_args[0].clone(),
+                    }),
+                    (Some("Result"), 2) => Ok(TryTarget::Result {
+                        ok: type_args[0].clone(),
+                        err: type_args[1].clone(),
+                    }),
+                    // Fall back to legacy heuristic so existing
+                    // Result-using code that surfaces as 2-arg
+                    // Named still works without name resolution.
+                    (_, 2) => Ok(TryTarget::Result {
+                        ok: type_args[0].clone(),
+                        err: type_args[1].clone(),
+                    }),
+                    (_, 1) => Ok(TryTarget::Option {
+                        inner: type_args[0].clone(),
+                    }),
+                    _ => Err(crate::CompilerError::Lowering(format!(
+                        "? operator requires Option<T> or Result<T, E>, found type with {} args",
+                        type_args.len()
+                    ))),
+                }
+            }
+            _ => Err(crate::CompilerError::Lowering(
+                "? operator requires Option<T> or Result<T, E>".to_string(),
+            )),
+        }
     }
 
     /// Extract T and E from Result<T, E> type

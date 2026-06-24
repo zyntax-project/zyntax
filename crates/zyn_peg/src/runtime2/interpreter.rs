@@ -321,6 +321,7 @@ impl<'g> GrammarInterpreter<'g> {
             | ["SuffixCall"]
             | ["SuffixIndex"]
             | ["SuffixSlice"]
+            | ["SuffixTry"]
             | ["CastTarget"] => self.construct_suffix(type_path, fields, state),
             // Lambda parameter
             ["TypedLambdaParam"] => self.construct_lambda_param(fields, state, span),
@@ -2754,6 +2755,21 @@ impl<'g> GrammarInterpreter<'g> {
                                 end,
                                 step,
                             }),
+                            Type::Unknown,
+                            span,
+                        ))))
+                    }
+                    "SuffixTry" => {
+                        // `expr?` — Try (propagation) operator.
+                        // Unwraps `Some(v)` / `Ok(v)` to `v`; on
+                        // `None` / `Err(e)` returns early from the
+                        // enclosing function with `None` / `Err(e)`.
+                        // Folds into `TypedExpression::Try`, which
+                        // SSA lowering desugars to the early-return
+                        // branch.
+                        let acc_expr = self.parsed_value_to_expr(acc, state)?;
+                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                            TypedExpression::Try(Box::new(acc_expr)),
                             Type::Unknown,
                             span,
                         ))))
