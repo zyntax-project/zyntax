@@ -844,6 +844,15 @@ fn apply_krio_async_lowering(module: &mut zyntax_compiler::HirModule) -> Runtime
         .map_err(|e| RuntimeError::Execution(e.0))
 }
 
+/// Rewrite first-class fiber HIR ops (`FiberNew` / `FiberResume` /
+/// `FiberYield` / ...) to `Call::Symbol("krio_fiber_*")` so the
+/// backend sees only symbol calls. No-op on modules with no fiber
+/// ops — runs unconditionally because the rewrite is cheap and the
+/// alternative is per-frontend opt-in plumbing.
+fn apply_krio_fiber_lowering(module: &mut zyntax_compiler::HirModule) {
+    zyntax_compiler::fiber_lowering::apply_krio_fiber_lowering(module)
+}
+
 pub struct ZyntaxRuntime {
     /// The Cranelift JIT backend
     backend: CraneliftBackend,
@@ -1112,6 +1121,7 @@ impl ZyntaxRuntime {
         // `compile_module` continues to handle the lowering.
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
 
         // Compile the module
         self.compile_module(&hir_module)
@@ -2455,6 +2465,7 @@ impl ZyntaxRuntime {
         let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
 
         // Collect function names before compilation
         // Use resolve_global() to get the actual string from InternedString
@@ -2653,6 +2664,7 @@ impl ZyntaxRuntime {
         let mut hir_module = self.lower_typed_program(program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
 
         // Collect function names before compilation
         let function_names: Vec<String> = hir_module
@@ -3483,6 +3495,7 @@ impl TieredRuntime {
         let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
 
         // Collect function names before compilation. `f.name.to_string()`
         // returns the debug repr of InternedString (e.g.

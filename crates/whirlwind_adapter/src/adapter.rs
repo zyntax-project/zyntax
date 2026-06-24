@@ -423,6 +423,7 @@ impl WhirlwindAdapter {
                 body: Some(body),
                 visibility,
                 is_async,
+                is_fiber: false,
                 is_external: false,
                 calling_convention: zyntax_typed_ast::CallingConvention::Default,
                 link_name: None,

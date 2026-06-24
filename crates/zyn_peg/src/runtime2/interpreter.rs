@@ -964,11 +964,14 @@ impl<'g> GrammarInterpreter<'g> {
                 let body = self.get_field_optional_block("body", fields, state)?;
                 let annotations =
                     self.get_field_as_annotation_list("annotations", fields, state)?;
-                // Optional fields: grammar rules for `async def`, `async fn`,
-                // and `extern fn` set these explicitly. Default false when
-                // absent (regular sync function).
+                // Optional fields: grammar rules for `async def`, `fiber def`,
+                // `async fn`, and `extern fn` set these explicitly. Default
+                // false when absent (regular sync function).
                 let is_async = self
                     .get_field_optional_bool("is_async", fields, state)?
+                    .unwrap_or(false);
+                let is_fiber = self
+                    .get_field_optional_bool("is_fiber", fields, state)?
                     .unwrap_or(false);
                 let is_external = self
                     .get_field_optional_bool("is_external", fields, state)?
@@ -985,6 +988,7 @@ impl<'g> GrammarInterpreter<'g> {
                     body,
                     visibility: Visibility::Public,
                     is_async,
+                    is_fiber,
                     is_pure: false,
                     is_external,
                     calling_convention: CallingConvention::Default,

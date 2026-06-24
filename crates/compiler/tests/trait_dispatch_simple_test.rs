@@ -113,6 +113,7 @@ fn test_vtable_generation_simple() {
         }),
         visibility: Visibility::Public,
         is_async: false,
+        is_fiber: false,
         is_external: false,
         calling_convention: zyntax_typed_ast::CallingConvention::Default,
         link_name: None,

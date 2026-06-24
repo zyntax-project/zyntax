@@ -33,6 +33,7 @@ fn create_extern_function(
         body: None, // Extern - no body
         visibility: Visibility::Public,
         is_async: false,
+        is_fiber: false,
         is_external: true,
         calling_convention: cc,
         link_name: None,
@@ -251,6 +252,7 @@ fn test_non_extern_function_without_body_fails() {
         body: None, // Regular function WITHOUT body
         visibility: Visibility::Public,
         is_async: false,
+        is_fiber: false,
         is_external: false, // NOT extern
         calling_convention: CallingConvention::Default,
         link_name: None,

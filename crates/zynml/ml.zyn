@@ -1586,6 +1586,10 @@ trait_bound_fn = { bound:fn_type }
 //   async def fetch(url: str): Data { }  // Async function
 //
 fn_def = {
+    // Fiber functions (match `fiber` keyword before `def`)
+    fiber_def_return_block | fiber_def_return_colon |
+    fiber_def_params_block | fiber_def_params_colon |
+    fiber_def_simple_block | fiber_def_simple_colon |
     // Async functions (must come first to match `async` keyword)
     async_def_return_block | async_def_return_colon |
     async_def_params_block | async_def_params_colon |
@@ -1603,6 +1607,68 @@ fn_def = {
     fn_def_params_colon | fn_def_params |
     fn_def_simple_colon | fn_def_simple
 }
+
+// ========== Fiber function definitions ==========
+// fiber def gen(): i32 { yield 1; yield 2 }
+//
+// Stackful coroutines — body runs on a per-fiber stack allocated at
+// `FiberNew` time. `yield expr` inside the body suspends until the
+// caller's next `.resume()`. Lowered to HIR fiber ops which the
+// fiber_lowering pass rewrites to `Call::Symbol("krio_fiber_*")`.
+
+fiber_def_return_block = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ body:block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params,
+      return_type: ret,
+      body: Some(body),
+      is_fiber: true,
+  }
+
+fiber_def_return_colon = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ ":" ~ body:indent_block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params,
+      return_type: ret,
+      body: Some(body),
+      is_fiber: true,
+  }
+
+fiber_def_params_block = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ body:block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params,
+      return_type: Type::Unit,
+      body: Some(body),
+      is_fiber: true,
+  }
+
+fiber_def_params_colon = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ ":" ~ body:indent_block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params,
+      return_type: Type::Unit,
+      body: Some(body),
+      is_fiber: true,
+  }
+
+fiber_def_simple_block = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ body:block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: [],
+      return_type: Type::Unit,
+      body: Some(body),
+      is_fiber: true,
+  }
+
+fiber_def_simple_colon = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ ":" ~ body:indent_block }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: [],
+      return_type: Type::Unit,
+      body: Some(body),
+      is_fiber: true,
+  }
 
 // ========== Async function definitions ==========
 // async def fetch(url: str): Response { await http.get(url) }

@@ -356,6 +356,11 @@ pub struct TypedFunction {
     pub visibility: Visibility,
     #[serde(default)]
     pub is_async: bool,
+    /// `true` for `fiber def` functions. The body is the fiber's
+    /// trampoline; calls construct a paused fiber (HIR `FiberNew`)
+    /// instead of running synchronously.
+    #[serde(default)]
+    pub is_fiber: bool,
     #[serde(default)]
     pub is_pure: bool, // True for @pure functions (no effects)
     #[serde(default)]

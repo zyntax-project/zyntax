@@ -1129,6 +1129,7 @@ impl TypeChecker {
                 body: method.body.clone(),
                 visibility: Visibility::Public,
                 is_async: method.is_async,
+                is_fiber: false,
                 is_pure: false,
                 is_external: false,
                 calling_convention: CallingConvention::Default,

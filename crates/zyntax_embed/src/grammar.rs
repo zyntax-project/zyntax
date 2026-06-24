@@ -580,6 +580,7 @@ impl LanguageGrammar {
                 body: None, // Extern functions have no body
                 visibility: Visibility::Public,
                 is_async: false,
+                is_fiber: false,
                 is_pure: false,
                 is_external: true, // Mark as external
                 calling_convention: CallingConvention::Default,
@@ -605,6 +606,7 @@ impl LanguageGrammar {
                     body: None, // Extern functions have no body
                     visibility: Visibility::Public,
                     is_async: false,
+                    is_fiber: false,
                     is_pure: false,
                     is_external: true, // Mark as external
                     calling_convention: CallingConvention::Default,

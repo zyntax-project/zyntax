@@ -295,6 +295,7 @@ pub fn function_decl(
         visibility: Visibility::Public,
         type_params,
         is_async: false,
+        is_fiber: false,
         is_pure: false,
         is_external: false,
         calling_convention: CallingConvention::Default,

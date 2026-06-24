@@ -3768,6 +3768,7 @@ impl LoweringContext {
                         body: None, // No body - external function
                         visibility: zyntax_typed_ast::type_registry::Visibility::Public,
                         is_async: method.is_async,
+                        is_fiber: false,
                         is_pure: false,
                         is_external: true, // Mark as external
                         calling_convention:
@@ -3801,6 +3802,7 @@ impl LoweringContext {
                 body: retyped_body, // Use retyped body with updated self types
                 visibility: zyntax_typed_ast::type_registry::Visibility::Public,
                 is_async: method.is_async,
+                is_fiber: false,
                 is_pure: false,
                 is_external: false,
                 calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
@@ -4550,6 +4552,7 @@ impl LoweringContext {
             }),
             visibility: method.visibility,
             is_async: method.is_async,
+            is_fiber: false,
             is_pure: false,
             is_external: false,
             calling_convention: zyntax_typed_ast::CallingConvention::Default,
@@ -4621,6 +4624,7 @@ impl LoweringContext {
             body: Some(ctor.body.clone()),
             visibility: ctor.visibility,
             is_async: false,
+            is_fiber: false,
             is_pure: false,
             is_external: false,
             calling_convention: zyntax_typed_ast::CallingConvention::Default,

@@ -39,6 +39,7 @@ fn create_extern_function(
         body: None, // Extern functions have no body
         visibility: Visibility::Public,
         is_async: false,
+        is_fiber: false,
         is_external: true,
         calling_convention,
         link_name: None,

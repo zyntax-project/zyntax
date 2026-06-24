@@ -152,6 +152,7 @@ fn add_runtime_function_declarations(program: &mut TypedProgram, arena: &mut Ast
             body: None,
             visibility: Visibility::Public,
             is_async: false,
+            is_fiber: false,
             is_external: true,
             calling_convention: CallingConvention::Cdecl,
             link_name: None,

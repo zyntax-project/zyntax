@@ -322,6 +322,7 @@ impl<'a> TypedAstBuilder<'a> {
             body: Some(body),
             visibility,
             is_async: false,
+            is_fiber: false,
             is_pure: false,
             is_external: false,
             calling_convention: crate::type_registry::CallingConvention::Default,
