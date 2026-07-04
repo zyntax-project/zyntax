@@ -2411,6 +2411,23 @@ impl CraneliftBackend {
                                                 continue;
                                             }
                                         }
+                                        Intrinsic::Await => {
+                                            // An `Intrinsic::Await` that survives to codegen
+                                            // means a lowering invariant was violated: the
+                                            // async state-machine transform should have
+                                            // rewritten every await into save/suspend/resume
+                                            // before this point. Silently skipping it (the old
+                                            // catch-all behaviour) left the result HirId out of
+                                            // `value_map`, so the NEXT instruction that read it
+                                            // panicked with a cryptic "not in value_map". Fail
+                                            // here with a descriptive error instead.
+                                            return Err(crate::CompilerError::Backend(
+                                                "unlowered `await` reached codegen — the async \
+                                                 state-machine transform did not run for this \
+                                                 function (await outside an `async def`?)"
+                                                    .to_string(),
+                                            ));
+                                        }
                                         _ => {
                                             // Other intrinsics not implemented yet
                                             continue;

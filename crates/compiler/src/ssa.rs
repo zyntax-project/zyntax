@@ -5897,6 +5897,25 @@ impl SsaBuilder {
             }
 
             TypedExpression::Await(async_expr) => {
+                // Composition guardrail: `await` inside a `fiber def` body
+                // has no coherent runtime semantics — a stackful fiber
+                // suspends by switching stacks, not by parking on a
+                // future, so there is no state machine to resume when the
+                // future completes. Reject with a hard error rather than
+                // emitting an `Intrinsic::Await` that no lowering pass
+                // handles (which crashes codegen at the neighbouring
+                // instruction). Drive the fiber from an async function
+                // instead. Enforced here because SSA visits every
+                // reachable expression regardless of nesting.
+                if self.function.signature.is_fiber {
+                    return Err(crate::CompilerError::Lowering(
+                        "`await` is not allowed inside a `fiber def` body; drive the fiber \
+                         from an `async def` (call `f.next()` in the async body and `await` \
+                         there)"
+                            .to_string(),
+                    ));
+                }
+
                 // Emit an Intrinsic::Await call for the async state machine transformation.
                 // The AsyncCompiler will later detect these await points and split the function
                 // into a state machine with states before/after each await.

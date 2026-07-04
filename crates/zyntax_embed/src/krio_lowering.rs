@@ -36,23 +36,47 @@ impl std::error::Error for KrioLoweringError {}
 pub fn apply_krio_effect_lowering(
     module: &mut zyntax_compiler::HirModule,
 ) -> Result<(), KrioLoweringError> {
+    // Predicate: does `f` perform an effect that has a resumable
+    // handler (so it needs the captures-lift state-machine transform)?
+    let has_resumable_effect = |f: &zyntax_compiler::hir::HirFunction| -> bool {
+        f.signature.effects.iter().any(|effect_name| {
+            if let Some(effect) = module.effects.values().find(|e| e.name == *effect_name) {
+                module
+                    .handlers
+                    .values()
+                    .filter(|h| h.effect_id == effect.id)
+                    .any(|h| h.implementations.iter().any(|i| i.is_resumable))
+            } else {
+                false
+            }
+        })
+    };
+
+    // Composition guardrail: a `fiber def` that performs a resumable
+    // effect would get BOTH the state-machine transform (here) and
+    // fiber lowering, whose save/restore models disagree on any value
+    // live across both a perform and a yield. Reject rather than
+    // silently miscompile. (Lifted once the handler stack is made
+    // fiber-aware — see the fiber×effect×async plan, Phase 4/5.)
+    if let Some(bad) = module
+        .functions
+        .values()
+        .find(|f| f.signature.is_fiber && has_resumable_effect(f))
+    {
+        return Err(KrioLoweringError(format!(
+            "`fiber def {}` performs a resumable algebraic effect — this composition is \
+             not yet supported (the fiber stack switch and the effect state machine have \
+             incompatible suspension models). Perform the effect from a non-fiber function, \
+             or use a non-resumable handler.",
+            bad.name.resolve_global().unwrap_or_default()
+        )));
+    }
+
     let resumable_fn_ids: Vec<HirId> = module
         .functions
         .values()
         .filter(|f| {
-            !f.signature.is_async
-                && !f.signature.effects.is_empty()
-                && f.signature.effects.iter().any(|effect_name| {
-                    if let Some(effect) = module.effects.values().find(|e| e.name == *effect_name) {
-                        module
-                            .handlers
-                            .values()
-                            .filter(|h| h.effect_id == effect.id)
-                            .any(|h| h.implementations.iter().any(|i| i.is_resumable))
-                    } else {
-                        false
-                    }
-                })
+            !f.signature.is_async && !f.signature.effects.is_empty() && has_resumable_effect(f)
         })
         .map(|f| f.id)
         .collect();
