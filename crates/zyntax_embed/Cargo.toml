@@ -53,11 +53,15 @@ default = ["native"]
 
 # `native` activates the full native runtime: Cranelift JIT, dynamic
 # `.zrtl` plugin loading via `dlopen`, and the cranelift-backend code
-# paths in zyntax_compiler.
+# paths in zyntax_compiler. Includes `krio-async-backend`: krio's
+# captures-lift state machine is now the async path (the legacy
+# `async_support.rs` captures-lift bug is resolved — all 14 formerly-
+# ignored tests pass through krio).
 native = [
     "zyntax_compiler/cranelift-backend",
     "zyntax_compiler/dynamic-plugins",
     "dynamic-plugins",
+    "krio-async-backend",
 ]
 
 # `parse-only` builds zyntax_embed without any native backend or
@@ -73,14 +77,14 @@ dynamic-plugins = []
 
 llvm-backend = ["zyntax_compiler/llvm-backend"]
 all-backends = ["zyntax_compiler/all-backends", "llvm-backend"]
-# Use krio-async's captures-lift state-machine transform instead of
-# the legacy async_support.rs path. Off by default while we shake
-# down the integration; eventually becomes the default once the 14
-# captures-lift-bug tests pass through it.
-# krio_adapter is now an unconditional dep (needed by Phase I's
+# Use krio-async's captures-lift state-machine transform for async
+# functions. Enabled by `native` (the default). Kept as a separate
+# feature so `parse-only` / non-native builds can opt out, and so the
+# legacy `async_support.rs` path stays reachable for A/B debugging by
+# building with `--no-default-features`.
+# krio_adapter is an unconditional dep (needed by
 # `apply_krio_effect_lowering` for resumable-effect fns regardless of
-# this feature). The feature now only controls which path async
-# functions take: with it set, async fns also go through krio's
+# this feature). With the feature set, async fns go through krio's
 # captures-lift; without, the legacy `async_support` path handles them.
 krio-async-backend = []
 
