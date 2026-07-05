@@ -50,13 +50,14 @@ fn async_drives_fiber_no_await() {
     assert_eq!(result.as_i64(), Some(6), "1+2+3 = 6");
 }
 
-/// Await INSIDE the fiber-driving loop. Currently BROKEN — the
-/// promise resolves to `None` instead of the sum. Root cause is NOT
-/// fiber-specific: `async_await_in_plain_loop` below shows plain
-/// await-in-a-while-loop hangs outright. Both trace to the async
-/// state machine's handling of an await suspension on a loop
-/// back-edge. Tracked as the await-in-loop bug; re-enable when fixed.
-#[ignore = "await-inside-a-while-loop miscompiles (async SM loop back-edge); see async_await_in_plain_loop"]
+/// Await INSIDE the fiber-driving loop. Currently BROKEN — the promise
+/// resolves to `None`. Root cause is the async state machine (krio
+/// path) / BC interp mishandling an `await` suspension on a loop
+/// back-edge — NOT dead-code elimination (verified: DCE is skipped on
+/// all live paths, and `async_await_in_plain_loop` hangs identically
+/// with no fiber involved). Tracked as the await-in-loop krio-SM bug;
+/// re-enable when fixed.
+#[ignore = "await-on-loop-back-edge miscompiles in the krio async SM / interp; see async_await_in_plain_loop"]
 #[test]
 fn async_drives_fiber_with_await_in_loop() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
@@ -105,12 +106,14 @@ fn async_drives_fiber_with_await_in_loop() {
     );
 }
 
-/// Minimal reproduction of the await-in-loop bug: await inside a
-/// plain counter-driven while loop, NO fiber. Currently HANGS (the
-/// async state machine never advances past the awaiting loop state),
-/// which is why the fiber-driven variant above returns None. This is
-/// the true root bug; the fiber composition is an innocent bystander.
-#[ignore = "await-inside-a-while-loop hangs — async SM loop back-edge bug"]
+/// Minimal reproduction: `await` inside a plain counter-driven while
+/// loop, NO fiber. HANGS — the async state machine never advances past
+/// the awaiting loop state. This is the true root bug (the fiber
+/// variant above is a bystander). Confirmed NOT to be dead-code
+/// elimination: DCE is skipped on every live path (interp forces
+/// opt_level=0; see interp_runtime.rs), and a fix to DCE's use-tracking
+/// left this hang unchanged.
+#[ignore = "await-on-loop-back-edge hangs in the krio async SM / interp"]
 #[test]
 fn async_await_in_plain_loop() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
