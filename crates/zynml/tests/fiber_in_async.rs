@@ -1,11 +1,14 @@
 //! Composition C — driving a fiber from inside an async body.
 //!
-//! Phase 0.2 of the fiber×effect×async plan: the composition-C audit
-//! reported a `CreateClosure: Lambda function HirId(...) not found`
-//! warning on the await-in-loop-while-driving-a-fiber shape. These
-//! tests execute that shape end-to-end; a real miscompile would show
-//! up as a wrong sum, and a compile failure as an Err from
-//! `compile_typed_program`.
+//! Coverage:
+//! * fiber-in-async WITHOUT await — works.
+//! * plain `await` inside a `while` loop — works (regression test for
+//!   the save-before-suspend fix in krio_adapter's await lowering; the
+//!   bridge call is now emitted AFTER the slot saves, so the native
+//!   synchronous-resolve path doesn't clobber loop-carried state).
+//! * fiber-drive + `await` in the same loop — still open (the fiber
+//!   handle must survive the await suspension AND the fiber-step
+//!   decode; that's the cooperative fiber-in-async work in Phase 5).
 
 #![cfg(feature = "krio-async-backend")]
 
@@ -50,14 +53,14 @@ fn async_drives_fiber_no_await() {
     assert_eq!(result.as_i64(), Some(6), "1+2+3 = 6");
 }
 
-/// Await INSIDE the fiber-driving loop. Currently BROKEN — the promise
-/// resolves to `None`. Root cause is the async state machine (krio
-/// path) / BC interp mishandling an `await` suspension on a loop
-/// back-edge — NOT dead-code elimination (verified: DCE is skipped on
-/// all live paths, and `async_await_in_plain_loop` hangs identically
-/// with no fiber involved). Tracked as the await-in-loop krio-SM bug;
-/// re-enable when fixed.
-#[ignore = "await-on-loop-back-edge miscompiles in the krio async SM / interp; see async_await_in_plain_loop"]
+/// Await INSIDE the fiber-driving loop. Still open — resolves to
+/// `None`. The core await-in-loop hang is fixed (see
+/// `async_await_in_plain_loop`), but combining a fiber `.next()` decode
+/// with an await suspension in the same loop needs the fiber handle
+/// preserved across the await AND the Option<T> step decode threaded
+/// through — the cooperative fiber-in-async work in Phase 5 of the
+/// fiber×effect×async plan. Re-enable when that lands.
+#[ignore = "fiber .next() + await in the same loop — Phase 5 cooperative fiber-in-async"]
 #[test]
 fn async_drives_fiber_with_await_in_loop() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
@@ -106,14 +109,14 @@ fn async_drives_fiber_with_await_in_loop() {
     );
 }
 
-/// Minimal reproduction: `await` inside a plain counter-driven while
-/// loop, NO fiber. HANGS — the async state machine never advances past
-/// the awaiting loop state. This is the true root bug (the fiber
-/// variant above is a bystander). Confirmed NOT to be dead-code
-/// elimination: DCE is skipped on every live path (interp forces
-/// opt_level=0; see interp_runtime.rs), and a fix to DCE's use-tracking
-/// left this hang unchanged.
-#[ignore = "await-on-loop-back-edge hangs in the krio async SM / interp"]
+/// `await` inside a plain counter-driven while loop, NO fiber.
+/// Regression test for the save-before-suspend bug: the krio await
+/// lowering used to emit the yielding bridge call
+/// (`__zyntax_async_set_timeout`) BEFORE the `AsyncSaveSlot`s. On the
+/// native runtime that bridge resolves synchronously and recursively,
+/// so the trailing saves clobbered the loop-carried state back to its
+/// pre-suspension values every iteration and the loop spun forever.
+/// Emitting the saves before the bridge fixes it. Sums 0+1+2 = 3.
 #[test]
 fn async_await_in_plain_loop() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");

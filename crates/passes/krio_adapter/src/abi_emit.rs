@@ -1002,25 +1002,35 @@ fn lower_host_bridge_await_site(
         const_args: vec![],
         is_tail: false,
     });
-    new_insts.push(rewritten_bridge);
-    // Preserve any instructions between the producing Call and the
-    // Intrinsic::Await (captures-lift saves emitted by emit_save_load,
-    // for instance).
+    // Save-before-suspend discipline. ALL state writes — the
+    // captures-lift saves and the state-slot save — must be emitted
+    // BEFORE the bridge call (`__zyntax_async_set_timeout` and
+    // friends), because on the native runtime that bridge resolves
+    // *synchronously and recursively*: it sleeps, calls
+    // `resolve_future`, and drives the entire continuation to
+    // completion on the same stack before returning. If the saves
+    // ran after the bridge, the continuation would read un-saved
+    // (stale) slots, and then the trailing saves would clobber the
+    // slots back to their pre-suspension values — so a loop that
+    // awaits would reset its loop-carried state every iteration and
+    // spin forever. (On wasm the bridge only schedules a JS timer
+    // and returns, so ordering was invisible there — but
+    // saves-first is correct on both targets.)
+    //
+    // `between` = instructions originally between the producing Call
+    // and the Await; `post_await` = captures-lift saves
+    // `emit_save_load` pushed at the end of the block. Both are
+    // state writes that belong before the yield.
     new_insts.extend(between);
-    // Preserve captures-lift saves that landed AFTER the
-    // `Intrinsic::Await` (emit_save_load pushes them at the end of
-    // the original yield block). Without this step, any live SSA
-    // value computed before the yield — a Binary result, a Load,
-    // anything other than a Constant — would never be written to
-    // its slot, and the resume side's `AsyncLoadSlot` would read
-    // zero, which manifests as the SM re-parking forever instead of
-    // reaching `Return`.
     new_insts.extend(post_await);
     new_insts.push(HirInstruction::AsyncSaveSlot {
         frame,
         slot: state_slot,
         value: next_state_const,
     });
+    // The bridge call is the actual suspension point — emit it LAST,
+    // after every slot has been written.
+    new_insts.push(rewritten_bridge);
 
     // Commit yield_block: new instructions + Return Pending terminator.
     let yield_block = function
