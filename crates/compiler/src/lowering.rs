@@ -1156,6 +1156,23 @@ impl LoweringContext {
                     )?;
                 }
             }
+            TypedStatement::With(with_stmt) => {
+                for handler in &mut with_stmt.handlers {
+                    for arg in &mut handler.args {
+                        self.resolve_method_calls_in_expression(
+                            arg,
+                            var_types,
+                            function_param_specs,
+                        )?;
+                    }
+                }
+                self.resolve_method_calls_in_block(
+                    &mut with_stmt.body,
+                    var_types,
+                    function_param_specs,
+                    function_return_type,
+                )?;
+            }
             TypedStatement::Continue => {}
         }
         Ok(())

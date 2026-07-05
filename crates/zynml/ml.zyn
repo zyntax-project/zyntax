@@ -1987,6 +1987,7 @@ param_simple = { name:identifier }
 
 statement = {
     let_stmt |
+    with_stmt |
     if_stmt |
     while_let_stmt |
     while_stmt |
@@ -2154,6 +2155,18 @@ while_let_stmt = { "while" ~ "let" ~ pat:pattern ~ "=" ~ scrut:expr ~ body:block
   -> WhileLet {
       pattern: pat,
       scrutinee: scrut,
+      body: body,
+  }
+
+// with HANDLER { ... } — scope an algebraic-effect handler over a
+// region. Performs of the handler's effect inside `body` resolve to
+// this handler. Replaces the parsed-but-never-lowered `@with(H)`
+// annotation with a real block statement.
+// Multi-handler (`with A, B { }`) and parameterised handlers
+// (`with H(cfg) { }`) are follow-ups; single handler ships first.
+with_stmt = { "with" ~ handler:identifier ~ body:block }
+  -> With {
+      handler: handler,
       body: body,
   }
 

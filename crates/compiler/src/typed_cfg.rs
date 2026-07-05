@@ -1073,6 +1073,46 @@ impl TypedCfgBuilder {
                     exit_id = after_block_id;
                 }
 
+                TypedStatement::With(with_stmt) => {
+                    // `with H { body }` — for this slice, lower the body
+                    // like a nested block so it executes. Single-handler
+                    // performs already resolve correctly via static
+                    // dispatch, so this is behaviourally correct today.
+                    //
+                    // NEXT SLICE: emit `__zyntax_effect_push_handler` at
+                    // `with_entry_id` and `__zyntax_effect_pop_handler`
+                    // on every exit edge out of `with_exit` (via the
+                    // shared ScopeExitEmitter) so handler scoping becomes
+                    // regional. The entry/exit boundary is kept distinct
+                    // here precisely so that insertion has a home.
+                    let with_entry_id = self.new_block_id();
+                    let after_with_id = self.new_block_id();
+
+                    all_blocks.push(TypedBasicBlock {
+                        id: current_block_id,
+                        label: None,
+                        statements: current_statements.clone(),
+                        terminator: TypedTerminator::Jump(with_entry_id),
+                        pattern_check: None,
+                    });
+
+                    let (with_blocks, _, with_exit) =
+                        self.split_at_control_flow(&with_stmt.body, with_entry_id, false)?;
+                    all_blocks.extend(with_blocks);
+
+                    if let Some(last_block) =
+                        all_blocks.iter_mut().rev().find(|b| b.id == with_exit)
+                    {
+                        if matches!(last_block.terminator, TypedTerminator::Unreachable) {
+                            last_block.terminator = TypedTerminator::Jump(after_with_id);
+                        }
+                    }
+
+                    current_statements = Vec::new();
+                    current_block_id = after_with_id;
+                    exit_id = after_with_id;
+                }
+
                 TypedStatement::Expression(expr) => {
                     // Check if expression is a Block - if so, flatten it
                     if let TypedExpression::Block(block) = &expr.node {

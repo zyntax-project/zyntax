@@ -1255,6 +1255,18 @@ impl TypeChecker {
                 self.check_loop_statement(loop_stmt)?;
                 Ok(Type::Primitive(PrimitiveType::Unit))
             }
+            TypedStatement::With(with_stmt) => {
+                // Type-check the scoped body. Handler resolution
+                // itself is a lowering-time concern; here we just
+                // descend so the body's statements get checked.
+                for handler in &with_stmt.handlers {
+                    for arg in &handler.args {
+                        self.check_expression(&arg.node)?;
+                    }
+                }
+                self.check_block(&with_stmt.body)?;
+                Ok(Type::Primitive(PrimitiveType::Unit))
+            }
             // TODO: Implement other statement types
             TypedStatement::For(_)
             | TypedStatement::Match(_)

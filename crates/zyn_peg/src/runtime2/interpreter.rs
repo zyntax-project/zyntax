@@ -327,6 +327,8 @@ impl<'g> GrammarInterpreter<'g> {
             // `while true { match EXPR { case PATTERN { body } case _ { break } } }`
             // so no new typed-AST variant is introduced.
             ["WhileLet"] => self.construct_while_let(fields, state, span),
+            // `with HANDLER { body }` — algebraic-effect handler scope.
+            ["With"] => self.construct_with(fields, state, span),
             // Lambda parameter
             ["TypedLambdaParam"] => self.construct_lambda_param(fields, state, span),
             _ => Err(format!("unknown type path: {}", type_path)),
@@ -479,6 +481,38 @@ impl<'g> GrammarInterpreter<'g> {
             TypedStatement::While(TypedWhile {
                 condition: Box::new(true_lit),
                 body: synthesized_body,
+                span,
+            }),
+            Type::Primitive(PrimitiveType::Unit),
+            span,
+        ))))
+    }
+
+    /// Construct `with HANDLER { body }` — a handler-scoping block.
+    /// The grammar parses a single handler identifier today; the
+    /// typed AST carries a `Vec<TypedWithHandler>` so multi-handler
+    /// (`with A, B { }`) becomes a grammar/parser change only.
+    fn construct_with<'a>(
+        &self,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        span: Span,
+    ) -> Result<ParsedValue, String> {
+        use zyntax_typed_ast::typed_ast::{TypedWith, TypedWithHandler};
+
+        let handler_name = self.get_field_as_interned("handler", fields, state)?;
+        let body = self.get_field_as_block("body", fields, state)?;
+
+        let handler = TypedWithHandler {
+            name: handler_name,
+            args: Vec::new(),
+            span,
+        };
+
+        Ok(ParsedValue::Statement(Box::new(typed_node(
+            TypedStatement::With(TypedWith {
+                handlers: vec![handler],
+                body,
                 span,
             }),
             Type::Primitive(PrimitiveType::Unit),

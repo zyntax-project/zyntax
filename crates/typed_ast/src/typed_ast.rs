@@ -452,6 +452,37 @@ pub enum TypedStatement {
     Coroutine(TypedCoroutine),
     Defer(TypedDefer),
     Select(TypedSelect),
+    /// `with H { body }` — scope algebraic-effect handler(s) over a
+    /// region. Performs of a handled effect inside `body` resolve to
+    /// the innermost matching handler in scope. Replaces the
+    /// annotation-only `@with(H)`.
+    With(TypedWith),
+}
+
+/// `with H, ... { body }` — handler-scoping block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedWith {
+    /// Handlers pushed for the duration of `body`, in declaration
+    /// order (popped in reverse on every exit edge). A `Vec` even
+    /// though the grammar currently parses a single handler — so
+    /// multi-handler (`with A, B { }`) is a grammar/parser change
+    /// only, no typed-AST churn.
+    pub handlers: Vec<TypedWithHandler>,
+    pub body: TypedBlock,
+    pub span: Span,
+}
+
+/// One handler in a `with` block's handler list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedWithHandler {
+    /// The handler's declared name (resolved to a `handler H for E`
+    /// declaration at lowering time).
+    pub name: InternedString,
+    /// Constructor arguments for a parameterised handler
+    /// (`with H(cfg) { }`). Empty until handler-state (Phase 3)
+    /// lands; parsed here for forward-compatibility.
+    pub args: Vec<TypedNode<TypedExpression>>,
+    pub span: Span,
 }
 
 impl Default for TypedStatement {
