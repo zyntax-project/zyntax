@@ -8523,7 +8523,7 @@ impl SsaBuilder {
                 // The name is used for trait dispatch (e.g., $Tensor -> $Tensor$add)
                 HirType::Ptr(Box::new(HirType::Opaque(*name)))
             }
-            Type::Named { id, .. } => {
+            Type::Named { id, type_args, .. } => {
                 // Look up the type definition in the registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
                     use crate::hir::HirStructType;
@@ -8557,6 +8557,74 @@ impl SsaBuilder {
                     }) = self.type_registry.resolve_alias(type_def.name)
                     {
                         return HirType::Ptr(Box::new(HirType::Opaque(*extern_name)));
+                    }
+
+                    // Named enum instances retain their discriminated-union
+                    // shape in per-function SSA. Substitute declaration type
+                    // parameters before converting variant payloads so, for
+                    // example, `EffectResult<Bool>::Completed` carries Bool
+                    // rather than the declaration's unresolved `T`.
+                    if let TypeKind::Enum { variants } = &type_def.kind {
+                        use crate::hir::{HirUnionType, HirUnionVariant};
+
+                        let hir_variants = variants
+                            .iter()
+                            .enumerate()
+                            .map(|(variant_index, variant)| {
+                                let substitute = |ty: &Type| {
+                                    zyntax_typed_ast::TypeRegistry::substitute_type_params(
+                                        ty,
+                                        &type_def.type_params,
+                                        type_args,
+                                    )
+                                };
+                                let variant_ty = match &variant.fields {
+                                    zyntax_typed_ast::VariantFields::Unit => HirType::Void,
+                                    zyntax_typed_ast::VariantFields::Tuple(types)
+                                        if types.len() == 1 =>
+                                    {
+                                        self.convert_type(&substitute(&types[0]))
+                                    }
+                                    zyntax_typed_ast::VariantFields::Tuple(types) => {
+                                        HirType::Struct(HirStructType {
+                                            name: None,
+                                            fields: types
+                                                .iter()
+                                                .map(|ty| self.convert_type(&substitute(ty)))
+                                                .collect(),
+                                            packed: false,
+                                        })
+                                    }
+                                    zyntax_typed_ast::VariantFields::Named(fields) => {
+                                        HirType::Struct(HirStructType {
+                                            name: Some(variant.name),
+                                            fields: fields
+                                                .iter()
+                                                .map(|field| {
+                                                    self.convert_type(&substitute(&field.ty))
+                                                })
+                                                .collect(),
+                                            packed: false,
+                                        })
+                                    }
+                                };
+                                HirUnionVariant {
+                                    name: variant.name,
+                                    ty: variant_ty,
+                                    discriminant: variant
+                                        .discriminant
+                                        .unwrap_or(variant_index as i64)
+                                        as u64,
+                                }
+                            })
+                            .collect();
+
+                        return HirType::Union(Box::new(HirUnionType {
+                            name: Some(type_def.name),
+                            variants: hir_variants,
+                            discriminant_type: Box::new(HirType::U32),
+                            is_c_union: false,
+                        }));
                     }
 
                     // Abstract types are zero-cost wrappers with struct layout
@@ -10082,6 +10150,21 @@ impl SsaBuilder {
                 false_target: next_block_id,
             };
 
+            // Identifier patterns bind values while lowering the test block.
+            // The arm body is reached only through that block's true edge, so
+            // those definitions dominate the body and must seed its SSA map.
+            // Without this propagation, reading a bound payload in the arm
+            // creates an unrelated i64 undef instead of the typed union value.
+            let pattern_bindings = self
+                .definitions
+                .get(&test_block_id)
+                .cloned()
+                .unwrap_or_default();
+            self.definitions
+                .get_mut(&body_block_id)
+                .expect("match body definitions were initialized")
+                .extend(pattern_bindings);
+
             // In body block: execute arm body and jump to end
             let arm_result = self.translate_expression(body_block_id, &arm.body)?;
 
@@ -11024,110 +11107,156 @@ impl SsaBuilder {
         scrutinee_val: HirId,
         scrutinee_ty: &Type,
     ) -> CompilerResult<HirId> {
-        use zyntax_typed_ast::Type as FrontendType;
-
-        // Check if the scrutinee is actually an enum/named type that supports enum patterns
-        // If the scrutinee is a primitive type, enum pattern matching always fails
-        let is_enum_type = matches!(
-            scrutinee_ty,
-            FrontendType::Named { .. }
-                | FrontendType::Union(_)
-                | FrontendType::Optional(_)
-                | FrontendType::Result { .. }
-        );
-
-        if !is_enum_type {
-            // For non-enum types (like integers), enum patterns always fail to match
-            // Return a constant false value
-            let false_val = self.create_value(
-                HirType::Bool,
-                HirValueKind::Constant(crate::hir::HirConstant::Bool(false)),
-            );
-            return Ok(false_val);
+        let (variant_index, payload_types) = match scrutinee_ty {
+            Type::Named { id, type_args, .. } => {
+                let type_def = self.type_registry.get_type_by_id(*id).ok_or_else(|| {
+                    crate::CompilerError::Analysis(format!(
+                        "enum pattern refers to unknown type {id:?}"
+                    ))
+                })?;
+                if type_def.name != *enum_name {
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "enum pattern names `{enum_name}` but the scrutinee is `{}`",
+                        type_def.name
+                    )));
+                }
+                let zyntax_typed_ast::TypeKind::Enum { variants } = &type_def.kind else {
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "pattern type `{enum_name}` is not an enum"
+                    )));
+                };
+                let (index, variant) = variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, variant)| variant.name == *variant_name)
+                    .ok_or_else(|| {
+                        crate::CompilerError::Analysis(format!(
+                            "unknown variant `{variant_name}` for enum `{enum_name}`"
+                        ))
+                    })?;
+                let declared_types = match &variant.fields {
+                    zyntax_typed_ast::VariantFields::Unit => vec![],
+                    zyntax_typed_ast::VariantFields::Tuple(types) => types.clone(),
+                    zyntax_typed_ast::VariantFields::Named(fields) => {
+                        fields.iter().map(|field| field.ty.clone()).collect()
+                    }
+                };
+                let payload_types = declared_types
+                    .into_iter()
+                    .map(|ty| {
+                        zyntax_typed_ast::TypeRegistry::substitute_type_params(
+                            &ty,
+                            &type_def.type_params,
+                            type_args,
+                        )
+                    })
+                    .collect();
+                (u32::try_from(index).unwrap_or(u32::MAX), payload_types)
+            }
+            Type::Optional(inner) => {
+                if variant_name.resolve_global().as_deref() == Some("Some") {
+                    (1, vec![inner.as_ref().clone()])
+                } else {
+                    (0, vec![])
+                }
+            }
+            Type::Result { ok_type, err_type } => {
+                if variant_name.resolve_global().as_deref() == Some("Err") {
+                    (1, vec![err_type.as_ref().clone()])
+                } else {
+                    (0, vec![ok_type.as_ref().clone()])
+                }
+            }
+            _ => {
+                return Ok(self.create_value(
+                    HirType::Bool,
+                    HirValueKind::Constant(crate::hir::HirConstant::Bool(false)),
+                ));
+            }
+        };
+        if payload_types.len() != field_patterns.len() {
+            return Err(crate::CompilerError::Analysis(format!(
+                "variant `{variant_name}` has {} fields but the pattern supplies {}",
+                payload_types.len(),
+                field_patterns.len()
+            )));
         }
 
-        // Step 1: Extract discriminant (tag) from enum
-        // Enums are typically represented as tagged unions: { tag: u32, payload: union { ... } }
-        // The tag is usually at index 0
-
         let tag_val = self.create_value(HirType::U32, HirValueKind::Instruction);
-        let extract_tag_inst = HirInstruction::ExtractValue {
-            result: tag_val,
-            aggregate: scrutinee_val,
-            indices: vec![0], // Tag is at index 0
-            ty: HirType::U32,
-        };
-
-        self.add_instruction(block_id, extract_tag_inst);
+        self.add_instruction(
+            block_id,
+            HirInstruction::GetUnionDiscriminant {
+                result: tag_val,
+                union_val: scrutinee_val,
+            },
+        );
         self.add_use(scrutinee_val, tag_val);
-
-        // Step 2: Get expected discriminant value for this variant
-        // TODO: Look up variant discriminant from TypeRegistry
-        // For now, use a placeholder value based on variant name hash
-        let expected_discriminant = variant_name.to_string().len() as u32; // Placeholder
-
         let expected_val = self.create_value(
             HirType::U32,
-            HirValueKind::Constant(crate::hir::HirConstant::U32(expected_discriminant)),
+            HirValueKind::Constant(crate::hir::HirConstant::U32(variant_index)),
         );
-
-        // Step 3: Compare tag with expected discriminant
         let tag_matches = self.create_value(HirType::Bool, HirValueKind::Instruction);
         let tag_cmp_inst = HirInstruction::Binary {
             op: crate::hir::BinaryOp::Eq,
             result: tag_matches,
-            ty: HirType::Bool,
+            ty: HirType::U32,
             left: tag_val,
             right: expected_val,
         };
-
         self.add_instruction(block_id, tag_cmp_inst);
         self.add_use(tag_val, tag_matches);
         self.add_use(expected_val, tag_matches);
-
-        // Step 4: If no payload fields, return tag match result
         if field_patterns.is_empty() {
             return Ok(tag_matches);
         }
 
-        // Step 5: Extract payload from enum (at index 1)
-        // The payload is a union, we need to extract the specific variant's data
-        let payload_ty = HirType::Void; // TODO: Get actual payload type
-        let payload_val = self.create_value(payload_ty.clone(), HirValueKind::Instruction);
-
-        let extract_payload_inst = HirInstruction::ExtractValue {
-            result: payload_val,
-            aggregate: scrutinee_val,
-            indices: vec![1], // Payload is at index 1
-            ty: payload_ty,
+        let payload_hir_types = payload_types
+            .iter()
+            .map(|ty| self.convert_type(ty))
+            .collect::<Vec<_>>();
+        let payload_ty = if payload_hir_types.len() == 1 {
+            payload_hir_types[0].clone()
+        } else {
+            HirType::Struct(crate::hir::HirStructType {
+                name: None,
+                fields: payload_hir_types.clone(),
+                packed: false,
+            })
         };
-
-        self.add_instruction(block_id, extract_payload_inst);
+        let payload_val = self.create_value(payload_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::ExtractUnionValue {
+                result: payload_val,
+                ty: payload_ty,
+                union_val: scrutinee_val,
+                variant_index,
+            },
+        );
         self.add_use(scrutinee_val, payload_val);
-
-        // Step 6: Test each field pattern against payload fields
         let mut field_result = None;
-
-        for (idx, field_pattern) in field_patterns.iter().enumerate() {
-            // Extract field from payload
-            let field_ty = self.convert_type(&field_pattern.ty);
-            let field_val = self.create_value(field_ty.clone(), HirValueKind::Instruction);
-
-            let extract_field_inst = HirInstruction::ExtractValue {
-                result: field_val,
-                aggregate: payload_val,
-                indices: vec![idx as u32],
-                ty: field_ty,
+        for (index, (field_pattern, field_type)) in
+            field_patterns.iter().zip(payload_types.iter()).enumerate()
+        {
+            let field_val = if payload_hir_types.len() == 1 {
+                payload_val
+            } else {
+                let field_ty = payload_hir_types[index].clone();
+                let field_val = self.create_value(field_ty.clone(), HirValueKind::Instruction);
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::ExtractValue {
+                        result: field_val,
+                        aggregate: payload_val,
+                        indices: vec![u32::try_from(index).unwrap_or(u32::MAX)],
+                        ty: field_ty,
+                    },
+                );
+                self.add_use(payload_val, field_val);
+                field_val
             };
-
-            self.add_instruction(block_id, extract_field_inst);
-            self.add_use(payload_val, field_val);
-
-            // Test pattern against field
             let field_test =
-                self.translate_pattern_test(block_id, field_pattern, field_val, &field_pattern.ty)?;
-
-            // AND with previous field results
+                self.translate_pattern_test(block_id, field_pattern, field_val, field_type)?;
             field_result = Some(if let Some(prev_result) = field_result {
                 let and_result = self.create_value(HirType::Bool, HirValueKind::Instruction);
                 let and_inst = HirInstruction::Binary {
@@ -11141,14 +11270,11 @@ impl SsaBuilder {
                 self.add_instruction(block_id, and_inst);
                 self.add_use(prev_result, and_result);
                 self.add_use(field_test, and_result);
-
                 and_result
             } else {
                 field_test
             });
         }
-
-        // Step 7: AND tag match with field tests
         if let Some(fields_match) = field_result {
             let final_result = self.create_value(HirType::Bool, HirValueKind::Instruction);
             let final_and_inst = HirInstruction::Binary {
@@ -11162,10 +11288,8 @@ impl SsaBuilder {
             self.add_instruction(block_id, final_and_inst);
             self.add_use(tag_matches, final_result);
             self.add_use(fields_match, final_result);
-
             Ok(final_result)
         } else {
-            // No fields, just return tag match
             Ok(tag_matches)
         }
     }

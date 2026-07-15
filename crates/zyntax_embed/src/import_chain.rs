@@ -1025,7 +1025,8 @@ pub(crate) fn register_enum_declarations(
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
     use zyntax_typed_ast::type_registry::{
-        FieldDef, TypeDefinition, TypeKind, TypeMetadata, VariantDef, VariantFields, Visibility,
+        FieldDef, TypeDefinition, TypeKind, TypeMetadata, TypeParam, Variance, VariantDef,
+        VariantFields, Visibility,
     };
     use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedVariantFields};
     use zyntax_typed_ast::TypeId;
@@ -1075,11 +1076,23 @@ pub(crate) fn register_enum_declarations(
                 })
                 .collect();
 
+            let type_params: Vec<TypeParam> = enum_decl
+                .type_params
+                .iter()
+                .map(|param| TypeParam {
+                    name: param.name,
+                    bounds: vec![],
+                    variance: Variance::Invariant,
+                    default: param.default.clone(),
+                    span: param.span,
+                })
+                .collect();
+
             let type_def = TypeDefinition {
                 id: type_id,
                 name: enum_decl.name,
                 kind: TypeKind::Enum { variants },
-                type_params: vec![],
+                type_params,
                 constraints: vec![],
                 fields: vec![],
                 methods: vec![],

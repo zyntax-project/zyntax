@@ -2902,7 +2902,7 @@ impl LoweringContext {
                 }
             }
 
-            Type::Named { id, .. } => {
+            Type::Named { id, type_args, .. } => {
                 // Look up type definition in registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
                     // Phase I.1: Resume<T> is the reified continuation
@@ -2954,13 +2954,26 @@ impl LoweringContext {
                             // Convert enum to discriminated union
                             let hir_variants: Vec<_> = variants
                                 .iter()
-                                .map(|variant| {
+                                .enumerate()
+                                .map(|(variant_index, variant)| {
+                                    let substitute = |ty: &Type| {
+                                        zyntax_typed_ast::TypeRegistry::substitute_type_params(
+                                            ty,
+                                            &type_def.type_params,
+                                            type_args,
+                                        )
+                                    };
                                     let variant_ty = match &variant.fields {
                                         zyntax_typed_ast::VariantFields::Unit => HirType::Void,
+                                        zyntax_typed_ast::VariantFields::Tuple(types)
+                                            if types.len() == 1 =>
+                                        {
+                                            self.convert_type(&substitute(&types[0]))
+                                        }
                                         zyntax_typed_ast::VariantFields::Tuple(types) => {
                                             let fields: Vec<_> = types
                                                 .iter()
-                                                .map(|ty| self.convert_type(ty))
+                                                .map(|ty| self.convert_type(&substitute(ty)))
                                                 .collect();
                                             HirType::Struct(crate::hir::HirStructType {
                                                 name: None,
@@ -2971,7 +2984,9 @@ impl LoweringContext {
                                         zyntax_typed_ast::VariantFields::Named(fields) => {
                                             let field_types: Vec<_> = fields
                                                 .iter()
-                                                .map(|field| self.convert_type(&field.ty))
+                                                .map(|field| {
+                                                    self.convert_type(&substitute(&field.ty))
+                                                })
                                                 .collect();
                                             HirType::Struct(crate::hir::HirStructType {
                                                 name: Some(variant.name),
@@ -2984,7 +2999,10 @@ impl LoweringContext {
                                     crate::hir::HirUnionVariant {
                                         name: variant.name,
                                         ty: variant_ty,
-                                        discriminant: variant.discriminant.unwrap_or(0) as u64,
+                                        discriminant: variant
+                                            .discriminant
+                                            .unwrap_or(variant_index as i64)
+                                            as u64,
                                     }
                                 })
                                 .collect();

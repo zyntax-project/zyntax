@@ -1372,11 +1372,23 @@ impl ZyntaxRuntime {
                         })
                         .collect();
 
+                    let type_params: Vec<TypeParam> = enum_decl
+                        .type_params
+                        .iter()
+                        .map(|param| TypeParam {
+                            name: param.name,
+                            bounds: vec![],
+                            variance: Variance::Invariant,
+                            default: param.default.clone(),
+                            span: param.span,
+                        })
+                        .collect();
+
                     let type_def = TypeDefinition {
                         id: type_id,
                         name: enum_decl.name,
                         kind: TypeKind::Enum { variants },
-                        type_params: vec![],
+                        type_params,
                         constraints: vec![],
                         fields: vec![],
                         methods: vec![],
