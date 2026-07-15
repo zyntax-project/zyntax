@@ -3183,8 +3183,13 @@ impl SsaBuilder {
         }
     }
 
-    /// Translate expression to SSA value
-    fn translate_expression(
+    /// Translate a typed expression into an SSA value in the current block.
+    ///
+    /// This is the builder's general expression-lowering entry point and is
+    /// used throughout Zyntax compilation. It is public so compiler extensions,
+    /// including registered [`BuiltinClass`](crate::builtin_class::BuiltinClass)
+    /// implementations, can participate in the same lowering pipeline.
+    pub fn translate_expression(
         &mut self,
         block_id: HirId,
         expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
@@ -7425,8 +7430,12 @@ impl SsaBuilder {
             .add_instruction(inst);
     }
 
-    /// Add a use of a value
-    fn add_use(&mut self, value: HirId, user: HirId) {
+    /// Record a def-use edge in the function under construction.
+    ///
+    /// Zyntax's lowering paths use this to maintain SSA use information. It is
+    /// also available to compiler extensions that emit instructions through
+    /// this builder.
+    pub fn add_use(&mut self, value: HirId, user: HirId) {
         if let Some(val) = self.function.values.get_mut(&value) {
             val.uses.insert(user);
         }
@@ -8383,8 +8392,11 @@ impl SsaBuilder {
         Ok(result)
     }
 
-    /// Convert frontend type to HIR type
-    fn convert_type(&self, ty: &Type) -> HirType {
+    /// Convert a TypedAST type to its SSA/HIR representation.
+    ///
+    /// This is the builder's standard frontend-to-IR type conversion used by
+    /// Zyntax lowering and by compiler extensions using the public builder.
+    pub fn convert_type(&self, ty: &Type) -> HirType {
         use zyntax_typed_ast::PrimitiveType;
 
         match ty {
