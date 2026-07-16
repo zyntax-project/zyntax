@@ -2637,6 +2637,31 @@ impl LoweringContext {
                 continue;
             };
 
+            // Handler state (Phase 3): a stateful handler carries a `H$state`
+            // region allocated per `with` scope. Find its `H$new` constructor
+            // so we can call it at scope entry and pass the pointer to
+            // push_handler (instead of a null state). Stateless handlers keep
+            // the null-state fast path.
+            let state_new_fn = self
+                .module
+                .handlers
+                .values()
+                .find(|h| h.name == scope.handler_name)
+                .filter(|h| !h.state_fields.is_empty())
+                .and_then(|_| {
+                    let new_name = format!(
+                        "{}$new",
+                        scope.handler_name.resolve_global().unwrap_or_default()
+                    );
+                    self.module
+                        .functions
+                        .iter()
+                        .find(|(_, f)| {
+                            f.name.resolve_global().as_deref() == Some(new_name.as_str())
+                        })
+                        .map(|(id, _)| *id)
+                });
+
             // Helper to mint a fresh SSA value in the function.
             let mut mint = |ty: HirType, kind: HirValueKind| -> HirId {
                 let id = HirId::new();
@@ -2658,25 +2683,48 @@ impl LoweringContext {
                 HirType::I64,
                 HirValueKind::Constant(HirConstant::I64(effect_id.as_u32() as i64)),
             );
-            let null_state_val = mint(HirType::I64, HirValueKind::Constant(HirConstant::I64(0)));
+            // Handler state: the constructor result for a stateful handler, or
+            // a null constant for a stateless one.
+            let state_val = if state_new_fn.is_some() {
+                mint(
+                    HirType::Ptr(Box::new(HirType::Void)),
+                    HirValueKind::Instruction,
+                )
+            } else {
+                mint(HirType::I64, HirValueKind::Constant(HirConstant::I64(0)))
+            };
             let op_table_addr = mint(
                 HirType::Ptr(Box::new(HirType::Void)),
                 HirValueKind::Global(op_table_global_id),
             );
             let frame_id_val = mint(HirType::I64, HirValueKind::Instruction);
 
-            // push_handler(effect_id, handler_state=null, op_table) -> frame_id
+            // push_handler(effect_id, handler_state, op_table) -> frame_id
             let push_inst = HirInstruction::Call {
                 result: Some(frame_id_val),
                 callee: HirCallable::Symbol("__zyntax_effect_push_handler".to_string()),
-                args: vec![effect_id_val, null_state_val, op_table_addr],
+                args: vec![effect_id_val, state_val, op_table_addr],
                 type_args: vec![],
                 const_args: vec![],
                 is_tail: false,
             };
-            // Prepend push at the very start of the scope entry block.
+            // Prepend push at the very start of the scope entry block, then the
+            // constructor call before it (so `state_val` is defined first).
             if let Some(entry_block) = func.blocks.get_mut(&scope.entry) {
                 entry_block.instructions.insert(0, push_inst);
+                if let Some(new_id) = state_new_fn {
+                    entry_block.instructions.insert(
+                        0,
+                        HirInstruction::Call {
+                            result: Some(state_val),
+                            callee: HirCallable::Function(new_id),
+                            args: vec![],
+                            type_args: vec![],
+                            const_args: vec![],
+                            is_tail: false,
+                        },
+                    );
+                }
             } else {
                 continue;
             }
@@ -2726,6 +2774,20 @@ impl LoweringContext {
                     };
                     if let Some(block) = func.blocks.get_mut(&bid) {
                         block.instructions.push(pop_inst);
+                        // Free the handler-state region on the same exit edge.
+                        // It escaped into push_handler so drop-insert won't
+                        // touch it; the pop above guarantees no later perform
+                        // can still reach it.
+                        if state_new_fn.is_some() {
+                            block.instructions.push(HirInstruction::Call {
+                                result: None,
+                                callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Free),
+                                args: vec![state_val],
+                                type_args: vec![],
+                                const_args: vec![],
+                                is_tail: false,
+                            });
+                        }
                     }
                 }
             }

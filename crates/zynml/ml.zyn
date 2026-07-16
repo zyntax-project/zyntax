@@ -612,12 +612,35 @@ effect_op = { "def" ~ name:identifier ~ type_params:type_params? ~ "(" ~ params:
 //           handler RefState<S> for State<S> { ... }
 // Note: Effect type arguments like <S> in State<S> are parsed but currently
 // discarded since they should match the handler's type params.
-handler_def = { "handler" ~ name:identifier ~ type_params:type_params? ~ "for" ~ effect:identifier ~ ("<" ~ type_args ~ ">")? ~ "{" ~ impls:handler_impl* ~ "}" }
+handler_def = { "handler" ~ name:identifier ~ type_params:type_params? ~ "for" ~ effect:identifier ~ ("<" ~ type_args ~ ">")? ~ "{" ~ fields:handler_field* ~ impls:handler_impl* ~ "}" }
   -> TypedDeclaration::EffectHandler {
       name: intern(name),
       effect_name: intern(effect),
       type_params: type_params,
+      fields: fields,
       handlers: impls,
+  }
+
+// Handler state field: mutable (var) or immutable (let) state that persists
+// across performs within a `with H { }` scope. Declared before the op defs.
+//   var count: i64 = 0
+//   let limit: i64 = 100
+handler_field = { handler_var_field | handler_let_field }
+
+handler_var_field = { "var" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr }
+  -> TypedField {
+      name: intern(name),
+      ty: ty,
+      initializer: init,
+      is_mutable: true,
+  }
+
+handler_let_field = { "let" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr }
+  -> TypedField {
+      name: intern(name),
+      ty: ty,
+      initializer: init,
+      is_mutable: false,
   }
 
 // Handler implementation: def sample<T>(self, ..., resume: Resume<T>): T { body }

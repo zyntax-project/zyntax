@@ -1372,13 +1372,14 @@ impl<'g> GrammarInterpreter<'g> {
                 let name = self.get_field_as_interned("name", fields, state)?;
                 let effect_name = self.get_field_as_interned("effect_name", fields, state)?;
                 // TODO: Parse type_params when generic handler support is needed
+                let state_fields = self.get_field_as_field_list("fields", fields, state)?;
                 let handlers = self.get_field_as_handler_impl_list("handlers", fields, state)?;
 
                 TypedDeclaration::EffectHandler(zyntax_typed_ast::TypedEffectHandler {
                     name,
                     effect_name,
                     type_params: vec![],
-                    fields: vec![],
+                    fields: state_fields,
                     handlers,
                     span,
                 })
@@ -1680,13 +1681,23 @@ impl<'g> GrammarInterpreter<'g> {
         let ty = self
             .get_field_optional("ty", fields, state)?
             .unwrap_or(Type::Any);
+        // Optional slots — present for handler-state fields (`var/let x: T =
+        // init`), absent for plain struct fields (which only carry name/ty).
+        let initializer = self.get_field_optional_expr("initializer", fields, state)?;
+        let is_mutable = self
+            .get_field_as_bool("is_mutable", fields, state)
+            .unwrap_or(false);
 
         Ok(ParsedValue::Field(zyntax_typed_ast::TypedField {
             name,
             ty,
-            initializer: None,
+            initializer: initializer.map(Box::new),
             visibility: Visibility::Public,
-            mutability: Mutability::Immutable,
+            mutability: if is_mutable {
+                Mutability::Mutable
+            } else {
+                Mutability::Immutable
+            },
             is_static: false,
             span,
         }))

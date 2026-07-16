@@ -4328,27 +4328,42 @@ impl CraneliftBackend {
                             // the handler body to `__zyntax_effect_resume(k, v)`,
                             // so the sentinel value itself is irrelevant —
                             // only the arity matters today).
-                            let (handler_func_name, is_resumable) = if let Some(handler) =
-                                hir_module
+                            let (handler_func_name, is_resumable, has_state) =
+                                if let Some(handler) = hir_module
                                     .handlers
                                     .values()
                                     .find(|h| h.effect_id == *effect_id)
-                            {
-                                if let Some(impl_) = handler
-                                    .implementations
-                                    .iter()
-                                    .find(|i| i.op_name == *op_name)
                                 {
-                                    (
-                                        mangle_handler_op_name(handler.name, impl_.op_name),
-                                        impl_.is_resumable,
-                                    )
-                                } else {
-                                    warn!(
+                                    if let Some(impl_) = handler
+                                        .implementations
+                                        .iter()
+                                        .find(|i| i.op_name == *op_name)
+                                    {
+                                        (
+                                            mangle_handler_op_name(handler.name, impl_.op_name),
+                                            impl_.is_resumable,
+                                            !handler.state_fields.is_empty(),
+                                        )
+                                    } else {
+                                        warn!(
                                         "[Effect] No implementation for operation {:?} in handler",
                                         op_name
                                     );
-                                    // Fall through to trap
+                                        // Fall through to trap
+                                        if let Some(result_id) = result {
+                                            self.value_map.insert(
+                                                *result_id,
+                                                builder.ins().iconst(types::I64, 0),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                } else {
+                                    warn!("[Effect] No handler found for effect {:?}", effect_id);
+                                    // Unhandled effect - trap at runtime
+                                    builder
+                                        .ins()
+                                        .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
                                     if let Some(result_id) = result {
                                         self.value_map.insert(
                                             *result_id,
@@ -4356,19 +4371,7 @@ impl CraneliftBackend {
                                         );
                                     }
                                     continue;
-                                }
-                            } else {
-                                warn!("[Effect] No handler found for effect {:?}", effect_id);
-                                // Unhandled effect - trap at runtime
-                                builder
-                                    .ins()
-                                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-                                if let Some(result_id) = result {
-                                    self.value_map
-                                        .insert(*result_id, builder.ins().iconst(types::I64, 0));
-                                }
-                                continue;
-                            };
+                                };
 
                             // Try to find the handler function in the module
                             // Look up by name in hir_module.functions, then get FuncId from function_map
@@ -4409,6 +4412,38 @@ impl CraneliftBackend {
                                         .iter()
                                         .filter_map(|a| self.value_map.get(a).copied())
                                         .collect();
+                                    // Stateful handler op takes an implicit
+                                    // `self: H$state` first arg — the state
+                                    // region the innermost `with H { }`
+                                    // allocated. Fetch it from the handler
+                                    // stack (null outside any `with`, which is
+                                    // why a stateful handler must be entered
+                                    // via `with`). Non-resumable only; the
+                                    // continuation-lifting backend threads its
+                                    // own state.
+                                    if has_state && !is_resumable {
+                                        let mut ls_sig = self.module.make_signature();
+                                        ls_sig.params.push(AbiParam::new(types::I64));
+                                        ls_sig.returns.push(AbiParam::new(ptr_ty));
+                                        let state_ptr = match self.module.declare_function(
+                                            "__zyntax_effect_lookup_state",
+                                            Linkage::Import,
+                                            &ls_sig,
+                                        ) {
+                                            Ok(fid) => {
+                                                let lref = self
+                                                    .module
+                                                    .declare_func_in_func(fid, builder.func);
+                                                let effc = builder
+                                                    .ins()
+                                                    .iconst(types::I64, effect_id.as_u32() as i64);
+                                                let c = builder.ins().call(lref, &[effc]);
+                                                builder.inst_results(c)[0]
+                                            }
+                                            Err(_) => builder.ins().iconst(ptr_ty, 0),
+                                        };
+                                        arg_values.insert(0, state_ptr);
+                                    }
                                     // Resumable handler takes an extra
                                     // Resume<T> = i64 sentinel (arity match).
                                     if is_resumable {

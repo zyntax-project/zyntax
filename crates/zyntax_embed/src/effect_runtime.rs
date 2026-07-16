@@ -237,6 +237,28 @@ pub extern "C" fn __zyntax_effect_lookup_op(effect_id: u64, op_index: u64) -> *m
     })
 }
 
+/// Resolve the innermost in-scope handler state for `effect_id`. Walks the
+/// handler stack top-down and returns the first matching frame's
+/// `handler_state` pointer (the `self` region a `with H { }` allocated), or
+/// null if no handler for this effect is in scope. The perform-site codegen
+/// passes this as the implicit first argument to a stateful handler op.
+///
+/// # Safety
+/// The returned pointer aliases a heap region owned by the enclosing
+/// `with` scope; it stays valid until that scope's `pop_handler`.
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_lookup_state(effect_id: u64) -> *mut u8 {
+    HANDLER_STACK.with(|stack| {
+        let s = stack.borrow();
+        for frame in s.iter().rev() {
+            if frame.effect_id == effect_id {
+                return frame.handler_state;
+            }
+        }
+        core::ptr::null_mut()
+    })
+}
+
 /// Layout of the Resume<T> struct, as compiled code constructs it at
 /// each perform site (see
 /// `krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites`).
@@ -721,6 +743,18 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             flags: ZrtlSigFlags::NONE,
             return_type: ptr_tag(),
             params: params2(u64_tag(), u64_tag()),
+        },
+    );
+
+    // lookup_state(effect_id: u64) -> *u8 (handler `self` region or null)
+    runtime.register_function_typed(
+        "__zyntax_effect_lookup_state",
+        __zyntax_effect_lookup_state as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::NONE,
+            return_type: ptr_tag(),
+            params: params1(u64_tag()),
         },
     );
 
