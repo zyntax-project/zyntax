@@ -13,6 +13,38 @@ use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirVal
 use crate::CompilerResult;
 use std::collections::{HashMap, HashSet};
 
+/// Successor block ids of a terminator, derived directly from its targets.
+/// Preferred over the cached `HirBlock::successors` field, which some
+/// transforms (notably the async state-machine lowering) leave empty.
+fn terminator_successors(term: &crate::hir::HirTerminator) -> Vec<HirId> {
+    use crate::hir::HirTerminator as T;
+    match term {
+        T::Branch { target } => vec![*target],
+        T::CondBranch {
+            true_target,
+            false_target,
+            ..
+        } => vec![*true_target, *false_target],
+        T::Switch { default, cases, .. } => {
+            let mut v = Vec::with_capacity(cases.len() + 1);
+            v.push(*default);
+            v.extend(cases.iter().map(|(_, t)| *t));
+            v
+        }
+        T::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+        T::PatternMatch {
+            patterns, default, ..
+        } => {
+            let mut v: Vec<HirId> = patterns.iter().map(|p| p.target).collect();
+            if let Some(d) = default {
+                v.push(*d);
+            }
+            v
+        }
+        T::Return { .. } | T::Unreachable => vec![],
+    }
+}
+
 /// Analysis results for a module
 #[derive(Debug)]
 pub struct ModuleAnalysis {
@@ -264,9 +296,27 @@ impl AnalysisRunner {
             for (block_id, block) in &func.blocks {
                 let mut new_live_out = HashSet::new();
 
-                // Union of successors' live_in
-                for succ_id in &block.successors {
-                    new_live_out.extend(&live_in[succ_id]);
+                // Union of successors' live_in. Derive successors from the
+                // terminator rather than the cached `block.successors`
+                // field — that field is empty on async-transformed
+                // functions, which would otherwise strand liveness at
+                // per-block scope and drop any non-phi value live across a
+                // block boundary (e.g. a fiber handle live across an await).
+                for succ_id in terminator_successors(&block.terminator) {
+                    if let Some(s) = live_in.get(&succ_id) {
+                        new_live_out.extend(s);
+                    }
+                    // A phi incoming for THIS block's edge is live-out of
+                    // this block (a use on the edge, not at the phi block).
+                    if let Some(succ_block) = func.blocks.get(&succ_id) {
+                        for phi in &succ_block.phis {
+                            for (val, pred) in &phi.incoming {
+                                if pred == block_id {
+                                    new_live_out.insert(*val);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // live_in = use ∪ (live_out - def)
@@ -330,14 +380,15 @@ impl AnalysisRunner {
             let mut block_uses = HashSet::new();
             let mut block_defs = HashSet::new();
 
-            // Process phis
+            // Process phis. The result is defined here, but each incoming
+            // value is NOT a use of this block — it's a use live-out of its
+            // specific predecessor (handled per-edge in the fixpoint). Adding
+            // incomings to this block's uses would over-approximate: the
+            // value would look live along every path into the block, not just
+            // its own edge, keeping loop-init values spuriously live across
+            // suspends.
             for phi in &block.phis {
                 block_defs.insert(phi.result);
-                for (val, _) in &phi.incoming {
-                    if !block_defs.contains(val) {
-                        block_uses.insert(*val);
-                    }
-                }
             }
 
             // Process instructions
@@ -405,6 +456,54 @@ impl AnalysisRunner {
                     if !defs.contains(arg) {
                         uses.insert(*arg);
                     }
+                }
+            }
+            // Fiber ops carry their handle/value operands here (still HIR
+            // variants during the async captures-lift, which runs before
+            // fiber lowering). Without these a fiber handle live across an
+            // `await` isn't seen as live-out and never gets a save slot —
+            // it's undefined on resume.
+            HirInstruction::FiberNew {
+                closure,
+                stack_size,
+                ..
+            } => {
+                if !defs.contains(closure) {
+                    uses.insert(*closure);
+                }
+                if !defs.contains(stack_size) {
+                    uses.insert(*stack_size);
+                }
+            }
+            HirInstruction::FiberResume { fiber, .. } => {
+                if !defs.contains(fiber) {
+                    uses.insert(*fiber);
+                }
+            }
+            HirInstruction::FiberResumeWith { fiber, value, .. } => {
+                if !defs.contains(fiber) {
+                    uses.insert(*fiber);
+                }
+                if !defs.contains(value) {
+                    uses.insert(*value);
+                }
+            }
+            HirInstruction::FiberYield { value } => {
+                if !defs.contains(value) {
+                    uses.insert(*value);
+                }
+            }
+            HirInstruction::FiberTransfer { target, value, .. } => {
+                if !defs.contains(target) {
+                    uses.insert(*target);
+                }
+                if !defs.contains(value) {
+                    uses.insert(*value);
+                }
+            }
+            HirInstruction::FiberCancel { fiber } | HirInstruction::FiberDrop { fiber } => {
+                if !defs.contains(fiber) {
+                    uses.insert(*fiber);
                 }
             }
             _ => {}

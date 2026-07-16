@@ -53,14 +53,15 @@ fn async_drives_fiber_no_await() {
     assert_eq!(result.as_i64(), Some(6), "1+2+3 = 6");
 }
 
-/// Await INSIDE the fiber-driving loop. Still open — resolves to
-/// `None`. The core await-in-loop hang is fixed (see
-/// `async_await_in_plain_loop`), but combining a fiber `.next()` decode
-/// with an await suspension in the same loop needs the fiber handle
-/// preserved across the await AND the Option<T> step decode threaded
-/// through — the cooperative fiber-in-async work in Phase 5 of the
-/// fiber×effect×async plan. Re-enable when that lands.
-#[ignore = "fiber .next() + await in the same loop — Phase 5 cooperative fiber-in-async"]
+/// Await INSIDE the fiber-driving loop. The captures-lift half is now
+/// fixed: the fiber handle is correctly saved/restored across the await
+/// (SSA reconstruction in `krio_adapter::emit::repair_ssa_for_reloads`),
+/// verified by the handle keeping the same pointer across every resume.
+/// Still open at the RUNTIME layer — the fiber is resumed once more than
+/// expected and crashes inside `krio_fiber_resume`, a cross-native-stack
+/// resume issue separate from the captures-lift and adjacent to the
+/// cooperative-resume work (Phase 5.2). Re-enable when that lands.
+#[ignore = "fiber .next() + await in the same loop — runtime resume across async suspend (Phase 5.2)"]
 #[test]
 fn async_drives_fiber_with_await_in_loop() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");

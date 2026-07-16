@@ -62,12 +62,13 @@ use crate::{HirBlockId, HirCoroCfg, HirFnId, HirLiveness};
 ///   * Record the original→fresh HirId mapping; the caller (or
 ///     subsequent emission steps) rewrites uses across the resume
 ///     region.
+#[allow(clippy::type_complexity)]
 pub fn emit_save_load(
     cfg: &mut HirCoroCfg<'_>,
     layout: &StateMachineLayout<HirBlockId, crate::HirLocalId, HirFnId>,
     liveness: &HirLiveness,
     frame_ptr: HirId,
-) -> HashMap<HirId, HirId> {
+) -> (HashMap<HirId, HirId>, HashMap<HirId, Vec<(HirId, HirId)>>) {
     // ── Saves ──
     for (yield_block, saves) in &layout.yield_saves {
         // Collect saves into a Vec we can walk after the (cfg, function)
@@ -97,15 +98,19 @@ pub fn emit_save_load(
     }
 
     // ── Loads (and freshly-defined SSA values for them) ──
+    // For each saved value, mint a fresh SSA id per resume block that
+    // reloads it and insert the `AsyncLoadSlot`. We DON'T rewrite uses
+    // per-resume-block here (the old approach) — a value defined once
+    // before a loop and reloaded inside it needs a loop-header phi, not a
+    // blind original→reload substitution that breaks the entry path.
+    // Collect the reloads and do proper SSA reconstruction afterwards.
     let mut original_to_fresh: HashMap<HirId, HirId> = HashMap::new();
+    // original SSA id → [(reload id, resume-block hir id)]
+    let mut reloads: HashMap<HirId, Vec<(HirId, HirId)>> = HashMap::new();
 
     for (resume_block, loads) in &layout.resume_loads {
         let resume_hir = cfg.block_id_to_hir(*resume_block);
-        // First mint the fresh SSA values + register them in function.values.
-        // We do this in a separate pass because each minting needs &mut on
-        // function.values, and the block.instructions.insert below also
-        // needs &mut on function.blocks — both are fields of HirFunction.
-        let mut fresh_loads: Vec<(u32, HirId, HirType, HirId)> = Vec::new(); // (slot, fresh_id, ty, original_id)
+        let mut fresh_loads: Vec<(u32, HirId, HirType)> = Vec::new(); // (slot, fresh_id, ty)
         for (slot, hir_local) in loads {
             let original_id = match liveness.local_to_hir.get(hir_local) {
                 Some(&v) => v,
@@ -129,15 +134,17 @@ pub fn emit_save_load(
                 },
             );
             original_to_fresh.insert(original_id, fresh_id);
-            fresh_loads.push((*slot, fresh_id, original_ty, original_id));
+            reloads
+                .entry(original_id)
+                .or_default()
+                .push((fresh_id, resume_hir));
+            fresh_loads.push((*slot, fresh_id, original_ty));
         }
 
-        // Now insert the AsyncLoadSlot instructions at the front of the
-        // block, in slot-index order so the IR reads cleanly.
+        // Insert the AsyncLoadSlot instructions at the front of the block,
+        // in slot-index order so the IR reads cleanly.
         if let Some(block) = cfg.function_mut().blocks.get_mut(&resume_hir) {
-            // Insert in reverse so each insert(0, _) results in the
-            // intended order at the front.
-            for (slot, fresh_id, ty, _orig) in fresh_loads.iter().rev() {
+            for (slot, fresh_id, ty) in fresh_loads.iter().rev() {
                 block.instructions.insert(
                     0,
                     HirInstruction::AsyncLoadSlot {
@@ -149,92 +156,284 @@ pub fn emit_save_load(
                 );
             }
         }
+    }
 
-        // Rewrite uses of the original HirId → fresh HirId in EVERY
-        // statement and terminator of the resume block onward. krio's
-        // captures-lift contract: "the host just needs to call
-        // load_value(frame, slot) and store the result"; and
-        // "downstream uses to point at the fresh id" — but krio
-        // doesn't know about HIR's use chains, so we do it here.
-        if !fresh_loads.is_empty() {
-            rewrite_uses_in_reachable(cfg, *resume_block, &original_to_fresh);
+    // SSA reconstruction is deferred to AFTER `emit_dispatcher` wires the
+    // dispatcher→resume-entry edges — until then the resume blocks are
+    // orphaned and dominance can't be computed. The orchestrator calls
+    // `repair_ssa_for_reloads` with the returned `reloads` map.
+    (original_to_fresh, reloads)
+}
+
+/// Number of blocks reachable from `start` over terminator edges.
+fn reachable_block_count(func: &zyntax_compiler::hir::HirFunction, start: HirId) -> usize {
+    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if let Some(block) = func.blocks.get(&b) {
+            for s in successors_of(&block.terminator) {
+                stack.push(s);
+            }
+        }
+    }
+    seen.len()
+}
+
+/// Rebuild `successors`/`predecessors` on every block from its terminator.
+/// The async lowering leaves these cached fields empty/stale; the dominator
+/// tree needs them accurate.
+fn rebuild_cfg_edges(func: &mut zyntax_compiler::hir::HirFunction) {
+    for b in func.blocks.values_mut() {
+        b.successors.clear();
+        b.predecessors.clear();
+    }
+    let edges: Vec<(HirId, HirId)> = func
+        .blocks
+        .iter()
+        .flat_map(|(bid, b)| {
+            let from = *bid;
+            successors_of(&b.terminator)
+                .into_iter()
+                .map(move |s| (from, s))
+        })
+        .collect();
+    for (from, to) in edges {
+        if let Some(b) = func.blocks.get_mut(&from) {
+            b.successors.push(to);
+        }
+        if let Some(b) = func.blocks.get_mut(&to) {
+            b.predecessors.push(from);
+        }
+    }
+}
+
+/// Iterated dominance frontier of a set of definition blocks — the blocks
+/// that need a phi for a value defined in those blocks.
+fn iterated_dominance_frontier(
+    dt: &zyntax_compiler::analysis::DominatorTree,
+    defs: &HashSet<HirId>,
+) -> HashSet<HirId> {
+    let mut idf = HashSet::new();
+    let mut worklist: Vec<HirId> = defs.iter().copied().collect();
+    while let Some(b) = worklist.pop() {
+        for &f in dt.frontier(b) {
+            if idf.insert(f) {
+                worklist.push(f);
+            }
+        }
+    }
+    idf
+}
+
+/// For a single logical value with defs at `def_value` (block → SSA id),
+/// compute the reaching definition entering each block: its own def if it
+/// has one, else the reaching def of its immediate dominator.
+fn compute_reaching_defs(
+    dt: &zyntax_compiler::analysis::DominatorTree,
+    def_value: &HashMap<HirId, HirId>,
+) -> HashMap<HirId, HirId> {
+    let mut reaching: HashMap<HirId, HirId> = HashMap::new();
+    // RPO visits each block after its immediate dominator.
+    for &b in dt.rpo() {
+        if let Some(&v) = def_value.get(&b) {
+            reaching.insert(b, v);
+        } else if let Some(idom) = dt.idom(b) {
+            if let Some(&v) = reaching.get(&idom) {
+                reaching.insert(b, v);
+            }
+        }
+    }
+    reaching
+}
+
+/// Proper SSA reconstruction for values that are saved before a suspend and
+/// reloaded on resume. The reload creates a second definition of the value;
+/// where the pre-suspend definition and the reload paths merge (loop
+/// headers), a phi is required. Blindly rewriting uses to the reload
+/// instead breaks the first (pre-suspend) iteration, where the reload is
+/// undefined. For each saved value: place phis at the iterated dominance
+/// frontier of {original-def, reload blocks}, then rename every use to the
+/// reaching definition and wire up the phi operands per predecessor.
+pub fn repair_ssa_for_reloads(
+    func: &mut zyntax_compiler::hir::HirFunction,
+    reloads: &HashMap<HirId, Vec<(HirId, HirId)>>,
+) {
+    use zyntax_compiler::analysis::DominatorTree;
+    use zyntax_compiler::hir::{HirPhi, HirType, HirValue, HirValueKind};
+
+    if reloads.is_empty() {
+        return;
+    }
+
+    rebuild_cfg_edges(func);
+    // The async transform leaves `entry_block` pointing at the ORIGINAL
+    // (pre-dispatcher) entry, which no longer dominates the resume blocks.
+    // The real entry after the transform is the dispatcher prologue — a
+    // no-predecessor block. There can be several no-pred blocks (orphaned
+    // closure bodies etc.), so pick the one that reaches the most blocks.
+    // Root the dominator tree there so every block (incl. resume entries)
+    // is in its RPO.
+    let real_entry = func
+        .blocks
+        .iter()
+        .filter(|(_, b)| b.predecessors.is_empty())
+        .map(|(id, _)| *id)
+        .max_by_key(|&c| reachable_block_count(func, c));
+    if let Some(e) = real_entry {
+        func.entry_block = e;
+    }
+    let dt = DominatorTree::new(func);
+
+    // Defining block of every SSA value (params → entry block).
+    let mut def_block: HashMap<HirId, HirId> = HashMap::new();
+    for p in &func.signature.params {
+        def_block.insert(p.id, func.entry_block);
+    }
+    for (bid, block) in &func.blocks {
+        for phi in &block.phis {
+            def_block.insert(phi.result, *bid);
+        }
+        for inst in &block.instructions {
+            if let Some(r) = crate::instruction_result(inst) {
+                def_block.insert(r, *bid);
+            }
         }
     }
 
-    original_to_fresh
-}
-
-/// Walk all blocks reachable from `start_bb` (via `cfg.function`'s
-/// terminators) and rewrite every operand HirId via `mapping`.
-/// Skips the loaded-result-defining instructions themselves: their
-/// `value` field is already the fresh id; only post-load uses get
-/// rebound.
-fn rewrite_uses_in_reachable(
-    cfg: &mut HirCoroCfg<'_>,
-    start_bb: HirBlockId,
-    mapping: &HashMap<HirId, HirId>,
-) {
-    let start_hir = cfg.block_id_to_hir(start_bb);
-    let func = cfg.function_mut();
-
-    // Reachability over the post-transform CFG.
-    let mut visited: HashSet<HirId> = HashSet::new();
-
-    let full_replacement: indexmap::IndexMap<HirId, HirId> =
-        mapping.iter().map(|(k, v)| (*k, *v)).collect();
-
-    // The walk carries the ACTIVE replacement map per-path. A phi
-    // node is a "rewrite barrier": once execution passes through a
-    // phi block whose result HirId is in our replacement keys, that
-    // entry must drop OUT of the active map for downstream blocks.
-    // Reason: the phi re-introduces the canonical name at the join,
-    // so all uses past the phi should resolve to the phi.result, not
-    // to the fresh id from the back-edge. Without this propagation,
-    // emit_save_load's rewrites bleed into post-loop code (the
-    // function exit, etc.), causing Cranelift dominance failures.
-    //
-    // Reachability is approximated by visited (we revisit a block
-    // only if a more-restrictive map arrives — but to keep
-    // complexity bounded we just visit each block once with the
-    // first map that reaches it; the loop pattern is the only place
-    // multiple maps could differ, and that's exactly what the phi
-    // barrier handles).
-    type ReplMap = indexmap::IndexMap<HirId, HirId>;
-    let mut path_stack: Vec<(HirId, ReplMap)> = vec![(start_hir, full_replacement)];
-
-    while let Some((bb, active_map_into)) = path_stack.pop() {
-        if !visited.insert(bb) {
-            continue;
+    for (original, reload_list) in reloads {
+        // Definition sites: the original def block + every reload block.
+        let odb = def_block.get(original).copied().unwrap_or(func.entry_block);
+        let mut def_blocks: HashSet<HirId> = HashSet::new();
+        def_blocks.insert(odb);
+        for (_, rb) in reload_list {
+            def_blocks.insert(*rb);
         }
-        let block = match func.blocks.get_mut(&bb) {
-            Some(b) => b,
-            None => continue,
-        };
 
-        // Shrink the active map: drop entries whose original HirId is
-        // re-defined by a phi in THIS block. This block uses the phi
-        // result (canonical), and downstream blocks reachable only
-        // through this phi should also see the canonical value.
-        let block_phi_results: HashSet<HirId> = block.phis.iter().map(|p| p.result).collect();
-        let mut active_map = active_map_into;
-        active_map.retain(|orig, _| !block_phi_results.contains(orig));
+        let ty = func
+            .values
+            .get(original)
+            .map(|v| v.ty.clone())
+            .unwrap_or(HirType::I64);
 
-        if active_map.is_empty() {
-            // Nothing to rewrite past here; still walk successors so
-            // they're marked visited (and stop), but no instr edits.
-            for succ in successors_of(&block.terminator) {
-                path_stack.push((succ, ReplMap::new()));
+        // Reaching definitions from the base defs only (no phis yet). Used
+        // to prune spurious phis: a phi is only needed where the value has
+        // ≥2 distinct reaching defs among the block's predecessors. A value
+        // re-defined each iteration inside the loop (e.g. the `let Some(x)`
+        // binding) is NOT live-in at the loop header — one predecessor has
+        // no reaching def — so it must not get a (would-be-undefined) phi.
+        let mut base_defs: HashMap<HirId, HirId> = HashMap::new();
+        base_defs.insert(odb, *original);
+        for (rid, rb) in reload_list {
+            base_defs.insert(*rb, *rid);
+        }
+        let reaching0 = compute_reaching_defs(&dt, &base_defs);
+
+        // Allocate a phi value per IDF block that is a genuine merge.
+        let phi_blocks = iterated_dominance_frontier(&dt, &def_blocks);
+        let mut def_value = base_defs.clone();
+        let mut phi_result: HashMap<HirId, HirId> = HashMap::new();
+        for &pb in &phi_blocks {
+            // Skip blocks that are already definition sites: the original
+            // def block (when it's a loop-header phi, e.g. `sum`/`i` — the
+            // existing phi already merges the back-edge) or a reload block.
+            // Inserting another phi there would double-define the value.
+            if def_value.contains_key(&pb) {
+                continue;
             }
-            continue;
+            // Prune: only a real merge (≥2 distinct reaching defs among
+            // predecessors) needs a phi. Fewer means the value isn't
+            // live-in here on all paths — a phi would introduce an
+            // undefined operand that gets read at runtime.
+            let distinct: HashSet<HirId> = func
+                .blocks
+                .get(&pb)
+                .map(|b| {
+                    b.predecessors
+                        .iter()
+                        .filter_map(|q| reaching0.get(q).copied())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if distinct.len() < 2 {
+                continue;
+            }
+            let pid = HirId::new();
+            func.values.insert(
+                pid,
+                HirValue {
+                    id: pid,
+                    ty: ty.clone(),
+                    kind: HirValueKind::Instruction,
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+            def_value.insert(pb, pid);
+            phi_result.insert(pb, pid);
         }
 
-        for inst in &mut block.instructions {
-            inst.replace_uses(&active_map);
+        let reaching = compute_reaching_defs(&dt, &def_value);
+
+        // Rename uses (instructions + terminator, NOT phis) to the reaching
+        // def. Phis are wired separately below so their per-predecessor
+        // operands stay correct.
+        for (bid, block) in func.blocks.iter_mut() {
+            let rd = match reaching.get(bid) {
+                Some(&v) => v,
+                None => continue,
+            };
+            if rd == *original {
+                continue;
+            }
+            let map: indexmap::IndexMap<HirId, HirId> = std::iter::once((*original, rd)).collect();
+            for inst in &mut block.instructions {
+                inst.replace_uses(&map);
+            }
+            rewrite_terminator_uses(&mut block.terminator, &map);
         }
-        rewrite_terminator_uses(&mut block.terminator, &active_map);
-        for succ in successors_of(&block.terminator) {
-            if !visited.contains(&succ) {
-                path_stack.push((succ, active_map.clone()));
+
+        // Wire the inserted phis: each predecessor contributes the reaching
+        // def at its exit. Only the phis we actually inserted (not skipped
+        // pre-existing def sites). A predecessor with no reaching def is one
+        // where the value isn't defined on that path (an over-placed phi for
+        // a value not live-in there) — fill it with `Undef` so the phi is
+        // well-formed for every predecessor; such phis are dead and get
+        // cleaned up downstream.
+        for (&pb, &pid) in &phi_result {
+            let preds = func
+                .blocks
+                .get(&pb)
+                .map(|b| b.predecessors.clone())
+                .unwrap_or_default();
+            let mut incoming: Vec<(HirId, HirId)> = Vec::with_capacity(preds.len());
+            for q in &preds {
+                let v = if let Some(&v) = reaching.get(q) {
+                    v
+                } else {
+                    let uid = HirId::new();
+                    func.values.insert(
+                        uid,
+                        HirValue {
+                            id: uid,
+                            ty: ty.clone(),
+                            kind: HirValueKind::Undef,
+                            uses: HashSet::new(),
+                            span: None,
+                        },
+                    );
+                    uid
+                };
+                incoming.push((v, *q));
+            }
+            if let Some(block) = func.blocks.get_mut(&pb) {
+                block.phis.push(HirPhi {
+                    result: pid,
+                    ty: ty.clone(),
+                    incoming,
+                });
             }
         }
     }

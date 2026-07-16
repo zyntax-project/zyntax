@@ -752,7 +752,7 @@ impl<'a> AsyncHooks for HirAsyncHooks<'a> {
 // def over-saves, which is correct.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
+pub(crate) fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
     use HirInstruction as I;
     match inst {
         I::Binary { result, .. }
@@ -779,6 +779,15 @@ fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
         | I::TraitMethodCall { result, .. }
         | I::PerformEffect { result, .. }
         | I::HandleEffect { result, .. } => *result,
+
+        // Fiber ops are still their HIR variants at captures-lift time
+        // (fiber lowering runs after the async transform), so their defs
+        // must be visible to liveness or a fiber handle live across a
+        // suspend won't be saved/restored.
+        I::FiberNew { result, .. }
+        | I::FiberResume { result, .. }
+        | I::FiberResumeWith { result, .. }
+        | I::FiberTransfer { result, .. } => Some(*result),
 
         _ => None,
     }
@@ -849,6 +858,27 @@ fn instruction_uses(inst: &HirInstruction) -> smallvec::SmallVec<[HirId; 4]> {
                 uses.push(*a);
             }
         }
+        // Fiber ops — see `instruction_result`. The fiber handle operand
+        // must be a visible use so a handle live across a suspend is saved.
+        I::FiberNew {
+            closure,
+            stack_size,
+            ..
+        } => {
+            uses.push(*closure);
+            uses.push(*stack_size);
+        }
+        I::FiberResume { fiber, .. } => uses.push(*fiber),
+        I::FiberResumeWith { fiber, value, .. } => {
+            uses.push(*fiber);
+            uses.push(*value);
+        }
+        I::FiberYield { value } => uses.push(*value),
+        I::FiberTransfer { target, value, .. } => {
+            uses.push(*target);
+            uses.push(*value);
+        }
+        I::FiberCancel { fiber } | I::FiberDrop { fiber } => uses.push(*fiber),
         _ => {}
     }
     uses
@@ -986,17 +1016,34 @@ impl HirLiveness {
             // save). Without phi inclusion, await-in-loop patterns
             // miss the loop counter / accumulator phis and the
             // resume side reads undefined values.
-            let mut defined_at_or_before: Vec<HashSet<HirId>> =
-                Vec::with_capacity(block.instructions.len());
-            let mut acc: HashSet<HirId> =
+            // Values whose definition dominates any suspension in THIS
+            // block: params, ALL phi results, and every instruction def
+            // from OTHER blocks. Current-block defs are folded in
+            // incrementally below (respecting the suspension index).
+            // Intersecting this over-approximation with the
+            // post-suspension live set filters it to what's actually live
+            // across the suspend — so a value defined in a dominating
+            // predecessor block (e.g. a fiber handle created before the
+            // loop) is captured instead of read undefined on resume.
+            let mut foreign_defs: HashSet<HirId> =
                 cfg.function.signature.params.iter().map(|p| p.id).collect();
-            // Add all phi results across the function (cross-block
-            // SSA values).
-            for other_block in cfg.function.blocks.values() {
+            for (other_id, other_block) in &cfg.function.blocks {
                 for phi in &other_block.phis {
-                    acc.insert(phi.result);
+                    foreign_defs.insert(phi.result);
+                }
+                if other_id == hir_block_id {
+                    continue;
+                }
+                for inst in &other_block.instructions {
+                    if let Some(def) = instruction_result(inst) {
+                        foreign_defs.insert(def);
+                    }
                 }
             }
+
+            let mut defined_at_or_before: Vec<HashSet<HirId>> =
+                Vec::with_capacity(block.instructions.len());
+            let mut acc: HashSet<HirId> = foreign_defs.clone();
             for inst in &block.instructions {
                 if let Some(def) = instruction_result(inst) {
                     acc.insert(def);
@@ -1046,17 +1093,9 @@ impl HirLiveness {
                     s
                 };
                 let defined_pre = if idx == 0 {
-                    // Function params + all phi results (defined at
-                    // top of their blocks, conservatively assumed to
-                    // dominate this site via SSA).
-                    let mut s: HashSet<HirId> =
-                        cfg.function.signature.params.iter().map(|p| p.id).collect();
-                    for other_block in cfg.function.blocks.values() {
-                        for phi in &other_block.phis {
-                            s.insert(phi.result);
-                        }
-                    }
-                    s
+                    // Nothing defined in this block yet — only the
+                    // dominating params/phis/other-block defs.
+                    foreign_defs.clone()
                 } else {
                     defined_at_or_before[idx - 1].clone()
                 };

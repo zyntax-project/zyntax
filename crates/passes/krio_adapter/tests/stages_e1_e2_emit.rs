@@ -73,9 +73,12 @@ fn run_through_e2(state_slot: u32, captures_slot_base: u32, emit_dispatcher: boo
         krio_async::transform_to_state_machine(&mut cfg, fn_id, &suspending, &hooks, &liveness.map)
             .expect("transform must succeed");
 
-    let rewrites = emit::emit_save_load(&mut cfg, &layout, &liveness, frame);
+    let (rewrites, reloads) = emit::emit_save_load(&mut cfg, &layout, &liveness, frame);
     if emit_dispatcher {
         emit::emit_dispatcher(&mut cfg, &layout, frame, state_slot);
+        // Post-load use rewriting now lives in the SSA-reconstruction pass,
+        // which runs after the dispatcher wires the resume-entry edges.
+        emit::repair_ssa_for_reloads(cfg.function_mut(), &reloads);
     }
     drop(cfg);
 
@@ -161,7 +164,7 @@ fn e1_post_load_uses_are_rewritten() {
         rewrites,
         live_across,
         ..
-    } = run_through_e2(0, 1, false);
+    } = run_through_e2(0, 1, true);
 
     // The live_across SSA id should have been rewritten to a fresh
     // post-load id in any block reachable from the resume entry.

@@ -241,8 +241,12 @@ pub fn lower_async_function(
         }
     }
 
-    let rewrites = emit::emit_save_load(&mut cfg, &layout, &liveness, frame_ptr);
+    let (rewrites, reloads) = emit::emit_save_load(&mut cfg, &layout, &liveness, frame_ptr);
     emit::emit_dispatcher(&mut cfg, &layout, frame_ptr, state_slot);
+    // SSA reconstruction for the captures-lift reloads. Runs AFTER the
+    // dispatcher wires the entry switch → resume-entry edges, so the CFG is
+    // fully connected and dominance (loop-header phi placement) is correct.
+    emit::repair_ssa_for_reloads(cfg.function_mut(), &reloads);
 
     // Phase F.2: replace `Intrinsic::Await` calls with the
     // poll-the-inner-promise state machine. Allocates two slots per
