@@ -205,10 +205,23 @@ exceptional edges and the move-tracking ownership rule are the follow-up.
 
 ---
 
-## Phase 3 — Handler state across performs
+## Phase 3 — Handler state across performs — ✅ SHIPPED (8c63488)
 
 **Size:** medium. **Unblocks:** 4+ programs (db-pool handler, credit handler,
 handler-scoped-fiber). **Depends on:** 1 (with-block + push_handler).
+
+**Shipped scope:** 3.1/3.2/3.3 for the non-resumable path. State is a
+synthesized `@reference` struct `H$state`; `synthesize_handler_state`
+(runtime.rs, pre-registry-snapshot) registers it, builds an `H$new()`
+constructor that allocates+initialises it, and prepends `self: H$state` to
+every non-resumable op. `lower_with_scopes` calls `H$new()` at scope entry,
+passes the pointer to `push_handler`, and frees it on each exit edge;
+`__zyntax_effect_lookup_state` feeds it to the perform site as the implicit
+first arg. A stateful handler must be entered via `with` (static path passes
+null self). Follow-ups: resumable-handler state (krio path), typed drop of
+state fields (e.g. an `Option<Fiber<T>>` field — currently raw `free`, no
+field destructors), and a regional override matching the default's
+statefulness.
 
 ### 3.1 Handler-state syntax
 - `crates/zynml/ml.zyn`: allow `var name: T = init` / `let name: T = init`
