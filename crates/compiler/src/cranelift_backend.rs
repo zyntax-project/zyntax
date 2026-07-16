@@ -589,11 +589,6 @@ impl CraneliftBackend {
             log::trace!("{}", dump);
         }
 
-        // Process globals first (including vtables)
-        for (id, global) in &module.globals {
-            self.compile_global(*id, global)?;
-        }
-
         // Two-pass function compilation:
         // Pass 1: Declare all functions (populate function_map)
         // Pre-scan: Build map of call-site-inferred param types for extern functions
@@ -603,6 +598,16 @@ impl CraneliftBackend {
 
         for (id, function) in &module.functions {
             self.declare_function(*id, function, module)?;
+        }
+
+        // Process globals AFTER declaring functions. Vtable / effect
+        // op-table globals materialise fn-pointer arrays via
+        // `write_function_addr`, which needs every referenced function
+        // already in `function_map` (declaration is enough — bodies
+        // compile in Pass 2). Compiling globals before declaration left
+        // those relocations unresolved (null slots).
+        for (id, global) in &module.globals {
+            self.compile_global(*id, global)?;
         }
 
         // Pass 2: Compile all function bodies
@@ -4380,25 +4385,111 @@ impl CraneliftBackend {
 
                             if let Some(hir_id) = handler_hir_id {
                                 if let Some(&func_id) = self.function_map.get(&hir_id) {
-                                    // Direct call to compiled handler
-                                    let local_callee =
+                                    // Regional dispatch. The compile-time
+                                    // `func_id` is the STATIC handler (the
+                                    // one in module scope). A `with H { }`
+                                    // block may override it at runtime by
+                                    // pushing H's op-table onto the handler
+                                    // stack. Resolve the op function pointer
+                                    // dynamically:
+                                    //   dyn = __zyntax_effect_lookup_op(effect, op_index)
+                                    //   fn_ptr = select(dyn != 0, dyn, &static)
+                                    //   call_indirect fn_ptr(args)
+                                    // No branch — one `select` + one
+                                    // indirect call. When no `with` is in
+                                    // scope `dyn` is null and the static
+                                    // handler is used (unchanged behaviour).
+                                    let ptr_ty = self.module.target_config().pointer_type();
+
+                                    let static_ref =
                                         self.module.declare_func_in_func(func_id, builder.func);
+                                    let static_addr = builder.ins().func_addr(ptr_ty, static_ref);
+
                                     let mut arg_values: Vec<Value> = args
                                         .iter()
                                         .filter_map(|a| self.value_map.get(a).copied())
                                         .collect();
-                                    // Phase H Tier 3: resumable handler takes
-                                    // an extra Resume<T> = i64 sentinel. Pad
-                                    // arity to match the handler's signature.
+                                    // Resumable handler takes an extra
+                                    // Resume<T> = i64 sentinel (arity match).
                                     if is_resumable {
                                         arg_values.push(builder.ins().iconst(types::I64, 0));
                                     }
-                                    let call = builder.ins().call(local_callee, &arg_values);
+
+                                    // op_index = position of this op in the
+                                    // effect's operation list (stable order,
+                                    // shared with op-table construction).
+                                    let op_index = hir_module
+                                        .effects
+                                        .get(effect_id)
+                                        .and_then(|e| {
+                                            e.operations.iter().position(|o| o.name == *op_name)
+                                        })
+                                        .unwrap_or(0)
+                                        as i64;
+                                    let effect_u64 =
+                                        builder.ins().iconst(types::I64, effect_id.as_u32() as i64);
+                                    let op_index_val = builder.ins().iconst(types::I64, op_index);
+
+                                    // dyn_fn = __zyntax_effect_lookup_op(effect, op_index)
+                                    let mut lookup_sig = self.module.make_signature();
+                                    lookup_sig.params.push(AbiParam::new(types::I64));
+                                    lookup_sig.params.push(AbiParam::new(types::I64));
+                                    lookup_sig.returns.push(AbiParam::new(ptr_ty));
+                                    let dyn_fn = match self.module.declare_function(
+                                        "__zyntax_effect_lookup_op",
+                                        Linkage::Import,
+                                        &lookup_sig,
+                                    ) {
+                                        Ok(fid) => {
+                                            let lref =
+                                                self.module.declare_func_in_func(fid, builder.func);
+                                            let c = builder
+                                                .ins()
+                                                .call(lref, &[effect_u64, op_index_val]);
+                                            builder.inst_results(c)[0]
+                                        }
+                                        // Lookup symbol unavailable — fall
+                                        // back to static only.
+                                        Err(_) => static_addr,
+                                    };
+
+                                    let zero = builder.ins().iconst(ptr_ty, 0);
+                                    let is_dyn = builder.ins().icmp(IntCC::NotEqual, dyn_fn, zero);
+                                    let fn_ptr = builder.ins().select(is_dyn, dyn_fn, static_addr);
+
+                                    // Build the indirect-call signature from
+                                    // the actual argument value types (matches
+                                    // the handler op's compiled ABI for scalar
+                                    // params) + return type.
+                                    let mut call_sig = self.module.make_signature();
+                                    for &av in &arg_values {
+                                        let vt = builder.func.dfg.value_type(av);
+                                        call_sig.params.push(AbiParam::new(vt));
+                                    }
+                                    let ret_ct = match return_ty {
+                                        HirType::I8 | HirType::U8 | HirType::Bool => {
+                                            Some(types::I8)
+                                        }
+                                        HirType::I16 | HirType::U16 => Some(types::I16),
+                                        HirType::I32 | HirType::U32 => Some(types::I32),
+                                        HirType::I64 | HirType::U64 | HirType::Ptr(_) => {
+                                            Some(types::I64)
+                                        }
+                                        HirType::F32 => Some(types::F32),
+                                        HirType::F64 => Some(types::F64),
+                                        HirType::Void => None,
+                                        _ => Some(types::I64),
+                                    };
+                                    if let Some(rc) = ret_ct {
+                                        call_sig.returns.push(AbiParam::new(rc));
+                                    }
+                                    let sig_ref = builder.import_signature(call_sig);
+                                    let call =
+                                        builder.ins().call_indirect(sig_ref, fn_ptr, &arg_values);
                                     if let Some(result_id) = result {
                                         if let Some(&ret_val) = builder.inst_results(call).first() {
                                             self.value_map.insert(*result_id, ret_val);
                                         } else if matches!(return_ty, HirType::Void) {
-                                            // Void return - create dummy value
                                             self.value_map.insert(
                                                 *result_id,
                                                 builder.ins().iconst(types::I64, 0),

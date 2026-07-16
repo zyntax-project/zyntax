@@ -247,6 +247,17 @@ pub struct LoweringContext {
     /// via `ZyntaxRuntime::register_builtin_class` before
     /// compilation runs.
     pub builtin_registry: Arc<crate::builtin_class::BuiltinRegistry>,
+    /// Cache of per-handler effect op-tables (handler name → op_table
+    /// global id). Built lazily the first time a `with H` block needs
+    /// H's op_table; reused across every subsequent `with H` site so
+    /// the module carries one op_table global per handler, not one
+    /// per use.
+    pub handler_op_tables: HashMap<InternedString, HirId>,
+    /// `with`-scopes discovered per function, processed after ALL
+    /// functions are lowered (a `with H` needs H's op fns to already
+    /// be in the module, which isn't guaranteed at the point the
+    /// enclosing function is lowered).
+    pub pending_with_scopes: Vec<(HirId, Vec<crate::typed_cfg::WithScopeInfo>)>,
 }
 
 /// Symbol table for name resolution
@@ -470,6 +481,8 @@ impl LoweringContext {
             ownership_modes: HashMap::new(),
             copy_types: std::collections::HashSet::new(),
             builtin_registry: Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
+            handler_op_tables: HashMap::new(),
+            pending_with_scopes: Vec::new(),
         }
     }
 
@@ -613,6 +626,19 @@ impl AstLowering for LoweringContext {
         // Second pass: lower each declaration
         for decl in &program.declarations {
             self.lower_declaration(decl)?;
+        }
+
+        // `with H { }` post-pass: now that every function (including
+        // synthesised handler op fns) is in the module, emit
+        // push_handler/pop_handler for each recorded scope. The
+        // function is taken out of the module while mutated so
+        // `build_op_table` can read the rest of the module freely.
+        let pending = std::mem::take(&mut self.pending_with_scopes);
+        for (fn_id, scopes) in pending {
+            if let Some(mut func) = self.module.functions.swap_remove(&fn_id) {
+                self.lower_with_scopes(&mut func, &scopes)?;
+                self.module.functions.insert(fn_id, func);
+            }
         }
 
         // New Phase: Lower trait implementations and generate vtables
@@ -2377,6 +2403,17 @@ impl LoweringContext {
 
         hir_func = ssa.function;
 
+        // `with H { }` handler scoping: record the scopes now, emit
+        // push/pop in a post-pass after ALL functions are lowered — a
+        // `with H` needs H's op fns present in the module, which isn't
+        // guaranteed when the enclosing function is lowered. Block ids
+        // are preserved from the typed CFG, so the recorded scope ids
+        // stay valid in the finished function.
+        if !typed_cfg_builder.with_scopes.is_empty() {
+            self.pending_with_scopes
+                .push((hir_func.id, typed_cfg_builder.with_scopes.clone()));
+        }
+
         // Add string globals generated during SSA construction
         for global in ssa.string_globals {
             self.module.globals.insert(global.id, global);
@@ -2405,6 +2442,206 @@ impl LoweringContext {
         // Add to module
         self.module.add_function(hir_func);
 
+        Ok(())
+    }
+
+    /// Build (or reuse) the effect op-table global for `handler_name`.
+    /// The op-table is a fn-pointer array — `op_table[i]` is the
+    /// handler's implementation of the effect's i-th operation — laid
+    /// out exactly like a trait vtable and materialised through the
+    /// same `write_function_addr` relocation path. Returns
+    /// `(effect_id, op_table_global_id)`, or `None` if the handler or
+    /// effect can't be resolved.
+    fn build_op_table(&mut self, handler_name: InternedString) -> Option<(HirId, HirId)> {
+        // Resolve the handler declaration.
+        let handler = self
+            .module
+            .handlers
+            .values()
+            .find(|h| h.name == handler_name)?
+            .clone();
+        let effect_id = handler.effect_id;
+
+        // Cached?
+        if let Some(&global_id) = self.handler_op_tables.get(&handler_name) {
+            return Some((effect_id, global_id));
+        }
+
+        // Effect operations define the op ordering (op_index).
+        let effect = self.module.effects.get(&effect_id)?.clone();
+
+        // For each effect op, in declaration order, find the handler's
+        // implementing function by its mangled name (`Handler$op`).
+        use crate::hir::{HirMethodSignature, HirVTable, HirVTableEntry};
+        let mut methods: Vec<HirVTableEntry> = Vec::with_capacity(effect.operations.len());
+        for op in &effect.operations {
+            let mangled = crate::effect_codegen::mangle_handler_op_name(handler_name, op.name);
+            let func_id = self
+                .module
+                .functions
+                .iter()
+                .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
+                .map(|(id, _)| *id);
+            let Some(func_id) = func_id else {
+                log::warn!(
+                    "[with] handler {} has no implementation fn for op {} — op-table entry left null",
+                    handler_name.resolve_global().unwrap_or_default(),
+                    op.name.resolve_global().unwrap_or_default(),
+                );
+                continue;
+            };
+            methods.push(HirVTableEntry {
+                method_name: op.name,
+                function_id: func_id,
+                // Signature is inert for materialisation (only
+                // `function_id` is read when emitting the fn-ptr
+                // relocations); fill a minimal placeholder.
+                signature: HirMethodSignature {
+                    name: op.name,
+                    params: op.params.iter().map(|p| p.ty.clone()).collect(),
+                    return_type: op.return_type.clone(),
+                    is_static: false,
+                    is_async: false,
+                },
+            });
+        }
+
+        let vtable = HirVTable {
+            id: HirId::new(),
+            trait_id: zyntax_typed_ast::TypeId::new(0),
+            for_type: crate::hir::HirType::Void,
+            methods,
+        };
+        let global_id = vtable.id;
+        let global_name = {
+            let mut arena = self.arena.lock().unwrap();
+            arena.intern_string(&format!(
+                "$optable${}",
+                handler_name.resolve_global().unwrap_or_default()
+            ))
+        };
+        let global = crate::trait_lowering::create_vtable_global(vtable, global_name);
+        self.module.add_global(global);
+        self.handler_op_tables.insert(handler_name, global_id);
+        Some((effect_id, global_id))
+    }
+
+    /// Emit `push_handler` at each `with`-scope entry and
+    /// `pop_handler` on every edge that leaves the scope. This is the
+    /// shared exit-edge emitter the plan calls for; Phase 2's
+    /// `FiberDrop` will reuse the same edge-classification shape.
+    fn lower_with_scopes(
+        &mut self,
+        func: &mut crate::hir::HirFunction,
+        scopes: &[crate::typed_cfg::WithScopeInfo],
+    ) -> CompilerResult<()> {
+        use crate::hir::{
+            HirCallable, HirConstant, HirInstruction, HirType, HirValue, HirValueKind,
+        };
+
+        for scope in scopes {
+            let Some((effect_id, op_table_global_id)) = self.build_op_table(scope.handler_name)
+            else {
+                log::warn!(
+                    "[with] could not resolve handler {} — scope left un-pushed (static dispatch still applies)",
+                    scope.handler_name.resolve_global().unwrap_or_default()
+                );
+                continue;
+            };
+
+            // Helper to mint a fresh SSA value in the function.
+            let mut mint = |ty: HirType, kind: HirValueKind| -> HirId {
+                let id = HirId::new();
+                func.values.insert(
+                    id,
+                    HirValue {
+                        id,
+                        ty,
+                        kind,
+                        uses: std::collections::HashSet::new(),
+                        span: None,
+                    },
+                );
+                id
+            };
+
+            // Constants + op-table address.
+            let effect_id_val = mint(
+                HirType::I64,
+                HirValueKind::Constant(HirConstant::I64(effect_id.as_u32() as i64)),
+            );
+            let null_state_val = mint(HirType::I64, HirValueKind::Constant(HirConstant::I64(0)));
+            let op_table_addr = mint(
+                HirType::Ptr(Box::new(HirType::Void)),
+                HirValueKind::Global(op_table_global_id),
+            );
+            let frame_id_val = mint(HirType::I64, HirValueKind::Instruction);
+
+            // push_handler(effect_id, handler_state=null, op_table) -> frame_id
+            let push_inst = HirInstruction::Call {
+                result: Some(frame_id_val),
+                callee: HirCallable::Symbol("__zyntax_effect_push_handler".to_string()),
+                args: vec![effect_id_val, null_state_val, op_table_addr],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            };
+            // Prepend push at the very start of the scope entry block.
+            if let Some(entry_block) = func.blocks.get_mut(&scope.entry) {
+                entry_block.instructions.insert(0, push_inst);
+            } else {
+                continue;
+            }
+
+            // pop_handler on every scope-exit edge. A block belongs to
+            // the scope (`body_blocks`); its terminator "leaves" when it
+            // returns, or branches to a block outside the scope
+            // (including the fall-through `after`). CondBranch/Switch
+            // with MIXED in/out targets need edge splitting — deferred;
+            // logged so it's visible rather than silently wrong.
+            let scope_set: std::collections::HashSet<HirId> =
+                scope.body_blocks.iter().copied().collect();
+            for &bid in &scope.body_blocks {
+                let Some(block) = func.blocks.get(&bid) else {
+                    continue;
+                };
+                let leaves = match &block.terminator {
+                    crate::hir::HirTerminator::Return { .. } => true,
+                    crate::hir::HirTerminator::Branch { target } => !scope_set.contains(target),
+                    crate::hir::HirTerminator::CondBranch {
+                        true_target,
+                        false_target,
+                        ..
+                    } => {
+                        let t_out = !scope_set.contains(true_target);
+                        let f_out = !scope_set.contains(false_target);
+                        if t_out != f_out {
+                            log::warn!(
+                                "[with] mixed in/out CondBranch in handler scope {} — pop on one edge not yet emitted (edge-split follow-up)",
+                                scope.handler_name.resolve_global().unwrap_or_default()
+                            );
+                            false
+                        } else {
+                            t_out && f_out
+                        }
+                    }
+                    _ => false,
+                };
+                if leaves {
+                    let pop_inst = HirInstruction::Call {
+                        result: None,
+                        callee: HirCallable::Symbol("__zyntax_effect_pop_handler".to_string()),
+                        args: vec![frame_id_val],
+                        type_args: vec![],
+                        const_args: vec![],
+                        is_tail: false,
+                    };
+                    if let Some(block) = func.blocks.get_mut(&bid) {
+                        block.instructions.push(pop_inst);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

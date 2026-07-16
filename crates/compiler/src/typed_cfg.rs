@@ -19,6 +19,25 @@ use zyntax_typed_ast::{
     InternedString, Span, Type,
 };
 
+/// A `with H { body }` scope discovered during CFG construction.
+/// Consumed by `LoweringContext` after SSA to emit
+/// `__zyntax_effect_push_handler` at `entry` and
+/// `__zyntax_effect_pop_handler` on every edge that leaves the scope.
+#[derive(Debug, Clone)]
+pub struct WithScopeInfo {
+    /// The handler name (`with H`) — resolved to a `HirEffectHandler`
+    /// at the post-SSA lowering pass.
+    pub handler_name: InternedString,
+    /// Block where the scope begins (push the handler here). This is
+    /// also the entry of the body's block subgraph.
+    pub entry: HirId,
+    /// Block the scope falls through to on normal exit.
+    pub after: HirId,
+    /// Every block belonging to the scope body (entry included). Used
+    /// to classify which terminator edges leave the scope.
+    pub body_blocks: Vec<HirId>,
+}
+
 /// Builder for creating CFG from TypedAST
 pub struct TypedCfgBuilder {
     /// Next block ID to allocate
@@ -26,6 +45,8 @@ pub struct TypedCfgBuilder {
     /// Stack of loop contexts for Break/Continue handling
     /// Each entry is (header_id, after_id) for the loop
     loop_stack: Vec<(HirId, HirId)>,
+    /// `with` scopes discovered during construction, in source order.
+    pub with_scopes: Vec<WithScopeInfo>,
 }
 
 /// Control flow graph with TypedAST statements (not yet converted to HIR)
@@ -92,6 +113,7 @@ impl TypedCfgBuilder {
         Self {
             next_block_id: 0,
             loop_stack: Vec::new(),
+            with_scopes: Vec::new(),
         }
     }
 
@@ -1098,6 +1120,12 @@ impl TypedCfgBuilder {
 
                     let (with_blocks, _, with_exit) =
                         self.split_at_control_flow(&with_stmt.body, with_entry_id, false)?;
+                    // Record the body's block ids (entry included) so the
+                    // post-SSA pass can classify scope-exiting edges.
+                    let mut body_block_ids: Vec<HirId> = with_blocks.iter().map(|b| b.id).collect();
+                    if !body_block_ids.contains(&with_entry_id) {
+                        body_block_ids.push(with_entry_id);
+                    }
                     all_blocks.extend(with_blocks);
 
                     if let Some(last_block) =
@@ -1106,6 +1134,17 @@ impl TypedCfgBuilder {
                         if matches!(last_block.terminator, TypedTerminator::Unreachable) {
                             last_block.terminator = TypedTerminator::Jump(after_with_id);
                         }
+                    }
+
+                    // Single handler today (`Vec` in the typed AST is for
+                    // forward-compat); record it for the push/pop pass.
+                    if let Some(handler) = with_stmt.handlers.first() {
+                        self.with_scopes.push(WithScopeInfo {
+                            handler_name: handler.name,
+                            entry: with_entry_id,
+                            after: after_with_id,
+                            body_blocks: body_block_ids,
+                        });
                     }
 
                     current_statements = Vec::new();

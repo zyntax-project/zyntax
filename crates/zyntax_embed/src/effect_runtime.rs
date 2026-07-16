@@ -203,6 +203,40 @@ pub extern "C" fn __zyntax_effect_lookup_handler(effect_id: u64) -> *mut u8 {
     })
 }
 
+/// Resolve a single effect operation to its handler function pointer.
+/// Walks the handler stack top-down for the innermost frame handling
+/// `effect_id`, then reads `op_table[op_index]` (the op-table is a
+/// fn-pointer array laid out like a vtable). Returns the raw function
+/// address, or null if no handler for this effect is in scope.
+///
+/// The perform-site codegen uses this to build the dynamic dispatch:
+///   `fn_ptr = select(lookup_op(...) != 0, lookup_op(...), static_fn)`
+/// so a `with H { }` in scope wins, and otherwise the compile-time
+/// static handler is used — no branch, one `call_indirect`.
+///
+/// # Safety
+/// The returned pointer is a code address into JIT-compiled memory
+/// held live by the runtime for the program's duration; the caller
+/// invokes it as the handler op's function type.
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_lookup_op(effect_id: u64, op_index: u64) -> *mut u8 {
+    HANDLER_STACK.with(|stack| {
+        let s = stack.borrow();
+        for frame in s.iter().rev() {
+            if frame.effect_id == effect_id {
+                if frame.op_table.is_null() {
+                    return core::ptr::null_mut();
+                }
+                // op_table is `*mut u8` to an array of pointer-sized
+                // function addresses; index by op position.
+                let slot = unsafe { (frame.op_table as *const *mut u8).add(op_index as usize) };
+                return unsafe { *slot };
+            }
+        }
+        core::ptr::null_mut()
+    })
+}
+
 /// Layout of the Resume<T> struct, as compiled code constructs it at
 /// each perform site (see
 /// `krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites`).
@@ -675,6 +709,18 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             flags: ZrtlSigFlags::NONE,
             return_type: ptr_tag(),
             params: params1(u64_tag()),
+        },
+    );
+
+    // lookup_op(effect_id: u64, op_index: u64) -> *u8 (fn ptr or null)
+    runtime.register_function_typed(
+        "__zyntax_effect_lookup_op",
+        __zyntax_effect_lookup_op as *const u8,
+        ZrtlSymbolSig {
+            param_count: 2,
+            flags: ZrtlSigFlags::NONE,
+            return_type: ptr_tag(),
+            params: params2(u64_tag(), u64_tag()),
         },
     );
 
