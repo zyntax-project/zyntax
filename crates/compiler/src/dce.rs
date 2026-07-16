@@ -133,6 +133,41 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
                             worklist.push(*function);
                         }
                     }
+                    HirInstruction::PerformEffect {
+                        effect_id, op_name, ..
+                    } => {
+                        // A `perform` reaches the op function of every
+                        // handler for this effect — the concrete one is
+                        // selected at runtime (statically for a single
+                        // handler, or via the handler stack under a
+                        // `with` block). Mark ALL candidate handler op
+                        // fns reachable so their bodies get compiled;
+                        // otherwise the direct/indirect call resolves to
+                        // an undefined symbol at JIT finalize.
+                        for handler in module.handlers.values() {
+                            if handler.effect_id != *effect_id {
+                                continue;
+                            }
+                            if !handler
+                                .implementations
+                                .iter()
+                                .any(|i| i.op_name == *op_name)
+                            {
+                                continue;
+                            }
+                            let mangled = crate::effect_codegen::mangle_handler_op_name(
+                                handler.name,
+                                *op_name,
+                            );
+                            for (fid, f) in &module.functions {
+                                if f.name.resolve_global().as_deref() == Some(mangled.as_str())
+                                    && !reachable.contains(fid)
+                                {
+                                    worklist.push(*fid);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
