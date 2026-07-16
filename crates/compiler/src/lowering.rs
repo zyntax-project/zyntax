@@ -2423,6 +2423,10 @@ impl LoweringContext {
 
         hir_func = ssa.function;
 
+        // Fiber drop-site insertion: free fibers created (and not
+        // moved out) in this function before it returns.
+        Self::emit_fiber_drops(&mut hir_func);
+
         // `with H { }` handler scoping: record the scopes now, emit
         // push/pop in a post-pass after ALL functions are lowered — a
         // `with H` needs H's op fns present in the module, which isn't
@@ -2463,6 +2467,70 @@ impl LoweringContext {
         self.module.add_function(hir_func);
 
         Ok(())
+    }
+
+    /// Insert `FiberDrop` before every `Return` for each fiber this
+    /// function creates and does NOT move out. Fibers are heap-backed
+    /// (a `Box<Fiber>` + an mmap'd stack); without a drop they leak.
+    ///
+    /// Conservative + safe for the first cut:
+    ///   * Only fibers created by a `FiberNew` in the ENTRY block are
+    ///     considered — those are created unconditionally and dominate
+    ///     every return, so dropping them at each return can't free an
+    ///     uninitialised handle.
+    ///   * A fiber that ESCAPES — appears in any `Return`'s values, or
+    ///     flows through any phi (so it may be returned on some path) —
+    ///     is never dropped here (it becomes the caller's obligation).
+    ///     That trades a possible leak on conditional-return paths for
+    ///     a guarantee of no double-free.
+    /// Fibers created in inner (conditional/loop) blocks are left to a
+    /// later, liveness-based drop pass; they leak for now. Runs before
+    /// `apply_krio_fiber_lowering`, which rewrites `FiberDrop` into a
+    /// `krio_fiber_free` call.
+    fn emit_fiber_drops(func: &mut crate::hir::HirFunction) {
+        use crate::hir::{HirInstruction, HirTerminator};
+
+        let entry = func.entry_block;
+        let mut fiber_vals: Vec<HirId> = Vec::new();
+        if let Some(eb) = func.blocks.get(&entry) {
+            for inst in &eb.instructions {
+                if let HirInstruction::FiberNew { result, .. } = inst {
+                    fiber_vals.push(*result);
+                }
+            }
+        }
+        if fiber_vals.is_empty() {
+            return;
+        }
+
+        // Escape set: any value returned, or fed into a phi.
+        let mut escapes: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+        for block in func.blocks.values() {
+            if let HirTerminator::Return { values } = &block.terminator {
+                escapes.extend(values.iter().copied());
+            }
+            for phi in &block.phis {
+                for (val, _blk) in &phi.incoming {
+                    escapes.insert(*val);
+                }
+            }
+        }
+
+        let droppable: Vec<HirId> = fiber_vals
+            .into_iter()
+            .filter(|v| !escapes.contains(v))
+            .collect();
+        if droppable.is_empty() {
+            return;
+        }
+
+        for block in func.blocks.values_mut() {
+            if matches!(block.terminator, HirTerminator::Return { .. }) {
+                for &fiber in &droppable {
+                    block.instructions.push(HirInstruction::FiberDrop { fiber });
+                }
+            }
+        }
     }
 
     /// Build (or reuse) the effect op-table global for `handler_name`.

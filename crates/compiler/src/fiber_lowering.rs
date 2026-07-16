@@ -137,6 +137,15 @@ fn rewrite(inst: &HirInstruction) -> Option<HirInstruction> {
             is_tail: false,
         }),
 
+        HirInstruction::FiberDrop { fiber } => Some(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Symbol("krio_fiber_free".to_string()),
+            args: vec![*fiber],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        }),
+
         _ => None,
     }
 }

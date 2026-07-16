@@ -860,6 +860,13 @@ pub enum HirInstruction {
     /// the fiber is responsible for checking and exiting cleanly.
     /// No-op if the fiber is already `Done` or `Errored`.
     FiberCancel { fiber: HirId },
+
+    /// Free a fiber's backing storage (its `Box<Fiber>` + mmap'd
+    /// stack + guard page) and clear any per-fiber runtime state
+    /// keyed by its handle. Emitted at the scope exit of a
+    /// `Type::Fiber` binding that is not moved out. Lowered to
+    /// `krio_fiber_free`.
+    FiberDrop { fiber: HirId },
 }
 
 /// Block terminator instructions
@@ -1132,6 +1139,9 @@ impl HirInstruction {
             HirInstruction::FiberCancel { fiber } => {
                 replace(fiber, replacements);
             }
+            HirInstruction::FiberDrop { fiber } => {
+                replace(fiber, replacements);
+            }
         }
     }
 
@@ -1339,6 +1349,9 @@ impl HirInstruction {
                 ops.push(*value);
             }
             HirInstruction::FiberCancel { fiber } => {
+                ops.push(*fiber);
+            }
+            HirInstruction::FiberDrop { fiber } => {
                 ops.push(*fiber);
             }
         }

@@ -1905,6 +1905,19 @@ pub unsafe extern "C" fn krio_fiber_cancel(fiber: *mut FiberRepr) {
     fiber_backend().fiber_cancel(fiber)
 }
 
+/// `krio_fiber_free` — release a fiber's backing storage (box +
+/// mmap'd stack + guard page) and clear its per-fiber runtime state.
+/// Emitted at the scope exit of a fiber that isn't moved out. The
+/// handle is dangling afterwards.
+///
+/// # Safety
+/// `fiber` must be a valid handle returned by `krio_fiber_new` that
+/// hasn't already been freed; it must not be used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_free(fiber: *mut FiberRepr) {
+    fiber_backend().fiber_free(fiber)
+}
+
 /// `krio_fiber_abort_with` — Wren-style abort from inside the
 /// fiber body. Stashes `(variant, payload)` and yields; the
 /// caller's next `krio_fiber_resume` returns a step with
@@ -1958,6 +1971,7 @@ pub fn fiber_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("krio_fiber_yield", krio_fiber_yield as *const u8, 1),
         ("krio_fiber_transfer", krio_fiber_transfer as *const u8, 2),
         ("krio_fiber_cancel", krio_fiber_cancel as *const u8, 1),
+        ("krio_fiber_free", krio_fiber_free as *const u8, 1),
         (
             "krio_fiber_abort_with",
             krio_fiber_abort_with as *const u8,

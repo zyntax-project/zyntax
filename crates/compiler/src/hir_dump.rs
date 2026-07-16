@@ -1056,6 +1056,10 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
             let f = mapper.value(fiber);
             format!("fiber.cancel {}", f)
         }
+        HirInstruction::FiberDrop { fiber } => {
+            let f = mapper.value(fiber);
+            format!("fiber.drop {}", f)
+        }
     }
 }
 

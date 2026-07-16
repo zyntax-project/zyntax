@@ -1334,6 +1334,17 @@ pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolI
                 params: params1(ptr_tag()),
             },
         ),
+        // krio_fiber_free(fiber: ptr) -> void
+        (
+            "krio_fiber_free",
+            zyntax_compiler::zrtl::krio_fiber_free as *const u8,
+            ZrtlSymbolSig {
+                param_count: 1,
+                flags: no_flags,
+                return_type: void_tag(),
+                params: params1(ptr_tag()),
+            },
+        ),
         // krio_fiber_abort_with(variant: i64, payload: i64) -> void
         (
             "krio_fiber_abort_with",

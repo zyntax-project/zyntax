@@ -93,6 +93,17 @@ pub trait FiberCfg: Send + Sync {
     /// `fiber` must be a valid handle.
     unsafe fn fiber_cancel(&self, fiber: *mut FiberRepr);
 
+    /// Free the fiber's backing storage (its box, mmap'd stack, guard
+    /// page) and clear any per-fiber runtime state keyed by the
+    /// handle. Called at the scope exit of a fiber that isn't moved
+    /// out. After this the handle is dangling — the caller must not
+    /// use it again. Default is a no-op (backends that leak).
+    ///
+    /// # Safety
+    /// `fiber` must be a valid handle returned by `fiber_new` that
+    /// hasn't already been freed.
+    unsafe fn fiber_free(&self, _fiber: *mut FiberRepr) {}
+
     /// Abort the currently-running fiber with an error payload.
     /// Wren-style: called from inside the fiber body (no handle
     /// argument — the backend looks up the active fiber via its

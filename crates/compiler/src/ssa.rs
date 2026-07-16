@@ -12167,7 +12167,9 @@ impl HirInstruction {
             | HirInstruction::FiberResume { result, .. }
             | HirInstruction::FiberResumeWith { result, .. }
             | HirInstruction::FiberTransfer { result, .. } => Some(*result),
-            HirInstruction::FiberYield { .. } | HirInstruction::FiberCancel { .. } => None,
+            HirInstruction::FiberYield { .. }
+            | HirInstruction::FiberCancel { .. }
+            | HirInstruction::FiberDrop { .. } => None,
         }
     }
 }

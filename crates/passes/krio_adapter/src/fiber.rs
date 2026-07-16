@@ -15,11 +15,13 @@
 //! Returned `*mut FiberRepr` handles are `Box<krio_fiber::Fiber>`
 //! pointers cast through `*mut FiberRepr`. The contract requires every
 //! handle stays on the thread that created it (matches krio-fiber's
-//! `!Send` `Fiber`), and the caller owns the lifetime: a future
-//! `krio_fiber_free` will be the symmetric `Box::from_raw` drop. For
-//! the scaffold, fibers leak on completion — fine for tests and
-//! short-lived bench shapes, will move to explicit drop when the
-//! frontend wires lifetime tracking.
+//! `!Send` `Fiber`), and the caller owns the lifetime. `fiber_free`
+//! is the symmetric `Box::from_raw` drop (unmaps the stack + guard
+//! page + clears the per-fiber error slot); the frontend emits it at
+//! the scope exit of a fiber that isn't moved out. Fibers created in
+//! conditional/inner scopes, or received via a call return, aren't
+//! dropped yet (a later liveness-based pass) — they leak but never
+//! double-free.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -209,6 +211,22 @@ impl FiberCfg for KrioFiberBackend {
     unsafe fn fiber_cancel(&self, fiber: *mut FiberRepr) {
         let fiber = &*(fiber as *const Fiber);
         fiber.cancel();
+    }
+
+    unsafe fn fiber_free(&self, fiber: *mut FiberRepr) {
+        if fiber.is_null() {
+            return;
+        }
+        // Clear any per-fiber error latched under this handle before
+        // the address is reclaimed — otherwise a future fiber reusing
+        // the same address could inherit a stale error.
+        let key = fiber as usize;
+        ERROR_MAP.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+        // Reclaim ownership handed out by `fiber_new`'s `Box::into_raw`.
+        // Dropping the box unmaps the fiber's stack + guard page.
+        drop(Box::from_raw(fiber as *mut Fiber));
     }
 
     fn fiber_abort_with(&self, variant: i64, payload: i64) {
