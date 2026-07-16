@@ -154,10 +154,18 @@ panicking on the default build. Turns silent miscompiles into diagnostics.
 
 ---
 
-## Phase 2 — Deterministic fiber lifecycle (drop)
+## Phase 2 — Deterministic fiber lifecycle (drop) — ✅ SHIPPED (8fdf32f)
 
 **Size:** medium. **Unblocks:** 6+ programs (socket-holding fiber, async-owns-fiber
 early return, all cancellation stories). **Depends on:** 0.4. **Prereq for:** 6.
+
+**Shipped scope:** 2.1/2.2/2.4 as specified. 2.3 landed as a conservative
+`emit_fiber_drops` pass (lowering.rs) rather than a ScopeExitEmitter integration:
+drops only entry-block `FiberNew` results (they dominate all returns, so the
+handle is always initialised) and skips any fiber that escapes via a `Return`
+value or a phi. Guarantees no double-free; leaves inner/conditional and
+call-received fibers leaking until a later liveness-based pass. `break`/abort/
+exceptional edges and the move-tracking ownership rule are the follow-up.
 
 ### 2.1 FiberDrop HIR op
 - `crates/compiler/src/hir.rs`: `HirInstruction::FiberDrop { fiber: HirId }`.
