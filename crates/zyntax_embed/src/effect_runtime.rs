@@ -259,6 +259,62 @@ pub extern "C" fn __zyntax_effect_lookup_state(effect_id: u64) -> *mut u8 {
     })
 }
 
+thread_local! {
+    /// Per-fiber saved handler-stack segments. A fiber shares the one
+    /// thread-local `HANDLER_STACK` with its caller (same OS thread), so
+    /// any handler it pushes and doesn't pop before yielding would leak
+    /// into the caller's view — and truncating the shared stack after a
+    /// resume would strand the fiber's own open handlers before it pops
+    /// them on the next resume. Instead, each fiber's frames above the
+    /// caller's baseline are lifted out on yield/return and re-pushed on
+    /// the next resume, giving every fiber its own handler-stack segment
+    /// layered on top of whatever was active when it was resumed. Keyed
+    /// by fiber pointer (as `usize`).
+    static HANDLER_SEGMENTS: RefCell<std::collections::HashMap<usize, Vec<HandlerFrame>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Enter a fiber's handler context just before resuming it. Records the
+/// current stack depth as the fiber's baseline, then re-pushes any frames
+/// the fiber had open when it last yielded (empty on the first resume).
+/// Returns the baseline so the matching `leave` can restore it.
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_fiber_enter(fiber: *mut u8) -> i64 {
+    let baseline = HANDLER_STACK.with(|stack| stack.borrow().len());
+    let saved = HANDLER_SEGMENTS.with(|segs| segs.borrow_mut().remove(&(fiber as usize)));
+    if let Some(frames) = saved {
+        HANDLER_STACK.with(|stack| stack.borrow_mut().extend(frames));
+    }
+    baseline as i64
+}
+
+/// Leave a fiber's handler context just after a resume returns. Lifts the
+/// frames the fiber left open (everything above `baseline`) back into its
+/// saved segment and truncates the shared stack to `baseline`, so the
+/// caller sees exactly the stack it had before the resume.
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_fiber_leave(fiber: *mut u8, baseline: i64) {
+    let base = baseline.max(0) as usize;
+    HANDLER_STACK.with(|stack| {
+        let mut s = stack.borrow_mut();
+        if s.len() > base {
+            let frames: Vec<HandlerFrame> = s.split_off(base);
+            HANDLER_SEGMENTS.with(|segs| {
+                segs.borrow_mut().insert(fiber as usize, frames);
+            });
+        }
+    });
+}
+
+/// Drop a fiber's saved handler segment. Called when the fiber is freed so
+/// a later fiber that reuses the same address can't inherit stale frames.
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_fiber_forget(fiber: *mut u8) {
+    HANDLER_SEGMENTS.with(|segs| {
+        segs.borrow_mut().remove(&(fiber as usize));
+    });
+}
+
 /// Layout of the Resume<T> struct, as compiled code constructs it at
 /// each perform site (see
 /// `krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites`).
@@ -755,6 +811,42 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             flags: ZrtlSigFlags::NONE,
             return_type: ptr_tag(),
             params: params1(u64_tag()),
+        },
+    );
+
+    // fiber_enter(fiber: *u8) -> i64 baseline (re-push fiber's saved frames)
+    runtime.register_function_typed(
+        "__zyntax_effect_fiber_enter",
+        __zyntax_effect_fiber_enter as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: i64_tag(),
+            params: params1(ptr_tag()),
+        },
+    );
+
+    // fiber_leave(fiber: *u8, baseline: i64) (lift fiber's frames out)
+    runtime.register_function_typed(
+        "__zyntax_effect_fiber_leave",
+        __zyntax_effect_fiber_leave as *const u8,
+        ZrtlSymbolSig {
+            param_count: 2,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: void_tag(),
+            params: params2(ptr_tag(), i64_tag()),
+        },
+    );
+
+    // fiber_forget(fiber: *u8) (drop saved segment on free)
+    runtime.register_function_typed(
+        "__zyntax_effect_fiber_forget",
+        __zyntax_effect_fiber_forget as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: void_tag(),
+            params: params1(ptr_tag()),
         },
     );
 

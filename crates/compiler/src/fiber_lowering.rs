@@ -35,26 +35,91 @@
 //! now produced by the `Call::Symbol` invocation instead. No use-list
 //! fixup needed because the result id is reused verbatim.
 
-use crate::hir::{HirCallable, HirInstruction, HirModule};
+use crate::hir::{HirCallable, HirId, HirInstruction, HirModule, HirType, HirValue, HirValueKind};
 
 /// Rewrite every fiber op in the module into its `Call::Symbol`
 /// equivalent. Idempotent: running the pass twice is a no-op
 /// (subsequent runs see only `Call` instructions and skip).
 ///
+/// Most ops map 1:1. `FiberResume`/`FiberResumeWith` expand to three
+/// calls — the resume is bracketed by `__zyntax_effect_fiber_enter` /
+/// `__zyntax_effect_fiber_leave` so the fiber gets its own handler-stack
+/// segment across the stack switch (a `perform` inside the fiber sees the
+/// handlers active when it was resumed, and its own open handlers don't
+/// leak into the caller). `FiberDrop` gains a `__zyntax_effect_fiber_forget`
+/// so the freed fiber's saved segment is dropped.
+///
 /// Call this immediately before backend compilation, after any
-/// frontend-side fiber-shape transforms have run. Today there are no
-/// frontends emitting fiber ops, so this pass is a no-op on every
-/// in-tree module — wiring it in early avoids a "where does this
-/// pass go" question when the first frontend lands.
+/// frontend-side fiber-shape transforms have run.
 pub fn apply_krio_fiber_lowering(module: &mut HirModule) {
     for func in module.functions.values_mut() {
+        let mut minted: Vec<HirId> = Vec::new();
         for block in func.blocks.values_mut() {
-            for inst in &mut block.instructions {
-                if let Some(replacement) = rewrite(inst) {
-                    *inst = replacement;
+            let mut out = Vec::with_capacity(block.instructions.len());
+            for inst in std::mem::take(&mut block.instructions) {
+                match &inst {
+                    // Bracket the resume with enter/leave. `enter` returns
+                    // the caller's stack depth (baseline) and re-pushes the
+                    // fiber's saved frames; `leave` lifts the fiber's open
+                    // frames back out and truncates to baseline.
+                    HirInstruction::FiberResume { fiber, .. }
+                    | HirInstruction::FiberResumeWith { fiber, .. } => {
+                        let fiber = *fiber;
+                        let baseline = HirId::new();
+                        minted.push(baseline);
+                        out.push(sym_call(
+                            "__zyntax_effect_fiber_enter",
+                            Some(baseline),
+                            vec![fiber],
+                        ));
+                        out.push(rewrite(&inst).expect("resume rewrites to a krio_fiber_* call"));
+                        out.push(sym_call(
+                            "__zyntax_effect_fiber_leave",
+                            None,
+                            vec![fiber, baseline],
+                        ));
+                    }
+                    // Forget the fiber's saved segment before freeing it, so
+                    // an address-reused fiber can't inherit stale frames.
+                    HirInstruction::FiberDrop { fiber } => {
+                        out.push(sym_call("__zyntax_effect_fiber_forget", None, vec![*fiber]));
+                        out.push(rewrite(&inst).expect("FiberDrop rewrites to krio_fiber_free"));
+                    }
+                    _ => match rewrite(&inst) {
+                        Some(replacement) => out.push(replacement),
+                        None => out.push(inst),
+                    },
                 }
             }
+            block.instructions = out;
         }
+        // Register the minted baseline values (i64 results of `fiber_enter`)
+        // so downstream sees a typed SSA value for each.
+        for id in minted {
+            func.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: HirType::I64,
+                    kind: HirValueKind::Instruction,
+                    uses: std::collections::HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+    }
+}
+
+/// Build a `Call::Symbol` instruction (the runtime-extern call shape used
+/// throughout this pass).
+fn sym_call(name: &str, result: Option<HirId>, args: Vec<HirId>) -> HirInstruction {
+    HirInstruction::Call {
+        result,
+        callee: HirCallable::Symbol(name.to_string()),
+        args,
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
     }
 }
 
