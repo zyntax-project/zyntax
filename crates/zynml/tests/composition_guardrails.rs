@@ -101,3 +101,34 @@ fn resumable_effect_in_plain_function_still_compiles() {
         "non-fiber resumable effect must still compile"
     );
 }
+
+/// The `@with(H)` annotation is removed — it never applied handler
+/// scoping (silent no-op). It now fails to compile with a message
+/// pointing at the `with H { }` block statement that replaces it.
+#[test]
+fn at_with_annotation_is_rejected() {
+    let src = r#"
+        effect E {
+            def op(): i64
+        }
+
+        handler H for E {
+            def op(): i64 { return 5 }
+        }
+
+        @effect(E)
+        @with(H)
+        def run(): i64 {
+            return op()
+        }
+
+        def main(): i64 {
+            return run()
+        }
+    "#;
+    let err = compile_error(src).expect("@with should be a hard compile error");
+    assert!(
+        err.contains("@with") && err.contains("with H"),
+        "error should name @with and point to the with-block; got: {err}"
+    );
+}

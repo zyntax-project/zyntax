@@ -2221,6 +2221,26 @@ impl LoweringContext {
 
     /// Lower a function
     fn lower_function(&mut self, func: &TypedFunction) -> CompilerResult<()> {
+        // The `@with(H)` annotation is removed. It never lowered — a
+        // function tagged `@with` silently ran with NO handler scoping,
+        // a quiet miscompilation. `with H { }` block statements replace
+        // it (real regional handler dispatch). Reject `@with` loudly so
+        // the silent no-op can't recur. (`func.with_handlers` is
+        // populated from the annotation by the effect-extraction pass.)
+        let has_with_annotation = func
+            .annotations
+            .iter()
+            .any(|a| a.name.resolve_global().as_deref() == Some("with"))
+            || !func.with_handlers.is_empty();
+        if has_with_annotation {
+            return Err(crate::CompilerError::Lowering(format!(
+                "`@with(...)` on `{}` is no longer supported (it never applied handler \
+                 scoping — silently a no-op). Use a `with H {{ ... }}` block statement \
+                 around the code that performs the effect instead.",
+                func.name.resolve_global().unwrap_or_default()
+            )));
+        }
+
         // Convert function signature
         let signature = self.convert_function_signature(func)?;
 
