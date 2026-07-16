@@ -249,10 +249,25 @@ statefulness.
 
 ---
 
-## Phase 4 — Handler stack survives fiber stack switch
+## Phase 4 — Handler stack survives fiber stack switch — ✅ SHIPPED (feaa281)
 
 **Size:** small. **Unblocks:** 3+ programs (perform inside fiber body sees outer
 handler; sensor pipeline; parser-combinator). **Depends on:** 1.
+
+**Shipped scope:** The primary goal (a perform inside a fiber resolves against
+the handlers active at resume) already held via the same-thread thread-local
+stack. But the plan's literal "snapshot len, truncate after resume" is
+UNSOUND — it strands a fiber's own open handlers before it pops them on the
+next resume, regressing multi-yield fibers. Shipped the correct version: a
+per-fiber handler-stack SEGMENT. `FiberResume`/`FiberResumeWith` lower to a
+triple bracketed by `__zyntax_effect_fiber_enter` (re-push the fiber's saved
+frames, return the caller's baseline depth) and `__zyntax_effect_fiber_leave`
+(lift frames above baseline into the fiber's segment, truncate to baseline);
+`FiberDrop` emits `__zyntax_effect_fiber_forget`. Each fiber thus owns a
+segment layered on the caller's baseline: no leak into the caller, no
+stranding across yields, and interleaved fibers keep their own handlers. The
+non-resumable-in-fiber case was never rejected (the guardrail is
+resumable-only), so nothing to relax; resumable-in-fiber stays deferred.
 
 ### 4.1 Snapshot/restore around resume
 - `crates/passes/krio_adapter/src/fiber.rs`: in `KrioFiberBackend::fiber_resume`
