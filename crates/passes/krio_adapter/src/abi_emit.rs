@@ -1384,6 +1384,7 @@ pub fn lower_perform_effect_calls(
 pub fn upgrade_resume_struct_at_perform_sites(
     function: &mut HirFunction,
     handler_resolution: &std::collections::HashMap<(HirId, InternedString), HirId>,
+    op_index_resolution: &std::collections::HashMap<(HirId, InternedString), u64>,
     poll_fn_id: HirId,
     frame_ptr: HirId,
     resume_scratch_slot: u32,
@@ -1397,6 +1398,8 @@ pub fn upgrade_resume_struct_at_perform_sites(
         inst_idx: usize,
         perform_result_temp: HirId,
         handler_fn_id: HirId,
+        effect_id: HirId,
+        op_index: u64,
         args: Vec<HirId>,
         return_ty: HirType,
     }
@@ -1422,6 +1425,11 @@ pub fn upgrade_resume_struct_at_perform_sites(
                         inst_idx: i,
                         perform_result_temp: *perform_result_temp,
                         handler_fn_id,
+                        effect_id: *effect_id,
+                        op_index: op_index_resolution
+                            .get(&(*effect_id, *op_name))
+                            .copied()
+                            .unwrap_or(0),
                         args: args.clone(),
                         return_ty: return_ty.clone(),
                     });
@@ -1619,16 +1627,86 @@ pub fn upgrade_resume_struct_at_perform_sites(
             volatile: false,
         });
 
-        // Direct Call to the handler: result = handler_fn(args..., r_ptr).
+        // Regional dispatch (mirrors the non-resumable Cranelift path).
+        // The statically-resolved `handler_fn_id` is the fallback; a
+        // `with H { }` in scope overrides it by pushing H's op-table
+        // onto the handler stack. Resolve the op fn pointer:
+        //   dyn      = __zyntax_effect_lookup_op(effect_id, op_index)
+        //   static   = &handler_fn_id  (CreateClosure with no captures
+        //              lowers to a raw function address)
+        //   fn_ptr   = select(dyn != 0, dyn, static)
+        //   result   = indirect_call fn_ptr(args..., r_ptr)
+        // When no `with` is in scope `dyn` is null and the static
+        // handler runs — unchanged from the previous direct call.
         let mut handler_args = site.args.clone();
         handler_args.push(r_ptr_id);
+
+        let fn_ptr_ty = HirType::Function(Box::new(HirFunctionType {
+            params: vec![HirType::I64],
+            returns: vec![HirType::I64],
+            lifetime_params: vec![],
+            is_variadic: false,
+        }));
+        let static_addr = mint_value(
+            &mut function.values,
+            HirType::I64,
+            HirValueKind::Instruction,
+        );
+        new_insts.push(HirInstruction::CreateClosure {
+            result: static_addr,
+            closure_ty: fn_ptr_ty,
+            function: site.handler_fn_id,
+            captures: vec![],
+        });
+
+        let effect_const = mint_const_i64(&mut function.values, site.effect_id.as_u32() as i64);
+        let op_index_const = mint_const_i64(&mut function.values, site.op_index as i64);
+        let dyn_fn = mint_value(
+            &mut function.values,
+            HirType::I64,
+            HirValueKind::Instruction,
+        );
         new_insts.push(HirInstruction::Call {
-            result: Some(site.perform_result_temp),
-            callee: HirCallable::Function(site.handler_fn_id),
-            args: handler_args,
+            result: Some(dyn_fn),
+            callee: HirCallable::Symbol("__zyntax_effect_lookup_op".to_string()),
+            args: vec![effect_const, op_index_const],
             type_args: vec![],
             const_args: vec![],
             is_tail: false,
+        });
+
+        let zero = mint_const_i64(&mut function.values, 0);
+        let cond = mint_value(
+            &mut function.values,
+            HirType::Bool,
+            HirValueKind::Instruction,
+        );
+        new_insts.push(HirInstruction::Binary {
+            result: cond,
+            op: BinaryOp::Ne,
+            ty: HirType::I64,
+            left: dyn_fn,
+            right: zero,
+        });
+
+        let fn_ptr = mint_value(
+            &mut function.values,
+            HirType::I64,
+            HirValueKind::Instruction,
+        );
+        new_insts.push(HirInstruction::Select {
+            result: fn_ptr,
+            ty: HirType::I64,
+            condition: cond,
+            true_val: dyn_fn,
+            false_val: static_addr,
+        });
+
+        new_insts.push(HirInstruction::IndirectCall {
+            result: Some(site.perform_result_temp),
+            func_ptr: fn_ptr,
+            args: handler_args,
+            return_ty: site.return_ty.clone(),
         });
 
         // Phase I.2 refinement: for resumable perform sites the

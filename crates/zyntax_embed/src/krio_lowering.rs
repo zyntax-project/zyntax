@@ -114,6 +114,19 @@ pub fn apply_krio_effect_lowering(
         }
     }
 
+    // Op-index resolution: `(effect_id, op_name) → position of the op
+    // in the effect's operation list`. Must match the op-table
+    // ordering built in `LoweringContext::build_op_table` so
+    // `with H { }` regional dispatch resolves to the right slot. Keyed
+    // by effect_id so it's independent of which handler is active.
+    let mut op_index_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), u64> =
+        HashMap::new();
+    for effect in module.effects.values() {
+        for (idx, op) in effect.operations.iter().enumerate() {
+            op_index_resolution.insert((effect.id, op.name), idx as u64);
+        }
+    }
+
     for fn_id in resumable_fn_ids {
         let mut function = match module.functions.swap_remove(&fn_id) {
             Some(f) => f,
@@ -157,6 +170,7 @@ pub fn apply_krio_effect_lowering(
         krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites(
             &mut function,
             &handler_resolution,
+            &op_index_resolution,
             new_poll_id,
             post_reshape_frame_ptr,
             lower_result.resume_scratch_slot,
