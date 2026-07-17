@@ -217,3 +217,92 @@ fn timeout_frees_a_fiber_owning_tasks_fiber() {
     );
     assert!(!has_pending_timers(), "timed-out task's timer deregistered");
 }
+
+/// A `with H { await ...; perform }` in an async task: the handler H,
+/// pushed before the await, must still be active for the perform after
+/// the await. The per-task handler segment saves H while the task is
+/// parked and restores it on the next drive. Handler stack returns to
+/// baseline; no segment lingers.
+#[test]
+fn with_block_spans_await_in_async() {
+    use zyntax_embed::host_futures::{handler_stack_depth, task_handler_segment_count};
+
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    compile(
+        &mut rt,
+        r#"
+        effect Log { def emit(): i64 }
+        handler H for Log { def emit(): i64 { return 7 } }
+
+        @effect(Log)
+        async def main(): i64 {
+            let mut r: i64 = 0
+            with H {
+                await sleep(20)
+                r = emit()
+            }
+            return r
+        }
+        "#,
+    );
+
+    let p = rt.call_async("main", &[]).expect("call");
+    let v = p.await_raw().expect("resolve");
+    assert_eq!(v.as_i64(), Some(7), "emit() under H after the await = 7");
+    assert_eq!(handler_stack_depth(), 0, "handler stack back to baseline");
+    assert_eq!(task_handler_segment_count(), 0, "no leftover segment");
+}
+
+/// Two interleaved async tasks each open a DIFFERENT handler across an
+/// await. With per-task handler segments each task's perform resolves to
+/// its own handler; a shared stack would cross-contaminate (one task's
+/// open handler visible to the other while both are parked).
+#[test]
+fn interleaved_with_blocks_stay_isolated() {
+    use zyntax_embed::host_futures::handler_stack_depth;
+
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    compile(
+        &mut rt,
+        r#"
+        effect Log { def emit(): i64 }
+        handler H1 for Log { def emit(): i64 { return 1 } }
+        handler H2 for Log { def emit(): i64 { return 2 } }
+
+        @effect(Log)
+        async def task_a(): i64 {
+            let mut r: i64 = 0
+            with H1 {
+                await sleep(30)
+                r = emit()
+            }
+            return r
+        }
+        @effect(Log)
+        async def task_b(): i64 {
+            let mut r: i64 = 0
+            with H2 {
+                await sleep(30)
+                r = emit()
+            }
+            return r
+        }
+        "#,
+    );
+
+    let a = rt.call_async("task_a", &[]).expect("call a");
+    let b = rt.call_async("task_b", &[]).expect("call b");
+    let results = drive_tasks(&[a, b]);
+
+    assert_eq!(
+        results[0].as_ref().ok().and_then(ZyntaxValue::as_i64),
+        Some(1),
+        "task_a's perform resolves to its own H1, not H2"
+    );
+    assert_eq!(
+        results[1].as_ref().ok().and_then(ZyntaxValue::as_i64),
+        Some(2),
+        "task_b's perform resolves to its own H2, not H1"
+    );
+    assert_eq!(handler_stack_depth(), 0, "handler stack back to baseline");
+}

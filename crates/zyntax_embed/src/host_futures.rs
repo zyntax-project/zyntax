@@ -219,6 +219,18 @@ pub fn task_fiber_count(task_id: i64) -> usize {
     krio_adapter::fiber::task_fiber_count(task_id)
 }
 
+/// Current handler-stack depth (diagnostics/tests) — back to baseline (0
+/// at top level) between task drives.
+pub fn handler_stack_depth() -> usize {
+    crate::effect_runtime::handler_stack_depth()
+}
+
+/// Number of tasks holding a saved handler segment (diagnostics/tests) —
+/// 0 once every task's `with`-block frames were popped or forgotten.
+pub fn task_handler_segment_count() -> usize {
+    crate::effect_runtime::task_handler_segment_count()
+}
+
 /// Drive the nearest pending timer: sleep until its deadline, then resolve
 /// its future (advancing the parked SM one step). Returns the resolve
 /// outcome, or `None` if no timers are pending.
@@ -272,7 +284,13 @@ pub fn drive_next_timer_with_task() -> Option<(i64, ResolveOutcome)> {
     if deadline > now {
         std::thread::sleep(deadline - now);
     }
-    Some((task_id, resolve_future(handle, 0)))
+    // Bracket the SM drive with the task's handler-stack segment so a
+    // `with`-block it opened across the suspend is re-pushed for this step
+    // and lifted back out afterwards (isolated from other tasks).
+    let baseline = crate::effect_runtime::task_handler_enter(task_id);
+    let outcome = resolve_future(handle, 0);
+    crate::effect_runtime::task_handler_leave(task_id, baseline);
+    Some((task_id, outcome))
 }
 
 /// Drop every parked future and pending timer belonging to `task_id`.
@@ -295,6 +313,9 @@ pub fn deregister_task(task_id: i64) {
     // Free any fibers the cancelled task created but never dropped (it
     // won't reach its normal scope-exit `FiberDrop`s).
     krio_adapter::fiber::free_task_fibers(task_id);
+    // Drop its open handler-stack segment (the `pop_handler`s it never
+    // reached) so a `with`-block it left open doesn't linger.
+    crate::effect_runtime::task_handler_forget(task_id);
 }
 
 /// Signature for the top-level task completion callback. Receives

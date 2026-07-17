@@ -315,6 +315,71 @@ pub extern "C" fn __zyntax_effect_fiber_forget(fiber: *mut u8) {
     });
 }
 
+thread_local! {
+    /// Per-async-task saved handler-stack segments — the async analogue of
+    /// `HANDLER_SEGMENTS` (per fiber). Cooperative tasks share the one
+    /// thread-local `HANDLER_STACK`, so a task that opens a `with H { }`
+    /// spanning an `await` would leave `H` on the stack while parked,
+    /// visible to any other task the executor drives next. The cooperative
+    /// executor brackets every task drive with `task_handler_enter` /
+    /// `task_handler_leave`, giving each task its own segment layered on the
+    /// executor's baseline: a parked task's open handlers live in its
+    /// segment, not on the shared stack. Keyed by task id.
+    static TASK_HANDLER_SEGMENTS: RefCell<std::collections::HashMap<i64, Vec<HandlerFrame>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Enter a task's handler context just before driving it: record the
+/// current stack depth as the baseline and re-push any frames the task had
+/// open when it last parked (empty on the first drive). Returns the
+/// baseline for the matching `task_handler_leave`.
+pub fn task_handler_enter(task_id: i64) -> usize {
+    let baseline = HANDLER_STACK.with(|stack| stack.borrow().len());
+    let saved = TASK_HANDLER_SEGMENTS.with(|segs| segs.borrow_mut().remove(&task_id));
+    if let Some(frames) = saved {
+        HANDLER_STACK.with(|stack| stack.borrow_mut().extend(frames));
+    }
+    baseline
+}
+
+/// Leave a task's handler context just after a drive returns: lift the
+/// frames it left open (everything above `baseline`) into its saved
+/// segment and truncate the shared stack to `baseline`, so the next task
+/// the executor drives can't see this one's open handlers.
+pub fn task_handler_leave(task_id: i64, baseline: usize) {
+    HANDLER_STACK.with(|stack| {
+        let mut s = stack.borrow_mut();
+        if s.len() > baseline {
+            let frames: Vec<HandlerFrame> = s.split_off(baseline);
+            TASK_HANDLER_SEGMENTS.with(|segs| {
+                segs.borrow_mut().insert(task_id, frames);
+            });
+        }
+    });
+}
+
+/// Drop a task's saved handler segment. Called when the task completes or
+/// is cancelled — a cancelled task's open `with`-block frames are freed
+/// (the `pop_handler` it never reached) rather than lingering.
+pub fn task_handler_forget(task_id: i64) {
+    TASK_HANDLER_SEGMENTS.with(|segs| {
+        segs.borrow_mut().remove(&task_id);
+    });
+}
+
+/// Current depth of the shared handler stack (diagnostics/tests). Should
+/// return to its baseline (0 at top level) between task drives.
+pub fn handler_stack_depth() -> usize {
+    HANDLER_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Whether any task has a saved handler segment (diagnostics/tests). 0 in
+/// the borrowed count means every task's `with`-block frames were popped
+/// on completion or forgotten on cancel.
+pub fn task_handler_segment_count() -> usize {
+    TASK_HANDLER_SEGMENTS.with(|segs| segs.borrow().len())
+}
+
 /// Layout of the Resume<T> struct, as compiled code constructs it at
 /// each perform site (see
 /// `krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites`).

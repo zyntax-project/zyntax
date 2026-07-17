@@ -4633,11 +4633,20 @@ pub(crate) fn drive_until(
         ResolveOutcome,
     };
 
+    // Drive one task's poll, stamped with its id and bracketed by its
+    // handler-stack segment (so a `with`-block it opens across an await
+    // stays isolated from other tasks).
+    let poll_task = |i: usize, p: &ZyntaxPromise| {
+        set_current_task_id(i as i64);
+        let baseline = crate::effect_runtime::task_handler_enter(i as i64);
+        let _ = p.poll();
+        crate::effect_runtime::task_handler_leave(i as i64, baseline);
+    };
+
     // Initial drive: poll each task once (parks its first `await` timer,
     // stamped with its index, or completes synchronously).
     for (i, p) in promises.iter().enumerate() {
-        set_current_task_id(i as i64);
-        let _ = p.poll();
+        poll_task(i, p);
     }
 
     loop {
@@ -4688,8 +4697,7 @@ pub(crate) fn drive_until(
                 // it (matching the pre-cooperative spin behaviour).
                 for (i, p) in promises.iter().enumerate() {
                     if p.is_pending() {
-                        set_current_task_id(i as i64);
-                        let _ = p.poll();
+                        poll_task(i, p);
                     }
                 }
                 std::thread::yield_now();
