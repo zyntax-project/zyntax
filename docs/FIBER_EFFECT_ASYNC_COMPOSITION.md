@@ -311,9 +311,18 @@ via two fixes independent of the `@cooperative` mechanism below:
   latches the synchronous result and marks the promise Ready instead of
   re-polling.
 
-The 5.1/5.2 work below (make `f.next()` itself a suspension so the executor
-interleaves fiber steps between tasks) is a SEPARATE optimisation, still
-unbuilt — the composition is correct without it.
+**Cooperative executor foundation shipped (cc21fbc).** Native async is now
+genuinely cooperative: `__zyntax_async_set_timeout` records a timer and
+returns (the SM parks) instead of blocking inline, and the driver sleeps to
+the nearest deadline and resolves — so multiple tasks interleave.
+`drive_tasks(&[promise])` runs several tasks concurrently (two each doing
+`await sleep(50)` finish in ~50ms, not ~100ms). See
+[[project_cooperative_executor]]. This is the substrate Phases 6 (cancel)
+and 7 (parking handlers) needed.
+
+The 5.1/5.2 work below (make `f.next()` ITSELF a suspension so the executor
+interleaves fiber STEPS — not just awaits — between tasks) is still unbuilt;
+it now has the cooperative executor to build on.
 
 **Size:** medium. **Unblocks:** 5+ programs (backpressure, http server, ecs, game
 loop). **Depends on:** 0.1 (krio default), 2 (drop). **Lifts:** part of 0.3.
