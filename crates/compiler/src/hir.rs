@@ -1870,6 +1870,13 @@ pub struct FunctionAttributes {
     pub hot: bool,
     pub pure: bool,
     pub const_fn: bool,
+    /// Set by the `@cooperative` (alias `@coop`) function annotation. Marks
+    /// an async function whose fiber steps may interleave with other tasks
+    /// at the cooperative executor's yield points. Currently only recorded
+    /// — no codegen consumes it yet; the fiber-step interleaving lowering
+    /// that reads this flag is a later phase.
+    #[serde(default)]
+    pub cooperative: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

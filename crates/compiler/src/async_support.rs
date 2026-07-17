@@ -2042,7 +2042,13 @@ impl AsyncCompiler {
             previous_version: None,
             is_external: false,
             calling_convention: CallingConvention::C,
-            attributes: FunctionAttributes::default(),
+            // Carry the `@cooperative` (`@coop`) marker across the async
+            // transform so it lands on the user-facing entry function; the
+            // rest of the attributes are regenerated for the state machine.
+            attributes: FunctionAttributes {
+                cooperative: original_func.attributes.cooperative,
+                ..FunctionAttributes::default()
+            },
             link_name: None,
         })
     }

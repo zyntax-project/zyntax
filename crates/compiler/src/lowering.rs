@@ -3029,6 +3029,17 @@ impl LoweringContext {
         // still default to `Fast` at construction time; this only
         // changes the lowering of user `TypedFunction`s.
         hir_func.calling_convention = crate::hir::CallingConvention::C;
+
+        // `@cooperative` (short alias `@coop`) marks an async function whose
+        // fiber steps may interleave at the executor's yield points. Recorded
+        // here so both spellings are recognized; the interleaving lowering
+        // that acts on it is a later phase.
+        hir_func.attributes.cooperative = func.annotations.iter().any(|a| {
+            matches!(
+                a.name.resolve_global().as_deref(),
+                Some("cooperative") | Some("coop")
+            )
+        });
     }
 
     /// Compute parameter attributes
