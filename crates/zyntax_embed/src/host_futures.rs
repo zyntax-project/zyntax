@@ -201,6 +201,13 @@ pub fn has_pending_timers() -> bool {
     TIMER_QUEUE.with(|q| !q.borrow().is_empty())
 }
 
+/// The earliest pending timer deadline, if any. Lets a driver decide
+/// whether to sleep-drive it or bail (e.g. on a timeout that fires first).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn next_timer_deadline() -> Option<web_time::Instant> {
+    TIMER_QUEUE.with(|q| q.borrow().iter().map(|(d, _)| *d).min())
+}
+
 /// Drive the nearest pending timer: sleep until its deadline, then resolve
 /// its future (advancing the parked SM one step). Returns the resolve
 /// outcome, or `None` if no timers are pending.
@@ -255,6 +262,25 @@ pub fn drive_next_timer_with_task() -> Option<(i64, ResolveOutcome)> {
         std::thread::sleep(deadline - now);
     }
     Some((task_id, resolve_future(handle, 0)))
+}
+
+/// Drop every parked future and pending timer belonging to `task_id`.
+/// Used when a task is cancelled so the executor stops driving its (now
+/// dead) state machine and its timers don't fire into freed memory. The
+/// state-machine-level cleanup of resources the task owned (fibers,
+/// handler frames) is a separate codegen concern; this only tears down
+/// the parking layer.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn deregister_task(task_id: i64) {
+    let handles: Vec<i64> = FUTURE_TABLE.with(|t| {
+        t.borrow()
+            .iter()
+            .filter(|(_, p)| p.task_id == task_id)
+            .map(|(h, _)| *h)
+            .collect()
+    });
+    TIMER_QUEUE.with(|q| q.borrow_mut().retain(|(_, h)| !handles.contains(h)));
+    FUTURE_TABLE.with(|t| t.borrow_mut().retain(|_, p| p.task_id != task_id));
 }
 
 /// Signature for the top-level task completion callback. Receives

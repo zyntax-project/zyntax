@@ -4363,48 +4363,29 @@ impl ZyntaxPromise {
         }
     }
 
-    /// Block until the promise completes and return the raw value
+    /// Block until the promise completes and return the raw value.
+    /// Cooperatively drives the shared timer queue (native); on wasm the
+    /// JS event loop drives resolution, so it just spins on `poll()`.
     pub fn await_raw(&self) -> RuntimeResult<ZyntaxValue> {
-        // Initial drive: advance the state machine to its first suspension
-        // (which parks a timer via `__zyntax_async_set_timeout`) or to
-        // completion.
-        match self.poll() {
-            PromiseState::Ready(value) => return Ok(value),
-            PromiseState::Failed(err) => return Err(RuntimeError::Promise(err)),
-            PromiseState::Cancelled => {
-                return Err(RuntimeError::Promise("Promise was cancelled".to_string()))
-            }
-            PromiseState::Pending => {}
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            drive_until(std::slice::from_ref(self), None, |ps| ps[0].is_complete());
         }
-
-        // Cooperative driving: sleep to the nearest parked timer, resolve
-        // it (re-driving the SM one step), and repeat until Ready. On wasm
-        // the JS event loop drives resolution instead, so we just spin.
+        #[cfg(target_arch = "wasm32")]
         loop {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                match crate::host_futures::drive_next_timer() {
-                    Some(crate::host_futures::ResolveOutcome::Ready(v)) => {
-                        let ready = ZyntaxValue::Int(v);
-                        self.state.lock().unwrap().state = PromiseState::Ready(ready.clone());
-                        return Ok(ready);
-                    }
-                    // ReParked / UnknownHandle: more timers to drive.
-                    Some(_) => continue,
-                    // No pending timer — the task can't make progress via a
-                    // timer. Fall through to a re-poll (another mechanism may
-                    // have advanced it) then yield.
-                    None => {}
-                }
+            if !matches!(self.poll(), PromiseState::Pending) {
+                break;
             }
-
-            match self.poll() {
-                PromiseState::Ready(value) => return Ok(value),
-                PromiseState::Failed(err) => return Err(RuntimeError::Promise(err)),
-                PromiseState::Cancelled => {
-                    return Err(RuntimeError::Promise("Promise was cancelled".to_string()))
-                }
-                PromiseState::Pending => std::thread::yield_now(),
+            std::thread::yield_now();
+        }
+        match self.state() {
+            PromiseState::Ready(value) => Ok(value),
+            PromiseState::Failed(err) => Err(RuntimeError::Promise(err)),
+            PromiseState::Cancelled => {
+                Err(RuntimeError::Promise("Promise was cancelled".to_string()))
+            }
+            PromiseState::Pending => {
+                Err(RuntimeError::Promise("Task did not complete".to_string()))
             }
         }
     }
@@ -4465,31 +4446,51 @@ impl ZyntaxPromise {
         self.state.lock().unwrap().state.clone()
     }
 
-    /// Block until the promise completes with a timeout
+    /// Block until the promise completes with a timeout.
     ///
-    /// Returns `Err` if the timeout is exceeded.
+    /// Returns `Err` if the timeout is exceeded. On timeout the task is
+    /// cancelled and its parked future/timer torn down so the executor
+    /// stops driving it.
     pub fn await_with_timeout(&self, timeout: std::time::Duration) -> RuntimeResult<ZyntaxValue> {
-        let start = web_time::Instant::now();
-        loop {
-            if start.elapsed() > timeout {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let deadline = web_time::Instant::now() + timeout;
+            let completed = drive_until(std::slice::from_ref(self), Some(deadline), |ps| {
+                ps[0].is_complete()
+            });
+            if !completed {
+                self.cancel();
+                crate::host_futures::deregister_task(0);
                 return Err(RuntimeError::Promise(format!(
                     "Async operation timed out after {:?}",
                     timeout
                 )));
             }
-            match self.poll() {
-                PromiseState::Pending => {
-                    std::thread::yield_now();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let start = web_time::Instant::now();
+            loop {
+                if start.elapsed() > timeout {
+                    return Err(RuntimeError::Promise(format!(
+                        "Async operation timed out after {:?}",
+                        timeout
+                    )));
                 }
-                PromiseState::Ready(value) => {
-                    return Ok(value);
+                if !matches!(self.poll(), PromiseState::Pending) {
+                    break;
                 }
-                PromiseState::Failed(err) => {
-                    return Err(RuntimeError::Promise(err));
-                }
-                PromiseState::Cancelled => {
-                    return Err(RuntimeError::Promise("Promise was cancelled".to_string()));
-                }
+                std::thread::yield_now();
+            }
+        }
+        match self.state() {
+            PromiseState::Ready(value) => Ok(value),
+            PromiseState::Failed(err) => Err(RuntimeError::Promise(err)),
+            PromiseState::Cancelled => {
+                Err(RuntimeError::Promise("Promise was cancelled".to_string()))
+            }
+            PromiseState::Pending => {
+                Err(RuntimeError::Promise("Task did not complete".to_string()))
             }
         }
     }
@@ -4612,19 +4613,25 @@ impl Clone for ZyntaxPromise {
     }
 }
 
-/// Drive multiple async tasks cooperatively to completion, interleaving
-/// them via the shared timer queue: while one task is parked on its
-/// `await` timer, another advances. Each task is stamped with its slice
-/// index as its task id so completion routes back to the right promise.
-/// Returns each task's result in order.
+/// Cooperatively drive `promises` (each stamped with its slice index as
+/// task id), advancing them via the shared timer queue, until `done`
+/// returns true or `deadline` (if any) passes. Returns true if `done` was
+/// reached, false on timeout. A task that becomes `Cancelled` mid-drive
+/// has its parked futures/timers torn down so the executor stops driving
+/// its (now dead) state machine.
 ///
-/// This is the multi-task counterpart to `ZyntaxPromise::await_raw`: the
-/// single-task version drains only its own timers, this one drains all
-/// tasks' timers in deadline order, so two tasks each doing `await sleep`
-/// overlap instead of running one-after-the-other.
+/// This is the single cooperative core under `await_raw`, `drive_tasks`,
+/// the timeout variants, and the `Promise.all`/`Promise.race` combinators.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn drive_tasks(promises: &[ZyntaxPromise]) -> Vec<RuntimeResult<ZyntaxValue>> {
-    use crate::host_futures::{drive_next_timer_with_task, set_current_task_id, ResolveOutcome};
+pub(crate) fn drive_until(
+    promises: &[ZyntaxPromise],
+    deadline: Option<web_time::Instant>,
+    mut done: impl FnMut(&[ZyntaxPromise]) -> bool,
+) -> bool {
+    use crate::host_futures::{
+        deregister_task, drive_next_timer_with_task, next_timer_deadline, set_current_task_id,
+        ResolveOutcome,
+    };
 
     // Initial drive: poll each task once (parks its first `await` timer,
     // stamped with its index, or completes synchronously).
@@ -4633,38 +4640,97 @@ pub fn drive_tasks(promises: &[ZyntaxPromise]) -> Vec<RuntimeResult<ZyntaxValue>
         let _ = p.poll();
     }
 
-    // Cooperative loop: resolve the nearest pending timer, route completion
-    // to the owning task, until all tasks are done.
-    while !promises.iter().all(|p| p.is_complete()) {
-        match drive_next_timer_with_task() {
-            Some((task_id, ResolveOutcome::Ready(v))) => {
-                if let Some(p) = promises.get(task_id as usize) {
-                    p.state.lock().unwrap().state = PromiseState::Ready(ZyntaxValue::Int(v));
+    loop {
+        // Tear down the parking of any newly-cancelled tasks.
+        for (i, p) in promises.iter().enumerate() {
+            if p.is_cancelled() {
+                deregister_task(i as i64);
+            }
+        }
+        if done(promises) {
+            return true;
+        }
+        if let Some(dl) = deadline {
+            if web_time::Instant::now() >= dl {
+                return false;
+            }
+        }
+
+        match next_timer_deadline() {
+            Some(td) => {
+                // If the timeout fires before the next timer, wait it out
+                // and report timeout rather than driving past the deadline.
+                if let Some(dl) = deadline {
+                    if td > dl {
+                        let now = web_time::Instant::now();
+                        if dl > now {
+                            std::thread::sleep(dl - now);
+                        }
+                        return false;
+                    }
+                }
+                if let Some((task_id, ResolveOutcome::Ready(v))) = drive_next_timer_with_task() {
+                    if let Some(p) = promises.get(task_id as usize) {
+                        let mut inner = p.state.lock().unwrap();
+                        if matches!(inner.state, PromiseState::Pending) {
+                            inner.state = PromiseState::Ready(ZyntaxValue::Int(v));
+                        }
+                    }
                 }
             }
-            // ReParked / UnknownHandle: keep draining timers.
-            Some(_) => {}
             None => {
-                // No timers pending yet some task is unfinished — re-poll the
-                // pending ones (a task may complete synchronously without an
-                // await). If none progress, avoid a hot spin.
-                let mut progressed = false;
+                // No parked timers, yet a task is unfinished. A real
+                // async SM always parks a timer, so this only happens for
+                // a task that advances purely by re-polling (e.g. a
+                // multi-poll simulated SM in tests) or one genuinely stuck
+                // waiting on an external event. Re-poll the pending ones
+                // and yield — the loop's `done`/`deadline` checks terminate
+                // it (matching the pre-cooperative spin behaviour).
                 for (i, p) in promises.iter().enumerate() {
                     if p.is_pending() {
                         set_current_task_id(i as i64);
                         let _ = p.poll();
-                        if !p.is_pending() {
-                            progressed = true;
-                        }
                     }
                 }
-                if !progressed && !crate::host_futures::has_pending_timers() {
-                    break;
-                }
+                std::thread::yield_now();
             }
         }
     }
+}
 
+/// `Promise.all` completion predicate: done when any child failed
+/// (fast-fail) or all children are complete.
+fn promise_all_done(ps: &[ZyntaxPromise]) -> bool {
+    ps.iter()
+        .any(|p| matches!(p.state(), PromiseState::Failed(_)))
+        || ps.iter().all(|p| p.is_complete())
+}
+
+/// Collect the values of a completed promise group, fast-failing on the
+/// first failure / cancellation / unfinished task.
+fn collect_all(ps: &[ZyntaxPromise]) -> RuntimeResult<Vec<ZyntaxValue>> {
+    let mut values = Vec::with_capacity(ps.len());
+    for p in ps {
+        match p.state() {
+            PromiseState::Ready(v) => values.push(v),
+            PromiseState::Failed(e) => return Err(RuntimeError::Promise(e)),
+            PromiseState::Cancelled => {
+                return Err(RuntimeError::Promise("Promise was cancelled".to_string()))
+            }
+            PromiseState::Pending => {
+                return Err(RuntimeError::Promise("Task did not complete".to_string()))
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// Drive multiple async tasks cooperatively to completion, interleaving
+/// them via the shared timer queue: while one task is parked on its
+/// `await` timer, another advances. Returns each task's result in order.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drive_tasks(promises: &[ZyntaxPromise]) -> Vec<RuntimeResult<ZyntaxValue>> {
+    drive_until(promises, None, |ps| ps.iter().all(|p| p.is_complete()));
     promises
         .iter()
         .map(|p| match p.state() {
@@ -4790,46 +4856,59 @@ impl PromiseAll {
     ///
     /// Returns all results in order, or the first error encountered.
     pub fn await_all(&mut self) -> RuntimeResult<Vec<ZyntaxValue>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        drive_until(&self.promises, None, promise_all_done);
+        #[cfg(target_arch = "wasm32")]
         loop {
             match self.poll() {
-                PromiseAllState::Pending => {
-                    std::thread::yield_now();
-                }
-                PromiseAllState::AllReady(values) => {
-                    return Ok(values);
-                }
-                PromiseAllState::Failed(err) => {
-                    return Err(RuntimeError::Promise(err));
-                }
+                PromiseAllState::Pending => std::thread::yield_now(),
+                PromiseAllState::AllReady(values) => return Ok(values),
+                PromiseAllState::Failed(err) => return Err(RuntimeError::Promise(err)),
             }
         }
+        collect_all(&self.promises)
     }
 
-    /// Block until all promises complete with a timeout
+    /// Block until all promises complete with a timeout (drives all
+    /// children cooperatively; concurrent, not one-after-the-other).
     pub fn await_all_with_timeout(
         &mut self,
         timeout: std::time::Duration,
     ) -> RuntimeResult<Vec<ZyntaxValue>> {
-        let start = web_time::Instant::now();
-        loop {
-            if start.elapsed() > timeout {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let deadline = web_time::Instant::now() + timeout;
+            let done = drive_until(&self.promises, Some(deadline), promise_all_done);
+            if !done {
+                for (i, p) in self.promises.iter().enumerate() {
+                    if p.cancel() {
+                        crate::host_futures::deregister_task(i as i64);
+                    }
+                }
                 return Err(RuntimeError::Promise(format!(
                     "PromiseAll timed out after {:?}",
                     timeout
                 )));
             }
-            match self.poll() {
-                PromiseAllState::Pending => {
-                    std::thread::yield_now();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let start = web_time::Instant::now();
+            loop {
+                if start.elapsed() > timeout {
+                    return Err(RuntimeError::Promise(format!(
+                        "PromiseAll timed out after {:?}",
+                        timeout
+                    )));
                 }
-                PromiseAllState::AllReady(values) => {
-                    return Ok(values);
-                }
-                PromiseAllState::Failed(err) => {
-                    return Err(RuntimeError::Promise(err));
+                match self.poll() {
+                    PromiseAllState::Pending => std::thread::yield_now(),
+                    PromiseAllState::AllReady(values) => return Ok(values),
+                    PromiseAllState::Failed(err) => return Err(RuntimeError::Promise(err)),
                 }
             }
         }
+        collect_all(&self.promises)
     }
 
     /// Get the number of promises in this group
@@ -4922,23 +5001,46 @@ impl PromiseRace {
         PromiseRaceState::Pending
     }
 
-    /// Block until any promise completes
+    /// Block until any promise completes, then cancel the losers.
     ///
-    /// Returns the index and value of the first promise to complete.
+    /// Returns the index and value of the first promise to complete. The
+    /// still-pending promises are cancelled and their parked futures/timers
+    /// torn down so the executor stops driving them.
     pub fn await_first(&mut self) -> RuntimeResult<(usize, ZyntaxValue)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            drive_until(&self.promises, None, |ps| {
+                ps.iter().any(|p| !p.is_pending())
+            });
+            // Cancel the losers (anything still pending) and free their
+            // parking.
+            for (i, p) in self.promises.iter().enumerate() {
+                if p.cancel() {
+                    crate::host_futures::deregister_task(i as i64);
+                }
+            }
+            for (index, p) in self.promises.iter().enumerate() {
+                match p.state() {
+                    PromiseState::Ready(value) => return Ok((index, value)),
+                    PromiseState::Failed(err) => {
+                        return Err(RuntimeError::Promise(format!(
+                            "Promise {index} failed: {err}"
+                        )))
+                    }
+                    _ => {}
+                }
+            }
+            Err(RuntimeError::Promise("No promise completed".to_string()))
+        }
+        #[cfg(target_arch = "wasm32")]
         loop {
             match self.poll() {
-                PromiseRaceState::Pending => {
-                    std::thread::yield_now();
-                }
-                PromiseRaceState::Winner(index, value) => {
-                    return Ok((index, value));
-                }
+                PromiseRaceState::Pending => std::thread::yield_now(),
+                PromiseRaceState::Winner(index, value) => return Ok((index, value)),
                 PromiseRaceState::Failed(index, err) => {
                     return Err(RuntimeError::Promise(format!(
-                        "Promise {} failed: {}",
-                        index, err
-                    )));
+                        "Promise {index} failed: {err}"
+                    )))
                 }
             }
         }

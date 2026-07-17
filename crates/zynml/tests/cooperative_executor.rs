@@ -6,9 +6,10 @@
 
 #![cfg(feature = "krio-async-backend")]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_embed::{drive_tasks, ZyntaxRuntime, ZyntaxValue};
+use zyntax_embed::host_futures::has_pending_timers;
+use zyntax_embed::{drive_tasks, PromiseRace, ZyntaxRuntime, ZyntaxValue};
 
 fn compile(rt: &mut ZyntaxRuntime, src: &str) {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
@@ -98,5 +99,77 @@ fn interleaved_multi_await_tasks_complete() {
     assert_eq!(
         results[1].as_ref().ok().and_then(ZyntaxValue::as_i64),
         Some(22)
+    );
+}
+
+/// Promise.race resolves with the first task and cancels the losers,
+/// tearing down their parked timers so the executor stops driving them.
+#[test]
+fn race_resolves_first_and_cancels_loser() {
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    compile(
+        &mut rt,
+        r#"
+        async def fast(): i64 {
+            await sleep(20)
+            return 1
+        }
+        async def slow(): i64 {
+            await sleep(500)
+            return 2
+        }
+        "#,
+    );
+
+    let a = rt.call_async("fast", &[]).expect("call fast");
+    let b = rt.call_async("slow", &[]).expect("call slow");
+    let mut race = PromiseRace::new(vec![a, b]);
+
+    let start = Instant::now();
+    let (idx, val) = race.await_first().expect("race resolves");
+    let elapsed = start.elapsed();
+
+    assert_eq!(idx, 0, "fast wins");
+    assert_eq!(val.as_i64(), Some(1));
+    // Returned when `fast` finished (~20ms), not after `slow`'s 500ms.
+    assert!(
+        elapsed.as_millis() < 300,
+        "race returns on the first winner, not the slow loser; got {elapsed:?}"
+    );
+    // The loser was cancelled and its 500ms timer deregistered.
+    assert!(
+        !has_pending_timers(),
+        "the cancelled loser's timer must be torn down"
+    );
+}
+
+/// await_with_timeout cancels a task that overruns and deregisters its
+/// parked timer, returning at ~the timeout rather than the full sleep.
+#[test]
+fn timeout_cancels_overrunning_task() {
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    compile(
+        &mut rt,
+        r#"
+        async def slow(): i64 {
+            await sleep(500)
+            return 9
+        }
+        "#,
+    );
+
+    let p = rt.call_async("slow", &[]).expect("call slow");
+    let start = Instant::now();
+    let r = p.await_with_timeout(Duration::from_millis(50));
+    let elapsed = start.elapsed();
+
+    assert!(r.is_err(), "should time out before the 500ms sleep");
+    assert!(
+        elapsed.as_millis() >= 45 && elapsed.as_millis() < 300,
+        "returns at ~the timeout, not after the full sleep; got {elapsed:?}"
+    );
+    assert!(
+        !has_pending_timers(),
+        "the timed-out task's timer must be deregistered"
     );
 }

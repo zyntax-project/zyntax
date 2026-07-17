@@ -2672,7 +2672,10 @@ async fn outer(x: i32) i32 {
 
         let results = all.await_all().expect("Empty PromiseAll should succeed");
         assert!(results.is_empty());
-        assert_eq!(all.poll_count(), 1);
+        // The cooperative driver completes an empty group immediately
+        // without polling the wrapper (nothing to drive), so poll_count
+        // stays 0 rather than the pre-refactor 1.
+        assert_eq!(all.poll_count(), 0);
 
         println!("SUCCESS: Empty PromiseAll completes immediately");
     }
