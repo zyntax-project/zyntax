@@ -2452,10 +2452,12 @@ pipe_call = { callee:identifier ~ "(" ~ args:call_args_list? ~ ")" }
 
 // Ternary conditional: condition ? true_expr : false_expr
 // Also: value_a if condition else value_b (Python-style)
-// C-style `cond ? then : else` removed — conflicts with `?` postfix
-// (the Try operator on Option / Result). ZynML programs use the
-// Python-style `then if cond else else_val` form instead.
-ternary_expr = { python_ternary | null_coalesce_expr }
+// Both C-style `cond ? then : else` and Python-style
+// `then if cond else else` are supported. The C-style form coexists with
+// the `?` postfix Try operator via a negative lookahead on `suffix_try`
+// (see below): a `?` that is followed by `<expr> :` is a ternary, not a
+// postfix Try, so it is left for `ternary_with_branches` to consume.
+ternary_expr = { python_ternary | ternary_with_branches | null_coalesce_expr }
 
 // Python-style ternary: value_a if condition else value_b
 // Maps to TypedIfExpr (If in TypedExpression)
@@ -2633,7 +2635,13 @@ suffix_index = { "[" ~ index:expr ~ "]" }
 // the enclosing function with `None` / `Err(e)` respectively. Folds
 // into `TypedExpression::Try` and is lowered to an early-return
 // branch at SSA time.
-suffix_try = { "?" }
+//
+// The negative lookahead disambiguates from the C-style ternary
+// `cond ? then : else`: a `?` that is followed by `<expr> :` belongs to
+// a ternary, so `suffix_try` declines it and lets `ternary_with_branches`
+// (a wider rule) consume the whole `? then : else`. A bare `x?` (nothing,
+// or a non-`:` continuation, after the `?`) stays a Try.
+suffix_try = { "?" ~ !(null_coalesce_expr ~ ":") }
   -> SuffixTry { }
 
 // Slice suffix: [start:end] or [start:end:step] or [:end] or [::step] etc.
