@@ -356,20 +356,22 @@ loop). **Depends on:** 0.1 (krio default), 2 (drop). **Lifts:** part of 0.3.
 **Size:** large. **Unblocks:** 4+ programs (ml-inference cancel, http server
 shutdown, socket cleanup). **Depends on:** 2 (FiberDrop), 1 (pop_handler).
 
-**Parking-layer teardown (5dbb684) + fiber resource cleanup (5f0bf61)
-shipped; handler-frame cleanup still open.** `host_futures::deregister_task`
+**SHIPPED (5dbb684 + 5f0bf61 + 3c575f0).** `host_futures::deregister_task`
 drops a task's parked futures + timers; the cooperative driver tears down a
 task the moment it's Cancelled; `Promise.race` cancels the losers and
-`await_with_timeout` cancels the overrunner, so no timer fires into a dead
-state machine. A cancelled task's owned FIBERS are now freed via a per-task
-registry (`krio_adapter::fiber::TASK_FIBERS` + `free_task_fibers`, wired
-through the executor) instead of leaking. Still TODO: a cancelled task's
-open HANDLER frames (a `with`-block spanning the suspend) linger on the
-thread-local `HANDLER_STACK` — this needs per-task handler-stack segments
-for cooperative tasks (the async analogue of Phase 4's per-fiber segments),
-which also fixes a broader gap: interleaved tasks currently share
-`HANDLER_STACK`, so one task's open handler is visible to another
-mid-interleave. See [[project_cooperative_executor]].
+`await_with_timeout` cancels the overrunner. A cancelled task's owned
+resources are freed instead of leaking: FIBERS via a per-task registry
+(`krio_adapter::fiber::TASK_FIBERS` + `free_task_fibers`), and open HANDLER
+frames via per-task handler-stack segments (`effect_runtime::
+TASK_HANDLER_SEGMENTS` + `task_handler_enter/leave/forget`, the async
+analogue of Phase 4's per-fiber segments). The executor brackets every SM
+drive with enter/leave, which ALSO fixed a broader interleave gap:
+cooperative tasks no longer share `HANDLER_STACK`, so a task's open handler
+isn't visible to another mid-interleave (`with H { await; perform }` works
+in async; interleaved tasks with different handlers stay isolated). Still
+TODO: reverse-acquisition-order drop ordering + the `Resume<T>`-before-frame
+invariant for resumable-effect-owning cancelled tasks (ties into Phase 7).
+See [[project_cooperative_executor]].
 
 ### 6.1 Cancel token from async to fiber
 - `Promise::cancel()` marks the async task cancelled. On next poll the SM runs its
@@ -398,12 +400,30 @@ mid-interleave. See [[project_cooperative_executor]].
 handler-that-awaits, effect_handler_returns_pending). **Depends on:** 5.
 
 ### 7.1 Replace spin-poll with Pending propagation
-- `__zyntax_effect_resume` (`effect_runtime.rs:252-372`) currently spin-polls the
-  caller's SM under `LOOP_BUDGET=100_000`. A handler that returns Pending (parked
-  continuation, or one that awaits) must instead propagate Pending up to the
-  executor, not burn the budget.
-- Requires the resume path to be a real suspension point, coordinated with the
-  async SM the caller lives in.
+- `__zyntax_effect_resume` (`effect_runtime.rs`) spin-polled the caller's SM under
+  `LOOP_BUDGET=100_000`. A resumed continuation that reaches an `await` parks on a
+  timer and returns Pending; nothing drove that timer from inside the resume loop,
+  so it burned the budget and panicked.
+- **Runtime substrate DONE (1925db2).** On Pending the loop now drives the nearest
+  pending timer (`host_futures::drive_next_timer_with_task`) and re-polls, so a
+  continuation that awaits waits out its timer and resumes. No-timer Pending still
+  counts toward the budget (stuck-SM detection preserved). Handler-segment bracket
+  inside the drive keeps interleaved tasks isolated. Host-ABI test:
+  `crates/zyntax_embed/tests/cooperative_resume.rs`.
+- **BLOCKED on codegen (the large piece).** A `@effect(E) async def` that performs
+  then awaits compiles but hangs: `__zyntax_async_set_timeout` is never called —
+  the composed SM never reaches the await. The resumable perform site writes
+  `next_state=1`, but the async-transformed SM's dispatcher doesn't route that to
+  the post-perform continuation (it lands on a state that returns Pending forever).
+  Root cause: the resumable captures-lift SM transform and the async await-SM
+  transform each renumber states independently over the same function. They must
+  enumerate ONE coherent suspend-point table (await points AND perform points) with
+  a single state numbering. Fix lives in `crates/passes/krio_adapter/`
+  (`abi_emit.rs` resume_entries/next_state, `lib.rs` suspend-set tainting). See
+  [[project_phase7_parking_handlers]].
+- Handler-body-awaits (`async def op(k)` inside a handler) doesn't compile yet —
+  the harder target where the handler itself suspends (resume path becomes a real
+  suspension point coordinated with the caller's SM).
 
 ### 7.2 FiberStep envelope widening (if fiber-await lands here)
 - If a cooperative fiber body needs to await: widen `FiberStep` beyond 2 tag bits
