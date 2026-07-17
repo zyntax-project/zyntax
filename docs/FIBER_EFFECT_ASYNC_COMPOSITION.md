@@ -410,17 +410,24 @@ handler-that-awaits, effect_handler_returns_pending). **Depends on:** 5.
   counts toward the budget (stuck-SM detection preserved). Handler-segment bracket
   inside the drive keeps interleaved tasks isolated. Host-ABI test:
   `crates/zyntax_embed/tests/cooperative_resume.rs`.
-- **BLOCKED on codegen (the large piece).** A `@effect(E) async def` that performs
-  then awaits compiles but hangs: `__zyntax_async_set_timeout` is never called —
-  the composed SM never reaches the await. The resumable perform site writes
-  `next_state=1`, but the async-transformed SM's dispatcher doesn't route that to
-  the post-perform continuation (it lands on a state that returns Pending forever).
-  Root cause: the resumable captures-lift SM transform and the async await-SM
-  transform each renumber states independently over the same function. They must
-  enumerate ONE coherent suspend-point table (await points AND perform points) with
-  a single state numbering. Fix lives in `crates/passes/krio_adapter/`
-  (`abi_emit.rs` resume_entries/next_state, `lib.rs` suspend-set tainting). See
-  [[project_phase7_parking_handlers]].
+- **Composition FIXED (a16525d).** A `@effect(E) async def` that performs a
+  resumable effect now composes: the perform becomes a real suspension/resume
+  state, the handler resumes the continuation, and an `await` after the resume is
+  driven cooperatively to Ready. The bug was double-lowering — `apply_krio_async_lowering`
+  rewrote the fn into a promise entry (`is_async` cleared, `@effect` signature kept)
+  + `$poll` fn, then `apply_krio_effect_lowering` re-grabbed both (its filter gated
+  only on `!is_async` + signature effects) and clobbered the SM with an empty-yield
+  re-transform. Fix (both in `crates/zyntax_embed/src/krio_lowering.rs`): the effect
+  pass now gates on a raw `PerformEffect` in the BODY (not the signature list), and
+  the async pass runs `upgrade_resume_struct_at_perform_sites` for async performing
+  fns. Covers perform-only, perform→await, await→perform. e2e:
+  `crates/zynml/tests/async_effect_composition.rs`. Note: the state numbering was
+  ALWAYS unified (krio classifies await + perform identically); no numbering
+  redesign was needed. See [[project_phase7_parking_handlers]].
+- **Follow-up (open): conditional await after perform.** `let x=op(); if c { await ... }; return x+100`
+  fails Cranelift SSA verification (perform-result reload used at the branch merge
+  from a non-dominating def). Separate `repair_ssa_for_reloads` dominance bug in
+  `crates/passes/krio_adapter/src/emit.rs`, exposed not caused by the composition.
 - Handler-body-awaits (`async def op(k)` inside a handler) doesn't compile yet —
   the harder target where the handler itself suspends (resume path becomes a real
   suspension point coordinated with the caller's SM).
