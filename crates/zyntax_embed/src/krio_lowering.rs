@@ -72,11 +72,33 @@ pub fn apply_krio_effect_lowering(
         )));
     }
 
+    // Gate on a raw `PerformEffect` still present in the body — NOT just
+    // the signature's effect list. `apply_krio_async_lowering` runs first
+    // and rewrites an `async` performing fn into a promise entry (whose
+    // `is_async` flag is cleared but whose signature keeps the `@effect`
+    // list) plus a poll fn (whose performs are already lowered to the
+    // dispatch machinery). Both would match a signature-only filter and be
+    // re-lowered here — a double transform that clobbers the async SM with
+    // an empty-yield layout. A raw `PerformEffect` in the body is present
+    // only on genuinely-sync performing fns the async pass left untouched.
+    let body_has_perform = |f: &zyntax_compiler::hir::HirFunction| -> bool {
+        f.blocks.values().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    zyntax_compiler::hir::HirInstruction::PerformEffect { .. }
+                )
+            })
+        })
+    };
     let resumable_fn_ids: Vec<HirId> = module
         .functions
         .values()
         .filter(|f| {
-            !f.signature.is_async && !f.signature.effects.is_empty() && has_resumable_effect(f)
+            !f.signature.is_async
+                && !f.signature.effects.is_empty()
+                && body_has_perform(f)
+                && has_resumable_effect(f)
         })
         .map(|f| f.id)
         .collect();
@@ -232,6 +254,54 @@ pub fn apply_krio_async_lowering(
 
         let suspending = krio_adapter::HirSuspendingFns::from_module(_module);
 
+        // An `async def` may ALSO perform a resumable algebraic effect.
+        // `lower_async_function` (below) already turns the `PerformEffect`
+        // into a suspension/resume state, but the handler-dispatch +
+        // `Resume<T>` construction lives in a separate pass
+        // (`upgrade_resume_struct_at_perform_sites`) that the non-async
+        // resumable path runs. The effect path skips async fns, so we run
+        // that upgrade here too — otherwise the perform site parks with no
+        // way to reach its handler. Build the same resolution maps it needs.
+        let mut handler_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), HirId> =
+            HashMap::new();
+        for handler in _module.handlers.values() {
+            for impl_ in &handler.implementations {
+                if !impl_.is_resumable {
+                    continue;
+                }
+                let mangled = zyntax_compiler::mangle_handler_op_name(handler.name, impl_.op_name);
+                if let Some(handler_fn_id) = _module
+                    .functions
+                    .iter()
+                    .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
+                    .map(|(id, _)| *id)
+                {
+                    handler_resolution.insert((handler.effect_id, impl_.op_name), handler_fn_id);
+                }
+            }
+        }
+        let mut op_index_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), u64> =
+            HashMap::new();
+        for effect in _module.effects.values() {
+            for (idx, op) in effect.operations.iter().enumerate() {
+                op_index_resolution.insert((effect.id, op.name), idx as u64);
+            }
+        }
+        // Effect names whose handler set includes a resumable impl — used
+        // to decide per-fn whether the resume-struct upgrade must run.
+        let resumable_effect_names: HashSet<zyntax_typed_ast::InternedString> = _module
+            .effects
+            .values()
+            .filter(|effect| {
+                _module
+                    .handlers
+                    .values()
+                    .filter(|h| h.effect_id == effect.id)
+                    .any(|h| h.implementations.iter().any(|i| i.is_resumable))
+            })
+            .map(|effect| effect.name)
+            .collect();
+
         let async_fn_ids: Vec<HirId> = _module
             .functions
             .values()
@@ -319,6 +389,32 @@ pub fn apply_krio_async_lowering(
                         }
                     }
                 }
+            }
+
+            // If this async fn performs a resumable effect, build the
+            // handler-dispatch + `Resume<T>` machinery at each perform site
+            // (the async analogue of the non-async resumable path). Without
+            // this the perform site parks with no route to its handler.
+            if original_signature
+                .effects
+                .iter()
+                .any(|e| resumable_effect_names.contains(e))
+            {
+                let post_reshape_frame_ptr = function
+                    .signature
+                    .params
+                    .first()
+                    .map(|p| p.id)
+                    .unwrap_or(frame_ptr);
+                krio_adapter::abi_emit::upgrade_resume_struct_at_perform_sites(
+                    &mut function,
+                    &handler_resolution,
+                    &op_index_resolution,
+                    new_poll_id,
+                    post_reshape_frame_ptr,
+                    lower_result.resume_scratch_slot,
+                    lower_result.refcount_slot,
+                );
             }
 
             let mut entry_fn = krio_adapter::abi_emit::generate_promise_entry(
