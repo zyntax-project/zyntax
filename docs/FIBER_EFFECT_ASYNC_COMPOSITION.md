@@ -291,6 +291,30 @@ resumable-only), so nothing to relax; resumable-in-fiber stays deferred.
 
 ## Phase 5 — Cooperative fiber-in-async
 
+**Composition bug fixed (a932db9 + ca95b35); cooperative-scheduling feature
+still unbuilt.** Driving a fiber across an `await` in the same loop
+(`while let Some(x) = f.next() { await sleep(20); sum = sum + x }`) now works,
+via two fixes independent of the `@cooperative` mechanism below:
+- **Captures-lift SSA reconstruction** (`krio_adapter::emit::repair_ssa_for_reloads`):
+  a value defined before a loop and reloaded on resume (the fiber handle) was
+  read undefined after the suspend — the transform blindly rewrote in-loop
+  uses to the reload, undefined on the pre-suspend iteration. Now proper
+  dominance-frontier phi placement (pruned to real merges) + rename to the
+  reaching def, run after the dispatcher wires the resume edges. Fixed four
+  underlying liveness bugs too (per-edge phi liveness, terminator-derived
+  successors, fiber-op use/def visibility, cross-block `defined_pre`).
+- **Scheduler sync-completion latch** (`host_futures::arm/take_sync_completion`):
+  the native bridge resolves inline and re-polls recursively, so a task can
+  finish inside one `poll()` while outer frames return Pending. The await loop
+  then re-polled a finished SM and resumed a fiber the loop-exit path had
+  already freed (UAF). `complete_task` was a no-op natively; now `poll()`
+  latches the synchronous result and marks the promise Ready instead of
+  re-polling.
+
+The 5.1/5.2 work below (make `f.next()` itself a suspension so the executor
+interleaves fiber steps between tasks) is a SEPARATE optimisation, still
+unbuilt — the composition is correct without it.
+
 **Size:** medium. **Unblocks:** 5+ programs (backpressure, http server, ecs, game
 loop). **Depends on:** 0.1 (krio default), 2 (drop). **Lifts:** part of 0.3.
 
