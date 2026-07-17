@@ -356,6 +356,17 @@ loop). **Depends on:** 0.1 (krio default), 2 (drop). **Lifts:** part of 0.3.
 **Size:** large. **Unblocks:** 4+ programs (ml-inference cancel, http server
 shutdown, socket cleanup). **Depends on:** 2 (FiberDrop), 1 (pop_handler).
 
+**Parking-layer teardown shipped (5dbb684); SM-level resource cleanup still
+open.** `host_futures::deregister_task` drops a task's parked futures +
+timers; the cooperative driver tears down a task the moment it's Cancelled;
+`Promise.race` cancels the losers and `await_with_timeout` cancels the
+overrunner, so no timer fires into a dead state machine. Still TODO: 6.1's
+codegen half — a cancelled task must run a cleanup edge that runs `FiberDrop`
+on every fiber it owns and `pop_handler` on every open handler frame (in
+reverse acquisition order; a fiber owning a `Resume<T>` drops before the
+handler frame that would resume it). Today a cancelled task's owned fibers /
+handler frames leak (never double-free). See [[project_cooperative_executor]].
+
 ### 6.1 Cancel token from async to fiber
 - `Promise::cancel()` marks the async task cancelled. On next poll the SM runs its
   cleanup path: `FiberDrop` on every owned fiber, `pop_handler` on every open
