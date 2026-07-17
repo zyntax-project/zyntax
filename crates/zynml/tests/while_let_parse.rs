@@ -63,12 +63,12 @@ fn while_let_some_desugars_to_while_true_match() {
         "expected exactly one synthesized statement in body"
     );
 
+    // The desugar lowers the loop body to a statement-level `match`
+    // (`TypedStatement::Match`) — see the `match on Option + while-let`
+    // end-to-end fix.
     let match_expr = match &w.body.statements[0].node {
-        TypedStatement::Expression(e) => match &e.node {
-            TypedExpression::Match(m) => m,
-            other => panic!("expected Match expr, got {other:?}"),
-        },
-        other => panic!("expected Expression stmt, got {other:?}"),
+        TypedStatement::Match(m) => m,
+        other => panic!("expected Match stmt, got {other:?}"),
     };
 
     // Two arms: the user pattern, then a wildcard `break`.
