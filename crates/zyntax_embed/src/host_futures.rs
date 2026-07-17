@@ -168,8 +168,12 @@ thread_local! {
 }
 
 /// Set the id of the task about to be driven (see `CURRENT_TASK_ID`).
+/// Also stamps the fiber backend so a fiber the task creates is attributed
+/// to it (and freed if the task is cancelled).
 pub fn set_current_task_id(id: i64) {
     CURRENT_TASK_ID.with(|c| c.set(id));
+    #[cfg(not(target_arch = "wasm32"))]
+    krio_adapter::fiber::set_fiber_task_id(id);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -206,6 +210,13 @@ pub fn has_pending_timers() -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn next_timer_deadline() -> Option<web_time::Instant> {
     TIMER_QUEUE.with(|q| q.borrow().iter().map(|(d, _)| *d).min())
+}
+
+/// Number of live fibers attributed to `task_id` (diagnostics/tests) —
+/// 0 after the task completes or is cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn task_fiber_count(task_id: i64) -> usize {
+    krio_adapter::fiber::task_fiber_count(task_id)
 }
 
 /// Drive the nearest pending timer: sleep until its deadline, then resolve
@@ -281,6 +292,9 @@ pub fn deregister_task(task_id: i64) {
     });
     TIMER_QUEUE.with(|q| q.borrow_mut().retain(|(_, h)| !handles.contains(h)));
     FUTURE_TABLE.with(|t| t.borrow_mut().retain(|_, p| p.task_id != task_id));
+    // Free any fibers the cancelled task created but never dropped (it
+    // won't reach its normal scope-exit `FiberDrop`s).
+    krio_adapter::fiber::free_task_fibers(task_id);
 }
 
 /// Signature for the top-level task completion callback. Receives

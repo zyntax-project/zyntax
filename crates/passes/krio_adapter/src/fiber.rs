@@ -24,7 +24,7 @@
 //! double-free.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use krio_fiber::{Fiber, FiberStep};
 use zyntax_compiler::fiber_backend::{
@@ -58,6 +58,51 @@ thread_local! {
     /// thread-local so this map is safely accessible without
     /// synchronisation).
     static ERROR_MAP: RefCell<HashMap<usize, AbortInfo>> = RefCell::new(HashMap::new());
+
+    /// Task that owns fibers created right now. The cooperative executor
+    /// stamps this (via `set_fiber_task_id`) before driving a task, so a
+    /// fiber the task creates can be freed if that task is later cancelled
+    /// — a cancelled task never reaches its normal scope-exit `FiberDrop`.
+    /// 0 = no owning task (plain, non-async fibers).
+    static FIBER_TASK_ID: Cell<i64> = const { Cell::new(0) };
+
+    /// Live fibers grouped by owning task, for cancel-time cleanup. Added
+    /// on `fiber_new` under the current `FIBER_TASK_ID`, removed on
+    /// `fiber_free` (the normal scope-exit drop). `free_task_fibers` frees
+    /// whatever a cancelled task left behind. A fiber that a task RETURNS
+    /// only escapes on a completing (non-cancelled) path, so this never
+    /// frees a live escapee.
+    static TASK_FIBERS: RefCell<HashMap<i64, HashSet<usize>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Stamp the task that owns fibers created from now on (see `TASK_FIBERS`).
+pub fn set_fiber_task_id(id: i64) {
+    FIBER_TASK_ID.with(|c| c.set(id));
+}
+
+/// Number of live fibers currently attributed to `task_id`. For tests /
+/// diagnostics — after a task completes or is cancelled this should be 0.
+pub fn task_fiber_count(task_id: i64) -> usize {
+    TASK_FIBERS.with(|m| m.borrow().get(&task_id).map(|s| s.len()).unwrap_or(0))
+}
+
+/// Free every fiber still owned by `task_id`. Used when the task is
+/// cancelled and won't run its own scope-exit `FiberDrop`s: unmaps each
+/// fiber's stack + guard page and clears its per-fiber error slot.
+pub fn free_task_fibers(task_id: i64) {
+    let ptrs: Vec<usize> = TASK_FIBERS.with(|m| {
+        m.borrow_mut()
+            .remove(&task_id)
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default()
+    });
+    let backend = KrioFiberBackend;
+    for ptr in ptrs {
+        unsafe {
+            backend.fiber_free(ptr as *mut FiberRepr);
+        }
+    }
 }
 
 /// Default fiber backend backed by krio-fiber. Stateless — the
@@ -159,7 +204,14 @@ impl FiberCfg for KrioFiberBackend {
         // Hand ownership to the caller via raw pointer. Reclaimed by
         // an eventual `krio_fiber_free`.
         let boxed = Box::new(fiber);
-        Box::into_raw(boxed) as *mut FiberRepr
+        let ptr = Box::into_raw(boxed) as *mut FiberRepr;
+        // Record the fiber under the task driving right now so a cancel of
+        // that task can free it.
+        let task = FIBER_TASK_ID.with(|c| c.get());
+        TASK_FIBERS.with(|m| {
+            m.borrow_mut().entry(task).or_default().insert(ptr as usize);
+        });
+        ptr
     }
 
     unsafe fn fiber_resume(&self, fiber: *mut FiberRepr) -> i64 {
@@ -223,6 +275,13 @@ impl FiberCfg for KrioFiberBackend {
         let key = fiber as usize;
         ERROR_MAP.with(|m| {
             m.borrow_mut().remove(&key);
+        });
+        // Drop the fiber from its owning task's set so a later
+        // `free_task_fibers` can't double-free it.
+        TASK_FIBERS.with(|m| {
+            for set in m.borrow_mut().values_mut() {
+                set.remove(&key);
+            }
         });
         // Reclaim ownership handed out by `fiber_new`'s `Box::into_raw`.
         // Dropping the box unmaps the fiber's stack + guard page.

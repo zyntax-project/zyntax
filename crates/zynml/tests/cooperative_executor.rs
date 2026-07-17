@@ -173,3 +173,47 @@ fn timeout_cancels_overrunning_task() {
         "the timed-out task's timer must be deregistered"
     );
 }
+
+/// Cancelling (here via timeout) a task that owns a fiber frees that
+/// fiber — a cancelled task never runs its normal scope-exit FiberDrop,
+/// so the executor tears it down. Verifies the fiber is gone from the
+/// per-task registry and nothing double-frees / crashes.
+#[test]
+fn timeout_frees_a_fiber_owning_tasks_fiber() {
+    use zyntax_embed::host_futures::task_fiber_count;
+
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    compile(
+        &mut rt,
+        r#"
+        fiber def gen(): i64 {
+            yield 1
+            yield 2
+            yield 3
+        }
+        async def main(): i64 {
+            let f = gen()
+            let mut sum: i64 = 0
+            while let Some(x) = f.next() {
+                await sleep(500)
+                sum = sum + x
+            }
+            return sum
+        }
+        "#,
+    );
+
+    let p = rt.call_async("main", &[]).expect("call main");
+    // Times out after the fiber is created + first step, well before the
+    // 500ms sleep — so the task is cancelled mid-drive, holding the fiber.
+    let r = p.await_with_timeout(Duration::from_millis(50));
+    assert!(r.is_err(), "should time out mid-drive");
+
+    // The single task drove as index 0; its fiber was freed on cancel.
+    assert_eq!(
+        task_fiber_count(0),
+        0,
+        "the cancelled task's fiber must be freed, not leaked"
+    );
+    assert!(!has_pending_timers(), "timed-out task's timer deregistered");
+}
