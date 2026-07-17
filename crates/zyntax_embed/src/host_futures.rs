@@ -156,6 +156,35 @@ thread_local! {
     /// tests that only exercise the FutureTable itself.
     static COMPLETE_TASK_CALLBACK: RefCell<Option<CompleteTaskFn>> =
         const { RefCell::new(None) };
+
+    /// Synchronous-completion latch. The native host bridges (e.g.
+    /// `__zyntax_async_set_timeout`) resolve synchronously and re-poll
+    /// the state machine recursively, so a task can run to completion
+    /// entirely within a single top-level `poll()` — yet the outer poll
+    /// frames still return Pending. Without this the scheduler would
+    /// re-poll a state machine that already ran its completion path
+    /// (freeing resources — e.g. a driven fiber — which the re-poll then
+    /// touches → use-after-free). `complete_task` records the result
+    /// here; the scheduler checks it after each poll and treats a
+    /// synchronously-completed task as Ready instead of re-polling.
+    static SYNC_COMPLETION: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// Arm the synchronous-completion latch for the next poll: clear any
+/// stale value and install a `complete_task` callback that records the
+/// result. Idempotent — safe to call before every poll on the driving
+/// thread.
+pub fn arm_sync_completion() {
+    SYNC_COMPLETION.with(|c| c.set(None));
+    set_complete_task_callback(Box::new(|_task_id, value| {
+        SYNC_COMPLETION.with(|c| c.set(Some(value)));
+    }));
+}
+
+/// Take the synchronous-completion result if the last poll completed the
+/// task inline (via a nested resolve → `complete_task`). Clears the latch.
+pub fn take_sync_completion() -> Option<i64> {
+    SYNC_COMPLETION.with(|c| c.take())
 }
 
 /// Signature for the top-level task completion callback. Receives

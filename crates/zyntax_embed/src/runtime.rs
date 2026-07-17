@@ -4226,10 +4226,21 @@ impl ZyntaxPromise {
                     // New ABI: poll(state_machine: *mut u8) -> i64
                     // Return value: 0 = Pending, positive = Ready(value), negative = Failed
 
+                    // Arm the synchronous-completion latch: native host
+                    // bridges resolve inline and re-poll recursively, so
+                    // this poll may run the SM to completion even though it
+                    // returns Pending at the outer frame. If so, take the
+                    // Ready value instead of returning Pending (which would
+                    // make the scheduler re-poll an already-finished SM —
+                    // and re-touch resources its completion path freed).
+                    crate::host_futures::arm_sync_completion();
                     let f: extern "C" fn(*mut u8) -> i64 = std::mem::transmute(poll_fn);
                     let result = f(state_machine);
+                    let sync_done = crate::host_futures::take_sync_completion();
 
-                    if result == 0 {
+                    if let Some(v) = sync_done {
+                        inner.state = PromiseState::Ready(ZyntaxValue::Int(v));
+                    } else if result == 0 {
                         // Pending - state remains unchanged
                     } else if result < 0 {
                         // Negative value indicates failure
