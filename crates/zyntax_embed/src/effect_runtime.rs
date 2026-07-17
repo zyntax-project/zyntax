@@ -529,20 +529,44 @@ pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> 
 
         let mut iter = 0u32;
         loop {
+            let rc = poll_fn(r.state_machine_ptr);
+            if rc != 0 {
+                return rc;
+            }
+            // Pending. If the resumed caller reached a real suspension
+            // point after this resume — an `await` inside the `@effect`
+            // fn continuation — its poll fn parked on a future in the
+            // timer queue. Rather than busy-spin the poll fn (which never
+            // makes progress on its own; the timer queue is what advances
+            // the awaited future), cooperatively drive the nearest timer
+            // and re-poll. This is the parking-handler substrate: a
+            // continuation that awaits no longer burns LOOP_BUDGET and
+            // panics — it waits out its timer and resumes. Driving the
+            // timer may advance a different task's SM (interleaving); the
+            // handler-segment bracket inside `drive_next_timer_with_task`
+            // keeps each task's `with`-block state isolated across that.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if crate::host_futures::has_pending_timers() {
+                    let _ = crate::host_futures::drive_next_timer_with_task();
+                    continue;
+                }
+            }
+            // No timer to drive and still Pending: genuine no-progress.
+            // Count these toward the budget so a stuck state machine still
+            // panics with actionable context (a legitimate await always
+            // has a pending timer, so it never reaches this arm).
             iter = iter.saturating_add(1);
             if iter > LOOP_BUDGET {
                 panic!(
                     "__zyntax_effect_resume inner poll loop exceeded {} \
-                     iterations without Ready (state_machine_ptr={:p}, \
-                     next_state={}, value={}, depth={}). poll_fn keeps \
-                     returning Pending (rc=0); the state machine is stuck \
-                     in a state that never reaches a Return.",
+                     iterations without Ready and no pending timer to drive \
+                     (state_machine_ptr={:p}, next_state={}, value={}, \
+                     depth={}). poll_fn keeps returning Pending (rc=0); the \
+                     state machine is stuck in a state that never reaches a \
+                     Return.",
                     LOOP_BUDGET, r.state_machine_ptr, r.next_state, value, depth
                 );
-            }
-            let rc = poll_fn(r.state_machine_ptr);
-            if rc != 0 {
-                return rc;
             }
         }
     }
