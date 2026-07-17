@@ -121,6 +121,9 @@ pub use iterator::{
     ZrtlIteratorExt, ZrtlRangeIterator, ZyntaxArrayIterator, ZyntaxStringBytesIterator,
     ZyntaxStringCharsIterator, ZyntaxValueIterator,
 };
+/// Cooperative multi-task driver (native only — wasm is JS-event-loop driven).
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub use runtime::drive_tasks;
 #[cfg(feature = "native")]
 pub use runtime::{
     // Async ABI types

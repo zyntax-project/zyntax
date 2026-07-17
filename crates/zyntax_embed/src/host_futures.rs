@@ -157,34 +157,104 @@ thread_local! {
     static COMPLETE_TASK_CALLBACK: RefCell<Option<CompleteTaskFn>> =
         const { RefCell::new(None) };
 
-    /// Synchronous-completion latch. The native host bridges (e.g.
-    /// `__zyntax_async_set_timeout`) resolve synchronously and re-poll
-    /// the state machine recursively, so a task can run to completion
-    /// entirely within a single top-level `poll()` — yet the outer poll
-    /// frames still return Pending. Without this the scheduler would
-    /// re-poll a state machine that already ran its completion path
-    /// (freeing resources — e.g. a driven fiber — which the re-poll then
-    /// touches → use-after-free). `complete_task` records the result
-    /// here; the scheduler checks it after each poll and treats a
-    /// synchronously-completed task as Ready instead of re-polling.
-    static SYNC_COMPLETION: Cell<Option<i64>> = const { Cell::new(None) };
+    /// Id of the task the executor is currently driving. The state
+    /// machine's `register_future` call hardcodes task_id 0 (codegen
+    /// doesn't thread a per-task id yet), so the multi-task executor
+    /// stamps the real id here before each poll/resolve; `register_future`
+    /// picks it up so a parked future knows which task it belongs to and
+    /// completion routes back to the right promise. Single-task drivers
+    /// leave it at 0.
+    static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
 }
 
-/// Arm the synchronous-completion latch for the next poll: clear any
-/// stale value and install a `complete_task` callback that records the
-/// result. Idempotent — safe to call before every poll on the driving
-/// thread.
-pub fn arm_sync_completion() {
-    SYNC_COMPLETION.with(|c| c.set(None));
-    set_complete_task_callback(Box::new(|_task_id, value| {
-        SYNC_COMPLETION.with(|c| c.set(Some(value)));
-    }));
+/// Set the id of the task about to be driven (see `CURRENT_TASK_ID`).
+pub fn set_current_task_id(id: i64) {
+    CURRENT_TASK_ID.with(|c| c.set(id));
 }
 
-/// Take the synchronous-completion result if the last poll completed the
-/// task inline (via a nested resolve → `complete_task`). Clears the latch.
-pub fn take_sync_completion() -> Option<i64> {
-    SYNC_COMPLETION.with(|c| c.take())
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// Pending native timers: `(deadline, future handle)`. The cooperative
+    /// executor sleeps until the nearest deadline, then resolves that
+    /// handle's future — re-driving the parked state machine one step.
+    /// This replaces the old synchronous `thread::sleep` + inline resolve
+    /// inside `__zyntax_async_set_timeout`, so a task parks (returns
+    /// Pending) instead of blocking the thread, and multiple tasks can
+    /// interleave. On wasm the JS event loop plays this role, so the queue
+    /// is native-only.
+    static TIMER_QUEUE: RefCell<Vec<(web_time::Instant, i64)>> =
+        RefCell::new(Vec::new());
+}
+
+/// Schedule `handle`'s future to resolve after `ms` milliseconds. Records
+/// the deadline and returns immediately (the cooperative-park replacement
+/// for a blocking sleep).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn schedule_timer(handle: i64, ms: i64) {
+    let deadline = web_time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64);
+    TIMER_QUEUE.with(|q| q.borrow_mut().push((deadline, handle)));
+}
+
+/// True if any native timer is pending.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn has_pending_timers() -> bool {
+    TIMER_QUEUE.with(|q| !q.borrow().is_empty())
+}
+
+/// Drive the nearest pending timer: sleep until its deadline, then resolve
+/// its future (advancing the parked SM one step). Returns the resolve
+/// outcome, or `None` if no timers are pending.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drive_next_timer() -> Option<ResolveOutcome> {
+    let entry = TIMER_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            return None;
+        }
+        // Pop the earliest-deadline entry (small N — linear scan is fine).
+        let mut min_i = 0;
+        for i in 1..q.len() {
+            if q[i].0 < q[min_i].0 {
+                min_i = i;
+            }
+        }
+        Some(q.swap_remove(min_i))
+    })?;
+    let (deadline, handle) = entry;
+    let now = web_time::Instant::now();
+    if deadline > now {
+        std::thread::sleep(deadline - now);
+    }
+    Some(resolve_future(handle, 0))
+}
+
+/// Like [`drive_next_timer`], but also returns the id of the task whose
+/// future was resolved (so a multi-task executor can route the outcome
+/// back to the right promise). Sets `CURRENT_TASK_ID` to that task before
+/// resolving, so any re-park inside the resolve stamps the same id.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drive_next_timer_with_task() -> Option<(i64, ResolveOutcome)> {
+    let entry = TIMER_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            return None;
+        }
+        let mut min_i = 0;
+        for i in 1..q.len() {
+            if q[i].0 < q[min_i].0 {
+                min_i = i;
+            }
+        }
+        Some(q.swap_remove(min_i))
+    })?;
+    let (deadline, handle) = entry;
+    let task_id = FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|p| p.task_id).unwrap_or(0));
+    set_current_task_id(task_id);
+    let now = web_time::Instant::now();
+    if deadline > now {
+        std::thread::sleep(deadline - now);
+    }
+    Some((task_id, resolve_future(handle, 0)))
 }
 
 /// Signature for the top-level task completion callback. Receives
@@ -412,6 +482,14 @@ pub extern "C" fn __zyntax_register_future(
     refcount_offset: i64,
     task_id: i64,
 ) -> i64 {
+    // Codegen hardcodes task_id 0; when the executor is driving a specific
+    // task it stamps the real id in `CURRENT_TASK_ID`. Prefer an explicit
+    // non-zero task_id if one is ever threaded through.
+    let task_id = if task_id == 0 {
+        CURRENT_TASK_ID.with(|c| c.get())
+    } else {
+        task_id
+    };
     register_future(ParkedFuture {
         poll_fn_ptr,
         state_machine_ptr,

@@ -4226,21 +4226,16 @@ impl ZyntaxPromise {
                     // New ABI: poll(state_machine: *mut u8) -> i64
                     // Return value: 0 = Pending, positive = Ready(value), negative = Failed
 
-                    // Arm the synchronous-completion latch: native host
-                    // bridges resolve inline and re-poll recursively, so
-                    // this poll may run the SM to completion even though it
-                    // returns Pending at the outer frame. If so, take the
-                    // Ready value instead of returning Pending (which would
-                    // make the scheduler re-poll an already-finished SM —
-                    // and re-touch resources its completion path freed).
-                    crate::host_futures::arm_sync_completion();
+                    // Drive the state machine one step. Under the cooperative
+                    // executor the host bridges park a timer and return, so
+                    // this poll advances to the next suspension (Pending) or
+                    // to completion (non-zero); it never runs the whole task
+                    // inline. Completion of a parked task happens later via
+                    // `resolve_future` in the executor's timer loop.
                     let f: extern "C" fn(*mut u8) -> i64 = std::mem::transmute(poll_fn);
                     let result = f(state_machine);
-                    let sync_done = crate::host_futures::take_sync_completion();
 
-                    if let Some(v) = sync_done {
-                        inner.state = PromiseState::Ready(ZyntaxValue::Int(v));
-                    } else if result == 0 {
+                    if result == 0 {
                         // Pending - state remains unchanged
                     } else if result < 0 {
                         // Negative value indicates failure
@@ -4370,20 +4365,46 @@ impl ZyntaxPromise {
 
     /// Block until the promise completes and return the raw value
     pub fn await_raw(&self) -> RuntimeResult<ZyntaxValue> {
+        // Initial drive: advance the state machine to its first suspension
+        // (which parks a timer via `__zyntax_async_set_timeout`) or to
+        // completion.
+        match self.poll() {
+            PromiseState::Ready(value) => return Ok(value),
+            PromiseState::Failed(err) => return Err(RuntimeError::Promise(err)),
+            PromiseState::Cancelled => {
+                return Err(RuntimeError::Promise("Promise was cancelled".to_string()))
+            }
+            PromiseState::Pending => {}
+        }
+
+        // Cooperative driving: sleep to the nearest parked timer, resolve
+        // it (re-driving the SM one step), and repeat until Ready. On wasm
+        // the JS event loop drives resolution instead, so we just spin.
         loop {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                match crate::host_futures::drive_next_timer() {
+                    Some(crate::host_futures::ResolveOutcome::Ready(v)) => {
+                        let ready = ZyntaxValue::Int(v);
+                        self.state.lock().unwrap().state = PromiseState::Ready(ready.clone());
+                        return Ok(ready);
+                    }
+                    // ReParked / UnknownHandle: more timers to drive.
+                    Some(_) => continue,
+                    // No pending timer — the task can't make progress via a
+                    // timer. Fall through to a re-poll (another mechanism may
+                    // have advanced it) then yield.
+                    None => {}
+                }
+            }
+
             match self.poll() {
-                PromiseState::Pending => {
-                    std::thread::yield_now();
-                }
-                PromiseState::Ready(value) => {
-                    return Ok(value);
-                }
-                PromiseState::Failed(err) => {
-                    return Err(RuntimeError::Promise(err));
-                }
+                PromiseState::Ready(value) => return Ok(value),
+                PromiseState::Failed(err) => return Err(RuntimeError::Promise(err)),
                 PromiseState::Cancelled => {
-                    return Err(RuntimeError::Promise("Promise was cancelled".to_string()));
+                    return Err(RuntimeError::Promise("Promise was cancelled".to_string()))
                 }
+                PromiseState::Pending => std::thread::yield_now(),
             }
         }
     }
@@ -4589,6 +4610,74 @@ impl Clone for ZyntaxPromise {
             state: self.state.clone(),
         }
     }
+}
+
+/// Drive multiple async tasks cooperatively to completion, interleaving
+/// them via the shared timer queue: while one task is parked on its
+/// `await` timer, another advances. Each task is stamped with its slice
+/// index as its task id so completion routes back to the right promise.
+/// Returns each task's result in order.
+///
+/// This is the multi-task counterpart to `ZyntaxPromise::await_raw`: the
+/// single-task version drains only its own timers, this one drains all
+/// tasks' timers in deadline order, so two tasks each doing `await sleep`
+/// overlap instead of running one-after-the-other.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drive_tasks(promises: &[ZyntaxPromise]) -> Vec<RuntimeResult<ZyntaxValue>> {
+    use crate::host_futures::{drive_next_timer_with_task, set_current_task_id, ResolveOutcome};
+
+    // Initial drive: poll each task once (parks its first `await` timer,
+    // stamped with its index, or completes synchronously).
+    for (i, p) in promises.iter().enumerate() {
+        set_current_task_id(i as i64);
+        let _ = p.poll();
+    }
+
+    // Cooperative loop: resolve the nearest pending timer, route completion
+    // to the owning task, until all tasks are done.
+    while !promises.iter().all(|p| p.is_complete()) {
+        match drive_next_timer_with_task() {
+            Some((task_id, ResolveOutcome::Ready(v))) => {
+                if let Some(p) = promises.get(task_id as usize) {
+                    p.state.lock().unwrap().state = PromiseState::Ready(ZyntaxValue::Int(v));
+                }
+            }
+            // ReParked / UnknownHandle: keep draining timers.
+            Some(_) => {}
+            None => {
+                // No timers pending yet some task is unfinished — re-poll the
+                // pending ones (a task may complete synchronously without an
+                // await). If none progress, avoid a hot spin.
+                let mut progressed = false;
+                for (i, p) in promises.iter().enumerate() {
+                    if p.is_pending() {
+                        set_current_task_id(i as i64);
+                        let _ = p.poll();
+                        if !p.is_pending() {
+                            progressed = true;
+                        }
+                    }
+                }
+                if !progressed && !crate::host_futures::has_pending_timers() {
+                    break;
+                }
+            }
+        }
+    }
+
+    promises
+        .iter()
+        .map(|p| match p.state() {
+            PromiseState::Ready(v) => Ok(v),
+            PromiseState::Failed(e) => Err(RuntimeError::Promise(e)),
+            PromiseState::Cancelled => {
+                Err(RuntimeError::Promise("Promise was cancelled".to_string()))
+            }
+            PromiseState::Pending => {
+                Err(RuntimeError::Promise("Task did not complete".to_string()))
+            }
+        })
+        .collect()
 }
 
 // ============================================================================

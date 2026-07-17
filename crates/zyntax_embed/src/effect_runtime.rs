@@ -601,26 +601,15 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm_by_offset(
 #[cfg(not(target_arch = "wasm32"))]
 #[no_mangle]
 pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
-    // Native path: synchronous sleep + inline resolve on the same
-    // thread that registered the future. This is the simplest
-    // shape that round-trips through the FutureTable correctly
-    // (which is thread-local) and is sufficient for native
-    // semantics — "async sleep" on a multi-threaded host just
-    // means the calling thread blocks for `ms` ms, like any
-    // blocking I/O. The cooperative-yield-to-event-loop concept
-    // is wasm-specific (single-threaded event loop); native
-    // callers that want true async cooperation should drive their
-    // SMs via the existing tokio-backed ZyntaxPromise plumbing.
-    //
-    // The cooperative-parking machinery still runs (the SM polls
-    // call `__zyntax_register_future` before this function, this
-    // function calls `resolve_future` which advances the SM by
-    // one poll). The only thing native skips is "yield control
-    // back to a JS event loop while waiting" — there's no event
-    // loop to yield to.
-    let ms_u64 = ms.max(0) as u64;
-    std::thread::sleep(std::time::Duration::from_millis(ms_u64));
-    crate::host_futures::resolve_future(handle, 0);
+    // Cooperative native path: record a timer for `handle` and return
+    // immediately. The state machine's poll then returns Pending (parks)
+    // instead of the thread blocking inline. The cooperative executor
+    // (the promise driver) sleeps until the nearest deadline and resolves
+    // the future, re-driving the parked SM one step. This is the native
+    // analogue of the wasm `setTimeout(ms, () => resolve_future(handle))`
+    // event-loop bridge and lets multiple tasks interleave: while one task
+    // is parked on its timer, the executor can advance another.
+    crate::host_futures::schedule_timer(handle, ms);
 }
 
 // Wasm32: Rust-side stub. The actual bridge call gets emitted by

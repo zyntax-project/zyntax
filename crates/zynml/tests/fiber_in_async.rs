@@ -56,11 +56,10 @@ fn async_drives_fiber_no_await() {
 /// Await INSIDE the fiber-driving loop — the full composition. Two fixes
 /// make it work: (1) captures-lift SSA reconstruction so the fiber handle
 /// is saved/restored across the await (`repair_ssa_for_reloads`), and
-/// (2) a synchronous-completion latch in the scheduler so a task that
-/// runs to completion inside one recursive `poll()` (the native bridge
-/// resolves inline) is seen as Ready instead of being re-polled — the
-/// re-poll used to re-enter the state machine and resume the fiber the
-/// loop-exit path had already freed.
+/// (2) the cooperative executor — `await` parks a timer and returns, and
+/// the driver resolves it once, so the state machine is never re-polled
+/// after completion (the old synchronous-recursive bridge re-entered the
+/// SM and resumed the fiber the loop-exit path had already freed).
 #[test]
 fn async_drives_fiber_with_await_in_loop() {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");

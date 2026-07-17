@@ -103,20 +103,32 @@ fn async_set_timeout_resolves_after_at_least_ms() {
 }
 
 #[test]
-fn async_set_timeout_symbol_is_callable_natively() {
-    // Phase I.4a changed the native impl from "spawn worker thread"
-    // to "synchronous sleep + inline resolve_future" so the
-    // FutureTable's thread-local nature works cleanly. The function
-    // now blocks the calling thread for `ms` ms — like any blocking
-    // I/O — and resolves any registered future for the given
-    // handle inline before returning. With an unknown handle (as in
-    // this smoke test), resolve_future is a no-op.
+fn async_set_timeout_is_cooperative_non_blocking() {
+    // The cooperative native impl records a timer and returns
+    // immediately (it does NOT block the calling thread) — the SM
+    // parks and the executor sleeps to the deadline later, via
+    // `drive_next_timer`. Assert it returns fast and scheduled a timer.
+    use zyntax_embed::host_futures::{drive_next_timer, has_pending_timers};
+
+    clear_for_tests();
     let start = Instant::now();
     __zyntax_async_set_timeout(123456, 50);
     let elapsed = start.elapsed();
     assert!(
-        elapsed.as_millis() >= 45,
-        "__zyntax_async_set_timeout should block for the requested duration; took {:?}",
+        elapsed.as_millis() < 25,
+        "cooperative set_timeout must return immediately, not block; took {:?}",
         elapsed
     );
+    assert!(has_pending_timers(), "a timer should be scheduled");
+
+    // Draining the timer sleeps to the deadline, then resolves the
+    // (unknown) handle — a no-op resolve, but it blocks here, not in
+    // set_timeout, and only when the executor chooses to.
+    let drain_start = Instant::now();
+    let _ = drive_next_timer();
+    assert!(
+        drain_start.elapsed().as_millis() >= 45,
+        "draining the timer should wait out the deadline"
+    );
+    assert!(!has_pending_timers(), "timer consumed");
 }
