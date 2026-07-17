@@ -1270,6 +1270,11 @@ impl CraneliftBackend {
                             type_cache.insert(ty.clone(), cranelift_ty);
                         }
                     }
+                    HirInstruction::ExtractUnionValue { ty, .. } => {
+                        if let Ok(cranelift_ty) = self.translate_type(ty) {
+                            type_cache.insert(ty.clone(), cranelift_ty);
+                        }
+                    }
                     HirInstruction::Alloca { ty, .. } => {
                         if let Ok(cranelift_ty) = self.translate_type(ty) {
                             type_cache.insert(ty.clone(), cranelift_ty);

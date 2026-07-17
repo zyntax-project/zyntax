@@ -3136,6 +3136,11 @@ impl SsaBuilder {
             return Bitcast;
         }
 
+        if matches!(source_ty, HirType::Bool) && Self::int_type_width_and_sign(target_ty).is_some()
+        {
+            return ZExt;
+        }
+
         if let (Some((src_bits, src_signed)), Some((dst_bits, _dst_signed))) = (
             Self::int_type_width_and_sign(source_ty),
             Self::int_type_width_and_sign(target_ty),
@@ -10108,62 +10113,34 @@ impl SsaBuilder {
                 target: test_block_id,
             };
 
-            // In test block: check if pattern matches
-            let pattern_matches = self.translate_pattern_test(
+            // Nested variant payloads must only be inspected after the outer
+            // discriminant succeeds. Lower the pattern as control flow rather
+            // than an eager boolean expression so an inactive union payload is
+            // never reinterpreted as the nested enum type.
+            let pattern_success_id = if arm.guard.is_some() {
+                let guard_block_id = HirId::new();
+                self.function
+                    .blocks
+                    .insert(guard_block_id, HirBlock::new(guard_block_id));
+                self.definitions.insert(guard_block_id, IndexMap::new());
+                guard_block_id
+            } else {
+                body_block_id
+            };
+            self.translate_pattern_branch(
                 test_block_id,
                 &arm.pattern,
                 scrutinee_val,
                 &match_expr.scrutinee.ty,
+                pattern_success_id,
+                next_block_id,
             )?;
 
-            // If guard exists, evaluate it and AND with pattern match result
-            let final_condition = if let Some(guard_expr) = &arm.guard {
-                let guard_val = self.translate_expression(test_block_id, guard_expr)?;
-
-                // Create AND: pattern_matches && guard
-                let and_result = self.create_value(HirType::Bool, HirValueKind::Instruction);
-                let and_inst = HirInstruction::Binary {
-                    op: crate::hir::BinaryOp::And,
-                    result: and_result,
-                    ty: HirType::Bool,
-                    left: pattern_matches,
-                    right: guard_val,
-                };
-
-                self.add_instruction(test_block_id, and_inst);
-                self.add_use(pattern_matches, and_result);
-                self.add_use(guard_val, and_result);
-
-                and_result
-            } else {
-                pattern_matches
-            };
-
-            // Conditional branch: if pattern matches (and guard passes), go to body, else next arm
-            self.function
-                .blocks
-                .get_mut(&test_block_id)
-                .unwrap()
-                .terminator = HirTerminator::CondBranch {
-                condition: final_condition,
-                true_target: body_block_id,
-                false_target: next_block_id,
-            };
-
-            // Identifier patterns bind values while lowering the test block.
-            // The arm body is reached only through that block's true edge, so
-            // those definitions dominate the body and must seed its SSA map.
-            // Without this propagation, reading a bound payload in the arm
-            // creates an unrelated i64 undef instead of the typed union value.
-            let pattern_bindings = self
-                .definitions
-                .get(&test_block_id)
-                .cloned()
-                .unwrap_or_default();
-            self.definitions
-                .get_mut(&body_block_id)
-                .expect("match body definitions were initialized")
-                .extend(pattern_bindings);
+            if let Some(guard_expr) = &arm.guard {
+                let guard_val = self.translate_expression(pattern_success_id, guard_expr)?;
+                let guard_exit = self.continuation_block.take().unwrap_or(pattern_success_id);
+                self.set_pattern_cond_branch(guard_exit, guard_val, body_block_id, next_block_id);
+            }
 
             // In body block: execute arm body and jump to end
             let arm_result = self.translate_expression(body_block_id, &arm.body)?;
@@ -10492,6 +10469,341 @@ impl SsaBuilder {
 
     /// Test if a pattern matches a scrutinee value
     /// Returns a boolean HIR value indicating match success
+    fn translate_pattern_branch(
+        &mut self,
+        block_id: HirId,
+        pattern: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedPattern>,
+        scrutinee_val: HirId,
+        scrutinee_ty: &Type,
+        true_target: HirId,
+        false_target: HirId,
+    ) -> CompilerResult<()> {
+        use zyntax_typed_ast::typed_ast::TypedPattern;
+
+        match &pattern.node {
+            TypedPattern::Wildcard => {
+                self.set_pattern_branch(block_id, true_target);
+                Ok(())
+            }
+            TypedPattern::Identifier { name, .. } => {
+                self.write_variable(*name, block_id, scrutinee_val);
+                self.var_types
+                    .insert(*name, self.convert_type(scrutinee_ty));
+                self.var_typed_ast_types.insert(*name, scrutinee_ty.clone());
+                self.set_pattern_branch(block_id, true_target);
+                Ok(())
+            }
+            TypedPattern::Enum {
+                name,
+                variant,
+                fields,
+            } => self.translate_enum_pattern_branch(
+                block_id,
+                Some(name),
+                variant,
+                fields,
+                scrutinee_val,
+                scrutinee_ty,
+                true_target,
+                false_target,
+            ),
+            TypedPattern::Constructor {
+                constructor,
+                pattern: inner_pattern,
+            } => {
+                if let Type::Unresolved(variant) = constructor {
+                    let (_, payload_types) =
+                        self.enum_pattern_variant(None, variant, scrutinee_ty)?;
+                    let field_patterns = if payload_types.is_empty() {
+                        &[][..]
+                    } else {
+                        std::slice::from_ref(inner_pattern.as_ref())
+                    };
+                    self.translate_enum_pattern_branch(
+                        block_id,
+                        None,
+                        variant,
+                        field_patterns,
+                        scrutinee_val,
+                        scrutinee_ty,
+                        true_target,
+                        false_target,
+                    )
+                } else {
+                    let condition = self.translate_pattern_test(
+                        block_id,
+                        pattern,
+                        scrutinee_val,
+                        scrutinee_ty,
+                    )?;
+                    let exit_block = self.continuation_block.take().unwrap_or(block_id);
+                    self.set_pattern_cond_branch(exit_block, condition, true_target, false_target);
+                    Ok(())
+                }
+            }
+            _ => {
+                let condition =
+                    self.translate_pattern_test(block_id, pattern, scrutinee_val, scrutinee_ty)?;
+                let exit_block = self.continuation_block.take().unwrap_or(block_id);
+                self.set_pattern_cond_branch(exit_block, condition, true_target, false_target);
+                Ok(())
+            }
+        }
+    }
+
+    fn translate_enum_pattern_branch(
+        &mut self,
+        block_id: HirId,
+        enum_name: Option<&InternedString>,
+        variant_name: &InternedString,
+        field_patterns: &[zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedPattern>],
+        scrutinee_val: HirId,
+        scrutinee_ty: &Type,
+        true_target: HirId,
+        false_target: HirId,
+    ) -> CompilerResult<()> {
+        let (variant_index, payload_types) =
+            self.enum_pattern_variant(enum_name, variant_name, scrutinee_ty)?;
+        if payload_types.len() != field_patterns.len() {
+            return Err(crate::CompilerError::Analysis(format!(
+                "variant `{variant_name}` has {} fields but the pattern supplies {}",
+                payload_types.len(),
+                field_patterns.len()
+            )));
+        }
+
+        let tag_matches = self.emit_enum_pattern_tag_test(block_id, scrutinee_val, variant_index);
+        if field_patterns.is_empty() {
+            self.set_pattern_cond_branch(block_id, tag_matches, true_target, false_target);
+            return Ok(());
+        }
+
+        let payload_block = self.create_pattern_block();
+        self.set_pattern_cond_branch(block_id, tag_matches, payload_block, false_target);
+
+        let payload_hir_types = payload_types
+            .iter()
+            .map(|ty| self.convert_type(ty))
+            .collect::<Vec<_>>();
+        let payload_ty = if payload_hir_types.len() == 1 {
+            payload_hir_types[0].clone()
+        } else {
+            HirType::Struct(crate::hir::HirStructType {
+                name: None,
+                fields: payload_hir_types.clone(),
+                packed: false,
+            })
+        };
+        let payload_val = self.create_value(payload_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            payload_block,
+            HirInstruction::ExtractUnionValue {
+                result: payload_val,
+                ty: payload_ty,
+                union_val: scrutinee_val,
+                variant_index,
+            },
+        );
+        self.add_use(scrutinee_val, payload_val);
+
+        let mut field_values = Vec::with_capacity(field_patterns.len());
+        for (index, field_ty) in payload_hir_types.iter().enumerate() {
+            if payload_hir_types.len() == 1 {
+                field_values.push(payload_val);
+            } else {
+                let field_val = self.create_value(field_ty.clone(), HirValueKind::Instruction);
+                self.add_instruction(
+                    payload_block,
+                    HirInstruction::ExtractValue {
+                        result: field_val,
+                        aggregate: payload_val,
+                        indices: vec![u32::try_from(index).unwrap_or(u32::MAX)],
+                        ty: field_ty.clone(),
+                    },
+                );
+                self.add_use(payload_val, field_val);
+                field_values.push(field_val);
+            }
+        }
+
+        let mut current_block = payload_block;
+        for (index, ((field_pattern, field_type), field_value)) in field_patterns
+            .iter()
+            .zip(payload_types.iter())
+            .zip(field_values)
+            .enumerate()
+        {
+            let field_success = if index + 1 == field_patterns.len() {
+                true_target
+            } else {
+                self.create_pattern_block()
+            };
+            self.translate_pattern_branch(
+                current_block,
+                field_pattern,
+                field_value,
+                field_type,
+                field_success,
+                false_target,
+            )?;
+            current_block = field_success;
+        }
+        Ok(())
+    }
+
+    fn enum_pattern_variant(
+        &self,
+        enum_name: Option<&InternedString>,
+        variant_name: &InternedString,
+        scrutinee_ty: &Type,
+    ) -> CompilerResult<(u32, Vec<Type>)> {
+        match scrutinee_ty {
+            Type::Named { id, type_args, .. } => {
+                let type_def = self.type_registry.get_type_by_id(*id).ok_or_else(|| {
+                    crate::CompilerError::Analysis(format!(
+                        "enum pattern refers to unknown type {id:?}"
+                    ))
+                })?;
+                if let Some(enum_name) = enum_name {
+                    if type_def.name != *enum_name {
+                        return Err(crate::CompilerError::Analysis(format!(
+                            "enum pattern names `{enum_name}` but the scrutinee is `{}`",
+                            type_def.name
+                        )));
+                    }
+                }
+                let zyntax_typed_ast::TypeKind::Enum { variants } = &type_def.kind else {
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "pattern type `{}` is not an enum",
+                        type_def.name
+                    )));
+                };
+                let (index, variant) = variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, variant)| variant.name == *variant_name)
+                    .ok_or_else(|| {
+                        crate::CompilerError::Analysis(format!(
+                            "unknown variant `{variant_name}` for enum `{}`",
+                            type_def.name
+                        ))
+                    })?;
+                let declared_types = match &variant.fields {
+                    zyntax_typed_ast::VariantFields::Unit => vec![],
+                    zyntax_typed_ast::VariantFields::Tuple(types) => types.clone(),
+                    zyntax_typed_ast::VariantFields::Named(fields) => {
+                        fields.iter().map(|field| field.ty.clone()).collect()
+                    }
+                };
+                let payload_types = declared_types
+                    .into_iter()
+                    .map(|ty| {
+                        zyntax_typed_ast::TypeRegistry::substitute_type_params(
+                            &ty,
+                            &type_def.type_params,
+                            type_args,
+                        )
+                    })
+                    .collect();
+                Ok((u32::try_from(index).unwrap_or(u32::MAX), payload_types))
+            }
+            Type::Optional(inner) => {
+                match variant_name.resolve_global().as_deref() {
+                    Some("Some") => Ok((1, vec![inner.as_ref().clone()])),
+                    Some("None") => Ok((0, vec![])),
+                    _ => Err(crate::CompilerError::Analysis(format!(
+                        "unknown variant `{variant_name}` for Option"
+                    ))),
+                }
+            }
+            Type::Result { ok_type, err_type } => {
+                match variant_name.resolve_global().as_deref() {
+                    Some("Ok") => Ok((0, vec![ok_type.as_ref().clone()])),
+                    Some("Err") => Ok((1, vec![err_type.as_ref().clone()])),
+                    _ => Err(crate::CompilerError::Analysis(format!(
+                        "unknown variant `{variant_name}` for Result"
+                    ))),
+                }
+            }
+            _ => Err(crate::CompilerError::Analysis(format!(
+                "enum variant pattern `{variant_name}` requires an enum scrutinee, found {scrutinee_ty:?}"
+            ))),
+        }
+    }
+
+    fn emit_enum_pattern_tag_test(
+        &mut self,
+        block_id: HirId,
+        scrutinee_val: HirId,
+        variant_index: u32,
+    ) -> HirId {
+        let tag_val = self.create_value(HirType::U32, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::GetUnionDiscriminant {
+                result: tag_val,
+                union_val: scrutinee_val,
+            },
+        );
+        self.add_use(scrutinee_val, tag_val);
+        let expected_val = self.create_value(
+            HirType::U32,
+            HirValueKind::Constant(crate::hir::HirConstant::U32(variant_index)),
+        );
+        let tag_matches = self.create_value(HirType::Bool, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: crate::hir::BinaryOp::Eq,
+                result: tag_matches,
+                ty: HirType::U32,
+                left: tag_val,
+                right: expected_val,
+            },
+        );
+        self.add_use(tag_val, tag_matches);
+        self.add_use(expected_val, tag_matches);
+        tag_matches
+    }
+
+    fn create_pattern_block(&mut self) -> HirId {
+        let block_id = HirId::new();
+        self.function
+            .blocks
+            .insert(block_id, HirBlock::new(block_id));
+        self.definitions.insert(block_id, IndexMap::new());
+        block_id
+    }
+
+    fn set_pattern_branch(&mut self, block_id: HirId, target: HirId) {
+        self.function.blocks.get_mut(&block_id).unwrap().terminator =
+            HirTerminator::Branch { target };
+        self.propagate_pattern_definitions(block_id, target);
+    }
+
+    fn set_pattern_cond_branch(
+        &mut self,
+        block_id: HirId,
+        condition: HirId,
+        true_target: HirId,
+        false_target: HirId,
+    ) {
+        self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::CondBranch {
+            condition,
+            true_target,
+            false_target,
+        };
+        self.propagate_pattern_definitions(block_id, true_target);
+    }
+
+    fn propagate_pattern_definitions(&mut self, source: HirId, target: HirId) {
+        let definitions = self.definitions.get(&source).cloned().unwrap_or_default();
+        self.definitions
+            .get_mut(&target)
+            .expect("pattern target definitions were initialized")
+            .extend(definitions);
+    }
+
     fn translate_pattern_test(
         &mut self,
         block_id: HirId,

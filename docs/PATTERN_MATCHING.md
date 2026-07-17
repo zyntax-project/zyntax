@@ -604,12 +604,15 @@ HirType::Union(HirUnionType {
 
 ### Current Limitations
 
-1. **Pattern Types**: Only enum variant patterns with single identifier bindings
+1. **Pattern Types**: Enum variants support recursively nested enum patterns
+   through dominance-safe decision blocks. An inner payload is extracted only
+   on the matching outer-variant edge.
    - No tuple destructuring: `Some((x, y))` ❌
-   - No nested patterns: `Some(Ok(x))` ❌
+   - Nested enum patterns: `Some(Ok(x))` ✅
    - No struct patterns in variants: `Some(Point { x, y })` ❌
 
-2. **Custom Enums**: Hardcoded support for Optional and Result only
+2. **Enum Resolution**: Named enums resolve through the `TypeRegistry`;
+   `Optional` and `Result` also support their direct built-in type forms.
    - Need type registry integration for user-defined enums
 
 3. **Guards**: Pattern guards partially implemented
