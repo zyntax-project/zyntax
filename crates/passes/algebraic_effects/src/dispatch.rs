@@ -54,6 +54,9 @@ fn build_handler_declarations(handler: &TypedEffectHandler) -> Vec<TypedNode<Typ
                     body: impl_.body.clone(),
                     visibility: Visibility::Public,
                     is_pure: false,
+                    // An `async def` handler op becomes an async fn: it awaits
+                    // in its body and parks the performer until it resumes.
+                    is_async: impl_.is_async,
                     ..Default::default()
                 }),
                 Type::Primitive(PrimitiveType::Unit),

@@ -2047,6 +2047,9 @@ impl<'g> GrammarInterpreter<'g> {
             .get_field_optional("return_type", fields, state)?
             .unwrap_or(Type::Primitive(PrimitiveType::Unit));
         let body = self.get_field_optional_block("body", fields, state)?;
+        let is_async = self
+            .get_field_optional_bool("is_async", fields, state)?
+            .unwrap_or(false);
 
         Ok(ParsedValue::EffectHandlerImpl(
             zyntax_typed_ast::TypedEffectHandlerImpl {
@@ -2055,6 +2058,7 @@ impl<'g> GrammarInterpreter<'g> {
                 params,
                 return_type,
                 body,
+                is_async,
                 span,
             },
         ))

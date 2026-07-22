@@ -644,13 +644,28 @@ handler_let_field = { "let" ~ name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:
   }
 
 // Handler implementation: def sample<T>(self, ..., resume: Resume<T>): T { body }
-handler_impl = { "def" ~ name:identifier ~ type_params:type_params? ~ "(" ~ params:fn_params? ~ ")" ~ ret:fn_return_clause? ~ body:block }
+// `async def op(...)` handler bodies suspend (await) before resuming the
+// performer. The `async` variant must come first so the keyword matches.
+handler_impl = { handler_impl_async | handler_impl_sync }
+
+handler_impl_async = { "async" ~ "def" ~ name:identifier ~ type_params:type_params? ~ "(" ~ params:fn_params? ~ ")" ~ ret:fn_return_clause? ~ body:block }
   -> TypedEffectHandlerImpl {
       op_name: intern(name),
       type_params: type_params,
       params: params,
       return_type: ret,
       body: Some(body),
+      is_async: true,
+  }
+
+handler_impl_sync = { "def" ~ name:identifier ~ type_params:type_params? ~ "(" ~ params:fn_params? ~ ")" ~ ret:fn_return_clause? ~ body:block }
+  -> TypedEffectHandlerImpl {
+      op_name: intern(name),
+      type_params: type_params,
+      params: params,
+      return_type: ret,
+      body: Some(body),
+      is_async: false,
   }
 
 // ============================================================================

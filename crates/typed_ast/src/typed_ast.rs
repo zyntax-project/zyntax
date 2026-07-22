@@ -329,6 +329,10 @@ pub struct TypedEffectHandlerImpl {
     pub return_type: Type,
     /// Implementation body
     pub body: Option<TypedBlock>,
+    /// Whether the op is declared `async def` — the handler body itself
+    /// suspends (awaits), parking the performer until the handler resumes it.
+    #[serde(default)]
+    pub is_async: bool,
     /// Source span
     #[serde(default)]
     pub span: Span,
