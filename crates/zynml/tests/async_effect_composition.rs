@@ -236,6 +236,36 @@ fn fiber_handle_survives_a_resumable_perform() {
 }
 
 #[test]
+fn call_result_survives_a_resumable_perform() {
+    // A CALL result (not a rematerialisable constant) live across a resumable
+    // perform. `z = helper(3)` needs a real capture slot; it is saved before
+    // the perform and reloaded after. The inliner then inlines `helper`,
+    // rewriting `call_result -> return_value` across the function — but its
+    // hand-rolled operand substitution skipped `AsyncSaveSlot`, so the save
+    // kept pointing at the orphaned call-result id. Codegen drops a save of an
+    // unmapped value, so z reloaded 0 (returned 1 instead of 1 + 6 = 7). The
+    // fix routes operand substitution through the canonical `replace_uses`.
+    assert_eq!(
+        run_program(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E { def op(k: Resume<i64>): i64 { return k(1) } }
+            def helper(a: i64): i64 { return a + a }
+            @effect(E)
+            async def work(): i64 {
+                let z = helper(3)
+                let x = op()
+                return x + z
+            }
+            async def run(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            "#
+        ),
+        Some(7),
+        "a call result live across a resumable perform must survive inlining"
+    );
+}
+
+#[test]
 fn mixed_async_and_sync_handlers_for_one_op() {
     // One operation handled by a sync handler (H1) and an async handler (H2),
     // selected at runtime by which `with` block is in scope. The perform site

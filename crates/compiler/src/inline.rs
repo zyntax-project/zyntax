@@ -1350,76 +1350,19 @@ fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) 
         _ => {}
     }
 
-    let map = |id: &mut HirId| {
-        if let Some(&new) = subs.get(id) {
-            *id = new;
-        }
-    };
-    match inst {
-        HirInstruction::Binary { left, right, .. } => {
-            map(left);
-            map(right);
-        }
-        HirInstruction::Unary { operand, .. } => map(operand),
-        HirInstruction::Cast { operand, .. } => map(operand),
-        HirInstruction::Load { ptr, .. } => map(ptr),
-        HirInstruction::Store { value, ptr, .. } => {
-            map(value);
-            map(ptr);
-        }
-        HirInstruction::GetElementPtr { ptr, indices, .. } => {
-            map(ptr);
-            for i in indices {
-                map(i);
-            }
-        }
-        HirInstruction::Call { args, .. } => {
-            for a in args {
-                map(a);
-            }
-        }
-        HirInstruction::IndirectCall { func_ptr, args, .. } => {
-            map(func_ptr);
-            for a in args {
-                map(a);
-            }
-        }
-        HirInstruction::Select {
-            condition,
-            true_val,
-            false_val,
-            ..
-        } => {
-            map(condition);
-            map(true_val);
-            map(false_val);
-        }
-        HirInstruction::ExtractValue { aggregate, .. } => map(aggregate),
-        HirInstruction::InsertValue {
-            aggregate, value, ..
-        } => {
-            map(aggregate);
-            map(value);
-        }
-        _ => {}
-    }
-    // The result HirId of an instruction also gets substituted —
-    // necessary because we minted fresh ids for callee-defined
-    // values during the clone.
-    match inst {
-        HirInstruction::Binary { result, .. } => map(result),
-        HirInstruction::Unary { result, .. } => map(result),
-        HirInstruction::Cast { result, .. } => map(result),
-        HirInstruction::Load { result, .. } => map(result),
-        HirInstruction::GetElementPtr { result, .. } => map(result),
-        HirInstruction::ExtractValue { result, .. } => map(result),
-        HirInstruction::InsertValue { result, .. } => map(result),
-        HirInstruction::Select { result, .. } => map(result),
-        HirInstruction::Alloca { result, .. } => map(result),
-        HirInstruction::Call {
-            result: Some(r), ..
-        } => map(r),
-        _ => {}
+    // Operand substitution delegates to the canonical, exhaustive
+    // `HirInstruction::replace_uses`. The hand-rolled match this
+    // replaced covered only ~11 variants and fell through for the rest —
+    // silently skipping AsyncSaveSlot / AsyncLoadSlot / PerformEffect /
+    // FiberNew / CreateClosure operands. Inlining a callee whose result
+    // was later saved across a suspend (`AsyncSaveSlot { value:
+    // call_result }`) therefore left the save pointing at the orphaned
+    // call-result id; codegen skips a save of an unmapped value, so the
+    // reloaded slot read 0 after resume. Delegating keeps this in lock-
+    // step with the operand set for every current and future variant.
+    if !subs.is_empty() {
+        let idx: IndexMap<HirId, HirId> = subs.iter().map(|(&k, &v)| (k, v)).collect();
+        inst.replace_uses(&idx);
     }
 }
 
