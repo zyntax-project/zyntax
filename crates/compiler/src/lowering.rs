@@ -2699,11 +2699,43 @@ impl LoweringContext {
             );
             let frame_id_val = mint(HirType::I64, HirValueKind::Instruction);
 
-            // push_handler(effect_id, handler_state, op_table) -> frame_id
+            // Async mask: bit i set = this handler's op at index i (in the
+            // effect's declaration order) is async. Lets a perform under this
+            // `with` scope pick the drive-vs-call convention at runtime, so an
+            // operation can have both async and sync handlers in different
+            // scopes.
+            let async_mask: u64 = {
+                let handler = self
+                    .module
+                    .handlers
+                    .values()
+                    .find(|h| h.name == scope.handler_name);
+                match (handler, self.module.effects.get(&effect_id)) {
+                    (Some(h), Some(effect)) => {
+                        let mut mask = 0u64;
+                        for (idx, op) in effect.operations.iter().enumerate().take(64) {
+                            if h.implementations
+                                .iter()
+                                .any(|i| i.op_name == op.name && i.is_async)
+                            {
+                                mask |= 1u64 << idx;
+                            }
+                        }
+                        mask
+                    }
+                    _ => 0,
+                }
+            };
+            let async_mask_val = mint(
+                HirType::I64,
+                HirValueKind::Constant(HirConstant::I64(async_mask as i64)),
+            );
+
+            // push_handler(effect_id, handler_state, op_table, async_mask) -> frame_id
             let push_inst = HirInstruction::Call {
                 result: Some(frame_id_val),
                 callee: HirCallable::Symbol("__zyntax_effect_push_handler".to_string()),
-                args: vec![effect_id_val, state_val, op_table_addr],
+                args: vec![effect_id_val, state_val, op_table_addr, async_mask_val],
                 type_args: vec![],
                 const_args: vec![],
                 is_tail: false,

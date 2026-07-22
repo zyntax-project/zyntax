@@ -1396,7 +1396,7 @@ fn effect_runtime_symbols_are_registered_at_runtime_construction() {
     let sigs = runtime.plugin_signatures();
 
     for (name, expected_params) in [
-        ("__zyntax_effect_push_handler", 3),
+        ("__zyntax_effect_push_handler", 4),
         ("__zyntax_effect_pop_handler", 1),
         ("__zyntax_effect_lookup_handler", 1),
         ("__zyntax_effect_resume", 2),

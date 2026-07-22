@@ -133,24 +133,3 @@ fn at_with_annotation_is_rejected() {
          (non-frontend-syntax) terms; got: {err}"
     );
 }
-
-/// A resumable effect operation handled by BOTH an async and a non-async
-/// handler is rejected — the perform site cannot pick the calling convention
-/// statically when the handler is chosen at runtime by handler-scope
-/// dispatch. (Lifted when the op-table carries a runtime async bit.)
-#[test]
-fn mixed_async_and_sync_handlers_rejected() {
-    let src = r#"
-        effect E { def op(): i64 }
-        handler H1 for E { def op(k: Resume<i64>): i64 { return k(1) } }
-        handler H2 for E { async def op(k: Resume<i64>): i64 { await sleep(10) return k(2) } }
-        @effect(E)
-        async def work(): i64 { return op() }
-        async def run(): i64 { var v: i64 = 0 with H1 { v = await work() } return v }
-    "#;
-    let err = compile_error(src).expect("mixed async/sync handlers should be a hard error");
-    assert!(
-        err.contains("both async and non-async") && err.contains("op"),
-        "error should name the mixed-async-ness conflict; got: {err}"
-    );
-}

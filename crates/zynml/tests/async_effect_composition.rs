@@ -207,6 +207,47 @@ fn async_handler_multi_shot_simple_performer() {
 }
 
 #[test]
+fn mixed_async_and_sync_handlers_for_one_op() {
+    // One operation handled by a sync handler (H1) and an async handler (H2),
+    // selected at runtime by which `with` block is in scope. The perform site
+    // picks the drive-vs-call convention at runtime (async_mask + finish_op).
+    const SRC: &str = r#"
+        effect E { def op(): i64 }
+        handler H1 for E { def op(k: Resume<i64>): i64 { return k(1) } }
+        handler H2 for E { async def op(k: Resume<i64>): i64 { await sleep(10) return k(2) } }
+        @effect(E)
+        async def work(): i64 { let x = op() return x + 100 }
+        async def runSync(): i64 { var v: i64 = 0 with H1 { v = await work() } return v }
+        async def runAsync(): i64 { var v: i64 = 0 with H2 { v = await work() } return v }
+    "#;
+    let run_entry = |entry: &str| -> Option<i64> {
+        let mut rt = ZyntaxRuntime::new().expect("rt");
+        let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
+        let program = grammar.parse_with_filename(SRC, "<mixed>").expect("parse");
+        rt.config_mut().builtins.insert(
+            "sleep".to_string(),
+            "__zyntax_async_set_timeout".to_string(),
+        );
+        rt.compile_typed_program(program).expect("compile");
+        let p = rt.call_async(entry, &[]).expect("call");
+        drive_tasks(&[p])[0]
+            .as_ref()
+            .ok()
+            .and_then(ZyntaxValue::as_i64)
+    };
+    assert_eq!(
+        run_entry("runSync"),
+        Some(101),
+        "sync handler: k(1) -> 1 -> 101"
+    );
+    assert_eq!(
+        run_entry("runAsync"),
+        Some(102),
+        "async handler: await, then k(2) -> 2 -> 102"
+    );
+}
+
+#[test]
 fn async_handler_tasks_interleave() {
     // Two tasks each perform an effect whose async handler awaits ~50ms.
     // They must OVERLAP (both handlers park, the executor drives both timers

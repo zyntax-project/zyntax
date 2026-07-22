@@ -111,6 +111,13 @@ pub struct HandlerFrame {
     /// returns this; the perform-site indexes into it to find the
     /// concrete op function.
     pub op_table: *mut u8,
+    /// Bit `i` set = this handler's op at index `i` is async (its op fn is
+    /// a promise entry the perform site must drive), clear = synchronous.
+    /// A compile-time constant passed at the `with`-scope push site, so a
+    /// perform under this handler knows whether to drive or call directly
+    /// even when different `with` blocks install async and sync handlers
+    /// for the same operation.
+    pub async_mask: u64,
 }
 
 // HandlerFrame is !Send because of the raw pointers, which is fine
@@ -133,6 +140,7 @@ pub extern "C" fn __zyntax_effect_push_handler(
     effect_id: u64,
     handler_state: *mut u8,
     op_table: *mut u8,
+    async_mask: u64,
 ) -> u64 {
     HANDLER_STACK.with(|stack| {
         let mut s = stack.borrow_mut();
@@ -141,9 +149,44 @@ pub extern "C" fn __zyntax_effect_push_handler(
             effect_id,
             handler_state,
             op_table,
+            async_mask,
         });
         frame_id
     })
+}
+
+/// Whether the active handler for `effect_id`'s op at `op_index` is async.
+/// Returns 1 if async, 0 if sync, and -1 if no handler is in scope (the
+/// perform site then falls back to its compile-time static default). The
+/// perform site uses this to pick the drive-vs-call convention at runtime
+/// for an operation with mixed async/sync handlers.
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_lookup_op_is_async(effect_id: u64, op_index: u64) -> i64 {
+    HANDLER_STACK.with(|stack| {
+        let s = stack.borrow();
+        for frame in s.iter().rev() {
+            if frame.effect_id == effect_id {
+                return ((frame.async_mask >> op_index) & 1) as i64;
+            }
+        }
+        -1
+    })
+}
+
+/// Finish a resumable perform whose handler op was dispatched at runtime.
+/// `raw` is the value the op fn returned: for an async handler it is a
+/// `*Promise` (drive it via `__zyntax_effect_launch_handler` — the perform's
+/// result is the handler's return / park value); for a sync handler it is
+/// the op result directly. `is_async` (0/1) selects. This keeps the perform
+/// site a single straight-line block even for mixed async/sync operations.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_finish_op(raw: i64, is_async: i64, resume_ptr: *mut u8) -> i64 {
+    if is_async != 0 {
+        __zyntax_effect_launch_handler(raw as *mut u8, resume_ptr)
+    } else {
+        raw
+    }
 }
 
 /// Pop a handler frame.
@@ -874,6 +917,15 @@ const fn params3(a: TypeTag, b: TypeTag, c: TypeTag) -> [TypeTag; MAX_PARAMS] {
     p
 }
 
+const fn params4(a: TypeTag, b: TypeTag, c: TypeTag, d: TypeTag) -> [TypeTag; MAX_PARAMS] {
+    let mut p = empty_params();
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+    p
+}
+
 #[allow(clippy::too_many_arguments)]
 const fn params6(
     a: TypeTag,
@@ -907,15 +959,40 @@ const fn params6(
 /// in Phase B.
 #[cfg(feature = "native")]
 pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
-    // push_handler(effect_id: u64, handler_state: *u8, op_table: *u8) -> u64
+    // push_handler(effect_id: u64, handler_state: *u8, op_table: *u8, async_mask: u64) -> u64
     runtime.register_function_typed(
         "__zyntax_effect_push_handler",
         __zyntax_effect_push_handler as *const u8,
         ZrtlSymbolSig {
-            param_count: 3,
+            param_count: 4,
             flags: ZrtlSigFlags::EFFECTFUL,
             return_type: u64_tag(),
-            params: params3(u64_tag(), ptr_tag(), ptr_tag()),
+            params: params4(u64_tag(), ptr_tag(), ptr_tag(), u64_tag()),
+        },
+    );
+
+    // lookup_op_is_async(effect_id: u64, op_index: u64) -> i64 (1/0/-1)
+    runtime.register_function_typed(
+        "__zyntax_effect_lookup_op_is_async",
+        __zyntax_effect_lookup_op_is_async as *const u8,
+        ZrtlSymbolSig {
+            param_count: 2,
+            flags: ZrtlSigFlags::NONE,
+            return_type: TypeTag::I64,
+            params: params2(u64_tag(), u64_tag()),
+        },
+    );
+
+    // finish_op(raw: i64, is_async: i64, resume: *u8) -> i64
+    #[cfg(not(target_arch = "wasm32"))]
+    runtime.register_function_typed(
+        "__zyntax_effect_finish_op",
+        __zyntax_effect_finish_op as *const u8,
+        ZrtlSymbolSig {
+            param_count: 3,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::I64,
+            params: params3(TypeTag::I64, TypeTag::I64, ptr_tag()),
         },
     );
 
@@ -1709,8 +1786,8 @@ mod tests {
     #[test]
     fn push_pop_round_trip_returns_frame_ids() {
         reset_handler_stack_for_test();
-        let id_a = __zyntax_effect_push_handler(1, dummy_ptr(0xaa), dummy_ptr(0xab));
-        let id_b = __zyntax_effect_push_handler(2, dummy_ptr(0xba), dummy_ptr(0xbb));
+        let id_a = __zyntax_effect_push_handler(1, dummy_ptr(0xaa), dummy_ptr(0xab), 0);
+        let id_b = __zyntax_effect_push_handler(2, dummy_ptr(0xba), dummy_ptr(0xbb), 0);
         assert_eq!(id_a, 0, "first push gets frame id 0");
         assert_eq!(id_b, 1, "second push gets frame id 1");
         // LIFO pop: B first, then A.
@@ -1734,8 +1811,8 @@ mod tests {
         let outer_op_table = dummy_ptr(0x100);
         let inner_op_table = dummy_ptr(0x200);
         // Both handlers serve effect_id = 42.
-        let outer = __zyntax_effect_push_handler(42, dummy_ptr(0xaa), outer_op_table);
-        let inner = __zyntax_effect_push_handler(42, dummy_ptr(0xbb), inner_op_table);
+        let outer = __zyntax_effect_push_handler(42, dummy_ptr(0xaa), outer_op_table, 0);
+        let inner = __zyntax_effect_push_handler(42, dummy_ptr(0xbb), inner_op_table, 0);
 
         // Walks top-down → inner wins.
         let found = __zyntax_effect_lookup_handler(42);
@@ -1761,7 +1838,7 @@ mod tests {
     fn lookup_returns_null_when_no_handler_in_scope() {
         reset_handler_stack_for_test();
         // No frame for effect 99.
-        __zyntax_effect_push_handler(1, dummy_ptr(0), dummy_ptr(0));
+        __zyntax_effect_push_handler(1, dummy_ptr(0), dummy_ptr(0), 0);
         let found = __zyntax_effect_lookup_handler(99);
         assert!(
             found.is_null(),

@@ -27,19 +27,32 @@ impl std::fmt::Display for KrioLoweringError {
 
 impl std::error::Error for KrioLoweringError {}
 
-/// A resumable operation handled by both an async and a non-async handler
-/// implementation. A perform site resolves the calling convention (drive the
-/// handler's promise vs. use its return value directly) at compile time, but
-/// which handler runs is chosen at runtime by handler-scope dispatch, so the
-/// convention can't be picked statically. Rejected rather than miscompiled.
-fn mixed_asyncness_error(op_name: zyntax_typed_ast::InternedString) -> KrioLoweringError {
-    KrioLoweringError(format!(
-        "resumable effect operation `{}` has both async and non-async handler \
-         implementations. A perform site cannot select the calling convention statically \
-         when the handler is chosen at runtime — make every handler for this operation \
-         async, or make them all synchronous.",
-        op_name.resolve_global().unwrap_or_default()
-    ))
+/// Record a resolved handler op into `map`, tracking whether the operation
+/// has MIXED async/non-async handlers. The value is
+/// `(static-default fn id, static-default is_async, is_mixed)`. The first
+/// handler seen is the static default; a later handler that disagrees on
+/// async-ness flips `is_mixed`, so the perform site emits a RUNTIME
+/// drive-vs-call branch (via `__zyntax_effect_lookup_op_is_async` +
+/// `__zyntax_effect_finish_op`) instead of a compile-time one.
+fn record_handler_resolution(
+    map: &mut std::collections::HashMap<
+        (HirId, zyntax_typed_ast::InternedString),
+        (HirId, bool, bool),
+    >,
+    key: (HirId, zyntax_typed_ast::InternedString),
+    handler_fn_id: HirId,
+    is_async: bool,
+) {
+    match map.get_mut(&key) {
+        Some(entry) => {
+            if entry.1 != is_async {
+                entry.2 = true;
+            }
+        }
+        None => {
+            map.insert(key, (handler_fn_id, is_async, false));
+        }
+    }
 }
 
 /// Phase I.3b: route resumable-effect fns through krio's
@@ -135,8 +148,10 @@ pub fn apply_krio_effect_lowering(
     // `(effect_id, op_name) → (handler-fn id, is_async)`. The async bit lets
     // the perform-site emitter drive the handler's promise instead of using
     // its return value directly.
-    let mut handler_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), (HirId, bool)> =
-        HashMap::new();
+    let mut handler_resolution: HashMap<
+        (HirId, zyntax_typed_ast::InternedString),
+        (HirId, bool, bool),
+    > = HashMap::new();
     for handler in module.handlers.values() {
         for impl_ in &handler.implementations {
             if !impl_.is_resumable {
@@ -149,14 +164,12 @@ pub fn apply_krio_effect_lowering(
                 .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
                 .map(|(id, _)| *id)
             {
-                let key = (handler.effect_id, impl_.op_name);
-                if let Some(&(_, existing_async)) = handler_resolution.get(&key) {
-                    if existing_async != impl_.is_async {
-                        return Err(mixed_asyncness_error(impl_.op_name));
-                    }
-                } else {
-                    handler_resolution.insert(key, (handler_fn_id, impl_.is_async));
-                }
+                record_handler_resolution(
+                    &mut handler_resolution,
+                    (handler.effect_id, impl_.op_name),
+                    handler_fn_id,
+                    impl_.is_async,
+                );
             }
         }
     }
@@ -289,7 +302,7 @@ pub fn apply_krio_async_lowering(
         // way to reach its handler. Build the same resolution maps it needs.
         let mut handler_resolution: HashMap<
             (HirId, zyntax_typed_ast::InternedString),
-            (HirId, bool),
+            (HirId, bool, bool),
         > = HashMap::new();
         for handler in _module.handlers.values() {
             for impl_ in &handler.implementations {
@@ -303,14 +316,12 @@ pub fn apply_krio_async_lowering(
                     .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
                     .map(|(id, _)| *id)
                 {
-                    let key = (handler.effect_id, impl_.op_name);
-                    if let Some(&(_, existing_async)) = handler_resolution.get(&key) {
-                        if existing_async != impl_.is_async {
-                            return Err(mixed_asyncness_error(impl_.op_name));
-                        }
-                    } else {
-                        handler_resolution.insert(key, (handler_fn_id, impl_.is_async));
-                    }
+                    record_handler_resolution(
+                        &mut handler_resolution,
+                        (handler.effect_id, impl_.op_name),
+                        handler_fn_id,
+                        impl_.is_async,
+                    );
                 }
             }
         }

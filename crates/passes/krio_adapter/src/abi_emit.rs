@@ -1383,7 +1383,7 @@ pub fn lower_perform_effect_calls(
 /// built once by the caller from `module.handlers`.
 pub fn upgrade_resume_struct_at_perform_sites(
     function: &mut HirFunction,
-    handler_resolution: &std::collections::HashMap<(HirId, InternedString), (HirId, bool)>,
+    handler_resolution: &std::collections::HashMap<(HirId, InternedString), (HirId, bool, bool)>,
     op_index_resolution: &std::collections::HashMap<(HirId, InternedString), u64>,
     poll_fn_id: HirId,
     frame_ptr: HirId,
@@ -1399,6 +1399,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
         perform_result_temp: HirId,
         handler_fn_id: HirId,
         handler_is_async: bool,
+        handler_is_mixed: bool,
         effect_id: HirId,
         op_index: u64,
         args: Vec<HirId>,
@@ -1420,7 +1421,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
                 return_ty,
             } = inst
             {
-                if let Some(&(handler_fn_id, handler_is_async)) =
+                if let Some(&(handler_fn_id, handler_is_async, handler_is_mixed)) =
                     handler_resolution.get(&(*effect_id, *op_name))
                 {
                     sites.push(PerformSite {
@@ -1429,6 +1430,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
                         perform_result_temp: *perform_result_temp,
                         handler_fn_id,
                         handler_is_async,
+                        handler_is_mixed,
                         effect_id: *effect_id,
                         op_index: op_index_resolution
                             .get(&(*effect_id, *op_name))
@@ -1718,7 +1720,69 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // (which would re-poll and double-run the post-perform
         // code). Instead it RETURNS the handler's value directly,
         // cast to i64 (the poll-fn ABI's return type).
-        let return_value_id = if site.handler_is_async {
+        let return_value_id = if site.handler_is_mixed {
+            // The operation has BOTH async and sync handlers, selected at
+            // runtime by handler-scope dispatch. Compute the convention at
+            // runtime: the dynamic (with-block) handler's async bit if one is
+            // active (`cond`), else the static default's compile-time bit.
+            // The op fn returns an i64 (a `*Promise` for async, the value for
+            // sync); `finish_op` drives the promise (async) or passes the
+            // value through (sync), keeping this a single straight-line block.
+            let dyn_is_async = mint_value(
+                &mut function.values,
+                HirType::I64,
+                HirValueKind::Instruction,
+            );
+            new_insts.push(HirInstruction::Call {
+                result: Some(dyn_is_async),
+                callee: HirCallable::Symbol("__zyntax_effect_lookup_op_is_async".to_string()),
+                args: vec![effect_const, op_index_const],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+            let static_async_const = mint_const_i64(
+                &mut function.values,
+                if site.handler_is_async { 1 } else { 0 },
+            );
+            let is_async_val = mint_value(
+                &mut function.values,
+                HirType::I64,
+                HirValueKind::Instruction,
+            );
+            new_insts.push(HirInstruction::Select {
+                result: is_async_val,
+                ty: HirType::I64,
+                condition: cond,
+                true_val: dyn_is_async,
+                false_val: static_async_const,
+            });
+            let raw = mint_value(
+                &mut function.values,
+                HirType::I64,
+                HirValueKind::Instruction,
+            );
+            new_insts.push(HirInstruction::IndirectCall {
+                result: Some(raw),
+                func_ptr: fn_ptr,
+                args: handler_args,
+                return_ty: HirType::I64,
+            });
+            let finish_result = mint_value(
+                &mut function.values,
+                HirType::I64,
+                HirValueKind::Instruction,
+            );
+            new_insts.push(HirInstruction::Call {
+                result: Some(finish_result),
+                callee: HirCallable::Symbol("__zyntax_effect_finish_op".to_string()),
+                args: vec![raw, is_async_val, r_ptr_id],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+            finish_result
+        } else if site.handler_is_async {
             // Async handler: its entry ran NO body — the IndirectCall
             // returned a `*Promise`. LAUNCH it (poll once so its awaits
             // register timers the executor drives, INTERLEAVED with other
