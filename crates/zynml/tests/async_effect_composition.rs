@@ -207,6 +207,35 @@ fn async_handler_multi_shot_simple_performer() {
 }
 
 #[test]
+fn fiber_handle_survives_a_resumable_perform() {
+    // A fiber created before a resumable perform and iterated after it: the
+    // fiber handle is a value live across the perform. It must be saved BEFORE
+    // the suspend (emit_save_load placed the capture save AFTER the perform,
+    // stranding it on the resume side — the handle came back NULL and
+    // `f.next()` dereferenced it). k(1) -> x=1; sum 10+20=30; 1+30=31.
+    assert_eq!(
+        run_program(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E { def op(k: Resume<i64>): i64 { return k(1) } }
+            fiber def gen() { yield 10 yield 20 }
+            @effect(E)
+            async def work(): i64 {
+                let f = gen()
+                let x = op()
+                var s: i64 = 0
+                while let Some(y) = f.next() { s = s + y }
+                return x + s
+            }
+            async def run(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            "#
+        ),
+        Some(31),
+        "a fiber handle live across a resumable perform must survive the suspend"
+    );
+}
+
+#[test]
 fn mixed_async_and_sync_handlers_for_one_op() {
     // One operation handled by a sync handler (H1) and an async handler (H2),
     // selected at runtime by which `with` block is in scope. The perform site

@@ -82,6 +82,17 @@ pub fn emit_save_load(
         let yield_hir = cfg.block_id_to_hir(*yield_block);
         let func = cfg.function_mut();
         if let Some(block) = func.blocks.get_mut(&yield_hir) {
+            // A save must run BEFORE the block's suspension point — nothing
+            // after the suspend executes on the park path, and
+            // `lower_perform_effect_calls` splits the block at the
+            // `PerformEffect`, moving anything after it into the resume
+            // continuation. Appending at the block end therefore stranded the
+            // capture saves for a `perform` AFTER the suspend, so values live
+            // across the perform (a fiber handle, any non-rematerialisable
+            // value) came back 0 on resume. Insert before the suspension
+            // instruction instead. (For an await it lands before the await,
+            // which is equally correct — the await result is a resume-load,
+            // not a yield-save.)
             for (slot, hir_local) in saves {
                 let value = match liveness.local_to_hir.get(hir_local) {
                     Some(&v) => v,
@@ -92,7 +103,24 @@ pub fn emit_save_load(
                     slot: *slot,
                     value,
                 };
-                block.instructions.push(inst);
+                // Re-find the suspend index each time: a prior insert shifted
+                // it. Fall back to the block end if there's no suspension
+                // instruction (defensive — a yield block always has one).
+                match block.instructions.iter().position(|inst| {
+                    matches!(
+                        inst,
+                        HirInstruction::PerformEffect { .. }
+                            | HirInstruction::Call {
+                                callee: zyntax_compiler::hir::HirCallable::Intrinsic(
+                                    zyntax_compiler::hir::Intrinsic::Await
+                                ),
+                                ..
+                            }
+                    )
+                }) {
+                    Some(idx) => block.instructions.insert(idx, inst),
+                    None => block.instructions.push(inst),
+                }
             }
         }
     }
