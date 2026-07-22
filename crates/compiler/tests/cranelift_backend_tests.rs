@@ -2678,7 +2678,27 @@ fn test_effect_module_compilation() {
 /// Test compiling a function with PerformEffect instruction
 #[test]
 fn test_perform_effect_instruction() {
-    let mut backend = CraneliftBackend::new().expect("Failed to create backend");
+    // Regional handler dispatch lowers a perform site to
+    // `select(__zyntax_effect_lookup_op(effect, op) != 0, dyn, static)` plus a
+    // `__zyntax_effect_lookup_state` load — runtime symbols the real host
+    // registers via `register_effect_runtime_symbols`. A bare backend must
+    // supply them or `finalize_definitions` panics on the unresolved reloc.
+    // The stubs never run here (we only exercise compilation), so null returns
+    // are fine.
+    extern "C" fn stub_lookup_op(_effect_id: u64, _op_index: u64) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    extern "C" fn stub_lookup_state(_effect_id: u64) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    let mut backend = CraneliftBackend::with_runtime_symbols(&[
+        ("__zyntax_effect_lookup_op", stub_lookup_op as *const u8),
+        (
+            "__zyntax_effect_lookup_state",
+            stub_lookup_state as *const u8,
+        ),
+    ])
+    .expect("Failed to create backend");
 
     // Create module with effect, handler, and function that performs the effect
     let module = create_module_with_perform_effect();
