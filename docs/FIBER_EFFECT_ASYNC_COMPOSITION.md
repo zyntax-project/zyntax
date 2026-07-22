@@ -424,10 +424,19 @@ handler-that-awaits, effect_handler_returns_pending). **Depends on:** 5.
   `crates/zynml/tests/async_effect_composition.rs`. Note: the state numbering was
   ALWAYS unified (krio classifies await + perform identically); no numbering
   redesign was needed. See [[project_phase7_parking_handlers]].
-- **Follow-up (open): conditional await after perform.** `let x=op(); if c { await ... }; return x+100`
-  fails Cranelift SSA verification (perform-result reload used at the branch merge
-  from a non-dominating def). Separate `repair_ssa_for_reloads` dominance bug in
-  `crates/passes/krio_adapter/src/emit.rs`, exposed not caused by the composition.
+- **Follow-up FIXED (cc5148f): value live across a conditional suspension.** A value
+  produced at a suspension resume (await result or perform result) that stays live
+  across a LATER conditional suspension was used at the branch merge from a
+  non-dominating def (its suspend block returns Pending, so it doesn't dominate the
+  resume region). `repair_ssa_for_reloads` pruned the needed merge phi because it
+  read the syntactic def block. Fix: the orchestrator maps each await/perform result
+  to its RESUME block and passes it as the effective def site. General bug (not
+  perform-specific) — the pure-async twin failed identically; both fixed. e2e in
+  `crates/zynml/tests/async_effect_composition.rs`.
+  - Side note: fixed a session regression this surfaced —
+    `test_perform_effect_instruction` panicked on unresolved `__zyntax_effect_lookup_op`
+    in a bare backend (regional dispatch emits it at every perform site); the test now
+    registers null stubs (08af2b7).
 - Handler-body-awaits (`async def op(k)` inside a handler) doesn't compile yet —
   the harder target where the handler itself suspends (resume path becomes a real
   suspension point coordinated with the caller's SM).
