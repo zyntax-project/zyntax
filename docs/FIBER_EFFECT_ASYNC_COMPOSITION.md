@@ -437,9 +437,17 @@ handler-that-awaits, effect_handler_returns_pending). **Depends on:** 5.
     `test_perform_effect_instruction` panicked on unresolved `__zyntax_effect_lookup_op`
     in a bare backend (regional dispatch emits it at every perform site); the test now
     registers null stubs (08af2b7).
-- Handler-body-awaits (`async def op(k)` inside a handler) doesn't compile yet —
-  the harder target where the handler itself suspends (resume path becomes a real
-  suspension point coordinated with the caller's SM).
+- Handler-body-awaits — async handler operations now PARSE and thread `is_async`
+  from grammar → `TypedEffectHandlerImpl` → the synthesized handler-op function
+  (736d4be), but are GUARDRAILED at lowering (clear error) because the perform site
+  can't yet drive an async handler: it would call the handler's async entry and use
+  the returned promise as the op result (verified — returns a garbage pointer). The
+  remaining core is a perform-site ABI change on BOTH the Cranelift static path
+  (`cranelift_backend.rs` select+indirect-call) and the krio resumable path
+  (`upgrade_resume_struct_at_perform_sites`): call the handler's async entry, register
+  its promise for the executor to drive, and park the performer until the handler's
+  `k(v)` resumes it. The cooperative-resume substrate (1925db2) already drives the
+  timers the handler awaits on. This is the harder half of 7.1.
 
 ### 7.2 FiberStep envelope widening (if fiber-await lands here)
 - If a cooperative fiber body needs to await: widen `FiberStep` beyond 2 tag bits
