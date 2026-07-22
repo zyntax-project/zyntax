@@ -437,26 +437,35 @@ handler-that-awaits, effect_handler_returns_pending). **Depends on:** 5.
     `test_perform_effect_instruction` panicked on unresolved `__zyntax_effect_lookup_op`
     in a bare backend (regional dispatch emits it at every perform site); the test now
     registers null stubs (08af2b7).
-- Handler-body-awaits — async handler operations now PARSE and thread `is_async`
-  from grammar → `TypedEffectHandlerImpl` → the synthesized handler-op function
-  (736d4be), but are GUARDRAILED at lowering (clear error) because the perform site
-  can't yet drive an async handler: it would call the handler's async entry and use
-  the returned promise as the op result (verified — returns a garbage pointer). The
-  remaining core is a perform-site ABI change: call the handler's async entry, register
-  its promise for the executor to drive, and park the performer until the handler
-  resumes it. The cooperative-resume substrate (1925db2) already drives the timers the
-  handler awaits on.
+- **Handler-body-awaits — SHIPPED (c3970c3 + follow-ups).** Async handler operations
+  (the body awaits, then resumes the performer) now work end to end. The perform site
+  (HIR-first, in `krio_adapter::upgrade_resume_struct_at_perform_sites` — one edit,
+  every backend rides it) drives an async handler op's `*Promise` via a new
+  `__zyntax_effect_drive_handler` runtime symbol instead of using the promise pointer
+  as the op result. `is_async` threads `TypedEffectHandlerImpl` → `HirEffectHandlerImpl`
+  → `handler_resolution` → the perform site.
 
-  **This must land on ALL lowering targets, not just Cranelift** (see the all-backends
-  rule). Do it HIR-first where possible: the RESUMABLE perform lowers through
-  `krio_adapter` (`upgrade_resume_struct_at_perform_sites`) to backend-agnostic HIR, so
-  the drive/park logic added there covers Cranelift + LLVM + wasm at once. The
-  per-backend static-perform lowerings then each need matching async-handler awareness:
-  Cranelift (`cranelift_backend.rs` select+indirect-call), LLVM (`llvm_backend.rs`
-  resolve-handler + direct-call + Resume sentinel — keep `llvm_effect_parity_tests.rs`
-  green), wasm (compiles the generic HIR). The HIR interpreter (`hir_interp.rs`) doesn't
-  implement `PerformEffect` yet (Phase B.2) — a separate gap to close. This is the
-  harder half of 7.1.
+  The driver is **self-contained** (closes the cross-task hazards a naive inline drive
+  would reopen — verified against the code: the sync-completion latch is gone and
+  `drive_next_timer_with_task` leaks `CURRENT_TASK_ID`): a fresh negative driver task id
+  tags the handler's own awaits and the loop advances ONLY the handler's own timers
+  (`drive_own_timer`), never the global nearest — so no cross-task re-poll / UAF /
+  affinity break. `CURRENT_TASK_ID` is saved/restored; polls are bracketed with the
+  per-task handler-stack segment. The handler's resume goes through the existing
+  `__zyntax_effect_resume`. Honest limit (not a correctness gap): a handler awaiting a
+  signal only ANOTHER task can satisfy blocks rather than interleaves — cross-task
+  interleaving is a separate feature. Verified: parks (~30ms elapses), segments balance,
+  interleaves without corrupting a concurrent task, multi-shot on a simple performer.
+
+  Gaps closed / status: async handlers are at **full parity with sync handlers**.
+  Multi-shot where the performer owns droppable state (a fiber across the perform) is a
+  PRE-EXISTING limitation shared by sync and async (both panic identically). Mixed
+  async/sync handlers for one operation are rejected (a perform site can't pick the ABI
+  when the handler is runtime-selected; runtime-async-bit is the follow-up that lifts
+  it). Backend coverage: Cranelift verified; LLVM should ride the HIR-first change
+  (generic ops + a JIT-resolved runtime symbol) but is unverifiable in this env; wasm
+  needs a `WASM_POLL_DISPATCH` poll arm for the driver (native-only today); the HIR
+  interpreter still lacks `PerformEffect` (Phase B.2) and tiers up.
 
 ### 7.2 FiberStep envelope widening (if fiber-await lands here)
 - If a cooperative fiber body needs to await: widen `FiberStep` beyond 2 tag bits
