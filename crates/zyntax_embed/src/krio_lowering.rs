@@ -64,7 +64,7 @@ pub fn apply_krio_effect_lowering(
         .find(|f| f.signature.is_fiber && has_resumable_effect(f))
     {
         return Err(KrioLoweringError(format!(
-            "`fiber def {}` performs a resumable algebraic effect — this composition is \
+            "fiber function `{}` performs a resumable algebraic effect — this composition is \
              not yet supported (the fiber stack switch and the effect state machine have \
              incompatible suspension models). Perform the effect from a non-fiber function, \
              or use a non-resumable handler.",

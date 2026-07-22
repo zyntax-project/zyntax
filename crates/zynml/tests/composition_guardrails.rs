@@ -128,8 +128,9 @@ fn at_with_annotation_is_rejected() {
     "#;
     let err = compile_error(src).expect("@with should be a hard compile error");
     assert!(
-        err.contains("@with") && err.contains("with H"),
-        "error should name @with and point to the with-block; got: {err}"
+        err.contains("handler-scoping") && err.contains("no longer supported"),
+        "error should describe the removed handler-scoping annotation in neutral \
+         (non-frontend-syntax) terms; got: {err}"
     );
 }
 

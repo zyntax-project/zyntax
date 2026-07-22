@@ -2234,9 +2234,9 @@ impl LoweringContext {
             || !func.with_handlers.is_empty();
         if has_with_annotation {
             return Err(crate::CompilerError::Lowering(format!(
-                "`@with(...)` on `{}` is no longer supported (it never applied handler \
-                 scoping — silently a no-op). Use a `with H {{ ... }}` block statement \
-                 around the code that performs the effect instead.",
+                "a handler-scoping annotation on `{}` is no longer supported (it never \
+                 applied handler scoping — silently a no-op). Scope the handler over the \
+                 code that performs the effect with a handler-scoping region instead.",
                 func.name.resolve_global().unwrap_or_default()
             )));
         }

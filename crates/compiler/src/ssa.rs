@@ -2102,7 +2102,7 @@ impl SsaBuilder {
                     active_yields.push(yielded);
                 } else {
                     return Err(crate::CompilerError::Analysis(
-                        "`yield` is only valid inside `fiber def` bodies or compute expression bodies"
+                        "yield is only valid inside a fiber function body or a reduction body"
                             .to_string(),
                     ));
                 }
@@ -3962,7 +3962,7 @@ impl SsaBuilder {
                             })
                             .ok_or_else(|| {
                                 crate::CompilerError::Lowering(format!(
-                                    "fiber def `{}` not found in function table",
+                                    "fiber function `{}` not found in function table",
                                     func_name.resolve_global().unwrap_or_default()
                                 ))
                             })?;
@@ -5919,9 +5919,10 @@ impl SsaBuilder {
                 // reachable expression regardless of nesting.
                 if self.function.signature.is_fiber {
                     return Err(crate::CompilerError::Lowering(
-                        "`await` is not allowed inside a `fiber def` body; drive the fiber \
-                         from an `async def` (call `f.next()` in the async body and `await` \
-                         there)"
+                        "await is not allowed inside a fiber function — a fiber suspends by \
+                         switching stacks, not by parking on a future, so there is no state \
+                         machine to resume. Drive the fiber from an async function instead \
+                         (advance it there and await)"
                             .to_string(),
                     ));
                 }
