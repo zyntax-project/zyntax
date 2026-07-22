@@ -27,6 +27,21 @@ impl std::fmt::Display for KrioLoweringError {
 
 impl std::error::Error for KrioLoweringError {}
 
+/// A resumable operation handled by both an async and a non-async handler
+/// implementation. A perform site resolves the calling convention (drive the
+/// handler's promise vs. use its return value directly) at compile time, but
+/// which handler runs is chosen at runtime by handler-scope dispatch, so the
+/// convention can't be picked statically. Rejected rather than miscompiled.
+fn mixed_asyncness_error(op_name: zyntax_typed_ast::InternedString) -> KrioLoweringError {
+    KrioLoweringError(format!(
+        "resumable effect operation `{}` has both async and non-async handler \
+         implementations. A perform site cannot select the calling convention statically \
+         when the handler is chosen at runtime — make every handler for this operation \
+         async, or make them all synchronous.",
+        op_name.resolve_global().unwrap_or_default()
+    ))
+}
+
 /// Phase I.3b: route resumable-effect fns through krio's
 /// captures-lift + poll-fn transform. Wraps each one in a SYNC
 /// entry (returns T, not `*Promise<T>`) so the user-visible
@@ -134,10 +149,14 @@ pub fn apply_krio_effect_lowering(
                 .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
                 .map(|(id, _)| *id)
             {
-                handler_resolution.insert(
-                    (handler.effect_id, impl_.op_name),
-                    (handler_fn_id, impl_.is_async),
-                );
+                let key = (handler.effect_id, impl_.op_name);
+                if let Some(&(_, existing_async)) = handler_resolution.get(&key) {
+                    if existing_async != impl_.is_async {
+                        return Err(mixed_asyncness_error(impl_.op_name));
+                    }
+                } else {
+                    handler_resolution.insert(key, (handler_fn_id, impl_.is_async));
+                }
             }
         }
     }
@@ -284,10 +303,14 @@ pub fn apply_krio_async_lowering(
                     .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
                     .map(|(id, _)| *id)
                 {
-                    handler_resolution.insert(
-                        (handler.effect_id, impl_.op_name),
-                        (handler_fn_id, impl_.is_async),
-                    );
+                    let key = (handler.effect_id, impl_.op_name);
+                    if let Some(&(_, existing_async)) = handler_resolution.get(&key) {
+                        if existing_async != impl_.is_async {
+                            return Err(mixed_asyncness_error(impl_.op_name));
+                        }
+                    } else {
+                        handler_resolution.insert(key, (handler_fn_id, impl_.is_async));
+                    }
                 }
             }
         }
