@@ -4643,11 +4643,30 @@ pub(crate) fn drive_until(
         crate::effect_runtime::task_handler_leave(i as i64, baseline);
     };
 
+    // Mark any promise whose SM was completed by a NESTED resume (an async
+    // handler's `k(v)` drove a parked performer to Ready from inside the
+    // executor's drive of the handler). Its top-level poll returned Pending
+    // and it has no timer of its own, so the executor would otherwise never
+    // finish it — and must NOT re-poll it (the finished SM would re-enter).
+    let harvest = |promises: &[ZyntaxPromise]| {
+        for p in promises.iter() {
+            let mut inner = p.state.lock().unwrap();
+            if matches!(inner.state, PromiseState::Pending) {
+                if let Some(sm) = inner.state_machine {
+                    if let Some(v) = crate::host_futures::take_sm_completion(sm) {
+                        inner.state = PromiseState::Ready(ZyntaxValue::Int(v));
+                    }
+                }
+            }
+        }
+    };
+
     // Initial drive: poll each task once (parks its first `await` timer,
     // stamped with its index, or completes synchronously).
     for (i, p) in promises.iter().enumerate() {
         poll_task(i, p);
     }
+    harvest(promises);
 
     loop {
         // Tear down the parking of any newly-cancelled tasks.
@@ -4656,6 +4675,7 @@ pub(crate) fn drive_until(
                 deregister_task(i as i64);
             }
         }
+        harvest(promises);
         if done(promises) {
             return true;
         }

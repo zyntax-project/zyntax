@@ -207,6 +207,52 @@ fn async_handler_multi_shot_simple_performer() {
 }
 
 #[test]
+fn async_handler_tasks_interleave() {
+    // Two tasks each perform an effect whose async handler awaits ~50ms.
+    // They must OVERLAP (both handlers park, the executor drives both timers
+    // together) — well under the ~100ms a blocking drive would take.
+    use std::time::Instant;
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
+    let program = grammar
+        .parse_with_filename(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E {
+                async def op(k: Resume<i64>): i64 { await sleep(50) return k(7) }
+            }
+            @effect(E)
+            async def work(): i64 { return op() }
+            async def taskA(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            async def taskB(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            "#,
+            "<interleave>",
+        )
+        .expect("parse");
+    rt.config_mut().builtins.insert(
+        "sleep".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
+    rt.compile_typed_program(program).expect("compile");
+    let a = rt.call_async("taskA", &[]).expect("taskA");
+    let b = rt.call_async("taskB", &[]).expect("taskB");
+    let t = Instant::now();
+    let r = drive_tasks(&[a, b]);
+    let ms = t.elapsed().as_millis();
+    assert_eq!(r[0].as_ref().ok().and_then(ZyntaxValue::as_i64), Some(7));
+    assert_eq!(r[1].as_ref().ok().and_then(ZyntaxValue::as_i64), Some(7));
+    assert!(
+        ms >= 45,
+        "both handlers actually waited their ~50ms timer; got {ms}ms"
+    );
+    assert!(
+        ms < 90,
+        "the two async-handler tasks must INTERLEAVE (~50ms), not run \
+         sequentially (~100ms); got {ms}ms"
+    );
+}
+
+#[test]
 fn async_handler_does_not_corrupt_a_concurrent_task() {
     // An async-handler task runs alongside a normal task. The self-contained
     // drive blocks the handler task for its own await but must not corrupt the

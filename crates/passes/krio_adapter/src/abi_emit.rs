@@ -1720,9 +1720,15 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // cast to i64 (the poll-fn ABI's return type).
         let return_value_id = if site.handler_is_async {
             // Async handler: its entry ran NO body — the IndirectCall
-            // returned a `*Promise`. Drive that promise to completion (the
-            // handler awaits, then calls `k(v)` which re-polls the performer
-            // exactly as the sync path does), and return the driven result.
+            // returned a `*Promise`. LAUNCH it (poll once so its awaits
+            // register timers the executor drives, INTERLEAVED with other
+            // tasks) and PARK the performer by returning Pending (0). The
+            // handler's `k(v)` resumes the performer via the normal resume
+            // path; that completion is recorded by SM ptr and the executor
+            // harvests it (see `__zyntax_effect_launch_handler` +
+            // `host_futures::record_sm_completion`). __zyntax_effect_resume
+            // sets the performer's state slot before re-polling, so no
+            // explicit state save is needed here.
             let promise_ptr = mint_value(
                 &mut function.values,
                 HirType::Ptr(Box::new(HirType::U8)),
@@ -1734,20 +1740,27 @@ pub fn upgrade_resume_struct_at_perform_sites(
                 args: handler_args,
                 return_ty: HirType::Ptr(Box::new(HirType::U8)),
             });
-            let drive_result = mint_value(
+            // launch returns the handler's inline result if it completed
+            // WITHOUT awaiting (e.g. multi-shot `k(1)+k(2)` → the handler's
+            // combined return, which is the perform's result), or 0 if it
+            // parked on an await. Returning it means: completed-inline →
+            // performer's poll returns Ready(result); parked → returns
+            // Pending(0) and the executor finishes the performer when the
+            // handler resumes it.
+            let launch_result = mint_value(
                 &mut function.values,
                 HirType::I64,
                 HirValueKind::Instruction,
             );
             new_insts.push(HirInstruction::Call {
-                result: Some(drive_result),
-                callee: HirCallable::Symbol("__zyntax_effect_drive_handler".to_string()),
-                args: vec![promise_ptr],
+                result: Some(launch_result),
+                callee: HirCallable::Symbol("__zyntax_effect_launch_handler".to_string()),
+                args: vec![promise_ptr, r_ptr_id],
                 type_args: vec![],
                 const_args: vec![],
                 is_tail: false,
             });
-            drive_result
+            launch_result
         } else {
             new_insts.push(HirInstruction::IndirectCall {
                 result: Some(site.perform_result_temp),

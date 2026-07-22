@@ -176,6 +176,72 @@ pub fn set_current_task_id(id: i64) {
     krio_adapter::fiber::set_fiber_task_id(id);
 }
 
+thread_local! {
+    /// State machines that reached Ready via a NESTED resume — i.e. a
+    /// performer that an async handler's `k(v)` drove to completion from
+    /// inside the executor's drive of the handler, rather than from the
+    /// executor's own poll of the performer's promise. Keyed by the SM
+    /// pointer (which both the `Resume` struct and the performer's promise
+    /// hold), valued by the program result. The executor consumes this
+    /// before polling a promise: if its SM completed nested, mark it Ready
+    /// WITHOUT re-polling (re-polling would re-enter an already-finished SM
+    /// — the use-after-free the removed sync-completion latch once guarded).
+    static SM_COMPLETIONS: RefCell<std::collections::HashMap<usize, i64>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record that the SM at `sm_ptr` reached Ready with `value` during a nested
+/// resume. Called by `__zyntax_effect_resume` when it drives a performer to
+/// completion.
+pub fn record_sm_completion(sm_ptr: *mut u8, value: i64) {
+    SM_COMPLETIONS.with(|c| {
+        c.borrow_mut().insert(sm_ptr as usize, value);
+    });
+}
+
+/// Take a nested-completion value for `sm_ptr`, if one was recorded. Clears
+/// it. The executor calls this before polling a promise.
+pub fn take_sm_completion(sm_ptr: *mut u8) -> Option<i64> {
+    SM_COMPLETIONS.with(|c| c.borrow_mut().remove(&(sm_ptr as usize)))
+}
+
+thread_local! {
+    /// Async-handler SM ptr → the performer SM ptr it handles. An async
+    /// handler HANDLES the performer's computation, so the handler's RETURN
+    /// value is the perform's result (this matters for multi-shot: the
+    /// handler's return combines its `k(v)` results, and that combination —
+    /// not the last resume — is what the performer completes with). When the
+    /// handler reaches Ready, its result is routed to the performer via
+    /// `record_sm_completion`.
+    static HANDLER_TO_PERFORMER: RefCell<std::collections::HashMap<usize, usize>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Register that the async handler SM `handler_sm` handles the performer SM
+/// `performer_sm`. Called when the handler is launched.
+pub fn register_handler_performer(handler_sm: *mut u8, performer_sm: *mut u8) {
+    HANDLER_TO_PERFORMER.with(|m| {
+        m.borrow_mut()
+            .insert(handler_sm as usize, performer_sm as usize);
+    });
+}
+
+/// If `handler_sm` is a registered async handler, record its `value` as the
+/// completion of the performer it handles and drop the mapping. Returns true
+/// if it routed. Called on every SM Ready so a handler completing (inline or
+/// executor-driven) finishes its parked performer with the HANDLER's return.
+pub fn route_handler_completion(handler_sm: *mut u8, value: i64) -> bool {
+    let performer = HANDLER_TO_PERFORMER.with(|m| m.borrow_mut().remove(&(handler_sm as usize)));
+    if let Some(performer) = performer {
+        SM_COMPLETIONS.with(|c| {
+            c.borrow_mut().insert(performer, value);
+        });
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     /// Pending native timers: `(deadline, future handle)`. The cooperative
@@ -478,10 +544,12 @@ pub fn resolve_future(handle: i64, value: i64) -> ResolveOutcome {
         *(parked.state_machine_ptr as *mut i64) = parked.next_state;
         let rc = poll_parked_sm(&parked);
         if rc != 0 {
-            // SM reached Ready. Forward the value to the scheduler
-            // and return it through the outcome so the wasm export
-            // shim can also pass it back to JS if it wants.
-            complete_task(parked.task_id, rc);
+            // SM reached Ready. If it's an async handler op, route its return
+            // value to the performer it handles (the handler's return IS the
+            // perform's result). Otherwise forward to the scheduler.
+            if !route_handler_completion(parked.state_machine_ptr, rc) {
+                complete_task(parked.task_id, rc);
+            }
             ResolveOutcome::Ready(rc)
         } else {
             // SM yielded again. It must have synchronously called
