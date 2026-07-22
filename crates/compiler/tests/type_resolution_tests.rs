@@ -249,17 +249,15 @@ fn test_enum_type_resolution() {
                 "None variant should be Void"
             );
 
-            // Second variant (Some) should be a struct with one I32 field
-            match &union_ty.variants[1].ty {
-                HirType::Struct(s) => {
-                    assert_eq!(s.fields.len(), 1, "Some variant should have 1 field");
-                    assert!(
-                        matches!(s.fields[0], HirType::I32),
-                        "Some field should be I32"
-                    );
-                }
-                other => panic!("Expected Struct for Some variant, got {:?}", other),
-            }
+            // Second variant (Some) is a SINGLE-field tuple variant, which
+            // lowering unwraps directly to the field type (no Struct wrapper) —
+            // see `LoweringContext::convert_type`'s `Tuple(types) if types.len()
+            // == 1` arm. Multi-field tuple variants become `HirType::Struct`.
+            assert!(
+                matches!(union_ty.variants[1].ty, HirType::I32),
+                "single-field Some(I32) should unwrap to I32, got {:?}",
+                union_ty.variants[1].ty
+            );
         }
         other => panic!("Expected HirType::Union, got {:?}", other),
     }
