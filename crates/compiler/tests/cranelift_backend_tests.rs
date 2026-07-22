@@ -3680,6 +3680,7 @@ fn create_effect_module() -> HirModule {
             entry_block: impl_block_id,
             blocks: impl_blocks.clone(),
             is_resumable: false,
+            is_async: false,
         }],
     };
     module.handlers.insert(handler_id, handler);

@@ -153,6 +153,7 @@ fn create_simple_handler(
                 entry_block: block_id,
                 blocks,
                 is_resumable,
+                is_async: false,
             }
         })
         .collect();

@@ -586,6 +586,7 @@ mod tests {
                     entry_block: impl_block_id,
                     blocks: impl_blocks,
                     is_resumable: false,
+                    is_async: false,
                 }],
             },
         );

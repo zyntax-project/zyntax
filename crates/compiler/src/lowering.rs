@@ -3800,6 +3800,7 @@ impl LoweringContext {
                     entry_block: HirId::new(),
                     blocks: indexmap::IndexMap::new(), // Will be filled in when we compile the body
                     is_resumable,
+                    is_async: impl_.is_async,
                 }
             })
             .collect();

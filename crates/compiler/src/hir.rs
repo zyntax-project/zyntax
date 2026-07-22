@@ -99,6 +99,10 @@ pub struct HirEffectHandlerImpl {
     pub blocks: IndexMap<HirId, HirBlock>,
     /// Whether this handler uses the continuation (resumable)
     pub is_resumable: bool,
+    /// Whether the op body suspends (awaits) — the handler is driven as a
+    /// task and the performer parks until the handler resumes it.
+    #[serde(default)]
+    pub is_async: bool,
 }
 
 /// Lifetime identifier for memory safety tracking.

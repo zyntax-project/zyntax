@@ -217,6 +217,7 @@ fn h4_lower_async_module_includes_effectful_functions() {
             entry_block: handler_entry_id,
             blocks: handler_blocks,
             is_resumable: true,
+                    is_async: false,
         }],
     };
     module.handlers.insert(handler.id, handler);
@@ -290,6 +291,7 @@ fn h4_lower_async_module_skips_non_resumable_effects() {
             entry_block: handler_entry_id,
             blocks: handler_blocks,
             is_resumable: false,
+                    is_async: false,
         }],
     };
     module.handlers.insert(handler.id, handler);
