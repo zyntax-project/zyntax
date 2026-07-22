@@ -548,6 +548,16 @@ pub fn resolve_future(handle: i64, value: i64) -> ResolveOutcome {
             // value to the performer it handles (the handler's return IS the
             // perform's result). Otherwise forward to the scheduler.
             if !route_handler_completion(parked.state_machine_ptr, rc) {
+                // Record the completion by SM ptr as well: a nested driver may
+                // be spinning THIS same SM (e.g. `__zyntax_effect_resume`
+                // driving a performer that itself awaited). Resolving the
+                // performer's timer polls it to Ready HERE — the outer driver
+                // must observe that and NOT re-poll the finished SM (a re-poll
+                // re-enters its post-await region, e.g. re-resuming a fiber the
+                // scope-exit already freed). The driver reads this via
+                // `take_sm_completion(sm)`; the top-level executor's `harvest`
+                // consumes it the same way.
+                record_sm_completion(parked.state_machine_ptr, rc);
                 complete_task(parked.task_id, rc);
             }
             ResolveOutcome::Ready(rc)

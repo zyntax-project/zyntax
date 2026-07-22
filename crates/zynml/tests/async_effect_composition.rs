@@ -266,6 +266,39 @@ fn call_result_survives_a_resumable_perform() {
 }
 
 #[test]
+fn perform_resume_await_then_fiber_next() {
+    // The full composition in one flow: perform -> resume -> await -> fiber.next().
+    // The performer's `await` resolves inside the perform's resume-drive loop,
+    // which polls the performer to Ready (running the fiber loop to completion
+    // and freeing the fiber at scope exit). The resume loop then re-polled the
+    // SAME finished SM, re-entering the post-await region and re-resuming the
+    // freed fiber -> null `_trampoline_state` -> non-unwinding abort. The drive
+    // now records the SM completion by pointer; the resume loop takes it and
+    // returns instead of re-polling. k(1) -> x=1; 10+20=30; 1+30=31.
+    assert_eq!(
+        run_program(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E { def op(k: Resume<i64>): i64 { return k(1) } }
+            fiber def gen() { yield 10 yield 20 }
+            @effect(E)
+            async def work(): i64 {
+                let f = gen()
+                let x = op()
+                await sleep(10)
+                var s: i64 = 0
+                while let Some(y) = f.next() { s = s + y }
+                return x + s
+            }
+            async def run(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            "#
+        ),
+        Some(31),
+        "perform -> resume -> await -> fiber.next() must not re-poll the finished SM"
+    );
+}
+
+#[test]
 fn mixed_async_and_sync_handlers_for_one_op() {
     // One operation handled by a sync handler (H1) and an async handler (H2),
     // selected at runtime by which `with` block is in scope. The perform site

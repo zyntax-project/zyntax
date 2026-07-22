@@ -592,6 +592,17 @@ pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> 
             {
                 if crate::host_futures::has_pending_timers() {
                     let _ = crate::host_futures::drive_next_timer_with_task();
+                    // The drive may have resolved THIS SM's own awaited future,
+                    // polling it to Ready from inside `resolve_future`. If so,
+                    // that completion is recorded by SM ptr — take it and
+                    // return WITHOUT re-polling. Re-polling a finished SM
+                    // re-enters its post-await region and, e.g., re-resumes a
+                    // fiber the scope-exit already freed (a UAF abort on the
+                    // `perform -> resume -> await -> fiber.next()` composition).
+                    if let Some(done) = crate::host_futures::take_sm_completion(r.state_machine_ptr)
+                    {
+                        return done;
+                    }
                     continue;
                 }
             }
