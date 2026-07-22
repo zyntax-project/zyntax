@@ -442,12 +442,21 @@ handler-that-awaits, effect_handler_returns_pending). **Depends on:** 5.
   (736d4be), but are GUARDRAILED at lowering (clear error) because the perform site
   can't yet drive an async handler: it would call the handler's async entry and use
   the returned promise as the op result (verified — returns a garbage pointer). The
-  remaining core is a perform-site ABI change on BOTH the Cranelift static path
-  (`cranelift_backend.rs` select+indirect-call) and the krio resumable path
-  (`upgrade_resume_struct_at_perform_sites`): call the handler's async entry, register
-  its promise for the executor to drive, and park the performer until the handler's
-  `k(v)` resumes it. The cooperative-resume substrate (1925db2) already drives the
-  timers the handler awaits on. This is the harder half of 7.1.
+  remaining core is a perform-site ABI change: call the handler's async entry, register
+  its promise for the executor to drive, and park the performer until the handler
+  resumes it. The cooperative-resume substrate (1925db2) already drives the timers the
+  handler awaits on.
+
+  **This must land on ALL lowering targets, not just Cranelift** (see the all-backends
+  rule). Do it HIR-first where possible: the RESUMABLE perform lowers through
+  `krio_adapter` (`upgrade_resume_struct_at_perform_sites`) to backend-agnostic HIR, so
+  the drive/park logic added there covers Cranelift + LLVM + wasm at once. The
+  per-backend static-perform lowerings then each need matching async-handler awareness:
+  Cranelift (`cranelift_backend.rs` select+indirect-call), LLVM (`llvm_backend.rs`
+  resolve-handler + direct-call + Resume sentinel — keep `llvm_effect_parity_tests.rs`
+  green), wasm (compiles the generic HIR). The HIR interpreter (`hir_interp.rs`) doesn't
+  implement `PerformEffect` yet (Phase B.2) — a separate gap to close. This is the
+  harder half of 7.1.
 
 ### 7.2 FiberStep envelope widening (if fiber-await lands here)
 - If a cooperative fiber body needs to await: widen `FiberStep` beyond 2 tag bits
