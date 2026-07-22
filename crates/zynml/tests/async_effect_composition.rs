@@ -151,6 +151,96 @@ fn async_handler_op_no_await_resumes() {
 }
 
 #[test]
+fn async_handler_await_parks_and_balances() {
+    // The handler's await actually PARKS (the ~30ms elapses; it doesn't spin)
+    // and the handler-stack segments return to baseline afterwards (a
+    // with-block the handler opens across its await stays isolated).
+    use std::time::Instant;
+    let src = r#"
+        effect E { def op(): i64 }
+        handler H for E {
+            async def op(k: Resume<i64>): i64 { await sleep(30) return k(7) }
+        }
+        @effect(E)
+        async def work(): i64 { return op() }
+        async def run(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+    "#;
+    let t = Instant::now();
+    assert_eq!(run_program(src), Some(7));
+    assert!(
+        t.elapsed().as_millis() >= 25,
+        "handler must actually park on its timer (~30ms), not spin"
+    );
+    assert_eq!(
+        zyntax_embed::host_futures::handler_stack_depth(),
+        0,
+        "handler stack must return to baseline"
+    );
+    assert_eq!(
+        zyntax_embed::host_futures::task_handler_segment_count(),
+        0,
+        "no handler-stack segment may leak after the drive"
+    );
+}
+
+#[test]
+fn async_handler_multi_shot_simple_performer() {
+    // The handler resumes twice; a performer with no droppable scope state
+    // re-runs its post-perform code per resume. k(1)->101, k(2)->102, sum=203.
+    // (Multi-shot where the performer owns droppable state — e.g. a fiber —
+    // is a pre-existing limitation shared by sync and async handlers alike.)
+    assert_eq!(
+        run_program(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E {
+                async def op(k: Resume<i64>): i64 { let a = k(1) let b = k(2) return a + b }
+            }
+            @effect(E)
+            async def work(): i64 { let x = op() return x + 100 }
+            async def run(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            "#
+        ),
+        Some(203),
+        "multi-shot async handler re-runs the performer per resume"
+    );
+}
+
+#[test]
+fn async_handler_does_not_corrupt_a_concurrent_task() {
+    // An async-handler task runs alongside a normal task. The self-contained
+    // drive blocks the handler task for its own await but must not corrupt the
+    // other task (which completes independently).
+    let mut rt = ZyntaxRuntime::new().expect("rt");
+    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
+    let program = grammar
+        .parse_with_filename(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E {
+                async def op(k: Resume<i64>): i64 { await sleep(10) return k(7) }
+            }
+            @effect(E)
+            async def work(): i64 { return op() }
+            async def taskA(): i64 { var v: i64 = 0 with H { v = await work() } return v }
+            async def taskB(): i64 { await sleep(5) return 99 }
+            "#,
+            "<concurrent>",
+        )
+        .expect("parse");
+    rt.config_mut().builtins.insert(
+        "sleep".to_string(),
+        "__zyntax_async_set_timeout".to_string(),
+    );
+    rt.compile_typed_program(program).expect("compile");
+    let a = rt.call_async("taskA", &[]).expect("taskA");
+    let b = rt.call_async("taskB", &[]).expect("taskB");
+    let r = drive_tasks(&[a, b]);
+    assert_eq!(r[0].as_ref().ok().and_then(ZyntaxValue::as_i64), Some(7));
+    assert_eq!(r[1].as_ref().ok().and_then(ZyntaxValue::as_i64), Some(99));
+}
+
+#[test]
 fn async_handler_op_awaits_then_resumes() {
     // The async handler op AWAITS, then resumes the performer. The perform
     // site drives the handler's own await chain (self-contained) to k(7).
