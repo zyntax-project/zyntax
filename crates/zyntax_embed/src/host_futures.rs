@@ -293,6 +293,61 @@ pub fn drive_next_timer_with_task() -> Option<(i64, ResolveOutcome)> {
     Some((task_id, outcome))
 }
 
+/// Current task id (the one the executor is driving, or a driver id set by
+/// a nested handler drive). Public so the effect-runtime handler driver can
+/// save/restore it around a nested drive.
+pub fn current_task_id() -> i64 {
+    CURRENT_TASK_ID.with(|c| c.get())
+}
+
+thread_local! {
+    /// Fresh ids for driving a handler's OWN await chain. Negative so they
+    /// can never collide with a real top-level task id (which start at 0 and
+    /// increase) — a handler drive tags its awaits with one of these, and
+    /// `drive_own_timer` advances only timers carrying it, so the drive never
+    /// touches another task's state (no cross-task re-poll / affinity break).
+    static NEXT_DRIVER_TASK_ID: Cell<i64> = const { Cell::new(-2) };
+}
+
+/// Allocate a fresh negative task id for a self-contained handler drive.
+pub fn alloc_driver_task_id() -> i64 {
+    NEXT_DRIVER_TASK_ID.with(|c| {
+        let v = c.get();
+        c.set(v - 1);
+        v
+    })
+}
+
+/// Drive the nearest pending timer that belongs to `task_id` ONLY, then
+/// resolve its future (advancing that SM one step). Returns the outcome, or
+/// `None` if no timer for `task_id` is pending. Unlike
+/// [`drive_next_timer_with_task`] (which drains the globally-nearest timer
+/// and interleaves other tasks), this advances just one task's own await
+/// chain — the isolation a self-contained handler drive needs so it never
+/// re-polls, frees, or misattributes another task.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drive_own_timer(task_id: i64) -> Option<ResolveOutcome> {
+    let entry = TIMER_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        let mut best: Option<usize> = None;
+        for i in 0..q.len() {
+            let handle = q[i].1;
+            let owned =
+                FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|p| p.task_id) == Some(task_id));
+            if owned && best.map_or(true, |b| q[i].0 < q[b].0) {
+                best = Some(i);
+            }
+        }
+        best.map(|i| q.swap_remove(i))
+    })?;
+    let (deadline, handle) = entry;
+    let now = web_time::Instant::now();
+    if deadline > now {
+        std::thread::sleep(deadline - now);
+    }
+    Some(resolve_future(handle, 0))
+}
+
 /// Drop every parked future and pending timer belonging to `task_id`.
 /// Used when a task is cancelled so the executor stops driving its (now
 /// dead) state machine and its timers don't fire into freed memory. The

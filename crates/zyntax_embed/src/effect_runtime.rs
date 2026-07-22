@@ -572,6 +572,97 @@ pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> 
     }
 }
 
+/// Drive an ASYNC handler operation's promise to completion and return its
+/// result. Called at a resumable perform site when the resolved handler op
+/// is async: the handler entry was invoked and returned a `*Promise`
+/// `{ state_machine_ptr @ 0, poll_fn_ptr @ 8 }` WITHOUT running the body.
+///
+/// Self-contained drive (closes the cross-task hazards a naive inline drive
+/// would reopen):
+///   * A fresh negative driver task id tags the handler's own awaits, and
+///     the loop advances ONLY the handler's own timers (`drive_own_timer`),
+///     never the globally-nearest one — so it can't re-poll, free, or
+///     misattribute another live task.
+///   * `CURRENT_TASK_ID` is saved and restored around the drive, so the
+///     stamp never leaks to the caller.
+///   * The handler's polls are bracketed with `task_handler_enter/leave`, so
+///     a `with`-block it opens across an await stays in its own segment and
+///     isn't visible to the caller or interleaved tasks.
+///
+/// Honest limitation: because the drive only advances the handler's own
+/// timers, a handler that awaits something only ANOTHER top-level task can
+/// satisfy will not interleave (it blocks, correctly). Cross-task
+/// interleaving is a separate feature, not a correctness gap.
+///
+/// # Safety
+/// `promise_ptr` must be a `*Promise` from an async handler entry; its
+/// `state_machine_ptr`/`poll_fn_ptr` must stay live for the drive (they do —
+/// the entry mallocs them and nothing else frees them before Ready).
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn __zyntax_effect_drive_handler(promise_ptr: *mut u8) -> i64 {
+    if promise_ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        let sm = *(promise_ptr as *const *mut u8); // offset 0
+        let poll_fn_ptr = *((promise_ptr as *const u8).add(8) as *const *const u8); // offset 8
+        if sm.is_null() || poll_fn_ptr.is_null() {
+            return 0;
+        }
+        let poll_fn: extern "C" fn(*mut u8) -> i64 = core::mem::transmute(poll_fn_ptr);
+
+        let driver_task = crate::host_futures::alloc_driver_task_id();
+        let prev_task = crate::host_futures::current_task_id();
+        crate::host_futures::set_current_task_id(driver_task);
+        let baseline = task_handler_enter(driver_task);
+
+        // Initial poll. A handler with no await runs `k(v)` inline and
+        // reaches Ready in one poll; an awaiting handler parks its own timer
+        // and returns Pending.
+        let mut result = poll_fn(sm);
+        if result == 0 {
+            use crate::host_futures::ResolveOutcome;
+            const BUDGET: u32 = 100_000;
+            let mut idle = 0u32;
+            loop {
+                match crate::host_futures::drive_own_timer(driver_task) {
+                    Some(ResolveOutcome::Ready(v)) => {
+                        result = v;
+                        break;
+                    }
+                    // Re-parked on the next own await, or a stale handle —
+                    // keep draining this handler's chain.
+                    Some(_) => {
+                        idle = 0;
+                        continue;
+                    }
+                    None => {
+                        idle = idle.saturating_add(1);
+                        if idle > BUDGET {
+                            crate::host_futures::set_current_task_id(prev_task);
+                            panic!(
+                                "__zyntax_effect_drive_handler: handler SM parked with no own \
+                                 timer to drive and never reached Ready (sm={sm:p}). An async \
+                                 handler that awaits a signal only another task can satisfy is \
+                                 not supported by the self-contained drive."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        task_handler_leave(driver_task, baseline);
+        crate::host_futures::set_current_task_id(prev_task);
+        task_handler_forget(driver_task);
+        // NOTE: the handler SM + 16-byte promise are intentionally not freed
+        // here yet (memory-safe leak); reclaiming them is a hardening step
+        // that must not race the drive's own parked-timer references.
+        result
+    }
+}
+
 /// Abort the current handler without resuming. The handler's caller
 /// observes this as an early return with `value`.
 ///
@@ -937,6 +1028,20 @@ pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRunti
             flags: ZrtlSigFlags::EFFECTFUL,
             return_type: TypeTag::I64,
             params: params2(ptr_tag(), TypeTag::I64),
+        },
+    );
+
+    // drive_handler(promise: *u8) -> i64 — drive an async handler op's
+    // promise to completion at the perform site. Native-only for now.
+    #[cfg(not(target_arch = "wasm32"))]
+    runtime.register_function_typed(
+        "__zyntax_effect_drive_handler",
+        __zyntax_effect_drive_handler as *const u8,
+        ZrtlSymbolSig {
+            param_count: 1,
+            flags: ZrtlSigFlags::EFFECTFUL,
+            return_type: TypeTag::I64,
+            params: params1(ptr_tag()),
         },
     );
 

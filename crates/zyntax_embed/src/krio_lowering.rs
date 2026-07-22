@@ -117,7 +117,10 @@ pub fn apply_krio_effect_lowering(
 
     let suspending = krio_adapter::HirSuspendingFns::from_module(module);
 
-    let mut handler_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), HirId> =
+    // `(effect_id, op_name) → (handler-fn id, is_async)`. The async bit lets
+    // the perform-site emitter drive the handler's promise instead of using
+    // its return value directly.
+    let mut handler_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), (HirId, bool)> =
         HashMap::new();
     for handler in module.handlers.values() {
         for impl_ in &handler.implementations {
@@ -131,7 +134,10 @@ pub fn apply_krio_effect_lowering(
                 .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
                 .map(|(id, _)| *id)
             {
-                handler_resolution.insert((handler.effect_id, impl_.op_name), handler_fn_id);
+                handler_resolution.insert(
+                    (handler.effect_id, impl_.op_name),
+                    (handler_fn_id, impl_.is_async),
+                );
             }
         }
     }
@@ -262,8 +268,10 @@ pub fn apply_krio_async_lowering(
         // resumable path runs. The effect path skips async fns, so we run
         // that upgrade here too — otherwise the perform site parks with no
         // way to reach its handler. Build the same resolution maps it needs.
-        let mut handler_resolution: HashMap<(HirId, zyntax_typed_ast::InternedString), HirId> =
-            HashMap::new();
+        let mut handler_resolution: HashMap<
+            (HirId, zyntax_typed_ast::InternedString),
+            (HirId, bool),
+        > = HashMap::new();
         for handler in _module.handlers.values() {
             for impl_ in &handler.implementations {
                 if !impl_.is_resumable {
@@ -276,7 +284,10 @@ pub fn apply_krio_async_lowering(
                     .find(|(_, f)| f.name.resolve_global().as_deref() == Some(mangled.as_str()))
                     .map(|(id, _)| *id)
                 {
-                    handler_resolution.insert((handler.effect_id, impl_.op_name), handler_fn_id);
+                    handler_resolution.insert(
+                        (handler.effect_id, impl_.op_name),
+                        (handler_fn_id, impl_.is_async),
+                    );
                 }
             }
         }

@@ -124,3 +124,56 @@ fn await_result_survives_conditional_await() {
         "await result must survive a later conditional await used at the merge"
     );
 }
+
+#[test]
+fn async_handler_op_no_await_resumes() {
+    // An async handler op with no await runs `k(7)` inline; the perform site
+    // drives its promise and returns the resumed value.
+    assert_eq!(
+        run_program(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E {
+                async def op(k: Resume<i64>): i64 { return k(7) }
+            }
+            @effect(E)
+            async def work(): i64 { return op() }
+            async def run(): i64 {
+                var v: i64 = 0
+                with H { v = await work() }
+                return v
+            }
+            "#
+        ),
+        Some(7),
+        "async handler op (no await) must drive to k(7)"
+    );
+}
+
+#[test]
+fn async_handler_op_awaits_then_resumes() {
+    // The async handler op AWAITS, then resumes the performer. The perform
+    // site drives the handler's own await chain (self-contained) to k(7).
+    assert_eq!(
+        run_program(
+            r#"
+            effect E { def op(): i64 }
+            handler H for E {
+                async def op(k: Resume<i64>): i64 {
+                    await sleep(10)
+                    return k(7)
+                }
+            }
+            @effect(E)
+            async def work(): i64 { return op() }
+            async def run(): i64 {
+                var v: i64 = 0
+                with H { v = await work() }
+                return v
+            }
+            "#
+        ),
+        Some(7),
+        "async handler op must await, then resume the performer to k(7)"
+    );
+}

@@ -133,32 +133,3 @@ fn at_with_annotation_is_rejected() {
          (non-frontend-syntax) terms; got: {err}"
     );
 }
-
-/// An `async def` handler op parses and threads `is_async` through, but the
-/// perform site can't yet drive an async (awaiting) handler — it would use
-/// the handler's promise pointer as the op result (silent miscompile).
-/// Rejected until the perform-parks-performer path lands. (Lifted then.)
-#[test]
-fn async_handler_body_is_rejected() {
-    let src = r#"
-        effect E { def op(): i64 }
-        handler H for E {
-            async def op(k: Resume<i64>): i64 {
-                await sleep(10)
-                return k(7)
-            }
-        }
-        @effect(E)
-        def work(): i64 { return op() }
-        def run(): i64 {
-            var v: i64 = 0
-            with H { v = work() }
-            return v
-        }
-    "#;
-    let err = compile_error(src).expect("async handler body should be a hard compile error");
-    assert!(
-        err.contains("H::op") && err.contains("not yet supported"),
-        "error should name the async handler op and say it's unsupported; got: {err}"
-    );
-}

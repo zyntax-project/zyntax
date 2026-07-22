@@ -1383,7 +1383,7 @@ pub fn lower_perform_effect_calls(
 /// built once by the caller from `module.handlers`.
 pub fn upgrade_resume_struct_at_perform_sites(
     function: &mut HirFunction,
-    handler_resolution: &std::collections::HashMap<(HirId, InternedString), HirId>,
+    handler_resolution: &std::collections::HashMap<(HirId, InternedString), (HirId, bool)>,
     op_index_resolution: &std::collections::HashMap<(HirId, InternedString), u64>,
     poll_fn_id: HirId,
     frame_ptr: HirId,
@@ -1398,6 +1398,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
         inst_idx: usize,
         perform_result_temp: HirId,
         handler_fn_id: HirId,
+        handler_is_async: bool,
         effect_id: HirId,
         op_index: u64,
         args: Vec<HirId>,
@@ -1419,12 +1420,15 @@ pub fn upgrade_resume_struct_at_perform_sites(
                 return_ty,
             } = inst
             {
-                if let Some(&handler_fn_id) = handler_resolution.get(&(*effect_id, *op_name)) {
+                if let Some(&(handler_fn_id, handler_is_async)) =
+                    handler_resolution.get(&(*effect_id, *op_name))
+                {
                     sites.push(PerformSite {
                         block_id: *block_id,
                         inst_idx: i,
                         perform_result_temp: *perform_result_temp,
                         handler_fn_id,
+                        handler_is_async,
                         effect_id: *effect_id,
                         op_index: op_index_resolution
                             .get(&(*effect_id, *op_name))
@@ -1702,13 +1706,6 @@ pub fn upgrade_resume_struct_at_perform_sites(
             false_val: static_addr,
         });
 
-        new_insts.push(HirInstruction::IndirectCall {
-            result: Some(site.perform_result_temp),
-            func_ptr: fn_ptr,
-            args: handler_args,
-            return_ty: site.return_ty.clone(),
-        });
-
         // Phase I.2 refinement: for resumable perform sites the
         // handler's return value IS the perform's result. If the
         // handler called `k(v)`, the runtime symbol re-polled the
@@ -1721,22 +1718,60 @@ pub fn upgrade_resume_struct_at_perform_sites(
         // (which would re-poll and double-run the post-perform
         // code). Instead it RETURNS the handler's value directly,
         // cast to i64 (the poll-fn ABI's return type).
-        let return_value_id = if matches!(site.return_ty, HirType::I64) {
-            site.perform_result_temp
-        } else {
-            // Cast non-i64 returns to i64 for the poll ABI.
-            let cast_id = mint_value(
+        let return_value_id = if site.handler_is_async {
+            // Async handler: its entry ran NO body — the IndirectCall
+            // returned a `*Promise`. Drive that promise to completion (the
+            // handler awaits, then calls `k(v)` which re-polls the performer
+            // exactly as the sync path does), and return the driven result.
+            let promise_ptr = mint_value(
+                &mut function.values,
+                HirType::Ptr(Box::new(HirType::U8)),
+                HirValueKind::Instruction,
+            );
+            new_insts.push(HirInstruction::IndirectCall {
+                result: Some(promise_ptr),
+                func_ptr: fn_ptr,
+                args: handler_args,
+                return_ty: HirType::Ptr(Box::new(HirType::U8)),
+            });
+            let drive_result = mint_value(
                 &mut function.values,
                 HirType::I64,
                 HirValueKind::Instruction,
             );
-            new_insts.push(HirInstruction::Cast {
-                op: pick_param_to_i64_cast(&site.return_ty),
-                result: cast_id,
-                ty: HirType::I64,
-                operand: site.perform_result_temp,
+            new_insts.push(HirInstruction::Call {
+                result: Some(drive_result),
+                callee: HirCallable::Symbol("__zyntax_effect_drive_handler".to_string()),
+                args: vec![promise_ptr],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
             });
-            cast_id
+            drive_result
+        } else {
+            new_insts.push(HirInstruction::IndirectCall {
+                result: Some(site.perform_result_temp),
+                func_ptr: fn_ptr,
+                args: handler_args,
+                return_ty: site.return_ty.clone(),
+            });
+            if matches!(site.return_ty, HirType::I64) {
+                site.perform_result_temp
+            } else {
+                // Cast non-i64 returns to i64 for the poll ABI.
+                let cast_id = mint_value(
+                    &mut function.values,
+                    HirType::I64,
+                    HirValueKind::Instruction,
+                );
+                new_insts.push(HirInstruction::Cast {
+                    op: pick_param_to_i64_cast(&site.return_ty),
+                    result: cast_id,
+                    ty: HirType::I64,
+                    operand: site.perform_result_temp,
+                });
+                cast_id
+            }
         };
 
         // Splice the new instructions in place of the PerformEffect.

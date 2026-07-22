@@ -3697,23 +3697,6 @@ impl LoweringContext {
 
     /// Lower an effect handler declaration to HIR
     fn lower_effect_handler(&mut self, handler: &TypedEffectHandler) -> CompilerResult<()> {
-        // An async handler operation (its body suspends) threads `is_async`
-        // through, but the perform site does not yet drive an async handler:
-        // it would call the handler's async entry and use the returned promise
-        // as the operation result — a silent miscompile. Reject until the
-        // perform site can park the performer and drive the handler as a task.
-        if let Some(bad) = handler.handlers.iter().find(|i| i.is_async) {
-            return Err(crate::CompilerError::Lowering(format!(
-                "handler operation `{}::{}` is async, but async handler \
-                 operations are not yet supported: the perform site cannot yet \
-                 park the performer and drive the handler as a task. Provide a \
-                 non-async handler operation (it may still capture and resume a \
-                 continuation).",
-                handler.name.resolve_global().unwrap_or_default(),
-                bad.op_name.resolve_global().unwrap_or_default(),
-            )));
-        }
-
         // Get the pre-registered handler ID
         let handler_id = *self.symbols.handlers.get(&handler.name).ok_or_else(|| {
             crate::CompilerError::Lowering(format!(
