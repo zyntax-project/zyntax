@@ -243,10 +243,66 @@ pub fn lower_async_function(
 
     let (rewrites, reloads) = emit::emit_save_load(&mut cfg, &layout, &liveness, frame_ptr);
     emit::emit_dispatcher(&mut cfg, &layout, frame_ptr, state_slot);
+
+    // Map each await-result value to its RESUME block. An await result is
+    // syntactically defined in its suspend block (which returns Pending, so it
+    // does not dominate the resume region); `lower_await_calls` reloads it at
+    // the resume block below. SSA reconstruction needs the resume block as the
+    // value's effective def site — otherwise a value live across a LATER
+    // conditional suspension has its merge phi wrongly pruned. Block ids map by
+    // seq index the same way `lower_await_calls` resolves them.
+    let await_resume_def: HashMap<HirId, HirId> = {
+        let f = cfg.function();
+        let block_keys: Vec<HirId> = f.blocks.keys().copied().collect();
+        let resolve = |bb: HirBlockId| block_keys.get(bb.0 as usize).copied();
+        let mut m = HashMap::new();
+        for (yb, next_state) in &layout.yield_blocks {
+            let yhir = match resolve(*yb) {
+                Some(h) => h,
+                None => continue,
+            };
+            let rseq = match layout.resume_entries.get(*next_state as usize) {
+                Some(s) => *s,
+                None => continue,
+            };
+            let rhir = match resolve(rseq) {
+                Some(h) => h,
+                None => continue,
+            };
+            if let Some(block) = f.blocks.get(&yhir) {
+                for inst in &block.instructions {
+                    // Both await results and perform (resumable-effect) results
+                    // are produced at the resume block, not the suspend block
+                    // they live in — `lower_await_calls` / `lower_perform_effect_calls`
+                    // reload them there. Same effective-def override applies.
+                    let result = match inst {
+                        zyntax_compiler::hir::HirInstruction::Call {
+                            callee:
+                                zyntax_compiler::hir::HirCallable::Intrinsic(
+                                    zyntax_compiler::hir::Intrinsic::Await,
+                                ),
+                            result: Some(r),
+                            ..
+                        } => Some(*r),
+                        zyntax_compiler::hir::HirInstruction::PerformEffect {
+                            result: Some(r),
+                            ..
+                        } => Some(*r),
+                        _ => None,
+                    };
+                    if let Some(r) = result {
+                        m.insert(r, rhir);
+                    }
+                }
+            }
+        }
+        m
+    };
+
     // SSA reconstruction for the captures-lift reloads. Runs AFTER the
     // dispatcher wires the entry switch → resume-entry edges, so the CFG is
     // fully connected and dominance (loop-header phi placement) is correct.
-    emit::repair_ssa_for_reloads(cfg.function_mut(), &reloads);
+    emit::repair_ssa_for_reloads(cfg.function_mut(), &reloads, &await_resume_def);
 
     // Phase F.2: replace `Intrinsic::Await` calls with the
     // poll-the-inner-promise state machine. Allocates two slots per

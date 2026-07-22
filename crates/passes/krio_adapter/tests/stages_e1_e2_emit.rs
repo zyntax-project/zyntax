@@ -78,7 +78,11 @@ fn run_through_e2(state_slot: u32, captures_slot_base: u32, emit_dispatcher: boo
         emit::emit_dispatcher(&mut cfg, &layout, frame, state_slot);
         // Post-load use rewriting now lives in the SSA-reconstruction pass,
         // which runs after the dispatcher wires the resume-entry edges.
-        emit::repair_ssa_for_reloads(cfg.function_mut(), &reloads);
+        emit::repair_ssa_for_reloads(
+            cfg.function_mut(),
+            &reloads,
+            &std::collections::HashMap::new(),
+        );
     }
     drop(cfg);
 

@@ -260,6 +260,16 @@ fn compute_reaching_defs(
 pub fn repair_ssa_for_reloads(
     func: &mut zyntax_compiler::hir::HirFunction,
     reloads: &HashMap<HirId, Vec<(HirId, HirId)>>,
+    // Override map: `await-result value → its RESUME block`. An await's
+    // result is syntactically defined in the suspend block (which returns
+    // Pending and has no CFG successors), so it does not dominate the resume
+    // region; `lower_await_calls` reloads it at the resume block afterwards.
+    // For SSA reconstruction to treat the value as available downstream of
+    // the resume (and correctly place/wire the merge phi when the value is
+    // live across a LATER conditional suspension), we take the resume block
+    // as its effective definition site. Empty is fine — falls back to the
+    // syntactic def block.
+    await_resume_def: &HashMap<HirId, HirId>,
 ) {
     use zyntax_compiler::analysis::DominatorTree;
     use zyntax_compiler::hir::{HirPhi, HirType, HirValue, HirValueKind};
@@ -305,7 +315,14 @@ pub fn repair_ssa_for_reloads(
 
     for (original, reload_list) in reloads {
         // Definition sites: the original def block + every reload block.
-        let odb = def_block.get(original).copied().unwrap_or(func.entry_block);
+        // For an await result, use its resume block as the def site (see the
+        // `await_resume_def` doc) so the reaching-def analysis reflects where
+        // the value is actually available.
+        let odb = await_resume_def
+            .get(original)
+            .copied()
+            .or_else(|| def_block.get(original).copied())
+            .unwrap_or(func.entry_block);
         let mut def_blocks: HashSet<HirId> = HashSet::new();
         def_blocks.insert(odb);
         for (_, rb) in reload_list {

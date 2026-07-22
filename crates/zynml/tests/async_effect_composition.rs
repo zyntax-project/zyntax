@@ -86,3 +86,41 @@ fn await_then_perform_carries_value() {
         "resumed value must survive an await that precedes the perform"
     );
 }
+
+#[test]
+fn perform_result_survives_conditional_await() {
+    // perform, then a CONDITIONAL await, then use the perform result at the
+    // branch merge. The result is produced at the perform's resume block, so
+    // the merge phi must reload it on the await path; a naive dominance check
+    // (suspend block doesn't dominate the resume region) previously pruned
+    // that phi → Cranelift SSA verification failure.
+    assert_eq!(
+        run_program(&program(
+            "let x = op()\n if x > 0 {\n await sleep(10)\n }\n return x + 100"
+        )),
+        Some(101),
+        "perform result must survive a conditional await used at the merge"
+    );
+}
+
+#[test]
+fn await_result_survives_conditional_await() {
+    // Same shape with a pure-async value (no effect): an await result used
+    // after a later conditional await. Regression guard for the general
+    // captures-lift SSA reconstruction, not just the effect composition.
+    let src = r#"
+        async def work(): i64 {
+            let y = await sleep(5)
+            if y >= 0 {
+                await sleep(10)
+            }
+            return y + 100
+        }
+        async def run(): i64 { return await work() }
+    "#;
+    assert_eq!(
+        run_program(src),
+        Some(100),
+        "await result must survive a later conditional await used at the merge"
+    );
+}
