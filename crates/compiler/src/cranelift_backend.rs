@@ -267,6 +267,12 @@ pub struct CraneliftBackend {
     builder_context: FunctionBuilderContext,
     /// Codegen context
     codegen_context: codegen::Context,
+    /// When set, `compile_function_body` captures the final CLIF + native
+    /// disassembly of each function (for verification tests). Off by default —
+    /// enabling it turns on Cranelift's disasm generation.
+    capture_ir: bool,
+    /// Last captured `(CLIF, Option<disassembly>)` when `capture_ir` is on.
+    captured_ir: Option<(String, Option<String>)>,
     /// Data description for constants
     data_desc: DataDescription,
     /// Mapping from HIR functions to JIT function IDs
@@ -452,6 +458,8 @@ impl CraneliftBackend {
             module,
             builder_context: FunctionBuilderContext::new(),
             codegen_context: codegen::Context::new(),
+            capture_ir: false,
+            captured_ir: None,
             data_desc: DataDescription::new(),
             function_map: HashMap::new(),
             global_map: HashMap::new(),
@@ -5459,6 +5467,15 @@ impl CraneliftBackend {
             }
         }
 
+        // Verification capture: enable disasm generation + snapshot the CLIF
+        // before the module consumes the context.
+        let clif_snapshot = if self.capture_ir {
+            self.codegen_context.set_disasm(true);
+            Some(self.codegen_context.func.display().to_string())
+        } else {
+            None
+        };
+
         // Compile the function
         log::debug!(
             "[Cranelift] About to call define_function for {:?}",
@@ -5488,12 +5505,32 @@ impl CraneliftBackend {
             self.compiled_functions.insert(id, compiled_func);
         }
 
+        // Verification capture: grab the native disassembly the just-completed
+        // compile produced, pair it with the CLIF snapshot.
+        if let Some(clif) = clif_snapshot {
+            let disasm = self
+                .codegen_context
+                .compiled_code()
+                .and_then(|c| c.vcode.clone());
+            self.captured_ir = Some((clif, disasm));
+        }
+
         // Clear context for next function
         self.codegen_context.clear();
         self.value_map.clear();
         self.block_map.clear();
 
         Ok(())
+    }
+
+    /// Enable/disable CLIF + disassembly capture (verification tests only).
+    pub fn set_capture_ir(&mut self, on: bool) {
+        self.capture_ir = on;
+    }
+
+    /// Take the last captured `(CLIF, Option<native disassembly>)`.
+    pub fn take_captured_ir(&mut self) -> Option<(String, Option<String>)> {
+        self.captured_ir.take()
     }
 
     /// Compile a global variable (including vtables)

@@ -3504,9 +3504,36 @@ fn test_vector_dot_i8x16_executes() {
 
     let mut backend = CraneliftBackend::new().expect("backend");
     let id = func.id;
+    backend.set_capture_ir(true);
     backend
         .compile_function(id, &func)
         .expect("VectorDot should compile");
+
+    // Verify the fold, not just the value: the CLIF must be the exact
+    // widening-dot tree, and on a FEAT_DotProd host the native disassembly
+    // must contain `sdot` (and `addv` for the i32x4 reduce) — NOT `smull`.
+    let (clif, disasm) = backend.take_captured_ir().expect("captured IR");
+    eprintln!("\n===== VectorDot CLIF =====\n{clif}");
+    eprintln!(
+        "===== VectorDot disasm =====\n{}",
+        disasm.as_deref().unwrap_or("<none>")
+    );
+    assert!(
+        clif.contains("swiden_low") && clif.contains("iadd_pairwise"),
+        "CLIF is not the widening-dot shape:\n{clif}"
+    );
+    #[cfg(target_arch = "aarch64")]
+    if let Some(d) = &disasm {
+        assert!(
+            d.contains("sdot"),
+            "expected a fused `sdot` in the disassembly (got smull/addp?):\n{d}"
+        );
+        assert!(
+            d.contains("addv"),
+            "expected `addv` for the i32x4 horizontal reduce:\n{d}"
+        );
+    }
+
     backend.finalize_definitions().expect("finalize");
     let raw = backend.get_function_ptr(id).expect("fn ptr");
     let fn_ptr = unsafe {
