@@ -5300,8 +5300,11 @@ impl CraneliftBackend {
                 }
             }
 
-            // Finalize builder
-            builder.finalize();
+            // Finalize builder. Cranelift's `FunctionBuilder::finalize` now
+            // takes the target frontend config (used to validate/complete the
+            // function against the target's ABI); source it from the JIT module.
+            let frontend_config = self.module.target_config();
+            builder.finalize(frontend_config);
         }
 
         // Debug: Print IR after finalize
