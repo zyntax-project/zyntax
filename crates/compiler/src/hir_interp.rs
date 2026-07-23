@@ -490,6 +490,58 @@ pub enum Op {
         args: u32,
         stride: u32,
     },
+
+    // ── SIMD / vector (scalarized) ──
+    // The interpreter has no vector registers; a vector value is held as
+    // `ZyntaxValue::Array` of `lanes` scalar lanes, each in the element's
+    // precise width. Every op below is a native lane loop — inline, never
+    // an FFI/plugin call — so `@kernel`/auto-vectorized code executes here
+    // with the SAME numeric result the Cranelift/LLVM/wasm backends produce.
+    /// `dst = splat(regs[scalar])` → `lanes` copies.
+    VSplat {
+        dst: Reg,
+        scalar: Reg,
+        lanes: u8,
+    },
+    /// `dst = [read_typed(regs[ptr] + i*sizeof(elem)) for i in 0..lanes]`.
+    VLoad {
+        dst: Reg,
+        ptr: Reg,
+        lanes: u8,
+        elem_ty: u32,
+    },
+    /// `write_typed(regs[ptr] + i*sizeof(elem)) = lane_i` for each lane.
+    VStore {
+        val: Reg,
+        ptr: Reg,
+        elem_ty: u32,
+    },
+    /// `dst = regs[vector][lane]`.
+    VExtract {
+        dst: Reg,
+        vector: Reg,
+        lane: u8,
+    },
+    /// `dst = regs[vector] with lane := regs[scalar]`.
+    VInsert {
+        dst: Reg,
+        vector: Reg,
+        scalar: Reg,
+        lane: u8,
+    },
+    /// `dst = fold(regs[vector], op)` — horizontal reduction to a scalar.
+    VReduce {
+        dst: Reg,
+        vector: Reg,
+        op: BinaryOp,
+    },
+    /// `dst[i] = regs[lhs][i] op regs[rhs][i]` — element-wise arithmetic.
+    VBinOp {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        op: BinaryOp,
+    },
 }
 
 /// One compiled function: bytecode stream + side pools.
@@ -847,6 +899,18 @@ fn lower_inst(
             let dst = reg(*result)?;
             let lhs = reg(*left)?;
             let rhs = reg(*right)?;
+            // Vector-typed arithmetic scalarizes to a lane-wise op — the
+            // vectorization passes and `@kernel` emit `Binary` with a
+            // `HirType::Vector` operand type (no dedicated vector-arith op).
+            if matches!(ty, HirType::Vector(..)) {
+                cf.code.push(Op::VBinOp {
+                    dst,
+                    lhs,
+                    rhs,
+                    op: *op,
+                });
+                return Ok(());
+            }
             // Float vs integer selected by HirType.
             let is_float = matches!(ty, HirType::F32 | HirType::F64);
             let op = if is_float {
@@ -1252,6 +1316,107 @@ fn lower_inst(
                 .push(ZyntaxValue::Pointer(handle as usize as *mut u8));
             cf.code.push(Op::LoadConst { dst, c: const_idx });
         }
+        // ── SIMD / vector (scalarized) ──
+        HirInstruction::VectorSplat { result, ty, scalar } => {
+            let dst = reg(*result)?;
+            let s = reg(*scalar)?;
+            let lanes = match ty {
+                HirType::Vector(_, n) => *n as u8,
+                _ => {
+                    return Err(InterpError::UnsupportedInstruction(
+                        "VectorSplat with non-vector type".to_string(),
+                    ))
+                }
+            };
+            cf.code.push(Op::VSplat {
+                dst,
+                scalar: s,
+                lanes,
+            });
+        }
+        HirInstruction::VectorLoad {
+            result, ty, ptr, ..
+        } => {
+            let dst = reg(*result)?;
+            let p = reg(*ptr)?;
+            let (elem, lanes) = match ty {
+                HirType::Vector(e, n) => ((**e).clone(), *n as u8),
+                _ => {
+                    return Err(InterpError::UnsupportedInstruction(
+                        "VectorLoad with non-vector type".to_string(),
+                    ))
+                }
+            };
+            let elem_ty = type_idx(cf, &elem);
+            cf.code.push(Op::VLoad {
+                dst,
+                ptr: p,
+                lanes,
+                elem_ty,
+            });
+        }
+        HirInstruction::VectorStore { value, ptr, .. } => {
+            let v = reg(*value)?;
+            let p = reg(*ptr)?;
+            // The store carries no type; recover the element type from the
+            // value register's `HirType::Vector(elem, _)`.
+            let elem = match cf.reg_types.get(v as usize) {
+                Some(HirType::Vector(e, _)) => (**e).clone(),
+                _ => {
+                    return Err(InterpError::UnsupportedInstruction(
+                        "VectorStore of non-vector value".to_string(),
+                    ))
+                }
+            };
+            let elem_ty = type_idx(cf, &elem);
+            cf.code.push(Op::VStore {
+                val: v,
+                ptr: p,
+                elem_ty,
+            });
+        }
+        HirInstruction::VectorExtractLane {
+            result,
+            vector,
+            lane,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let vec = reg(*vector)?;
+            cf.code.push(Op::VExtract {
+                dst,
+                vector: vec,
+                lane: *lane,
+            });
+        }
+        HirInstruction::VectorInsertLane {
+            result,
+            vector,
+            scalar,
+            lane,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let vec = reg(*vector)?;
+            let s = reg(*scalar)?;
+            cf.code.push(Op::VInsert {
+                dst,
+                vector: vec,
+                scalar: s,
+                lane: *lane,
+            });
+        }
+        HirInstruction::VectorHorizontalReduce {
+            result, vector, op, ..
+        } => {
+            let dst = reg(*result)?;
+            let vec = reg(*vector)?;
+            cf.code.push(Op::VReduce {
+                dst,
+                vector: vec,
+                op: *op,
+            });
+        }
         other => {
             return Err(InterpError::UnsupportedInstruction(format!(
                 "{:?}",
@@ -1412,6 +1577,7 @@ fn size_of_hir_ty(ty: &HirType) -> usize {
         HirType::I128 | HirType::U128 => 16,
         HirType::Struct(s) => s.fields.iter().map(size_of_hir_ty).sum::<usize>().max(1),
         HirType::Array(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
+        HirType::Vector(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
         _ => 8,
     }
 }
@@ -1981,52 +2147,54 @@ impl HirInterpreter {
                     pc += 1;
                 }
                 Op::FAdd { dst, lhs, rhs } => {
-                    regs[*dst as usize] =
-                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a + b)?;
+                    let x = freg_f64(&regs[*lhs as usize])?;
+                    let y = freg_f64(&regs[*rhs as usize])?;
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x + y);
                     pc += 1;
                 }
                 Op::FSub { dst, lhs, rhs } => {
-                    regs[*dst as usize] =
-                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a - b)?;
+                    let x = freg_f64(&regs[*lhs as usize])?;
+                    let y = freg_f64(&regs[*rhs as usize])?;
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x - y);
                     pc += 1;
                 }
                 Op::FMul { dst, lhs, rhs } => {
-                    regs[*dst as usize] =
-                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a * b)?;
+                    let x = freg_f64(&regs[*lhs as usize])?;
+                    let y = freg_f64(&regs[*rhs as usize])?;
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x * y);
                     pc += 1;
                 }
                 Op::FDiv { dst, lhs, rhs } => {
-                    regs[*dst as usize] =
-                        fbin(&regs[*lhs as usize], &regs[*rhs as usize], |a, b| a / b)?;
+                    let x = freg_f64(&regs[*lhs as usize])?;
+                    let y = freg_f64(&regs[*rhs as usize])?;
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x / y);
                     pc += 1;
                 }
                 Op::FNeg { dst, src } => {
-                    regs[*dst as usize] = match &regs[*src as usize] {
-                        ZyntaxValue::Float(x) => ZyntaxValue::Float(-*x),
-                        other => other.clone(),
-                    };
+                    let x = freg_f64(&regs[*src as usize])?;
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], -x);
                     pc += 1;
                 }
                 Op::FSqrt { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
-                    regs[*dst as usize] = ZyntaxValue::Float(x.sqrt());
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x.sqrt());
                     pc += 1;
                 }
                 Op::FRsqrt { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
-                    regs[*dst as usize] = ZyntaxValue::Float(1.0 / x.sqrt());
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], 1.0 / x.sqrt());
                     pc += 1;
                 }
                 Op::FAbs { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
-                    regs[*dst as usize] = ZyntaxValue::Float(x.abs());
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x.abs());
                     pc += 1;
                 }
                 Op::FMulAdd { dst, a, b, c } => {
                     let av = freg_f64(&regs[*a as usize])?;
                     let bv = freg_f64(&regs[*b as usize])?;
                     let cv = freg_f64(&regs[*c as usize])?;
-                    regs[*dst as usize] = ZyntaxValue::Float(av.mul_add(bv, cv));
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], av.mul_add(bv, cv));
                     pc += 1;
                 }
                 Op::ICmpEq { dst, lhs, rhs } => {
@@ -2237,6 +2405,81 @@ impl HirInterpreter {
                         addr = addr.wrapping_add(idx_val.wrapping_mul(s));
                     }
                     regs[*dst as usize] = ZyntaxValue::Pointer(addr as usize as *mut u8);
+                    pc += 1;
+                }
+
+                // ── SIMD / vector (scalarized: value is Array of lanes) ──
+                Op::VSplat { dst, scalar, lanes } => {
+                    let s = regs[*scalar as usize].clone();
+                    regs[*dst as usize] = ZyntaxValue::Array(vec![s; *lanes as usize]);
+                    pc += 1;
+                }
+                Op::VLoad {
+                    dst,
+                    ptr,
+                    lanes,
+                    elem_ty,
+                } => {
+                    let elem = cf.type_pool[*elem_ty as usize].clone();
+                    let esize = size_of_hir_ty(&elem);
+                    let p = ptr_of(&regs[*ptr as usize])?;
+                    let mut lane_vals = Vec::with_capacity(*lanes as usize);
+                    for i in 0..*lanes as usize {
+                        lane_vals.push(unsafe { read_typed(p.wrapping_add(i * esize), &elem) });
+                    }
+                    regs[*dst as usize] = ZyntaxValue::Array(lane_vals);
+                    pc += 1;
+                }
+                Op::VStore { val, ptr, elem_ty } => {
+                    let elem = cf.type_pool[*elem_ty as usize].clone();
+                    let esize = size_of_hir_ty(&elem);
+                    let p = ptr_of(&regs[*ptr as usize])?;
+                    let lane_vals = as_vector(&regs[*val as usize])?;
+                    for (i, lane) in lane_vals.iter().enumerate() {
+                        unsafe { write_typed(p.wrapping_add(i * esize), lane, &elem) };
+                    }
+                    pc += 1;
+                }
+                Op::VExtract { dst, vector, lane } => {
+                    let lane_vals = as_vector(&regs[*vector as usize])?;
+                    regs[*dst as usize] = lane_vals
+                        .get(*lane as usize)
+                        .cloned()
+                        .unwrap_or(ZyntaxValue::Undef);
+                    pc += 1;
+                }
+                Op::VInsert {
+                    dst,
+                    vector,
+                    scalar,
+                    lane,
+                } => {
+                    let mut lane_vals = as_vector(&regs[*vector as usize])?;
+                    let s = regs[*scalar as usize].clone();
+                    if let Some(slot) = lane_vals.get_mut(*lane as usize) {
+                        *slot = s;
+                    }
+                    regs[*dst as usize] = ZyntaxValue::Array(lane_vals);
+                    pc += 1;
+                }
+                Op::VReduce { dst, vector, op } => {
+                    let lane_vals = as_vector(&regs[*vector as usize])?;
+                    let mut acc = lane_vals.first().cloned().unwrap_or(ZyntaxValue::Int(0));
+                    for lane in lane_vals.iter().skip(1) {
+                        acc = apply_lane_binop(*op, &acc, lane)?;
+                    }
+                    regs[*dst as usize] = acc;
+                    pc += 1;
+                }
+                Op::VBinOp { dst, lhs, rhs, op } => {
+                    let a = as_vector(&regs[*lhs as usize])?;
+                    let b = as_vector(&regs[*rhs as usize])?;
+                    let n = a.len().min(b.len());
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        out.push(apply_lane_binop(*op, &a[i], &b[i])?);
+                    }
+                    regs[*dst as usize] = ZyntaxValue::Array(out);
                     pc += 1;
                 }
                 Op::Jump { target } => {
@@ -2484,16 +2727,6 @@ fn ibin(
     Ok(ZyntaxValue::Int(f(li, ri)))
 }
 
-fn fbin(
-    l: &ZyntaxValue,
-    r: &ZyntaxValue,
-    f: impl FnOnce(f64, f64) -> f64,
-) -> Result<ZyntaxValue, InterpError> {
-    let lf = freg_f64(l)?;
-    let rf = freg_f64(r)?;
-    Ok(ZyntaxValue::Float(f(lf, rf)))
-}
-
 fn ireg_i64(v: &ZyntaxValue) -> Result<i64, InterpError> {
     value_to_i64(v).ok_or_else(|| InterpError::TypeMismatch {
         expected: "integer".to_string(),
@@ -2506,6 +2739,129 @@ fn freg_f64(v: &ZyntaxValue) -> Result<f64, InterpError> {
         expected: "float".to_string(),
         got: format!("{:?}", v),
     })
+}
+
+/// Wrap an `f64` arithmetic result in the destination's precise float width.
+/// The interpreter funnels float math through `f64`; narrowing the result to
+/// `F32` when the register's `HirType` says so keeps `f32` values correctly
+/// typed — and bit-matches the native backends, since for `+`/`-`/`*` a single
+/// f64 op on f32-representable inputs rounds to the same `f32` the hardware
+/// produces. Without this, every `f32` scalar op returned an `f64`-tagged
+/// `Float`, diverging from Cranelift/LLVM (and mistyping the value).
+fn fval(dst_ty: &HirType, r: f64) -> ZyntaxValue {
+    match dst_ty {
+        HirType::F32 => ZyntaxValue::F32(r as f32),
+        _ => ZyntaxValue::Float(r),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIMD / vector helpers (scalarized lanes)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Coerce a register value to a raw memory pointer (accepts the raw-address
+/// `Int`/`UInt` shapes the i64-funneled arithmetic bus produces, same as the
+/// scalar `Op::Load`/`Op::Store`).
+fn ptr_of(v: &ZyntaxValue) -> Result<*mut u8, InterpError> {
+    match v {
+        ZyntaxValue::Pointer(p) => Ok(*p),
+        ZyntaxValue::Int(n) => Ok(*n as usize as *mut u8),
+        ZyntaxValue::UInt(n) => Ok(*n as usize as *mut u8),
+        other => Err(InterpError::TypeMismatch {
+            expected: "pointer".to_string(),
+            got: format!("{:?}", other),
+        }),
+    }
+}
+
+/// Read the lanes of a scalarized vector value (held as `ZyntaxValue::Array`).
+/// Returns an owned copy so the caller can write its result register without a
+/// borrow conflict.
+fn as_vector(v: &ZyntaxValue) -> Result<Vec<ZyntaxValue>, InterpError> {
+    match v {
+        ZyntaxValue::Array(lanes) => Ok(lanes.clone()),
+        other => Err(InterpError::TypeMismatch {
+            expected: "vector (Array of lanes)".to_string(),
+            got: format!("{:?}", other),
+        }),
+    }
+}
+
+/// Map a scalar `ZyntaxValue` back to its precise `HirType`, so a lane-wise op
+/// can reconstruct the result in the element's own width (e.g. keep `f32x4`
+/// lanes as `F32`, not widen to `f64`).
+fn hir_ty_of_value(v: &ZyntaxValue) -> HirType {
+    match v {
+        ZyntaxValue::Bool(_) => HirType::Bool,
+        ZyntaxValue::I8(_) => HirType::I8,
+        ZyntaxValue::I16(_) => HirType::I16,
+        ZyntaxValue::I32(_) => HirType::I32,
+        ZyntaxValue::Int(_) => HirType::I64,
+        ZyntaxValue::U8(_) => HirType::U8,
+        ZyntaxValue::U16(_) => HirType::U16,
+        ZyntaxValue::U32(_) => HirType::U32,
+        ZyntaxValue::UInt(_) => HirType::U64,
+        ZyntaxValue::F32(_) => HirType::F32,
+        ZyntaxValue::Float(_) => HirType::F64,
+        _ => HirType::I64,
+    }
+}
+
+/// Apply a binary op to one lane pair, preserving the left lane's element
+/// width. Float when either lane is float; integer otherwise. This is the
+/// scalar kernel of `VBinOp` (element-wise) and `VReduce` (fold).
+fn apply_lane_binop(
+    op: BinaryOp,
+    a: &ZyntaxValue,
+    b: &ZyntaxValue,
+) -> Result<ZyntaxValue, InterpError> {
+    let is_float = matches!(a, ZyntaxValue::Float(_) | ZyntaxValue::F32(_))
+        || matches!(b, ZyntaxValue::Float(_) | ZyntaxValue::F32(_));
+    if is_float {
+        let x = freg_f64(a)?;
+        let y = freg_f64(b)?;
+        let r = match op {
+            BinaryOp::Add | BinaryOp::FAdd => x + y,
+            BinaryOp::Sub | BinaryOp::FSub => x - y,
+            BinaryOp::Mul | BinaryOp::FMul => x * y,
+            BinaryOp::Div | BinaryOp::FDiv => x / y,
+            other => {
+                return Err(InterpError::UnsupportedInstruction(format!(
+                    "vector float lane op {:?}",
+                    other
+                )))
+            }
+        };
+        Ok(match a {
+            ZyntaxValue::F32(_) => ZyntaxValue::F32(r as f32),
+            _ => ZyntaxValue::Float(r),
+        })
+    } else {
+        let x = ireg_i64(a)?;
+        let y = ireg_i64(b)?;
+        let r = match op {
+            BinaryOp::Add | BinaryOp::FAdd => x.wrapping_add(y),
+            BinaryOp::Sub | BinaryOp::FSub => x.wrapping_sub(y),
+            BinaryOp::Mul | BinaryOp::FMul => x.wrapping_mul(y),
+            BinaryOp::Div | BinaryOp::FDiv => {
+                if y == 0 {
+                    0
+                } else {
+                    x.wrapping_div(y)
+                }
+            }
+            BinaryOp::And => x & y,
+            BinaryOp::Or => x | y,
+            BinaryOp::Xor => x ^ y,
+            other => {
+                return Err(InterpError::UnsupportedInstruction(format!(
+                    "vector int lane op {:?}",
+                    other
+                )))
+            }
+        };
+        Ok(value_from_i64_as(&hir_ty_of_value(a), r))
+    }
 }
 
 fn eval_cast(op: CastOp, o: ZyntaxValue, ty: &HirType) -> Result<ZyntaxValue, InterpError> {
@@ -3191,6 +3547,221 @@ mod tests {
             )
             .expect("call should succeed");
         assert!(matches!(result, ZyntaxValue::Int(42)));
+    }
+
+    /// SIMD scalarization: splat → element-wise add → insert → extract →
+    /// horizontal reduce, all inline (no FFI). `c = splat(2)+splat(3)` =
+    /// `[5,5,5,5]`; insert lane 1 := 10 → `[5,10,5,5]`; reduce_add = 25;
+    /// extract lane 1 = 10; return 25 + 10 = 35.
+    #[test]
+    fn bc_runs_vector_splat_binop_reduce() {
+        let mut func = mk_fn("vsum", vec![], vec![HirType::F32]);
+        let vec_ty = HirType::Vector(Box::new(HirType::F32), 4);
+        let c2 = add_value(
+            &mut func,
+            HirType::F32,
+            HirValueKind::Constant(HirConstant::F32(2.0)),
+        );
+        let c3 = add_value(
+            &mut func,
+            HirType::F32,
+            HirValueKind::Constant(HirConstant::F32(3.0)),
+        );
+        let c10 = add_value(
+            &mut func,
+            HirType::F32,
+            HirValueKind::Constant(HirConstant::F32(10.0)),
+        );
+        let a = add_value(&mut func, vec_ty.clone(), HirValueKind::Instruction);
+        let b = add_value(&mut func, vec_ty.clone(), HirValueKind::Instruction);
+        let c = add_value(&mut func, vec_ty.clone(), HirValueKind::Instruction);
+        let c_ins = add_value(&mut func, vec_ty.clone(), HirValueKind::Instruction);
+        let e = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+        let r = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+        let out = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+
+        let entry_id = func.entry_block;
+        let entry = func.blocks.get_mut(&entry_id).unwrap();
+        entry.instructions.push(HirInstruction::VectorSplat {
+            result: a,
+            ty: vec_ty.clone(),
+            scalar: c2,
+        });
+        entry.instructions.push(HirInstruction::VectorSplat {
+            result: b,
+            ty: vec_ty.clone(),
+            scalar: c3,
+        });
+        entry.instructions.push(HirInstruction::Binary {
+            result: c,
+            op: BinaryOp::FAdd,
+            ty: vec_ty.clone(),
+            left: a,
+            right: b,
+        });
+        entry.instructions.push(HirInstruction::VectorInsertLane {
+            result: c_ins,
+            ty: vec_ty.clone(),
+            vector: c,
+            scalar: c10,
+            lane: 1,
+        });
+        entry.instructions.push(HirInstruction::VectorExtractLane {
+            result: e,
+            ty: HirType::F32,
+            vector: c_ins,
+            lane: 1,
+        });
+        entry
+            .instructions
+            .push(HirInstruction::VectorHorizontalReduce {
+                result: r,
+                ty: HirType::F32,
+                vector: c_ins,
+                op: BinaryOp::FAdd,
+            });
+        entry.instructions.push(HirInstruction::Binary {
+            result: out,
+            op: BinaryOp::FAdd,
+            ty: HirType::F32,
+            left: r,
+            right: e,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![out] };
+
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.functions.insert(func.id, func);
+        let mut interp = HirInterpreter::new();
+        let result = interp.call(&module, "vsum", vec![]).expect("call ok");
+        // The trailing scalar `r + e` is an `f32` add — it must stay `F32`
+        // (not widen to `Float`), matching the native backends.
+        match result {
+            ZyntaxValue::F32(x) => assert!((x - 35.0).abs() < 1e-6, "got {x}"),
+            other => panic!("expected F32(35.0), got {other:?}"),
+        }
+    }
+
+    /// Scalar `f32` arithmetic must stay `f32`-typed and `f32`-precise, not
+    /// funnel through `f64`/`Float`. `def f(a,b): f32 { return a*b - a }`
+    /// with a=0.1, b=0.2 → the `F32`-rounded result, which differs from the
+    /// `f64` value in the low bits — asserting the exact `f32` bit pattern
+    /// pins that the op computed in `f32`.
+    #[test]
+    fn bc_scalar_f32_stays_f32() {
+        let mut func = mk_fn("f", vec![HirType::F32, HirType::F32], vec![HirType::F32]);
+        let a = func.signature.params[0].id;
+        let b = func.signature.params[1].id;
+        for (id, idx) in [(a, 0u32), (b, 1u32)] {
+            func.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty: HirType::F32,
+                    kind: HirValueKind::Parameter(idx),
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+        }
+        let prod = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+        let out = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+        let entry_id = func.entry_block;
+        let entry = func.blocks.get_mut(&entry_id).unwrap();
+        entry.instructions.push(HirInstruction::Binary {
+            result: prod,
+            op: BinaryOp::FMul,
+            ty: HirType::F32,
+            left: a,
+            right: b,
+        });
+        entry.instructions.push(HirInstruction::Binary {
+            result: out,
+            op: BinaryOp::FSub,
+            ty: HirType::F32,
+            left: prod,
+            right: a,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![out] };
+
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.functions.insert(func.id, func);
+        let mut interp = HirInterpreter::new();
+        let result = interp
+            .call(
+                &module,
+                "f",
+                vec![ZyntaxValue::F32(0.1), ZyntaxValue::F32(0.2)],
+            )
+            .expect("call ok");
+        let expect: f32 = 0.1f32 * 0.2f32 - 0.1f32;
+        match result {
+            ZyntaxValue::F32(x) => assert_eq!(x.to_bits(), expect.to_bits(), "got {x}"),
+            other => panic!("expected F32, got {other:?}"),
+        }
+    }
+
+    /// SIMD memory roundtrip: `store` a splatted vector into a stack buffer,
+    /// `load` it back, and reduce. Exercises `VectorStore`/`VectorLoad`'s
+    /// per-lane `write_typed`/`read_typed`. splat(7) → store → load →
+    /// reduce_add = 28.
+    #[test]
+    fn bc_runs_vector_load_store_roundtrip() {
+        let mut func = mk_fn("vld", vec![], vec![HirType::F32]);
+        let vec_ty = HirType::Vector(Box::new(HirType::F32), 4);
+        let buf = add_value(
+            &mut func,
+            HirType::Ptr(Box::new(HirType::F32)),
+            HirValueKind::Instruction,
+        );
+        let c7 = add_value(
+            &mut func,
+            HirType::F32,
+            HirValueKind::Constant(HirConstant::F32(7.0)),
+        );
+        let v = add_value(&mut func, vec_ty.clone(), HirValueKind::Instruction);
+        let w = add_value(&mut func, vec_ty.clone(), HirValueKind::Instruction);
+        let r = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+
+        let entry_id = func.entry_block;
+        let entry = func.blocks.get_mut(&entry_id).unwrap();
+        entry.instructions.push(HirInstruction::Alloca {
+            result: buf,
+            ty: vec_ty.clone(),
+            count: None,
+            align: 16,
+        });
+        entry.instructions.push(HirInstruction::VectorSplat {
+            result: v,
+            ty: vec_ty.clone(),
+            scalar: c7,
+        });
+        entry.instructions.push(HirInstruction::VectorStore {
+            value: v,
+            ptr: buf,
+            align: 16,
+        });
+        entry.instructions.push(HirInstruction::VectorLoad {
+            result: w,
+            ty: vec_ty.clone(),
+            ptr: buf,
+            align: 16,
+        });
+        entry
+            .instructions
+            .push(HirInstruction::VectorHorizontalReduce {
+                result: r,
+                ty: HirType::F32,
+                vector: w,
+                op: BinaryOp::FAdd,
+            });
+        entry.terminator = HirTerminator::Return { values: vec![r] };
+
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.functions.insert(func.id, func);
+        let mut interp = HirInterpreter::new();
+        let result = interp.call(&module, "vld", vec![]).expect("call ok");
+        let got = value_to_f64(&result).unwrap_or(f64::NAN);
+        assert!((got - 28.0).abs() < 1e-6, "got {result:?}");
     }
 
     /// `def main(): i64 { if (true) return 1 else return 0 }`
