@@ -1209,19 +1209,21 @@ impl<'ctx> LLVMBackend<'ctx> {
             HirInstruction::Binary {
                 result,
                 op,
-                ty: _,
+                ty,
                 left,
                 right,
             } => {
-                log::debug!("[LLVM] compile_instruction: Binary op={:?}, result={:?}, left={:?}, right={:?}", op, result, left, right);
                 let left_val = self.get_value(*left)?;
-                log::debug!("[LLVM]   left_val = {:?}", left_val);
                 let right_val = self.get_value(*right)?;
-                log::debug!("[LLVM]   right_val = {:?}", right_val);
-                let result_val = self.compile_binary_op(*op, left_val, right_val)?;
-                log::debug!("[LLVM]   result_val = {:?}", result_val);
+                // Element-wise vector arithmetic: LLVM's build_int_*/build_float_*
+                // accept vector operands directly (VectorValue is Int/FloatMathValue),
+                // but the scalar path's `.into_int_value()` would panic on them.
+                let result_val = if let HirType::Vector(elem, _) = ty {
+                    self.compile_vector_binary(*op, left_val, right_val, elem)?
+                } else {
+                    self.compile_binary_op(*op, left_val, right_val)?
+                };
                 self.value_map.insert(*result, result_val);
-                log::debug!("[LLVM]   inserted result={:?} into value_map", result);
             }
 
             HirInstruction::Unary {
@@ -2763,6 +2765,48 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// Compile a binary operation
+    /// Element-wise SIMD arithmetic — `VectorValue` implements both
+    /// `IntMathValue` and `FloatMathValue`, so the `build_int_*` / `build_float_*`
+    /// builders take the vectors directly (no per-lane loop).
+    fn compile_vector_binary(
+        &self,
+        op: BinaryOp,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+        elem: &HirType,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let l = left.into_vector_value();
+        let r = right.into_vector_value();
+        let out = if matches!(elem, HirType::F32 | HirType::F64) {
+            match op {
+                BinaryOp::Add | BinaryOp::FAdd => self.builder.build_float_add(l, r, "vfadd")?,
+                BinaryOp::Sub | BinaryOp::FSub => self.builder.build_float_sub(l, r, "vfsub")?,
+                BinaryOp::Mul | BinaryOp::FMul => self.builder.build_float_mul(l, r, "vfmul")?,
+                BinaryOp::Div | BinaryOp::FDiv => self.builder.build_float_div(l, r, "vfdiv")?,
+                other => {
+                    return Err(CompilerError::CodeGen(format!(
+                        "vector float binop {other:?}"
+                    )))
+                }
+            }
+        } else {
+            match op {
+                BinaryOp::Add => self.builder.build_int_add(l, r, "vadd")?,
+                BinaryOp::Sub => self.builder.build_int_sub(l, r, "vsub")?,
+                BinaryOp::Mul => self.builder.build_int_mul(l, r, "vmul")?,
+                BinaryOp::And => self.builder.build_and(l, r, "vand")?,
+                BinaryOp::Or => self.builder.build_or(l, r, "vor")?,
+                BinaryOp::Xor => self.builder.build_xor(l, r, "vxor")?,
+                other => {
+                    return Err(CompilerError::CodeGen(format!(
+                        "vector int binop {other:?}"
+                    )))
+                }
+            }
+        };
+        Ok(out.into())
+    }
+
     fn compile_binary_op(
         &mut self,
         op: BinaryOp,

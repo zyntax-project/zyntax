@@ -48,6 +48,7 @@ fn make_sig(params: Vec<HirType>, returns: Vec<HirType>) -> HirFunctionSignature
         lifetime_params: vec![],
         is_variadic: false,
         is_async: false,
+        is_fiber: false,
         effects: vec![],
         is_pure: false,
     }
@@ -127,6 +128,7 @@ fn llvm_backend_compiles_perform_effect_with_resumable_handler() {
             entry_block: HirId::new(),
             blocks: IndexMap::new(),
             is_resumable: true,
+            is_async: false,
         }],
     };
 

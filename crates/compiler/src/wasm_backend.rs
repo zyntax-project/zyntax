@@ -47,7 +47,7 @@
 
 use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
-    HirValueKind,
+    HirValueKind, VectorMinMaxKind, VectorUnaryKind,
 };
 use std::collections::HashMap;
 
@@ -1621,6 +1621,139 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(self.local_get(*b)?);
                 out.push(self.local_get(*acc)?);
                 out.push(WasmInst::I32x4RelaxedDotI8x16I7x16AddS);
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorExtractLane {
+                result,
+                ty,
+                vector,
+                lane,
+            } => {
+                out.push(self.local_get(*vector)?);
+                let l = *lane;
+                // `ty` is the scalar element type; extract + widen into the funnel.
+                match ty {
+                    HirType::I8 => {
+                        out.push(WasmInst::I8x16ExtractLaneS(l));
+                        out.push(WasmInst::I64ExtendI32S);
+                    }
+                    HirType::U8 | HirType::Bool => {
+                        out.push(WasmInst::I8x16ExtractLaneU(l));
+                        out.push(WasmInst::I64ExtendI32U);
+                    }
+                    HirType::I16 => {
+                        out.push(WasmInst::I16x8ExtractLaneS(l));
+                        out.push(WasmInst::I64ExtendI32S);
+                    }
+                    HirType::U16 => {
+                        out.push(WasmInst::I16x8ExtractLaneU(l));
+                        out.push(WasmInst::I64ExtendI32U);
+                    }
+                    HirType::I32 | HirType::U32 => {
+                        out.push(WasmInst::I32x4ExtractLane(l));
+                        out.push(WasmInst::I64ExtendI32S);
+                    }
+                    HirType::I64 | HirType::U64 => out.push(WasmInst::I64x2ExtractLane(l)),
+                    HirType::F32 => {
+                        out.push(WasmInst::F32x4ExtractLane(l));
+                        out.push(WasmInst::F64PromoteF32);
+                    }
+                    HirType::F64 => out.push(WasmInst::F64x2ExtractLane(l)),
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!(
+                            "extract lane {other:?}"
+                        )))
+                    }
+                }
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorInsertLane {
+                result,
+                ty,
+                vector,
+                scalar,
+                lane,
+            } => {
+                out.push(self.local_get(*vector)?);
+                out.push(self.local_get(*scalar)?);
+                let elem = match ty {
+                    HirType::Vector(e, _) => &**e,
+                    _ => return Err(WasmEmitError::Unsupported("insert non-vector".into())),
+                };
+                let l = *lane;
+                match elem {
+                    HirType::I8 | HirType::U8 => {
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::I8x16ReplaceLane(l));
+                    }
+                    HirType::I16 | HirType::U16 => {
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::I16x8ReplaceLane(l));
+                    }
+                    HirType::I32 | HirType::U32 => {
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::I32x4ReplaceLane(l));
+                    }
+                    HirType::I64 | HirType::U64 => out.push(WasmInst::I64x2ReplaceLane(l)),
+                    HirType::F32 => {
+                        out.push(WasmInst::F32DemoteF64);
+                        out.push(WasmInst::F32x4ReplaceLane(l));
+                    }
+                    HirType::F64 => out.push(WasmInst::F64x2ReplaceLane(l)),
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!("insert lane {other:?}")))
+                    }
+                }
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorUnaryOp {
+                result,
+                ty,
+                op,
+                operand,
+            } => {
+                out.push(self.local_get(*operand)?);
+                let is_f32 = matches!(ty, HirType::Vector(e, _) if matches!(**e, HirType::F32));
+                let inst = match (op, is_f32) {
+                    (VectorUnaryKind::Sqrt, true) => WasmInst::F32x4Sqrt,
+                    (VectorUnaryKind::Sqrt, false) => WasmInst::F64x2Sqrt,
+                    (VectorUnaryKind::Abs, true) => WasmInst::F32x4Abs,
+                    (VectorUnaryKind::Abs, false) => WasmInst::F64x2Abs,
+                    (VectorUnaryKind::Neg, true) => WasmInst::F32x4Neg,
+                    (VectorUnaryKind::Neg, false) => WasmInst::F64x2Neg,
+                    (VectorUnaryKind::Ceil, true) => WasmInst::F32x4Ceil,
+                    (VectorUnaryKind::Ceil, false) => WasmInst::F64x2Ceil,
+                    (VectorUnaryKind::Floor, true) => WasmInst::F32x4Floor,
+                    (VectorUnaryKind::Floor, false) => WasmInst::F64x2Floor,
+                    (VectorUnaryKind::Trunc, true) => WasmInst::F32x4Trunc,
+                    (VectorUnaryKind::Trunc, false) => WasmInst::F64x2Trunc,
+                    (VectorUnaryKind::Round, true) => WasmInst::F32x4Nearest,
+                    (VectorUnaryKind::Round, false) => WasmInst::F64x2Nearest,
+                };
+                out.push(inst);
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorMinMax {
+                result,
+                ty,
+                op,
+                left,
+                right,
+            } => {
+                out.push(self.local_get(*left)?);
+                out.push(self.local_get(*right)?);
+                let is_f32 = matches!(ty, HirType::Vector(e, _) if matches!(**e, HirType::F32));
+                let inst = match (op, is_f32) {
+                    (VectorMinMaxKind::Min, true) => WasmInst::F32x4Min,
+                    (VectorMinMaxKind::Max, true) => WasmInst::F32x4Max,
+                    (VectorMinMaxKind::Min, false) => WasmInst::F64x2Min,
+                    (VectorMinMaxKind::Max, false) => WasmInst::F64x2Max,
+                };
+                out.push(inst);
                 out.push(self.local_set(*result)?);
                 Ok(())
             }
