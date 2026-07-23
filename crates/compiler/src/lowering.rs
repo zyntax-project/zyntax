@@ -3488,6 +3488,15 @@ impl LoweringContext {
                 }
             }
 
+            Type::Vector(inner, lanes) => {
+                // First-class SIMD surface type lowers directly to the
+                // HIR vector variant — identical shape to the builtin
+                // name bridge (`f32x4` → `Vector(F32, 4)`), so both the
+                // typed and stringly spellings converge on inline vector
+                // instructions in every backend.
+                HirType::Vector(Box::new(self.convert_type(inner)), *lanes as u32)
+            }
+
             _ => HirType::I64, // Default for unsupported types
         }
     }

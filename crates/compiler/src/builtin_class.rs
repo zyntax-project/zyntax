@@ -130,6 +130,7 @@ impl BuiltinRegistry {
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(FiberClass));
+        reg.register(Arc::new(VectorClass));
         reg
     }
 
@@ -228,4 +229,111 @@ impl BuiltinClass for FiberClass {
             _ => Ok(None),
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Vector<T, N> wrapper class (first-class SIMD)
+// ────────────────────────────────────────────────────────────────
+
+/// Wrapper class for the compiler-known `Type::Vector(_, _)` variant.
+///
+/// Every method against a SIMD vector value dispatches here and lowers
+/// to an inline vector instruction — horizontal reductions, element-
+/// wise unary math, min/max, and lane access. Element-wise binary
+/// arithmetic (`a + b`) and lane indexing (`v[i]`) are routed directly
+/// from the `Binary` / `Index` expression handlers in the SSA builder
+/// (a value's lowered `HirType::Vector` shape selects the vector path),
+/// so they do not appear here.
+///
+/// A single class covers every `Type::Vector(elem, lanes)`
+/// instantiation; the concrete element type and lane count are read
+/// back from the lowered receiver value inside each emitter.
+pub struct VectorClass;
+
+impl BuiltinClass for VectorClass {
+    fn name(&self) -> &str {
+        "Vector"
+    }
+
+    fn matches(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Vector(_, _))
+    }
+
+    fn dispatch(
+        &self,
+        ssa: &mut crate::ssa::SsaBuilder,
+        block_id: HirId,
+        method: &str,
+        receiver: &TypedNode<TypedExpression>,
+        _receiver_ty: &Type,
+        args: &[TypedNode<TypedExpression>],
+        _result_ty: &Type,
+    ) -> CompilerResult<Option<HirId>> {
+        use crate::hir::{VectorMinMaxKind, VectorUnaryKind};
+
+        match method {
+            // Horizontal reductions. `sum`/`reduce` add all lanes; the
+            // emitter defaults the op to the lane type's add.
+            "sum" | "reduce" | "horizontal_sum" => {
+                ssa.emit_vector_reduce(block_id, receiver, None).map(Some)
+            }
+
+            // Element-wise unary math: the method name selects the lane
+            // operation, all sharing one emitter.
+            "sqrt" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Sqrt).map(Some),
+            "abs" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Abs).map(Some),
+            "neg" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Neg).map(Some),
+            "ceil" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Ceil).map(Some),
+            "floor" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Floor).map(Some),
+            "trunc" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Trunc).map(Some),
+            "round" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Round).map(Some),
+
+            "min" => match args.first() {
+                Some(other) => ssa
+                    .emit_vector_minmax(block_id, receiver, other, VectorMinMaxKind::Min)
+                    .map(Some),
+                None => Ok(None),
+            },
+            "max" => match args.first() {
+                Some(other) => ssa
+                    .emit_vector_minmax(block_id, receiver, other, VectorMinMaxKind::Max)
+                    .map(Some),
+                None => Ok(None),
+            },
+
+            // Lane access by method form, mirroring the `v[i]` sugar.
+            "extract" | "lane" => match args.first() {
+                Some(lane_expr) => {
+                    let vector_val = ssa.translate_expression(block_id, receiver)?;
+                    let lane_val = ssa.translate_expression(block_id, lane_expr)?;
+                    let lane = ssa.const_lane_index(lane_val).ok_or_else(|| {
+                        crate::CompilerError::Lowering("lane index must be a constant".to_string())
+                    })?;
+                    ssa.emit_vector_extract_lane(block_id, vector_val, lane)
+                        .map(Some)
+                }
+                None => Ok(None),
+            },
+
+            // `v.insert(i, x)` — static lane, scalar value.
+            "insert" => match (args.first(), args.get(1)) {
+                (Some(lane_expr), Some(scalar_expr)) => ssa
+                    .emit_vector_insert_lane(block_id, receiver, lane_expr, scalar_expr)
+                    .map(Some),
+                _ => Ok(None),
+            },
+
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Shared trampoline so each unary arm above stays a one-liner.
+fn ssa_unary(
+    ssa: &mut crate::ssa::SsaBuilder,
+    block_id: HirId,
+    receiver: &TypedNode<TypedExpression>,
+    kind: crate::hir::VectorUnaryKind,
+) -> CompilerResult<HirId> {
+    ssa.emit_vector_unary(block_id, receiver, kind)
 }

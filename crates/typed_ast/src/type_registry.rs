@@ -394,6 +394,14 @@ pub enum Type {
     /// `FiberResume` rather than a regular method call.
     Fiber(Box<Type>),
 
+    /// First-class SIMD vector type: `Simd<T, N>` (surface spellings
+    /// `f32x4`, `i32x4`, `i8x16`, …). A fixed-width lane bundle whose
+    /// element type is `T` and lane count `N`. Constructors (`splat`),
+    /// arithmetic operators, and lane/reduce methods are dispatched at HIR
+    /// to the inline `Vector*` ops — never runtime FFI — mirroring the
+    /// `Fiber` first-class model. Lowers to `HirType::Vector(T, N)`.
+    Vector(Box<Type>, usize),
+
     /// Union type: T1 | T2 | ... | Tn
     Union(Vec<Type>),
 

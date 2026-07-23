@@ -1458,6 +1458,43 @@ impl<'g> GrammarInterpreter<'g> {
                         let inner = type_args.into_iter().next().unwrap_or(Type::Any);
                         return Ok(ParsedValue::Type(Type::Fiber(Box::new(inner))));
                     }
+
+                    // First-class SIMD, generic spelling `Simd<T, N>`. The
+                    // element type is the sole type argument; the lane count
+                    // is the leading const argument. Only take this path when
+                    // the lane count is a concrete positive literal — a
+                    // const-generic variable falls through to normal
+                    // resolution for later monomorphization.
+                    if name_str == "Simd" {
+                        let lanes = match const_args.first() {
+                            Some(ConstValue::Int(n)) if *n > 0 => Some(*n as usize),
+                            Some(ConstValue::UInt(n)) if *n > 0 => Some(*n as usize),
+                            _ => None,
+                        };
+                        if let Some(lanes) = lanes {
+                            let inner = type_args.into_iter().next().unwrap_or(Type::Any);
+                            return Ok(ParsedValue::Type(Type::Vector(Box::new(inner), lanes)));
+                        }
+                    }
+
+                    // First-class SIMD, short alias spelling `<prim>x<lanes>`
+                    // (e.g. `f32x4`, `i8x16`). Recognised only for a bare name
+                    // with no explicit arguments; the prefix must name a
+                    // primitive and the suffix a positive lane count.
+                    if type_args.is_empty() && const_args.is_empty() {
+                        if let Some((prefix, lanes_str)) = name_str.split_once('x') {
+                            if let Ok(lanes) = lanes_str.parse::<usize>() {
+                                if lanes > 0 {
+                                    if let Some(prim) = self.primitive_type_from_name(prefix) {
+                                        return Ok(ParsedValue::Type(Type::Vector(
+                                            Box::new(Type::Primitive(prim)),
+                                            lanes,
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Tensor shape/dtype sugar from tensor[...] syntax.

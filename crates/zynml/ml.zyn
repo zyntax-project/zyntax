@@ -1382,7 +1382,7 @@ type_args_angle = { "<" ~ args:type_args ~ ">" }
 //   List<int>      -> List<int>
 //   int            -> int
 //
-type_expr = { ty:optional_type | ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:primitive_type | ty:simple_type }
+type_expr = { ty:optional_type | ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:simd_type | ty:primitive_type | ty:simple_type }
   -> ty
 
 // Tuple type: (T1, T2) or (T1, T2, T3)
@@ -1434,7 +1434,7 @@ optional_type = { "?" ~ inner:type_expr_non_optional }
   }
 
 // Type expression without the optional prefix (to avoid infinite recursion)
-type_expr_non_optional = { ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:primitive_type | ty:simple_type }
+type_expr_non_optional = { ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:simd_type | ty:primitive_type | ty:simple_type }
   -> ty
 
 // Tensor type syntax (canonical): tensor[shape..., dtype?]
@@ -1523,6 +1523,21 @@ simple_type = { name:identifier }
       type_args: [],
       const_args: [],
   }
+
+// First-class SIMD short alias: `f32x4`, `i8x16`, ... — a primitive
+// lane prefix immediately followed by `x<lanes>`. Matched atomically so
+// `f32x4` is not split into the `f32` primitive plus a stray `x4`. Must
+// precede `primitive_type` in the type alternatives. Emitted as a Named
+// token whose `<prim>x<lanes>` shape the type builder rewrites into the
+// first-class vector type.
+simd_type = { name:simd_alias_ident }
+  -> Type::Named {
+      name: intern(name),
+      type_args: [],
+      const_args: [],
+  }
+
+simd_alias_ident = @{ ("i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64") ~ "x" ~ ASCII_DIGIT+ }
 
 array_type = { "Array" ~ "<" ~ elem:type_expr ~ ">" }
   -> Type::Named {

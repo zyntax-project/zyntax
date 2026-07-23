@@ -3517,6 +3517,29 @@ impl SsaBuilder {
                 // Regular binary operations for primitive types
                 let left_val = self.translate_expression(block_id, left)?;
                 let right_val = self.translate_expression(block_id, right)?;
+
+                // First-class SIMD: when either lowered operand is a
+                // vector register this is element-wise vector
+                // arithmetic. Route to an inline vector `Binary`
+                // (broadcasting a scalar operand) and bypass the scalar
+                // width / float-tag fixups below. Falls through for
+                // operators with no vector encoding.
+                let lhs_is_vec = matches!(
+                    self.function.values.get(&left_val).map(|v| &v.ty),
+                    Some(HirType::Vector(..))
+                );
+                let rhs_is_vec = matches!(
+                    self.function.values.get(&right_val).map(|v| &v.ty),
+                    Some(HirType::Vector(..))
+                );
+                if lhs_is_vec || rhs_is_vec {
+                    if let Some(result) =
+                        self.emit_vector_binary(block_id, op, left_val, right_val)?
+                    {
+                        return Ok(result);
+                    }
+                }
+
                 let result_type = self.convert_type(&expr.ty);
 
                 // First-pass: pick the HIR op from the typed-AST operand
@@ -3724,6 +3747,21 @@ impl SsaBuilder {
             TypedExpression::Call(call) => {
                 let callee = &call.callee;
                 let args = &call.positional_args;
+
+                // First-class SIMD constructors: `f32x4::splat(x)`,
+                // `f32x4::new(a, b, c, d)`. The callee arrives as a
+                // two-segment `Path` or a `$`-mangled `Variable`; the
+                // type segment must name a `<prim>x<lanes>` vector. Every
+                // constructor lowers to inline vector instructions.
+                if let Some((type_name, member)) = Self::associated_call_parts(&callee.node) {
+                    if let Some((elem_ty, lanes)) = Self::parse_simd_alias(&type_name) {
+                        if let Some(result) =
+                            self.emit_vector_constructor(block_id, &elem_ty, lanes, &member, args)?
+                        {
+                            return Ok(result);
+                        }
+                    }
+                }
 
                 // F-string closure inlining: println(f"text {expr}") desugars to
                 // println(__fstring__("text", expr)). Intercept this pattern and
@@ -4792,6 +4830,18 @@ impl SsaBuilder {
                 let object_val = self.translate_expression(block_id, object)?;
                 let index_val = self.translate_expression(block_id, index)?;
 
+                // First-class SIMD: `v[i]` on a vector value is a static
+                // lane extract, not a memory load. The lane index must
+                // be a compile-time constant.
+                if self.vector_layout_of(object_val).is_some() {
+                    let lane = self.const_lane_index(index_val).ok_or_else(|| {
+                        crate::CompilerError::Lowering(
+                            "vector lane index must be a constant".to_string(),
+                        )
+                    })?;
+                    return self.emit_vector_extract_lane(block_id, object_val, lane);
+                }
+
                 // The grammar layer assigns `Type::Unknown` to every
                 // Index expression (see
                 // `runtime2/interpreter.rs::construct_expression`),
@@ -5754,6 +5804,7 @@ impl SsaBuilder {
                     &method_call.receiver,
                     &receiver_type,
                     method_call.method,
+                    &method_call.positional_args,
                     &expr.ty,
                 )? {
                     return Ok(intercepted);
@@ -7982,6 +8033,7 @@ impl SsaBuilder {
         receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
         receiver_type: &Type,
         method: zyntax_typed_ast::InternedString,
+        args: &[zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>],
         result_ty: &Type,
     ) -> CompilerResult<Option<HirId>> {
         let method_name = match method.resolve_global() {
@@ -8003,7 +8055,7 @@ impl SsaBuilder {
             method_name.as_str(),
             receiver_expr,
             receiver_type,
-            &[],
+            args,
             result_ty,
         )
     }
@@ -8398,6 +8450,495 @@ impl SsaBuilder {
         Ok(result)
     }
 
+    // ────────────────────────────────────────────────────────────
+    // First-class SIMD vector emitters
+    //
+    // Every method/operator/index against a value whose lowered type
+    // is `HirType::Vector(elem, lanes)` routes here and emits an
+    // inline vector instruction. No path falls back to an out-of-line
+    // symbol call — the vocabulary is first-class in the IR and every
+    // backend lowers it to native vector instructions.
+    // ────────────────────────────────────────────────────────────
+
+    /// Recover the `(vector_ty, element_ty, lanes)` layout of an SSA
+    /// value, or `None` when the value is not a vector register.
+    pub(crate) fn vector_layout_of(&self, value: HirId) -> Option<(HirType, HirType, u32)> {
+        match self.function.values.get(&value).map(|v| v.ty.clone()) {
+            Some(HirType::Vector(elem, lanes)) => {
+                let vec_ty = HirType::Vector(elem.clone(), lanes);
+                Some((vec_ty, *elem, lanes))
+            }
+            _ => None,
+        }
+    }
+
+    /// Interpret an SSA value as a compile-time lane index. Lane
+    /// selection is a static operand of `VectorExtractLane` /
+    /// `VectorInsertLane`, so only constant indices are accepted.
+    pub(crate) fn const_lane_index(&self, value: HirId) -> Option<u8> {
+        match self.function.values.get(&value).map(|v| &v.kind) {
+            Some(HirValueKind::Constant(c)) => match c {
+                HirConstant::I8(n) => u8::try_from(*n).ok(),
+                HirConstant::I16(n) => u8::try_from(*n).ok(),
+                HirConstant::I32(n) => u8::try_from(*n).ok(),
+                HirConstant::I64(n) => u8::try_from(*n).ok(),
+                HirConstant::U8(n) => Some(*n),
+                HirConstant::U16(n) => u8::try_from(*n).ok(),
+                HirConstant::U32(n) => u8::try_from(*n).ok(),
+                HirConstant::U64(n) => u8::try_from(*n).ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Classify a scalar HIR type as `(is_float, bit_width, is_signed)`,
+    /// or `None` for non-numeric types.
+    fn scalar_class(ty: &HirType) -> Option<(bool, u32, bool)> {
+        Some(match ty {
+            HirType::I8 => (false, 8, true),
+            HirType::I16 => (false, 16, true),
+            HirType::I32 => (false, 32, true),
+            HirType::I64 => (false, 64, true),
+            HirType::I128 => (false, 128, true),
+            HirType::U8 => (false, 8, false),
+            HirType::U16 => (false, 16, false),
+            HirType::U32 => (false, 32, false),
+            HirType::U64 => (false, 64, false),
+            HirType::U128 => (false, 128, false),
+            HirType::F32 => (true, 32, false),
+            HirType::F64 => (true, 64, false),
+            _ => return None,
+        })
+    }
+
+    /// Coerce a scalar value to `target` if it differs, emitting the
+    /// appropriate numeric `Cast`. Lane scalars reach the vector
+    /// emitters at whatever width the frontend inferred (e.g. a
+    /// `1.0` literal is `F64`), but every backend's vector op requires
+    /// the scalar to match the lane element type exactly — Cranelift's
+    /// verifier rejects a mismatched `splat`/`insertlane`. Returns the
+    /// original value unchanged when it already matches or is
+    /// non-numeric.
+    pub(crate) fn coerce_scalar_to(
+        &mut self,
+        block_id: HirId,
+        value: HirId,
+        target: &HirType,
+    ) -> HirId {
+        let src = match self.function.values.get(&value).map(|v| v.ty.clone()) {
+            Some(t) => t,
+            None => return value,
+        };
+        if &src == target {
+            return value;
+        }
+        let op = match (Self::scalar_class(&src), Self::scalar_class(target)) {
+            (Some((true, sw, _)), Some((true, tw, _))) => {
+                if sw > tw {
+                    crate::hir::CastOp::FpTrunc
+                } else if sw < tw {
+                    crate::hir::CastOp::FpExt
+                } else {
+                    return value;
+                }
+            }
+            (Some((false, sw, s_signed)), Some((false, tw, _))) => {
+                if sw > tw {
+                    crate::hir::CastOp::Trunc
+                } else if sw < tw {
+                    if s_signed {
+                        crate::hir::CastOp::SExt
+                    } else {
+                        crate::hir::CastOp::ZExt
+                    }
+                } else {
+                    // Same-width integers share a representation.
+                    return value;
+                }
+            }
+            (Some((false, _, s_signed)), Some((true, _, _))) => {
+                if s_signed {
+                    crate::hir::CastOp::SiToFp
+                } else {
+                    crate::hir::CastOp::UiToFp
+                }
+            }
+            (Some((true, _, _)), Some((false, _, t_signed))) => {
+                if t_signed {
+                    crate::hir::CastOp::FpToSi
+                } else {
+                    crate::hir::CastOp::FpToUi
+                }
+            }
+            _ => return value,
+        };
+        let result = self.create_value(target.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Cast {
+                op,
+                result,
+                ty: target.clone(),
+                operand: value,
+            },
+        );
+        self.add_use(value, result);
+        result
+    }
+
+    /// `vector.sum()` / horizontal reduction. The reduce op defaults
+    /// to a lane-type-appropriate add (`FAdd` for float lanes, `Add`
+    /// for integer lanes); callers pass `op_hint` to override.
+    pub(crate) fn emit_vector_reduce(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        op_hint: Option<crate::hir::BinaryOp>,
+    ) -> CompilerResult<HirId> {
+        let vector_val = self.translate_expression(block_id, receiver_expr)?;
+        let (_, elem_ty, _) = self.vector_layout_of(vector_val).ok_or_else(|| {
+            crate::CompilerError::Lowering(
+                "horizontal reduction requires a vector receiver".to_string(),
+            )
+        })?;
+        let is_float = matches!(elem_ty, HirType::F32 | HirType::F64);
+        let op = op_hint.unwrap_or(if is_float {
+            crate::hir::BinaryOp::FAdd
+        } else {
+            crate::hir::BinaryOp::Add
+        });
+        let result = self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorHorizontalReduce {
+                result,
+                ty: elem_ty,
+                vector: vector_val,
+                op,
+            },
+        );
+        self.add_use(vector_val, result);
+        Ok(result)
+    }
+
+    /// Element-wise SIMD unary op (`sqrt`/`abs`/`neg`/`ceil`/`floor`/
+    /// `trunc`/`round`).
+    pub(crate) fn emit_vector_unary(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        kind: crate::hir::VectorUnaryKind,
+    ) -> CompilerResult<HirId> {
+        let operand = self.translate_expression(block_id, receiver_expr)?;
+        let (vec_ty, _, _) = self.vector_layout_of(operand).ok_or_else(|| {
+            crate::CompilerError::Lowering("unary op requires a vector receiver".to_string())
+        })?;
+        let result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorUnaryOp {
+                result,
+                ty: vec_ty,
+                op: kind,
+                operand,
+            },
+        );
+        self.add_use(operand, result);
+        Ok(result)
+    }
+
+    /// Element-wise SIMD min/max: `a.min(b)` / `a.max(b)`.
+    pub(crate) fn emit_vector_minmax(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        other_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        kind: crate::hir::VectorMinMaxKind,
+    ) -> CompilerResult<HirId> {
+        let left = self.translate_expression(block_id, receiver_expr)?;
+        let right = self.translate_expression(block_id, other_expr)?;
+        let (vec_ty, _, _) = self.vector_layout_of(left).ok_or_else(|| {
+            crate::CompilerError::Lowering("min/max requires a vector receiver".to_string())
+        })?;
+        let result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorMinMax {
+                result,
+                ty: vec_ty,
+                op: kind,
+                left,
+                right,
+            },
+        );
+        self.add_use(left, result);
+        self.add_use(right, result);
+        Ok(result)
+    }
+
+    /// Extract a single scalar lane from an already-lowered vector
+    /// value. The lane index is a static operand.
+    pub(crate) fn emit_vector_extract_lane(
+        &mut self,
+        block_id: HirId,
+        vector_val: HirId,
+        lane: u8,
+    ) -> CompilerResult<HirId> {
+        let (_, elem_ty, _) = self.vector_layout_of(vector_val).ok_or_else(|| {
+            crate::CompilerError::Lowering("lane extract requires a vector value".to_string())
+        })?;
+        let result = self.create_value(elem_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorExtractLane {
+                result,
+                ty: elem_ty,
+                vector: vector_val,
+                lane,
+            },
+        );
+        self.add_use(vector_val, result);
+        Ok(result)
+    }
+
+    /// Insert a scalar into a static lane: `v.insert(i, x)`.
+    pub(crate) fn emit_vector_insert_lane(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        lane_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        scalar_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let vector_val = self.translate_expression(block_id, receiver_expr)?;
+        let (vec_ty, elem_ty, _) = self.vector_layout_of(vector_val).ok_or_else(|| {
+            crate::CompilerError::Lowering("lane insert requires a vector receiver".to_string())
+        })?;
+        let lane_val = self.translate_expression(block_id, lane_expr)?;
+        let lane = self.const_lane_index(lane_val).ok_or_else(|| {
+            crate::CompilerError::Lowering("lane index must be a constant".to_string())
+        })?;
+        let scalar = self.translate_expression(block_id, scalar_expr)?;
+        let scalar = self.coerce_scalar_to(block_id, scalar, &elem_ty);
+        let result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorInsertLane {
+                result,
+                ty: vec_ty,
+                vector: vector_val,
+                scalar,
+                lane,
+            },
+        );
+        self.add_use(vector_val, result);
+        self.add_use(scalar, result);
+        Ok(result)
+    }
+
+    /// Broadcast a scalar across every lane, producing `vec_ty`.
+    pub(crate) fn emit_vector_splat(
+        &mut self,
+        block_id: HirId,
+        scalar: HirId,
+        vec_ty: HirType,
+    ) -> CompilerResult<HirId> {
+        // The broadcast scalar must match the lane element type exactly.
+        let scalar = if let HirType::Vector(elem, _) = &vec_ty {
+            let elem = (**elem).clone();
+            self.coerce_scalar_to(block_id, scalar, &elem)
+        } else {
+            scalar
+        };
+        let result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorSplat {
+                result,
+                ty: vec_ty,
+                scalar,
+            },
+        );
+        self.add_use(scalar, result);
+        Ok(result)
+    }
+
+    /// Element-wise SIMD arithmetic for `a <op> b` when at least one
+    /// operand is a vector register. A scalar operand is broadcast
+    /// across the vector shape (splat) so `v * s` and `s + v` work.
+    /// Returns `Ok(None)` for operators with no element-wise vector
+    /// encoding (comparisons, bitwise, shifts) so the caller falls
+    /// back to its scalar path.
+    pub(crate) fn emit_vector_binary(
+        &mut self,
+        block_id: HirId,
+        op: &zyntax_typed_ast::typed_ast::BinaryOp,
+        mut left: HirId,
+        mut right: HirId,
+    ) -> CompilerResult<Option<HirId>> {
+        use zyntax_typed_ast::typed_ast::BinaryOp as FOp;
+
+        // Take the vector layout from whichever operand is a vector.
+        let vec_ty = match self
+            .vector_layout_of(left)
+            .or_else(|| self.vector_layout_of(right))
+        {
+            Some((t, _, _)) => t,
+            None => return Ok(None),
+        };
+        let elem_is_float = matches!(
+            &vec_ty,
+            HirType::Vector(elem, _) if matches!(**elem, HirType::F32 | HirType::F64)
+        );
+
+        let hir_op = match op {
+            FOp::Add if elem_is_float => crate::hir::BinaryOp::FAdd,
+            FOp::Add => crate::hir::BinaryOp::Add,
+            FOp::Sub if elem_is_float => crate::hir::BinaryOp::FSub,
+            FOp::Sub => crate::hir::BinaryOp::Sub,
+            FOp::Mul if elem_is_float => crate::hir::BinaryOp::FMul,
+            FOp::Mul => crate::hir::BinaryOp::Mul,
+            FOp::Div if elem_is_float => crate::hir::BinaryOp::FDiv,
+            FOp::Div => crate::hir::BinaryOp::Div,
+            FOp::Rem if elem_is_float => crate::hir::BinaryOp::FRem,
+            FOp::Rem => crate::hir::BinaryOp::Rem,
+            _ => return Ok(None),
+        };
+
+        // Broadcast a scalar operand to the vector shape.
+        if self.vector_layout_of(left).is_none() {
+            left = self.emit_vector_splat(block_id, left, vec_ty.clone())?;
+        }
+        if self.vector_layout_of(right).is_none() {
+            right = self.emit_vector_splat(block_id, right, vec_ty.clone())?;
+        }
+
+        let result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: hir_op,
+                result,
+                ty: vec_ty,
+                left,
+                right,
+            },
+        );
+        self.add_use(left, result);
+        self.add_use(right, result);
+        Ok(Some(result))
+    }
+
+    /// Split an associated-call callee into `(type_name, member_name)`.
+    ///
+    /// `Type::member(..)` reaches the SSA builder either as a two-segment
+    /// `Path` (unresolved) or, once an earlier resolve pass has mangled
+    /// it, as a `$`-joined `Variable` (`Type$member` / `$Type$member`).
+    /// Both spellings collapse to the same pair here so vector
+    /// constructors are recognised regardless of pass ordering.
+    fn associated_call_parts(
+        callee: &zyntax_typed_ast::typed_ast::TypedExpression,
+    ) -> Option<(String, String)> {
+        match callee {
+            TypedExpression::Path(path) if path.segments.len() == 2 => Some((
+                path.segments[0].resolve_global()?,
+                path.segments[1].resolve_global()?,
+            )),
+            TypedExpression::Variable(name) => {
+                let raw = name.resolve_global()?;
+                let parts: Vec<&str> = raw.split('$').filter(|s| !s.is_empty()).collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse a `<prim>x<lanes>` SIMD alias (`f32x4`, `i8x16`, …) into its
+    /// element type and lane count. Returns `None` for any name that is
+    /// not structurally a vector alias, so ordinary associated calls
+    /// (`Tensor::zeros`, `Linear::new`) are never mistaken for one.
+    fn parse_simd_alias(name: &str) -> Option<(HirType, u32)> {
+        let (prefix, lanes_str) = name.split_once('x')?;
+        let lanes: u32 = lanes_str.parse().ok()?;
+        if lanes == 0 {
+            return None;
+        }
+        let elem = match prefix {
+            "i8" => HirType::I8,
+            "i16" => HirType::I16,
+            "i32" => HirType::I32,
+            "i64" => HirType::I64,
+            "u8" => HirType::U8,
+            "u16" => HirType::U16,
+            "u32" => HirType::U32,
+            "u64" => HirType::U64,
+            "f32" => HirType::F32,
+            "f64" => HirType::F64,
+            _ => return None,
+        };
+        Some((elem, lanes))
+    }
+
+    /// Emit an inline first-class SIMD constructor. `splat(x)` broadcasts
+    /// a scalar; `new(a, b, …)` / `of(a, b, …)` builds a full-lane literal
+    /// (splat lane 0, then insert the rest). Returns `Ok(None)` for an
+    /// unrecognised member so the caller falls back to normal call
+    /// resolution.
+    pub(crate) fn emit_vector_constructor(
+        &mut self,
+        block_id: HirId,
+        elem_ty: &HirType,
+        lanes: u32,
+        member: &str,
+        args: &[zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>],
+    ) -> CompilerResult<Option<HirId>> {
+        let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), lanes);
+        match member {
+            "splat" => {
+                let scalar_expr = args.first().ok_or_else(|| {
+                    crate::CompilerError::Lowering("splat requires one scalar argument".to_string())
+                })?;
+                let scalar = self.translate_expression(block_id, scalar_expr)?;
+                self.emit_vector_splat(block_id, scalar, vec_ty).map(Some)
+            }
+            "new" | "of" => {
+                if args.len() != lanes as usize {
+                    return Err(crate::CompilerError::Lowering(format!(
+                        "vector constructor expects {} lane arguments, got {}",
+                        lanes,
+                        args.len()
+                    )));
+                }
+                let first = self.translate_expression(block_id, &args[0])?;
+                let mut acc = self.emit_vector_splat(block_id, first, vec_ty.clone())?;
+                for (lane, arg) in args.iter().enumerate().skip(1) {
+                    let scalar = self.translate_expression(block_id, arg)?;
+                    let scalar = self.coerce_scalar_to(block_id, scalar, elem_ty);
+                    let next = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::VectorInsertLane {
+                            result: next,
+                            ty: vec_ty.clone(),
+                            vector: acc,
+                            scalar,
+                            lane: lane as u8,
+                        },
+                    );
+                    self.add_use(acc, next);
+                    self.add_use(scalar, next);
+                    acc = next;
+                }
+                Ok(Some(acc))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Convert a TypedAST type to its SSA/HIR representation.
     ///
     /// This is the builder's standard frontend-to-IR type conversion used by
@@ -8508,6 +9049,14 @@ impl SsaBuilder {
                 // SSA dispatch matches the variant directly to
                 // intercept `Fiber<T>::next()`.
                 HirType::Fiber(Box::new(self.convert_type(inner)))
+            }
+            Type::Vector(inner, lanes) => {
+                // First-class SIMD: the typed-AST vector type lowers to
+                // the HIR first-class vector variant so every backend
+                // emits inline vector instructions rather than an
+                // out-of-line plugin call. SSA dispatch matches the
+                // variant to intercept splat/extract/lane arithmetic.
+                HirType::Vector(Box::new(self.convert_type(inner)), *lanes as u32)
             }
             Type::Struct { fields, .. } => {
                 // Convert inline struct type to HirType::Struct
