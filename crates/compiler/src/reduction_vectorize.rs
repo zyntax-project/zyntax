@@ -55,7 +55,7 @@
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
-    BinaryOp, HirBlock, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirPhi,
+    BinaryOp, CastOp, HirBlock, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirPhi,
     HirTerminator, HirType, HirValue, HirValueKind,
 };
 use std::collections::HashSet;
@@ -126,9 +126,18 @@ struct ReductionPattern {
     n: HirId,
     reduce_op: BinaryOp,
     elementwise_op: BinaryOp,
+    /// Accumulator element type (the reduce type — i32 for the widening dot).
     elem_ty: HirType,
     ptr_a: HirId,
     ptr_b: HirId,
+    /// When set, the body is `acc += widen(a[i]) * widen(b[i])` with `i8`
+    /// operands widened to `i32` — vectorized to a stride-16 `VectorDot`
+    /// (i8x16 · i8x16 → i32x4) instead of a stride-4 same-width mul + reduce.
+    widening_dot: bool,
+    /// Load element type (i8/u8 for the dot; == elem_ty otherwise).
+    load_elem_ty: HirType,
+    /// `b` operand is unsigned (u8) → VectorDot's `rhs_unsigned`.
+    rhs_unsigned: bool,
     /// Original scalar body instructions — copied into the scalar
     /// epilogue at rewrite time.
     body_insts: Vec<HirInstruction>,
@@ -240,6 +249,47 @@ fn recognise(func: &HirFunction, lp: &NaturalLoop) -> Recognition {
         return Recognition::SkipOp;
     }
 
+    // Widening dot: `acc:i32 += (i32)a[i] * (i32)b[i]` where `a[i]`/`b[i]` are
+    // i8 loads sign/zero-extended before the multiply. `va`/`vb` are the
+    // widening casts, not direct loads — so the same-width resolver below
+    // rejects them (this is the "dot product with a Cast in between" the pass
+    // used to skip). Vectorize to a stride-16 `VectorDot` (i8x16·i8x16→i32x4).
+    if matches!(elementwise_op, BinaryOp::Mul)
+        && matches!(reduce_op, BinaryOp::Add)
+        && matches!(elem_ty, HirType::I32)
+    {
+        if let (Some((pa, la)), Some((pb, lb))) = (
+            resolve_widening_load(body, va, i_phi),
+            resolve_widening_load(body, vb, i_phi),
+        ) {
+            let invariant = [pa, pb].iter().all(|&p| {
+                !defined_in_block(func, p, body_id) && !defined_in_block(func, p, header_id)
+            });
+            if invariant {
+                return Recognition::Match(ReductionPattern {
+                    header: header_id,
+                    body: body_id,
+                    exit: exit_id,
+                    preheader: preheader_id,
+                    i_phi,
+                    i_next,
+                    sum_phi,
+                    sum_next,
+                    n,
+                    reduce_op,
+                    elementwise_op,
+                    elem_ty, // i32 accumulator
+                    ptr_a: pa,
+                    ptr_b: pb,
+                    widening_dot: true,
+                    load_elem_ty: la, // i8 / u8
+                    rhs_unsigned: matches!(lb, HirType::U8),
+                    body_insts: body.instructions.clone(),
+                });
+            }
+        }
+    }
+
     let ptr_a = match resolve_load_through_gep(body, va, i_phi) {
         Some(p) => p,
         None => return Recognition::SkipShape,
@@ -268,11 +318,43 @@ fn recognise(func: &HirFunction, lp: &NaturalLoop) -> Recognition {
         n,
         reduce_op,
         elementwise_op,
+        load_elem_ty: elem_ty.clone(),
         elem_ty,
         ptr_a,
         ptr_b,
+        widening_dot: false,
+        rhs_unsigned: false,
         body_insts: body.instructions.clone(),
     })
+}
+
+/// Resolve `value = Cast(Load(GEP(ptr, [i])))` where the cast widens an i8/u8
+/// load to i32 — the shape of one operand of a widening dot. Returns the base
+/// pointer and the load's element type.
+fn resolve_widening_load(block: &HirBlock, value: HirId, i: HirId) -> Option<(HirId, HirType)> {
+    let cast = find_inst_by_result_in(block, value)?;
+    let cast_operand = match cast {
+        HirInstruction::Cast {
+            operand, ty, op, ..
+        } if matches!(op, CastOp::SExt | CastOp::ZExt) && matches!(ty, HirType::I32) => *operand,
+        _ => return None,
+    };
+    let load = find_inst_by_result_in(block, cast_operand)?;
+    let (gep_addr, load_ty) = match load {
+        HirInstruction::Load { ptr, ty, .. } if matches!(ty, HirType::I8 | HirType::U8) => {
+            (*ptr, ty.clone())
+        }
+        _ => return None,
+    };
+    let gep = find_inst_by_result_in(block, gep_addr)?;
+    match gep {
+        HirInstruction::GetElementPtr { ptr, indices, .. }
+            if indices.len() == 1 && indices[0] == i =>
+        {
+            Some((*ptr, load_ty))
+        }
+        _ => None,
+    }
 }
 
 fn classify_phis(
@@ -451,18 +533,28 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
         .get(&pat.n)
         .map(|v| v.ty.clone())
         .unwrap_or(HirType::I64);
+    // Stride + vector types. The widening dot consumes 16 i8 lanes per
+    // iteration into an i32x4 accumulator via a single `VectorDot`; the
+    // same-width path consumes 4 elements (elementwise op + reduce).
+    let stride: i64 = if pat.widening_dot { 16 } else { 4 };
     let mask_const = match n_ty {
-        HirType::I32 | HirType::U32 => HirConstant::I32(!3i32),
-        _ => HirConstant::I64(!3i64),
+        HirType::I32 | HirType::U32 => HirConstant::I32(!((stride as i32) - 1)),
+        _ => HirConstant::I64(!(stride - 1)),
     };
     let mask_id = create_value(func, n_ty.clone(), HirValueKind::Constant(mask_const));
     let vec_n_id = create_value(func, n_ty.clone(), HirValueKind::Instruction);
 
-    // Synthesise vector-zero init for sum_vec. Use splat-of-zero
-    // since `HirConstant::Vector` isn't a thing — we materialise it
-    // via `VectorSplat` of a scalar zero.
+    // Accumulator element/vector type (`i32`/i32x4 for the dot). Synthesise the
+    // vector-zero init via `VectorSplat` of a scalar zero (no `HirConstant::Vector`).
     let elem_ty = pat.elem_ty.clone();
     let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), 4);
+    // Load element/vector type: i8/i8x16 for the dot, else == accumulator.
+    let load_elem_ty = pat.load_elem_ty.clone();
+    let load_vec_ty = if pat.widening_dot {
+        HirType::Vector(Box::new(load_elem_ty.clone()), 16)
+    } else {
+        vec_ty.clone()
+    };
     let zero_scalar = create_value(
         func,
         elem_ty.clone(),
@@ -492,32 +584,32 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
         });
     }
 
-    // New sum_vec phi result + i increment-by-4 + new vec body ops.
+    // New sum_vec phi result + i increment-by-stride + new vec body ops.
     let sum_vec_next = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
-    let va_vec = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
-    let vb_vec = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+    let va_vec = create_value(func, load_vec_ty.clone(), HirValueKind::Instruction);
+    let vb_vec = create_value(func, load_vec_ty.clone(), HirValueKind::Instruction);
     let vc_vec = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
     let addr_a_v = create_value(
         func,
-        HirType::Ptr(Box::new(elem_ty.clone())),
+        HirType::Ptr(Box::new(load_elem_ty.clone())),
         HirValueKind::Instruction,
     );
     let addr_b_v = create_value(
         func,
-        HirType::Ptr(Box::new(elem_ty.clone())),
+        HirType::Ptr(Box::new(load_elem_ty.clone())),
         HirValueKind::Instruction,
     );
-    let four = create_value(
+    let stride_const = create_value(
         func,
         n_ty.clone(),
         HirValueKind::Constant(match n_ty {
-            HirType::I32 | HirType::U32 => HirConstant::I32(4),
-            _ => HirConstant::I64(4),
+            HirType::I32 | HirType::U32 => HirConstant::I32(stride as i32),
+            _ => HirConstant::I64(stride),
         }),
     );
     let new_i_next = create_value(func, n_ty.clone(), HirValueKind::Instruction);
     let new_cmp = create_value(func, HirType::Bool, HirValueKind::Instruction);
-    let elem_size = elem_size_bytes(&elem_ty) as u32;
+    let load_align = elem_size_bytes(&load_elem_ty) as u32;
 
     // Replace header's phis: keep i_phi but rewrite its body
     // incoming to new_i_next; replace sum_phi with a vector-typed phi.
@@ -588,48 +680,61 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
         body_blk.instructions.clear();
         body_blk.instructions.push(HirInstruction::GetElementPtr {
             result: addr_a_v,
-            ty: HirType::Ptr(Box::new(elem_ty.clone())),
+            ty: HirType::Ptr(Box::new(load_elem_ty.clone())),
             ptr: pat.ptr_a,
             indices: vec![pat.i_phi],
         });
         body_blk.instructions.push(HirInstruction::VectorLoad {
             result: va_vec,
-            ty: vec_ty.clone(),
+            ty: load_vec_ty.clone(),
             ptr: addr_a_v,
-            align: elem_size,
+            align: load_align,
         });
         body_blk.instructions.push(HirInstruction::GetElementPtr {
             result: addr_b_v,
-            ty: HirType::Ptr(Box::new(elem_ty.clone())),
+            ty: HirType::Ptr(Box::new(load_elem_ty.clone())),
             ptr: pat.ptr_b,
             indices: vec![pat.i_phi],
         });
         body_blk.instructions.push(HirInstruction::VectorLoad {
             result: vb_vec,
-            ty: vec_ty.clone(),
+            ty: load_vec_ty.clone(),
             ptr: addr_b_v,
-            align: elem_size,
+            align: load_align,
         });
-        body_blk.instructions.push(HirInstruction::Binary {
-            op: pat.elementwise_op,
-            result: vc_vec,
-            ty: vec_ty.clone(),
-            left: va_vec,
-            right: vb_vec,
-        });
-        body_blk.instructions.push(HirInstruction::Binary {
-            op: pat.reduce_op,
-            result: sum_vec_next,
-            ty: vec_ty.clone(),
-            left: pat.sum_phi,
-            right: vc_vec,
-        });
+        if pat.widening_dot {
+            // sum_vec_next = VectorDot(sum_phi, a_i8x16, b_i8x16) — the fused
+            // widening dot-accumulate that lowers to SDOT.
+            body_blk.instructions.push(HirInstruction::VectorDot {
+                result: sum_vec_next,
+                acc: pat.sum_phi,
+                a: va_vec,
+                b: vb_vec,
+                rhs_i7: false,
+                rhs_unsigned: pat.rhs_unsigned,
+            });
+        } else {
+            body_blk.instructions.push(HirInstruction::Binary {
+                op: pat.elementwise_op,
+                result: vc_vec,
+                ty: vec_ty.clone(),
+                left: va_vec,
+                right: vb_vec,
+            });
+            body_blk.instructions.push(HirInstruction::Binary {
+                op: pat.reduce_op,
+                result: sum_vec_next,
+                ty: vec_ty.clone(),
+                left: pat.sum_phi,
+                right: vc_vec,
+            });
+        }
         body_blk.instructions.push(HirInstruction::Binary {
             op: BinaryOp::Add,
             result: new_i_next,
             ty: n_ty.clone(),
             left: pat.i_phi,
-            right: four,
+            right: stride_const,
         });
         body_blk.terminator = HirTerminator::Branch { target: pat.header };
     }
@@ -751,6 +856,33 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
     if let Some(exit_blk) = func.blocks.get_mut(&pat.exit) {
         exit_blk.predecessors.retain(|p| *p != pat.header);
         exit_blk.predecessors.push(scalar_check);
+    }
+
+    // Redirect post-loop uses of the reduction result. `sum_phi` is now the
+    // VECTOR accumulator — live only inside the loop and the post-vec
+    // reduce. Anything downstream of the loop (the exit's `return sum` /
+    // store, later blocks) must read the fully-reduced scalar `scalar_sum`
+    // instead. Without this the vectorized loop computes the right sum but
+    // nothing consumes it — the pass's fixtures all returned `()`, so this
+    // was previously untested and silently wrong for any *used* reduction.
+    let loop_region: HashSet<HirId> = [pat.header, pat.body, post_vec].into_iter().collect();
+    let mut redirect: indexmap::IndexMap<HirId, HirId> = indexmap::IndexMap::new();
+    redirect.insert(pat.sum_phi, scalar_sum);
+    for (bid, blk) in func.blocks.iter_mut() {
+        if loop_region.contains(bid) {
+            continue;
+        }
+        for inst in &mut blk.instructions {
+            inst.replace_uses(&redirect);
+        }
+        blk.terminator.replace_uses(&redirect);
+        for phi in &mut blk.phis {
+            for (val, _pred) in &mut phi.incoming {
+                if *val == pat.sum_phi {
+                    *val = scalar_sum;
+                }
+            }
+        }
     }
 }
 
@@ -1036,6 +1168,215 @@ mod tests {
                 .any(|i| matches!(i, HirInstruction::VectorHorizontalReduce { .. }))
         });
         assert!(has_reduce);
+    }
+
+    /// `for i in 0..n { sum:i32 += (i32)a[i] * (i32)b[i] }` with `a`,`b : *i8`.
+    fn build_widening_dot() -> HirFunction {
+        let mut f = HirFunction::new(InternedString::new_global("wdot"), sig());
+        let entry = HirId::new();
+        let header = HirId::new();
+        let body = HirId::new();
+        let exit = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        for id in [entry, header, body, exit] {
+            f.blocks.insert(id, HirBlock::new(id));
+        }
+        f.blocks.get_mut(&entry).unwrap().successors = vec![header];
+        f.blocks.get_mut(&header).unwrap().predecessors = vec![entry, body];
+        f.blocks.get_mut(&header).unwrap().successors = vec![body, exit];
+        f.blocks.get_mut(&body).unwrap().predecessors = vec![header];
+        f.blocks.get_mut(&body).unwrap().successors = vec![header];
+        f.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
+
+        let n_ty = HirType::I64;
+        let i8_ty = HirType::I8;
+        let i32_ty = HirType::I32;
+        let ptr_ty = HirType::Ptr(Box::new(i8_ty.clone()));
+        let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
+        let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
+        let n = add_param(&mut f, n_ty.clone(), 2);
+        let zero_int = add_const(&mut f, n_ty.clone(), HirConstant::I64(0));
+        let one = add_const(&mut f, n_ty.clone(), HirConstant::I64(1));
+        let zero_i32 = add_const(&mut f, i32_ty.clone(), HirConstant::I32(0));
+
+        let i_phi = add_inst(&mut f, n_ty.clone());
+        let sum_phi = add_inst(&mut f, i32_ty.clone());
+        let i_next = add_inst(&mut f, n_ty.clone());
+        let sum_next = add_inst(&mut f, i32_ty.clone());
+        f.blocks.get_mut(&header).unwrap().phis.push(HirPhi {
+            result: i_phi,
+            ty: n_ty.clone(),
+            incoming: vec![(zero_int, entry), (i_next, body)],
+        });
+        f.blocks.get_mut(&header).unwrap().phis.push(HirPhi {
+            result: sum_phi,
+            ty: i32_ty.clone(),
+            incoming: vec![(zero_i32, entry), (sum_next, body)],
+        });
+
+        let cond = add_inst(&mut f, HirType::Bool);
+        f.blocks
+            .get_mut(&header)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: cond,
+                ty: n_ty.clone(),
+                left: i_phi,
+                right: n,
+            });
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Branch { target: header };
+        f.blocks.get_mut(&header).unwrap().terminator = HirTerminator::CondBranch {
+            condition: cond,
+            true_target: body,
+            false_target: exit,
+        };
+        f.blocks.get_mut(&exit).unwrap().terminator = HirTerminator::Return { values: vec![] };
+
+        let addr_a = add_inst(&mut f, ptr_ty.clone());
+        let va = add_inst(&mut f, i8_ty.clone());
+        let va32 = add_inst(&mut f, i32_ty.clone());
+        let addr_b = add_inst(&mut f, ptr_ty.clone());
+        let vb = add_inst(&mut f, i8_ty.clone());
+        let vb32 = add_inst(&mut f, i32_ty.clone());
+        let vc = add_inst(&mut f, i32_ty.clone());
+
+        let body_blk = f.blocks.get_mut(&body).unwrap();
+        body_blk.instructions.push(HirInstruction::GetElementPtr {
+            result: addr_a,
+            ty: ptr_ty.clone(),
+            ptr: ptr_a,
+            indices: vec![i_phi],
+        });
+        body_blk.instructions.push(HirInstruction::Load {
+            result: va,
+            ty: i8_ty.clone(),
+            ptr: addr_a,
+            align: 1,
+            volatile: false,
+        });
+        body_blk.instructions.push(HirInstruction::Cast {
+            result: va32,
+            ty: i32_ty.clone(),
+            op: CastOp::SExt,
+            operand: va,
+        });
+        body_blk.instructions.push(HirInstruction::GetElementPtr {
+            result: addr_b,
+            ty: ptr_ty.clone(),
+            ptr: ptr_b,
+            indices: vec![i_phi],
+        });
+        body_blk.instructions.push(HirInstruction::Load {
+            result: vb,
+            ty: i8_ty.clone(),
+            ptr: addr_b,
+            align: 1,
+            volatile: false,
+        });
+        body_blk.instructions.push(HirInstruction::Cast {
+            result: vb32,
+            ty: i32_ty.clone(),
+            op: CastOp::SExt,
+            operand: vb,
+        });
+        body_blk.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Mul,
+            result: vc,
+            ty: i32_ty.clone(),
+            left: va32,
+            right: vb32,
+        });
+        body_blk.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Add,
+            result: sum_next,
+            ty: i32_ty.clone(),
+            left: sum_phi,
+            right: vc,
+        });
+        body_blk.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Add,
+            result: i_next,
+            ty: n_ty.clone(),
+            left: i_phi,
+            right: one,
+        });
+        body_blk.terminator = HirTerminator::Branch { target: header };
+
+        // Populate the signature params (matching the Parameter value ids) so
+        // the interpreter can bind call args, and return the accumulated sum
+        // (a real reduction consumes its result) to exercise the transform's
+        // post-loop use redirection.
+        let mk_param = |id, ty| crate::hir::HirParam {
+            id,
+            name: InternedString::new_global("p"),
+            ty,
+            attributes: crate::hir::ParamAttributes::default(),
+        };
+        f.signature.params = vec![
+            mk_param(ptr_a, ptr_ty.clone()),
+            mk_param(ptr_b, ptr_ty.clone()),
+            mk_param(n, n_ty.clone()),
+        ];
+        f.signature.returns = vec![i32_ty.clone()];
+        f.blocks.get_mut(&exit).unwrap().terminator = HirTerminator::Return {
+            values: vec![sum_phi],
+        };
+        f
+    }
+
+    #[test]
+    fn vectorizes_widening_i8_dot_to_vectordot() {
+        let mut f = build_widening_dot();
+        let stats = run(&mut f);
+        assert_eq!(
+            stats.vectorized, 1,
+            "widening i8 dot should vectorize: {stats:?}"
+        );
+        // The vectorized body must use the fused `VectorDot` (the SDOT
+        // primitive), not a same-width vector Mul + reduce.
+        let has_dot = f.blocks.values().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::VectorDot { .. }))
+        });
+        assert!(has_dot, "expected a VectorDot in the vectorized body");
+    }
+
+    #[test]
+    fn widening_dot_executes_correctly() {
+        let mut f = build_widening_dot();
+        let stats = run(&mut f);
+        assert_eq!(stats.vectorized, 1, "{stats:?}");
+        // Execute the transformed function through the interpreter with
+        // a=[1..=20], b=[1;20], n=20 → Σ(1..=20) = 210. The stride-16 vector
+        // loop covers [0,16) via one VectorDot (=136); the scalar epilogue
+        // [16,20) adds 17+18+19+20 = 74. Proves stride-16 + i8x16 load +
+        // VectorDot + i32 horizontal reduce + scalar epilogue + the post-loop
+        // exit redirect all compose to the right value.
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(f.id, f);
+        let a: Vec<i8> = (1..=20).collect();
+        let b: Vec<i8> = vec![1i8; 20];
+        let mut interp = crate::hir_interp::HirInterpreter::new();
+        let got = interp
+            .call(
+                &module,
+                "wdot",
+                vec![
+                    crate::value::ZyntaxValue::Pointer(a.as_ptr() as *mut u8),
+                    crate::value::ZyntaxValue::Pointer(b.as_ptr() as *mut u8),
+                    crate::value::ZyntaxValue::Int(20),
+                ],
+            )
+            .expect("interp call");
+        assert_eq!(
+            crate::hir_interp::value_to_i64(&got),
+            Some(210),
+            "got {got:?}"
+        );
     }
 
     #[test]
