@@ -219,3 +219,58 @@ fn tier_up_branching_preserves_correctness() {
         assert_eq!(r.as_i64(), Some(99), "got {:?}", r);
     }
 }
+
+/// Regression: an `f32`-returning function must read its result from the
+/// float register after tier-up. Before the fix the dispatcher used an
+/// `-> i64` transmute (reading the integer register) and defaulted the
+/// return to `Int`, so `pf()` came back as `Int(0)` instead of `5.0`.
+#[test]
+fn tier_up_f32_return_reads_float_register() {
+    let rt = compile_with_jit(
+        r#"
+        def pf(): f32 {
+            let x: f32 = 2.5
+            return x + x
+        }
+        "#,
+        1,
+    );
+
+    for _ in 0..3 {
+        let _ = rt.call_function_raw("pf", vec![]).unwrap();
+    }
+    let ids = rt.interp_registered_function_ids();
+    let tiered = poll_until(Duration::from_millis(1500), || {
+        ids.iter().any(|f| rt.interp_function_compiled(*f))
+    });
+    assert!(tiered, "pf never tiered up");
+
+    let r = rt.call_function_raw("pf", vec![]).unwrap();
+    assert_eq!(r.as_float(), Some(5.0), "post-JIT f32 return: {:?}", r);
+}
+
+/// Same, for an `f64` return.
+#[test]
+fn tier_up_f64_return_reads_float_register() {
+    let rt = compile_with_jit(
+        r#"
+        def pd(): f64 {
+            let x: f64 = 1.5
+            return x * 4.0
+        }
+        "#,
+        1,
+    );
+
+    for _ in 0..3 {
+        let _ = rt.call_function_raw("pd", vec![]).unwrap();
+    }
+    let ids = rt.interp_registered_function_ids();
+    let tiered = poll_until(Duration::from_millis(1500), || {
+        ids.iter().any(|f| rt.interp_function_compiled(*f))
+    });
+    assert!(tiered, "pd never tiered up");
+
+    let r = rt.call_function_raw("pd", vec![]).unwrap();
+    assert_eq!(r.as_float(), Some(6.0), "post-JIT f64 return: {:?}", r);
+}

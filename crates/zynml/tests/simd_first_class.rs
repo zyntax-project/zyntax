@@ -190,3 +190,38 @@ fn i32x4_dot_product_tiers_up_to_cranelift() {
         assert_eq!(result.as_i64(), Some(300), "post-JIT got {:?}", result);
     }
 }
+
+/// f32 dot product promoted to the Cranelift JIT. Guards the float
+/// return path specifically: the reduced `f32` scalar must be read from
+/// the float register after tier-up, not the integer register.
+/// ([1,2,3,4] · [5,6,7,8]) = 5+12+21+32 = 70.
+#[test]
+fn f32x4_dot_product_tiers_up_to_cranelift() {
+    let rt = compile_with_jit(
+        r#"
+        def dot4f(): f32 {
+            let a: f32x4 = f32x4::new(1.0, 2.0, 3.0, 4.0)
+            let b: f32x4 = f32x4::new(5.0, 6.0, 7.0, 8.0)
+            let p: f32x4 = a * b
+            return p.sum()
+        }
+        "#,
+    );
+
+    for _ in 0..4 {
+        let result = rt.call_function_raw("dot4f", vec![]).expect("call");
+        assert_eq!(result.as_float(), Some(70.0), "interp got {:?}", result);
+    }
+
+    let func_ids = rt.interp_registered_function_ids();
+    let tiered_up = poll_until(Duration::from_millis(2000), || {
+        func_ids.iter().any(|fid| rt.interp_function_compiled(*fid))
+    });
+    assert!(tiered_up, "dot4f never tiered up to Cranelift");
+
+    // Post-tier-up: the f32 return must survive the float-register read.
+    for _ in 0..4 {
+        let result = rt.call_function_raw("dot4f", vec![]).expect("call");
+        assert_eq!(result.as_float(), Some(70.0), "post-JIT got {:?}", result);
+    }
+}

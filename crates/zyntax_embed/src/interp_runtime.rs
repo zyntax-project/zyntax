@@ -69,7 +69,8 @@ use std::sync::Arc;
 use beadie::{Bead, TieredAdapter, TieredBound};
 use zyntax_compiler::hir::{HirId, HirModule};
 use zyntax_compiler::hir_interp::{
-    jit_dispatch_supported, jit_float_mask, HirInterpreter, InterpError, JitDispatch, ProfileSample,
+    jit_dispatch_supported, jit_float_mask, HirInterpreter, InterpError, JitDispatch, JitRet,
+    ProfileSample,
 };
 #[cfg(feature = "native")]
 use zyntax_compiler::tiered_backend::{make_policies, TieredConfig};
@@ -498,11 +499,11 @@ impl InterpRuntime {
                         n_params,
                         // Generic seam: no signature info available
                         // here. Assume all-i64 — callers wiring
-                        // f64-arg functions through this seam must
-                        // use the typed install path
+                        // f64-arg / float-return functions through this
+                        // seam must use the typed install path
                         // (`install_jit_with`) instead.
                         float_mask: 0,
-                        ret_is_float: false,
+                        ret: JitRet::Int,
                     })
                 }),
             );
@@ -940,7 +941,7 @@ impl InterpRuntime {
             // false and the tick-callback returns None — that
             // function stays in BC interp instead of crashing at
             // the bridge.
-            let (float_mask, ret_is_float, jit_supported) =
+            let (float_mask, ret_kind, jit_supported) =
                 if let Some((func_arc, _)) = func_arcs.get(&func_id) {
                     let p = &func_arc.signature.params;
                     let ret = func_arc
@@ -950,13 +951,18 @@ impl InterpRuntime {
                         .cloned()
                         .unwrap_or(zyntax_compiler::hir::HirType::Void);
                     let param_tys: Vec<_> = p.iter().map(|hp| hp.ty.clone()).collect();
+                    let ret_kind = match ret {
+                        zyntax_compiler::hir::HirType::F32 => JitRet::F32,
+                        zyntax_compiler::hir::HirType::F64 => JitRet::F64,
+                        _ => JitRet::Int,
+                    };
                     (
                         jit_float_mask(&param_tys),
-                        matches!(ret, zyntax_compiler::hir::HirType::F64),
+                        ret_kind,
                         jit_dispatch_supported(&param_tys, &ret),
                     )
                 } else {
-                    (0, false, false)
+                    (0, JitRet::Int, false)
                 };
 
             #[cfg(feature = "llvm-backend")]
@@ -1052,7 +1058,7 @@ impl InterpRuntime {
                         ptr: code as *const u8,
                         n_params,
                         float_mask,
-                        ret_is_float,
+                        ret: ret_kind,
                     })
                 }),
             );

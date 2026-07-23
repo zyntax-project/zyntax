@@ -1823,6 +1823,16 @@ pub struct HirInterpreter {
 /// AArch64 routes f64 args through d0..d7, separate from the x0..x7
 /// integer registers, and an all-i64 transmute would silently leave
 /// f64 args in the wrong register class.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum JitRet {
+    /// Integer/pointer/bool return — read from the integer register.
+    Int,
+    /// `f32` return — read from the float register as a 32-bit float.
+    F32,
+    /// `f64` return — read from the float register as a 64-bit float.
+    F64,
+}
+
 #[derive(Clone, Copy)]
 pub struct JitDispatch {
     pub ptr: *const u8,
@@ -1831,10 +1841,11 @@ pub struct JitDispatch {
     /// Only the lowest 8 bits are honoured; functions with more than
     /// 8 user-visible parameters fall back to the all-i64 dispatcher.
     pub float_mask: u8,
-    /// `true` ⇒ the function returns f64. The dispatcher transmutes
-    /// the return through `f64::to_bits` so the result still flows
-    /// through the i64 channel without losing precision.
-    pub ret_is_float: bool,
+    /// Return register class. Float returns land in the float register
+    /// (xmm0 / d0), not the integer register, so the dispatcher must
+    /// transmute to a float-returning signature to read them — an
+    /// `-> i64` transmute would read the (unrelated) integer register.
+    pub ret: JitRet,
 }
 
 unsafe impl Send for JitDispatch {}
@@ -3295,14 +3306,15 @@ fn call_jit_dispatch(d: JitDispatch, args: &[ZyntaxValue]) -> ZyntaxValue {
         }
     }
 
-    // If nothing's a float, route to the original i64-only path —
-    // it's already well-tested for that shape.
+    // If nothing's a float argument, route to the all-integer-args
+    // path. The return still needs the right register class: a float
+    // return lands in xmm0/d0, so transmute to a float-returning
+    // signature rather than reading the integer register.
     if n_f64 == 0 {
-        let raw = call_extern_symbol(d.ptr, args);
-        return if d.ret_is_float {
-            ZyntaxValue::Float(f64::from_bits(raw as u64))
-        } else {
-            ZyntaxValue::Int(raw)
+        return match d.ret {
+            JitRet::Int => ZyntaxValue::Int(call_extern_symbol(d.ptr, args)),
+            JitRet::F32 => ZyntaxValue::F32(call_extern_symbol_ret_f32(d.ptr, args)),
+            JitRet::F64 => ZyntaxValue::Float(call_extern_symbol_ret_f64(d.ptr, args)),
         };
     }
 
@@ -3311,11 +3323,51 @@ fn call_jit_dispatch(d: JitDispatch, args: &[ZyntaxValue]) -> ZyntaxValue {
     // we hit today (nbody's `advance` is (2,1), mandelbrot's
     // `mandel_count` is (0,2)). The tier-up install filter rejects
     // shapes outside this matrix so a missing arm can't reach here.
+    // Float returns combined with float args are rejected by
+    // `jit_dispatch_supported`, so the mixed dispatcher only ever
+    // returns through the integer register here.
     let raw_i64 = unsafe { call_extern_mixed(d.ptr, n_i64, n_f64, &i64_args, &f64_args) };
-    if d.ret_is_float {
-        ZyntaxValue::Float(f64::from_bits(raw_i64 as u64))
-    } else {
-        ZyntaxValue::Int(raw_i64)
+    ZyntaxValue::Int(raw_i64)
+}
+
+/// All-integer-argument dispatch with an `f32` return — mirrors
+/// `call_extern_symbol` but transmutes to a float-returning signature
+/// so the result is read from the float register (xmm0 / s0).
+fn call_extern_symbol_ret_f32(ptr: *const u8, args: &[ZyntaxValue]) -> f32 {
+    let a: Vec<i64> = args.iter().map(|v| value_to_i64(v).unwrap_or(0)).collect();
+    unsafe {
+        match a.len() {
+            0 => (core::mem::transmute::<_, extern "C" fn() -> f32>(ptr))(),
+            1 => (core::mem::transmute::<_, extern "C" fn(i64) -> f32>(ptr))(a[0]),
+            2 => (core::mem::transmute::<_, extern "C" fn(i64, i64) -> f32>(ptr))(a[0], a[1]),
+            3 => (core::mem::transmute::<_, extern "C" fn(i64, i64, i64) -> f32>(ptr))(
+                a[0], a[1], a[2],
+            ),
+            4 => (core::mem::transmute::<_, extern "C" fn(i64, i64, i64, i64) -> f32>(ptr))(
+                a[0], a[1], a[2], a[3],
+            ),
+            _ => f32::from_bits(call_extern_symbol(ptr, args) as u32),
+        }
+    }
+}
+
+/// All-integer-argument dispatch with an `f64` return. See
+/// `call_extern_symbol_ret_f32`.
+fn call_extern_symbol_ret_f64(ptr: *const u8, args: &[ZyntaxValue]) -> f64 {
+    let a: Vec<i64> = args.iter().map(|v| value_to_i64(v).unwrap_or(0)).collect();
+    unsafe {
+        match a.len() {
+            0 => (core::mem::transmute::<_, extern "C" fn() -> f64>(ptr))(),
+            1 => (core::mem::transmute::<_, extern "C" fn(i64) -> f64>(ptr))(a[0]),
+            2 => (core::mem::transmute::<_, extern "C" fn(i64, i64) -> f64>(ptr))(a[0], a[1]),
+            3 => (core::mem::transmute::<_, extern "C" fn(i64, i64, i64) -> f64>(ptr))(
+                a[0], a[1], a[2],
+            ),
+            4 => (core::mem::transmute::<_, extern "C" fn(i64, i64, i64, i64) -> f64>(ptr))(
+                a[0], a[1], a[2], a[3],
+            ),
+            _ => f64::from_bits(call_extern_symbol(ptr, args) as u64),
+        }
     }
 }
 
@@ -3398,9 +3450,34 @@ pub fn jit_dispatch_supported(params: &[HirType], ret: &HirType) -> bool {
     if n > 8 {
         return false;
     }
-    // Returns are funneled through the i64 channel as bits — support
-    // i64-like, f64, and pointer returns. Anything else (e.g. struct
-    // returns via sret) needs ABI-specific handling we don't have yet.
+    // The dispatcher marshals each parameter through either the integer
+    // register file (int/pointer/bool) or the float register file
+    // (f64). Anything else — f32 params (needs a 32-bit float
+    // transmute the matrix doesn't have), vectors, structs — would be
+    // placed in the wrong register class, so leave those functions in
+    // the BC interpreter where they evaluate correctly.
+    let param_ok = |t: &HirType| {
+        matches!(
+            t,
+            HirType::Bool
+                | HirType::I8
+                | HirType::I16
+                | HirType::I32
+                | HirType::I64
+                | HirType::U8
+                | HirType::U16
+                | HirType::U32
+                | HirType::U64
+                | HirType::F64
+                | HirType::Ptr(_)
+        )
+    };
+    if !params.iter().all(param_ok) {
+        return false;
+    }
+    // Supported return classes: the integer register (int/pointer/
+    // bool), or the float register (f32/f64) — the latter read via a
+    // float-returning transmute in `call_jit_dispatch`.
     if !matches!(
         ret,
         HirType::Void
@@ -3421,11 +3498,17 @@ pub fn jit_dispatch_supported(params: &[HirType], ret: &HirType) -> bool {
     }
     let n_f64 = params.iter().filter(|t| matches!(t, HirType::F64)).count();
     let n_i64 = n - n_f64;
-    // All-i64: original path supports up to 8 args.
+    // All-integer-args: supports up to 8 args, including float returns
+    // (read from the float register in `call_jit_dispatch`).
     if n_f64 == 0 {
         return n_i64 <= 8;
     }
-    // Mixed dispatcher: matrix covers (n_i64, n_f64) with total ≤ 4.
+    // Mixed args go through the integer-return matrix (total ≤ 4); a
+    // float return combined with float args has no arm, so keep those
+    // in the interpreter.
+    if matches!(ret, HirType::F32 | HirType::F64) {
+        return false;
+    }
     n_i64 + n_f64 <= 4
 }
 
