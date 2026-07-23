@@ -1025,7 +1025,11 @@ impl<'a> FunctionEmitter<'a> {
                 let dst = self.local_set(*result)?;
                 out.push(lhs);
                 out.push(rhs);
-                emit_binary_op(out, *op, ty)?;
+                if let HirType::Vector(elem, _) = ty {
+                    emit_vector_binary(out, *op, elem)?;
+                } else {
+                    emit_binary_op(out, *op, ty)?;
+                }
                 out.push(dst);
                 Ok(())
             }
@@ -1514,6 +1518,112 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(self.local_set(*result)?);
                 Ok(())
             }
+            // ===== SIMD / vector (v128) =====
+            HirInstruction::VectorLoad { result, ptr, .. } => {
+                out.push(self.local_get(*ptr)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(WasmInst::V128Load(MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: 0,
+                }));
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorStore { value, ptr, .. } => {
+                out.push(self.local_get(*ptr)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(self.local_get(*value)?);
+                out.push(WasmInst::V128Store(MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: 0,
+                }));
+                Ok(())
+            }
+            HirInstruction::VectorSplat { result, ty, scalar } => {
+                out.push(self.local_get(*scalar)?);
+                // The scalar rides the i64 (int) / f64 (float) funnel; narrow +
+                // splat into the lane shape.
+                let elem = match ty {
+                    HirType::Vector(e, _) => &**e,
+                    _ => return Err(WasmEmitError::Unsupported("VectorSplat non-vector".into())),
+                };
+                match elem {
+                    HirType::I8 | HirType::U8 => {
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::I8x16Splat);
+                    }
+                    HirType::I16 | HirType::U16 => {
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::I16x8Splat);
+                    }
+                    HirType::I32 | HirType::U32 => {
+                        out.push(WasmInst::I32WrapI64);
+                        out.push(WasmInst::I32x4Splat);
+                    }
+                    HirType::I64 | HirType::U64 => out.push(WasmInst::I64x2Splat),
+                    HirType::F32 => {
+                        out.push(WasmInst::F32DemoteF64);
+                        out.push(WasmInst::F32x4Splat);
+                    }
+                    HirType::F64 => out.push(WasmInst::F64x2Splat),
+                    other => {
+                        return Err(WasmEmitError::Unsupported(format!("splat lane {other:?}")))
+                    }
+                }
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorHorizontalReduce {
+                result,
+                ty,
+                vector,
+                op,
+            } => {
+                let is_float = matches!(ty, HirType::F32 | HirType::F64);
+                if !is_float && matches!(op, BinaryOp::Add) {
+                    // i32x4 add-reduce: sum the 4 lanes, extend into the funnel.
+                    out.push(self.local_get(*vector)?);
+                    out.push(WasmInst::I32x4ExtractLane(0));
+                    for lane in 1..4 {
+                        out.push(self.local_get(*vector)?);
+                        out.push(WasmInst::I32x4ExtractLane(lane));
+                        out.push(WasmInst::I32Add);
+                    }
+                    out.push(WasmInst::I64ExtendI32S);
+                } else if is_float && matches!(op, BinaryOp::FAdd | BinaryOp::Add) {
+                    // f32x4 add-reduce → f64 funnel.
+                    out.push(self.local_get(*vector)?);
+                    out.push(WasmInst::F32x4ExtractLane(0));
+                    for lane in 1..4 {
+                        out.push(self.local_get(*vector)?);
+                        out.push(WasmInst::F32x4ExtractLane(lane));
+                        out.push(WasmInst::F32Add);
+                    }
+                    out.push(WasmInst::F64PromoteF32);
+                } else {
+                    return Err(WasmEmitError::Unsupported(format!(
+                        "vector reduce {op:?} on {ty:?}"
+                    )));
+                }
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
+            HirInstruction::VectorDot {
+                result, acc, a, b, ..
+            } => {
+                // Fused widening dot-accumulate: `acc + dot(a, b)`, i8x16→i32x4,
+                // as one relaxed-SIMD instruction (the wasm analogue of SDOT /
+                // VPDPBUSD). Exact for a 7-bit rhs; the accumulate + reduce make
+                // the common quant path correct.
+                out.push(self.local_get(*a)?);
+                out.push(self.local_get(*b)?);
+                out.push(self.local_get(*acc)?);
+                out.push(WasmInst::I32x4RelaxedDotI8x16I7x16AddS);
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
             other => Err(WasmEmitError::Unsupported(format!(
                 "instruction {:?}",
                 std::mem::discriminant(other)
@@ -1759,6 +1869,9 @@ fn lower_type(ty: &HirType) -> Result<ValType> {
     Ok(match ty {
         I64 | I32 | I16 | I8 | U64 | U32 | U16 | U8 | Bool => ValType::I64,
         F64 | F32 => ValType::F64,
+        // Every supported 128-bit SIMD shape is one wasm `v128` local; the
+        // lane shape rides on the ops, not the type (wasm v128 is untyped).
+        Vector(_, _) => ValType::V128,
         other => return Err(WasmEmitError::Unsupported(format!("type {:?}", other))),
     })
 }
@@ -1844,6 +1957,45 @@ fn emit_binary_op(out: &mut Vec<WasmInst<'static>>, op: BinaryOp, ty: &HirType) 
             return Err(WasmEmitError::Unsupported(format!(
                 "binary op {:?} on {:?}",
                 op, ty
+            )))
+        }
+    };
+    out.push(inst);
+    Ok(())
+}
+
+/// Element-wise SIMD arithmetic, dispatched by lane type (v128 operands on the
+/// stack). wasm has no i8x16 multiply or integer vector division.
+fn emit_vector_binary(
+    out: &mut Vec<WasmInst<'static>>,
+    op: BinaryOp,
+    elem: &HirType,
+) -> Result<()> {
+    use BinaryOp::*;
+    use HirType::*;
+    let inst = match (elem, op) {
+        (I8 | U8, Add) => WasmInst::I8x16Add,
+        (I8 | U8, Sub) => WasmInst::I8x16Sub,
+        (I16 | U16, Add) => WasmInst::I16x8Add,
+        (I16 | U16, Sub) => WasmInst::I16x8Sub,
+        (I16 | U16, Mul) => WasmInst::I16x8Mul,
+        (I32 | U32, Add) => WasmInst::I32x4Add,
+        (I32 | U32, Sub) => WasmInst::I32x4Sub,
+        (I32 | U32, Mul) => WasmInst::I32x4Mul,
+        (I64 | U64, Add) => WasmInst::I64x2Add,
+        (I64 | U64, Sub) => WasmInst::I64x2Sub,
+        (I64 | U64, Mul) => WasmInst::I64x2Mul,
+        (F32, Add | FAdd) => WasmInst::F32x4Add,
+        (F32, Sub | FSub) => WasmInst::F32x4Sub,
+        (F32, Mul | FMul) => WasmInst::F32x4Mul,
+        (F32, Div | FDiv) => WasmInst::F32x4Div,
+        (F64, Add | FAdd) => WasmInst::F64x2Add,
+        (F64, Sub | FSub) => WasmInst::F64x2Sub,
+        (F64, Mul | FMul) => WasmInst::F64x2Mul,
+        (F64, Div | FDiv) => WasmInst::F64x2Div,
+        _ => {
+            return Err(WasmEmitError::Unsupported(format!(
+                "vector binary {op:?} on lane {elem:?}"
             )))
         }
     };
