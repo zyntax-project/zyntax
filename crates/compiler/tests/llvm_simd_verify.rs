@@ -99,4 +99,38 @@ fn llvm_vector_dot_emits_sdot_intrinsic() {
         ir.contains("llvm.vector.reduce.add"),
         "LLVM IR missing the vector reduce intrinsic:\n{ir}"
     );
+
+    // Final proof: emit native assembly via a host TargetMachine and confirm
+    // the intrinsic actually became an `sdot` (+ `addv`) machine instruction —
+    // not just a promise in the IR.
+    use inkwell::targets::{
+        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    };
+    use inkwell::OptimizationLevel;
+    Target::initialize_native(&InitializationConfig::default()).expect("init native target");
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple).expect("target from triple");
+    let tm = target
+        .create_target_machine(
+            &triple,
+            TargetMachine::get_host_cpu_name().to_str().unwrap(),
+            TargetMachine::get_host_cpu_features().to_str().unwrap(),
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .expect("target machine");
+    let m = backend.module();
+    m.set_triple(&triple);
+    m.set_data_layout(&tm.get_target_data().get_data_layout());
+    let asm = tm
+        .write_to_memory_buffer(m, FileType::Assembly)
+        .map(|buf| String::from_utf8_lossy(buf.as_slice()).to_string())
+        .expect("emit native asm");
+    eprintln!("\n===== VectorDot native asm =====\n{asm}");
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(asm.contains("sdot"), "native asm missing `sdot`:\n{asm}");
+        assert!(asm.contains("addv"), "native asm missing `addv`:\n{asm}");
+    }
 }
