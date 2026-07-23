@@ -59,6 +59,8 @@ mod array;
 mod convert;
 mod effect_runtime;
 mod error;
+#[cfg(feature = "native")]
+mod fiber;
 mod grammar;
 mod grammar2;
 /// Cooperative-async future table. Browser-runtime parking layer
@@ -114,6 +116,8 @@ pub use array::ZyntaxArray;
 // HirInterpreter without the beadie wrapper can grab it directly.
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};
 pub use error::{ConversionError, ZyntaxError};
+#[cfg(feature = "native")]
+pub use fiber::{ZyntaxFiber, ZyntaxFiberStep};
 pub use grammar::{GrammarError, GrammarResult, LanguageGrammar};
 pub use grammar2::{Grammar2, Grammar2Error, Grammar2Result};
 pub use iterator::{

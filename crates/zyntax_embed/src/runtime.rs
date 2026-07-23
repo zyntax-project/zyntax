@@ -1779,6 +1779,28 @@ impl ZyntaxRuntime {
         T::from_zyntax(result).map_err(RuntimeError::from)
     }
 
+    /// Calls a compiled `fiber def` constructor and returns an owning,
+    /// thread-affine host handle.
+    ///
+    /// The returned handle is process-local runtime state. Applications must
+    /// never serialize it; reconstruct a fresh fiber after runtime loss.
+    pub fn call_fiber(
+        &self,
+        name: &str,
+        args: &[ZyntaxValue],
+    ) -> RuntimeResult<crate::ZyntaxFiber> {
+        if !args.is_empty() {
+            return Err(RuntimeError::ArgumentCount {
+                expected: 0,
+                got: args.len(),
+            });
+        }
+        let entry = self
+            .get_function_ptr(name)
+            .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
+        crate::ZyntaxFiber::from_entry(entry)
+    }
+
     /// Call a function and get the raw ZyntaxValue result
     ///
     /// Note: This uses the stored function signature to determine the calling convention.
