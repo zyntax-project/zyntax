@@ -42,7 +42,7 @@ use std::collections::HashMap;
 
 use crate::hir::{
     BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
-    HirTerminator, HirType, HirValueKind, UnaryOp,
+    HirTerminator, HirType, HirValueKind, UnaryOp, VectorMinMaxKind, VectorUnaryKind,
 };
 use crate::value::ZyntaxValue;
 
@@ -541,6 +541,28 @@ pub enum Op {
         lhs: Reg,
         rhs: Reg,
         op: BinaryOp,
+    },
+    /// `dst[i] = kind(regs[operand][i])` — element-wise unary (float lanes).
+    VUnary {
+        dst: Reg,
+        operand: Reg,
+        kind: VectorUnaryKind,
+    },
+    /// `dst[i] = min|max(regs[lhs][i], regs[rhs][i])` — element-wise.
+    VMinMax {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        kind: VectorMinMaxKind,
+    },
+    /// `dst = fused widening dot-accumulate` — 16×i8 → 4×i32:
+    /// `dst[j] = acc[j] + Σ_{k<4} a[4j+k] * b[4j+k]` (widened to i32).
+    VDot {
+        dst: Reg,
+        acc: Reg,
+        a: Reg,
+        b: Reg,
+        unsigned: bool,
     },
 }
 
@@ -1415,6 +1437,57 @@ fn lower_inst(
                 dst,
                 vector: vec,
                 op: *op,
+            });
+        }
+        HirInstruction::VectorUnaryOp {
+            result,
+            op,
+            operand,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let o = reg(*operand)?;
+            cf.code.push(Op::VUnary {
+                dst,
+                operand: o,
+                kind: *op,
+            });
+        }
+        HirInstruction::VectorMinMax {
+            result,
+            op,
+            left,
+            right,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let l = reg(*left)?;
+            let r = reg(*right)?;
+            cf.code.push(Op::VMinMax {
+                dst,
+                lhs: l,
+                rhs: r,
+                kind: *op,
+            });
+        }
+        HirInstruction::VectorDot {
+            result,
+            acc,
+            a,
+            b,
+            rhs_unsigned,
+            ..
+        } => {
+            let dst = reg(*result)?;
+            let acc_r = reg(*acc)?;
+            let a_r = reg(*a)?;
+            let b_r = reg(*b)?;
+            cf.code.push(Op::VDot {
+                dst,
+                acc: acc_r,
+                a: a_r,
+                b: b_r,
+                unsigned: *rhs_unsigned,
             });
         }
         other => {
@@ -2482,6 +2555,61 @@ impl HirInterpreter {
                     regs[*dst as usize] = ZyntaxValue::Array(out);
                     pc += 1;
                 }
+                Op::VUnary { dst, operand, kind } => {
+                    let v = as_vector(&regs[*operand as usize])?;
+                    let out: Vec<ZyntaxValue> =
+                        v.iter().map(|lane| apply_lane_unary(*kind, lane)).collect();
+                    regs[*dst as usize] = ZyntaxValue::Array(out);
+                    pc += 1;
+                }
+                Op::VMinMax {
+                    dst,
+                    lhs,
+                    rhs,
+                    kind,
+                } => {
+                    let a = as_vector(&regs[*lhs as usize])?;
+                    let b = as_vector(&regs[*rhs as usize])?;
+                    let n = a.len().min(b.len());
+                    let out: Vec<ZyntaxValue> = (0..n)
+                        .map(|i| apply_lane_minmax(*kind, &a[i], &b[i]))
+                        .collect();
+                    regs[*dst as usize] = ZyntaxValue::Array(out);
+                    pc += 1;
+                }
+                Op::VDot {
+                    dst,
+                    acc,
+                    a,
+                    b,
+                    unsigned,
+                } => {
+                    // 16×i8 · 16×i8 → 4×i32: each output lane accumulates the 4
+                    // (widened) products in its byte group onto `acc`. `a` is
+                    // signed; `b` is unsigned when `unsigned` (VPDPBUSD/USDOT).
+                    let acc_v = as_vector(&regs[*acc as usize])?;
+                    let a_v = as_vector(&regs[*a as usize])?;
+                    let b_v = as_vector(&regs[*b as usize])?;
+                    let zero = ZyntaxValue::Int(0);
+                    let mut out = Vec::with_capacity(4);
+                    for j in 0..4 {
+                        let mut sum = value_to_i64(acc_v.get(j).unwrap_or(&zero)).unwrap_or(0);
+                        for k in 0..4 {
+                            let idx = 4 * j + k;
+                            let av = value_to_i64(a_v.get(idx).unwrap_or(&zero)).unwrap_or(0);
+                            let bv_raw = value_to_i64(b_v.get(idx).unwrap_or(&zero)).unwrap_or(0);
+                            let bv = if *unsigned {
+                                (bv_raw as u8) as i64
+                            } else {
+                                (bv_raw as i8) as i64
+                            };
+                            sum = sum.wrapping_add(av.wrapping_mul(bv));
+                        }
+                        out.push(ZyntaxValue::I32(sum as i32));
+                    }
+                    regs[*dst as usize] = ZyntaxValue::Array(out);
+                    pc += 1;
+                }
                 Op::Jump { target } => {
                     pc = *target as usize;
                 }
@@ -2861,6 +2989,40 @@ fn apply_lane_binop(
             }
         };
         Ok(value_from_i64_as(&hir_ty_of_value(a), r))
+    }
+}
+
+/// One lane of `VectorUnaryOp` — float only, width-preserving. `Round` uses
+/// round-half-to-even to match hardware `nearest` (Cranelift `nearest`, wasm
+/// `f*.nearest`), not Rust's half-away-from-zero `round`.
+fn apply_lane_unary(kind: VectorUnaryKind, a: &ZyntaxValue) -> ZyntaxValue {
+    let x = value_to_f64(a).unwrap_or(0.0);
+    let r = match kind {
+        VectorUnaryKind::Sqrt => x.sqrt(),
+        VectorUnaryKind::Abs => x.abs(),
+        VectorUnaryKind::Neg => -x,
+        VectorUnaryKind::Ceil => x.ceil(),
+        VectorUnaryKind::Floor => x.floor(),
+        VectorUnaryKind::Trunc => x.trunc(),
+        VectorUnaryKind::Round => x.round_ties_even(),
+    };
+    match a {
+        ZyntaxValue::F32(_) => ZyntaxValue::F32(r as f32),
+        _ => ZyntaxValue::Float(r),
+    }
+}
+
+/// One lane of `VectorMinMax` — float only, width-preserving.
+fn apply_lane_minmax(kind: VectorMinMaxKind, a: &ZyntaxValue, b: &ZyntaxValue) -> ZyntaxValue {
+    let x = value_to_f64(a).unwrap_or(0.0);
+    let y = value_to_f64(b).unwrap_or(0.0);
+    let r = match kind {
+        VectorMinMaxKind::Min => x.min(y),
+        VectorMinMaxKind::Max => x.max(y),
+    };
+    match a {
+        ZyntaxValue::F32(_) => ZyntaxValue::F32(r as f32),
+        _ => ZyntaxValue::Float(r),
     }
 }
 
@@ -3762,6 +3924,136 @@ mod tests {
         let result = interp.call(&module, "vld", vec![]).expect("call ok");
         let got = value_to_f64(&result).unwrap_or(f64::NAN);
         assert!((got - 28.0).abs() < 1e-6, "got {result:?}");
+    }
+
+    /// Rayzor-parity ops #1/#2: `VectorUnaryOp` (Sqrt) + `VectorMinMax` (Max).
+    /// sqrt(splat 9.0) = [3,3,3,3]; max(that, splat 5.0) = [5,5,5,5];
+    /// reduce_add = 20.
+    #[test]
+    fn bc_runs_vector_unary_and_minmax() {
+        let mut func = mk_fn("vum", vec![], vec![HirType::F32]);
+        let vt = HirType::Vector(Box::new(HirType::F32), 4);
+        let c9 = add_value(
+            &mut func,
+            HirType::F32,
+            HirValueKind::Constant(HirConstant::F32(9.0)),
+        );
+        let c5 = add_value(
+            &mut func,
+            HirType::F32,
+            HirValueKind::Constant(HirConstant::F32(5.0)),
+        );
+        let v9 = add_value(&mut func, vt.clone(), HirValueKind::Instruction);
+        let sq = add_value(&mut func, vt.clone(), HirValueKind::Instruction);
+        let v5 = add_value(&mut func, vt.clone(), HirValueKind::Instruction);
+        let mx = add_value(&mut func, vt.clone(), HirValueKind::Instruction);
+        let r = add_value(&mut func, HirType::F32, HirValueKind::Instruction);
+        let e = func.entry_block;
+        let blk = func.blocks.get_mut(&e).unwrap();
+        blk.instructions.push(HirInstruction::VectorSplat {
+            result: v9,
+            ty: vt.clone(),
+            scalar: c9,
+        });
+        blk.instructions.push(HirInstruction::VectorUnaryOp {
+            result: sq,
+            ty: vt.clone(),
+            op: VectorUnaryKind::Sqrt,
+            operand: v9,
+        });
+        blk.instructions.push(HirInstruction::VectorSplat {
+            result: v5,
+            ty: vt.clone(),
+            scalar: c5,
+        });
+        blk.instructions.push(HirInstruction::VectorMinMax {
+            result: mx,
+            ty: vt.clone(),
+            op: VectorMinMaxKind::Max,
+            left: sq,
+            right: v5,
+        });
+        blk.instructions
+            .push(HirInstruction::VectorHorizontalReduce {
+                result: r,
+                ty: HirType::F32,
+                vector: mx,
+                op: BinaryOp::FAdd,
+            });
+        blk.terminator = HirTerminator::Return { values: vec![r] };
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.functions.insert(func.id, func);
+        let mut interp = HirInterpreter::new();
+        let got = value_to_f64(&interp.call(&module, "vum", vec![]).expect("ok")).unwrap();
+        assert!((got - 20.0).abs() < 1e-6, "got {got}");
+    }
+
+    /// Rayzor-parity op #3: fused widening `VectorDot` (the SDOT primitive).
+    /// dot(acc=0:i32x4, a=splat 2:i8x16, b=splat 3:i8x16) → each output lane
+    /// sums 4 products of 2*3=6 → [24,24,24,24]; reduce_add = 96.
+    #[test]
+    fn bc_runs_vector_dot() {
+        let mut func = mk_fn("vdot", vec![], vec![HirType::I32]);
+        let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
+        let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
+        let c0 = add_value(
+            &mut func,
+            HirType::I32,
+            HirValueKind::Constant(HirConstant::I32(0)),
+        );
+        let c2 = add_value(
+            &mut func,
+            HirType::I8,
+            HirValueKind::Constant(HirConstant::I8(2)),
+        );
+        let c3 = add_value(
+            &mut func,
+            HirType::I8,
+            HirValueKind::Constant(HirConstant::I8(3)),
+        );
+        let acc = add_value(&mut func, i32x4.clone(), HirValueKind::Instruction);
+        let a = add_value(&mut func, i8x16.clone(), HirValueKind::Instruction);
+        let b = add_value(&mut func, i8x16.clone(), HirValueKind::Instruction);
+        let d = add_value(&mut func, i32x4.clone(), HirValueKind::Instruction);
+        let r = add_value(&mut func, HirType::I32, HirValueKind::Instruction);
+        let e = func.entry_block;
+        let blk = func.blocks.get_mut(&e).unwrap();
+        blk.instructions.push(HirInstruction::VectorSplat {
+            result: acc,
+            ty: i32x4.clone(),
+            scalar: c0,
+        });
+        blk.instructions.push(HirInstruction::VectorSplat {
+            result: a,
+            ty: i8x16.clone(),
+            scalar: c2,
+        });
+        blk.instructions.push(HirInstruction::VectorSplat {
+            result: b,
+            ty: i8x16.clone(),
+            scalar: c3,
+        });
+        blk.instructions.push(HirInstruction::VectorDot {
+            result: d,
+            acc,
+            a,
+            b,
+            rhs_i7: false,
+            rhs_unsigned: false,
+        });
+        blk.instructions
+            .push(HirInstruction::VectorHorizontalReduce {
+                result: r,
+                ty: HirType::I32,
+                vector: d,
+                op: BinaryOp::Add,
+            });
+        blk.terminator = HirTerminator::Return { values: vec![r] };
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.functions.insert(func.id, func);
+        let mut interp = HirInterpreter::new();
+        let got = value_to_i64(&interp.call(&module, "vdot", vec![]).expect("ok")).unwrap();
+        assert_eq!(got, 96, "got {got}");
     }
 
     /// `def main(): i64 { if (true) return 1 else return 0 }`

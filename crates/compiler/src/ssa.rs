@@ -12467,7 +12467,10 @@ impl HirInstruction {
             | HirInstruction::VectorExtractLane { result, .. }
             | HirInstruction::VectorInsertLane { result, .. }
             | HirInstruction::VectorHorizontalReduce { result, .. }
-            | HirInstruction::VectorLoad { result, .. } => Some(*result),
+            | HirInstruction::VectorLoad { result, .. }
+            | HirInstruction::VectorUnaryOp { result, .. }
+            | HirInstruction::VectorMinMax { result, .. }
+            | HirInstruction::VectorDot { result, .. } => Some(*result),
             // VectorStore writes to memory, no result value
             HirInstruction::VectorStore { .. } => None,
 

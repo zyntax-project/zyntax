@@ -995,6 +995,45 @@ fn fmt_instruction(inst: &HirInstruction, mapper: &mut IdMapper) -> String {
             let p = mapper.value(ptr);
             format!("vstore {}, {}, align {}", v, p, align)
         }
+        HirInstruction::VectorUnaryOp {
+            result,
+            ty,
+            op,
+            operand,
+        } => {
+            let r = mapper.value(result);
+            let o = mapper.value(operand);
+            format!("{}: {} = vunary.{:?} {}", r, fmt_type(ty), op, o)
+        }
+        HirInstruction::VectorMinMax {
+            result,
+            ty,
+            op,
+            left,
+            right,
+        } => {
+            let r = mapper.value(result);
+            let l = mapper.value(left);
+            let rt = mapper.value(right);
+            format!("{}: {} = v{:?} {}, {}", r, fmt_type(ty), op, l, rt)
+        }
+        HirInstruction::VectorDot {
+            result,
+            acc,
+            a,
+            b,
+            rhs_i7,
+            rhs_unsigned,
+        } => {
+            let r = mapper.value(result);
+            let acc = mapper.value(acc);
+            let a = mapper.value(a);
+            let b = mapper.value(b);
+            format!(
+                "{} = vdot {}, {}, {} (i7={}, u={})",
+                r, acc, a, b, rhs_i7, rhs_unsigned
+            )
+        }
         HirInstruction::AsyncSaveSlot { frame, slot, value } => {
             let f = mapper.value(frame);
             let v = mapper.value(value);

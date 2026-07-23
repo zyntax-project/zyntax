@@ -750,6 +750,49 @@ pub enum HirInstruction {
         align: u32,
     },
 
+    /// Element-wise SIMD unary op (sqrt/abs/neg/ceil/floor/trunc/round).
+    ///
+    /// `ty` must be `HirType::Vector(elem_ty, lanes)` — the operand and result
+    /// type. Float lanes only.
+    VectorUnaryOp {
+        result: HirId,
+        ty: HirType,
+        op: VectorUnaryKind,
+        operand: HirId,
+    },
+
+    /// Element-wise SIMD min/max.
+    ///
+    /// `ty` must be `HirType::Vector(elem_ty, lanes)`. `left`/`right` share it.
+    VectorMinMax {
+        result: HirId,
+        ty: HirType,
+        op: VectorMinMaxKind,
+        left: HirId,
+        right: HirId,
+    },
+
+    /// Fused widening dot-accumulate: `result = acc + dot(a, b)`.
+    ///
+    /// The hardware primitive behind the quantised hot path: 16 `i8` lanes in
+    /// each of `a`/`b` are (widening-) multiplied and pairwise-summed into 4
+    /// `i32` lanes, added to the `i32x4` accumulator `acc`. Lowers to AArch64
+    /// `SDOT`/`USDOT` / x86 VNNI `VPDPBUSD` / wasm `i32x4.dot_i8x16`, with a
+    /// widen→mul→pairwise-add fallback where the fused instruction is absent.
+    ///
+    /// `acc` is `Vector(I32, 4)`; `a`/`b` are `Vector(I8, 16)`; `result` is
+    /// `Vector(I32, 4)`. `rhs_unsigned` selects the signed×unsigned kernel
+    /// (VPDPBUSD/USDOT); `rhs_i7` opts into the relaxed 7-bit dot on targets
+    /// that offer it.
+    VectorDot {
+        result: HirId,
+        acc: HirId,
+        a: HirId,
+        b: HirId,
+        rhs_i7: bool,
+        rhs_unsigned: bool,
+    },
+
     /// Save an SSA value into the async state machine's frame at a
     /// fixed slot index. Emitted by `krio_adapter` before a yielding
     /// `Return` so the value can be reloaded on resume.
@@ -1111,6 +1154,18 @@ impl HirInstruction {
                 replace(value, replacements);
                 replace(ptr, replacements);
             }
+            HirInstruction::VectorUnaryOp { operand, .. } => {
+                replace(operand, replacements);
+            }
+            HirInstruction::VectorMinMax { left, right, .. } => {
+                replace(left, replacements);
+                replace(right, replacements);
+            }
+            HirInstruction::VectorDot { acc, a, b, .. } => {
+                replace(acc, replacements);
+                replace(a, replacements);
+                replace(b, replacements);
+            }
             HirInstruction::AsyncSaveSlot { frame, value, .. } => {
                 replace(frame, replacements);
                 replace(value, replacements);
@@ -1322,6 +1377,18 @@ impl HirInstruction {
             HirInstruction::VectorStore { value, ptr, .. } => {
                 ops.push(*value);
                 ops.push(*ptr);
+            }
+            HirInstruction::VectorUnaryOp { operand, .. } => {
+                ops.push(*operand);
+            }
+            HirInstruction::VectorMinMax { left, right, .. } => {
+                ops.push(*left);
+                ops.push(*right);
+            }
+            HirInstruction::VectorDot { acc, a, b, .. } => {
+                ops.push(*acc);
+                ops.push(*a);
+                ops.push(*b);
             }
             HirInstruction::AsyncSaveSlot { frame, value, .. } => {
                 ops.push(*frame);
@@ -1805,6 +1872,28 @@ pub enum UnaryOp {
     Neg,
     Not,
     FNeg,
+}
+
+/// Element-wise SIMD unary operation kinds (see [`HirInstruction::VectorUnaryOp`]).
+/// Float lanes only; each maps to a native per-lane vector instruction
+/// (e.g. Cranelift `fsqrt`/`fabs`/`fneg`/`ceil`/`floor`/`trunc`/`nearest`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VectorUnaryKind {
+    Sqrt,
+    Abs,
+    Neg,
+    Ceil,
+    Floor,
+    Trunc,
+    Round,
+}
+
+/// Element-wise SIMD min/max kinds (see [`HirInstruction::VectorMinMax`]).
+/// Maps to native `fmin`/`fmax` (float) per lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VectorMinMaxKind {
+    Min,
+    Max,
 }
 
 /// Cast operations

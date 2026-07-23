@@ -589,7 +589,10 @@ impl AnalysisRunner {
             | HirInstruction::VectorExtractLane { result, .. }
             | HirInstruction::VectorInsertLane { result, .. }
             | HirInstruction::VectorHorizontalReduce { result, .. }
-            | HirInstruction::VectorLoad { result, .. } => Some(*result),
+            | HirInstruction::VectorLoad { result, .. }
+            | HirInstruction::VectorUnaryOp { result, .. }
+            | HirInstruction::VectorMinMax { result, .. }
+            | HirInstruction::VectorDot { result, .. } => Some(*result),
             // VectorStore only writes to memory, no result
             HirInstruction::VectorStore { .. } => None,
 
