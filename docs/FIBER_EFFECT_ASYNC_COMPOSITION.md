@@ -14,6 +14,11 @@ are the "coherent composition" gate; 4–7 are "compose well"; 8 is the unificat
   (`lower_async_function`, poll-fn ABI `fn(*mut u8) -> i64`, uniform 8-byte slots).
 - `fiber def` → krio-fiber stackful stack-switching (`krio_fiber_*` symbols,
   mmap'd 64 KiB stack, per-arch context switch). Disjoint substrate.
+- Bidirectional host resume is exposed to generated fiber bodies through
+  `krio_fiber_take_input()`. The krio adapter retains the value returned by the
+  void-lowered `FiberYield` runtime call until generated code explicitly reads
+  it, so `resume_with(value)` has a real receiving half without backend-specific
+  calls in an embedding language.
 - Three thread-locals: `ACTIVE_FIBER`/`ACTIVE_TRAMPOLINE` (save/restored, composes),
   `ABORT_PAYLOAD`/`ERROR_MAP` (per-thread, fiber-unaware), `HANDLER_STACK`
   (per-thread, NOT save/restored across fiber switch, currently dead in compiled

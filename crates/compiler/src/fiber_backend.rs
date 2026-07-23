@@ -76,6 +76,16 @@ pub trait FiberCfg: Send + Sync {
     /// local and yields it with `value`.
     fn fiber_yield(&self, value: i64);
 
+    /// Read and clear the scalar delivered by the most recent
+    /// [`Self::fiber_resume_with`] of the currently-running fiber.
+    ///
+    /// This is the receiving half of bidirectional yield. It is valid only
+    /// from inside a resumed fiber body. Backends without bidirectional input
+    /// support return zero until they implement this method.
+    fn fiber_take_input(&self) -> i64 {
+        0
+    }
+
     /// Symmetric switch — abandon the caller and transfer to `target`
     /// with `value`. Returns the value the current fiber receives when
     /// somebody later transfers back to it. Packed return shape

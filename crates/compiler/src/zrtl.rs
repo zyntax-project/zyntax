@@ -1811,6 +1811,7 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
 //   krio_fiber_resume_with(fiber: *mut FiberRepr, value: i64)
 //       -> i64                                              (FiberStep tag)
 //   krio_fiber_yield(value: i64)
+//   krio_fiber_take_input() -> i64
 //   krio_fiber_transfer(target: *mut FiberRepr, value: i64) -> i64
 //   krio_fiber_cancel(fiber: *mut FiberRepr)
 //
@@ -1881,6 +1882,16 @@ pub unsafe extern "C" fn krio_fiber_resume_with(fiber: *mut FiberRepr, value: i6
 #[no_mangle]
 pub unsafe extern "C" fn krio_fiber_yield(value: i64) {
     fiber_backend().fiber_yield(value)
+}
+
+/// `krio_fiber_take_input` — read and clear the scalar delivered by the most
+/// recent bidirectional resume of the currently-running fiber.
+///
+/// This must be called from inside a fiber body after that body has previously
+/// yielded and was resumed with [`krio_fiber_resume_with`].
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_take_input() -> i64 {
+    fiber_backend().fiber_take_input()
 }
 
 /// `krio_fiber_transfer` — symmetric switch. Abandons the caller
@@ -1969,6 +1980,11 @@ pub fn fiber_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
             2,
         ),
         ("krio_fiber_yield", krio_fiber_yield as *const u8, 1),
+        (
+            "krio_fiber_take_input",
+            krio_fiber_take_input as *const u8,
+            0,
+        ),
         ("krio_fiber_transfer", krio_fiber_transfer as *const u8, 2),
         ("krio_fiber_cancel", krio_fiber_cancel as *const u8, 1),
         ("krio_fiber_free", krio_fiber_free as *const u8, 1),

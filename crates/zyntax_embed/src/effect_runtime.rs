@@ -1693,6 +1693,17 @@ pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolI
                 params: params1(i64_tag()),
             },
         ),
+        // krio_fiber_take_input() -> i64
+        (
+            "krio_fiber_take_input",
+            zyntax_compiler::zrtl::krio_fiber_take_input as *const u8,
+            ZrtlSymbolSig {
+                param_count: 0,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: [zyntax_compiler::zrtl::TypeTag::VOID; 16],
+            },
+        ),
         // krio_fiber_transfer(target: ptr, value: i64) -> i64
         (
             "krio_fiber_transfer",

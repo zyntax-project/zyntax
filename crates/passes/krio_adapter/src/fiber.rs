@@ -51,6 +51,11 @@ thread_local! {
     /// the abort point.
     static ABORT_PAYLOAD: Cell<Option<AbortInfo>> = const { Cell::new(None) };
 
+    /// Scalar returned by `yield_u64` when the host resumes the active fiber.
+    /// The yield runtime call must return `void` to generated HIR today, so the
+    /// backend retains the value until `krio_fiber_take_input` consumes it.
+    static RESUME_INPUT: Cell<Option<u64>> = const { Cell::new(None) };
+
     /// Per-fiber error slot. Populated by `encode_step` when it
     /// surfaces Errored, read+cleared by `fiber_take_error` from
     /// the caller's side after iteration ends. Keyed by the fiber
@@ -242,11 +247,16 @@ impl FiberCfg for KrioFiberBackend {
     fn fiber_yield(&self, value: i64) {
         // `yield_u64` is a free function on krio-fiber — it consults
         // the thread-local "currently active fiber" set by `resume`.
-        // The discarded `Option<u64>` return is what the next
-        // `resume_with` will deliver back; bidirectional generators
-        // recover it via `take_input_u64` from the fiber body, not
-        // through the yield call site.
-        let _ = krio_fiber::yield_u64(value as u64);
+        // Its `Option<u64>` return is what the matching `resume_with`
+        // delivered. Generated HIR currently models FiberYield as a void
+        // instruction, so retain that return until the explicit receiving
+        // primitive reads it.
+        let input = krio_fiber::yield_u64(value as u64);
+        RESUME_INPUT.with(|slot| slot.set(input));
+    }
+
+    fn fiber_take_input(&self) -> i64 {
+        RESUME_INPUT.with(|slot| slot.take().map_or(0, |value| value as i64))
     }
 
     unsafe fn fiber_transfer(&self, _target: *mut FiberRepr, _value: i64) -> i64 {
@@ -368,6 +378,12 @@ mod tests {
         let _ = krio_fiber::yield_u64(20);
     }
 
+    extern "C" fn receives_resume_value() {
+        unsafe { zrtl::krio_fiber_yield(7) };
+        let input = unsafe { zrtl::krio_fiber_take_input() };
+        unsafe { zrtl::krio_fiber_yield(input) };
+    }
+
     #[test]
     fn empty_body_runs_to_done() {
         ensure_installed();
@@ -412,6 +428,20 @@ mod tests {
             assert_eq!((t1, p1), (FIBER_STEP_YIELDED, 10));
             assert_eq!((t2, p2), (FIBER_STEP_YIELDED, 20));
             assert_eq!((t3, p3), (FIBER_STEP_DONE, 0));
+        }
+    }
+
+    #[test]
+    fn bidirectional_resume_value_is_visible_inside_the_fiber() {
+        ensure_installed();
+        unsafe {
+            let f = zrtl::krio_fiber_new(receives_resume_value as *mut u8, 0);
+            let (first_tag, first_payload) = unpack_fiber_step(zrtl::krio_fiber_resume(f));
+            assert_eq!((first_tag, first_payload), (FIBER_STEP_YIELDED, 7));
+            let (second_tag, second_payload) =
+                unpack_fiber_step(zrtl::krio_fiber_resume_with(f, 99));
+            assert_eq!((second_tag, second_payload), (FIBER_STEP_YIELDED, 99));
+            zrtl::krio_fiber_free(f);
         }
     }
 }
