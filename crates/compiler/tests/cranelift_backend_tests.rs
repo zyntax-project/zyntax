@@ -350,7 +350,9 @@ fn test_vector_i64x2_mul_compilation() {
 #[test]
 fn test_vector_unsupported_lane_shape_rejected() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
-    let func = create_vector_arithmetic_function("vec_i16x8_add", BinaryOp::Add, HirType::I16, 8);
+    // f32x8 is 256-bit — Zyntax's Cranelift backend supports only the 128-bit
+    // lane shapes (the 6 real ones incl. i8x16/i16x8), so this is rejected.
+    let func = create_vector_arithmetic_function("vec_f32x8_add", BinaryOp::Add, HirType::F32, 8);
     let err = backend
         .compile_function(func.id, &func)
         .expect_err("Expected unsupported SIMD lane shape to be rejected");
@@ -3377,6 +3379,143 @@ fn test_vector_load_f32x4_executes() {
         (result - 10.0f32).abs() < 1e-5,
         "Expected vload + hreduce_add([1,2,3,4]) == 10.0, got {result}"
     );
+}
+
+/// Execution: `VectorUnaryOp(Sqrt)` per-lane then reduce. Loads [4,9,16,25],
+/// sqrt → [2,3,4,5], reduce_add → 14. Verifies the `sqrt` vector op lowers
+/// and computes per-lane.
+#[test]
+fn test_vector_unary_sqrt_executes() {
+    let (mut func, ptr) = make_ptr_to_f32_func("exec_vsqrt");
+    let vt = HirType::Vector(Box::new(HirType::F32), 4);
+    let entry = func.entry_block;
+    let v = func.create_value(vt.clone(), HirValueKind::Instruction);
+    let sq = func.create_value(vt.clone(), HirValueKind::Instruction);
+    let sum = func.create_value(HirType::F32, HirValueKind::Instruction);
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::VectorLoad {
+        result: v,
+        ty: vt.clone(),
+        ptr,
+        align: 4,
+    });
+    block.add_instruction(HirInstruction::VectorUnaryOp {
+        result: sq,
+        ty: vt.clone(),
+        op: VectorUnaryKind::Sqrt,
+        operand: v,
+    });
+    block.add_instruction(HirInstruction::VectorHorizontalReduce {
+        result: sum,
+        ty: HirType::F32,
+        vector: sq,
+        op: BinaryOp::FAdd,
+    });
+    block.set_terminator(HirTerminator::Return { values: vec![sum] });
+
+    let mut backend = CraneliftBackend::new().expect("backend");
+    let fn_ptr = unsafe { jit_ptr_to_f32(&mut backend, func) }.expect("JIT failed");
+    let data = [4.0f32, 9.0, 16.0, 25.0];
+    let got = unsafe { fn_ptr(data.as_ptr()) };
+    assert!((got - 14.0).abs() < 1e-5, "sqrt-reduce got {got}");
+}
+
+/// Execution: the fused widening `VectorDot` (SDOT tree). Loads a=[1..16],
+/// b=[1;16] as i8x16, `dot(acc=0, a, b)` groups the 16 products into 4 i32
+/// lanes [10,26,42,58]; reduce_add → 136 (= Σ 1..16). Validates the exact
+/// swiden/imul/iadd_pairwise/iadd tree computes the right value. (Whether it
+/// *folds* to AArch64 `sdot` is an objdump check — the CLIF matches the
+/// FEAT_DotProd ISLE rule shape by construction.)
+#[test]
+fn test_vector_dot_i8x16_executes() {
+    let name = create_test_string("exec_vdot");
+    let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
+    let sig = HirFunctionSignature {
+        params: vec![
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("a"),
+                ty: ptr_i8(),
+                attributes: ParamAttributes::default(),
+            },
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("b"),
+                ty: ptr_i8(),
+                attributes: ParamAttributes::default(),
+            },
+        ],
+        returns: vec![HirType::I32],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let mut func = HirFunction::new(name, sig);
+    func.calling_convention = CallingConvention::C;
+    let a_ptr = func.create_value(ptr_i8(), HirValueKind::Parameter(0));
+    let b_ptr = func.create_value(ptr_i8(), HirValueKind::Parameter(1));
+    let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
+    let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
+    let av = func.create_value(i8x16.clone(), HirValueKind::Instruction);
+    let bv = func.create_value(i8x16.clone(), HirValueKind::Instruction);
+    let zero = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(0)));
+    let acc = func.create_value(i32x4.clone(), HirValueKind::Instruction);
+    let dot = func.create_value(i32x4.clone(), HirValueKind::Instruction);
+    let r = func.create_value(HirType::I32, HirValueKind::Instruction);
+    let entry = func.entry_block;
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::VectorLoad {
+        result: av,
+        ty: i8x16.clone(),
+        ptr: a_ptr,
+        align: 1,
+    });
+    block.add_instruction(HirInstruction::VectorLoad {
+        result: bv,
+        ty: i8x16.clone(),
+        ptr: b_ptr,
+        align: 1,
+    });
+    block.add_instruction(HirInstruction::VectorSplat {
+        result: acc,
+        ty: i32x4.clone(),
+        scalar: zero,
+    });
+    block.add_instruction(HirInstruction::VectorDot {
+        result: dot,
+        acc,
+        a: av,
+        b: bv,
+        rhs_i7: false,
+        rhs_unsigned: false,
+    });
+    block.add_instruction(HirInstruction::VectorHorizontalReduce {
+        result: r,
+        ty: HirType::I32,
+        vector: dot,
+        op: BinaryOp::Add,
+    });
+    block.set_terminator(HirTerminator::Return { values: vec![r] });
+
+    let mut backend = CraneliftBackend::new().expect("backend");
+    let id = func.id;
+    backend
+        .compile_function(id, &func)
+        .expect("VectorDot should compile");
+    backend.finalize_definitions().expect("finalize");
+    let raw = backend.get_function_ptr(id).expect("fn ptr");
+    let fn_ptr = unsafe {
+        std::mem::transmute::<*const u8, unsafe extern "C" fn(*const i8, *const i8) -> i32>(raw)
+    };
+    let a: [i8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let b: [i8; 16] = [1; 16];
+    let got = unsafe { fn_ptr(a.as_ptr(), b.as_ptr()) };
+    assert_eq!(got, 136, "VectorDot([1..16]·[1;16]) reduce mismatch");
 }
 
 /// Execution: VectorStore stores 4 floats to memory, verify they are written.

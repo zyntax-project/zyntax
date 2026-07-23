@@ -35,7 +35,7 @@ use crate::effect_codegen::{
 use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirGlobal, HirId, HirInstruction, HirModule,
     HirPatternKind, HirPhi, HirStructType, HirTerminator, HirType, HirVTable, HirValueKind,
-    Intrinsic, UnaryOp,
+    Intrinsic, UnaryOp, VectorMinMaxKind, VectorUnaryKind,
 };
 use crate::{CompilerError, CompilerResult};
 
@@ -4773,6 +4773,8 @@ impl CraneliftBackend {
                                     match (&**elem_ty, *count) {
                                         (HirType::F32, 4) => Some(types::F32X4),
                                         (HirType::F64, 2) => Some(types::F64X2),
+                                        (HirType::I8, 16) | (HirType::U8, 16) => Some(types::I8X16),
+                                        (HirType::I16, 8) | (HirType::U16, 8) => Some(types::I16X8),
                                         (HirType::I32, 4) | (HirType::U32, 4) => Some(types::I32X4),
                                         (HirType::I64, 2) | (HirType::U64, 2) => Some(types::I64X2),
                                         _ => None,
@@ -4824,6 +4826,8 @@ impl CraneliftBackend {
                                 // (avoids borrowing self via translate_type while builder is live).
                                 let vec_clif_ty = builder.func.dfg.value_type(vec_val);
                                 let lane_count: u8 = match vec_clif_ty {
+                                    types::I8X16 => 16,
+                                    types::I16X8 => 8,
                                     types::F32X4 | types::I32X4 => 4,
                                     types::F64X2 | types::I64X2 => 2,
                                     _ => {
@@ -4831,7 +4835,29 @@ impl CraneliftBackend {
                                         0
                                     }
                                 };
-                                if lane_count > 0 {
+                                // Integer horizontal-add via a pairwise-reduction
+                                // tree instead of a serial extractlane chain: for
+                                // i32x4/i64x2 the AArch64 backend folds
+                                // `extractlane(iadd_pairwise(iadd_pairwise(x,x),
+                                // iadd_pairwise(x,x)), 0)` into a single `addv`
+                                // (a pattern the serial chain never matches). GVN
+                                // shares the repeated operand so the tree stays the
+                                // exact matched shape. Restricted to widths that
+                                // can't overflow the pairwise accumulation.
+                                let pairwise = matches!(op, BinaryOp::Add)
+                                    && matches!(vec_clif_ty, types::I32X4 | types::I64X2);
+                                if pairwise {
+                                    let mut v = vec_val;
+                                    let mut n = lane_count;
+                                    while n > 1 {
+                                        v = builder.ins().iadd_pairwise(v, v);
+                                        n /= 2;
+                                    }
+                                    let acc = builder.ins().extractlane(v, 0u8);
+                                    self.value_map.insert(*result, acc);
+                                } else if lane_count > 0 {
+                                    // Serial fallback: float-add, or ops/widths with
+                                    // no horizontal hardware idiom.
                                     let mut acc = builder.ins().extractlane(vec_val, 0u8);
                                     for lane_idx in 1..lane_count {
                                         let lane_val = builder.ins().extractlane(vec_val, lane_idx);
@@ -4866,6 +4892,8 @@ impl CraneliftBackend {
                                     match (&**elem_ty, *count) {
                                         (HirType::F32, 4) => Some(types::F32X4),
                                         (HirType::F64, 2) => Some(types::F64X2),
+                                        (HirType::I8, 16) | (HirType::U8, 16) => Some(types::I8X16),
+                                        (HirType::I16, 8) | (HirType::U16, 8) => Some(types::I16X8),
                                         (HirType::I32, 4) | (HirType::U32, 4) => Some(types::I32X4),
                                         (HirType::I64, 2) | (HirType::U64, 2) => Some(types::I64X2),
                                         _ => None,
@@ -4892,6 +4920,90 @@ impl CraneliftBackend {
                             {
                                 let flags = MemFlags::new().with_notrap();
                                 builder.ins().store(flags, vec_val, ptr_val, 0);
+                            }
+                        }
+                        HirInstruction::VectorUnaryOp {
+                            result,
+                            ty: _,
+                            op,
+                            operand,
+                        } => {
+                            if let Some(&v) = self.value_map.get(operand) {
+                                let r = match op {
+                                    VectorUnaryKind::Sqrt => builder.ins().sqrt(v),
+                                    VectorUnaryKind::Abs => builder.ins().fabs(v),
+                                    VectorUnaryKind::Neg => builder.ins().fneg(v),
+                                    VectorUnaryKind::Ceil => builder.ins().ceil(v),
+                                    VectorUnaryKind::Floor => builder.ins().floor(v),
+                                    VectorUnaryKind::Trunc => builder.ins().trunc(v),
+                                    VectorUnaryKind::Round => builder.ins().nearest(v),
+                                };
+                                self.value_map.insert(*result, r);
+                            }
+                        }
+                        HirInstruction::VectorMinMax {
+                            result,
+                            ty: _,
+                            op,
+                            left,
+                            right,
+                        } => {
+                            if let (Some(&l), Some(&r)) =
+                                (self.value_map.get(left), self.value_map.get(right))
+                            {
+                                let out = match op {
+                                    VectorMinMaxKind::Min => builder.ins().fmin(l, r),
+                                    VectorMinMaxKind::Max => builder.ins().fmax(l, r),
+                                };
+                                self.value_map.insert(*result, out);
+                            }
+                        }
+                        HirInstruction::VectorDot {
+                            result,
+                            acc,
+                            a,
+                            b,
+                            rhs_i7: _,
+                            rhs_unsigned,
+                        } => {
+                            if let (Some(&a_v), Some(&b_v), Some(&acc_v)) = (
+                                self.value_map.get(a),
+                                self.value_map.get(b),
+                                self.value_map.get(acc),
+                            ) {
+                                // The exact widen→imul→(widen-each-product)→
+                                // iadd_pairwise×3→iadd(acc) tree the AArch64
+                                // backend folds into ONE `sdot` on FEAT_DotProd
+                                // hosts. Both operands are sign-widened and each
+                                // i16 product is widened to i32 SEPARATELY, then
+                                // reduced entirely in i32 — early narrowing or
+                                // reassociation silently drops the fold to
+                                // smull/addp. `rhs_unsigned` uses uwiden (correct,
+                                // but no SDOT rule → generic pairwise fallback).
+                                let a_lo = builder.ins().swiden_low(a_v);
+                                let a_hi = builder.ins().swiden_high(a_v);
+                                let (b_lo, b_hi) = if *rhs_unsigned {
+                                    (
+                                        builder.ins().uwiden_low(b_v),
+                                        builder.ins().uwiden_high(b_v),
+                                    )
+                                } else {
+                                    (
+                                        builder.ins().swiden_low(b_v),
+                                        builder.ins().swiden_high(b_v),
+                                    )
+                                };
+                                let lo = builder.ins().imul(a_lo, b_lo);
+                                let hi = builder.ins().imul(a_hi, b_hi);
+                                let lo_w_lo = builder.ins().swiden_low(lo);
+                                let lo_w_hi = builder.ins().swiden_high(lo);
+                                let hi_w_lo = builder.ins().swiden_low(hi);
+                                let hi_w_hi = builder.ins().swiden_high(hi);
+                                let inner_lo = builder.ins().iadd_pairwise(lo_w_lo, lo_w_hi);
+                                let inner_hi = builder.ins().iadd_pairwise(hi_w_lo, hi_w_hi);
+                                let pair = builder.ins().iadd_pairwise(inner_lo, inner_hi);
+                                let out = builder.ins().iadd(pair, acc_v);
+                                self.value_map.insert(*result, out);
                             }
                         }
 
@@ -5667,6 +5779,8 @@ impl CraneliftBackend {
             HirType::Vector(elem_ty, count) => match (&**elem_ty, *count) {
                 (HirType::F32, 4) => Ok(types::F32X4),
                 (HirType::F64, 2) => Ok(types::F64X2),
+                (HirType::I8, 16) | (HirType::U8, 16) => Ok(types::I8X16),
+                (HirType::I16, 8) | (HirType::U16, 8) => Ok(types::I16X8),
                 (HirType::I32, 4) | (HirType::U32, 4) => Ok(types::I32X4),
                 (HirType::I64, 2) | (HirType::U64, 2) => Ok(types::I64X2),
                 _ => Err(CompilerError::CodeGen(format!(
