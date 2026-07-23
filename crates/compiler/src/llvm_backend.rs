@@ -17,6 +17,7 @@
 use crate::hir::{
     BinaryOp, CastOp, HirBlock, HirCallable, HirConstant, HirFunction, HirGlobal, HirId,
     HirInstruction, HirModule, HirPhi, HirTerminator, HirType, HirVTable, HirValueKind, UnaryOp,
+    VectorMinMaxKind, VectorUnaryKind,
 };
 use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
@@ -2509,6 +2510,248 @@ impl<'ctx> LLVMBackend<'ctx> {
                     .insert(*result, self.context.i64_type().const_zero().into());
             }
 
+            // ========== SIMD / Vector ==========
+            HirInstruction::VectorLoad {
+                result, ty, ptr, ..
+            } => {
+                let ptr_val = self.get_value(*ptr)?.into_pointer_value();
+                let llvm_ty = self.translate_type(ty)?;
+                let loaded = self.builder.build_load(llvm_ty, ptr_val, "vload")?;
+                self.value_map.insert(*result, loaded);
+            }
+            HirInstruction::VectorStore { value, ptr, .. } => {
+                let val = self.get_value(*value)?;
+                let ptr_val = self.get_value(*ptr)?.into_pointer_value();
+                self.builder.build_store(ptr_val, val)?;
+            }
+            HirInstruction::VectorSplat { result, ty, scalar } => {
+                let scalar_val = self.get_value(*scalar)?;
+                let vec_ty = self.translate_type(ty)?.into_vector_type();
+                let lanes = vec_ty.get_size();
+                let mut vec = vec_ty.get_undef();
+                for i in 0..lanes {
+                    let idx = self.context.i32_type().const_int(i as u64, false);
+                    vec = self
+                        .builder
+                        .build_insert_element(vec, scalar_val, idx, "splat")?;
+                }
+                self.value_map.insert(*result, vec.into());
+            }
+            HirInstruction::VectorExtractLane {
+                result,
+                vector,
+                lane,
+                ..
+            } => {
+                let vec = self.get_value(*vector)?.into_vector_value();
+                let idx = self.context.i32_type().const_int(*lane as u64, false);
+                let elem = self.builder.build_extract_element(vec, idx, "vext")?;
+                self.value_map.insert(*result, elem);
+            }
+            HirInstruction::VectorInsertLane {
+                result,
+                vector,
+                scalar,
+                lane,
+                ..
+            } => {
+                let vec = self.get_value(*vector)?.into_vector_value();
+                let s = self.get_value(*scalar)?;
+                let idx = self.context.i32_type().const_int(*lane as u64, false);
+                let out = self.builder.build_insert_element(vec, s, idx, "vins")?;
+                self.value_map.insert(*result, out.into());
+            }
+            HirInstruction::VectorHorizontalReduce {
+                result,
+                ty,
+                vector,
+                op,
+            } => {
+                let vec = self.get_value(*vector)?.into_vector_value();
+                let vec_ty = vec.get_type();
+                let lanes = vec_ty.get_size();
+                let out_ty = self.translate_type(ty)?;
+                let is_float = matches!(ty, HirType::F32 | HirType::F64);
+                if matches!(op, BinaryOp::Add) && !is_float {
+                    // llvm.vector.reduce.add.<vec> → the backend lowers to addv.
+                    let bits = out_ty.into_int_type().get_bit_width();
+                    let name = format!("llvm.vector.reduce.add.v{lanes}i{bits}");
+                    let f = self.module.get_function(&name).unwrap_or_else(|| {
+                        let ft = out_ty.fn_type(&[vec_ty.into()], false);
+                        self.module.add_function(&name, ft, None)
+                    });
+                    let r = self.call_basic(f, &[vec.into()], "vreduce")?;
+                    self.value_map.insert(*result, r);
+                } else {
+                    // Serial extract + scalar combine.
+                    let mut acc = self.builder.build_extract_element(
+                        vec,
+                        self.context.i32_type().const_zero(),
+                        "l0",
+                    )?;
+                    for i in 1..lanes {
+                        let idx = self.context.i32_type().const_int(i as u64, false);
+                        let lane = self.builder.build_extract_element(vec, idx, "l")?;
+                        acc = match op {
+                            BinaryOp::Add => self
+                                .builder
+                                .build_int_add(acc.into_int_value(), lane.into_int_value(), "r")?
+                                .into(),
+                            BinaryOp::FAdd => self
+                                .builder
+                                .build_float_add(
+                                    acc.into_float_value(),
+                                    lane.into_float_value(),
+                                    "r",
+                                )?
+                                .into(),
+                            _ => acc,
+                        };
+                    }
+                    self.value_map.insert(*result, acc);
+                }
+            }
+            HirInstruction::VectorUnaryOp {
+                result,
+                ty,
+                op,
+                operand,
+            } => {
+                let v = self.get_value(*operand)?;
+                let vt = self.translate_type(ty)?;
+                let iname = match op {
+                    VectorUnaryKind::Sqrt => "llvm.sqrt",
+                    VectorUnaryKind::Abs => "llvm.fabs",
+                    VectorUnaryKind::Ceil => "llvm.ceil",
+                    VectorUnaryKind::Floor => "llvm.floor",
+                    VectorUnaryKind::Trunc => "llvm.trunc",
+                    VectorUnaryKind::Round => "llvm.roundeven",
+                    VectorUnaryKind::Neg => "",
+                };
+                if op == &VectorUnaryKind::Neg {
+                    let r = self
+                        .builder
+                        .build_float_neg(v.into_vector_value(), "vneg")?;
+                    self.value_map.insert(*result, r.into());
+                } else {
+                    let vecty = vt.into_vector_type();
+                    let etype = if vecty.get_element_type().into_float_type().get_bit_width() == 32
+                    {
+                        "f32"
+                    } else {
+                        "f64"
+                    };
+                    let name = format!("{iname}.v{}{etype}", vecty.get_size());
+                    let f = self.module.get_function(&name).unwrap_or_else(|| {
+                        let ft = vt.fn_type(&[vt.into()], false);
+                        self.module.add_function(&name, ft, None)
+                    });
+                    let r = self.call_basic(f, &[v.into()], "vunary")?;
+                    self.value_map.insert(*result, r);
+                }
+            }
+            HirInstruction::VectorMinMax {
+                result,
+                ty,
+                op,
+                left,
+                right,
+            } => {
+                let l = self.get_value(*left)?;
+                let r = self.get_value(*right)?;
+                let vt = self.translate_type(ty)?;
+                let vecty = vt.into_vector_type();
+                let etype = if vecty.get_element_type().into_float_type().get_bit_width() == 32 {
+                    "f32"
+                } else {
+                    "f64"
+                };
+                let base = match op {
+                    VectorMinMaxKind::Min => "llvm.minnum",
+                    VectorMinMaxKind::Max => "llvm.maxnum",
+                };
+                let name = format!("{base}.v{}{etype}", vecty.get_size());
+                let f = self.module.get_function(&name).unwrap_or_else(|| {
+                    let ft = vt.fn_type(&[vt.into(), vt.into()], false);
+                    self.module.add_function(&name, ft, None)
+                });
+                let out = self.call_basic(f, &[l.into(), r.into()], "vminmax")?;
+                self.value_map.insert(*result, out);
+            }
+            HirInstruction::VectorDot {
+                result,
+                acc,
+                a,
+                b,
+                rhs_unsigned,
+                ..
+            } => {
+                let acc_v = self.get_value(*acc)?;
+                let a_v = self.get_value(*a)?;
+                let b_v = self.get_value(*b)?;
+                let i32x4 = self.context.i32_type().vec_type(4);
+                let i8x16 = self.context.i8_type().vec_type(16);
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // The AArch64 NEON dot-product intrinsic — one SDOT/UDOT.
+                    let name = if *rhs_unsigned {
+                        "llvm.aarch64.neon.udot.v4i32.v16i8"
+                    } else {
+                        "llvm.aarch64.neon.sdot.v4i32.v16i8"
+                    };
+                    let f = self.module.get_function(name).unwrap_or_else(|| {
+                        let ft = i32x4.fn_type(&[i32x4.into(), i8x16.into(), i8x16.into()], false);
+                        self.module.add_function(name, ft, None)
+                    });
+                    let r = self.call_basic(f, &[acc_v.into(), a_v.into(), b_v.into()], "sdot")?;
+                    self.value_map.insert(*result, r);
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    // Portable fallback: widen each i8 lane to i32, multiply,
+                    // then sum consecutive groups of 4 into the 4 output lanes.
+                    let i32ty = self.context.i32_type();
+                    let av = a_v.into_vector_value();
+                    let bv = b_v.into_vector_value();
+                    let mut out = acc_v.into_vector_value();
+                    for j in 0..4u32 {
+                        let mut lane = self
+                            .builder
+                            .build_extract_element(out, i32ty.const_int(j as u64, false), "acc_j")?
+                            .into_int_value();
+                        for k in 0..4u32 {
+                            let idx = i32ty.const_int((4 * j + k) as u64, false);
+                            let ai = self
+                                .builder
+                                .build_extract_element(av, idx, "ai")?
+                                .into_int_value();
+                            let bi = self
+                                .builder
+                                .build_extract_element(bv, idx, "bi")?
+                                .into_int_value();
+                            let aw = if *rhs_unsigned {
+                                self.builder.build_int_z_extend(ai, i32ty, "aw")?
+                            } else {
+                                self.builder.build_int_s_extend(ai, i32ty, "aw")?
+                            };
+                            let bw = if *rhs_unsigned {
+                                self.builder.build_int_z_extend(bi, i32ty, "bw")?
+                            } else {
+                                self.builder.build_int_s_extend(bi, i32ty, "bw")?
+                            };
+                            let prod = self.builder.build_int_mul(aw, bw, "prod")?;
+                            lane = self.builder.build_int_add(lane, prod, "acc")?;
+                        }
+                        out = self.builder.build_insert_element(
+                            out,
+                            lane,
+                            i32ty.const_int(j as u64, false),
+                            "outj",
+                        )?;
+                    }
+                    self.value_map.insert(*result, out.into());
+                }
+            }
             _ => {
                 return Err(CompilerError::CodeGen(format!(
                     "Instruction not yet implemented: {:?}",
@@ -3850,6 +4093,22 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// Helper to get or declare a unary LLVM intrinsic
+    /// Build a call to `f` and return its basic result value (all our
+    /// intrinsics return a value, never void).
+    fn call_basic(
+        &self,
+        f: FunctionValue<'ctx>,
+        args: &[inkwell::values::BasicMetadataValueEnum<'ctx>],
+        name: &str,
+    ) -> CompilerResult<inkwell::values::BasicValueEnum<'ctx>> {
+        match self.builder.build_call(f, args, name)?.try_as_basic_value() {
+            ValueKind::Basic(v) => Ok(v),
+            ValueKind::Instruction(_) => Err(CompilerError::CodeGen(format!(
+                "{name}: expected a value result"
+            ))),
+        }
+    }
+
     fn get_or_declare_intrinsic(
         &self,
         name: &str,
@@ -4184,6 +4443,8 @@ impl<'ctx> LLVMBackend<'ctx> {
             Vector(elem_ty, count) => match (&**elem_ty, *count) {
                 (F32, 4) => self.context.f32_type().vec_type(4).into(),
                 (F64, 2) => self.context.f64_type().vec_type(2).into(),
+                (I8, 16) | (U8, 16) => self.context.i8_type().vec_type(16).into(),
+                (I16, 8) | (U16, 8) => self.context.i16_type().vec_type(8).into(),
                 (I32, 4) | (U32, 4) => self.context.i32_type().vec_type(4).into(),
                 (I64, 2) | (U64, 2) => self.context.i64_type().vec_type(2).into(),
                 _ => {
