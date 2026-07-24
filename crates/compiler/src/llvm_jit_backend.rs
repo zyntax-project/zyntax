@@ -314,6 +314,16 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
         backend.set_only_compile_reachable(self.only_compile_reachable.clone());
+        // On-host JIT: target == host, so the target's VNNI capability is
+        // the host's (the TargetMachine below is likewise built from
+        // `get_host_cpu_features()`). A cross/portable-AOT compile would
+        // instead derive this from the AOT target's declared features so
+        // no host-only `vpdpbusd` is baked into the object.
+        #[cfg(target_arch = "x86_64")]
+        backend.set_x86_target_vnni(
+            std::arch::is_x86_feature_detected!("avxvnni")
+                || std::arch::is_x86_feature_detected!("avx512vnni"),
+        );
         let _llvm_ir = backend.compile_module(hir_module)?;
 
         // Patch internal function names to a linker-safe mangling.

@@ -133,6 +133,18 @@ pub struct LLVMBackend<'ctx> {
     /// install plus surfaces every type-translation gap the prelude
     /// has.
     only_compile_reachable: Option<std::collections::HashSet<HirId>>,
+
+    /// Whether the compilation **target** (not the host) has x86 VNNI
+    /// (`VPDPBUSD`). Set by the caller from the target-machine features:
+    /// for a JIT the target is the host, so it comes from host feature
+    /// detection; for a portable AOT object it must come from the AOT
+    /// target's declared features, NOT the build host — otherwise a
+    /// host-only `vpdpbusd` would be baked into a non-portable binary.
+    /// The `VectorDot` lowering reads this to choose the fused intrinsic
+    /// vs. the portable widening fallback. Defaults to `false`
+    /// (conservative — no VNNI unless the caller opts in for its target).
+    #[allow(dead_code)] // read only under #[cfg(target_arch = "x86_64")]
+    x86_target_vnni: bool,
 }
 
 /// Approximate byte size of a `HirType` for laying out union payloads
@@ -204,6 +216,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             dlsym_set: std::collections::HashSet::new(),
             self_recursive_set: std::collections::HashSet::new(),
             only_compile_reachable: None,
+            x86_target_vnni: false,
         }
     }
 
@@ -332,6 +345,15 @@ impl<'ctx> LLVMBackend<'ctx> {
         allowed: Option<std::collections::HashSet<HirId>>,
     ) {
         self.only_compile_reachable = allowed;
+    }
+
+    /// Declare whether the compilation **target** has x86 VNNI, gating
+    /// the fused `VPDPBUSD` lowering of `VectorDot`. Call before
+    /// `compile_module`. A JIT passes its host's capability (target ==
+    /// host); a portable AOT object passes its AOT target's declared
+    /// features so no host-only instruction is baked in.
+    pub fn set_x86_target_vnni(&mut self, has_vnni: bool) {
+        self.x86_target_vnni = has_vnni;
     }
 
     /// Get a reference to the compiled LLVM module
@@ -2716,10 +2738,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     self.call_basic(f, &[acc_v.into(), a_v.into(), b_v.into()], "sdot")?
                 };
                 #[cfg(target_arch = "x86_64")]
-                let dot = if (*rhs_i7 || *rhs_unsigned)
-                    && (std::arch::is_x86_feature_detected!("avxvnni")
-                        || std::arch::is_x86_feature_detected!("avx512vnni"))
-                {
+                let dot = if (*rhs_i7 || *rhs_unsigned) && self.x86_target_vnni {
                     self.emit_x86_vpdpbusd(acc_v, a_v, b_v)?
                 } else {
                     self.emit_portable_dot(acc_v, a_v, b_v, *rhs_unsigned)?

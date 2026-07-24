@@ -194,6 +194,9 @@ fn llvm_vector_dot_emits_vpdpbusd_on_vnni() {
 
     let context = Context::create();
     let mut backend = LLVMBackend::new(&context, "vnni_verify");
+    // Target has VNNI (we early-returned above if the host lacks it, and
+    // this test targets the host).
+    backend.set_x86_target_vnni(true);
     let ir = backend.compile_module(&module).expect("LLVM compile");
     eprintln!("\n===== VectorDot (VNNI) LLVM IR =====\n{ir}");
     assert!(
@@ -229,6 +232,65 @@ fn llvm_vector_dot_emits_vpdpbusd_on_vnni() {
     assert!(
         asm.contains("vpdpbusd"),
         "native asm missing the vpdpbusd instruction:\n{asm}"
+    );
+}
+
+/// AOT-portability gate: when the compilation **target** is declared
+/// without VNNI (`set_x86_target_vnni(false)`), the `VectorDot` must NOT
+/// emit `vpdpbusd` even on a VNNI-capable build host — so a portable AOT
+/// object never bakes in a host-only instruction. Runs on any x86 host
+/// (independent of the host's own VNNI support).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn llvm_vector_dot_portable_when_target_lacks_vnni() {
+    let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
+    let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
+    let mk = |n: &str, t: &HirType| HirParam {
+        id: HirId::new(),
+        name: InternedString::new_global(n),
+        ty: t.clone(),
+        attributes: ParamAttributes::default(),
+    };
+    let sig = HirFunctionSignature {
+        params: vec![mk("acc", &i32x4), mk("a", &i8x16), mk("b", &i8x16)],
+        returns: vec![i32x4.clone()],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let mut func = HirFunction::new(InternedString::new_global("vdot_portable"), sig);
+    func.calling_convention = CallingConvention::C;
+    let acc = func.create_value(i32x4.clone(), HirValueKind::Parameter(0));
+    let a = func.create_value(i8x16.clone(), HirValueKind::Parameter(1));
+    let b = func.create_value(i8x16.clone(), HirValueKind::Parameter(2));
+    let r = func.create_value(i32x4.clone(), HirValueKind::Instruction);
+    let entry = func.entry_block;
+    let blk = func.blocks.get_mut(&entry).unwrap();
+    blk.instructions.push(HirInstruction::VectorDot {
+        result: r,
+        acc,
+        a,
+        b,
+        rhs_i7: true,
+        rhs_unsigned: false,
+    });
+    blk.terminator = HirTerminator::Return { values: vec![r] };
+
+    let mut module = HirModule::new(InternedString::new_global("m"));
+    module.functions.insert(func.id, func);
+
+    let context = Context::create();
+    let mut backend = LLVMBackend::new(&context, "portable_verify");
+    backend.set_x86_target_vnni(false); // portable target — no VNNI
+    let ir = backend.compile_module(&module).expect("LLVM compile");
+    assert!(
+        !ir.contains("vpdpbusd"),
+        "portable target must not emit vpdpbusd:\n{ir}"
     );
 }
 
