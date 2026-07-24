@@ -8,8 +8,9 @@
 
 use inkwell::context::Context;
 use zyntax_compiler::hir::{
-    BinaryOp, HirConstant, HirFunction, HirFunctionSignature, HirInstruction, HirModule,
-    HirTerminator, HirType, HirValueKind,
+    BinaryOp, CallingConvention, HirCallable, HirConstant, HirFunction, HirFunctionSignature,
+    HirId, HirInstruction, HirModule, HirParam, HirTerminator, HirType, HirValueKind, Intrinsic,
+    ParamAttributes,
 };
 use zyntax_compiler::llvm_backend::LLVMBackend;
 use zyntax_typed_ast::InternedString;
@@ -133,4 +134,94 @@ fn llvm_vector_dot_emits_sdot_intrinsic() {
         assert!(asm.contains("sdot"), "native asm missing `sdot`:\n{asm}");
         assert!(asm.contains("addv"), "native asm missing `addv`:\n{asm}");
     }
+}
+
+/// A float-lane vector fused multiply-add must select the overloaded
+/// vector fma intrinsic (`@llvm.fma.v4f32`) — which the AArch64 selector
+/// lowers to an `fmla` machine instruction — not a separate mul + add.
+#[test]
+fn llvm_vector_fma_emits_fma_intrinsic() {
+    let f32x4 = HirType::Vector(Box::new(HirType::F32), 4);
+    // Three vector params — not constants — so LLVM can't fold the fma
+    // away before instruction selection; the `fmla` must survive to asm.
+    let mk_param = |n: &str| HirParam {
+        id: HirId::new(),
+        name: InternedString::new_global(n),
+        ty: f32x4.clone(),
+        attributes: ParamAttributes::default(),
+    };
+    let sig = HirFunctionSignature {
+        params: vec![mk_param("a"), mk_param("b"), mk_param("c")],
+        returns: vec![f32x4.clone()],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let mut func = HirFunction::new(InternedString::new_global("vfma"), sig);
+    func.calling_convention = CallingConvention::C;
+
+    let a = func.create_value(f32x4.clone(), HirValueKind::Parameter(0));
+    let b = func.create_value(f32x4.clone(), HirValueKind::Parameter(1));
+    let c = func.create_value(f32x4.clone(), HirValueKind::Parameter(2));
+    let r = func.create_value(f32x4.clone(), HirValueKind::Instruction);
+
+    let entry = func.entry_block;
+    let blk = func.blocks.get_mut(&entry).unwrap();
+    blk.instructions.push(HirInstruction::Call {
+        result: Some(r),
+        callee: HirCallable::Intrinsic(Intrinsic::Fma),
+        args: vec![a, b, c],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    blk.terminator = HirTerminator::Return { values: vec![r] };
+
+    let mut module = HirModule::new(InternedString::new_global("m"));
+    module.functions.insert(func.id, func);
+
+    let context = Context::create();
+    let mut backend = LLVMBackend::new(&context, "fma_verify");
+    let ir = backend.compile_module(&module).expect("LLVM compile");
+    eprintln!("\n===== VectorFma LLVM IR =====\n{ir}");
+    assert!(
+        ir.contains("llvm.fma.v4f32"),
+        "LLVM IR missing the vector fma intrinsic:\n{ir}"
+    );
+
+    use inkwell::targets::{
+        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    };
+    use inkwell::OptimizationLevel;
+    Target::initialize_native(&InitializationConfig::default()).expect("init native target");
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple).expect("target from triple");
+    let tm = target
+        .create_target_machine(
+            &triple,
+            TargetMachine::get_host_cpu_name().to_str().unwrap(),
+            TargetMachine::get_host_cpu_features().to_str().unwrap(),
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .expect("target machine");
+    let m = backend.module();
+    m.set_triple(&triple);
+    m.set_data_layout(&tm.get_target_data().get_data_layout());
+    let asm = tm
+        .write_to_memory_buffer(m, FileType::Assembly)
+        .map(|buf| String::from_utf8_lossy(buf.as_slice()).to_string())
+        .expect("emit native asm");
+    eprintln!("\n===== VectorFma native asm =====\n{asm}");
+    #[cfg(target_arch = "aarch64")]
+    assert!(
+        asm.contains("fmla") || asm.contains("fmadd"),
+        "native asm missing fused multiply-add:\n{asm}"
+    );
 }

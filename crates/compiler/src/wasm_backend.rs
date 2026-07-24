@@ -705,8 +705,12 @@ impl<'a> FunctionEmitter<'a> {
                             // others (math, bit-manipulation, overflow)
                             // need per-intrinsic emit logic.
                             let name = match intr {
-                                crate::hir::Intrinsic::Malloc => "host.malloc",
-                                crate::hir::Intrinsic::Free => "host.free",
+                                crate::hir::Intrinsic::Malloc => Some("host.malloc"),
+                                crate::hir::Intrinsic::Free => Some("host.free"),
+                                // Fused multiply-add lowers to inline wasm
+                                // instructions (relaxed madd / mul+add), so
+                                // it needs no host import.
+                                crate::hir::Intrinsic::Fma => None,
                                 other => {
                                     return Err(WasmEmitError::Unsupported(format!(
                                         "intrinsic call ({:?})",
@@ -714,12 +718,14 @@ impl<'a> FunctionEmitter<'a> {
                                     )));
                                 }
                             };
-                            let arity = args.len() as u32;
-                            let import_name = format!("{}@{}", name, arity);
-                            if !self.import_indices.contains_key(&import_name) {
-                                let idx = self.imports.len() as u32;
-                                self.imports.push((import_name.clone(), arity));
-                                self.import_indices.insert(import_name, idx);
+                            if let Some(name) = name {
+                                let arity = args.len() as u32;
+                                let import_name = format!("{}@{}", name, arity);
+                                if !self.import_indices.contains_key(&import_name) {
+                                    let idx = self.imports.len() as u32;
+                                    self.imports.push((import_name.clone(), arity));
+                                    self.import_indices.insert(import_name, idx);
+                                }
                             }
                         }
                         HirCallable::FuncRef(_) => {
@@ -1167,6 +1173,43 @@ impl<'a> FunctionEmitter<'a> {
                 args,
                 ..
             } => {
+                // Fused multiply-add (`a * b + c`), emitted by the
+                // `fma_contract` pass. Float-lane vectors use the
+                // relaxed madd instruction; scalars fall back to an
+                // unfused mul+add (wasm has no scalar fma, and scalar
+                // floats are funneled through f64 here).
+                if let HirCallable::Intrinsic(crate::hir::Intrinsic::Fma) = callee {
+                    if args.len() == 3 {
+                        out.push(self.local_get(args[0])?);
+                        out.push(self.local_get(args[1])?);
+                        match self.func.values.get(&args[0]).map(|v| &v.ty) {
+                            Some(HirType::Vector(elem, _)) => {
+                                out.push(self.local_get(args[2])?);
+                                out.push(match **elem {
+                                    HirType::F32 => WasmInst::F32x4RelaxedMadd,
+                                    HirType::F64 => WasmInst::F64x2RelaxedMadd,
+                                    ref other => {
+                                        return Err(WasmEmitError::Unsupported(format!(
+                                            "fma on vector lane {other:?}"
+                                        )))
+                                    }
+                                });
+                            }
+                            _ => {
+                                out.push(WasmInst::F64Mul);
+                                out.push(self.local_get(args[2])?);
+                                out.push(WasmInst::F64Add);
+                            }
+                        }
+                        if let Some(result_id) = result {
+                            out.push(self.local_set(*result_id)?);
+                        } else {
+                            out.push(WasmInst::Drop);
+                        }
+                        return Ok(());
+                    }
+                }
+
                 // `Symbol`, `Function`, the allocator `Intrinsic`s
                 // (Malloc/Free), and `Indirect` reach here.
                 // Indirect routes through the host

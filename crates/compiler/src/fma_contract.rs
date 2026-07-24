@@ -36,10 +36,12 @@
 //!   (defeating the optimisation) or leave a dangling reference.
 //!   The use count is collected by scanning every block's
 //!   instructions, phis, and terminator in the function.
-//! * Only `HirType::F64` is contracted today — the same pattern
-//!   would apply to `F32`, but the current SSA pipeline normalises
-//!   most float math to `F64` so the F32 path is rare enough to
-//!   skip until we see it.
+//! * Contracted for `F32`/`F64` scalars and for float-lane vectors
+//!   (`Vector(F32, N)` / `Vector(F64, N)`) — the fused op is
+//!   element-wise on vectors. `Intrinsic::Fma` is polymorphic: every
+//!   backend picks the scalar or vector fused instruction from the
+//!   operand type (Cranelift `fma`, LLVM `llvm.fma.*`, wasm
+//!   `f32x4.relaxed_madd`, the interpreter's per-lane `mul_add`).
 //! * Only `FAdd` is contracted. `FSub(fmul a b, c)` could become
 //!   `Fma(a, b, -c)` via an `FNeg`, but that needs an extra
 //!   instruction and an extra def-site; deferred.
@@ -114,23 +116,26 @@ fn contract_block(
     let mut contracted = 0;
 
     for idx in 0..instructions.len() {
-        // Record FMul F64 defs so a later FAdd can pick them up.
+        // Record contractable FMul defs so a later FAdd can pick them
+        // up (F32/F64 scalars and float-lane vectors).
         if let HirInstruction::Binary {
             op: BinaryOp::FMul,
-            ty: HirType::F64,
+            ty,
             left,
             right,
             result,
         } = &instructions[idx]
         {
-            fmul_defs.insert(*result, (*left, *right, idx));
+            if is_contractable_fma_ty(ty) {
+                fmul_defs.insert(*result, (*left, *right, idx));
+            }
             continue;
         }
 
-        // Look for FAdd F64 candidates.
+        // Look for FAdd candidates of the same contractable classes.
         let HirInstruction::Binary {
             op: BinaryOp::FAdd,
-            ty: HirType::F64,
+            ty: add_ty,
             left: add_left,
             right: add_right,
             result: add_result,
@@ -138,6 +143,9 @@ fn contract_block(
         else {
             continue;
         };
+        if !is_contractable_fma_ty(add_ty) {
+            continue;
+        }
 
         let add_result = *add_result;
 
@@ -190,6 +198,18 @@ fn contract_block(
     }
 
     contracted
+}
+
+/// Types eligible for multiply-add contraction: `F32`/`F64` scalars
+/// and float-lane vectors. `Intrinsic::Fma` is emitted for all of
+/// them; each backend selects the scalar or element-wise fused
+/// instruction from the operand type.
+fn is_contractable_fma_ty(ty: &HirType) -> bool {
+    match ty {
+        HirType::F32 | HirType::F64 => true,
+        HirType::Vector(elem, _) => matches!(**elem, HirType::F32 | HirType::F64),
+        _ => false,
+    }
 }
 
 /// Build a function-wide map `HirId -> number of times it appears
@@ -335,6 +355,62 @@ mod tests {
                 assert_eq!(args, &vec![a, b, c]);
             }
             other => panic!("expected Fma call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn contracts_vector_fmul_then_fadd() {
+        let entry = HirId::new();
+        let mut func = empty_func(entry);
+        let vty = HirType::Vector(Box::new(HirType::F32), 4);
+
+        let a = HirId::new();
+        let b = HirId::new();
+        let c = HirId::new();
+        let t = HirId::new();
+        let r = HirId::new();
+
+        let block = HirBlock {
+            id: entry,
+            label: None,
+            phis: Vec::new(),
+            instructions: vec![
+                HirInstruction::Binary {
+                    op: BinaryOp::FMul,
+                    result: t,
+                    ty: vty.clone(),
+                    left: a,
+                    right: b,
+                },
+                HirInstruction::Binary {
+                    op: BinaryOp::FAdd,
+                    result: r,
+                    ty: vty,
+                    left: t,
+                    right: c,
+                },
+            ],
+            terminator: HirTerminator::Return { values: vec![r] },
+            dominance_frontier: Default::default(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        };
+        func.blocks.insert(entry, block);
+
+        assert_eq!(run_function(&mut func), 1);
+        let block = &func.blocks[&entry];
+        assert_eq!(block.instructions.len(), 1);
+        match &block.instructions[0] {
+            HirInstruction::Call {
+                callee: HirCallable::Intrinsic(Intrinsic::Fma),
+                args,
+                result: Some(res),
+                ..
+            } => {
+                assert_eq!(*res, r);
+                assert_eq!(args, &vec![a, b, c]);
+            }
+            other => panic!("expected vector Fma call, got {:?}", other),
         }
     }
 

@@ -3831,20 +3831,31 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let b = self.get_value(args[1])?;
                 let c = self.get_value(args[2])?;
 
+                // Polymorphic: scalar float lanes select `llvm.fma.f32/f64`,
+                // float-lane vectors select the overloaded vector form
+                // (`llvm.fma.v4f32`, `llvm.fma.v2f64`).
                 let intrinsic_name = if a.is_float_value() {
                     let float_val = a.into_float_value();
                     if float_val.get_type() == self.context.f32_type() {
-                        "llvm.fma.f32"
+                        "llvm.fma.f32".to_string()
                     } else {
-                        "llvm.fma.f64"
+                        "llvm.fma.f64".to_string()
                     }
+                } else if a.is_vector_value() {
+                    let vecty = a.into_vector_value().get_type();
+                    let etype = if vecty.get_element_type().into_float_type().get_bit_width() == 32 {
+                        "f32"
+                    } else {
+                        "f64"
+                    };
+                    format!("llvm.fma.v{}{}", vecty.get_size(), etype)
                 } else {
                     return Err(CompilerError::CodeGen(
-                        "fma requires float arguments".to_string()
+                        "fma requires float or float-vector arguments".to_string()
                     ));
                 };
 
-                let fma_fn = self.get_or_declare_intrinsic_ternary(intrinsic_name, a.get_type())?;
+                let fma_fn = self.get_or_declare_intrinsic_ternary(&intrinsic_name, a.get_type())?;
                 let call_site = self.builder.build_call(fma_fn, &[a.into(), b.into(), c.into()], "fma")?;
 
                 match call_site.try_as_basic_value() {

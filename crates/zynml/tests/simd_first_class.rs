@@ -130,6 +130,56 @@ fn f32x4_scalar_broadcast_mul() {
     assert_eq!(result.as_float(), Some(6.0), "got {:?}", result);
 }
 
+/// Fused multiply-add on vectors: `a * b + c`, read one lane.
+/// The `fma_contract` pass fuses the vector FMul+FAdd into a single
+/// `Intrinsic::Fma`, lowered inline per backend. lane1 = 2*6 + 20 = 32.
+#[test]
+fn f32x4_fma_lane() {
+    let rt = compile_and_install(
+        r#"
+        def fma4(): f32 {
+            let a: f32x4 = f32x4::new(1.0, 2.0, 3.0, 4.0)
+            let b: f32x4 = f32x4::new(5.0, 6.0, 7.0, 8.0)
+            let c: f32x4 = f32x4::new(10.0, 20.0, 30.0, 40.0)
+            let r: f32x4 = a * b + c
+            return r[1]
+        }
+        "#,
+    );
+
+    let result = rt.call_function_raw("fma4", vec![]).expect("call");
+    assert_eq!(result.as_float(), Some(32.0), "got {:?}", result);
+}
+
+/// The same vector FMA promoted to the Cranelift JIT (Cranelift's `fma`
+/// lowers an f32x4 triple to a hardware fused multiply-add).
+#[test]
+fn f32x4_fma_tiers_up_to_cranelift() {
+    let rt = compile_with_jit(
+        r#"
+        def fma4(): f32 {
+            let a: f32x4 = f32x4::new(1.0, 2.0, 3.0, 4.0)
+            let b: f32x4 = f32x4::new(5.0, 6.0, 7.0, 8.0)
+            let c: f32x4 = f32x4::new(10.0, 20.0, 30.0, 40.0)
+            let r: f32x4 = a * b + c
+            return r[1]
+        }
+        "#,
+    );
+
+    for _ in 0..4 {
+        let result = rt.call_function_raw("fma4", vec![]).expect("call");
+        assert_eq!(result.as_float(), Some(32.0), "interp got {:?}", result);
+    }
+    let func_ids = rt.interp_registered_function_ids();
+    let tiered_up = poll_until(Duration::from_millis(2000), || {
+        func_ids.iter().any(|fid| rt.interp_function_compiled(*fid))
+    });
+    assert!(tiered_up, "fma4 never tiered up to Cranelift");
+    let result = rt.call_function_raw("fma4", vec![]).expect("call");
+    assert_eq!(result.as_float(), Some(32.0), "post-JIT got {:?}", result);
+}
+
 /// Element-wise unary math: sqrt of each lane, then read lane 2.
 /// sqrt(9.0) = 3.0.
 #[test]

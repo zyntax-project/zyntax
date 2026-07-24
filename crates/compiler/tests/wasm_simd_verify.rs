@@ -6,11 +6,72 @@
 #![cfg(feature = "wasm-jit")]
 
 use zyntax_compiler::hir::{
-    BinaryOp, HirConstant, HirFunction, HirFunctionSignature, HirInstruction, HirTerminator,
-    HirType, HirValueKind,
+    BinaryOp, HirCallable, HirConstant, HirFunction, HirFunctionSignature, HirInstruction,
+    HirTerminator, HirType, HirValueKind, Intrinsic,
 };
 use zyntax_compiler::wasm_backend::WasmBackend;
 use zyntax_typed_ast::InternedString;
+
+fn sig_f32x4() -> HirFunctionSignature {
+    HirFunctionSignature {
+        params: vec![],
+        returns: vec![HirType::Vector(Box::new(HirType::F32), 4)],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    }
+}
+
+/// A float-lane vector fused multiply-add must lower to the relaxed
+/// madd opcode, not a scalar fallback or an out-of-line import.
+#[test]
+fn wasm_vector_fma_emits_relaxed_madd() {
+    let mut func = HirFunction::new(InternedString::new_global("wfma"), sig_f32x4());
+    let f32x4 = HirType::Vector(Box::new(HirType::F32), 4);
+
+    let c1 = func.create_value(HirType::F32, HirValueKind::Constant(HirConstant::F32(2.0)));
+    let c2 = func.create_value(HirType::F32, HirValueKind::Constant(HirConstant::F32(3.0)));
+    let c3 = func.create_value(HirType::F32, HirValueKind::Constant(HirConstant::F32(4.0)));
+    let a = func.create_value(f32x4.clone(), HirValueKind::Instruction);
+    let b = func.create_value(f32x4.clone(), HirValueKind::Instruction);
+    let c = func.create_value(f32x4.clone(), HirValueKind::Instruction);
+    let r = func.create_value(f32x4.clone(), HirValueKind::Instruction);
+
+    let entry = func.entry_block;
+    let blk = func.blocks.get_mut(&entry).unwrap();
+    for (result, scalar) in [(a, c1), (b, c2), (c, c3)] {
+        blk.instructions.push(HirInstruction::VectorSplat {
+            result,
+            ty: f32x4.clone(),
+            scalar,
+        });
+    }
+    blk.instructions.push(HirInstruction::Call {
+        result: Some(r),
+        callee: HirCallable::Intrinsic(Intrinsic::Fma),
+        args: vec![a, b, c],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    blk.terminator = HirTerminator::Return { values: vec![r] };
+
+    let module = WasmBackend::new()
+        .compile_function(&func)
+        .expect("wasm compile");
+    let wat = wasmprinter::print_bytes(&module.bytes).expect("print wat");
+    eprintln!("\n===== VectorFma WAT =====\n{wat}");
+
+    assert!(
+        wat.contains("f32x4.relaxed_madd"),
+        "wasm missing the fused madd opcode:\n{wat}"
+    );
+}
 
 fn sig_i32() -> HirFunctionSignature {
     HirFunctionSignature {

@@ -2275,10 +2275,24 @@ impl HirInterpreter {
                     pc += 1;
                 }
                 Op::FMulAdd { dst, a, b, c } => {
-                    let av = freg_f64(&regs[*a as usize])?;
-                    let bv = freg_f64(&regs[*b as usize])?;
-                    let cv = freg_f64(&regs[*c as usize])?;
-                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], av.mul_add(bv, cv));
+                    // Vector operands (Array of lanes) fuse element-wise;
+                    // scalars fuse once. Lane width is preserved.
+                    if let ZyntaxValue::Array(_) = &regs[*a as usize] {
+                        let av = as_vector(&regs[*a as usize])?;
+                        let bv = as_vector(&regs[*b as usize])?;
+                        let cv = as_vector(&regs[*c as usize])?;
+                        let n = av.len().min(bv.len()).min(cv.len());
+                        let out: Vec<ZyntaxValue> = (0..n)
+                            .map(|i| lane_mul_add(&av[i], &bv[i], &cv[i]))
+                            .collect::<Result<_, _>>()?;
+                        regs[*dst as usize] = ZyntaxValue::Array(out);
+                    } else {
+                        let av = freg_f64(&regs[*a as usize])?;
+                        let bv = freg_f64(&regs[*b as usize])?;
+                        let cv = freg_f64(&regs[*c as usize])?;
+                        regs[*dst as usize] =
+                            fval(&cf.reg_types[*dst as usize], av.mul_add(bv, cv));
+                    }
                     pc += 1;
                 }
                 Op::ICmpEq { dst, lhs, rhs } => {
@@ -2944,6 +2958,22 @@ fn hir_ty_of_value(v: &ZyntaxValue) -> HirType {
         ZyntaxValue::Float(_) => HirType::F64,
         _ => HirType::I64,
     }
+}
+
+/// Fused multiply-add on one vector lane triple: `a * b + c`, preserving
+/// the lane element width (F32 lanes stay F32). Matches the width
+/// convention of `apply_lane_binop` (compute in f64, round to the lane
+/// type), so mixed vector arithmetic and FMA agree lane-for-lane.
+fn lane_mul_add(
+    a: &ZyntaxValue,
+    b: &ZyntaxValue,
+    c: &ZyntaxValue,
+) -> Result<ZyntaxValue, InterpError> {
+    let r = freg_f64(a)?.mul_add(freg_f64(b)?, freg_f64(c)?);
+    Ok(match a {
+        ZyntaxValue::F32(_) => ZyntaxValue::F32(r as f32),
+        _ => ZyntaxValue::Float(r),
+    })
 }
 
 /// Apply a binary op to one lane pair, preserving the left lane's element
