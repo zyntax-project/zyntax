@@ -136,6 +136,102 @@ fn llvm_vector_dot_emits_sdot_intrinsic() {
     }
 }
 
+/// On an x86_64 host with AVX-VNNI / AVX512-VNNI, the quantised
+/// `VectorDot` (with the unsigned-RHS `rhs_i7` contract) must select the
+/// `@llvm.x86.avx512.vpdpbusd.128` intrinsic, which the x86 selector
+/// lowers to a `vpdpbusd` machine instruction (VEX on AVX-VNNI parts,
+/// EVEX where AVX512-VNNI is present) — not the portable widening chain.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn llvm_vector_dot_emits_vpdpbusd_on_vnni() {
+    if !(std::arch::is_x86_feature_detected!("avxvnni")
+        || std::arch::is_x86_feature_detected!("avx512vnni"))
+    {
+        eprintln!("host lacks AVX-VNNI/AVX512-VNNI — skipping vpdpbusd assertion");
+        return;
+    }
+    let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
+    let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
+    let mk = |n: &str, t: &HirType| HirParam {
+        id: HirId::new(),
+        name: InternedString::new_global(n),
+        ty: t.clone(),
+        attributes: ParamAttributes::default(),
+    };
+    let sig = HirFunctionSignature {
+        params: vec![mk("acc", &i32x4), mk("a", &i8x16), mk("b", &i8x16)],
+        returns: vec![i32x4.clone()],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let mut func = HirFunction::new(InternedString::new_global("vdot"), sig);
+    func.calling_convention = CallingConvention::C;
+    let acc = func.create_value(i32x4.clone(), HirValueKind::Parameter(0));
+    let a = func.create_value(i8x16.clone(), HirValueKind::Parameter(1));
+    let b = func.create_value(i8x16.clone(), HirValueKind::Parameter(2));
+    let r = func.create_value(i32x4.clone(), HirValueKind::Instruction);
+
+    let entry = func.entry_block;
+    let blk = func.blocks.get_mut(&entry).unwrap();
+    blk.instructions.push(HirInstruction::VectorDot {
+        result: r,
+        acc,
+        a,
+        b,
+        rhs_i7: true,
+        rhs_unsigned: false,
+    });
+    blk.terminator = HirTerminator::Return { values: vec![r] };
+
+    let mut module = HirModule::new(InternedString::new_global("m"));
+    module.functions.insert(func.id, func);
+
+    let context = Context::create();
+    let mut backend = LLVMBackend::new(&context, "vnni_verify");
+    let ir = backend.compile_module(&module).expect("LLVM compile");
+    eprintln!("\n===== VectorDot (VNNI) LLVM IR =====\n{ir}");
+    assert!(
+        ir.contains("llvm.x86.avx512.vpdpbusd.128"),
+        "LLVM IR missing the x86 vpdpbusd intrinsic:\n{ir}"
+    );
+
+    use inkwell::targets::{
+        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    };
+    use inkwell::OptimizationLevel;
+    Target::initialize_native(&InitializationConfig::default()).expect("init native target");
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple).expect("target from triple");
+    let tm = target
+        .create_target_machine(
+            &triple,
+            TargetMachine::get_host_cpu_name().to_str().unwrap(),
+            TargetMachine::get_host_cpu_features().to_str().unwrap(),
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .expect("target machine");
+    let m = backend.module();
+    m.set_triple(&triple);
+    m.set_data_layout(&tm.get_target_data().get_data_layout());
+    let asm = tm
+        .write_to_memory_buffer(m, FileType::Assembly)
+        .map(|buf| String::from_utf8_lossy(buf.as_slice()).to_string())
+        .expect("emit native asm");
+    eprintln!("\n===== VectorDot (VNNI) native asm =====\n{asm}");
+    assert!(
+        asm.contains("vpdpbusd"),
+        "native asm missing the vpdpbusd instruction:\n{asm}"
+    );
+}
+
 /// A float-lane vector fused multiply-add must select the overloaded
 /// vector fma intrinsic (`@llvm.fma.v4f32`) — which the AArch64 selector
 /// lowers to an `fmla` machine instruction — not a separate mul + add.

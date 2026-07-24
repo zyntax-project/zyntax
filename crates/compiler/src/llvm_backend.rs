@@ -2685,17 +2685,25 @@ impl<'ctx> LLVMBackend<'ctx> {
                 acc,
                 a,
                 b,
+                rhs_i7,
                 rhs_unsigned,
-                ..
             } => {
                 let acc_v = self.get_value(*acc)?;
                 let a_v = self.get_value(*a)?;
                 let b_v = self.get_value(*b)?;
-                let i32x4 = self.context.i32_type().vec_type(4);
-                let i8x16 = self.context.i8_type().vec_type(16);
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = rhs_i7;
+
+                // AArch64 → one SDOT/UDOT. x86_64 with AVX-VNNI / AVX512-
+                // VNNI → one VPDPBUSD when the op authorizes the unsigned-
+                // RHS form (`rhs_i7`/`rhs_unsigned`). Otherwise the
+                // portable widening fallback. On a JIT the host feature
+                // probe is exact; a portable AOT object would instead gate
+                // on the target-machine features.
                 #[cfg(target_arch = "aarch64")]
-                {
-                    // The AArch64 NEON dot-product intrinsic — one SDOT/UDOT.
+                let dot = {
+                    let i32x4 = self.context.i32_type().vec_type(4);
+                    let i8x16 = self.context.i8_type().vec_type(16);
                     let name = if *rhs_unsigned {
                         "llvm.aarch64.neon.udot.v4i32.v16i8"
                     } else {
@@ -2705,54 +2713,21 @@ impl<'ctx> LLVMBackend<'ctx> {
                         let ft = i32x4.fn_type(&[i32x4.into(), i8x16.into(), i8x16.into()], false);
                         self.module.add_function(name, ft, None)
                     });
-                    let r = self.call_basic(f, &[acc_v.into(), a_v.into(), b_v.into()], "sdot")?;
-                    self.value_map.insert(*result, r);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
+                    self.call_basic(f, &[acc_v.into(), a_v.into(), b_v.into()], "sdot")?
+                };
+                #[cfg(target_arch = "x86_64")]
+                let dot = if (*rhs_i7 || *rhs_unsigned)
+                    && (std::arch::is_x86_feature_detected!("avxvnni")
+                        || std::arch::is_x86_feature_detected!("avx512vnni"))
                 {
-                    // Portable fallback: widen each i8 lane to i32, multiply,
-                    // then sum consecutive groups of 4 into the 4 output lanes.
-                    let i32ty = self.context.i32_type();
-                    let av = a_v.into_vector_value();
-                    let bv = b_v.into_vector_value();
-                    let mut out = acc_v.into_vector_value();
-                    for j in 0..4u32 {
-                        let mut lane = self
-                            .builder
-                            .build_extract_element(out, i32ty.const_int(j as u64, false), "acc_j")?
-                            .into_int_value();
-                        for k in 0..4u32 {
-                            let idx = i32ty.const_int((4 * j + k) as u64, false);
-                            let ai = self
-                                .builder
-                                .build_extract_element(av, idx, "ai")?
-                                .into_int_value();
-                            let bi = self
-                                .builder
-                                .build_extract_element(bv, idx, "bi")?
-                                .into_int_value();
-                            let aw = if *rhs_unsigned {
-                                self.builder.build_int_z_extend(ai, i32ty, "aw")?
-                            } else {
-                                self.builder.build_int_s_extend(ai, i32ty, "aw")?
-                            };
-                            let bw = if *rhs_unsigned {
-                                self.builder.build_int_z_extend(bi, i32ty, "bw")?
-                            } else {
-                                self.builder.build_int_s_extend(bi, i32ty, "bw")?
-                            };
-                            let prod = self.builder.build_int_mul(aw, bw, "prod")?;
-                            lane = self.builder.build_int_add(lane, prod, "acc")?;
-                        }
-                        out = self.builder.build_insert_element(
-                            out,
-                            lane,
-                            i32ty.const_int(j as u64, false),
-                            "outj",
-                        )?;
-                    }
-                    self.value_map.insert(*result, out.into());
-                }
+                    self.emit_x86_vpdpbusd(acc_v, a_v, b_v)?
+                } else {
+                    self.emit_portable_dot(acc_v, a_v, b_v, *rhs_unsigned)?
+                };
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                let dot = self.emit_portable_dot(acc_v, a_v, b_v, *rhs_unsigned)?;
+
+                self.value_map.insert(*result, dot);
             }
             _ => {
                 return Err(CompilerError::CodeGen(format!(
@@ -2762,6 +2737,90 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
         Ok(())
+    }
+
+    /// Portable widening dot-accumulate: sext/zext each `i8` lane to
+    /// `i32`, multiply, and sum consecutive groups of four into the four
+    /// `i32x4` output lanes, added to `acc`. The fallback for targets
+    /// without a fused dot instruction.
+    #[cfg(not(target_arch = "aarch64"))]
+    fn emit_portable_dot(
+        &self,
+        acc_v: BasicValueEnum<'ctx>,
+        a_v: BasicValueEnum<'ctx>,
+        b_v: BasicValueEnum<'ctx>,
+        rhs_unsigned: bool,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let i32ty = self.context.i32_type();
+        let av = a_v.into_vector_value();
+        let bv = b_v.into_vector_value();
+        let mut out = acc_v.into_vector_value();
+        for j in 0..4u32 {
+            let mut lane = self
+                .builder
+                .build_extract_element(out, i32ty.const_int(j as u64, false), "acc_j")?
+                .into_int_value();
+            for k in 0..4u32 {
+                let idx = i32ty.const_int((4 * j + k) as u64, false);
+                let ai = self
+                    .builder
+                    .build_extract_element(av, idx, "ai")?
+                    .into_int_value();
+                let bi = self
+                    .builder
+                    .build_extract_element(bv, idx, "bi")?
+                    .into_int_value();
+                let aw = if rhs_unsigned {
+                    self.builder.build_int_z_extend(ai, i32ty, "aw")?
+                } else {
+                    self.builder.build_int_s_extend(ai, i32ty, "aw")?
+                };
+                let bw = if rhs_unsigned {
+                    self.builder.build_int_z_extend(bi, i32ty, "bw")?
+                } else {
+                    self.builder.build_int_s_extend(bi, i32ty, "bw")?
+                };
+                let prod = self.builder.build_int_mul(aw, bw, "prod")?;
+                lane = self.builder.build_int_add(lane, prod, "acc")?;
+            }
+            out = self.builder.build_insert_element(
+                out,
+                lane,
+                i32ty.const_int(j as u64, false),
+                "outj",
+            )?;
+        }
+        Ok(out.into())
+    }
+
+    /// x86 VNNI fused dot-accumulate via `@llvm.x86.avx512.vpdpbusd.128`:
+    /// `acc += dot(u8 lanes, i8 lanes)`, grouped 16→4. The intrinsic's
+    /// first operand slot is unsigned and the second signed — the op's
+    /// `b` (the `rhs_i7`/`rhs_unsigned` operand) goes in the unsigned
+    /// slot, `a` in the signed slot. The `i8x16` inputs are bit-cast to
+    /// the intrinsic's `i32x4` operand type (a no-op reinterpret). LLVM
+    /// selects the VEX (AVX-VNNI) or EVEX (AVX512-VNNI) encoding from the
+    /// target-machine features.
+    #[cfg(target_arch = "x86_64")]
+    fn emit_x86_vpdpbusd(
+        &self,
+        acc_v: BasicValueEnum<'ctx>,
+        a_v: BasicValueEnum<'ctx>,
+        b_v: BasicValueEnum<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let i32x4 = self.context.i32_type().vec_type(4);
+        let name = "llvm.x86.avx512.vpdpbusd.128";
+        let f = self.module.get_function(name).unwrap_or_else(|| {
+            let ft = i32x4.fn_type(&[i32x4.into(), i32x4.into(), i32x4.into()], false);
+            self.module.add_function(name, ft, None)
+        });
+        let a_i32 = self
+            .builder
+            .build_bit_cast(a_v.into_vector_value(), i32x4, "vnni_a")?;
+        let b_i32 = self
+            .builder
+            .build_bit_cast(b_v.into_vector_value(), i32x4, "vnni_b")?;
+        self.call_basic(f, &[acc_v.into(), b_i32.into(), a_i32.into()], "vpdpbusd")
     }
 
     /// Compile a binary operation
