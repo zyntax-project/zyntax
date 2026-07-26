@@ -3545,6 +3545,106 @@ fn test_vector_dot_i8x16_executes() {
     assert_eq!(got, 136, "VectorDot([1..16]·[1;16]) reduce mismatch");
 }
 
+/// On an x86_64 host with AVX-VNNI, a `VectorDot` with `rhs_unsigned` (b
+/// zero-extended — the u8×i8 form) folds to a single `vpdpbusd` through the
+/// Cranelift tier: the x64 analogue of the aarch64 `sdot` fold. Proves
+/// Zyntax's quantized dot reaches the fused instruction on VNNI hardware.
+///
+/// Ignored by default: the fold requires a Cranelift build whose x64 backend
+/// lowers the widening-dot tree to `vpdpbusd`, which the pinned release does
+/// not yet carry. Against a stock Cranelift the tree lowers to the portable
+/// widening chain (still correct, just not fused), so the disasm assert would
+/// not hold. Un-ignore once the pinned Cranelift gains the VNNI lowering.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires a Cranelift build with x64 AVX-VNNI (vpdpbusd) lowering"]
+fn test_vector_dot_i8x16_vpdpbusd() {
+    let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
+    let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
+    let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
+    // Opaque operands (loaded from params) — constant splats would fold the
+    // `imul(swiden, uwiden)` subtree away before lowering ever sees the pattern.
+    let sig = HirFunctionSignature {
+        params: vec![
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("a"),
+                ty: ptr_i8(),
+                attributes: ParamAttributes::default(),
+            },
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("b"),
+                ty: ptr_i8(),
+                attributes: ParamAttributes::default(),
+            },
+        ],
+        returns: vec![i32x4.clone()],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let mut func = HirFunction::new(create_test_string("vdot_vnni"), sig);
+    func.calling_convention = CallingConvention::C;
+    let a_ptr = func.create_value(ptr_i8(), HirValueKind::Parameter(0));
+    let b_ptr = func.create_value(ptr_i8(), HirValueKind::Parameter(1));
+    let zero = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(0)));
+    let av = func.create_value(i8x16.clone(), HirValueKind::Instruction);
+    let bv = func.create_value(i8x16.clone(), HirValueKind::Instruction);
+    let acc = func.create_value(i32x4.clone(), HirValueKind::Instruction);
+    let dot = func.create_value(i32x4.clone(), HirValueKind::Instruction);
+    let entry = func.entry_block;
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::VectorLoad {
+        result: av,
+        ty: i8x16.clone(),
+        ptr: a_ptr,
+        align: 1,
+    });
+    block.add_instruction(HirInstruction::VectorLoad {
+        result: bv,
+        ty: i8x16.clone(),
+        ptr: b_ptr,
+        align: 1,
+    });
+    block.add_instruction(HirInstruction::VectorSplat {
+        result: acc,
+        ty: i32x4.clone(),
+        scalar: zero,
+    });
+    block.add_instruction(HirInstruction::VectorDot {
+        result: dot,
+        acc,
+        a: av,
+        b: bv,
+        rhs_i7: false,
+        rhs_unsigned: true,
+    });
+    block.set_terminator(HirTerminator::Return { values: vec![dot] });
+
+    let mut backend = CraneliftBackend::new().expect("backend");
+    backend.set_capture_ir(true);
+    backend
+        .compile_function(func.id, &func)
+        .expect("VectorDot(rhs_unsigned) should compile");
+    let (_clif, disasm) = backend.take_captured_ir().expect("captured IR");
+    let d = disasm.unwrap_or_default();
+    eprintln!("\n===== VectorDot(rhs_unsigned) disasm =====\n{d}");
+    if std::arch::is_x86_feature_detected!("avxvnni")
+        || std::arch::is_x86_feature_detected!("avx512vnni")
+    {
+        assert!(
+            d.contains("vpdpbusd"),
+            "expected a fused `vpdpbusd` on an AVX-VNNI host:\n{d}"
+        );
+    }
+}
+
 /// Execution: VectorStore stores 4 floats to memory, verify they are written.
 /// fn(ptr: *mut f32, scalar: f32) -> f32: splat(scalar) → vstore to ptr → return scalar
 #[test]
