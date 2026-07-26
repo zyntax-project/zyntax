@@ -2284,6 +2284,102 @@ impl SsaBuilder {
                 return Ok(cont_id);
             }
 
+            // `while` in expression position, built on demand.
+            //
+            // `TypedCfgBuilder::split_at_control_flow` performs the
+            // multi-block split for statements it walks, but it only walks
+            // function bodies — statements nested inside a value-position
+            // `TypedExpression::Block` (closure bodies, block expressions)
+            // never reach it. This arm builds the same three-block shape
+            // directly, mirroring the `If` arm above:
+            //
+            //     block_id ──► header ──cond──► body ──┐
+            //                    │  ▲                  │
+            //                    │  └──── back-edge ───┘
+            //                    └──!cond──► exit  (returned as the new current)
+            //
+            // The condition is translated into `header`, not `block_id`, so
+            // it is re-evaluated on every iteration.
+            //
+            // Loop-carried state must live behind memory the body reaches by
+            // call (signals, cells). Block-local SSA variables mutated across
+            // iterations would need phi nodes at the header, which this path
+            // does not insert — it seals all three blocks up front.
+            TypedStatement::While(while_stmt) => {
+                let header_id = HirId::new();
+                let body_id = HirId::new();
+                let exit_id = HirId::new();
+                for id in [header_id, body_id, exit_id] {
+                    self.function
+                        .blocks
+                        .insert(id, crate::hir::HirBlock::new(id));
+                    self.sealed_blocks.insert(id);
+                }
+                let inherited = self.definitions.get(&block_id).cloned().unwrap_or_default();
+                self.definitions.insert(header_id, inherited.clone());
+                self.definitions.insert(body_id, inherited.clone());
+                self.definitions.insert(exit_id, inherited);
+
+                // Fall through from the current block into the header.
+                {
+                    let blk = self.function.blocks.get_mut(&block_id).unwrap();
+                    blk.terminator = HirTerminator::Branch { target: header_id };
+                    blk.successors = vec![header_id];
+                }
+                self.function
+                    .blocks
+                    .get_mut(&header_id)
+                    .unwrap()
+                    .predecessors
+                    .push(block_id);
+
+                // Condition lives in the header so it re-runs per iteration.
+                let cond_val = self.translate_expression(header_id, &while_stmt.condition)?;
+                {
+                    let blk = self.function.blocks.get_mut(&header_id).unwrap();
+                    blk.terminator = HirTerminator::CondBranch {
+                        condition: cond_val,
+                        true_target: body_id,
+                        false_target: exit_id,
+                    };
+                    blk.successors = vec![body_id, exit_id];
+                }
+                self.function
+                    .blocks
+                    .get_mut(&body_id)
+                    .unwrap()
+                    .predecessors
+                    .push(header_id);
+                self.function
+                    .blocks
+                    .get_mut(&exit_id)
+                    .unwrap()
+                    .predecessors
+                    .push(header_id);
+
+                // Body statements, then the back-edge (unless the body
+                // already terminated, e.g. via `return`).
+                let mut body_tail = body_id;
+                for inner in &while_stmt.body.statements {
+                    body_tail = self.process_statement(body_tail, inner)?;
+                }
+                {
+                    let blk = self.function.blocks.get_mut(&body_tail).unwrap();
+                    if matches!(blk.terminator, HirTerminator::Unreachable) {
+                        blk.terminator = HirTerminator::Branch { target: header_id };
+                        blk.successors = vec![header_id];
+                    }
+                }
+                self.function
+                    .blocks
+                    .get_mut(&header_id)
+                    .unwrap()
+                    .predecessors
+                    .push(body_tail);
+
+                return Ok(exit_id);
+            }
+
             // Note: Control flow statements (While, etc.) are now handled at the
             // TypedCFG level by TypedCfgBuilder.split_at_control_flow()
             // This is the solution to Gap 2 - multi-block CFG construction
@@ -6247,6 +6343,21 @@ impl SsaBuilder {
                     if let Some(cont) = self.continuation_block.take() {
                         current = cont;
                     }
+                }
+                // A control-flow statement in this body carves its own
+                // blocks and hands back a continuation, so `current` may no
+                // longer be `block_id` — the block this expression started
+                // in now ends in a CondBranch/Branch, and the trailing value
+                // lives in `current`.
+                //
+                // Report that through `continuation_block`, the same channel
+                // control-flow *expressions* use. Callers that attach a
+                // terminator after evaluating an expression (the `Return`
+                // arms, for instance) consult it and terminate the block
+                // where evaluation actually ended, leaving the branch
+                // terminators this body installed intact.
+                if current != block_id {
+                    self.continuation_block = Some(current);
                 }
                 Ok(last_val)
             }
