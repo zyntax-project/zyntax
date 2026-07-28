@@ -19,6 +19,7 @@
 //! - Type information preserved for optimization opportunities
 //! - Memory safety validated before code generation
 
+pub mod affine_loop; // Closed-form affine reduction loops (acc += invariant over a counted loop)
 pub mod aggregate_split; // Replace struct round-trips with direct field Load/Store (HIR-level SROA)
 pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
 pub mod analysis;
@@ -1687,6 +1688,7 @@ pub struct InterpOptStats {
     pub aggregate_split: aggregate_split::AggregateSplitStats,
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub licm: licm::LicmStats,
+    pub affine_loop: affine_loop::AffineLoopStats,
     pub inline: inline::InlineStats,
     pub loop_vectorize: loop_vectorize::VectorizeStats,
     pub reduction_vectorize: reduction_vectorize::ReductionStats,
@@ -1882,6 +1884,34 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
             break;
         }
     }
+
+    // Affine reduction-loop closed-forming runs ONCE after the
+    // fixed-point sweep, before the vectorizers. Ordering rationale:
+    //   * After the sweep: it needs const_fold to have propagated
+    //     loop-invariant constants (e.g. `factor → 1.0`) into the
+    //     recurrence, cse/inline to have settled (the free-function
+    //     kernel's `step()` call is inlined into the body first), and
+    //     fma_contract to have canonicalised `a*1 + b` into the single
+    //     `Fma(acc, one, b)` form the recogniser matches. Running it
+    //     earlier would see a half-canonicalised body and bail.
+    //   * Before auto_vectorize: an affine accumulator is a serial,
+    //     loop-carried recurrence — not vectorizable — so closing it to
+    //     its constant closed form is strictly better than handing the
+    //     loop to the vectorizer, and removing the loop first keeps the
+    //     vectorizer from wasting a pass on it.
+    // The transform fires only when every input is a compile-time
+    // constant and (for floats) the closed form is provably bit-exact,
+    // so it introduces no rounding the serial loop wouldn't also
+    // produce. See `affine_loop` module docs for the soundness proof.
+    let al = affine_loop::run_module(module);
+    stats.affine_loop.folded += al.folded;
+    stats.affine_loop.loops_visited += al.loops_visited;
+    stats.affine_loop.skipped_shape += al.skipped_shape;
+    stats.affine_loop.skipped_no_preheader += al.skipped_no_preheader;
+    stats.affine_loop.skipped_unrecognized_body += al.skipped_unrecognized_body;
+    stats.affine_loop.skipped_trip_count += al.skipped_trip_count;
+    stats.affine_loop.skipped_recurrence += al.skipped_recurrence;
+    stats.affine_loop.skipped_float_inexact += al.skipped_float_inexact;
 
     // auto_vectorize runs ONCE after the fixed-point sweep terminates.
     // Vectorization is not fixed-point-monotonic — vector instructions
