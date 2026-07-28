@@ -17,13 +17,13 @@ zyntax_compiler  = { path = "../../compiler", default-features = false }
 # 1051689 (krio-fiber Windows port + CI infrastructure; no changes
 # to the krio-async / krio-stackless / krio-core APIs zyntax uses).
 # Bump the rev when newer krio fixes / features land.
-krio-async     = { git = "https://github.com/darmie/krio.git", package = "krio-async",     rev = "1051689" }
-krio-stackless = { git = "https://github.com/darmie/krio.git", package = "krio-stackless", rev = "1051689" }
-krio-core      = { git = "https://github.com/darmie/krio.git", package = "krio-core",      rev = "1051689" }
+krio-async     = { git = "https://github.com/darmie/krio.git", package = "krio-async",     rev = "9466253" }
+krio-stackless = { git = "https://github.com/darmie/krio.git", package = "krio-stackless", rev = "9466253" }
+krio-core      = { git = "https://github.com/darmie/krio.git", package = "krio-core",      rev = "9466253" }
 # Stackful fibers (per-fiber mmap stack + arch-specific context
 # switch). Drives the default `FiberCfg` impl for first-class fiber
 # HIR ops on native targets.
-krio-fiber     = { git = "https://github.com/darmie/krio.git", package = "krio-fiber",     rev = "1051689" }
+krio-fiber     = { git = "https://github.com/darmie/krio.git", package = "krio-fiber",     rev = "9466253" }
 
 log = "0.4"
 indexmap = "2"

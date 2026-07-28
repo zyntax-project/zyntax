@@ -1780,6 +1780,11 @@ pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolI
 /// emit `Call::Symbol("krio_fiber_*")` and link cleanly; the panic
 /// fires only if a fiber op actually executes before the real
 /// backend lands.
+///
+/// Native-only: it registers symbols on the native `ZyntaxRuntime`
+/// (`crate::runtime`, gated behind `native`); the wasm/parse-only build
+/// never constructs that runtime.
+#[cfg(feature = "native")]
 pub fn register_fiber_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
     let infos = fiber_runtime_symbol_infos();
     for info in &infos {
