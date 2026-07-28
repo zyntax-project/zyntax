@@ -844,6 +844,34 @@ impl<'a, D: DiagnosticDisplay> fmt::Display for DisplayWrapper<'a, D> {
     }
 }
 
+/// Render one diagnostic against one file, as a snippet box.
+///
+/// The full machinery wants a [`SourceMap`] and a [`DiagnosticDisplay`],
+/// which is more than a caller holding a single file and a single error
+/// needs. Front ends that parse one file at a time -- a `.blinc`
+/// reload, a REPL line, a language server's `didSave` -- reach for this
+/// instead of assembling both.
+///
+/// `use_colors` should be false when the output goes anywhere but a
+/// terminal: a log file, a UI label, a test assertion.
+pub fn render_diagnostic(
+    diagnostic: &Diagnostic,
+    filename: &str,
+    source: &str,
+    use_colors: bool,
+) -> String {
+    let mut source_map = SourceMap::new();
+    source_map.add_file(filename.to_string(), source.to_string());
+    format!(
+        "{}",
+        DisplayWrapper {
+            diagnostic,
+            display: &AriadneDiagnosticDisplay { use_colors },
+            source_map: &source_map,
+        }
+    )
+}
+
 /// Extension trait for integrating diagnostics with compiler phases
 pub trait WithDiagnostics {
     /// Run with diagnostic collection

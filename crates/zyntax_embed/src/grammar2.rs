@@ -38,8 +38,73 @@ pub enum Grammar2Error {
     #[error("Failed to parse source: {0}")]
     SourceParseError(String),
 
+    /// A parse failure with the source it came from, so a front end can
+    /// render it as a snippet instead of a coordinate pair.
+    ///
+    /// `Display` still produces the one-line form every existing caller
+    /// logs. [`Grammar2Error::render`] produces the snippet.
+    #[error("{file}:{line}:{column}: expected {}", expected.join(" or "))]
+    SourceParse {
+        file: String,
+        source_text: String,
+        /// Byte offset of the failure, for the annotation span.
+        offset: usize,
+        line: usize,
+        column: usize,
+        expected: Vec<String>,
+    },
+
     #[error("Unexpected parse result: expected TypedProgram")]
     UnexpectedResult,
+}
+
+impl Grammar2Error {
+    /// Render as a source snippet with the failure underlined, or
+    /// `None` for errors that carry no source to point at.
+    ///
+    /// `use_colors` should be false for anything but a terminal.
+    pub fn render(&self, use_colors: bool) -> Option<String> {
+        let Self::SourceParse {
+            file,
+            source_text,
+            offset,
+            expected,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        // The failure is a point, not a range. Underline the token that
+        // starts there so the caret has something to sit under.
+        let end = source_text[*offset..]
+            .find(|c: char| c.is_whitespace())
+            .map(|n| offset + n.max(1))
+            .unwrap_or(source_text.len())
+            .min(source_text.len());
+        // "end of input" is the outermost rule's expectation, which is
+        // what a PEG reports when nothing matched here at all. Said
+        // plainly it reads as nonsense, so translate it.
+        let stopped_cold = expected.iter().all(|e| e == "end of input");
+        let label = if stopped_cold {
+            "the parser stopped here".to_string()
+        } else {
+            format!("expected {}", expected.join(" or "))
+        };
+        let mut diagnostic = zyntax_typed_ast::diagnostics::Diagnostic::error("unexpected syntax")
+            .with_primary(Span::new(*offset, end), label);
+        if stopped_cold {
+            diagnostic = diagnostic.with_help(
+                "nothing from here on matched a known form — \
+                 look for an unclosed delimiter or a missing `=`",
+            );
+        }
+        Some(zyntax_typed_ast::diagnostics::render_diagnostic(
+            &diagnostic,
+            file,
+            source_text,
+            use_colors,
+        ))
+    }
 }
 
 /// Result type for grammar operations
@@ -151,10 +216,14 @@ impl Grammar2 {
                     );
                     Err(Grammar2Error::UnexpectedResult)
                 }
-                ParseResult::Failure(e) => Err(Grammar2Error::SourceParseError(format!(
-                    "Parse error at {}:{}: expected {:?}",
-                    e.line, e.column, e.expected
-                ))),
+                ParseResult::Failure(e) => Err(Grammar2Error::SourceParse {
+                    file: filename_owned.clone(),
+                    source_text: source_owned.clone(),
+                    offset: e.pos.min(source_owned.len()),
+                    line: e.line,
+                    column: e.column,
+                    expected: e.expected.clone(),
+                }),
             }
         };
 
