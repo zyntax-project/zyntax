@@ -330,7 +330,31 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
             .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
     };
 
+    // Deserialization rebuilds every HirId via `from_raw`, leaving the
+    // global id counter untouched. If this process later mints ids with
+    // `HirId::new()` (e.g. an optimization pass run on the loaded module)
+    // they must not collide with the ids already present, or a new value
+    // would overwrite a deserialized one in its id-keyed map. Advance the
+    // counter past the module's maximum id.
+    advance_hir_id_counter(&module);
+
     Ok(module)
+}
+
+/// Bump the global `HirId` counter above every id defined in `module`
+/// (function ids, value ids, block ids). See [`HirId::ensure_counter_above`].
+fn advance_hir_id_counter(module: &HirModule) {
+    let mut max_id = 0u32;
+    for func in module.functions.values() {
+        max_id = max_id.max(func.id.as_u32());
+        for id in func.values.keys() {
+            max_id = max_id.max(id.as_u32());
+        }
+        for id in func.blocks.keys() {
+            max_id = max_id.max(id.as_u32());
+        }
+    }
+    crate::hir::HirId::ensure_counter_above(max_id);
 }
 
 /// Deserialize a HIR module from a reader
@@ -429,6 +453,57 @@ mod tests {
 
         assert_eq!(module.name, deserialized.name);
         assert_eq!(module.version, deserialized.version);
+    }
+
+    #[test]
+    fn deserialize_advances_hir_id_counter() {
+        // Regression: deserialize rebuilds ids via `from_raw` without
+        // touching the global counter. If the counter isn't advanced, a
+        // later `HirId::new()` can collide with a loaded id and overwrite
+        // it in the values map — the fib bench-cache crash, where a new
+        // instruction result reused a parameter's id and dropped the
+        // parameter. After loading, the next minted id must be past the
+        // module's maximum id.
+        let mut module = create_test_module();
+        let base = HirId::new().as_u32();
+        let big = base + 100_000;
+
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let fname = arena.intern_string("f");
+        let sig = HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(fname, sig);
+        func.id = HirId::from_raw(big);
+        func.values.insert(
+            HirId::from_raw(big),
+            HirValue {
+                id: HirId::from_raw(big),
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
+        module.functions.insert(func.id, func);
+
+        let bytes = serialize_module(&module, Format::Postcard).unwrap();
+        let _ = deserialize_module(&bytes).unwrap();
+
+        let next = HirId::new().as_u32();
+        assert!(
+            next > big,
+            "deserialize must advance the id counter past the module max ({big}); got {next}"
+        );
     }
 
     #[test]

@@ -207,6 +207,19 @@ impl HirId {
         HirId(raw)
     }
 
+    /// Advance the global id counter so it is strictly greater than
+    /// `raw`. Deserialization rebuilds ids via [`Self::from_raw`] without
+    /// touching the counter; a subsequent [`Self::new`] could then hand
+    /// back an id already present in the loaded module and, when inserted
+    /// into a value/block map keyed by id, silently overwrite the
+    /// existing entry (e.g. a pass minting a new value with the same id
+    /// as a function parameter, dropping the parameter). Callers that
+    /// load a module from bytes must call this with the module's maximum
+    /// id to keep freshly minted ids collision-free.
+    pub fn ensure_counter_above(raw: u32) {
+        HIR_ID_COUNTER.fetch_max(raw.saturating_add(1), Ordering::Relaxed);
+    }
+
     /// Get the underlying u32.
     pub fn as_u32(self) -> u32 {
         self.0
