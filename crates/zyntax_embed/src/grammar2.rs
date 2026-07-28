@@ -58,6 +58,35 @@ pub enum Grammar2Error {
     UnexpectedResult,
 }
 
+/// How many alternatives to name before giving up on the list.
+///
+/// A PEG at a failed position has tried every branch that could start
+/// there, and a grammar with an expression precedence chain offers
+/// dozens. Past a handful the list stops being a hint and becomes a
+/// wall.
+const MAX_EXPECTED_SHOWN: usize = 6;
+
+/// Turn the parser's raw expectation list into something a user can act
+/// on: drop the bookkeeping, dedupe, and cap the length.
+fn readable_expectations(expected: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    expected
+        .iter()
+        // Internal bookkeeping, not grammar the user wrote: a packrat
+        // cache hit and a repetition-count failure describe how the
+        // parser works, not what belongs here.
+        .filter(|e| {
+            !e.starts_with("memoized")
+                && !e.starts_with("expected at least")
+                && e.as_str() != "end of input"
+                && e.as_str() != "any character"
+        })
+        .filter(|e| seen.insert(e.as_str()))
+        .take(MAX_EXPECTED_SHOWN)
+        .cloned()
+        .collect()
+}
+
 impl Grammar2Error {
     /// Render as a source snippet with the failure underlined, or
     /// `None` for errors that carry no source to point at.
@@ -74,29 +103,57 @@ impl Grammar2Error {
         else {
             return None;
         };
-        // The failure is a point, not a range. Underline the token that
-        // starts there so the caret has something to sit under.
-        let end = source_text[*offset..]
-            .find(|c: char| c.is_whitespace())
-            .map(|n| offset + n.max(1))
-            .unwrap_or(source_text.len())
-            .min(source_text.len());
-        // "end of input" is the outermost rule's expectation, which is
-        // what a PEG reports when nothing matched here at all. Said
-        // plainly it reads as nonsense, so translate it.
-        let stopped_cold = expected.iter().all(|e| e == "end of input");
-        let label = if stopped_cold {
-            "the parser stopped here".to_string()
+
+        // Running out of input is its own failure: the caret has
+        // nothing to sit under, so anchor it on the last thing the
+        // parser did read and say what happened.
+        let trailing_only_space = source_text[*offset..].trim().is_empty();
+        let (start, end, at_eof) = if trailing_only_space {
+            let last = source_text.trim_end().len();
+            (last.saturating_sub(1), last, true)
         } else {
-            format!("expected {}", expected.join(" or "))
+            // The failure is a point, not a range. Underline the token
+            // that starts there so the caret has something under it.
+            let token_end = source_text[*offset..]
+                .find(|c: char| c.is_whitespace())
+                .map(|n| offset + n.max(1))
+                .unwrap_or(source_text.len())
+                .min(source_text.len());
+            (*offset, token_end, false)
         };
-        let mut diagnostic = zyntax_typed_ast::diagnostics::Diagnostic::error("unexpected syntax")
-            .with_primary(Span::new(*offset, end), label);
-        if stopped_cold {
-            diagnostic = diagnostic.with_help(
-                "nothing from here on matched a known form — \
-                 look for an unclosed delimiter or a missing `=`",
+
+        let wanted = readable_expectations(expected);
+        let (message, label) = match (at_eof, wanted.is_empty()) {
+            (true, _) => ("unexpected end of input", "input ended here".to_string()),
+            // Nothing nameable left after filtering: the parser matched
+            // no branch at all here. "expected end of input", the
+            // outermost rule's expectation, is what it says raw, and
+            // that reads as nonsense.
+            (false, true) => ("unexpected syntax", "the parser stopped here".to_string()),
+            (false, false) => (
+                "unexpected syntax",
+                format!("expected {}", wanted.join(" or ")),
+            ),
+        };
+
+        let mut diagnostic = zyntax_typed_ast::diagnostics::Diagnostic::error(message)
+            .with_primary(
+                Span::new(start, end.max(start + 1).min(source_text.len().max(1))),
+                label,
             );
+        if at_eof {
+            diagnostic = diagnostic
+                .with_help("something opened earlier was never closed — check the delimiters");
+        } else if wanted.is_empty() {
+            diagnostic = diagnostic
+                .with_help("nothing from here on matched a known form — check for a typo in a keyword, or a missing delimiter");
+        }
+        let hidden = expected.len().saturating_sub(wanted.len());
+        if hidden > 0 && !wanted.is_empty() {
+            diagnostic = diagnostic.with_note(match hidden {
+                1 => "1 other alternative was possible here".to_string(),
+                n => format!("{n} other alternatives were possible here"),
+            });
         }
         Some(zyntax_typed_ast::diagnostics::render_diagnostic(
             &diagnostic,
@@ -216,14 +273,26 @@ impl Grammar2 {
                     );
                     Err(Grammar2Error::UnexpectedResult)
                 }
-                ParseResult::Failure(e) => Err(Grammar2Error::SourceParse {
-                    file: filename_owned.clone(),
-                    source_text: source_owned.clone(),
-                    offset: e.pos.min(source_owned.len()),
-                    line: e.line,
-                    column: e.column,
-                    expected: e.expected.clone(),
-                }),
+                ParseResult::Failure(e) => {
+                    // The failure that surfaces is the outermost rule
+                    // giving up, which lands at the START of the item
+                    // it couldn't consume — pointing at `component` or
+                    // `view` and reading as "the keyword isn't
+                    // recognised" when the real problem is a missing
+                    // brace three lines down. The state records how far
+                    // any attempt actually got; that is the position
+                    // worth showing.
+                    let furthest = state.furthest_error();
+                    let e = if furthest.pos > e.pos { furthest } else { e };
+                    Err(Grammar2Error::SourceParse {
+                        file: filename_owned.clone(),
+                        source_text: source_owned.clone(),
+                        offset: e.pos.min(source_owned.len()),
+                        line: e.line,
+                        column: e.column,
+                        expected: e.expected.clone(),
+                    })
+                }
             }
         };
 
