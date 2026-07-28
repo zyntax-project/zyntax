@@ -2885,6 +2885,55 @@ impl<'ctx> LLVMBackend<'ctx> {
         Ok(out.into())
     }
 
+    /// Coerce a scalar operand to `target` float (int -> sitofp, f32<->f64 via
+    /// ext/trunc, already-`target` untouched).
+    fn coerce_to_float(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        target: inkwell::types::FloatType<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        if v.is_int_value() {
+            Ok(self
+                .builder
+                .build_signed_int_to_float(v.into_int_value(), target, "sitofp")?
+                .into())
+        } else if v.into_float_value().get_type() == target {
+            Ok(v)
+        } else if target == self.context.f64_type() {
+            Ok(self
+                .builder
+                .build_float_ext(v.into_float_value(), target, "fpext")?
+                .into())
+        } else {
+            Ok(self
+                .builder
+                .build_float_trunc(v.into_float_value(), target, "fptrunc")?
+                .into())
+        }
+    }
+
+    /// A float op with a mixed (int) or narrower-float operand is invalid LLVM
+    /// IR, and `into_float_value()` on an int operand panics. When either
+    /// operand is a float, coerce both to the wider float type (f64 over f32).
+    /// Non-float ops pass through. Mirrors the Cranelift backend's reconcile.
+    fn reconcile_float_binary_operands(
+        &self,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> CompilerResult<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>)> {
+        if !(left.is_float_value() || right.is_float_value()) {
+            return Ok((left, right));
+        }
+        let f64_ty = self.context.f64_type();
+        let want_f64 = (left.is_float_value() && left.into_float_value().get_type() == f64_ty)
+            || (right.is_float_value() && right.into_float_value().get_type() == f64_ty);
+        let target = if want_f64 { f64_ty } else { self.context.f32_type() };
+        Ok((
+            self.coerce_to_float(left, target)?,
+            self.coerce_to_float(right, target)?,
+        ))
+    }
+
     fn compile_binary_op(
         &mut self,
         op: BinaryOp,
@@ -2892,6 +2941,10 @@ impl<'ctx> LLVMBackend<'ctx> {
         right: BasicValueEnum<'ctx>,
     ) -> CompilerResult<BasicValueEnum<'ctx>> {
         use BinaryOp::*;
+
+        // Float op with a mixed or narrower operand: coerce both to one float
+        // type so `into_float_value()` never sees an int and the IR is valid.
+        let (left, right) = self.reconcile_float_binary_operands(left, right)?;
 
         let result = match op {
             // Integer arithmetic
