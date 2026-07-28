@@ -2178,6 +2178,39 @@ fn emit_binary_op(out: &mut Vec<WasmInst<'static>>, op: BinaryOp, ty: &HirType) 
         (BinaryOp::Sub, true) => WasmInst::F64Sub,
         (BinaryOp::Mul, true) => WasmInst::F64Mul,
         (BinaryOp::Div, true) => WasmInst::F64Div,
+        // Explicit float ops: the SSA builder emits FAdd/FSub/FMul/FDiv for
+        // float arithmetic, so map them to the f64 funnel op regardless of the
+        // `ty` tag. (wasm has no `f64.rem`, so FRem stays unsupported.)
+        (BinaryOp::FAdd, _) => WasmInst::F64Add,
+        (BinaryOp::FSub, _) => WasmInst::F64Sub,
+        (BinaryOp::FMul, _) => WasmInst::F64Mul,
+        (BinaryOp::FDiv, _) => WasmInst::F64Div,
+        // Float comparisons produce an i32 bool; extend to the i64 funnel so
+        // the result matches the funneled bool slot.
+        (BinaryOp::FEq, _) => {
+            out.push(WasmInst::F64Eq);
+            WasmInst::I64ExtendI32U
+        }
+        (BinaryOp::FNe, _) => {
+            out.push(WasmInst::F64Ne);
+            WasmInst::I64ExtendI32U
+        }
+        (BinaryOp::FLt, _) => {
+            out.push(WasmInst::F64Lt);
+            WasmInst::I64ExtendI32U
+        }
+        (BinaryOp::FLe, _) => {
+            out.push(WasmInst::F64Le);
+            WasmInst::I64ExtendI32U
+        }
+        (BinaryOp::FGt, _) => {
+            out.push(WasmInst::F64Gt);
+            WasmInst::I64ExtendI32U
+        }
+        (BinaryOp::FGe, _) => {
+            out.push(WasmInst::F64Ge);
+            WasmInst::I64ExtendI32U
+        }
         (op, _) => {
             return Err(WasmEmitError::Unsupported(format!(
                 "binary op {:?} on {:?}",
@@ -2425,14 +2458,13 @@ mod tests {
                 span: None,
             },
         );
-        // `Add` + `ty=F64` is how the wasm backend represents a float add
-        // (`emit_binary_op` maps it to `F64Add`); the F-prefixed float ops are
-        // a separate, unsupported gap on this tier.
+        // FAdd on float + int: the F-prefixed float op maps to F64Add and the
+        // int operand is widened to f64 by the reconcile.
         let sum = add_value(&mut func, HirType::F64, HirValueKind::Instruction);
         let entry = func.blocks.get_mut(&func.entry_block).unwrap();
         entry.instructions.push(HirInstruction::Binary {
             result: sum,
-            op: BinaryOp::Add,
+            op: BinaryOp::FAdd,
             ty: HirType::F64,
             left: p0,
             right: p1,
@@ -2444,6 +2476,76 @@ mod tests {
             .expect("emit float+int");
         m.validate_full()
             .expect("float + int must validate (int widened to f64)");
+    }
+
+    #[test]
+    fn emits_float_compare_with_int() {
+        // `def f(x: f64, i: i64): bool { return x < i }` — FLt on float + int:
+        // the int is widened, F64Lt yields an i32 bool, extended to the funnel.
+        let p0 = HirId::new();
+        let p1 = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: p0,
+                    name: InternedString::new_global("x"),
+                    ty: HirType::F64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: p1,
+                    name: InternedString::new_global("i"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::Bool],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("f"), sig);
+        func.values.insert(
+            p0,
+            HirValue {
+                id: p0,
+                ty: HirType::F64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        func.values.insert(
+            p1,
+            HirValue {
+                id: p1,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(1),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let cmp = add_value(&mut func, HirType::Bool, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Binary {
+            result: cmp,
+            op: BinaryOp::FLt,
+            ty: HirType::Bool,
+            left: p0,
+            right: p1,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![cmp] };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit float compare");
+        m.validate_full()
+            .expect("float compare on float + int must validate");
     }
 
     /// Build an empty extra block keyed by `id` and graft it onto
