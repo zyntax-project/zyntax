@@ -1883,19 +1883,12 @@ impl CraneliftBackend {
                                 panic!("Binary op right operand {:?} not in value_map", right)
                             });
 
-                            // Widen integer operands to match if types differ (e.g., i32 vs i64)
-                            let lhs_ty = builder.func.dfg.value_type(lhs);
-                            let rhs_ty = builder.func.dfg.value_type(rhs);
-                            let (lhs, rhs) =
-                                if lhs_ty != rhs_ty && lhs_ty.is_int() && rhs_ty.is_int() {
-                                    if lhs_ty.bits() < rhs_ty.bits() {
-                                        (builder.ins().sextend(rhs_ty, lhs), rhs)
-                                    } else {
-                                        (lhs, builder.ins().sextend(lhs_ty, rhs))
-                                    }
-                                } else {
-                                    (lhs, rhs)
-                                };
+                            let (lhs, rhs) = Self::reconcile_binary_operands(
+                                &mut builder,
+                                ty.is_float(),
+                                lhs,
+                                rhs,
+                            );
 
                             let value = match op {
                                 BinaryOp::Add => {
@@ -5672,6 +5665,99 @@ impl CraneliftBackend {
         }
 
         Ok(cranelift_sig)
+    }
+
+    /// Convert `val` to `expected`, preserving its numeric value.
+    ///
+    /// Distinct from [`Self::coerce_value`], which reinterprets the
+    /// bits when the widths happen to match. That is right for an ABI
+    /// slot and wrong for arithmetic: `2i64` bitcast to `f64` is not
+    /// `2.0`.
+    fn convert_numeric(
+        builder: &mut FunctionBuilder,
+        val: Value,
+        actual: types::Type,
+        expected: types::Type,
+    ) -> Value {
+        if actual == expected {
+            return val;
+        }
+        match (actual.is_int(), expected.is_int()) {
+            (true, true) => {
+                if actual.bits() > expected.bits() {
+                    builder.ins().ireduce(expected, val)
+                } else {
+                    builder.ins().sextend(expected, val)
+                }
+            }
+            (false, false) => {
+                if actual.bits() > expected.bits() {
+                    builder.ins().fdemote(expected, val)
+                } else {
+                    builder.ins().fpromote(expected, val)
+                }
+            }
+            // `fcvt_from_sint` takes i32 or i64, so narrow types get
+            // widened first.
+            (true, false) => {
+                let widened = if actual.bits() < 32 {
+                    builder.ins().sextend(types::I32, val)
+                } else {
+                    val
+                };
+                builder.ins().fcvt_from_sint(expected, widened)
+            }
+            (false, true) => {
+                let converted = builder.ins().fcvt_to_sint_sat(types::I64, val);
+                if expected.bits() < 64 {
+                    builder.ins().ireduce(expected, converted)
+                } else {
+                    converted
+                }
+            }
+        }
+    }
+
+    /// Bring both operands of a binary op to the type the op works in.
+    ///
+    /// The HIR's result type picks the instruction, but the operands
+    /// can arrive in a different one: an integer literal in a float
+    /// expression (`pct + 2.0 + 2`) is materialised as an `iconst`, and
+    /// Cranelift's verifier rejects an `fadd` with an integer argument.
+    /// Mixed-width integers are widened to the larger of the two, which
+    /// is what the arithmetic below assumes.
+    fn reconcile_binary_operands(
+        builder: &mut FunctionBuilder,
+        result_is_float: bool,
+        lhs: Value,
+        rhs: Value,
+    ) -> (Value, Value) {
+        let lhs_ty = builder.func.dfg.value_type(lhs);
+        let rhs_ty = builder.func.dfg.value_type(rhs);
+        if lhs_ty == rhs_ty {
+            return (lhs, rhs);
+        }
+        if lhs_ty.is_vector() || rhs_ty.is_vector() {
+            return (lhs, rhs);
+        }
+        // A comparison's result type is a bool, so it can't say whether
+        // the operands are floats -- take that from the operands.
+        let want_float = result_is_float || lhs_ty.is_float() || rhs_ty.is_float();
+        let target = if want_float {
+            if lhs_ty == types::F64 || rhs_ty == types::F64 {
+                types::F64
+            } else {
+                types::F32
+            }
+        } else if lhs_ty.bits() >= rhs_ty.bits() {
+            lhs_ty
+        } else {
+            rhs_ty
+        };
+        (
+            Self::convert_numeric(builder, lhs, lhs_ty, target),
+            Self::convert_numeric(builder, rhs, rhs_ty, target),
+        )
     }
 
     /// Coerce a Cranelift value from one type to another (e.g., i64 -> i32, f64 -> f32)

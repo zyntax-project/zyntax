@@ -4103,3 +4103,72 @@ fn create_module_with_handle_effect() -> HirModule {
     module.add_function(func);
     module
 }
+
+/// `f64 + i32` must compile and produce the arithmetic sum.
+///
+/// The result type picks the instruction, so a float add reached the
+/// backend with an integer operand still typed `i32` — an untyped
+/// literal in a float expression, `pct + radius + 2`. Cranelift's
+/// verifier rejects `fadd.f64 v5, v2` where `v2: i32`, so the whole
+/// function was thrown away and the caller silently got nothing.
+#[test]
+fn mixed_float_and_int_operands_are_promoted() {
+    let mut backend = CraneliftBackend::new().expect("backend");
+
+    let sig = HirFunctionSignature {
+        params: vec![
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("a"),
+                ty: HirType::F64,
+                attributes: ParamAttributes::default(),
+            },
+            HirParam {
+                id: HirId::new(),
+                name: create_test_string("b"),
+                ty: HirType::I32,
+                attributes: ParamAttributes::default(),
+            },
+        ],
+        returns: vec![HirType::F64],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+
+    let mut func = HirFunction::new(create_test_string("mixed_add"), sig);
+    func.calling_convention = CallingConvention::C;
+
+    let a = func.create_value(HirType::F64, HirValueKind::Parameter(0));
+    let b = func.create_value(HirType::I32, HirValueKind::Parameter(1));
+    let sum = func.create_value(HirType::F64, HirValueKind::Instruction);
+
+    let entry = func.entry_block;
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::Binary {
+        op: BinaryOp::Add,
+        result: sum,
+        ty: HirType::F64,
+        left: a,
+        right: b,
+    });
+    block.set_terminator(HirTerminator::Return { values: vec![sum] });
+
+    let id = func.id;
+    backend
+        .compile_function(id, &func)
+        .expect("f64 + i32 must compile");
+    backend.finalize_definitions().expect("finalize");
+    let raw = backend.get_function_ptr(id).expect("fn ptr");
+    let f = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(f64, i32) -> f64>(raw) };
+    assert_eq!(
+        unsafe { f(0.5, 2) },
+        2.5,
+        "the int operand must be converted, not reinterpreted"
+    );
+}
