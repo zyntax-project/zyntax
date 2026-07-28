@@ -649,6 +649,8 @@ fn go_code_examples() {
 
     // Go generic type parameter with constraint
     let go_type_param = TypedTypeParam {
+        is_const: false,
+        const_ty: None,
         name: arena.intern_string("T"),
         bounds: vec![TypedTypeBound::Trait(Type::Named {
             id: TypeId::next(), // "comparable",
@@ -667,6 +669,8 @@ fn go_code_examples() {
     let go_generic_struct = TypedClass {
         name: arena.intern_string("Stack"),
         type_params: vec![TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: arena.intern_string("T"),
             bounds: vec![], // "any" means no constraints
             default: None,

@@ -1593,12 +1593,21 @@ pub enum TypedImportItem {
 }
 
 /// Type parameter with bounds
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TypedTypeParam {
     pub name: InternedString,
     pub bounds: Vec<TypedTypeBound>,
     pub default: Option<Type>,
     pub span: Span,
+    /// `true` for a const generic parameter (`const N: usize`) — a
+    /// compile-time value rather than a type. Ordinary type params are
+    /// `false`.
+    #[serde(default)]
+    pub is_const: bool,
+    /// Declared type of a const generic parameter (e.g. `usize`); `None`
+    /// for ordinary type parameters.
+    #[serde(default)]
+    pub const_ty: Option<Type>,
 }
 
 /// Type bounds

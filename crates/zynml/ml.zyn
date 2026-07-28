@@ -788,7 +788,20 @@ trait_param_simple = { name:identifier }
 type_params = { "<" ~ first:type_param ~ ("," ~ rest:type_param)* ~ ">" }
   -> prepend_list(first, rest)
 
-type_param = { name:identifier ~ (":" ~ type_bounds)? }
+// A generic parameter: a const generic (`const N: usize`) or an ordinary
+// type parameter (`T`, `U: Display`). The const branch is tried first so
+// the `const` keyword routes to a compile-time value param; ordinary
+// params still reduce to a bare interned name.
+type_param = { param:const_type_param | param:plain_type_param }
+  -> param
+
+const_type_param = { "const" ~ name:identifier ~ ":" ~ ty:type_expr }
+  -> ConstTypeParam {
+      name: intern(name),
+      ty: ty,
+  }
+
+plain_type_param = { name:identifier ~ (":" ~ type_bounds)? }
   -> intern(name)
 
 type_bounds = { ty:type_expr ~ ("+" ~ ty:type_expr)* }
@@ -971,9 +984,10 @@ struct_def = {
 // struct List<T> { items: Vec, count: int }
 // Optional leading `@annotations` (e.g. `@reference`) thread into the
 // Class declaration so the lowering pipeline can pick reference layout.
-struct_def_generic_brace = { annotations:annotation* ~ "struct" ~ name:identifier ~ type_params ~ "{" ~ fields:struct_field_list ~ "}" }
+struct_def_generic_brace = { annotations:annotation* ~ "struct" ~ name:identifier ~ tp:type_params ~ "{" ~ fields:struct_field_list ~ "}" }
   -> TypedDeclaration::Class {
       name: intern(name),
+      type_params: tp,
       fields: fields,
       annotations: annotations,
   }
@@ -990,9 +1004,10 @@ struct_def_brace = { annotations:annotation* ~ "struct" ~ name:identifier ~ "{" 
 
 // struct List<T>:
 //     ...
-struct_def_generic = { annotations:annotation* ~ "struct" ~ name:identifier ~ type_params ~ ":" ~ fields:struct_def_fields }
+struct_def_generic = { annotations:annotation* ~ "struct" ~ name:identifier ~ tp:type_params ~ ":" ~ fields:struct_def_fields }
   -> TypedDeclaration::Class {
       name: intern(name),
+      type_params: tp,
       fields: fields,
       annotations: annotations,
   }
@@ -1382,7 +1397,7 @@ type_args_angle = { "<" ~ args:type_args ~ ">" }
 //   List<int>      -> List<int>
 //   int            -> int
 //
-type_expr = { ty:optional_type | ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:simd_type | ty:primitive_type | ty:simple_type }
+type_expr = { ty:optional_type | ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:slice_type | ty:simd_type | ty:primitive_type | ty:simple_type }
   -> ty
 
 // Tuple type: (T1, T2) or (T1, T2, T3)
@@ -1434,7 +1449,7 @@ optional_type = { "?" ~ inner:type_expr_non_optional }
   }
 
 // Type expression without the optional prefix (to avoid infinite recursion)
-type_expr_non_optional = { ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:simd_type | ty:primitive_type | ty:simple_type }
+type_expr_non_optional = { ty:fn_type | ty:tuple_type | ty:tensor_type | ty:generic_type | ty:array_type | ty:slice_type | ty:simd_type | ty:primitive_type | ty:simple_type }
   -> ty
 
 // Tensor type syntax (canonical): tensor[shape..., dtype?]
@@ -1546,6 +1561,24 @@ array_type = { "Array" ~ "<" ~ elem:type_expr ~ ">" }
       const_args: [],
   }
 
+// Fixed-size array / slice: `[f32; 4]` (concrete) or `[T; N]` (const
+// generic — the size is a param the monomorphizer binds). Lowers to a
+// sized `HirType::Array`.
+slice_type = { "[" ~ elem:type_expr ~ ";" ~ size:slice_size ~ "]" }
+  -> Type::Array {
+      element: elem,
+      size: size,
+  }
+
+slice_size = { sz:slice_size_num | sz:slice_size_var }
+  -> sz
+
+slice_size_num = { value:type_const_int_raw }
+  -> parse_int(value)
+
+slice_size_var = { name:identifier }
+  -> intern(name)
+
 generic_type = { name:identifier ~ "<" ~ args:type_args ~ ">" }
   -> Type::Named {
       name: intern(name),
@@ -1553,14 +1586,29 @@ generic_type = { name:identifier ~ "<" ~ args:type_args ~ ">" }
       const_args: [],
   }
 
-// Type arguments: can be regular types or associated type bindings (Item=T)
-type_args = { arg:type_arg ~ ("," ~ arg:type_arg)* }
+// Type arguments: can be regular types, integer const args, or associated
+// type bindings (Item=T). Uses the first/rest + prepend_list idiom so the
+// FULL argument list survives (a plain repeated `arg:` binding keeps only
+// the last match) — the "Named" action then partitions types vs consts.
+type_args = { first:type_arg ~ rest:type_arg_comma* }
+  -> prepend_list(first, rest)
+
+type_arg_comma = { "," ~ arg:type_arg }
   -> arg
 
-// Single type argument: either associated binding or regular type
-// Associated binding must come first to match "Item=T" before "Item" is parsed as simple type
-type_arg = { arg:assoc_type_binding | arg:type_expr }
+// Single type argument: an associated binding (Item=T), an integer const
+// argument (the `4` in Buffer<f32, 4>), or a regular type. The const-int
+// alternative sits before type_expr so a digit routes to a compile-time
+// const rather than failing the type grammar; the "Named" action partitions
+// the collected args into type_args vs const_args by ParsedValue kind.
+type_arg = { arg:assoc_type_binding | arg:type_const_int | arg:type_expr }
   -> arg
+
+// Integer const generic argument in type-argument position.
+type_const_int = { value:type_const_int_raw }
+  -> parse_int(value)
+
+type_const_int_raw = @{ "-"? ~ ASCII_DIGIT+ }
 
 // Associated type binding: Item=T, Output=U
 // Used in trait bounds like Iterator<Item=T>
@@ -1792,9 +1840,10 @@ async_def_simple_colon = { "async" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ ":" ~
 // ========== Python-style function definitions with `def` keyword ==========
 
 // def map<T, U>(items): ReturnType { ... }
-def_generic_return_block = { "def" ~ name:identifier ~ type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ body:block }
+def_generic_return_block = { "def" ~ name:identifier ~ tp:type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ body:block }
   -> TypedDeclaration::Function {
       name: intern(name),
+      type_params: tp,
       params: params,
       return_type: ret,
       body: Some(body),
@@ -1802,18 +1851,20 @@ def_generic_return_block = { "def" ~ name:identifier ~ type_params ~ "(" ~ param
 
 // def map<T, U>(items): ReturnType:
 //     statements...
-def_generic_return_colon = { "def" ~ name:identifier ~ type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ ":" ~ body:indent_block }
+def_generic_return_colon = { "def" ~ name:identifier ~ tp:type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr ~ ":" ~ body:indent_block }
   -> TypedDeclaration::Function {
       name: intern(name),
+      type_params: tp,
       params: params,
       return_type: ret,
       body: Some(body),
   }
 
 // def process<T>(x) { ... }
-def_generic_block = { "def" ~ name:identifier ~ type_params ~ "(" ~ params:fn_params? ~ ")" ~ body:block }
+def_generic_block = { "def" ~ name:identifier ~ tp:type_params ~ "(" ~ params:fn_params? ~ ")" ~ body:block }
   -> TypedDeclaration::Function {
       name: intern(name),
+      type_params: tp,
       params: params,
       return_type: Type::Unit,
       body: Some(body),
@@ -1821,9 +1872,10 @@ def_generic_block = { "def" ~ name:identifier ~ type_params ~ "(" ~ params:fn_pa
 
 // def process<T>(x):
 //     statements...
-def_generic_colon = { "def" ~ name:identifier ~ type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ body:indent_block }
+def_generic_colon = { "def" ~ name:identifier ~ tp:type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ body:indent_block }
   -> TypedDeclaration::Function {
       name: intern(name),
+      type_params: tp,
       params: params,
       return_type: Type::Unit,
       body: Some(body),

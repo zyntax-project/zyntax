@@ -39,6 +39,8 @@ fn rust_style_generics() {
 
     // Type parameters with Rust-style bounds
     let _type_params = vec![TypedTypeParam {
+        is_const: false,
+        const_ty: None,
         name: t_param,
         bounds: vec![
             TypedTypeBound::Trait(Type::Named {
@@ -69,6 +71,8 @@ fn java_style_generics() {
     let java_class = TypedClass {
         name: arena.intern_string("Container"),
         type_params: vec![TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![
                 // T extends Comparable<T>
@@ -116,6 +120,8 @@ fn csharp_style_generics() {
     let csharp_class = TypedClass {
         name: arena.intern_string("Repository"),
         type_params: vec![TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![
                 // where T : class (reference type constraint)
@@ -148,6 +154,8 @@ fn csharp_style_generics() {
 
     // C#: struct ValueProcessor<T> where T : struct, IComparable<T>
     let value_processor_params = vec![TypedTypeParam {
+        is_const: false,
+        const_ty: None,
         name: t_param,
         bounds: vec![
             // where T : struct (value type constraint)
@@ -216,12 +224,16 @@ fn typescript_style_generics() {
 
     let type_params = vec![
         TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![], // T has no constraints
             default: None,
             span: Span::new(15, 16),
         },
         TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: k_param,
             bounds: vec![
                 // K extends keyof T (using custom constraint)
@@ -247,6 +259,8 @@ fn haxe_style_generics() {
     let haxe_class = TypedClass {
         name: arena.intern_string("DataProcessor"),
         type_params: vec![TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![
                 // T implements Iterable<String>
@@ -300,6 +314,8 @@ fn advanced_constraint_combinations() {
     // Complex constraint: T: Clone + Send + 'static + Into<U> where U: Display
     let complex_params = vec![
         TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![
                 TypedTypeBound::Trait(Type::Named {
@@ -323,6 +339,8 @@ fn advanced_constraint_combinations() {
             span: Span::new(10, 40),
         },
         TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: u_param,
             bounds: vec![TypedTypeBound::Trait(Type::Named {
                 id: TypeId::next(), // "Display",
@@ -346,6 +364,8 @@ fn associated_type_constraints() {
 
     // Rust: fn process<T>() where T: Iterator<Item = String>
     let associated_type_param = TypedTypeParam {
+        is_const: false,
+        const_ty: None,
         name: t_param,
         bounds: vec![
             TypedTypeBound::Trait(Type::Named {
@@ -399,6 +419,8 @@ mod tests {
         let t_param = arena.intern_string("T");
 
         let param = TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![
                 TypedTypeBound::Send,
@@ -421,6 +443,8 @@ mod tests {
         let t_param = arena.intern_string("T");
 
         let param = TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![
                 TypedTypeBound::ReferenceType,
@@ -442,6 +466,8 @@ mod tests {
         let constraint_name = arena.intern_string("keyof");
 
         let param = TypedTypeParam {
+            is_const: false,
+            const_ty: None,
             name: t_param,
             bounds: vec![TypedTypeBound::Custom {
                 name: constraint_name,

@@ -245,6 +245,7 @@ impl SymbolExtractor {
                     bounds,
                     default: None,
                     span: zyntax_typed_ast::Span::default(),
+                    ..Default::default()
                 });
             }
         }

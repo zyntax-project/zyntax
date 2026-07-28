@@ -2996,23 +2996,32 @@ impl LoweringContext {
             vec![hir_return_type]
         };
 
-        // Convert type params from TypedFunction to HirTypeParam
-        let hir_type_params: Vec<crate::hir::HirTypeParam> = func
-            .type_params
-            .iter()
-            .map(|tp| {
-                crate::hir::HirTypeParam {
+        // Split the generic params: ordinary type params become
+        // `HirTypeParam`; const generic params (`const N: usize`) become
+        // `HirConstParam` carrying an integer type the monomorphizer binds
+        // against a use site's const args.
+        let mut hir_type_params: Vec<crate::hir::HirTypeParam> = Vec::new();
+        let mut hir_const_params: Vec<crate::hir::HirConstParam> = Vec::new();
+        for tp in &func.type_params {
+            if tp.is_const {
+                hir_const_params.push(crate::hir::HirConstParam {
+                    name: tp.name,
+                    ty: self.const_param_hir_type(tp.const_ty.as_ref()),
+                    default: None,
+                });
+            } else {
+                hir_type_params.push(crate::hir::HirTypeParam {
                     name: tp.name,
                     constraints: vec![], // TODO: Convert bounds to constraints
-                }
-            })
-            .collect();
+                });
+            }
+        }
 
         Ok(HirFunctionSignature {
             params,
             returns,
             type_params: hir_type_params,
-            const_params: vec![],
+            const_params: hir_const_params,
             lifetime_params: vec![],
             is_variadic: false,
             is_async: func.is_async,
@@ -3020,6 +3029,32 @@ impl LoweringContext {
             effects: func.effects.clone(),
             is_pure: func.is_pure,
         })
+    }
+
+    /// Map a const generic parameter's declared type (`const N: usize`) to
+    /// its HIR integer type. `usize`/`isize` are not grammar primitives —
+    /// they parse to a named type — so normalize the common integer
+    /// spellings by name; anything else defaults to `U64` (const shapes are
+    /// non-negative sizes).
+    fn const_param_hir_type(&self, ty: Option<&Type>) -> HirType {
+        if let Some(Type::Named { id, .. }) = ty {
+            if let Some(n) = self
+                .type_registry
+                .get_type_by_id(*id)
+                .and_then(|d| d.name.resolve_global())
+            {
+                return match n.as_str() {
+                    "isize" | "i64" => HirType::I64,
+                    "i32" => HirType::I32,
+                    "u32" => HirType::U32,
+                    _ => HirType::U64,
+                };
+            }
+        }
+        match ty {
+            Some(t) => self.convert_type(t),
+            None => HirType::U64,
+        }
     }
 
     /// Set function attributes
@@ -3332,9 +3367,33 @@ impl LoweringContext {
                 }
             }
 
-            Type::Named { id, type_args, .. } => {
+            Type::Named {
+                id,
+                type_args,
+                const_args,
+                ..
+            } => {
                 // Look up type definition in registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
+                    // `Array<T, N>` with a concrete const size lowers to a
+                    // fixed-size HIR array (the `[T; N]` spelling takes the
+                    // `Type::Array` path instead). A const-generic *variable*
+                    // size resolves to no literal here and falls through to
+                    // normal handling until monomorphization binds it.
+                    if type_def.name.resolve_global().as_deref() == Some("Array") {
+                        let literal_size = const_args.iter().find_map(|c| match c {
+                            zyntax_typed_ast::ConstValue::UInt(u) => Some(*u),
+                            zyntax_typed_ast::ConstValue::Int(i) => Some((*i).max(0) as u64),
+                            _ => None,
+                        });
+                        if let Some(size) = literal_size {
+                            let elem = type_args
+                                .first()
+                                .map(|t| self.convert_type(t))
+                                .unwrap_or(HirType::I64);
+                            return HirType::Array(Box::new(elem), size);
+                        }
+                    }
                     // Phase I.1: Resume<T> is the reified continuation
                     // passed to resumable effect handlers. Represented in HIR
                     // as `Ptr(U8)` — opaque pointer to a `Resume` struct

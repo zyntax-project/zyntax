@@ -301,6 +301,7 @@ impl<'g> GrammarInterpreter<'g> {
             ["TypedVariant"] => self.construct_variant(fields, state, span),
             ["TypedParameter"] => self.construct_parameter(fields, state, span),
             ["TypedFieldInit"] => self.construct_field_init(fields, state, span),
+            ["ConstTypeParam"] => self.construct_const_type_param(fields, state, span),
             ["TypedFieldPattern"] => self.construct_field_pattern(fields, state, span),
             ["TypedMatchArm"] => self.construct_match_arm(fields, state, span),
             ["TypedCatch"] => self.construct_catch(fields, state, span),
@@ -1113,13 +1114,17 @@ impl<'g> GrammarInterpreter<'g> {
                 let is_external = self
                     .get_field_optional_bool("is_external", fields, state)?
                     .unwrap_or(false);
+                // Generic params from `def f<T, const N: usize>(...)`. Absent
+                // (non-generic def) yields an empty list.
+                let type_params =
+                    self.get_field_as_type_param_list("type_params", fields, state)?;
 
                 TypedDeclaration::Function(TypedFunction {
                     name,
                     annotations,
                     effects: vec![],
                     with_handlers: vec![],
-                    type_params: vec![],
+                    type_params,
                     params,
                     return_type,
                     body,
@@ -1228,10 +1233,14 @@ impl<'g> GrammarInterpreter<'g> {
                 // so existing (non-decorated) struct rules stay backward-compatible.
                 let annotations =
                     self.get_field_as_annotation_list("annotations", fields, state)?;
+                // Generic params from `struct S<T, const N: usize> { ... }`.
+                // Absent (non-generic struct) yields an empty list.
+                let type_params =
+                    self.get_field_as_type_param_list("type_params", fields, state)?;
 
                 TypedDeclaration::Class(zyntax_typed_ast::TypedClass {
                     name,
-                    type_params: vec![],
+                    type_params,
                     extends: None,
                     implements: vec![],
                     fields: fields_list,
@@ -1441,10 +1450,13 @@ impl<'g> GrammarInterpreter<'g> {
             "Unit" => Type::Primitive(PrimitiveType::Unit),
             "Named" => {
                 let name = self.get_field_as_interned("name", fields, state)?;
-                let mut type_args = self
-                    .get_field_as_type_list_optional("type_args", fields, state)?
-                    .unwrap_or_default();
-                let mut const_args = self.get_field_as_const_list("const_args", fields, state)?;
+                // A generic argument list mixes type args and integer const
+                // args (`Buffer<f32, 4>`); partition by ParsedValue kind.
+                let (mut type_args, mut const_args) =
+                    self.get_type_args_partitioned("type_args", fields, state)?;
+                // Some productions also emit an explicit `const_args` field
+                // (currently the tensor sugar path); merge any it carries.
+                const_args.extend(self.get_field_as_const_list("const_args", fields, state)?);
 
                 // Built-in `Fiber<T>` → `Type::Fiber(Box<Type>)`. The
                 // parser produces the structural shape; the inner is
@@ -1582,15 +1594,16 @@ impl<'g> GrammarInterpreter<'g> {
                 let size = if let Some(expr) = self.get_field("size", fields) {
                     match self.eval_expr(expr, state)? {
                         ParsedValue::Int(n) => Some(ConstValue::Int(n)),
+                        // A const-generic size (`[T; N]`) — carried as a
+                        // variable the monomorphizer binds at a use site.
+                        ParsedValue::Interned(name) => Some(ConstValue::Variable(name)),
                         ParsedValue::None => None,
                         ParsedValue::Optional(None) => None,
-                        ParsedValue::Optional(Some(v)) => {
-                            if let ParsedValue::Int(n) = *v {
-                                Some(ConstValue::Int(n))
-                            } else {
-                                None
-                            }
-                        }
+                        ParsedValue::Optional(Some(v)) => match *v {
+                            ParsedValue::Int(n) => Some(ConstValue::Int(n)),
+                            ParsedValue::Interned(name) => Some(ConstValue::Variable(name)),
+                            _ => None,
+                        },
                         _ => None,
                     }
                 } else {
@@ -1784,6 +1797,24 @@ impl<'g> GrammarInterpreter<'g> {
         Ok(ParsedValue::FieldInit {
             name,
             value: Box::new(ParsedValue::Expression(Box::new(value))),
+        })
+    }
+
+    /// Construct a const generic parameter declaration (`const N: usize`).
+    /// Carried as a `FieldInit { name, value: Type(ty) }` — the name→type
+    /// pairing distinguishes it from an ordinary type param (a bare
+    /// `Interned` name) when `get_field_as_type_param_list` collects them.
+    fn construct_const_type_param<'a>(
+        &self,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+        _span: Span,
+    ) -> Result<ParsedValue, String> {
+        let name = self.get_field_as_interned("name", fields, state)?;
+        let ty = self.get_field_as_type("ty", fields, state)?;
+        Ok(ParsedValue::FieldInit {
+            name,
+            value: Box::new(ParsedValue::Type(ty)),
         })
     }
 
@@ -2249,6 +2280,40 @@ impl<'g> GrammarInterpreter<'g> {
             ParsedValue::Type(ty) => Ok(Some(vec![ty])),
             other => Err(format!("field '{}' is not a type list: {:?}", name, other)),
         }
+    }
+
+    /// Read a generic-argument-list field, partitioning each entry into a
+    /// type argument (`ParsedValue::Type`) or a const argument (anything the
+    /// const converter accepts — e.g. the integer `4` in `Buffer<f32, 4>`).
+    /// Order is preserved within each partition.
+    fn get_type_args_partitioned<'a>(
+        &self,
+        name: &str,
+        fields: &[(String, ExprIR)],
+        state: &mut ParserState<'a>,
+    ) -> Result<(Vec<Type>, Vec<ConstValue>), String> {
+        let Some(expr) = self.get_field(name, fields) else {
+            return Ok((vec![], vec![]));
+        };
+        let val = self.eval_expr(expr, state)?;
+        let items = match val {
+            ParsedValue::List(items) => items,
+            ParsedValue::Optional(None) | ParsedValue::None => vec![],
+            ParsedValue::Optional(Some(inner)) => match *inner {
+                ParsedValue::List(items) => items,
+                single => vec![single],
+            },
+            single => vec![single],
+        };
+        let mut types = Vec::new();
+        let mut consts = Vec::new();
+        for item in items {
+            match item {
+                ParsedValue::Type(ty) => types.push(ty),
+                other => consts.push(self.parsed_value_to_const(other, state)?),
+            }
+        }
+        Ok((types, consts))
     }
 
     fn get_field_as_const_list<'a>(
@@ -4702,34 +4767,47 @@ impl<'g> GrammarInterpreter<'g> {
                     ParsedValue::List(items) => {
                         let mut result = Vec::new();
                         for item in items {
-                            let interned = self.parsed_value_to_interned(item, state)?;
-                            result.push(TypedTypeParam {
-                                name: interned,
-                                bounds: vec![],
-                                default: None,
-                                span: Span::default(),
-                            });
+                            result.push(self.parsed_value_to_type_param(item, state)?);
                         }
                         Ok(result)
                     }
                     ParsedValue::None => Ok(vec![]),
                     ParsedValue::Optional(None) => Ok(vec![]),
-                    ParsedValue::Interned(i) => Ok(vec![TypedTypeParam {
-                        name: i,
-                        bounds: vec![],
-                        default: None,
-                        span: Span::default(),
-                    }]),
-                    ParsedValue::Text(s) => Ok(vec![TypedTypeParam {
-                        name: state.intern(&s),
-                        bounds: vec![],
-                        default: None,
-                        span: Span::default(),
-                    }]),
-                    _ => Err(format!("field '{}' is not a type param list", name)),
+                    single => Ok(vec![self.parsed_value_to_type_param(single, state)?]),
                 }
             }
             None => Ok(vec![]),
+        }
+    }
+
+    /// Convert one collected type-parameter value into a `TypedTypeParam`.
+    /// An ordinary type param arrives as an interned name (`T`); a const
+    /// generic param arrives as a `FieldInit { name, value: Type(ty) }`
+    /// produced by `construct_const_type_param` for `const N: usize`.
+    fn parsed_value_to_type_param<'a>(
+        &self,
+        value: ParsedValue,
+        state: &mut ParserState<'a>,
+    ) -> Result<TypedTypeParam, String> {
+        match value {
+            ParsedValue::FieldInit { name, value } => match *value {
+                ParsedValue::Type(ty) => Ok(TypedTypeParam {
+                    name,
+                    is_const: true,
+                    const_ty: Some(ty),
+                    ..Default::default()
+                }),
+                other => Err(format!(
+                    "const type param '{name:?}' has a non-type annotation: {other:?}"
+                )),
+            },
+            other => {
+                let name = self.parsed_value_to_interned(other, state)?;
+                Ok(TypedTypeParam {
+                    name,
+                    ..Default::default()
+                })
+            }
         }
     }
 

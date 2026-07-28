@@ -3255,6 +3255,7 @@ impl AstHostFunctions for TypedAstBuilder {
                 bounds: Vec::new(),
                 default: None,
                 span,
+                ..Default::default()
             })
             .collect();
 
