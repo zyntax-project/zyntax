@@ -41,6 +41,7 @@ fn main() {
             variance: Variance::Covariant,
             default: None,
             span,
+            ..Default::default()
         }],
         vec![], // No fields exposed (implementation detail)
         vec![
@@ -100,6 +101,7 @@ fn main() {
                 variance: Variance::Invariant,
                 default: None,
                 span,
+                ..Default::default()
             },
             TypeParam {
                 name: arena.intern_string("V"),
@@ -107,6 +109,7 @@ fn main() {
                 variance: Variance::Covariant,
                 default: None,
                 span,
+                ..Default::default()
             },
         ],
         vec![],

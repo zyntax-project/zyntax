@@ -3213,6 +3213,92 @@ impl LoweringContext {
         self.convert_type(ty)
     }
 
+    /// Specialize a generic struct's field type by the use-site type and
+    /// const arguments at monomorphization.
+    ///
+    /// `type_subst` maps each ordinary type-parameter name to its concrete
+    /// type argument (`T` → `f32`); `const_subst` maps each const-parameter
+    /// name to its concrete value (`N` → `4`). The walk:
+    ///   - replaces a bare parameter reference — whether stored as
+    ///     `Unresolved(T)`, a named `TypeVar`, or a `Named` placeholder whose
+    ///     resolved name matches a type parameter — with its type argument;
+    ///   - replaces an array size / `Named` const arg of
+    ///     `ConstValue::Variable(N)` with the matching const argument
+    ///     (`[T; N]` → `[f32; 4]`);
+    ///   - recurses into array element types and `Named` type arguments.
+    /// Unmatched parameters are left untouched.
+    fn substitute_field_type(
+        &self,
+        ty: &Type,
+        type_subst: &std::collections::HashMap<zyntax_typed_ast::InternedString, Type>,
+        const_subst: &std::collections::HashMap<
+            zyntax_typed_ast::InternedString,
+            zyntax_typed_ast::ConstValue,
+        >,
+    ) -> Type {
+        use zyntax_typed_ast::ConstValue;
+
+        // Resolve a const value, replacing a matching `Variable(N)`.
+        let resolve_const = |cv: &ConstValue| -> ConstValue {
+            if let ConstValue::Variable(n) = cv {
+                if let Some(replacement) = const_subst.get(n) {
+                    return replacement.clone();
+                }
+            }
+            cv.clone()
+        };
+
+        match ty {
+            Type::Unresolved(name) => type_subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+            Type::TypeVar(tv) => tv
+                .name
+                .and_then(|n| type_subst.get(&n))
+                .cloned()
+                .unwrap_or_else(|| ty.clone()),
+            Type::Named {
+                id,
+                type_args,
+                const_args,
+                variance,
+                nullability,
+            } => {
+                // A bare reference to a type parameter lowers to a `Named`
+                // placeholder carrying no args; match it by its resolved name.
+                if type_args.is_empty() && const_args.is_empty() {
+                    if let Some(def) = self.type_registry.get_type_by_id(*id) {
+                        if let Some(replacement) = type_subst.get(&def.name) {
+                            return replacement.clone();
+                        }
+                    }
+                }
+                Type::Named {
+                    id: *id,
+                    type_args: type_args
+                        .iter()
+                        .map(|a| self.substitute_field_type(a, type_subst, const_subst))
+                        .collect(),
+                    const_args: const_args.iter().map(&resolve_const).collect(),
+                    variance: variance.clone(),
+                    nullability: *nullability,
+                }
+            }
+            Type::Array {
+                element_type,
+                size,
+                nullability,
+            } => Type::Array {
+                element_type: Box::new(self.substitute_field_type(
+                    element_type,
+                    type_subst,
+                    const_subst,
+                )),
+                size: size.as_ref().map(&resolve_const),
+                nullability: *nullability,
+            },
+            _ => ty.clone(),
+        }
+    }
+
     fn convert_type(&self, ty: &Type) -> HirType {
         use zyntax_typed_ast::PrimitiveType;
 
@@ -3412,11 +3498,50 @@ impl LoweringContext {
 
                     match &type_def.kind {
                         zyntax_typed_ast::TypeKind::Struct { fields, .. } => {
-                            // Convert struct fields
-                            let field_types: Vec<_> = fields
-                                .iter()
-                                .map(|field| self.convert_type(&field.ty))
-                                .collect();
+                            // Convert struct fields, specializing field types by
+                            // the use-site type/const arguments so a generic
+                            // `Buffer<T, const N>` used as `Buffer<f32, 4>` lowers
+                            // its `data: [T; N]` field to `Array(F32, 4)`.
+                            let field_types: Vec<_> =
+                                if type_args.is_empty() && const_args.is_empty() {
+                                    // Plain / non-instantiated use — behavior unchanged.
+                                    fields
+                                        .iter()
+                                        .map(|field| self.convert_type(&field.ty))
+                                        .collect()
+                                } else {
+                                    // Build name→arg maps from the declared params
+                                    // (split by kind, in declaration order) zipped
+                                    // against the use-site args.
+                                    let type_subst: std::collections::HashMap<_, _> = type_def
+                                        .type_params
+                                        .iter()
+                                        .filter(|tp| !tp.is_const)
+                                        .map(|tp| tp.name)
+                                        .zip(type_args.iter().cloned())
+                                        .collect();
+                                    let const_subst: std::collections::HashMap<_, _> = type_def
+                                        .type_params
+                                        .iter()
+                                        .filter(|tp| tp.is_const)
+                                        .map(|tp| tp.name)
+                                        .zip(const_args.iter().cloned())
+                                        .collect();
+                                    fields
+                                        .iter()
+                                        .map(|field| {
+                                            // Substitute both the type param (`T` → `f32`)
+                                            // and const param (`N` → `4`) into the field
+                                            // type, then lower.
+                                            let subst = self.substitute_field_type(
+                                                &field.ty,
+                                                &type_subst,
+                                                &const_subst,
+                                            );
+                                            self.convert_type(&subst)
+                                        })
+                                        .collect()
+                                };
 
                             // Strict V1 reference-class lowering: classes
                             // annotated with `@reference` use heap layout —
@@ -4319,6 +4444,8 @@ impl LoweringContext {
                             variance: zyntax_typed_ast::type_registry::Variance::Invariant,
                             default: tp.default.clone(),
                             span: tp.span,
+                            is_const: tp.is_const,
+                            const_ty: tp.const_ty.clone(),
                         }
                     })
                     .collect();

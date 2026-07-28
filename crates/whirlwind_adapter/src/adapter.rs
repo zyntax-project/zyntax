@@ -1012,6 +1012,7 @@ impl WhirlwindAdapter {
                                 variance: zyntax_typed_ast::Variance::Invariant,
                                 default: None,
                                 span: tp.span,
+                                ..Default::default()
                             }
                         })
                         .collect();
@@ -1179,6 +1180,7 @@ impl WhirlwindAdapter {
                                 variance: zyntax_typed_ast::Variance::Invariant,
                                 default: None,
                                 span: tp.span,
+                                ..Default::default()
                             }
                         })
                         .collect();
@@ -1295,6 +1297,7 @@ impl WhirlwindAdapter {
                                 variance: zyntax_typed_ast::Variance::Invariant,
                                 default: None,
                                 span: tp.span,
+                                ..Default::default()
                             }
                         })
                         .collect();
@@ -1386,6 +1389,7 @@ impl WhirlwindAdapter {
                                 variance: zyntax_typed_ast::Variance::Invariant,
                                 default: None,
                                 span: tp.span,
+                                ..Default::default()
                             }
                         })
                         .collect();

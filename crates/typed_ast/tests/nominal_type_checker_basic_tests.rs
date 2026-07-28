@@ -496,6 +496,7 @@ fn test_variance_in_generic_types() {
             variance: Variance::Covariant,
 
             span: Span::new(0, 10),
+            ..Default::default()
         }],
         super_type: None,
         interfaces: vec![],

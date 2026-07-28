@@ -1413,6 +1413,8 @@ impl ZyntaxRuntime {
                                 variance: Variance::Invariant,
                                 default: tp.default.clone(),
                                 span: tp.span,
+                                is_const: tp.is_const,
+                                const_ty: tp.const_ty.clone(),
                             })
                             .collect();
 
@@ -1486,6 +1488,8 @@ impl ZyntaxRuntime {
                         variance: Variance::Invariant,
                         default: tp.default.clone(),
                         span: tp.span,
+                        is_const: tp.is_const,
+                        const_ty: tp.const_ty.clone(),
                     })
                     .collect();
 
@@ -1578,6 +1582,8 @@ impl ZyntaxRuntime {
                             variance: Variance::Invariant,
                             default: param.default.clone(),
                             span: param.span,
+                            is_const: param.is_const,
+                            const_ty: param.const_ty.clone(),
                         })
                         .collect();
 

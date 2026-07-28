@@ -413,6 +413,8 @@ pub fn register_impl_blocks(
                                 variance: zyntax_typed_ast::type_registry::Variance::Invariant,
                                 default: tp.default.clone(),
                                 span: tp.span,
+                                is_const: tp.is_const,
+                                const_ty: tp.const_ty.clone(),
                             })
                             .collect();
 
@@ -507,6 +509,8 @@ pub fn register_impl_blocks(
                                 variance: zyntax_typed_ast::type_registry::Variance::Invariant,
                                 default: tp.default.clone(),
                                 span: tp.span,
+                                is_const: tp.is_const,
+                                const_ty: tp.const_ty.clone(),
                             }
                         })
                         .collect();

@@ -634,13 +634,19 @@ pub enum TypeKind {
 }
 
 /// Type parameter definition
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct TypeParam {
     pub name: InternedString,
     pub bounds: Vec<TypeBound>,
     pub variance: Variance,
     pub default: Option<Type>,
     pub span: Span,
+    /// Whether this is a const generic parameter (e.g. `const N: usize`).
+    #[serde(default)]
+    pub is_const: bool,
+    /// The declared type of a const generic parameter (e.g. `usize`).
+    #[serde(default)]
+    pub const_ty: Option<Type>,
 }
 
 /// Type constraints that can be applied to types
@@ -849,13 +855,14 @@ pub enum TypeBound {
 }
 
 /// Variance for type parameters
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Variance {
     /// Covariant: can substitute subtype for supertype
     Covariant,
     /// Contravariant: can substitute supertype for subtype
     Contravariant,
     /// Invariant: no substitution allowed
+    #[default]
     Invariant,
     /// Bivariant: both covariant and contravariant
     Bivariant,
@@ -1567,6 +1574,7 @@ impl TypeRegistry {
                 variance: Variance::Covariant,
                 default: None,
                 span,
+                ..Default::default()
             },
             TypeParam {
                 name: e_param_name,
@@ -1574,6 +1582,7 @@ impl TypeRegistry {
                 variance: Variance::Covariant,
                 default: None,
                 span,
+                ..Default::default()
             },
         ];
 
@@ -1625,6 +1634,7 @@ impl TypeRegistry {
             variance: Variance::Covariant,
             default: None,
             span,
+            ..Default::default()
         }];
 
         // Define variants: Some(T) and None
@@ -1833,6 +1843,7 @@ impl TypeRegistry {
                     variance: Variance::Invariant,
                     default: Some(self_type.clone()),
                     span,
+                    ..Default::default()
                 }],
                 super_traits: vec![],
                 methods: vec![
@@ -1947,6 +1958,7 @@ impl TypeRegistry {
                     variance: Variance::Invariant,
                     default: Some(self_type.clone()),
                     span,
+                    ..Default::default()
                 }],
                 super_traits: vec![],
                 methods: vec![
@@ -2000,6 +2012,7 @@ impl TypeRegistry {
                     variance: Variance::Contravariant,
                     default: None,
                     span,
+                    ..Default::default()
                 }],
                 super_traits: vec![],
                 methods: vec![MethodSig {
@@ -2059,6 +2072,7 @@ impl TypeRegistry {
                     variance: Variance::Contravariant,
                     default: None,
                     span,
+                    ..Default::default()
                 }],
                 super_traits: vec![],
                 methods: vec![MethodSig {
@@ -2413,6 +2427,7 @@ impl TypeRegistry {
                 variance: Variance::Invariant,
                 default: Some(self_type.clone()),
                 span: *span,
+                ..Default::default()
             }],
             super_traits: vec![],
             methods: vec![MethodSig {

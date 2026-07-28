@@ -917,6 +917,7 @@ fn test_where_clause_constraints() {
         variance: Variance::Invariant,
         default: None,
         span,
+        ..Default::default()
     };
 
     // Create a method with where clause: where T: Display + Clone
@@ -1033,6 +1034,7 @@ fn test_generic_method_instantiation() {
                 variance: Variance::Invariant,
                 default: None,
                 span,
+                ..Default::default()
             }],
             params: vec![],
             return_type: Type::Named {

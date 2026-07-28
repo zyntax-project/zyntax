@@ -461,6 +461,7 @@ fn test_generic_type_handling() {
         variance: Variance::Invariant,
         default: None,
         span: Span::new(0, 10),
+        ..Default::default()
     };
 
     // Create a generic type definition
