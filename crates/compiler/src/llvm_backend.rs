@@ -2927,7 +2927,11 @@ impl<'ctx> LLVMBackend<'ctx> {
         let f64_ty = self.context.f64_type();
         let want_f64 = (left.is_float_value() && left.into_float_value().get_type() == f64_ty)
             || (right.is_float_value() && right.into_float_value().get_type() == f64_ty);
-        let target = if want_f64 { f64_ty } else { self.context.f32_type() };
+        let target = if want_f64 {
+            f64_ty
+        } else {
+            self.context.f32_type()
+        };
         Ok((
             self.coerce_to_float(left, target)?,
             self.coerce_to_float(right, target)?,
