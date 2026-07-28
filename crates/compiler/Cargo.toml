@@ -70,14 +70,16 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 beadie = "0.3"
 
 # Optional features for backend support
-# Pulled from wasmtime main branch for Cranelift 0.133 — needed for
-# newer mem2reg/GVN/LICM behavior on the SROA + LICM retry.
-cranelift = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
-cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
-cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
-cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
-cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
-cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
+# Pinned to a specific wasmtime commit (not `branch = "main"`) so a
+# zyntax main checkout resolves the same Cranelift build every time and
+# downstream projects can depend on it reproducibly. Bump the rev
+# deliberately. This rev carries the x64 VNNI vpdpbusd (VEX + EVEX) work.
+cranelift = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
+cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
+cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
 inkwell = { version = "0.7.1", features = ["llvm21-1"], optional = true }  # LLVM bindings
 
 # Wasm encoder for the hot-function tier-1 JIT (Phase E). Optional
