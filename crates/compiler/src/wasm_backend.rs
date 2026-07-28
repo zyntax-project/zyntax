@@ -1029,8 +1029,41 @@ impl<'a> FunctionEmitter<'a> {
                 let lhs = self.local_get(*left)?;
                 let rhs = self.local_get(*right)?;
                 let dst = self.local_set(*result)?;
+                // A scalar float op emits `F64*` and needs both operands as
+                // f64 (the funnel). Coerce an int operand (i64 -> f64) or an
+                // f32 operand (promote) first, else wasm mis-validates on a
+                // mixed `float + int`. Mirror of the Cranelift/LLVM reconcile;
+                // vectors are handled by `emit_vector_binary` below.
+                let float_scalar = !matches!(ty, HirType::Vector(..))
+                    && (matches!(ty, HirType::F32 | HirType::F64)
+                        || matches!(
+                            op,
+                            BinaryOp::FAdd
+                                | BinaryOp::FSub
+                                | BinaryOp::FMul
+                                | BinaryOp::FDiv
+                                | BinaryOp::FRem
+                                | BinaryOp::FEq
+                                | BinaryOp::FNe
+                                | BinaryOp::FLt
+                                | BinaryOp::FLe
+                                | BinaryOp::FGt
+                                | BinaryOp::FGe
+                        ));
+                let lconv = float_scalar
+                    .then(|| self.wasm_widen_operand_to_f64(*left))
+                    .flatten();
+                let rconv = float_scalar
+                    .then(|| self.wasm_widen_operand_to_f64(*right))
+                    .flatten();
                 out.push(lhs);
+                if let Some(c) = lconv {
+                    out.push(c);
+                }
                 out.push(rhs);
+                if let Some(c) = rconv {
+                    out.push(c);
+                }
                 if let HirType::Vector(elem, _) = ty {
                     emit_vector_binary(out, *op, elem)?;
                 } else {
@@ -1967,6 +2000,22 @@ impl<'a> FunctionEmitter<'a> {
         }
     }
 
+    /// The wasm instruction that widens operand `id` to f64 for a scalar float
+    /// op: an int (i64 in the funnel) via `F64Convert`, an f32 via `F64Promote`.
+    /// Already-f64 or a non-numeric operand needs nothing.
+    fn wasm_widen_operand_to_f64(&self, id: HirId) -> Option<WasmInst<'static>> {
+        match self.func.values.get(&id).map(|v| &v.ty) {
+            Some(HirType::F32) => Some(WasmInst::F64PromoteF32),
+            Some(HirType::I8 | HirType::I16 | HirType::I32 | HirType::I64) => {
+                Some(WasmInst::F64ConvertI64S)
+            }
+            Some(HirType::U8 | HirType::U16 | HirType::U32 | HirType::U64) => {
+                Some(WasmInst::F64ConvertI64U)
+            }
+            _ => None,
+        }
+    }
+
     fn local_get(&self, id: HirId) -> Result<WasmInst<'static>> {
         let idx = *self
             .local_map
@@ -2321,6 +2370,80 @@ mod tests {
             .compile_function(&func)
             .expect("emit add");
         m.validate_full().expect("module structurally valid");
+    }
+
+    #[test]
+    fn reconciles_float_plus_int() {
+        // `def f(x: f64, i: i64): f64 { return x + i }` — the int operand must
+        // be widened to f64 (F64ConvertI64S) before F64Add, else the module
+        // fails wasm validation with a type mismatch.
+        let p0 = HirId::new();
+        let p1 = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![
+                HirParam {
+                    id: p0,
+                    name: InternedString::new_global("x"),
+                    ty: HirType::F64,
+                    attributes: ParamAttributes::default(),
+                },
+                HirParam {
+                    id: p1,
+                    name: InternedString::new_global("i"),
+                    ty: HirType::I64,
+                    attributes: ParamAttributes::default(),
+                },
+            ],
+            returns: vec![HirType::F64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("f"), sig);
+        func.values.insert(
+            p0,
+            HirValue {
+                id: p0,
+                ty: HirType::F64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        func.values.insert(
+            p1,
+            HirValue {
+                id: p1,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(1),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        // `Add` + `ty=F64` is how the wasm backend represents a float add
+        // (`emit_binary_op` maps it to `F64Add`); the F-prefixed float ops are
+        // a separate, unsupported gap on this tier.
+        let sum = add_value(&mut func, HirType::F64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Binary {
+            result: sum,
+            op: BinaryOp::Add,
+            ty: HirType::F64,
+            left: p0,
+            right: p1,
+        });
+        entry.terminator = HirTerminator::Return { values: vec![sum] };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit float+int");
+        m.validate_full()
+            .expect("float + int must validate (int widened to f64)");
     }
 
     /// Build an empty extra block keyed by `id` and graft it onto
