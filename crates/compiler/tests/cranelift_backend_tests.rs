@@ -3549,15 +3549,10 @@ fn test_vector_dot_i8x16_executes() {
 /// zero-extended — the u8×i8 form) folds to a single `vpdpbusd` through the
 /// Cranelift tier: the x64 analogue of the aarch64 `sdot` fold. Proves
 /// Zyntax's quantized dot reaches the fused instruction on VNNI hardware.
-///
-/// Ignored by default: the fold requires a Cranelift build whose x64 backend
-/// lowers the widening-dot tree to `vpdpbusd`, which the pinned release does
-/// not yet carry. Against a stock Cranelift the tree lowers to the portable
-/// widening chain (still correct, just not fused), so the disasm assert would
-/// not hold. Un-ignore once the pinned Cranelift gains the VNNI lowering.
+/// Runs only on an AVX-VNNI x86_64 host; the disasm assert is guarded on
+/// `is_x86_feature_detected!`, so it is a no-op on other x86_64 CPUs.
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "requires a Cranelift build with x64 AVX-VNNI (vpdpbusd) lowering"]
 fn test_vector_dot_i8x16_vpdpbusd() {
     let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
     let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
