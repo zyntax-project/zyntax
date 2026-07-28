@@ -5343,6 +5343,15 @@ impl SsaBuilder {
                             let offset = offsets[i] as i64;
                             let field_ty = hir_struct.fields[i].clone();
 
+                            // Coerce the initializer to the field's declared
+                            // width before storing. An integer literal types as
+                            // i32, so `n: i64 = 0` would otherwise `Store` a
+                            // 4-byte value into an 8-byte slot, leaving the high
+                            // bytes of the freshly malloc'd (uninitialized) region
+                            // intact — a garbage read on any allocator that
+                            // doesn't hand back zeroed memory.
+                            let field_val = self.coerce_scalar_to(block_id, field_val, &field_ty);
+
                             let offset_id = self.create_value(
                                 HirType::I64,
                                 HirValueKind::Constant(crate::hir::HirConstant::I64(offset)),
