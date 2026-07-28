@@ -844,6 +844,24 @@ impl<'a, D: DiagnosticDisplay> fmt::Display for DisplayWrapper<'a, D> {
     }
 }
 
+/// Whether diagnostics should be colourised for this process.
+///
+/// The usual convention, in the usual order: `NO_COLOR` set to anything
+/// non-empty turns colour off, `CLICOLOR_FORCE` set to anything but `0`
+/// turns it on regardless, and otherwise it follows whether stderr is a
+/// terminal. Piping to a file or a pager, and any captured test
+/// harness, therefore get plain text without having to ask.
+pub fn colors_enabled() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0") {
+        return true;
+    }
+    std::io::stderr().is_terminal()
+}
+
 /// Render one diagnostic against one file, as a snippet box.
 ///
 /// The full machinery wants a [`SourceMap`] and a [`DiagnosticDisplay`],

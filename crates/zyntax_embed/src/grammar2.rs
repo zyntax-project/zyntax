@@ -88,8 +88,23 @@ fn readable_expectations(expected: &[String]) -> Vec<String> {
 }
 
 impl Grammar2Error {
+    /// [`Grammar2Error::render`], colourised when the process is
+    /// attached to a terminal. See
+    /// [`zyntax_typed_ast::diagnostics::colors_enabled`] for the rules.
+    ///
+    /// This is what a CLI or a dev loop wants. Reach for `render(false)`
+    /// when the string goes somewhere that can't interpret escapes: a
+    /// log file, a UI label, a test assertion.
+    pub fn render_auto(&self) -> Option<String> {
+        self.render(zyntax_typed_ast::diagnostics::colors_enabled())
+    }
+
     /// Render as a source snippet with the failure underlined, or
     /// `None` for errors that carry no source to point at.
+    ///
+    /// The result is a block and begins on its own line, so appending
+    /// it to a log line ("... error={e}") puts the box under that line
+    /// rather than starting it halfway along.
     ///
     /// `use_colors` should be false for anything but a terminal.
     pub fn render(&self, use_colors: bool) -> Option<String> {
@@ -155,12 +170,13 @@ impl Grammar2Error {
                 n => format!("{n} other alternatives were possible here"),
             });
         }
-        Some(zyntax_typed_ast::diagnostics::render_diagnostic(
+        let report = zyntax_typed_ast::diagnostics::render_diagnostic(
             &diagnostic,
             file,
             source_text,
             use_colors,
-        ))
+        );
+        Some(format!("\n{report}"))
     }
 }
 
