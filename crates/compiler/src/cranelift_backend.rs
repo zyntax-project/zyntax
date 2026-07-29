@@ -3871,26 +3871,29 @@ impl CraneliftBackend {
                                 call_args.push(arg_val);
                             }
 
-                            // Step 5: Create function signature for indirect call
-                            // Build signature: first parameter is always self (data pointer)
-                            let mut param_types: Vec<AbiParam> = vec![AbiParam::new(ptr_type)]; // self
+                            // Step 5: Create function signature for indirect call.
+                            // Start from the module's default calling convention
+                            // (the platform ABI: SystemV on Unix x86_64,
+                            // WindowsFastcall on x86_64-msvc, AppleAarch64 on ARM
+                            // macOS) so the indirect call matches how the callee
+                            // was compiled. Hard-coding `SystemV` here made the
+                            // async poll fn — reached via `CreateClosure` — read a
+                            // garbage state-machine pointer on Windows (args landed
+                            // in SysV registers like rdi while the WindowsFastcall
+                            // callee read rcx), returning garbage for every async
+                            // execution. Same root cause and fix as the indirect
+                            // call site above.
+                            let mut sig = self.module.make_signature();
+                            sig.params.push(AbiParam::new(ptr_type)); // self (data ptr)
                             for _ in args {
                                 // TODO: Use actual types from method_sig.params
-                                param_types.push(AbiParam::new(ptr_type));
+                                sig.params.push(AbiParam::new(ptr_type));
                             }
-
-                            let return_types = if matches!(return_ty, HirType::Void) {
-                                vec![]
-                            } else {
+                            if !matches!(return_ty, HirType::Void) {
                                 // TODO: Translate return_ty from method_sig
-                                vec![AbiParam::new(ptr_type)]
-                            };
-
-                            let sig = builder.func.import_signature(Signature {
-                                params: param_types,
-                                returns: return_types,
-                                call_conv: CallConv::SystemV,
-                            });
+                                sig.returns.push(AbiParam::new(ptr_type));
+                            }
+                            let sig = builder.func.import_signature(sig);
 
                             // Step 6: Perform indirect call
                             let call_inst = builder.ins().call_indirect(sig, func_ptr, &call_args);
