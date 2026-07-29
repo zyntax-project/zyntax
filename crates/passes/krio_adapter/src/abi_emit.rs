@@ -25,9 +25,9 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use krio_async::StateMachineLayout;
 use zyntax_compiler::hir::{
-    BinaryOp, CastOp, HirBlock, HirCallable, HirConstant, HirFunction, HirFunctionSignature,
-    HirFunctionType, HirId, HirInstruction, HirParam, HirStructType, HirTerminator, HirType,
-    HirValue, HirValueKind, Intrinsic, ParamAttributes,
+    BinaryOp, CallingConvention, CastOp, HirBlock, HirCallable, HirConstant, HirFunction,
+    HirFunctionSignature, HirFunctionType, HirId, HirInstruction, HirParam, HirStructType,
+    HirTerminator, HirType, HirValue, HirValueKind, Intrinsic, ParamAttributes,
 };
 use zyntax_typed_ast::InternedString;
 
@@ -1912,6 +1912,15 @@ pub fn reshape_to_poll_abi(
     layout: &StateMachineLayout<HirBlockId, HirLocalId, HirFnId>,
     param_slots: &[(HirId, u32)],
 ) -> InternedString {
+    // The runtime invokes the poll fn through an `extern "C"` transmute
+    // (`fn(*mut u8) -> i64`), so it must carry the platform default
+    // calling convention. `CallingConvention::Fast` lowers to Cranelift's
+    // `Fast` (SystemV-flavoured on x86_64 — matches `extern "C"` on Unix
+    // by coincidence) but on x86_64-msvc it does NOT match Win64, so the
+    // poll fn would read its state-machine pointer from the wrong
+    // register. Pin it to `C` (= WindowsFastcall on Windows).
+    function.calling_convention = CallingConvention::C;
+
     let original_return_ty = function
         .signature
         .returns
@@ -2255,6 +2264,12 @@ pub fn generate_promise_entry(
     };
 
     let mut entry = HirFunction::new(original_name, entry_sig);
+    // The runtime calls this entry through an `extern "C"` transmute
+    // (`call_with_signature`), so it must use the platform default ABI.
+    // `HirFunction::new` defaults to `Fast`, which mismatches Win64 on
+    // x86_64-msvc (args land in SysV registers while the caller uses MS
+    // x64), making the entry read a garbage first argument on Windows.
+    entry.calling_convention = CallingConvention::C;
 
     // Re-mint param SSA values so they're owned by THIS function.
     // The new param HirIds match the entry's signature.params.id.
@@ -2522,6 +2537,10 @@ pub fn generate_sync_entry(
     };
 
     let mut entry = HirFunction::new(original_name, entry_sig);
+    // Runtime-called via `extern "C"` transmute → must use the platform
+    // default ABI, not `HirFunction::new`'s `Fast` default (mismatches
+    // Win64 on x86_64-msvc). See `generate_promise_entry`.
+    entry.calling_convention = CallingConvention::C;
 
     // Re-mint params for this function.
     for (i, p) in original_signature.params.iter().enumerate() {
