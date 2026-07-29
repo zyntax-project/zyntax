@@ -58,6 +58,7 @@ pub mod memory_pass;
 pub mod monomorphize;
 pub mod optimization;
 pub mod pattern_matching;
+pub mod pure_call_pre;
 pub mod purity;
 pub mod reduction_vectorize;
 pub mod runtime;
@@ -1698,6 +1699,7 @@ pub struct InterpOptStats {
     pub drop_insert: drop_insert::DropStats,
     pub tco: tco::TcoStats,
     pub recursive_inline: inline::RecursiveInlineStats,
+    pub pure_call_pre: pure_call_pre::PureCallPreStats,
 }
 
 /// Run the subset of HIR optimization passes that are safe for the
@@ -1964,11 +1966,16 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     // Recursive self-inlining above can leave two inlined copies of a
     // body sharing a pure sub-call — e.g. the depth-1 inline of `fib`
     // makes both the `fib(n-1)` and `fib(n-2)` expansions call
-    // `fib(n-3)`. Re-infer purity (inlining rewrote bodies) and re-run
-    // CSE so any such duplicate that sits in a dominance relationship
-    // collapses. (The cross-branch case is handled by a dedicated pass
-    // added next.)
+    // `fib(n-3)`. Re-infer purity (inlining rewrote bodies), then:
+    //   * `pure_call_pre` hoists the shared call across the two base-case
+    //     branches to their common dominator (the cross-branch case
+    //     dominator-CSE can't reach), gated on speculation-safety, and
+    //   * `cse` collapses any remaining duplicate that already sits in a
+    //     dominance relationship.
     purity::infer_module(module);
+    let pcp = pure_call_pre::run_module(module);
+    stats.pure_call_pre.hoisted += pcp.hoisted;
+    stats.pure_call_pre.groups_visited += pcp.groups_visited;
     let post_ri_cse = cse::eliminate_module(module);
     stats.cse.eliminated += post_ri_cse.eliminated;
     stats.cse.rewrites += post_ri_cse.rewrites;

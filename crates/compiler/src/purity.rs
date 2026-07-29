@@ -40,7 +40,9 @@
 //! is deliberately narrow: only instructions whose result is a pure
 //! function of their SSA operands are allowed.
 
-use crate::hir::{HirCallable, HirFunction, HirId, HirInstruction, HirModule};
+use crate::hir::{
+    BinaryOp, HirCallable, HirFunction, HirId, HirInstruction, HirModule, HirValueKind,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Stats surfaced for callers / tests.
@@ -176,6 +178,407 @@ fn locally_pure_callees(func: &HirFunction) -> Option<Vec<HirId>> {
         }
     }
     Some(callees)
+}
+
+// ─── Speculation safety (totality + no-fault) ─────────────────────────
+//
+// A pure function can be *speculated* — evaluated on a path where the
+// source program wouldn't have called it — only if doing so can never
+// change observable behaviour. Purity already rules out effects; what's
+// left is: the call must always terminate and never fault. This is the
+// gate the cross-branch pure-call hoist ([`crate::pure_call_pre`]) needs
+// before it may move a call to a dominating block that runs more often
+// than the original call sites.
+//
+// The analysis is deliberately narrow. It certifies a function only when
+// termination is structurally obvious:
+//   * pure (no effects) and non-faulting (no integer div/rem, which trap
+//     on zero),
+//   * an acyclic CFG (no intra-function loop that could spin forever),
+//   * every callee is itself speculation-safe, and
+//   * if self-recursive, the recursion is well-founded: some integer
+//     parameter strictly decreases on every self-call and a range guard
+//     (`param < c` / `param <= c`) at the entry sends small values to a
+//     recursion-free base case. Decreasing an integer that bottoms out
+//     at a `<` guard terminates for every starting value — including the
+//     smaller/negative ones a speculative call might introduce.
+//
+// Mutual recursion, non-range base guards (`param == 0`), and anything
+// that doesn't fit are conservatively rejected: the worst case of a
+// rejection is a missed optimisation, whereas a wrong acceptance is a
+// hang. `Add`/`Sub` are the only offset-bearing ops modelled, matching
+// [`crate::cse`]'s affine normalisation.
+
+/// The set of functions safe to speculatively evaluate. Requires purity
+/// to have been inferred already (reads `signature.is_pure`).
+pub fn speculation_safe_module(module: &HirModule) -> HashSet<HirId> {
+    let mut candidate: HashSet<HirId> = HashSet::new();
+    let mut callees_of: HashMap<HirId, HashSet<HirId>> = HashMap::new();
+    for (id, f) in &module.functions {
+        if f.is_external || f.blocks.is_empty() || !f.signature.is_pure {
+            continue;
+        }
+        if has_faulting_op(f) || !cfg_is_acyclic(f) {
+            continue;
+        }
+        candidate.insert(*id);
+        callees_of.insert(*id, direct_function_callees(f));
+    }
+
+    let mut safe: HashSet<HirId> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for id in &candidate {
+            if safe.contains(id) {
+                continue;
+            }
+            let callees = &callees_of[id];
+            // Every non-self callee must already be certified safe. A
+            // callee outside `candidate` (impure / faulting / looping /
+            // external) can never enter `safe`, so this also rejects any
+            // function reaching such a callee.
+            let non_self_all_safe = callees
+                .iter()
+                .filter(|c| **c != *id)
+                .all(|c| safe.contains(c));
+            if !non_self_all_safe {
+                continue;
+            }
+            let self_recursive = callees.contains(id);
+            let ok = if self_recursive {
+                structurally_decreasing(&module.functions[id])
+            } else {
+                true
+            };
+            if ok {
+                safe.insert(*id);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    safe
+}
+
+/// Any instruction that can trap at runtime disqualifies speculation.
+/// Integer `Div`/`Rem` trap on a zero divisor; a speculative call could
+/// hit a divisor the original control flow avoided.
+fn has_faulting_op(func: &HirFunction) -> bool {
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Binary {
+                op: BinaryOp::Div | BinaryOp::Rem,
+                ..
+            } = inst
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Direct `Function` callees (as a set).
+fn direct_function_callees(func: &HirFunction) -> HashSet<HirId> {
+    let mut s = HashSet::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Call {
+                callee: HirCallable::Function(fid),
+                ..
+            } = inst
+            {
+                s.insert(*fid);
+            }
+        }
+    }
+    s
+}
+
+/// True when the block CFG has no cycle (a loop could run forever, which
+/// would make a speculated call non-terminating). DFS with a colour
+/// marking; a grey→grey edge is a back-edge.
+fn cfg_is_acyclic(func: &HirFunction) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Colour {
+        White,
+        Grey,
+        Black,
+    }
+    let mut colour: HashMap<HirId, Colour> =
+        func.blocks.keys().map(|k| (*k, Colour::White)).collect();
+    // Iterative DFS with an explicit stack of (block, child-index).
+    let mut stack: Vec<(HirId, usize)> = Vec::new();
+    let entry = func.entry_block;
+    if !func.blocks.contains_key(&entry) {
+        return true;
+    }
+    stack.push((entry, 0));
+    colour.insert(entry, Colour::Grey);
+    while let Some((blk, idx)) = stack.pop() {
+        let succ = successors(func, blk);
+        if idx < succ.len() {
+            stack.push((blk, idx + 1));
+            let next = succ[idx];
+            match colour.get(&next).copied().unwrap_or(Colour::Black) {
+                Colour::Grey => return false, // back-edge → cycle
+                Colour::White => {
+                    colour.insert(next, Colour::Grey);
+                    stack.push((next, 0));
+                }
+                Colour::Black => {}
+            }
+        } else {
+            colour.insert(blk, Colour::Black);
+        }
+    }
+    true
+}
+
+/// Successor blocks of `blk` per its terminator.
+fn successors(func: &HirFunction, blk: HirId) -> Vec<HirId> {
+    use crate::hir::HirTerminator::*;
+    match &func.blocks[&blk].terminator {
+        Return { .. } | Unreachable => vec![],
+        Branch { target } => vec![*target],
+        CondBranch {
+            true_target,
+            false_target,
+            ..
+        } => vec![*true_target, *false_target],
+        Switch { default, cases, .. } => {
+            let mut v = vec![*default];
+            v.extend(cases.iter().map(|(_, t)| *t));
+            v
+        }
+        Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+        PatternMatch {
+            default, patterns, ..
+        } => {
+            let mut v: Vec<HirId> = patterns.iter().map(|p| p.target).collect();
+            if let Some(d) = default {
+                v.push(*d);
+            }
+            v
+        }
+    }
+}
+
+/// Well-founded self-recursion check: some integer parameter strictly
+/// decreases on every self-call, and a range guard at the entry routes
+/// small values to a recursion-free base. See the module note above for
+/// why this guarantees termination on every input.
+fn structurally_decreasing(func: &HirFunction) -> bool {
+    let self_id = func.id;
+    // param index → value id.
+    let mut param_id: HashMap<u32, HirId> = HashMap::new();
+    for (id, v) in &func.values {
+        if let HirValueKind::Parameter(idx) = v.kind {
+            param_id.insert(idx, *id);
+        }
+    }
+    if param_id.is_empty() {
+        return false;
+    }
+    let bin_defs = affine_bin_defs(func);
+    let int_consts = affine_int_consts(func);
+
+    // All self-calls, with their argument lists.
+    let self_calls: Vec<&Vec<HirId>> = func
+        .blocks
+        .values()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Function(fid),
+                args,
+                ..
+            } if *fid == self_id => Some(args),
+            _ => None,
+        })
+        .collect();
+    if self_calls.is_empty() {
+        return false;
+    }
+
+    // Try each parameter position as the decreasing measure.
+    for (&idx, &pid) in &param_id {
+        // Every self-call must strictly decrease param `idx`.
+        let decreases = self_calls.iter().all(|args| {
+            args.get(idx as usize)
+                .map(|a| {
+                    let (base, off) = affine_of(*a, &bin_defs, &int_consts);
+                    base == pid && off < 0
+                })
+                .unwrap_or(false)
+        });
+        if !decreases {
+            continue;
+        }
+        if entry_range_guard_to_base(func, pid, &bin_defs, &int_consts, self_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The entry block must branch on `x < c` / `x <= c` where `x` is an
+/// affine form of `pid`, with the true (small-value) side reaching no
+/// self-call — a genuine recursion-free base case for small inputs.
+fn entry_range_guard_to_base(
+    func: &HirFunction,
+    pid: HirId,
+    bin_defs: &HashMap<HirId, (BinaryOp, HirId, HirId)>,
+    int_consts: &HashMap<HirId, i128>,
+    self_id: HirId,
+) -> bool {
+    let entry = match func.blocks.get(&func.entry_block) {
+        Some(b) => b,
+        None => return false,
+    };
+    let crate::hir::HirTerminator::CondBranch {
+        condition,
+        true_target,
+        false_target,
+    } = &entry.terminator
+    else {
+        return false;
+    };
+    // The condition must be `Lt`/`Le` with the affine-of-pid on the left
+    // and a constant on the right (`x < c`), so the true side is the
+    // small-value side.
+    let Some((op, left, right)) = bin_defs
+        .get(condition)
+        .copied()
+        .and_then(|(op, l, r)| matches!(op, BinaryOp::Lt | BinaryOp::Le).then_some((op, l, r)))
+    else {
+        return false;
+    };
+    let _ = op;
+    let (lbase, _loff) = affine_of(left, bin_defs, int_consts);
+    if lbase != pid || !int_consts.contains_key(&right) {
+        return false;
+    }
+    // No self-call may be reachable from the true (base) side, and the
+    // false side is where recursion lives.
+    !self_call_reachable(func, *true_target, self_id) && {
+        let _ = false_target;
+        true
+    }
+}
+
+/// Is a call to `self_id` reachable from `start` (inclusive)?
+fn self_call_reachable(func: &HirFunction, start: HirId, self_id: HirId) -> bool {
+    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        let Some(block) = func.blocks.get(&b) else {
+            continue;
+        };
+        for inst in &block.instructions {
+            if let HirInstruction::Call {
+                callee: HirCallable::Function(fid),
+                ..
+            } = inst
+            {
+                if *fid == self_id {
+                    return true;
+                }
+            }
+        }
+        stack.extend(successors(func, b));
+    }
+    false
+}
+
+// ─── Small affine resolver (shared shape with `cse`) ──────────────────
+
+fn affine_bin_defs(func: &HirFunction) -> HashMap<HirId, (BinaryOp, HirId, HirId)> {
+    let mut m = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Lt | BinaryOp::Le),
+                result,
+                left,
+                right,
+                ..
+            } = inst
+            {
+                m.insert(*result, (*op, *left, *right));
+            }
+        }
+    }
+    m
+}
+
+fn affine_int_consts(func: &HirFunction) -> HashMap<HirId, i128> {
+    let mut m = HashMap::new();
+    for (id, v) in &func.values {
+        if let HirValueKind::Constant(c) = &v.kind {
+            let iv = match c {
+                crate::hir::HirConstant::I8(x) => *x as i128,
+                crate::hir::HirConstant::I16(x) => *x as i128,
+                crate::hir::HirConstant::I32(x) => *x as i128,
+                crate::hir::HirConstant::I64(x) => *x as i128,
+                crate::hir::HirConstant::I128(x) => *x,
+                crate::hir::HirConstant::U8(x) => *x as i128,
+                crate::hir::HirConstant::U16(x) => *x as i128,
+                crate::hir::HirConstant::U32(x) => *x as i128,
+                crate::hir::HirConstant::U64(x) => *x as i128,
+                _ => continue,
+            };
+            m.insert(*id, iv);
+        }
+    }
+    m
+}
+
+/// Canonical `(base, offset)` for an integer value via `add`/`sub` by a
+/// constant. Only `+c` / `-c` shift the offset; anything else is a base.
+fn affine_of(
+    id: HirId,
+    bin_defs: &HashMap<HirId, (BinaryOp, HirId, HirId)>,
+    int_consts: &HashMap<HirId, i128>,
+) -> (HirId, i128) {
+    fn go(
+        id: HirId,
+        bin_defs: &HashMap<HirId, (BinaryOp, HirId, HirId)>,
+        int_consts: &HashMap<HirId, i128>,
+        depth: u32,
+    ) -> (HirId, i128) {
+        if depth > 64 {
+            return (id, 0);
+        }
+        if let Some((op, l, r)) = bin_defs.get(&id).copied() {
+            match op {
+                BinaryOp::Add => {
+                    if let Some(c) = int_consts.get(&r) {
+                        let (b, o) = go(l, bin_defs, int_consts, depth + 1);
+                        return (b, o.wrapping_add(*c));
+                    }
+                    if let Some(c) = int_consts.get(&l) {
+                        let (b, o) = go(r, bin_defs, int_consts, depth + 1);
+                        return (b, o.wrapping_add(*c));
+                    }
+                }
+                BinaryOp::Sub => {
+                    if let Some(c) = int_consts.get(&r) {
+                        let (b, o) = go(l, bin_defs, int_consts, depth + 1);
+                        return (b, o.wrapping_sub(*c));
+                    }
+                }
+                _ => {}
+            }
+        }
+        (id, 0)
+    }
+    go(id, bin_defs, int_consts, 0)
 }
 
 #[cfg(test)]
@@ -383,5 +786,126 @@ mod tests {
             !m.functions[&cid].signature.is_pure,
             "caller of impure fn must be demoted"
         );
+    }
+
+    // ─── speculation-safety (totality gate) ──────────────────────────
+
+    /// Build a self-recursive `fib`-shaped function:
+    ///   entry: c = <guard_op>(n, 2); brcond c -> base, rec
+    ///   base:  return n
+    ///   rec:   a = n <arg_op> 1; r = call self(a); return r
+    /// The knobs let tests flip individual termination preconditions.
+    fn mk_recursive(
+        guard_op: BinaryOp,
+        arg_op: BinaryOp,
+        add_back_edge: bool,
+    ) -> (HirModule, HirId) {
+        let mut m = HirModule::new(InternedString::new_global("m"));
+        let mut f = mk("rec");
+        let fid = f.id;
+        let entry = f.entry_block;
+        let base = HirId::new();
+        let rec = HirId::new();
+        f.blocks.insert(base, HirBlock::new(base));
+        f.blocks.insert(rec, HirBlock::new(rec));
+
+        let n = param(&mut f, 0);
+        let two = konst(&mut f, HirConstant::I64(2));
+        let one = konst(&mut f, HirConstant::I64(1));
+
+        // entry: c = guard(n, 2); brcond c -> base, rec
+        let c = result(&mut f);
+        f.blocks
+            .get_mut(&entry)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: guard_op,
+                result: c,
+                ty: HirType::I64,
+                left: n,
+                right: two,
+            });
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::CondBranch {
+            condition: c,
+            true_target: base,
+            false_target: rec,
+        };
+
+        // base: return n
+        f.blocks.get_mut(&base).unwrap().terminator = HirTerminator::Return { values: vec![n] };
+
+        // rec: a = n arg_op 1 ; r = call self(a) ; return r  (+opt back-edge)
+        let a = result(&mut f);
+        f.blocks
+            .get_mut(&rec)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: arg_op,
+                result: a,
+                ty: HirType::I64,
+                left: n,
+                right: one,
+            });
+        let r = result(&mut f);
+        f.blocks
+            .get_mut(&rec)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Call {
+                result: Some(r),
+                callee: HirCallable::Function(fid),
+                args: vec![a],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+        f.blocks.get_mut(&rec).unwrap().terminator = if add_back_edge {
+            // A back-edge rec -> entry makes the CFG cyclic.
+            HirTerminator::Branch { target: entry }
+        } else {
+            HirTerminator::Return { values: vec![r] }
+        };
+
+        m.functions.insert(fid, f);
+        (m, fid)
+    }
+
+    #[test]
+    fn fib_shape_is_speculation_safe() {
+        // decreasing arg (n-1), range guard (n < 2), acyclic → total.
+        let (mut m, fid) = mk_recursive(BinaryOp::Lt, BinaryOp::Sub, false);
+        infer_module(&mut m);
+        let safe = speculation_safe_module(&m);
+        assert!(
+            safe.contains(&fid),
+            "fib-shaped fn should be speculation-safe"
+        );
+    }
+
+    #[test]
+    fn equality_base_guard_is_not_safe() {
+        // `n == 2` base guard doesn't cover small/negative values, so a
+        // speculated call could recurse forever → must be rejected.
+        let (mut m, fid) = mk_recursive(BinaryOp::Eq, BinaryOp::Sub, false);
+        infer_module(&mut m);
+        assert!(!speculation_safe_module(&m).contains(&fid));
+    }
+
+    #[test]
+    fn increasing_arg_is_not_safe() {
+        // self-call passes n+1 (grows away from the base) → not total.
+        let (mut m, fid) = mk_recursive(BinaryOp::Lt, BinaryOp::Add, false);
+        infer_module(&mut m);
+        assert!(!speculation_safe_module(&m).contains(&fid));
+    }
+
+    #[test]
+    fn looping_cfg_is_not_safe() {
+        // A back-edge makes the CFG cyclic; a loop could spin forever.
+        let (mut m, fid) = mk_recursive(BinaryOp::Lt, BinaryOp::Sub, true);
+        infer_module(&mut m);
+        assert!(!speculation_safe_module(&m).contains(&fid));
     }
 }
