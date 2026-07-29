@@ -2874,3 +2874,77 @@ fn mint_const_i64(values: &mut IndexMap<HirId, HirValue>, val: i64) -> HirId {
         HirValueKind::Constant(HirConstant::I64(val)),
     )
 }
+
+#[cfg(test)]
+mod calling_convention_tests {
+    use super::*;
+
+    /// A minimal `async fn f(x: i32) -> i32` signature plus its param id.
+    fn one_i32_param_sig() -> (HirFunctionSignature, HirId) {
+        let pid = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: pid,
+                name: InternedString::new_global("x"),
+                ty: HirType::I32,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I32],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: true,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        (sig, pid)
+    }
+
+    // The runtime invokes async entry/poll functions through `extern "C"`
+    // transmutes, so they must carry the platform-default calling
+    // convention (`C`), NOT `HirFunction::new`'s `Fast` default. On x86_64
+    // `Fast` is SystemV-flavoured and matches `extern "C"` on Unix by
+    // coincidence, but on x86_64-pc-windows-msvc it does not match Win64 —
+    // args land in the wrong registers and every JIT-executed async
+    // function returns garbage. These guard that fix from silently
+    // reverting if the generators are refactored.
+
+    #[test]
+    fn generated_promise_entry_uses_c_calling_convention() {
+        let (sig, pid) = one_i32_param_sig();
+        let entry = generate_promise_entry(
+            InternedString::new_global("double"),
+            &sig,
+            HirId::new(), // poll_fn_id
+            4,            // num_slots
+            &[(pid, 1)],  // param_slots (param at slot 1)
+            0,            // state_slot
+        );
+        assert_eq!(
+            entry.calling_convention,
+            CallingConvention::C,
+            "promise entry must use the platform-default ABI (see Win64 fix)"
+        );
+    }
+
+    #[test]
+    fn generated_sync_entry_uses_c_calling_convention() {
+        let (sig, pid) = one_i32_param_sig();
+        let entry = generate_sync_entry(
+            InternedString::new_global("double"),
+            &sig,
+            HirId::new(), // poll_fn_id
+            5,            // num_slots
+            &[(pid, 1)],  // param_slots
+            0,            // state_slot
+            2,            // refcount_slot
+        );
+        assert_eq!(
+            entry.calling_convention,
+            CallingConvention::C,
+            "sync entry must use the platform-default ABI (see Win64 fix)"
+        );
+    }
+}
