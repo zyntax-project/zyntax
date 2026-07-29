@@ -25,9 +25,9 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use krio_async::StateMachineLayout;
 use zyntax_compiler::hir::{
-    BinaryOp, CastOp, HirBlock, HirCallable, HirConstant, HirFunction, HirFunctionSignature,
-    HirFunctionType, HirId, HirInstruction, HirParam, HirStructType, HirTerminator, HirType,
-    HirValue, HirValueKind, Intrinsic, ParamAttributes,
+    BinaryOp, CallingConvention, CastOp, HirBlock, HirCallable, HirConstant, HirFunction,
+    HirFunctionSignature, HirFunctionType, HirId, HirInstruction, HirParam, HirStructType,
+    HirTerminator, HirType, HirValue, HirValueKind, Intrinsic, ParamAttributes,
 };
 use zyntax_typed_ast::InternedString;
 
@@ -1912,6 +1912,15 @@ pub fn reshape_to_poll_abi(
     layout: &StateMachineLayout<HirBlockId, HirLocalId, HirFnId>,
     param_slots: &[(HirId, u32)],
 ) -> InternedString {
+    // The runtime invokes the poll fn through an `extern "C"` transmute
+    // (`fn(*mut u8) -> i64`), so it must carry the platform default
+    // calling convention. `CallingConvention::Fast` lowers to Cranelift's
+    // `Fast` (SystemV-flavoured on x86_64 — matches `extern "C"` on Unix
+    // by coincidence) but on x86_64-msvc it does NOT match Win64, so the
+    // poll fn would read its state-machine pointer from the wrong
+    // register. Pin it to `C` (= WindowsFastcall on Windows).
+    function.calling_convention = CallingConvention::C;
+
     let original_return_ty = function
         .signature
         .returns
@@ -2255,6 +2264,12 @@ pub fn generate_promise_entry(
     };
 
     let mut entry = HirFunction::new(original_name, entry_sig);
+    // The runtime calls this entry through an `extern "C"` transmute
+    // (`call_with_signature`), so it must use the platform default ABI.
+    // `HirFunction::new` defaults to `Fast`, which mismatches Win64 on
+    // x86_64-msvc (args land in SysV registers while the caller uses MS
+    // x64), making the entry read a garbage first argument on Windows.
+    entry.calling_convention = CallingConvention::C;
 
     // Re-mint param SSA values so they're owned by THIS function.
     // The new param HirIds match the entry's signature.params.id.
@@ -2522,6 +2537,10 @@ pub fn generate_sync_entry(
     };
 
     let mut entry = HirFunction::new(original_name, entry_sig);
+    // Runtime-called via `extern "C"` transmute → must use the platform
+    // default ABI, not `HirFunction::new`'s `Fast` default (mismatches
+    // Win64 on x86_64-msvc). See `generate_promise_entry`.
+    entry.calling_convention = CallingConvention::C;
 
     // Re-mint params for this function.
     for (i, p) in original_signature.params.iter().enumerate() {
@@ -2854,4 +2873,78 @@ fn mint_const_i64(values: &mut IndexMap<HirId, HirValue>, val: i64) -> HirId {
         HirType::I64,
         HirValueKind::Constant(HirConstant::I64(val)),
     )
+}
+
+#[cfg(test)]
+mod calling_convention_tests {
+    use super::*;
+
+    /// A minimal `async fn f(x: i32) -> i32` signature plus its param id.
+    fn one_i32_param_sig() -> (HirFunctionSignature, HirId) {
+        let pid = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: pid,
+                name: InternedString::new_global("x"),
+                ty: HirType::I32,
+                attributes: ParamAttributes::default(),
+            }],
+            returns: vec![HirType::I32],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: true,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        (sig, pid)
+    }
+
+    // The runtime invokes async entry/poll functions through `extern "C"`
+    // transmutes, so they must carry the platform-default calling
+    // convention (`C`), NOT `HirFunction::new`'s `Fast` default. On x86_64
+    // `Fast` is SystemV-flavoured and matches `extern "C"` on Unix by
+    // coincidence, but on x86_64-pc-windows-msvc it does not match Win64 —
+    // args land in the wrong registers and every JIT-executed async
+    // function returns garbage. These guard that fix from silently
+    // reverting if the generators are refactored.
+
+    #[test]
+    fn generated_promise_entry_uses_c_calling_convention() {
+        let (sig, pid) = one_i32_param_sig();
+        let entry = generate_promise_entry(
+            InternedString::new_global("double"),
+            &sig,
+            HirId::new(), // poll_fn_id
+            4,            // num_slots
+            &[(pid, 1)],  // param_slots (param at slot 1)
+            0,            // state_slot
+        );
+        assert_eq!(
+            entry.calling_convention,
+            CallingConvention::C,
+            "promise entry must use the platform-default ABI (see Win64 fix)"
+        );
+    }
+
+    #[test]
+    fn generated_sync_entry_uses_c_calling_convention() {
+        let (sig, pid) = one_i32_param_sig();
+        let entry = generate_sync_entry(
+            InternedString::new_global("double"),
+            &sig,
+            HirId::new(), // poll_fn_id
+            5,            // num_slots
+            &[(pid, 1)],  // param_slots
+            0,            // state_slot
+            2,            // refcount_slot
+        );
+        assert_eq!(
+            entry.calling_convention,
+            CallingConvention::C,
+            "sync entry must use the platform-default ABI (see Win64 fix)"
+        );
+    }
 }
