@@ -28,6 +28,13 @@
 //!   * `Cast`
 //!   * `GetElementPtr`        — pure address arithmetic
 //!   * `ExtractValue`         — aggregate field read (no aliasing)
+//!   * `Call` to a proven-pure callee — its result depends only on its
+//!     arguments and it has no observable effect, so two such calls with
+//!     matching args are one value. Purity comes from
+//!     [`crate::purity`]; only functions in the supplied `pure_fns` set
+//!     qualify. Integer arguments are compared in a canonical affine
+//!     `(base, offset)` form, so `f((n-1)-2)` and `f((n-2)-1)` — both
+//!     `f(n-3)` — share a key.
 //!
 //! Commutative `Binary` ops (`Add`, `Mul`, `And`, `Or`, `Xor`, `Eq`,
 //! `Ne`, `FAdd`, `FMul`, `FEq`, `FNe`) get their operands sorted into
@@ -40,9 +47,10 @@
 //!
 //!   * `Load`           — could alias a `Store` between defs
 //!   * `Store` / atomics / fences — write effects
-//!   * `Call` / `IndirectCall` — arbitrary side effects, even
-//!                                marked-pure callees can read globals
-//!                                we don't model yet
+//!   * `Call` to an *impure* or non-`Function` callee (symbol /
+//!                                intrinsic / indirect) — may have side
+//!                                effects or read mutable state
+//!   * `IndirectCall`    — opaque target
 //!   * `Alloca`          — each one is a fresh allocation
 //!   * `CreateClosure`   — identity matters (each closure may have its
 //!                          own captured environment)
@@ -62,10 +70,24 @@
 
 use crate::analysis::DominatorTree;
 use crate::hir::{
-    BinaryOp, CastOp, HirCallable, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
-    UnaryOp,
+    BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
+    HirTerminator, HirType, HirValueKind, UnaryOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Read-only context threaded through the dominator walk: what's needed
+/// to value-number pure calls and affine integer expressions.
+struct CseCtx<'a> {
+    /// Functions proven pure by [`crate::purity`]. Only calls to these
+    /// are eligible for CSE — an impure call could observe or mutate
+    /// state, so two syntactically-identical impure calls are distinct.
+    pure_fns: &'a HashSet<HirId>,
+    /// `result → (op, left, right)` for every integer `Add`/`Sub`
+    /// binary, used to normalise chained constant offsets.
+    bin_defs: HashMap<HirId, (BinaryOp, HirId, HirId)>,
+    /// `id → integer value` for every integer constant.
+    int_consts: HashMap<HirId, i128>,
+}
 
 /// Counters surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +99,35 @@ pub struct CseStats {
     pub rewrites: usize,
 }
 
-/// Public entry. Runs CSE on a single function in place.
+/// Public entry. Runs CSE on a single function in place, with no
+/// cross-function purity knowledge — pure-call CSE is disabled (the
+/// `pure_fns` set is empty), so this behaves like the classic
+/// value-only CSE. Prefer [`eliminate_with`] when a purity set is
+/// available.
 pub fn eliminate(func: &mut HirFunction) -> CseStats {
+    eliminate_with(func, &HashSet::new())
+}
+
+/// CSE a single function, treating calls to any function in `pure_fns`
+/// as value-numbered (two identical pure calls collapse to one).
+pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseStats {
+    let ctx = CseCtx {
+        pure_fns,
+        bin_defs: collect_bin_defs(func),
+        int_consts: collect_int_consts(func),
+    };
     let dt = DominatorTree::new(func);
     let mut value_table: HashMap<VnKey, HirId> = HashMap::new();
     let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
 
-    visit_block(func, dt.entry(), &dt, &mut value_table, &mut substitutions);
+    visit_block(
+        func,
+        dt.entry(),
+        &dt,
+        &ctx,
+        &mut value_table,
+        &mut substitutions,
+    );
 
     let rewrites = apply_substitutions(func, &substitutions);
     let eliminated = remove_redundant_instructions(func, &substitutions);
@@ -94,15 +138,121 @@ pub fn eliminate(func: &mut HirFunction) -> CseStats {
     }
 }
 
-/// Same entry, looped over every function in `module`.
-pub fn eliminate_module(module: &mut crate::hir::HirModule) -> CseStats {
+/// Same entry, looped over every function in `module`. The set of pure
+/// functions is read from each function's `signature.is_pure` (populated
+/// by [`crate::purity::infer_module`]), so run purity inference first to
+/// enable pure-call CSE.
+pub fn eliminate_module(module: &mut HirModule) -> CseStats {
+    let pure_fns: HashSet<HirId> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| f.signature.is_pure)
+        .map(|(id, _)| *id)
+        .collect();
     let mut total = CseStats::default();
     for func in module.functions.values_mut() {
-        let stats = eliminate(func);
+        let stats = eliminate_with(func, &pure_fns);
         total.eliminated += stats.eliminated;
         total.rewrites += stats.rewrites;
     }
     total
+}
+
+/// `result → (op, left, right)` for every integer `Add`/`Sub` binary in
+/// the function — the raw material for affine offset normalisation.
+fn collect_bin_defs(func: &HirFunction) -> HashMap<HirId, (BinaryOp, HirId, HirId)> {
+    let mut m = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let HirInstruction::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                result,
+                left,
+                right,
+                ..
+            } = inst
+            {
+                m.insert(*result, (*op, *left, *right));
+            }
+        }
+    }
+    m
+}
+
+/// `id → integer value` for every integer-constant value.
+fn collect_int_consts(func: &HirFunction) -> HashMap<HirId, i128> {
+    let mut m = HashMap::new();
+    for (id, v) in &func.values {
+        if let HirValueKind::Constant(c) = &v.kind {
+            if let Some(i) = const_as_i128(c) {
+                m.insert(*id, i);
+            }
+        }
+    }
+    m
+}
+
+fn const_as_i128(c: &HirConstant) -> Option<i128> {
+    Some(match c {
+        HirConstant::I8(v) => *v as i128,
+        HirConstant::I16(v) => *v as i128,
+        HirConstant::I32(v) => *v as i128,
+        HirConstant::I64(v) => *v as i128,
+        HirConstant::I128(v) => *v,
+        HirConstant::U8(v) => *v as i128,
+        HirConstant::U16(v) => *v as i128,
+        HirConstant::U32(v) => *v as i128,
+        HirConstant::U64(v) => *v as i128,
+        _ => return None,
+    })
+}
+
+/// Canonical affine form of an integer value: `(base, offset)` such that
+/// the value equals `base + offset` under wrapping arithmetic. Walks
+/// through `add`/`sub` by an integer constant, accumulating the offset,
+/// so `(n-1)-2` and `(n-2)-1` both normalise to `(n, -3)`. Any value
+/// that isn't such a chain is its own base with offset 0.
+///
+/// Only `x + c`, `c + x`, and `x - c` shift the offset (coefficient +1
+/// on the base). `c - x` has coefficient -1, so it terminates the walk
+/// as an opaque base — normalising it would be unsound.
+fn affine_form(id: HirId, ctx: &CseCtx, substitutions: &HashMap<HirId, HirId>) -> (HirId, i128) {
+    fn go(
+        id: HirId,
+        ctx: &CseCtx,
+        substitutions: &HashMap<HirId, HirId>,
+        depth: u32,
+    ) -> (HirId, i128) {
+        let id = canonical(id, substitutions);
+        if depth > 64 {
+            return (id, 0);
+        }
+        if let Some((op, left, right)) = ctx.bin_defs.get(&id).copied() {
+            let l = canonical(left, substitutions);
+            let r = canonical(right, substitutions);
+            match op {
+                BinaryOp::Add => {
+                    if let Some(c) = ctx.int_consts.get(&r) {
+                        let (b, o) = go(l, ctx, substitutions, depth + 1);
+                        return (b, o.wrapping_add(*c));
+                    }
+                    if let Some(c) = ctx.int_consts.get(&l) {
+                        let (b, o) = go(r, ctx, substitutions, depth + 1);
+                        return (b, o.wrapping_add(*c));
+                    }
+                }
+                BinaryOp::Sub => {
+                    if let Some(c) = ctx.int_consts.get(&r) {
+                        let (b, o) = go(l, ctx, substitutions, depth + 1);
+                        return (b, o.wrapping_sub(*c));
+                    }
+                }
+                _ => {}
+            }
+        }
+        (id, 0)
+    }
+    go(id, ctx, substitutions, 0)
 }
 
 /// Visit `block_id` and its dominator-tree children in preorder.
@@ -113,6 +263,7 @@ fn visit_block(
     func: &HirFunction,
     block_id: HirId,
     dt: &DominatorTree,
+    ctx: &CseCtx,
     value_table: &mut HashMap<VnKey, HirId>,
     substitutions: &mut HashMap<HirId, HirId>,
 ) {
@@ -126,7 +277,7 @@ fn visit_block(
     };
 
     for inst in &block.instructions {
-        let Some((result, key)) = vn_key_for(inst, substitutions) else {
+        let Some((result, key)) = vn_key_for(inst, ctx, substitutions) else {
             continue;
         };
         match value_table.get(&key) {
@@ -142,7 +293,7 @@ fn visit_block(
     }
 
     for &child in dt.children(block_id) {
-        visit_block(func, child, dt, value_table, substitutions);
+        visit_block(func, child, dt, ctx, value_table, substitutions);
     }
 
     // Roll back insertions made in this block.
@@ -170,6 +321,13 @@ enum VnKey {
     Gep(HirType, HirId, Vec<HirId>),
     /// ExtractValue key: aggregate + indices + result type.
     Extract(HirType, HirId, Vec<u32>),
+    /// Pure call key: callee function id + affine forms of each argument
+    /// + generic type/const args. Only built for callees in
+    /// `ctx.pure_fns`, so two entries with this key are guaranteed to
+    /// name the same effect-free value. Args use their affine `(base,
+    /// offset)` normalisation so `f((n-1)-2)` and `f((n-2)-1)` share a
+    /// key.
+    Call(HirId, Vec<(HirId, i128)>, Vec<HirType>, Vec<HirConstant>),
 }
 
 /// Build the VN key for `inst` after chasing operand substitutions
@@ -178,6 +336,7 @@ enum VnKey {
 /// shape we don't CSE.
 fn vn_key_for(
     inst: &HirInstruction,
+    ctx: &CseCtx,
     substitutions: &HashMap<HirId, HirId>,
 ) -> Option<(HirId, VnKey)> {
     match inst {
@@ -235,6 +394,30 @@ fn vn_key_for(
                 indices.clone(),
             ),
         )),
+        // A call to a proven-pure function is value-numbered: its result
+        // depends only on its arguments and it has no observable effect,
+        // so two such calls with matching (affine-normalised) args are
+        // the same value. Impure callees, and any callable that isn't a
+        // direct `Function` (symbol / intrinsic / indirect), fall through
+        // to the not-CSE-able arm below.
+        HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Function(fid),
+            args,
+            type_args,
+            const_args,
+            ..
+        } if ctx.pure_fns.contains(fid) => {
+            let arg_forms: Vec<(HirId, i128)> = args
+                .iter()
+                .map(|a| affine_form(*a, ctx, substitutions))
+                .collect();
+            Some((
+                *result,
+                VnKey::Call(*fid, arg_forms, type_args.clone(), const_args.clone()),
+            ))
+        }
+
         // Side-effecting / identity-bearing instructions are not
         // CSE-able — see module doc for the rationale per variant.
         HirInstruction::Load { .. }
@@ -863,9 +1046,10 @@ mod tests {
     }
 
     #[test]
-    fn pure_calls_are_not_csed() {
-        // A Call could have side effects — we conservatively skip it
-        // even when the operands look identical.
+    fn symbol_calls_are_not_csed() {
+        // A `Symbol` callee is an opaque runtime/FFI target we can't
+        // prove pure — two identical symbol calls stay distinct even
+        // when the args match.
         let mut f = mk_func(HirType::I32);
         let a = add_param(&mut f, HirType::I32, 0);
         let r1 = add_inst_result(&mut f, HirType::I32);
@@ -894,6 +1078,144 @@ mod tests {
         );
         let stats = eliminate(&mut f);
         assert_eq!(stats.eliminated, 0);
+    }
+
+    #[test]
+    fn impure_function_calls_are_not_csed() {
+        // Same as above but with a `Function` callee that is NOT in the
+        // pure set: still not CSE-able.
+        let mut f = mk_func(HirType::I32);
+        let callee = HirId::new();
+        let a = add_param(&mut f, HirType::I32, 0);
+        let r1 = add_inst_result(&mut f, HirType::I32);
+        let r2 = add_inst_result(&mut f, HirType::I32);
+        for r in [r1, r2] {
+            push(
+                &mut f,
+                HirInstruction::Call {
+                    result: Some(r),
+                    callee: HirCallable::Function(callee),
+                    args: vec![a],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+            );
+        }
+        // Empty pure set (default `eliminate`).
+        assert_eq!(eliminate(&mut f).eliminated, 0);
+    }
+
+    #[test]
+    fn pure_function_calls_collapse_in_dominance() {
+        // Two calls to the same pure function with identical args, the
+        // first dominating the second → the second is redundant.
+        let mut f = mk_func(HirType::I32);
+        let callee = HirId::new();
+        let a = add_param(&mut f, HirType::I32, 0);
+        let r1 = add_inst_result(&mut f, HirType::I32);
+        let r2 = add_inst_result(&mut f, HirType::I32);
+        for r in [r1, r2] {
+            push(
+                &mut f,
+                HirInstruction::Call {
+                    result: Some(r),
+                    callee: HirCallable::Function(callee),
+                    args: vec![a],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+            );
+        }
+        f.blocks.get_mut(&f.entry_block).unwrap().terminator =
+            HirTerminator::Return { values: vec![r2] };
+        let pure: HashSet<HirId> = [callee].into_iter().collect();
+        let stats = eliminate_with(&mut f, &pure);
+        assert_eq!(stats.eliminated, 1, "second pure call should collapse");
+        match &f.blocks[&f.entry_block].terminator {
+            HirTerminator::Return { values } => assert_eq!(values, &vec![r1]),
+            _ => panic!("expected Return"),
+        }
+    }
+
+    #[test]
+    fn pure_calls_collapse_under_affine_arg_equivalence() {
+        // call f((n-1)-1)  and  call f(n-2) — args differ syntactically
+        // but are affinely equal (both n-2), so the pure calls collapse.
+        let mut f = mk_func(HirType::I64);
+        let callee = HirId::new();
+        let n = add_param(&mut f, HirType::I64, 0);
+        let one = add_const(&mut f, HirType::I64, HirConstant::I64(1));
+        let two = add_const(&mut f, HirType::I64, HirConstant::I64(2));
+
+        // a1 = n - 1 ; a2 = a1 - 1   (== n-2)
+        let a1 = add_inst_result(&mut f, HirType::I64);
+        let a2 = add_inst_result(&mut f, HirType::I64);
+        push(
+            &mut f,
+            HirInstruction::Binary {
+                op: BinaryOp::Sub,
+                result: a1,
+                ty: HirType::I64,
+                left: n,
+                right: one,
+            },
+        );
+        push(
+            &mut f,
+            HirInstruction::Binary {
+                op: BinaryOp::Sub,
+                result: a2,
+                ty: HirType::I64,
+                left: a1,
+                right: one,
+            },
+        );
+        // b = n - 2
+        let b = add_inst_result(&mut f, HirType::I64);
+        push(
+            &mut f,
+            HirInstruction::Binary {
+                op: BinaryOp::Sub,
+                result: b,
+                ty: HirType::I64,
+                left: n,
+                right: two,
+            },
+        );
+        let r1 = add_inst_result(&mut f, HirType::I64);
+        let r2 = add_inst_result(&mut f, HirType::I64);
+        push(
+            &mut f,
+            HirInstruction::Call {
+                result: Some(r1),
+                callee: HirCallable::Function(callee),
+                args: vec![a2],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        push(
+            &mut f,
+            HirInstruction::Call {
+                result: Some(r2),
+                callee: HirCallable::Function(callee),
+                args: vec![b],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        f.blocks.get_mut(&f.entry_block).unwrap().terminator =
+            HirTerminator::Return { values: vec![r2] };
+        let pure: HashSet<HirId> = [callee].into_iter().collect();
+        let stats = eliminate_with(&mut f, &pure);
+        assert_eq!(
+            stats.eliminated, 1,
+            "affinely-equal-arg pure calls should collapse"
+        );
     }
 
     #[test]

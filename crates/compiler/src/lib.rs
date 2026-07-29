@@ -58,6 +58,7 @@ pub mod memory_pass;
 pub mod monomorphize;
 pub mod optimization;
 pub mod pattern_matching;
+pub mod purity;
 pub mod reduction_vectorize;
 pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
@@ -1747,6 +1748,13 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     stats.alloca_promote.kept_on_stack += ap.kept_on_stack;
     stats.alloca_promote.skipped_unsupported += ap.skipped_unsupported;
 
+    // Purity inference feeds the pure-call CSE inside the sweep: with
+    // `signature.is_pure` populated, `cse::eliminate_module` can collapse
+    // two identical calls to an effect-free function into one. Runs once
+    // up front; it's re-run after recursive inlining (below), which
+    // rewrites bodies and can expose freshly-shared pure calls.
+    purity::infer_module(module);
+
     // Outer fixed-point: keeps iterating the whole sweep until none
     // of the passes report new work. Compounding example: inline
     // exposes new constant operands → const_fold creates a Constant
@@ -1952,6 +1960,18 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     stats.recursive_inline.skipped_too_large += ri.skipped_too_large;
     stats.recursive_inline.skipped_too_many_sites += ri.skipped_too_many_sites;
     stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
+
+    // Recursive self-inlining above can leave two inlined copies of a
+    // body sharing a pure sub-call — e.g. the depth-1 inline of `fib`
+    // makes both the `fib(n-1)` and `fib(n-2)` expansions call
+    // `fib(n-3)`. Re-infer purity (inlining rewrote bodies) and re-run
+    // CSE so any such duplicate that sits in a dominance relationship
+    // collapses. (The cross-branch case is handled by a dedicated pass
+    // added next.)
+    purity::infer_module(module);
+    let post_ri_cse = cse::eliminate_module(module);
+    stats.cse.eliminated += post_ri_cse.eliminated;
+    stats.cse.rewrites += post_ri_cse.rewrites;
 
     // Tail-call marker runs after the fixed-point sweep but before
     // drop_insert. Two ordering reasons:
