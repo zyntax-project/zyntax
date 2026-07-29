@@ -163,7 +163,10 @@ fn declare_handler(
 fn handler_body(mangled: &str, value: i32) -> HirFunction {
     let mut func = HirFunction::new(name(mangled), signature(vec![HirType::I32]));
     func.calling_convention = CallingConvention::C;
-    let konst = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(value)));
+    let konst = func.create_value(
+        HirType::I32,
+        HirValueKind::Constant(HirConstant::I32(value)),
+    );
     let entry = func.entry_block;
     let block = func.blocks.get_mut(&entry).unwrap();
     block.set_terminator(HirTerminator::Return {
@@ -390,5 +393,195 @@ fn a_perform_costs_about_what_a_call_costs() {
          structurally worse: {:.2}ns vs {:.2}ns direct",
         ns(via_perform),
         ns(via_call),
+    );
+}
+
+// ── Composition across the host boundary ─────────────────────────────
+//
+// Step 3 of the spike: can a handler live on the HOST side, so JIT'd
+// code performing an operation reaches Rust state?
+//
+// This is the shape a reactive read would take. `set_stateful_deps_notifier`
+// is already a process-global hook that compiled code reaches through
+// without knowing `Stateful` exists — but it runs in the other direction
+// (the write notifies), and the read side is inferred rather than
+// observed. A read handler inverts that: it sees every read in its
+// scope, exactly, as it happens.
+//
+// Worth stating plainly, because step 1 flagged continuations as the
+// open risk: a read handler is TAIL-RESUMPTIVE. `perform read(id)`
+// lowers to a plain call that returns the value and lets execution
+// continue, which is "resume with a value" without capturing anything.
+// So this needs neither `Resume<T>` nor `CaptureContinuation` — the two
+// pieces that are unproven and unimplemented respectively.
+
+use std::sync::Mutex;
+
+/// Signal ids the JIT'd code read, in order. Stands in for what a
+/// `Stateful` would collect as its dependency set.
+static READS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+/// The host side of the handler: record the read, return the value.
+/// Values are `id * 10` so the assertion can tell which id produced
+/// which contribution to the sum.
+extern "C" fn host_read(id: i64) -> i64 {
+    READS.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+    id * 10
+}
+
+fn i64_param(param_name: &str) -> HirParam {
+    HirParam {
+        id: HirId::new(),
+        name: name(param_name),
+        ty: HirType::I64,
+        attributes: ParamAttributes::default(),
+    }
+}
+
+/// `fn ReactiveHandler$read(id: i64) -> i64 { __test_host_read(id) }`
+fn delegating_handler_body(mangled: &str) -> HirFunction {
+    let mut sig = signature(vec![HirType::I64]);
+    sig.params = vec![i64_param("id")];
+    let mut func = HirFunction::new(name(mangled), sig);
+    func.calling_convention = CallingConvention::C;
+
+    let id = func.create_value(HirType::I64, HirValueKind::Parameter(0));
+    let out = func.create_value(HirType::I64, HirValueKind::Instruction);
+    let entry = func.entry_block;
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::Call {
+        result: Some(out),
+        callee: HirCallable::Symbol("__test_host_read".to_string()),
+        args: vec![id],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    block.set_terminator(HirTerminator::Return { values: vec![out] });
+    func
+}
+
+/// `fn run() -> i64 { perform read(1) + perform read(2) }`
+fn two_reads_function(fn_name: &str, effect_id: HirId, op: &str) -> HirFunction {
+    let mut func = HirFunction::new(name(fn_name), signature(vec![HirType::I64]));
+    func.calling_convention = CallingConvention::C;
+
+    let one = func.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(1)));
+    let two = func.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(2)));
+    let a = func.create_value(HirType::I64, HirValueKind::Instruction);
+    let b = func.create_value(HirType::I64, HirValueKind::Instruction);
+    let sum = func.create_value(HirType::I64, HirValueKind::Instruction);
+
+    let entry = func.entry_block;
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::PerformEffect {
+        result: Some(a),
+        effect_id,
+        op_name: name(op),
+        args: vec![one],
+        return_ty: HirType::I64,
+    });
+    block.add_instruction(HirInstruction::PerformEffect {
+        result: Some(b),
+        effect_id,
+        op_name: name(op),
+        args: vec![two],
+        return_ty: HirType::I64,
+    });
+    block.add_instruction(HirInstruction::Binary {
+        op: BinaryOp::Add,
+        result: sum,
+        ty: HirType::I64,
+        left: a,
+        right: b,
+    });
+    block.set_terminator(HirTerminator::Return { values: vec![sum] });
+    func
+}
+
+/// A handler that takes one `i64` and returns one, delegating to host
+/// code. Params must match the perform site or the call is malformed.
+fn declare_reading_handler(
+    handler_name: &str,
+    effect_id: HirId,
+    op: &str,
+) -> (HirId, HirEffectHandler) {
+    let (handler_id, mut handler) = declare_handler(handler_name, effect_id, op, HirType::I64);
+    handler.implementations[0].params = vec![i64_param("id")];
+    (handler_id, handler)
+}
+
+/// The composition question, answered by what the host observed: JIT'd
+/// code performed two reads, the host handler saw both ids in order,
+/// and the values it returned are what the computation summed.
+#[test]
+fn a_handler_can_delegate_to_host_state() {
+    READS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+    let mut module = empty_module();
+    let effect_id = HirId::new();
+    module.effects.insert(
+        effect_id,
+        HirEffect {
+            id: effect_id,
+            name: name("Reactive"),
+            type_params: vec![],
+            operations: vec![HirEffectOp {
+                id: HirId::new(),
+                name: name("read"),
+                type_params: vec![],
+                params: vec![i64_param("id")],
+                return_type: HirType::I64,
+            }],
+        },
+    );
+
+    let (handler_id, handler) = declare_reading_handler("ReactiveHandler", effect_id, "read");
+    module.handlers.insert(handler_id, handler);
+
+    let body = delegating_handler_body("ReactiveHandler$read");
+    module.functions.insert(body.id, body);
+
+    let run = two_reads_function("run_reads", effect_id, "read");
+    let run_id = run.id;
+    module.functions.insert(run_id, run);
+
+    extern "C" fn lookup_op(_effect_id: u64, _op_index: u64) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    extern "C" fn lookup_state(_effect_id: u64) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    extern "C" fn lookup_op_is_async(_effect_id: u64, _op_index: u64) -> i64 {
+        0
+    }
+    let mut backend = CraneliftBackend::with_runtime_symbols(&[
+        ("__zyntax_effect_lookup_op", lookup_op as *const u8),
+        ("__zyntax_effect_lookup_state", lookup_state as *const u8),
+        (
+            "__zyntax_effect_lookup_op_is_async",
+            lookup_op_is_async as *const u8,
+        ),
+        ("__test_host_read", host_read as *const u8),
+    ])
+    .expect("backend");
+
+    backend.compile_module(&module).expect("compile");
+    backend.finalize_definitions().expect("finalize");
+    let raw = backend.get_function_ptr(run_id).expect("fn ptr");
+    let f = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn() -> i64>(raw) };
+    let sum = unsafe { f() };
+
+    let observed = READS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        observed,
+        vec![1, 2],
+        "the host handler must see every read in its scope, in order"
+    );
+    assert_eq!(
+        sum, 30,
+        "and the values it returned are what the computation used \
+         (1*10 + 2*10); a wrong sum means the args or the return value \
+         did not survive the perform"
     );
 }
