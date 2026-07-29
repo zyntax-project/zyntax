@@ -258,3 +258,137 @@ fn the_handler_body_is_what_supplies_the_value() {
     assert_eq!(run_with(7), 7);
     assert_eq!(run_with(-3), -3);
 }
+
+// ── Cost ─────────────────────────────────────────────────────────────
+//
+// Step 2 of the spike: what does going through a handler cost, against
+// the same work reached by a direct call?
+//
+// The loop runs in Rust, not in the JIT: both variants pay an identical
+// Rust→native call per iteration, so the DIFFERENCE isolates the perform
+// overhead without hand-writing loop blocks and phis in HIR.
+//
+// The reference point is a `HashMap` lookup, because that is what a
+// signal read costs today. A handler per read is only interesting if the
+// overhead sits somewhere near that.
+//
+// RUN THIS IN RELEASE. The perform-vs-call ratio holds either way: both
+// sides are the same Cranelift-compiled code behind an identical
+// Rust->native call, so the build profile cancels out. The HashMap
+// figure does NOT — in debug it is unoptimised `std` hashing, ~20x
+// slower than it should be, which makes a perform look far cheaper
+// against a signal read than it really is.
+
+/// `fn direct() -> i32 { CounterHandler$bump() }` — the same handler
+/// body, reached by an ordinary call instead of a perform.
+fn calling_function(fn_name: &str, callee: HirId) -> HirFunction {
+    let mut func = HirFunction::new(name(fn_name), signature(vec![HirType::I32]));
+    func.calling_convention = CallingConvention::C;
+    let result = func.create_value(HirType::I32, HirValueKind::Instruction);
+    let entry = func.entry_block;
+    let block = func.blocks.get_mut(&entry).unwrap();
+    block.add_instruction(HirInstruction::Call {
+        result: Some(result),
+        callee: HirCallable::Function(callee),
+        args: vec![],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    });
+    block.set_terminator(HirTerminator::Return {
+        values: vec![result],
+    });
+    func
+}
+
+/// Compile one module holding both variants, so they share a backend
+/// and neither gets an allocation or layout advantage over the other.
+fn compile_both() -> (CraneliftBackend, HirId, HirId) {
+    let mut module = empty_module();
+
+    let (effect_id, effect) = declare_effect("Counter", "bump", HirType::I32);
+    module.effects.insert(effect_id, effect);
+    let (handler_id, handler) = declare_handler("CounterHandler", effect_id, "bump", HirType::I32);
+    module.handlers.insert(handler_id, handler);
+
+    let body = handler_body("CounterHandler$bump", 42);
+    let body_id = body.id;
+    module.functions.insert(body_id, body);
+
+    let performing = performing_function("via_perform", effect_id, "bump");
+    let perform_id = performing.id;
+    module.functions.insert(perform_id, performing);
+
+    let calling = calling_function("via_call", body_id);
+    let call_id = calling.id;
+    module.functions.insert(call_id, calling);
+
+    let mut backend = backend_with_effect_runtime();
+    backend.compile_module(&module).expect("compile");
+    backend.finalize_definitions().expect("finalize");
+    (backend, perform_id, call_id)
+}
+
+fn time_calls(raw: *const u8, iterations: u32) -> std::time::Duration {
+    let f = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn() -> i32>(raw) };
+    // Warm the branch predictor and the icache so the first iterations
+    // don't dominate a short run.
+    for _ in 0..1_000 {
+        std::hint::black_box(unsafe { f() });
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(unsafe { f() });
+    }
+    start.elapsed()
+}
+
+/// Reports the numbers; asserts only that a perform stays within an
+/// order of magnitude of a direct call. A tighter bound would be a
+/// flaky test rather than a better one — the point is to catch the
+/// perform site degrading into something structurally worse (a lookup
+/// per call that misses, a trap-and-recover), not to police jitter.
+#[test]
+fn a_perform_costs_about_what_a_call_costs() {
+    const N: u32 = 2_000_000;
+
+    let (backend, perform_id, call_id) = compile_both();
+    let perform_ptr = backend.get_function_ptr(perform_id).expect("perform ptr");
+    let call_ptr = backend.get_function_ptr(call_id).expect("call ptr");
+
+    let via_call = time_calls(call_ptr, N);
+    let via_perform = time_calls(perform_ptr, N);
+
+    // What a signal read costs today, for scale.
+    let mut map: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+    for k in 0..64u64 {
+        map.insert(k, k as i64);
+    }
+    let start = std::time::Instant::now();
+    for i in 0..N {
+        std::hint::black_box(map.get(&(u64::from(i) % 64)));
+    }
+    let via_hashmap = start.elapsed();
+
+    let ns = |d: std::time::Duration| d.as_nanos() as f64 / f64::from(N);
+    println!(
+        "per op over {N} iterations: direct call {:.2}ns, perform {:.2}ns, \
+         HashMap lookup {:.2}ns",
+        ns(via_call),
+        ns(via_perform),
+        ns(via_hashmap),
+    );
+    println!(
+        "perform overhead vs direct call: {:.2}x; vs a HashMap read: {:.2}x",
+        ns(via_perform) / ns(via_call).max(f64::EPSILON),
+        ns(via_perform) / ns(via_hashmap).max(f64::EPSILON),
+    );
+
+    assert!(
+        ns(via_perform) < ns(via_call) * 10.0 + 20.0,
+        "a perform should be a call plus a dispatch check, not something \
+         structurally worse: {:.2}ns vs {:.2}ns direct",
+        ns(via_perform),
+        ns(via_call),
+    );
+}

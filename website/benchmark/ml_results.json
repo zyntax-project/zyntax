@@ -1,0 +1,129 @@
+{
+  "attention": {
+    "phase": 4,
+    "metric": "GFLOP/s",
+    "baseline": "tokens/s target per model",
+    "note": "roadmap Phase 4: QK^T.scale.softmax.V, KV-cache, causal mask, flash tiling",
+    "pending": true
+  },
+  "elementwise_add_f32": {
+    "phase": 1,
+    "metric": "GB/s",
+    "baseline": "ZRTL $Tensor$add",
+    "note": "roadmap Phase 1: elementwise add, saturate bandwidth",
+    "pending": true
+  },
+  "fma_intrinsic": {
+    "phase": 0,
+    "metric": "GFLOP/s",
+    "baseline": "a*b+c auto-fusion",
+    "note": "roadmap Phase 0: explicit fma intrinsic vs auto-fused a*b+c",
+    "pending": true
+  },
+  "gelu_f32": {
+    "phase": 1,
+    "metric": "GB/s",
+    "baseline": "% of bandwidth",
+    "note": "roadmap Phase 1: GELU activation",
+    "pending": true
+  },
+  "gemm_f32": {
+    "phase": 2,
+    "metric": "GFLOP/s",
+    "baseline": "zrtl_simd $SIMD$gemm_f32",
+    "note": "roadmap Phase 2: tiled/register-blocked f32 GEMM over vload/fma/vstore",
+    "pending": true
+  },
+  "gemm_f32_fused": {
+    "phase": 2,
+    "metric": "GFLOP/s",
+    "baseline": "gemm_f32 (unfused + separate epilogue)",
+    "note": "roadmap Phase 2: GEMM + fused bias+GELU epilogue, fusion is free",
+    "pending": true
+  },
+  "qdot_u8i8_baseline": {
+    "phase": 0,
+    "metric": "GOP/s",
+    "baseline": "auto-vectorized u8xi8 dot (today)",
+    "note": "widening-accumulate u8xi8 dot -> VectorDot (vpdpbusd/sdot/i32x4.dot/fallback)",
+    "pending": false,
+    "tiers": {
+      "cranelift": {
+        "compile_ms": 0.10629200000000001,
+        "exec_ms": 0.23575000000000002,
+        "throughput": 8.895660657476139,
+        "speedup_vs_interp": 212.5719321314952,
+        "result": 1048576
+      },
+      "interp": {
+        "compile_ms": 0.339666,
+        "exec_ms": 50.11383300000001,
+        "throughput": 0.041847766863093466,
+        "speedup_vs_interp": 1.0,
+        "result": 1048576
+      },
+      "tiered": {
+        "compile_ms": 0.5650409999999999,
+        "exec_ms": 0.05425,
+        "throughput": 38.6571797235023,
+        "speedup_vs_interp": 923.7572903225807,
+        "result": 1048576
+      },
+      "tiered-llvm": {
+        "compile_ms": 0.619041,
+        "exec_ms": 0.052917,
+        "throughput": 39.630969253736986,
+        "speedup_vs_interp": 947.0270990418959,
+        "result": 1048576
+      }
+    }
+  },
+  "qdot_u8i8_intrinsic": {
+    "phase": 0,
+    "metric": "GOP/s",
+    "baseline": "qdot_u8i8_baseline",
+    "note": "roadmap Phase 0: same dot via explicit dot_u8i8 intrinsic",
+    "pending": true
+  },
+  "qgemm_int8": {
+    "phase": 3,
+    "metric": "GOP/s",
+    "baseline": "gemm_f32",
+    "note": "roadmap Phase 3: int8 GEMM via dot_u8i8 -> vpdpbusd, per-channel scales",
+    "pending": true
+  },
+  "quantize_dequantize_f32": {
+    "phase": 3,
+    "metric": "GB/s",
+    "baseline": "% of bandwidth",
+    "note": "roadmap Phase 3: quantize/dequantize throughput (Q8_0, Q4_K)",
+    "pending": true
+  },
+  "rmsnorm_f32": {
+    "phase": 1,
+    "metric": "GB/s",
+    "baseline": "% of bandwidth",
+    "note": "roadmap Phase 1: RMSNorm",
+    "pending": true
+  },
+  "softmax_f32": {
+    "phase": 1,
+    "metric": "GB/s",
+    "baseline": "% of bandwidth",
+    "note": "roadmap Phase 1: numerically stable softmax",
+    "pending": true
+  },
+  "transformer_block_e2e": {
+    "phase": 4,
+    "metric": "GFLOP/s",
+    "baseline": "captured known-good tiny model",
+    "note": "roadmap Phase 4: small quantized model end-to-end (prefill + decode)",
+    "pending": true
+  },
+  "meta": {
+    "arch": "aarch64",
+    "os": "macos",
+    "runs": 7,
+    "commit": "57e718a"
+  }
+}
