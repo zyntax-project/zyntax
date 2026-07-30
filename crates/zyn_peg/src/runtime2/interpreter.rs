@@ -1471,6 +1471,21 @@ impl<'g> GrammarInterpreter<'g> {
                         return Ok(ParsedValue::Type(Type::Fiber(Box::new(inner))));
                     }
 
+                    // Typed raw pointer `Ptr<T>` for manual buffers (ML
+                    // roadmap Phase 0.3). Lowers to `HirType::Ptr(T)` — the
+                    // same pointer the reference type produces — so a Tensor
+                    // can own a real contiguous typed buffer via `alloc<T>` /
+                    // `free`. Mutable: buffers are written through.
+                    if name_str == "Ptr" {
+                        let inner = type_args.into_iter().next().unwrap_or(Type::Any);
+                        return Ok(ParsedValue::Type(Type::Reference {
+                            ty: Box::new(inner),
+                            mutability: zyntax_typed_ast::type_registry::Mutability::Mutable,
+                            lifetime: None,
+                            nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+                        }));
+                    }
+
                     // First-class SIMD, generic spelling `Simd<T, N>`. The
                     // element type is the sole type argument; the lane count
                     // is the leading const argument. Only take this path when

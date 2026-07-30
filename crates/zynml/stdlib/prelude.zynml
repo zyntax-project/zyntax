@@ -1067,3 +1067,9 @@ def max_i64(a: i64, b: i64): i64 {
 def sqrt(x: f64): f64 {
     return x
 }
+
+// SIMD vector ops (`a.fma(b, c)`, `acc.dot_u8i8(a, b)`, `v.sum()`) are
+// methods on the first-class vector types, and the typed heap
+// (`alloc`/`free`/`vload_*`/`vstore_*`) lives in the `simd` module —
+// re-exported below so kernels can use them without an explicit import.
+from simd import *

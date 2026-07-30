@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_TENSOR};
+use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR};
 use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
@@ -316,6 +316,7 @@ fn bench_runtime() -> Result<ZyntaxRuntime, String> {
     rt.add_import_resolver(Box::new(|module_name| match module_name {
         "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
         "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
+        "simd" => Ok(Some(ZYNML_STDLIB_SIMD.to_string())),
         _ => Ok(None),
     }));
     let lang_grammar = SHARED_LANG_GRAMMAR
@@ -922,6 +923,7 @@ fn compute_cache_key(source: &str, run_with_opts: bool) -> String {
     h = fnv1a_64_update(h, ZYNML_STDLIB_PRELUDE.as_bytes());
     h = fnv1a_64_update(h, b"\0tensor\0");
     h = fnv1a_64_update(h, ZYNML_STDLIB_TENSOR.as_bytes());
+    h = fnv1a_64_update(h, ZYNML_STDLIB_SIMD.as_bytes());
     h = fnv1a_64_update(h, b"\0opts\0");
     h = fnv1a_64_update(h, &[u8::from(run_with_opts)]);
     h = fnv1a_64_update(h, b"\0schema\0");

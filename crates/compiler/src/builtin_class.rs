@@ -288,6 +288,33 @@ impl BuiltinClass for VectorClass {
             "trunc" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Trunc).map(Some),
             "round" => ssa_unary(ssa, block_id, receiver, VectorUnaryKind::Round).map(Some),
 
+            // Fused multiply-add `a.fma(b, c)` = `a * b + c` in one op.
+            "fma" => match (args.first(), args.get(1)) {
+                (Some(b), Some(c)) => ssa.emit_vector_fma(block_id, receiver, b, c).map(Some),
+                _ => Ok(None),
+            },
+
+            // Quantized dot-accumulate `acc.dot_*(a, b)` = `acc + dot(a, b)`.
+            // The suffix selects the lane signedness / 7-bit encoding.
+            "dot_u8i8" => match (args.first(), args.get(1)) {
+                (Some(a), Some(b)) => ssa
+                    .emit_vector_dot(block_id, receiver, a, b, true, false)
+                    .map(Some),
+                _ => Ok(None),
+            },
+            "dot_i8i8" => match (args.first(), args.get(1)) {
+                (Some(a), Some(b)) => ssa
+                    .emit_vector_dot(block_id, receiver, a, b, false, false)
+                    .map(Some),
+                _ => Ok(None),
+            },
+            "dot_u8i7" => match (args.first(), args.get(1)) {
+                (Some(a), Some(b)) => ssa
+                    .emit_vector_dot(block_id, receiver, a, b, true, true)
+                    .map(Some),
+                _ => Ok(None),
+            },
+
             "min" => match args.first() {
                 Some(other) => ssa
                     .emit_vector_minmax(block_id, receiver, other, VectorMinMaxKind::Min)

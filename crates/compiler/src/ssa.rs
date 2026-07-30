@@ -126,6 +126,33 @@ fn hir_ty_size(ty: &HirType) -> usize {
     }
 }
 
+/// Map a scalar type name (`i8`, `u32`, `f64`, …) to its `HirType`. Used
+/// to read the element type named in a typed memory intrinsic.
+fn scalar_hir_type(name: &str) -> Option<HirType> {
+    Some(match name {
+        "i8" => HirType::I8,
+        "i16" => HirType::I16,
+        "i32" => HirType::I32,
+        "i64" => HirType::I64,
+        "u8" => HirType::U8,
+        "u16" => HirType::U16,
+        "u32" => HirType::U32,
+        "u64" => HirType::U64,
+        "f32" => HirType::F32,
+        "f64" => HirType::F64,
+        _ => return None,
+    })
+}
+
+/// Map a SIMD short alias (`i8x16`, `i32x4`, `f32x4`, …) to a vector
+/// `HirType`, mirroring the type resolver's `<prim>x<lanes>` spelling.
+fn simd_alias_hir_type(name: &str) -> Option<HirType> {
+    let (prim, lanes) = name.split_once('x')?;
+    let elem = scalar_hir_type(prim)?;
+    let lanes: u32 = lanes.parse().ok()?;
+    (lanes > 0).then(|| HirType::Vector(Box::new(elem), lanes))
+}
+
 pub struct SsaBuilder {
     /// Current function being built
     function: HirFunction,
@@ -511,6 +538,14 @@ fn default_intrinsic_alias_map() -> IndexMap<InternedString, crate::hir::Intrins
     m.insert(
         InternedString::new_global("abs"),
         crate::hir::Intrinsic::Fabs,
+    );
+    // `free(p)` releases an `alloc<T>` buffer (ML roadmap Phase 0.3),
+    // rewritten to a direct `Intrinsic::Free` call. `alloc` needs the
+    // element type for sizing so it goes through `try_emit_simd_intrinsic`;
+    // `free` takes just the pointer and fits the alias map.
+    m.insert(
+        InternedString::new_global("free"),
+        crate::hir::Intrinsic::Free,
     );
     m
 }
@@ -4161,6 +4196,20 @@ impl SsaBuilder {
                                 .map(|s| s.to_string())
                                 .unwrap_or_default()
                         });
+
+                        // ML SIMD intrinsics (Phase 0.2): a `dot_u8i8` /
+                        // `vload` / etc. free-function call lowers directly to
+                        // its dedicated HIR vector instruction. `fma` is NOT
+                        // here — it routes through `intrinsic_alias_map` as an
+                        // `Intrinsic::Fma` call below.
+                        if let Some(result) = self.try_emit_simd_intrinsic(
+                            block_id,
+                            &name_str,
+                            &call.positional_args,
+                            &expr.ty,
+                        )? {
+                            return Ok(result);
+                        }
 
                         if name_str == INTERNAL_RENDER_EVENT_ALIAS
                             || name_str == INTERNAL_STREAM_EVENT_ALIAS
@@ -8740,6 +8789,230 @@ impl SsaBuilder {
         );
         self.add_use(vector_val, result);
         Ok(result)
+    }
+
+    /// Quantized dot-accumulate method `acc.dot_*(a, b)` → `VectorDot`
+    /// (`result = acc + dot(a, b)`, `acc: i32x4`, `a`/`b: i8x16`). The
+    /// `rhs_unsigned`/`rhs_i7` flags come from the method name and drive
+    /// the `vpdpbusd` / `usdot` / `sdot` / `i32x4.dot` selection.
+    pub(crate) fn emit_vector_dot(
+        &mut self,
+        block_id: HirId,
+        acc_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        a_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        b_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        rhs_unsigned: bool,
+        rhs_i7: bool,
+    ) -> CompilerResult<HirId> {
+        let acc = self.translate_expression(block_id, acc_expr)?;
+        let a = self.translate_expression(block_id, a_expr)?;
+        let b = self.translate_expression(block_id, b_expr)?;
+        let acc_ty = self
+            .vector_layout_of(acc)
+            .map(|(vec_ty, _, _)| vec_ty)
+            .or_else(|| self.function.values.get(&acc).map(|v| v.ty.clone()))
+            .unwrap_or(HirType::Vector(Box::new(HirType::I32), 4));
+        let result = self.create_value(acc_ty, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::VectorDot {
+                result,
+                acc,
+                a,
+                b,
+                rhs_i7,
+                rhs_unsigned,
+            },
+        );
+        self.add_use(acc, result);
+        self.add_use(a, result);
+        self.add_use(b, result);
+        Ok(result)
+    }
+
+    /// Fused multiply-add method `a.fma(b, c)` → `a * b + c` in one op.
+    /// Emitted as `Intrinsic::Fma` (polymorphic over float lanes), lowered
+    /// per backend to the hardware FMA.
+    pub(crate) fn emit_vector_fma(
+        &mut self,
+        block_id: HirId,
+        a_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        b_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        c_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let a = self.translate_expression(block_id, a_expr)?;
+        let b = self.translate_expression(block_id, b_expr)?;
+        let c = self.translate_expression(block_id, c_expr)?;
+        let ty = self
+            .vector_layout_of(a)
+            .map(|(vec_ty, _, _)| vec_ty)
+            .or_else(|| self.function.values.get(&a).map(|v| v.ty.clone()))
+            .unwrap_or(HirType::Vector(Box::new(HirType::F32), 4));
+        let result = self.create_value(ty, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Call {
+                result: Some(result),
+                callee: crate::hir::HirCallable::Intrinsic(crate::hir::Intrinsic::Fma),
+                args: vec![a, b, c],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        self.add_use(a, result);
+        self.add_use(b, result);
+        self.add_use(c, result);
+        Ok(result)
+    }
+
+    /// Memory intrinsics called as free functions from ZynML source,
+    /// lowered directly to their HIR instruction (ML roadmap Phase 0.3):
+    /// `alloc<T>(n)` → sized malloc, `vload_*`/`vstore_*` → vector
+    /// load/store. Returns `Ok(Some(result))` when `name` matches,
+    /// `Ok(None)` otherwise so the caller falls through to normal call
+    /// resolution. (`free` goes through the intrinsic alias map; the
+    /// vector-arithmetic ops are methods on the vector types.)
+    ///
+    /// These are the "@intrinsic tag → emitter" entries that need a
+    /// dedicated instruction rather than an `Intrinsic` call (`fma` goes
+    /// through `intrinsic_alias_map` instead). Every name here has a stub
+    /// `def` in `prelude.zynml` whose body is never lowered — the call
+    /// site is rewritten here so the fast instruction is optimizer-visible
+    /// and reached without depending on the auto-vectorizer.
+    ///
+    ///   * `dot_u8i8(acc, a, b)` / `dot_i8i8` / `dot_u8i7` → `VectorDot`
+    ///     (`acc: i32x4`, `a`/`b: i8x16` → `i32x4`; `result = acc + dot`).
+    ///     The suffix picks the signed/unsigned + i7 encoding that drives
+    ///     the `vpdpbusd` / `usdot` / `sdot` / `i32x4.dot` selection.
+    ///   * `hreduce(v)` → `VectorHorizontalReduce` (vector → scalar sum).
+    ///   * `vload(p)` → `VectorLoad` (result vector type = call return type).
+    ///   * `vstore(p, v)` → `VectorStore` (no result).
+    pub(crate) fn try_emit_simd_intrinsic(
+        &mut self,
+        block_id: HirId,
+        name: &str,
+        args: &[zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>],
+        _result_ty: &Type,
+    ) -> CompilerResult<Option<HirId>> {
+        let arity_err = |n: usize| {
+            crate::CompilerError::Lowering(format!(
+                "SIMD intrinsic `{name}` expects {n} argument(s), got {}",
+                args.len()
+            ))
+        };
+
+        match name {
+            // Typed heap allocation `alloc_<T>(n)`: malloc `n * sizeof(T)`
+            // bytes, typed as `Ptr<T>` from the call's declared return type
+            // (ML roadmap Phase 0.3). malloc's default alignment (>= 16
+            // bytes on 64-bit) covers 128-bit SIMD.
+            _ if name.starts_with("alloc") => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(arity_err(1));
+                }
+                let n = self.translate_expression(block_id, &args[0])?;
+                if args.len() == 2 {
+                    // Evaluate `align` for its (currently no) effect so the
+                    // arg isn't silently dropped from the IR shape.
+                    let _ = self.translate_expression(block_id, &args[1])?;
+                }
+                // The element type is named in the intrinsic (`alloc_i8`),
+                // so the pointer type is unambiguous without relying on
+                // return-type inference through the generic stub.
+                let elem = name
+                    .strip_prefix("alloc_")
+                    .and_then(scalar_hir_type)
+                    .ok_or_else(|| {
+                        crate::CompilerError::Lowering(format!(
+                            "`{name}` is not a known typed allocation (expected e.g. `alloc_i8`)"
+                        ))
+                    })?;
+                let ptr_ty = HirType::Ptr(Box::new(elem.clone()));
+                let elem_size = hir_ty_size(&elem) as i64;
+                let size_const = self.create_value(
+                    HirType::I64,
+                    HirValueKind::Constant(crate::hir::HirConstant::I64(elem_size)),
+                );
+                let byte_count = self.create_value(HirType::I64, HirValueKind::Instruction);
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Binary {
+                        op: crate::hir::BinaryOp::Mul,
+                        result: byte_count,
+                        ty: HirType::I64,
+                        left: n,
+                        right: size_const,
+                    },
+                );
+                self.add_use(n, byte_count);
+                let result = self.create_value(ptr_ty, HirValueKind::Instruction);
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::Call {
+                        result: Some(result),
+                        callee: crate::hir::HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                        args: vec![byte_count],
+                        type_args: vec![],
+                        const_args: vec![],
+                        is_tail: false,
+                    },
+                );
+                self.add_use(byte_count, result);
+                Ok(Some(result))
+            }
+            // `vload_<vec>(p)` — aligned/unaligned SIMD load. The result
+            // vector type is named in the intrinsic (`vload_i8x16`).
+            _ if name.starts_with("vload_") => {
+                if args.len() != 1 {
+                    return Err(arity_err(1));
+                }
+                let ptr = self.translate_expression(block_id, &args[0])?;
+                let vec_ty = name
+                    .strip_prefix("vload_")
+                    .and_then(simd_alias_hir_type)
+                    .ok_or_else(|| {
+                        crate::CompilerError::Lowering(format!(
+                            "`{name}` is not a known vector load (expected e.g. `vload_i8x16`)"
+                        ))
+                    })?;
+                let result = self.create_value(vec_ty.clone(), HirValueKind::Instruction);
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::VectorLoad {
+                        result,
+                        ty: vec_ty,
+                        ptr,
+                        // Unaligned by default (align = 1) so an arbitrary
+                        // caller buffer never faults; the aligned-alloc path
+                        // (Phase 0.3) can introduce an aligned variant.
+                        align: 1,
+                    },
+                );
+                self.add_use(ptr, result);
+                Ok(Some(result))
+            }
+            _ if name.starts_with("vstore") => {
+                if args.len() != 2 {
+                    return Err(arity_err(2));
+                }
+                let ptr = self.translate_expression(block_id, &args[0])?;
+                let value = self.translate_expression(block_id, &args[1])?;
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::VectorStore {
+                        value,
+                        ptr,
+                        align: 1,
+                    },
+                );
+                // `vstore` yields no value; hand back a Void placeholder for
+                // the expression slot (statement position discards it).
+                let unit = self.create_value(HirType::Void, HirValueKind::Undef);
+                Ok(Some(unit))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Element-wise SIMD unary op (`sqrt`/`abs`/`neg`/`ceil`/`floor`/

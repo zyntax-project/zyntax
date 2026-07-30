@@ -82,6 +82,9 @@ pub const ZYNML_STDLIB_PRELUDE: &str = include_str!("../stdlib/prelude.zynml");
 /// The embedded ZynML standard library - tensor
 pub const ZYNML_STDLIB_TENSOR: &str = include_str!("../stdlib/tensor.zynml");
 
+/// The embedded ZynML standard library - simd / typed-buffer module
+pub const ZYNML_STDLIB_SIMD: &str = include_str!("../stdlib/simd.zynml");
+
 /// Required ZRTL plugins for ZynML
 pub const REQUIRED_PLUGINS: &[&str] = &[
     "zrtl_tensor",
@@ -189,6 +192,7 @@ impl ZynML {
             Box::new(|module_name| match module_name {
                 "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
                 "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
+                "simd" => Ok(Some(ZYNML_STDLIB_SIMD.to_string())),
                 _ => Ok(None),
             });
         match &mut runtime {
