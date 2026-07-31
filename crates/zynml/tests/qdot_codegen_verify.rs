@@ -132,11 +132,15 @@ fn qdot_source_kernel_lowers_to_vector_dot_sequence() {
         );
     }
 
-    // Whether the widen/multiply/pairwise sequence collapses into a
-    // single fused dot depends on the target having a rule for this
-    // *mixed* unsigned x signed form. Where the fused instruction is
-    // emitted, assert it; otherwise the portable sequence above is the
-    // documented fallback, and the sequence assert is the real check.
+    // The fused dot IS emitted where the CPU supports it: `vpdpbusd` on
+    // VNNI x86, `sdot` for the signed form on aarch64 with FEAT_DotProd.
+    // The mixed unsigned x signed form needs `usdot` (FEAT_I8MM), which
+    // some aarch64 parts lack — there the portable widen/multiply/
+    // pairwise sequence is the correct lowering, not a codegen gap.
+    //
+    // NOTE: accepting either outcome makes this a weak check. It should
+    // assert the fused instruction whenever the running CPU has the
+    // needed feature, and only tolerate the fallback when it does not.
     let fused = d.contains("sdot") || d.contains("usdot") || d.contains("vpdpbusd");
     if fused {
         return;
