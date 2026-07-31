@@ -9171,6 +9171,19 @@ impl SsaBuilder {
         // The broadcast scalar must match the lane element type exactly.
         let scalar = if let HirType::Vector(elem, _) = &vec_ty {
             let elem = (**elem).clone();
+            // A literal argument can pick up the constructor's *vector*
+            // result type from inference — `i32x4::splat(0)` types the `0`
+            // as `i32x4`. Left alone that emits a vector-typed integer
+            // constant, which is not a legal constant shape. Retype the
+            // literal to the lane type before coercion; only constants are
+            // touched, so no computed value is disturbed.
+            if let Some(v) = self.function.values.get_mut(&scalar) {
+                if matches!(v.ty, HirType::Vector(_, _))
+                    && matches!(v.kind, HirValueKind::Constant(_))
+                {
+                    v.ty = elem.clone();
+                }
+            }
             self.coerce_scalar_to(block_id, scalar, &elem)
         } else {
             scalar

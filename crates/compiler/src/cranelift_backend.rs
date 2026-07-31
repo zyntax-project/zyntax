@@ -1731,7 +1731,22 @@ impl CraneliftBackend {
                     } else {
                         // For scalar types, use zero constant
                         let ty = type_cache.get(&value.ty).copied().unwrap_or(types::I64);
-                        let cranelift_val = if ty.is_int() {
+                        let cranelift_val = if ty.is_vector() {
+                            // A vector-typed undef materialises as an
+                            // all-zero vector. `iconst` is scalar-only —
+                            // giving it a vector type is not a legal
+                            // constant — so build the lane zero and
+                            // broadcast it.
+                            let lane = ty.lane_type();
+                            let zero = if lane == types::F32 {
+                                builder.ins().f32const(0.0)
+                            } else if lane == types::F64 {
+                                builder.ins().f64const(0.0)
+                            } else {
+                                builder.ins().iconst(lane, 0)
+                            };
+                            builder.ins().splat(ty, zero)
+                        } else if ty.is_int() {
                             builder.ins().iconst(ty, 0)
                         } else if ty.is_float() {
                             if ty == types::F32 {

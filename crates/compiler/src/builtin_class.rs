@@ -295,11 +295,15 @@ impl BuiltinClass for VectorClass {
                 _ => Ok(None),
             },
 
-            // Quantized dot-accumulate `acc.dot_*(a, b)` = `acc + dot(a, b)`.
-            // The suffix selects the lane signedness / 7-bit encoding.
+            // Quantized dot-accumulate `acc.dot_*(x, y)` = `acc + dot(x, y)`.
+            // The suffix names the lane signedness in argument order, so
+            // `dot_u8i8(x, y)` reads x as unsigned and y as signed. The
+            // underlying operation puts its unsigned operand second, so the
+            // arguments are handed over swapped; the per-lane products are
+            // the same either way, only the widening differs.
             "dot_u8i8" => match (args.first(), args.get(1)) {
-                (Some(a), Some(b)) => ssa
-                    .emit_vector_dot(block_id, receiver, a, b, true, false)
+                (Some(x), Some(y)) => ssa
+                    .emit_vector_dot(block_id, receiver, y, x, true, false)
                     .map(Some),
                 _ => Ok(None),
             },
@@ -310,8 +314,8 @@ impl BuiltinClass for VectorClass {
                 _ => Ok(None),
             },
             "dot_u8i7" => match (args.first(), args.get(1)) {
-                (Some(a), Some(b)) => ssa
-                    .emit_vector_dot(block_id, receiver, a, b, true, true)
+                (Some(x), Some(y)) => ssa
+                    .emit_vector_dot(block_id, receiver, y, x, true, true)
                     .map(Some),
                 _ => Ok(None),
             },
