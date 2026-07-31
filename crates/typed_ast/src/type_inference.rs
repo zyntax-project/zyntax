@@ -337,11 +337,67 @@ impl InferenceContext {
                 Ok(Type::Optional(Box::new(unified)))
             }
 
+            // Nullable is the explicit `T?` spelling of the same shape
+            (Type::Nullable(t1), Type::Nullable(t2)) => {
+                let unified = self.unify((**t1).clone(), (**t2).clone())?;
+                Ok(Type::Nullable(Box::new(unified)))
+            }
+
+            (Type::NonNull(t1), Type::NonNull(t2)) => {
+                let unified = self.unify((**t1).clone(), (**t2).clone())?;
+                Ok(Type::NonNull(Box::new(unified)))
+            }
+
+            // Fiber types unify through their yield type
+            (Type::Fiber(y1), Type::Fiber(y2)) => {
+                let unified = self.unify((**y1).clone(), (**y2).clone())?;
+                Ok(Type::Fiber(Box::new(unified)))
+            }
+
+            // Vector types: lane count is part of the type, so it must
+            // match exactly — `f32x4` and `f32x8` are distinct.
+            (Type::Vector(e1, n1), Type::Vector(e2, n2)) => {
+                if n1 != n2 {
+                    return Err(InferenceError::TypeMismatch {
+                        expected: t1,
+                        found: t2,
+                    });
+                }
+                let unified = self.unify((**e1).clone(), (**e2).clone())?;
+                Ok(Type::Vector(Box::new(unified), *n1))
+            }
+
+            (
+                Type::Result {
+                    ok_type: ok1,
+                    err_type: err1,
+                },
+                Type::Result {
+                    ok_type: ok2,
+                    err_type: err2,
+                },
+            ) => {
+                let ok = self.unify((**ok1).clone(), (**ok2).clone())?;
+                let err = self.unify((**err1).clone(), (**err2).clone())?;
+                Ok(Type::Result {
+                    ok_type: Box::new(ok),
+                    err_type: Box::new(err),
+                })
+            }
+
             // Gradual typing: Any unifies with anything
             (Type::Any, t) | (t, Type::Any) if self.options.gradual_typing => Ok(t.clone()),
 
             // Any type (for error recovery)
             (Type::Any, t) | (t, Type::Any) => Ok(t.clone()),
+
+            // `Unknown` and `Dynamic` are the other two spellings of "not
+            // known statically" — a binding with no annotation and a value
+            // whose type is settled at runtime. Both are treated
+            // interchangeably with `Any` throughout lowering, so they unify
+            // the same way rather than failing against every concrete type.
+            (Type::Unknown, t) | (t, Type::Unknown) => Ok(t.clone()),
+            (Type::Dynamic, t) | (t, Type::Dynamic) => Ok(t.clone()),
 
             // Error type propagates
             (Type::Error, _) | (_, Type::Error) => Ok(Type::Error),
@@ -351,11 +407,66 @@ impl InferenceContext {
             // compatible with any expected type in if/match branches)
             (Type::Never, t) | (t, Type::Never) => Ok(t.clone()),
 
+            // Parser placeholders. Every user-written type name arrives as
+            // `Unresolved` — the parser does not consult the registry — so
+            // without these arms any user type reaching unification is an
+            // automatic mismatch. Identical names unify directly; otherwise
+            // resolve through the registry and retry against the real type.
+            (Type::Unresolved(n1), Type::Unresolved(n2)) if n1 == n2 => Ok(t1),
+
+            (Type::Unresolved(name), other) | (other, Type::Unresolved(name)) => {
+                let other = other.clone();
+                match self.resolve_unresolved_name(*name) {
+                    Some(resolved) => self.unify(resolved, other),
+                    // Not in the registry: still unify if the other side is
+                    // the named type this placeholder spells.
+                    None if self.named_type_has_name(&other, *name) => Ok(other),
+                    None => Err(InferenceError::TypeMismatch {
+                        expected: t1,
+                        found: t2,
+                    }),
+                }
+            }
+
             // Otherwise, type mismatch
             _ => Err(InferenceError::TypeMismatch {
                 expected: t1,
                 found: t2,
             }),
+        }
+    }
+
+    /// Resolve a parser placeholder to the type it names: an alias target
+    /// when one is registered, otherwise the registered named type.
+    /// `None` when the registry has never seen the name.
+    fn resolve_unresolved_name(&self, name: InternedString) -> Option<Type> {
+        if let Some(target) = self.registry.resolve_alias(name) {
+            // A self-referential alias (`type A = A`) would recurse forever
+            // through `unify`; leave it unresolved instead.
+            if !matches!(target, Type::Unresolved(n) if *n == name) {
+                return Some(target.clone());
+            }
+        }
+
+        let def = self.registry.get_type_by_name(name)?;
+        Some(Type::Named {
+            id: def.id,
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            variance: Vec::new(),
+            nullability: crate::type_registry::NullabilityKind::default(),
+        })
+    }
+
+    /// Whether `ty` is the named type registered under `name`.
+    fn named_type_has_name(&self, ty: &Type, name: InternedString) -> bool {
+        match ty {
+            Type::Named { id, .. } => self
+                .registry
+                .get_type_by_id(*id)
+                .is_some_and(|def| def.name == name),
+            Type::Extern { name: n, .. } => *n == name,
+            _ => false,
         }
     }
 
@@ -441,6 +552,14 @@ impl InferenceContext {
                 nullability: *nullability,
             },
             Type::Optional(t) => Type::Optional(Box::new(self.apply_substitutions(t))),
+            Type::Nullable(t) => Type::Nullable(Box::new(self.apply_substitutions(t))),
+            Type::NonNull(t) => Type::NonNull(Box::new(self.apply_substitutions(t))),
+            Type::Fiber(t) => Type::Fiber(Box::new(self.apply_substitutions(t))),
+            Type::Vector(t, lanes) => Type::Vector(Box::new(self.apply_substitutions(t)), *lanes),
+            Type::Result { ok_type, err_type } => Type::Result {
+                ok_type: Box::new(self.apply_substitutions(ok_type)),
+                err_type: Box::new(self.apply_substitutions(err_type)),
+            },
             Type::Union(types) => {
                 Type::Union(types.iter().map(|t| self.apply_substitutions(t)).collect())
             }
@@ -469,7 +588,14 @@ impl InferenceContext {
             Type::Tuple(elems) => elems.iter().any(|e| self.occurs_check(var, e)),
             Type::Array { element_type, .. } => self.occurs_check(var, element_type),
             Type::Reference { ty, .. } => self.occurs_check(var, ty),
-            Type::Optional(t) => self.occurs_check(var, t),
+            Type::Optional(t)
+            | Type::Nullable(t)
+            | Type::NonNull(t)
+            | Type::Fiber(t)
+            | Type::Vector(t, _) => self.occurs_check(var, t),
+            Type::Result { ok_type, err_type } => {
+                self.occurs_check(var, ok_type) || self.occurs_check(var, err_type)
+            }
             Type::Union(types) | Type::Intersection(types) => {
                 types.iter().any(|t| self.occurs_check(var, t))
             }
