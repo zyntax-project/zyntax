@@ -54,9 +54,13 @@ fn host_has_neon_dotprod() -> bool {
 
 /// Compile the kernel from source and capture its CLIF + native disasm.
 fn capture_qdot_codegen() -> (String, Option<String>) {
+    capture_named(QDOT_SRC, "qdot")
+}
+
+fn capture_named(src: &str, name: &str) -> (String, Option<String>) {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("ZynML grammar should compile");
     let program = grammar
-        .parse_with_filename(QDOT_SRC, "<qdot>")
+        .parse_with_filename(src, "<qdot>")
         .expect("kernel should parse");
 
     let mut rt = ZyntaxRuntime::new().expect("runtime");
@@ -78,7 +82,7 @@ fn capture_qdot_codegen() -> (String, Option<String>) {
     let func = module
         .functions
         .values()
-        .find(|f| f.name.resolve_global().as_deref() == Some("qdot"))
+        .find(|f| f.name.resolve_global().as_deref() == Some(name))
         .expect("qdot should be lowered");
 
     // The dot must survive to codegen as a real vector op.
@@ -132,23 +136,39 @@ fn qdot_source_kernel_lowers_to_vector_dot_sequence() {
         );
     }
 
-    // The fused dot IS emitted where the CPU supports it: `vpdpbusd` on
-    // VNNI x86, `sdot` for the signed form on aarch64 with FEAT_DotProd.
-    // The mixed unsigned x signed form needs `usdot` (FEAT_I8MM), which
-    // some aarch64 parts lack — there the portable widen/multiply/
-    // pairwise sequence is the correct lowering, not a codegen gap.
-    //
-    // NOTE: accepting either outcome makes this a weak check. It should
-    // assert the fused instruction whenever the running CPU has the
-    // needed feature, and only tolerate the fallback when it does not.
-    let fused = d.contains("sdot") || d.contains("usdot") || d.contains("vpdpbusd");
-    if fused {
+    // The mixed unsigned x signed dot needs `usdot` (FEAT_I8MM) on
+    // aarch64. Where the CPU lacks it the portable widen/multiply/
+    // pairwise sequence is the correct lowering, so the fused form is
+    // asserted only where it is actually available. The signed variant,
+    // which only needs FEAT_DotProd, is pinned separately below.
+    if host_has_avxvnni() {
+        assert!(
+            d.contains("vpdpbusd"),
+            "VNNI host must emit the fused dot:\n{d}"
+        );
+    } else {
+        assert!(
+            d.contains("mul") && (d.contains("saddlp") || d.contains("addp") || d.contains("padd")),
+            "without a fused dot, expected the widen/multiply/pairwise-add \
+             fallback sequence:\n{d}"
+        );
+    }
+}
+
+/// The signed dot needs only FEAT_DotProd, which this host has, so the
+/// fused `sdot` must actually appear — no fallback accepted. This is the
+/// check that would catch the fused path silently regressing.
+#[test]
+fn signed_dot_kernel_emits_fused_sdot() {
+    if !host_has_neon_dotprod() {
         return;
     }
+    let src = QDOT_SRC.replace("dot_u8i8", "dot_i8i8");
+    let (_clif, disasm) = capture_named(&src, "qdot");
+    let d = disasm.unwrap_or_default();
     assert!(
-        d.contains("mul") && (d.contains("saddlp") || d.contains("addp") || d.contains("padd")),
-        "without a fused dot, expected the widen/multiply/pairwise-add \
-         fallback sequence:\n{d}"
+        d.contains("sdot"),
+        "a dot-product-capable host must emit the fused sdot:\n{d}"
     );
 }
 
