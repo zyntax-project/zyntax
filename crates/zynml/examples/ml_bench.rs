@@ -68,6 +68,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD};
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::{
     BinaryOp, CallingConvention, HirConstant, HirFunction, HirFunctionSignature, HirId,
@@ -140,8 +141,11 @@ struct Kernel {
 /// buffers (kept alive for the duration of every timed call), and the
 /// metadata needed to run it on any tier and check the result.
 struct RealKernel {
-    /// The function to compile. Its resolved name is [`Self::fn_name`].
-    func: HirFunction,
+    /// The module to compile. It contains the kernel function (resolved
+    /// name [`Self::fn_name`]) plus anything that function needs — a
+    /// hand-built kernel is a single function, a kernel compiled from
+    /// ZynML source carries whatever its imports pulled in.
+    module: HirModule,
     /// Resolved name `call_function_raw` looks the function up by.
     fn_name: &'static str,
     /// First operand buffer (`a`, signed i8 view).
@@ -168,12 +172,20 @@ impl RealKernel {
         ]
     }
 
-    /// Wrap the function in a single-function `HirModule` so the runtime
-    /// can resolve it by name.
+    /// The module the runtime compiles and resolves [`Self::fn_name`] in.
     fn module(&self) -> HirModule {
-        let mut m = HirModule::new(InternedString::new_global("ml_bench_mod"));
-        m.add_function(self.func.clone());
-        m
+        self.module.clone()
+    }
+
+    /// The kernel function itself. A source-compiled module also carries
+    /// whatever its imports pulled in, so the kernel is found by name
+    /// rather than assumed to be the only function present.
+    fn func(&self) -> &HirFunction {
+        self.module
+            .functions
+            .values()
+            .find(|f| f.name.resolve_global().as_deref() == Some(self.fn_name))
+            .unwrap_or_else(|| panic!("kernel `{}` missing from its module", self.fn_name))
     }
 }
 
@@ -252,11 +264,11 @@ fn registry() -> Vec<Kernel> {
         Kernel {
             name: "qdot_u8i8_intrinsic",
             phase: 0,
-            pending: true,
+            pending: false,
             metric: Metric::Gops,
             baseline: "qdot_u8i8_baseline",
-            note: "roadmap Phase 0: same dot via explicit dot_u8i8 intrinsic",
-            builder: None,
+            note: "roadmap Phase 0: the same dot written in pure ZynML",
+            builder: Some(build_qdot_u8i8_intrinsic),
         },
         Kernel {
             name: "fma_intrinsic",
@@ -546,14 +558,71 @@ fn build_qdot_u8i8_baseline() -> RealKernel {
     // (the ml_harness_tests own the u8×i8 numerical check, including a
     // b>127 unsigned case).
     let n = QDOT_N;
+    let mut module = HirModule::new(InternedString::new_global("ml_bench_mod"));
+    module.add_function(func);
     RealKernel {
-        func,
+        module,
         fn_name: "qdot_u8i8",
         a_buf: vec![1i8; n],
         b_buf: vec![1i8; n], // bit pattern 0x01 == u8 1
         n,
         ops: 2 * n as u64,  // one multiply + one add per element
         expected: n as i64, // Σ 1*1 over n elements
+    }
+}
+
+/// The same quantized dot, written in **pure ZynML** instead of
+/// hand-built HIR — the Phase 0 exit-gate kernel. It uses only the
+/// language surface: a typed pointer, whole-vector loads, the quantized
+/// dot method, and a horizontal reduce. Measuring it against
+/// `qdot_u8i8_baseline` answers the phase's question: does the explicit
+/// intrinsic path match the hand-built one?
+fn build_qdot_u8i8_intrinsic() -> RealKernel {
+    const SRC: &str = r#"
+import prelude
+
+def qdot_u8i8_src(a: Ptr<i8>, b: Ptr<i8>, n_bytes: i64): i32 {
+    let mut acc: i32x4 = i32x4::splat(0)
+    let mut off: i64 = 0
+    while off < n_bytes {
+        let av: i8x16 = vload_i8x16(a + off)
+        let bv: i8x16 = vload_i8x16(b + off)
+        acc = acc.dot_u8i8(av, bv)
+        off = off + 16
+    }
+    return acc.sum()
+}
+"#;
+
+    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("ZynML grammar should compile");
+    let program = grammar
+        .parse_with_filename(SRC, "<qdot_u8i8_intrinsic>")
+        .expect("kernel should parse");
+    let mut rt = ZyntaxRuntime::new().expect("runtime");
+    rt.add_import_resolver(Box::new(|m| match m {
+        "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
+        "simd" => Ok(Some(ZYNML_STDLIB_SIMD.to_string())),
+        _ => Ok(None),
+    }));
+    let builtins = rt
+        .config()
+        .builtins
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let module = rt
+        .lower_typed_program(program, builtins)
+        .expect("kernel should lower to HIR");
+
+    let n = QDOT_N;
+    RealKernel {
+        module,
+        fn_name: "qdot_u8i8_src",
+        a_buf: vec![1i8; n],
+        b_buf: vec![1i8; n], // bit pattern 0x01 == u8 1
+        n,
+        ops: 2 * n as u64,
+        expected: n as i64,
     }
 }
 
@@ -818,11 +887,11 @@ fn run_once(kernel: &RealKernel, tier: Tier) -> Result<(f64, f64, i64), String> 
         // Direct CraneliftBackend: compile + finalize, then call the raw
         // function pointer through the C ABI.
         Tier::Cranelift => {
-            let id = kernel.func.id;
+            let id = kernel.func().id;
             let t0 = Instant::now();
             let mut backend = CraneliftBackend::new().map_err(|e| format!("backend: {e:?}"))?;
             backend
-                .compile_function(id, &kernel.func)
+                .compile_function(id, kernel.func())
                 .map_err(|e| format!("compile: {e:?}"))?;
             backend
                 .finalize_definitions()
