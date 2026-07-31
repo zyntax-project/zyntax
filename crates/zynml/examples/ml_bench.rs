@@ -888,11 +888,25 @@ fn run_once(kernel: &RealKernel, tier: Tier) -> Result<(f64, f64, i64), String> 
         // Direct CraneliftBackend: compile + finalize, then call the raw
         // function pointer through the C ABI.
         Tier::Cranelift => {
-            let id = kernel.func().id;
+            // Run the same HIR optimization pipeline the runtime applies
+            // inside `compile_module`. Without it this tier would compile
+            // unoptimized HIR while every other tier compiles optimized
+            // HIR, so the row would report the cost of skipping the
+            // optimizer rather than the codegen number it is meant to
+            // isolate.
+            let mut module = kernel.module();
+            zyntax_compiler::run_interp_safe_opts(&mut module);
+            let func = module
+                .functions
+                .values()
+                .find(|f| f.name.resolve_global().as_deref() == Some(kernel.fn_name))
+                .ok_or_else(|| format!("kernel `{}` missing after opts", kernel.fn_name))?
+                .clone();
+            let id = func.id;
             let t0 = Instant::now();
             let mut backend = CraneliftBackend::new().map_err(|e| format!("backend: {e:?}"))?;
             backend
-                .compile_function(id, kernel.func())
+                .compile_function(id, &func)
                 .map_err(|e| format!("compile: {e:?}"))?;
             backend
                 .finalize_definitions()
@@ -908,6 +922,21 @@ fn run_once(kernel: &RealKernel, tier: Tier) -> Result<(f64, f64, i64), String> 
                     unsafe extern "C" fn(*const i8, *const i8, i64) -> i32,
                 >(ptr)
             };
+            // Untimed warmup, matching what the tiered tiers get. Without
+            // it this row times the first touch of a multi-megabyte
+            // working set straight from memory, while the tiered rows —
+            // which warm up before measuring — report steady state. That
+            // gap is cache residency, not codegen, and it made direct
+            // codegen look several times worse than it is.
+            for _ in 0..JIT_TIER_WARMUP_CALLS {
+                unsafe {
+                    f(
+                        kernel.a_buf.as_ptr(),
+                        kernel.b_buf.as_ptr(),
+                        kernel.n as i64,
+                    )
+                };
+            }
             let t1 = Instant::now();
             let r = unsafe {
                 f(
