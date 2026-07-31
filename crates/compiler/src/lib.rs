@@ -58,6 +58,7 @@ pub mod memory_pass;
 pub mod monomorphize;
 pub mod optimization;
 pub mod pattern_matching;
+pub mod phi_prune;
 pub mod pure_call_pre;
 pub mod purity;
 pub mod reduction_vectorize;
@@ -1700,6 +1701,7 @@ pub struct InterpOptStats {
     pub tco: tco::TcoStats,
     pub recursive_inline: inline::RecursiveInlineStats,
     pub pure_call_pre: pure_call_pre::PureCallPreStats,
+    pub phi_prune: phi_prune::PhiPruneStats,
 }
 
 /// Run the subset of HIR optimization passes that are safe for the
@@ -1956,6 +1958,16 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     //     becomes the caller's Return), so tco runs after and catches
     //     the new shapes. drop_insert needs to see the final post-
     //     inline body to place Frees at the correct life-range ends.
+    // Drop phis nothing reads before the remaining passes run. SSA
+    // placement gives every variable written in a loop a phi, including
+    // ones declared inside the body whose previous-iteration value is
+    // never observed. Each survivor becomes a loop-carried value in the
+    // backend and holds a register for the whole loop, which is what
+    // pushes the register allocator into spilling a real one.
+    let pp = phi_prune::run_module(module);
+    stats.phi_prune.removed += pp.removed;
+    stats.phi_prune.rounds = stats.phi_prune.rounds.max(pp.rounds);
+
     let ri = inline::run_module_recursive(module);
     stats.recursive_inline.functions_visited += ri.functions_visited;
     stats.recursive_inline.self_calls_inlined += ri.self_calls_inlined;
