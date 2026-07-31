@@ -1011,16 +1011,9 @@ def for_each<T>(items: List<T>, f: (T) => void) {
 // land once the trait-bound dispatch layer (Ord, Neg) can handle
 // f64/i64 uniformly without runtime overhead.
 
-// abs is intrinsic-aliased: every call site is rewritten at SSA
-// construction time to a direct HIR `Intrinsic::Fabs`, which the
-// Cranelift backend lowers to a single hardware FABS instruction.
-// This body is therefore never lowered or executed; it exists only
-// so the typed-AST / signature layer sees a `def abs(x: f64): f64`
-// in scope. The stub returns x to keep the IR well-formed if the
-// frontend ever bypasses the intrinsic rewrite.
-def abs(x: f64): f64 {
-    return x
-}
+// Absolute value — a single hardware instruction. Also available as the
+// `x.abs()` method on any number (see the static extensions below).
+extern def abs(x: f64): f64
 
 def abs_i64(x: i64): i64 {
     if x < 0 {
@@ -1057,15 +1050,32 @@ def max_i64(a: i64, b: i64): i64 {
     return b
 }
 
-// sqrt is intrinsic-aliased: every call site is rewritten at SSA
-// construction time to a direct HIR `Intrinsic::Sqrt`, which the
-// Cranelift backend lowers to a single hardware FSQRT instruction.
-// This body is therefore never lowered or executed; it exists only
-// so the typed-AST / signature layer sees a `def sqrt(x: f64): f64`
-// in scope. The stub returns x to keep the IR well-formed if the
-// frontend ever bypasses the intrinsic rewrite.
-def sqrt(x: f64): f64 {
-    return x
+// Square root — a single hardware instruction. Also available as the
+// `x.sqrt()` method on any number (see the static extensions below).
+extern def sqrt(x: f64): f64
+
+// ---- Static extensions on the number types ----
+//
+// The math every number carries, written as methods: `x.sqrt()`,
+// `x.abs()`. Each is one hardware instruction at the call site. These
+// are declarations — the implementation is the instruction itself, so
+// there is no body to write.
+impl f64 {
+    extern def sqrt(self): f64
+    extern def abs(self): f64
+}
+
+impl f32 {
+    extern def sqrt(self): f32
+    extern def abs(self): f32
+}
+
+impl i64 {
+    extern def abs(self): i64
+}
+
+impl i32 {
+    extern def abs(self): i32
 }
 
 // SIMD vector ops (`a.fma(b, c)`, `acc.dot_u8i8(a, b)`, `v.sum()`) are

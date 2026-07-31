@@ -131,6 +131,7 @@ impl BuiltinRegistry {
         let mut reg = Self::new();
         reg.register(Arc::new(FiberClass));
         reg.register(Arc::new(VectorClass));
+        reg.register(Arc::new(NumberClass));
         reg
     }
 
@@ -350,6 +351,49 @@ impl BuiltinClass for VectorClass {
                 _ => Ok(None),
             },
 
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Static extensions on the primitive number types: the math methods
+/// every numeric value carries (`x.sqrt()`, `x.abs()`). Each lowers to a
+/// direct intrinsic, so the call site becomes a single hardware
+/// instruction rather than a runtime call.
+///
+/// Declared in the prelude as static extensions (`impl f64 { … }`) so the
+/// signatures are in scope; the implementation is the machine
+/// instruction, so those declarations are bodyless.
+pub struct NumberClass;
+
+impl BuiltinClass for NumberClass {
+    fn name(&self) -> &str {
+        "Number"
+    }
+
+    fn matches(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Primitive(p) if p.is_numeric())
+    }
+
+    fn dispatch(
+        &self,
+        ssa: &mut crate::ssa::SsaBuilder,
+        block_id: HirId,
+        method: &str,
+        receiver: &TypedNode<TypedExpression>,
+        _receiver_ty: &Type,
+        _args: &[TypedNode<TypedExpression>],
+        _result_ty: &Type,
+    ) -> CompilerResult<Option<HirId>> {
+        use crate::hir::Intrinsic;
+
+        match method {
+            "sqrt" => ssa
+                .emit_scalar_unary_intrinsic(block_id, receiver, Intrinsic::Sqrt)
+                .map(Some),
+            "abs" => ssa
+                .emit_scalar_unary_intrinsic(block_id, receiver, Intrinsic::Fabs)
+                .map(Some),
             _ => Ok(None),
         }
     }

@@ -8791,6 +8791,38 @@ impl SsaBuilder {
         Ok(result)
     }
 
+    /// Scalar unary math method on a number (`x.sqrt()`, `x.abs()`) →
+    /// a direct intrinsic call, so the hardware instruction is reached
+    /// without a runtime call. Result keeps the receiver's type.
+    pub(crate) fn emit_scalar_unary_intrinsic(
+        &mut self,
+        block_id: HirId,
+        receiver_expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        intrinsic: crate::hir::Intrinsic,
+    ) -> CompilerResult<HirId> {
+        let operand = self.translate_expression(block_id, receiver_expr)?;
+        let ty = self
+            .function
+            .values
+            .get(&operand)
+            .map(|v| v.ty.clone())
+            .unwrap_or(HirType::F64);
+        let result = self.create_value(ty, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Call {
+                result: Some(result),
+                callee: crate::hir::HirCallable::Intrinsic(intrinsic),
+                args: vec![operand],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        self.add_use(operand, result);
+        Ok(result)
+    }
+
     /// Quantized dot-accumulate method `acc.dot_*(a, b)` → `VectorDot`
     /// (`result = acc + dot(a, b)`, `acc: i32x4`, `a`/`b: i8x16`). The
     /// `rhs_unsigned`/`rhs_i7` flags come from the method name and drive
