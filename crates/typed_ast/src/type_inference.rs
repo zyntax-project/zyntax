@@ -448,6 +448,13 @@ impl InferenceContext {
             }
         }
 
+        if let Some(prim) = name
+            .resolve_global()
+            .and_then(|n| crate::type_registry::PrimitiveType::from_type_name(&n))
+        {
+            return Some(Type::Primitive(prim));
+        }
+
         let def = self.registry.get_type_by_name(name)?;
         Some(Type::Named {
             id: def.id,

@@ -73,6 +73,36 @@ pub enum PrimitiveType {
 }
 
 impl PrimitiveType {
+    /// The primitive a source-level type name spells, if any.
+    ///
+    /// The parser does not resolve type names — every one arrives as
+    /// `Type::Unresolved(name)`, including the primitives, which is how
+    /// `impl f64 { ... }` ends up naming its `self` type as a string.
+    /// Resolution consults this before treating a name as unknown.
+    pub fn from_type_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "i8" => PrimitiveType::I8,
+            "i16" => PrimitiveType::I16,
+            "i32" => PrimitiveType::I32,
+            "i64" => PrimitiveType::I64,
+            "i128" => PrimitiveType::I128,
+            "u8" => PrimitiveType::U8,
+            "u16" => PrimitiveType::U16,
+            "u32" => PrimitiveType::U32,
+            "u64" => PrimitiveType::U64,
+            "u128" => PrimitiveType::U128,
+            "f32" => PrimitiveType::F32,
+            "f64" => PrimitiveType::F64,
+            "bool" => PrimitiveType::Bool,
+            "char" => PrimitiveType::Char,
+            "str" | "String" => PrimitiveType::String,
+            "isize" => PrimitiveType::ISize,
+            "usize" => PrimitiveType::USize,
+            "void" => PrimitiveType::Unit,
+            _ => return None,
+        })
+    }
+
     /// Check if this is a numeric type
     pub fn is_numeric(self) -> bool {
         matches!(

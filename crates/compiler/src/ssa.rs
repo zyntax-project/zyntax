@@ -9746,6 +9746,14 @@ impl SsaBuilder {
                         fields: hir_fields,
                         packed: false,
                     })
+                } else if let Some(prim) = name
+                    .resolve_global()
+                    .and_then(|n| zyntax_typed_ast::PrimitiveType::from_type_name(&n))
+                {
+                    // A primitive spelled as a bare name. `impl f64 { ... }`
+                    // types its `self` from the impl target, which the
+                    // parser records as a name rather than a resolved type.
+                    self.convert_type(&Type::Primitive(prim))
                 } else {
                     log::trace!(
                         "[WARN] Unresolved type '{}' not found in registry, defaulting to I64",

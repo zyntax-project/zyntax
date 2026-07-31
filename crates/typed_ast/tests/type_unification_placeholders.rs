@@ -210,3 +210,42 @@ fn unit_does_not_unify_with_a_value_type() {
         .unify(Type::Primitive(PrimitiveType::Unit), i64_ty())
         .is_err());
 }
+
+/// Primitives are not registered types, so a name that spells one has to
+/// be recognised directly — `impl f64 { ... }` names its receiver as a
+/// string, and without this it resolves to nothing.
+#[test]
+fn a_placeholder_naming_a_primitive_resolves_to_it() {
+    let mut ctx = ctx();
+    let f64_name = InternedString::new_global("f64");
+    let unified = ctx
+        .unify(Type::Unresolved(f64_name), f64_ty())
+        .expect("`f64` should resolve to the f64 primitive");
+    assert_eq!(unified, f64_ty());
+
+    // And it must not quietly unify with a different primitive.
+    assert!(ctx.unify(Type::Unresolved(f64_name), i64_ty()).is_err());
+}
+
+#[test]
+fn primitive_names_map_to_their_types() {
+    use zyntax_typed_ast::type_registry::PrimitiveType;
+
+    assert_eq!(
+        PrimitiveType::from_type_name("f64"),
+        Some(PrimitiveType::F64)
+    );
+    assert_eq!(
+        PrimitiveType::from_type_name("i32"),
+        Some(PrimitiveType::I32)
+    );
+    assert_eq!(
+        PrimitiveType::from_type_name("usize"),
+        Some(PrimitiveType::USize)
+    );
+    assert_eq!(
+        PrimitiveType::from_type_name("bool"),
+        Some(PrimitiveType::Bool)
+    );
+    assert_eq!(PrimitiveType::from_type_name("Tensor"), None);
+}

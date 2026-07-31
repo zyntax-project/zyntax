@@ -3398,6 +3398,14 @@ impl LoweringContext {
                         .with_help("supported SIMD types: f32x4, f64x2, i32x4, i64x2"),
                     );
                     HirType::Opaque(*name)
+                } else if let Some(prim) = name
+                    .resolve_global()
+                    .and_then(|n| zyntax_typed_ast::PrimitiveType::from_type_name(&n))
+                {
+                    // A primitive spelled as a bare name. `impl f64 { ... }`
+                    // types its `self` from the impl target, which the
+                    // parser records as a name rather than a resolved type.
+                    self.convert_type(&Type::Primitive(prim))
                 } else {
                     let type_name = name.resolve_global().unwrap_or_default();
                     // Suppress warnings for generic type params (T, U, E, etc.)

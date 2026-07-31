@@ -806,6 +806,15 @@ pub(crate) fn resolve_in_type(
                     type_def.id
                 );
                 *ty = resolved;
+            }
+            // Finally, the primitives. The parser resolves no type names,
+            // so `impl f64 { ... }` names its `self` type as a string and
+            // it arrives here unresolved like any other.
+            else if let Some(prim) = name
+                .resolve_global()
+                .and_then(|n| zyntax_typed_ast::PrimitiveType::from_type_name(&n))
+            {
+                *ty = Type::Primitive(prim);
             } else {
                 log::warn!(
                     "Could not resolve type '{}'",
