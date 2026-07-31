@@ -1076,7 +1076,7 @@ pub struct ZyntaxRuntime {
     /// interp's per-call state.
     interp: std::sync::Mutex<crate::interp_runtime::InterpRuntime>,
     /// Wrapper-class registry for compiler-known built-in types
-    /// (Fiber<T>, future SimdVector<T,N>, ...). Seeded with the
+    /// (`Fiber<T>`, future `SimdVector<T, N>`, ...). Seeded with the
     /// compiler's defaults at construction; embedders register
     /// additional classes via `register_builtin_class` BEFORE any
     /// compilation runs. Wrapped in `Arc<Mutex<_>>` so the
@@ -1960,7 +1960,7 @@ impl ZyntaxRuntime {
 
     /// Register an additional built-in wrapper class. Called before
     /// any compilation runs; the registered class joins the
-    /// compiler's defaults (Fiber<T>, future SimdVector<T,N>, ...)
+    /// compiler's defaults (`Fiber<T>`, future `SimdVector<T, N>`, ...)
     /// in the registry that `lower_typed_program` snapshots into
     /// the lowering ctx.
     ///

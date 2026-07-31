@@ -2,7 +2,7 @@ use crate::hir::{BinaryOp, CallingConvention, HirId, HirType};
 /// Vec<T>: Generic dynamic array
 ///
 /// Structure:
-/// ```
+/// ```text
 /// struct Vec<T> {
 ///     ptr: *T,        // Pointer to heap-allocated array
 ///     len: usize,     // Number of elements currently stored

@@ -7,7 +7,7 @@ use crate::hir::{BinaryOp, CallingConvention, HirType};
 /// For generic types, use Vec<T> which will be monomorphized.
 ///
 /// Structure:
-/// ```
+/// ```text
 /// struct vec_i32 {
 ///     ptr: *i32,      // Pointer to heap-allocated array
 ///     len: usize,     // Number of elements currently stored

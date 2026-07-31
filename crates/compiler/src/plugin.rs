@@ -8,6 +8,8 @@
 //!
 //! ```rust
 //! use zyntax_compiler::plugin::RuntimePlugin;
+//! # extern "C" fn my_array_create() {}
+//! # extern "C" fn my_array_push() {}
 //!
 //! pub struct HaxeRuntimePlugin;
 //!

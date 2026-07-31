@@ -2,7 +2,7 @@ use crate::hir::{BinaryOp, HirId, HirType, HirUnionVariant};
 /// Result<T,E> type implementation using HIR Builder
 ///
 /// Provides a generic result type for error handling:
-/// ```
+/// ```text
 /// union Result<T, E> {
 ///     Ok(T),    // Success value
 ///     Err(E),   // Error value

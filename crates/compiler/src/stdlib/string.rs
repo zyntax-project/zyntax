@@ -2,7 +2,7 @@ use crate::hir::{BinaryOp, HirId, HirType};
 /// String type implementation using HIR Builder
 ///
 /// Provides a UTF-8 string type backed by vec_u8:
-/// ```
+/// ```text
 /// struct String {
 ///     bytes: Vec_u8,  // UTF-8 byte storage
 /// }

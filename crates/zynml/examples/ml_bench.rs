@@ -176,17 +176,6 @@ impl RealKernel {
     fn module(&self) -> HirModule {
         self.module.clone()
     }
-
-    /// The kernel function itself. A source-compiled module also carries
-    /// whatever its imports pulled in, so the kernel is found by name
-    /// rather than assumed to be the only function present.
-    fn func(&self) -> &HirFunction {
-        self.module
-            .functions
-            .values()
-            .find(|f| f.name.resolve_global().as_deref() == Some(self.fn_name))
-            .unwrap_or_else(|| panic!("kernel `{}` missing from its module", self.fn_name))
-    }
 }
 
 /// The tiers `qdot_u8i8_baseline` is measured on.

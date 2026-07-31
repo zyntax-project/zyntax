@@ -2,7 +2,7 @@ use crate::hir::{BinaryOp, HirId, HirType, HirUnionVariant};
 /// Option<T> type implementation using HIR Builder
 ///
 /// Provides a generic optional value type:
-/// ```
+/// ```text
 /// union Option<T> {
 ///     None,      // No value
 ///     Some(T),   // Value of type T

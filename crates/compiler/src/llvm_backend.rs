@@ -127,7 +127,7 @@ pub struct LLVMBackend<'ctx> {
     /// `reachable_function_ids(&module, &["main"])` once per
     /// install — the BC interp's lazy-compile fallback still covers
     /// any unexpected reach at execution time. Without this filter
-    /// LLVM compiles every prelude helper (Option<T>, Result<T,E>,
+    /// LLVM compiles every prelude helper (`Option<T>`, `Result<T, E>`,
     /// List/Iterator/Tensor stdlib — ~100 functions on the bench
     /// kernels) and pays 300-900 ms of codegen + verifier time per
     /// install plus surfaces every type-translation gap the prelude

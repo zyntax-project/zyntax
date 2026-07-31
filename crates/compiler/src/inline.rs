@@ -220,10 +220,10 @@ pub struct RecursiveInlineStats {
     /// Self-call sites we actually inlined (depth 1).
     pub self_calls_inlined: usize,
     /// Skipped because the body exceeded
-    /// [`MAX_RECURSIVE_INLINE_INSTS`].
+    /// `MAX_RECURSIVE_INLINE_INSTS`.
     pub skipped_too_large: usize,
     /// Skipped because the function had more self-call sites than
-    /// [`MAX_RECURSIVE_INLINE_SITES`] — bounding IR growth.
+    /// `MAX_RECURSIVE_INLINE_SITES` — bounding IR growth.
     pub skipped_too_many_sites: usize,
     /// Skipped because the function's body has a shape the inliner
     /// can't safely splice (async, effects, struct returns, etc.).
@@ -238,7 +238,7 @@ pub struct RecursiveInlineStats {
 ///    reference the function id) become the depth-1 residual after
 ///    inlining — no infinite expansion.
 /// 2. The classifier here permits **self-calls inside the callee
-///    body**; the standard [`classify`] treats any internal `Call`
+///    body**; the standard `classify` treats any internal `Call`
 ///    as `Unsupported`, which would reject every recursive function
 ///    on the first instruction it sees.
 ///

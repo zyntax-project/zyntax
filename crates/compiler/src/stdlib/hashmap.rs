@@ -2,7 +2,7 @@ use crate::hir::{BinaryOp, CallingConvention, HirId, HirType};
 /// HashMap<K,V>: Generic hash table with open addressing
 ///
 /// Structure:
-/// ```
+/// ```text
 /// struct HashMap<K,V> {
 ///     buckets: *Bucket<K,V>,  // Array of buckets
 ///     len: usize,              // Number of key-value pairs

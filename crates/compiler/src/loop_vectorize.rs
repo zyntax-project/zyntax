@@ -2,7 +2,9 @@
 //!
 //! Recognises the canonical
 //!
-//!     for i in 0..n { c[i] = op(a[i], b[i]) }
+//! ```text
+//! for i in 0..n { c[i] = op(a[i], b[i]) }
+//! ```
 //!
 //! pattern that's been lowered to HIR and rewrites it to a stride-4
 //! `VectorLoad` / vector-binop / `VectorStore` main loop followed by
@@ -20,22 +22,26 @@
 //! Header (single phi `i` with init 0, increment by 1; loop bound is
 //! `i < n`):
 //!
-//!     i = phi [0 from preheader, i_next from body]
-//!     cond = (i < n)
-//!     cond_branch cond -> body, exit
+//! ```text
+//! i = phi [0 from preheader, i_next from body]
+//! cond = (i < n)
+//! cond_branch cond -> body, exit
+//! ```
 //!
 //! Body (the SAXPY shape — exactly these ops, in any order, with the
 //! only producer-consumer chain shown):
 //!
-//!     addr_a = GEP(ptr_a, [i])
-//!     va     = Load addr_a
-//!     addr_b = GEP(ptr_b, [i])
-//!     vb     = Load addr_b
-//!     vc     = Binary(elementwise_op, va, vb)
-//!     addr_c = GEP(ptr_c, [i])
-//!     Store vc -> addr_c
-//!     i_next = i + 1
-//!     Branch header
+//! ```text
+//! addr_a = GEP(ptr_a, [i])
+//! va     = Load addr_a
+//! addr_b = GEP(ptr_b, [i])
+//! vb     = Load addr_b
+//! vc     = Binary(elementwise_op, va, vb)
+//! addr_c = GEP(ptr_c, [i])
+//! Store vc -> addr_c
+//! i_next = i + 1
+//! Branch header
+//! ```
 //!
 //! `ptr_a`, `ptr_b`, `ptr_c` must be loop-invariant. The elementwise
 //! op must be one of the SIMD-safe set (`Add`, `Sub`, `Mul`, `FAdd`,
@@ -470,11 +476,13 @@ fn defined_in_block(func: &HirFunction, value: HirId, block_id: HirId) -> bool {
 
 /// Materialise the vector main loop + scalar epilogue. After this:
 ///
-///     preheader → vec_check → vec_body → vec_check (back-edge)
-///                     ↓
-///                   scalar_check → scalar_body → scalar_check (back-edge)
-///                                       ↓
-///                                     exit
+/// ```text
+/// preheader → vec_check → vec_body → vec_check (back-edge)
+///                 ↓
+///               scalar_check → scalar_body → scalar_check (back-edge)
+///                                   ↓
+///                                 exit
+/// ```
 ///
 /// where `vec_n = n & ~3` (rounded down to multiple of 4) drives the
 /// vector loop and `n` drives the scalar tail. The original header
@@ -905,7 +913,9 @@ mod tests {
 
     /// Build the canonical SAXPY loop:
     ///
-    ///     for i in 0..n { c[i] = a[i] + b[i] }
+    /// ```text
+    /// for i in 0..n { c[i] = a[i] + b[i] }
+    /// ```
     ///
     /// over the given elem_ty + binary op.
     fn build_saxpy(elem_ty: HirType, op: BinaryOp) -> HirFunction {

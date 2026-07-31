@@ -427,7 +427,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     ///
     /// Mirrors rayzor's `compile_to_object_file` (rayzor
     /// llvm_jit_backend.rs:1191). Uses the host-tuned TargetMachine
-    /// from [`Self::compile_module_to_ir`] for codegen options. The
+    /// from `Self::compile_module_to_ir` for codegen options. The
     /// resulting `.o` is ready for the system linker.
     pub fn compile_to_object_file(
         &self,

@@ -454,7 +454,7 @@ impl InterpRuntime {
     /// running it.
     ///
     /// Most callers want [`Self::install_cranelift_jit`] (or, with
-    /// `feature = "llvm-backend"`, [`Self::install_llvm_jit`]) which
+    /// `feature = "llvm-backend"`, `Self::install_llvm_jit`) which
     /// build the appropriate per-tier dispatch closure for you. This
     /// generic seam is what Phase E plugs the wasm-emitter into.
     ///

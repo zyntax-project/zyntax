@@ -22,12 +22,13 @@
 //! to `Call::Symbol("krio_fiber_*")` and the symbol resolution does the
 //! rest.
 //!
-//! ## Install / replace
+//! ## Install
 //!
-//! [`install_fiber_backend`] is set-once. Calling it a second time
-//! returns `false`; reset via the unsafe [`force_replace_fiber_backend`]
-//! (test-only helper that's also gated by an env var to avoid
-//! production foot-gun risk).
+//! [`install_fiber_backend`] is set-once, backed by a `OnceLock`. The
+//! first caller wins; every later call returns `false` and changes
+//! nothing. There is no reset — parallel test harnesses share one
+//! process-global slot, so a replaceable backend would let one test
+//! swap the backend out from under another.
 
 use crate::zrtl::FiberRepr;
 use std::sync::OnceLock;

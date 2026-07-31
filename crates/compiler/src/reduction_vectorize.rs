@@ -3,7 +3,9 @@
 //! Complementary to `loop_vectorize` (which handles store-to-array
 //! SAXPY shapes): this module recognises the canonical
 //!
-//!     for i in 0..n { sum += op(a[i], b[i]) }
+//! ```text
+//! for i in 0..n { sum += op(a[i], b[i]) }
+//! ```
 //!
 //! pattern, where `sum` is a header phi that accumulates per
 //! iteration. After vectorization the loop runs at stride 4 over a
@@ -18,21 +20,25 @@
 //!
 //! Two phis in the header:
 //!
-//!     i   = phi [0 from preheader, i_next from body]
-//!     sum = phi [0 from preheader, sum_next from body]
+//! ```text
+//! i   = phi [0 from preheader, i_next from body]
+//! sum = phi [0 from preheader, sum_next from body]
+//! ```
 //!
 //! Header bound: `i < n`, branch to body / exit on it.
 //!
 //! Body, exactly:
 //!
-//!     addr_a    = GEP(ptr_a, [i])
-//!     va        = Load addr_a
-//!     addr_b    = GEP(ptr_b, [i])
-//!     vb        = Load addr_b
-//!     vc        = Binary(elementwise_op, va, vb)    // Mul/Add/Sub
-//!     sum_next  = Binary(reduce_op, sum, vc)         // typically Add
-//!     i_next    = i + 1
-//!     Branch header
+//! ```text
+//! addr_a    = GEP(ptr_a, [i])
+//! va        = Load addr_a
+//! addr_b    = GEP(ptr_b, [i])
+//! vb        = Load addr_b
+//! vc        = Binary(elementwise_op, va, vb)    // Mul/Add/Sub
+//! sum_next  = Binary(reduce_op, sum, vc)         // typically Add
+//! i_next    = i + 1
+//! Branch header
+//! ```
 //!
 //! `reduce_op` must be one of `Add` / `FAdd` (the only ops where a
 //! lane-parallel reduction is semantically equivalent to the scalar
@@ -507,26 +513,28 @@ fn defined_in_block(func: &HirFunction, value: HirId, block_id: HirId) -> bool {
 
 /// Materialise the vector reduction loop + scalar epilogue. After:
 ///
-///     preheader: vec_n = n & ~3; vec_init = vector_zero(elem_ty, 4)
-///       → header (vec_check)
-///     header: i_vec = phi [0, i_vec_next]
-///             sum_vec = phi [vec_init, sum_vec_next]
-///             cond = i_vec < vec_n
-///             cond_branch -> body, post_vec
-///     body:   va_vec = VectorLoad ptr_a + i_vec
-///             vb_vec = VectorLoad ptr_b + i_vec
-///             vc_vec = Binary(elementwise, va_vec, vb_vec)
-///             sum_vec_next = Binary(reduce, sum_vec, vc_vec)
-///             i_vec_next = i_vec + 4
-///             Branch header
-///     post_vec: scalar_seed = VectorHorizontalReduce(sum_vec, reduce)
-///             → scalar_check
-///     scalar_check: i_s = phi [i_vec, i_s_next]
-///                   sum_s = phi [scalar_seed, sum_s_next]
-///                   cond2 = i_s < n
-///                   cond_branch -> scalar_body, exit
-///     scalar_body: (original scalar body verbatim, branching back
-///                   to scalar_check)
+/// ```text
+/// preheader: vec_n = n & ~3; vec_init = vector_zero(elem_ty, 4)
+///   → header (vec_check)
+/// header: i_vec = phi [0, i_vec_next]
+///         sum_vec = phi [vec_init, sum_vec_next]
+///         cond = i_vec < vec_n
+///         cond_branch -> body, post_vec
+/// body:   va_vec = VectorLoad ptr_a + i_vec
+///         vb_vec = VectorLoad ptr_b + i_vec
+///         vc_vec = Binary(elementwise, va_vec, vb_vec)
+///         sum_vec_next = Binary(reduce, sum_vec, vc_vec)
+///         i_vec_next = i_vec + 4
+///         Branch header
+/// post_vec: scalar_seed = VectorHorizontalReduce(sum_vec, reduce)
+///         → scalar_check
+/// scalar_check: i_s = phi [i_vec, i_s_next]
+///               sum_s = phi [scalar_seed, sum_s_next]
+///               cond2 = i_s < n
+///               cond_branch -> scalar_body, exit
+/// scalar_body: (original scalar body verbatim, branching back
+///               to scalar_check)
+/// ```
 fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
     let n_ty = func
         .values

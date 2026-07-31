@@ -61,7 +61,7 @@ use zyntax_typed_ast::TypedNode;
 ///
 /// The class only fans out into multiple `impl BuiltinClass`
 /// blocks if the instantiations need wildly different dispatch
-/// behaviour (rare). For Fiber<T>, today's MVP packs the yielded
+/// behaviour (rare). For `Fiber<T>`, today's MVP packs the yielded
 /// value into the upper bits of an i64 step; that encoding works
 /// for any pointer-sized scalar T. Wider Ts (e.g. structs, tuples)
 /// will need a different payload strategy — the dispatch routine
@@ -125,7 +125,7 @@ impl BuiltinRegistry {
     }
 
     /// Registry pre-populated with the compiler's default built-in
-    /// classes (Fiber<T>; future SimdVector<T,N>; ...). Embedders
+    /// classes (`Fiber<T>`; future `SimdVector<T, N>`; ...). Embedders
     /// add to this list via `register`.
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();

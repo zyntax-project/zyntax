@@ -13,7 +13,10 @@ use syn::{
 ///
 /// # Example
 ///
-/// ```rust
+/// Not compiled as a doctest: the expansion refers to `RuntimeSymbol` and
+/// `FunctionPtr`, which `runtime_plugin!` generates in the plugin crate.
+///
+/// ```ignore
 /// #[runtime_export("$Array$create")]
 /// pub extern "C" fn Array_create(elem0: i32, elem1: i32) -> *mut i32 {
 ///     // implementation
@@ -126,7 +129,10 @@ impl Parse for MethodArgs {
 ///
 /// # Example
 ///
-/// ```rust
+/// Not compiled as a doctest: the expansion refers to items
+/// `runtime_plugin!` generates in the plugin crate.
+///
+/// ```ignore
 /// #[runtime_method(
 ///     symbol = "$Array$length",
 ///     haxe_type = "Array",
@@ -219,7 +225,10 @@ impl Parse for PluginArgs {
 ///
 /// # Example
 ///
-/// ```rust
+/// Not compiled as a doctest: the macro defines the plugin's public items,
+/// so it can only be invoked once, at the plugin crate's root.
+///
+/// ```ignore
 /// runtime_plugin! {
 ///     name: "haxe",
 /// }
