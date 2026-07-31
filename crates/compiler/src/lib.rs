@@ -62,6 +62,7 @@ pub mod phi_prune;
 pub mod pure_call_pre;
 pub mod purity;
 pub mod reduction_vectorize;
+pub(crate) mod return_infer; // Return types for declarations that don't state one
 pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
 pub mod ssa;

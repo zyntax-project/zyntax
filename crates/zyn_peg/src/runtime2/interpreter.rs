@@ -1448,6 +1448,10 @@ impl<'g> GrammarInterpreter<'g> {
     ) -> Result<ParsedValue, String> {
         let ty = match variant {
             "Unit" => Type::Primitive(PrimitiveType::Unit),
+            // No type was written — the compiler works it out from
+            // context, the same way an unannotated `let` does. Distinct
+            // from `Unit`, which states that there is no value.
+            "Inferred" => Type::Any,
             "Named" => {
                 let name = self.get_field_as_interned("name", fields, state)?;
                 // A generic argument list mixes type args and integer const

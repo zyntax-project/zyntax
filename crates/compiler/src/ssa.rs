@@ -280,7 +280,7 @@ pub struct SsaBuilder {
     /// literals don't get accidentally placed.
     array_pool_placement: Option<HirId>,
     /// Wrapper-class registry for compiler-known built-in types
-    /// (Fiber<T>, future SimdVector<T,N>, ...). The `MethodCall`
+    /// (`Fiber<T>`, future `SimdVector<T, N>`, ...). The `MethodCall`
     /// handler consults this before normal trait method resolution.
     ///
     /// `Arc` shared with the runtime so embedders
@@ -12642,7 +12642,24 @@ impl SsaBuilder {
                             .unwrap_or(HirType::I64)
                     })
                     .collect();
-                (hir_params, HirType::I64)
+                // A lambda never writes a return type, so it comes from the
+                // body — `def(x): x * 0.5` returns a float, not a machine
+                // word. Anything the body doesn't settle keeps the I64 the
+                // closure ABI has always used.
+                let inferred = match &lambda.body {
+                    TypedLambdaBody::Expression(expr) => {
+                        crate::return_infer::returned_type_of(expr)
+                    }
+                    TypedLambdaBody::Block(block) => {
+                        crate::return_infer::infer_from_body("", block)
+                    }
+                };
+                let hir_return = if crate::return_infer::is_statically_settled(&inferred) {
+                    self.convert_type(&inferred)
+                } else {
+                    HirType::I64
+                };
+                (hir_params, hir_return)
             }
         };
 

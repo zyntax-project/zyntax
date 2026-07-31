@@ -863,7 +863,10 @@ impl LoweringContext {
                     self.resolve_method_calls_in_expression(expr, var_types, function_param_specs)?;
 
                     if !matches!(function_return_type, Type::Any | Type::Unknown)
-                        && !matches!(function_return_type, Type::Primitive(PrimitiveType::Unit))
+                        && !matches!(
+                            function_return_type,
+                            Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)
+                        )
                     {
                         if let Some(converted) = self
                             .try_implicit_from_conversion((**expr).clone(), function_return_type)
@@ -1684,33 +1687,6 @@ impl LoweringContext {
         }
     }
 
-    /// Check if a function body returns a value — either via explicit `return <expr>`
-    /// or via an implicit single-expression body (matching CFG builder behavior).
-    fn body_returns_value(func_name: &str, body: &zyntax_typed_ast::typed_ast::TypedBlock) -> bool {
-        use zyntax_typed_ast::typed_ast::TypedStatement;
-
-        // Explicit return statements always indicate a returning function
-        let has_explicit_return = body
-            .statements
-            .iter()
-            .any(|stmt| matches!(&stmt.node, TypedStatement::Return(Some(_))));
-        if has_explicit_return {
-            return true;
-        }
-
-        // Implicit single-expression return (matching CFG builder behavior at line 1365):
-        // A function body with exactly one statement that is a bare expression
-        // is treated as an implicit return by the CFG builder.
-        // Skip for main() — it's always void.
-        if func_name != "main" && body.statements.len() == 1 {
-            if let TypedStatement::Expression(_) = &body.statements[0].node {
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Collect all declarations for forward references
     fn collect_declarations(&mut self, program: &TypedProgram) -> CompilerResult<()> {
         for decl in &program.declarations {
@@ -1721,26 +1697,11 @@ impl LoweringContext {
                     if func.is_fiber {
                         self.symbols.fiber_fn_names.insert(func.name);
                     }
-                    // Record return type for call-site type resolution.
-                    // If return_type is Unit (no annotation) but body has `return <expr>`,
-                    // infer Dynamic — the return type will be evaluated at runtime.
-                    let effective_return_type = if matches!(
-                        func.return_type,
-                        zyntax_typed_ast::Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)
-                    ) {
-                        let fn_name = func.name.resolve_global().unwrap_or_default();
-                        let returns_value = func
-                            .body
-                            .as_ref()
-                            .map_or(false, |b| Self::body_returns_value(&fn_name, b));
-                        if returns_value {
-                            zyntax_typed_ast::Type::Dynamic
-                        } else {
-                            func.return_type.clone()
-                        }
-                    } else {
-                        func.return_type.clone()
-                    };
+                    // Record return type for call-site type resolution. A
+                    // declaration with no stated return type gets one from
+                    // its body — the same type the signature is built from,
+                    // so caller and callee cannot disagree.
+                    let effective_return_type = crate::return_infer::effective_return_type(func);
                     // `fiber def NAME(): T` declares T as the body's
                     // yield type. Callers see `Fiber<T>` — wrap here
                     // so the type checker, call-site type
@@ -2938,16 +2899,18 @@ impl LoweringContext {
             });
         }
 
-        // For void/unit functions, use empty returns vec (not vec![Void]).
-        // Exception: if body has `return <expr>` without a type annotation,
-        // the function has a Dynamic return type — evaluated at runtime as i64.
-        let hir_return_type = self.convert_type(&func.return_type);
+        // A stated return type is used as written. An unstated one comes
+        // from the body, via the same helper the call-site table uses, so
+        // caller and callee always agree.
+        let stated_return_type = !crate::return_infer::is_unstated(&func.return_type);
+        let effective_return_type = crate::return_infer::effective_return_type(func);
+        let hir_return_type = self.convert_type(&effective_return_type);
+
+        // Void is an empty returns vec, not vec![Void].
         let returns = if matches!(hir_return_type, HirType::Void) {
-            let returns_value = func
-                .body
-                .as_ref()
-                .map_or(false, |b| Self::body_returns_value(&func_name, b));
-            if returns_value {
+            vec![]
+        } else {
+            if !stated_return_type {
                 // Only warn for user-defined functions, not internal/stdlib
                 let is_internal = func_name == "main"
                     || func_name.starts_with('$')
@@ -2974,6 +2937,12 @@ impl LoweringContext {
                             | "to_string"
                     );
                 if !is_internal {
+                    let note = if matches!(effective_return_type, Type::Dynamic) {
+                        "the return paths do not agree on a type, so it is resolved at runtime"
+                            .to_string()
+                    } else {
+                        format!("inferred `{:?}` from the body", hir_return_type)
+                    };
                     self.emit_diagnostic(
                         LoweringDiagnostic::warning(format!(
                             "function `{}` returns a value but has no return type annotation",
@@ -2984,15 +2953,10 @@ impl LoweringContext {
                             "consider adding a return type annotation to `{}`",
                             func_name
                         ))
-                        .with_note("the return type will be inferred dynamically at runtime"),
+                        .with_note(note),
                     );
                 }
-                // Dynamic maps to I64 at the machine level
-                vec![HirType::I64]
-            } else {
-                vec![] // Genuinely void
             }
-        } else {
             vec![hir_return_type]
         };
 

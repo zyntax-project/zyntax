@@ -749,7 +749,7 @@ trait_method_def = { "def" ~ name:identifier ~ type_params? ~ "(" ~ trait_params
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: None,
   }
 
@@ -758,7 +758,7 @@ trait_method_fn = { "fn" ~ name:identifier ~ type_params? ~ "(" ~ trait_params? 
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: None,
   }
 
@@ -1000,7 +1000,7 @@ extern_fn_generic = { "extern" ~ "def" ~ name:identifier ~ tps:type_params ~ "("
       name: intern(name),
       type_params: tps,
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: None,
       is_external: true,
   }
@@ -1020,7 +1020,7 @@ extern_fn_params = { "extern" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: None,
       is_external: true,
   }
@@ -1310,7 +1310,7 @@ impl_method_params_expr = { "fn" ~ name:identifier ~ "(" ~ params:fn_params ~ ")
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1332,7 +1332,7 @@ impl_method_params_indent = { "fn" ~ name:identifier ~ "(" ~ params:fn_params ~ 
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1342,7 +1342,7 @@ impl_method_simple_indent = { "fn" ~ name:identifier ~ "(" ~ ")" ~ ":" ~ body:in
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1364,7 +1364,7 @@ impl_method_params = { "fn" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ b
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1373,7 +1373,7 @@ impl_method_simple = { "fn" ~ name:identifier ~ "(" ~ ")" ~ body:block }
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1393,7 +1393,7 @@ impl_method_def_params = { "def" ~ name:identifier ~ type_params? ~ "(" ~ params
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1402,7 +1402,7 @@ impl_method_def_simple = { "def" ~ name:identifier ~ "(" ~ ")" ~ body:block }
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1424,7 +1424,7 @@ impl_method_extern_params = { "extern" ~ "def" ~ name:identifier ~ "(" ~ params:
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: None,
   }
 
@@ -1433,7 +1433,7 @@ impl_method_extern_simple = { "extern" ~ "def" ~ name:identifier ~ "(" ~ ")" }
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: None,
   }
 
@@ -1796,7 +1796,7 @@ fiber_def_params_block = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ params:fn_p
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_fiber: true,
   }
@@ -1805,7 +1805,7 @@ fiber_def_params_colon = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ params:fn_p
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_fiber: true,
   }
@@ -1814,7 +1814,7 @@ fiber_def_simple_block = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ body:
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_fiber: true,
   }
@@ -1823,7 +1823,7 @@ fiber_def_simple_colon = { "fiber" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ ":" ~
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_fiber: true,
   }
@@ -1857,7 +1857,7 @@ async_def_params_block = { "async" ~ "def" ~ name:identifier ~ "(" ~ params:fn_p
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_async: true,
   }
@@ -1868,7 +1868,7 @@ async_def_params_colon = { "async" ~ "def" ~ name:identifier ~ "(" ~ params:fn_p
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_async: true,
   }
@@ -1878,7 +1878,7 @@ async_def_simple_block = { "async" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ body:
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_async: true,
   }
@@ -1889,7 +1889,7 @@ async_def_simple_colon = { "async" ~ "def" ~ name:identifier ~ "(" ~ ")" ~ ":" ~
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
       is_async: true,
   }
@@ -1923,7 +1923,7 @@ def_generic_block = { "def" ~ name:identifier ~ tp:type_params ~ "(" ~ params:fn
       name: intern(name),
       type_params: tp,
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1934,7 +1934,7 @@ def_generic_colon = { "def" ~ name:identifier ~ tp:type_params ~ "(" ~ params:fn
       name: intern(name),
       type_params: tp,
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1962,7 +1962,7 @@ def_params_block = { "def" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ bo
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1972,7 +1972,7 @@ def_params_colon = { "def" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ ":
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1981,7 +1981,7 @@ def_simple_block = { "def" ~ name:identifier ~ "(" ~ ")" ~ body:block }
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -1991,7 +1991,7 @@ def_simple_colon = { "def" ~ name:identifier ~ "(" ~ ")" ~ ":" ~ body:indent_blo
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -2011,7 +2011,7 @@ fn_def_generic = { "fn" ~ name:identifier ~ type_params ~ "(" ~ params:fn_params
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -2029,7 +2029,7 @@ fn_def_params = { "fn" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ body:b
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -2038,7 +2038,7 @@ fn_def_simple = { "fn" ~ name:identifier ~ "(" ~ ")" ~ body:block }
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -2060,7 +2060,7 @@ fn_def_generic_colon = { "fn" ~ name:identifier ~ type_params ~ "(" ~ params:fn_
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -2080,7 +2080,7 @@ fn_def_params_colon = { "fn" ~ name:identifier ~ "(" ~ params:fn_params ~ ")" ~ 
   -> TypedDeclaration::Function {
       name: intern(name),
       params: params,
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
@@ -2090,7 +2090,7 @@ fn_def_simple_colon = { "fn" ~ name:identifier ~ "(" ~ ")" ~ ":" ~ body:indent_b
   -> TypedDeclaration::Function {
       name: intern(name),
       params: [],
-      return_type: Type::Unit,
+      return_type: Type::Inferred,
       body: Some(body),
   }
 
