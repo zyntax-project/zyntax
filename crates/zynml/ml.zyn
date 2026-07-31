@@ -339,6 +339,7 @@ top_level_item = {
     enum_def |
     struct_def |
     extern_struct_def |
+    extern_fn_def |
     type_def |
     fn_def |
     let_stmt |
@@ -966,6 +967,62 @@ extern_struct_simple = { "extern" ~ "struct" ~ name:identifier }
   -> TypedDeclaration::ExternStruct {
       name: intern(name),
       type_params: [],
+  }
+
+// ========== Extern Function Declarations ==========
+// A bodyless function declaration: the signature is in scope for type
+// checking, and the implementation comes from outside the source — a
+// runtime symbol, or a built-in operation the compiler emits directly.
+//
+//   extern def malloc(size: i64): Ptr<i8>
+//   extern def vload_i8x16(p: Ptr<i8>): i8x16
+//   extern def free<T>(p: Ptr<T>)
+extern_fn_def = {
+    decl:extern_fn_generic_return | decl:extern_fn_generic |
+    decl:extern_fn_return | decl:extern_fn_params
+}
+  -> decl
+
+// extern def name<T, ...>(params): Ret
+extern_fn_generic_return = { "extern" ~ "def" ~ name:identifier ~ tps:type_params ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      type_params: tps,
+      params: params,
+      return_type: ret,
+      body: None,
+      is_external: true,
+  }
+
+// extern def name<T, ...>(params)
+extern_fn_generic = { "extern" ~ "def" ~ name:identifier ~ tps:type_params ~ "(" ~ params:fn_params? ~ ")" }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      type_params: tps,
+      params: params,
+      return_type: Type::Unit,
+      body: None,
+      is_external: true,
+  }
+
+// extern def name(params): Ret
+extern_fn_return = { "extern" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" ~ ":" ~ ret:type_expr }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params,
+      return_type: ret,
+      body: None,
+      is_external: true,
+  }
+
+// extern def name(params)
+extern_fn_params = { "extern" ~ "def" ~ name:identifier ~ "(" ~ params:fn_params? ~ ")" }
+  -> TypedDeclaration::Function {
+      name: intern(name),
+      params: params,
+      return_type: Type::Unit,
+      body: None,
+      is_external: true,
   }
 
 // ========== Regular Struct Definitions ==========

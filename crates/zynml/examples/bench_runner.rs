@@ -39,7 +39,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR};
+use zynml::{
+    Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR,
+};
 use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;

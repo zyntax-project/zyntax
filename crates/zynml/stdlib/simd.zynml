@@ -9,14 +9,13 @@
 // naturally free functions.
 //
 // Usage:
-//   let a: Ptr<i8> = alloc<i8>(len)
+//   let a: Ptr<i8> = alloc_i8(len)
 //   vstore_i8x16(a, some_vector)
 //   let v = vload_i8x16(a)
 //   free(a)
 //
-// The bodies are placeholders — a call is replaced with the actual
-// allocation / free / memory operation, so a body never runs; it is here
-// only so the signature is in scope and calls type-check.
+// These are declarations, not definitions: the implementation is the
+// machine operation itself, so there is no ZynML body to write.
 // ============================================================================
 
 // A general-purpose typed heap. `alloc_<T>(n)` returns a `Ptr<T>` to a
@@ -24,37 +23,15 @@
 // Any code needing owned, contiguous, typed memory (a tensor, a scratch
 // buffer, a ring) uses these directly. The element type is named in the
 // function so the returned pointer type is unambiguous.
-def alloc_i8(n: i64): Ptr<i8> {
-    return alloc_i8(n)
-}
-
-def alloc_i32(n: i64): Ptr<i32> {
-    return alloc_i32(n)
-}
-
-def alloc_f32(n: i64): Ptr<f32> {
-    return alloc_f32(n)
-}
-
-def free<T>(p: Ptr<T>) {
-    return
-}
+extern def alloc_i8(n: i64): Ptr<i8>
+extern def alloc_i32(n: i64): Ptr<i32>
+extern def alloc_f32(n: i64): Ptr<f32>
+extern def free<T>(p: Ptr<T>)
 
 // Load / store a whole SIMD vector at a pointer. `vload_*` reads the
 // vector named by its suffix; `vstore_*` writes one. Callers advance the
 // pointer between iterations to sweep a buffer.
-def vload_i8x16(p: Ptr<i8>): i8x16 {
-    return vload_i8x16(p)
-}
-
-def vload_i32x4(p: Ptr<i32>): i32x4 {
-    return vload_i32x4(p)
-}
-
-def vstore_i8x16(p: Ptr<i8>, v: i8x16) {
-    return
-}
-
-def vstore_i32x4(p: Ptr<i32>, v: i32x4) {
-    return
-}
+extern def vload_i8x16(p: Ptr<i8>): i8x16
+extern def vload_i32x4(p: Ptr<i32>): i32x4
+extern def vstore_i8x16(p: Ptr<i8>, v: i8x16)
+extern def vstore_i32x4(p: Ptr<i32>, v: i32x4)
