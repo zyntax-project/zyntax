@@ -3500,6 +3500,12 @@ pub fn jit_dispatch_supported(params: &[HirType], ret: &HirType) -> bool {
                 | HirType::U64
                 | HirType::F64
                 | HirType::Ptr(_)
+                // A reference is a pointer at the ABI level — same size,
+                // same register class. Source-level `Ptr<T>` lowers to
+                // this, so excluding it left kernels taking typed buffers
+                // compiled but never dispatched to, silently running in
+                // the interpreter.
+                | HirType::Ref { .. }
         )
     };
     if !params.iter().all(param_ok) {

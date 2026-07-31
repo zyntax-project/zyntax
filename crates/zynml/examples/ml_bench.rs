@@ -236,6 +236,7 @@ const TIERS: [Tier; 4] = [
 /// in; otherwise `hot_threshold = 1` is inert and the tier stays Cranelift.
 fn jit_tier_config(install_llvm: bool) -> TieredConfig {
     let mut cfg = TieredConfig::default();
+    cfg.verbosity = std::env::var("ML_BENCH_VERBOSE").is_ok() as u8;
     cfg.profile_config = ProfileConfig {
         warm_threshold: 0,
         hot_threshold: if install_llvm { 1 } else { u32::MAX as u64 },
