@@ -905,6 +905,12 @@ fn run_once(kernel: &RealKernel, tier: Tier) -> Result<(f64, f64, i64), String> 
             let id = func.id;
             let t0 = Instant::now();
             let mut backend = CraneliftBackend::new().map_err(|e| format!("backend: {e:?}"))?;
+            // Match the tiered path: it turns OSR back-edge probes off,
+            // since nothing consumes them there. Leaving them on emits a
+            // runtime call on every loop back edge, which for a kernel
+            // whose whole body is a handful of vector ops is most of the
+            // work being measured.
+            backend.set_emit_osr_probes(false);
             backend
                 .compile_function(id, &func)
                 .map_err(|e| format!("compile: {e:?}"))?;
