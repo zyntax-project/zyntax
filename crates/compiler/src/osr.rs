@@ -94,10 +94,10 @@ pub fn block_index_of(function: &HirFunction, block_id: HirId) -> Option<u64> {
 // Bead registry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Global registry mapping a `bead_id` (the `HirId` of the function's main
-/// body) to its [`Arc<Bead>`]. Populated by `TieredBackend::compile_module`
-/// at module load and consulted by [`osr_probe`] from JIT'd code on the
-/// hot path.
+/// Global registry mapping a `bead_id` (a sequential id from
+/// [`next_bead_id`]) to its [`Arc<Bead>`]. Populated at module load by
+/// `TieredBackend::compile_module` and by the interp-JIT install path in
+/// `zyntax_embed`; read by [`osr_probe`].
 ///
 /// Returning a `'static` reference to the inner `RwLock` keeps the call
 /// site short — `bead_registry().read()...`. The registry is initialized
@@ -107,8 +107,8 @@ pub fn bead_registry() -> &'static RwLock<HashMap<u64, Arc<Bead>>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Register `bead` under `bead_id`. Idempotent: re-registering a different
-/// bead under the same id replaces it (matches reload semantics).
+/// Register `bead` under `bead_id`. Re-registering under an existing id
+/// replaces the previous entry.
 pub fn register_bead(bead_id: u64, bead: Arc<Bead>) {
     bead_registry().write().unwrap().insert(bead_id, bead);
 }
@@ -183,8 +183,9 @@ pub const OSR_SAMPLE_TICK_SYMBOL: &str = "__zyntax_osr_sample_tick";
 ///
 /// Encapsulating the counter inside an extern function keeps the JIT IR
 /// short — no globals to declare, no atomic ops to emit inline. The
-/// function-call overhead is acceptable in tier 0 (which exists to be
-/// replaced); tier ≥ 1 doesn't emit this.
+/// sampling is 1-in-64 but this call is on every back-edge, so an enabled
+/// probe site costs a call plus a branch per iteration. Tier ≥ 1 doesn't
+/// emit this.
 ///
 /// `Ordering::Relaxed` is sufficient: we only need rough sampling, not
 /// strict ordering.
