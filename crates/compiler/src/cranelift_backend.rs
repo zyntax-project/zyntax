@@ -308,8 +308,8 @@ pub struct CraneliftBackend {
     /// `compile_function` call from the tiered runtime.
     compile_tier: usize,
     /// When `false`, tier-0 codegen skips the back-edge OSR probe and
-    /// dispatch emission entirely — neither `__zyntax_osr_sample_tick`
-    /// nor `__zyntax_osr_probe` calls are inserted at loop headers.
+    /// dispatch emission entirely — no arm-slot load and no
+    /// `__zyntax_osr_probe` call is inserted at loop headers.
     ///
     /// Defaults to `true` for backwards compatibility. Embedders that
     /// know no tier ≥ 1 backend will ever install OSR helpers (e.g. the
@@ -524,12 +524,9 @@ impl CraneliftBackend {
     }
 
     /// Enable / disable OSR back-edge probe emission for subsequent
-    /// `compile_function` calls. Default `true` preserves the historical
-    /// behaviour where every loop header gets a `__zyntax_osr_sample_tick`
-    /// + (1/64) `__zyntax_osr_probe` pair. Set to `false` for runtimes
-    /// that don't ever wire a tier ≥ 1 OSR-helper consumer — the
-    /// per-iteration extern call dominates float-heavy inner loops
-    /// (~100 ms on the 100 M-iteration mandelbrot).
+    /// `compile_function` calls. When enabled, each loop header loads the
+    /// bead's arm byte and branches to a `__zyntax_osr_probe` call only
+    /// once a tier ≥ 1 compile has installed helpers for that bead.
     pub fn set_emit_osr_probes(&mut self, enabled: bool) {
         self.emit_osr_probes = enabled;
     }
@@ -1898,6 +1895,7 @@ impl CraneliftBackend {
                         &mut self.module,
                         osr_bead_id,
                         site_key,
+                        crate::osr::arm_slot_addr(osr_bead_id),
                         &live_in_clir,
                         return_clir,
                     );
@@ -8639,8 +8637,8 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
 ///
 /// ```text
 ///   <existing header content above>
-///   v_tick = call __zyntax_osr_sample_tick()
-///   brif v_tick, b_post_probe, b_call_probe       ;; v_tick == 0 ⇒ sample fired
+///   v_armed = load.i8 [arm_slot]                  ;; per-bead byte
+///   brif v_armed, b_call_probe, b_post_probe      ;; zero ⇒ skip the probe
 ///
 /// b_call_probe:
 ///   v_helper = call __zyntax_osr_probe(bead_id, site_key)
@@ -8668,24 +8666,13 @@ fn emit_osr_back_edge_probe(
     module: &mut JITModule,
     bead_id: u64,
     site_key: u64,
+    arm_slot: *const u8,
     live_ins: &[cranelift_codegen::ir::Value],
     return_clir: Option<cranelift_codegen::ir::Type>,
 ) {
     use cranelift_codegen::ir::condcodes::IntCC;
 
     // Sample-tick signature: () -> i64
-    let mut tick_sig = module.make_signature();
-    tick_sig.returns.push(AbiParam::new(types::I64));
-    let tick_id = match module.declare_function(
-        crate::osr::OSR_SAMPLE_TICK_SYMBOL,
-        Linkage::Import,
-        &tick_sig,
-    ) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
-    let tick_func = module.declare_func_in_func(tick_id, builder.func);
-
     // Probe signature: (i64, i64) -> i64
     let mut probe_sig = module.make_signature();
     probe_sig.params.push(AbiParam::new(types::I64));
@@ -8714,10 +8701,12 @@ fn emit_osr_back_edge_probe(
         None
     };
 
-    // Sample tick.
-    let tick_call = builder.ins().call(tick_func, &[]);
-    let tick_val = builder.inst_results(tick_call)[0];
-    let tick_is_zero = builder.ins().icmp_imm(IntCC::Equal, tick_val, 0);
+    // Arm check: load the bead's arm byte and branch on it. The byte flips
+    // only when a tier ≥ 1 compile installs helpers for this bead. The load
+    // must observe a store from a broker thread, so it cannot be hoisted
+    // out of the loop, and it splits the header into extra blocks.
+    let slot_v = builder.ins().iconst(types::I64, arm_slot as i64);
+    let armed = builder.ins().load(types::I8, MemFlags::new(), slot_v, 0);
 
     let call_probe_block = builder.create_block();
     let post_probe_block = builder.create_block();
@@ -8729,7 +8718,7 @@ fn emit_osr_back_edge_probe(
 
     builder
         .ins()
-        .brif(tick_is_zero, call_probe_block, &[], post_probe_block, &[]);
+        .brif(armed, call_probe_block, &[], post_probe_block, &[]);
 
     // call_probe block: ask the runtime for a helper.
     builder.switch_to_block(call_probe_block);

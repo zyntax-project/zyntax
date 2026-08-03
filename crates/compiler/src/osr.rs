@@ -46,7 +46,7 @@
 //! `bead_id` as a constant in the probe call.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use beadie::Bead;
@@ -116,6 +116,52 @@ pub fn register_bead(bead_id: u64, bead: Arc<Bead>) {
 /// Drop a previously-registered bead. No-op if absent.
 pub fn unregister_bead(bead_id: u64) {
     bead_registry().write().unwrap().remove(&bead_id);
+    arm_slots().write().unwrap().remove(&bead_id);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Arm slots
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One byte per bead, read directly by generated code at every back-edge:
+/// zero while the bead has no OSR entries, non-zero once it does.
+///
+/// The address is baked into tier-0 code as a constant, so it has to
+/// outlive every compile that embeds it — hence the boxed value, whose
+/// address is stable regardless of map rehashing.
+fn arm_slots() -> &'static RwLock<HashMap<u64, Box<AtomicU8>>> {
+    static SLOTS: OnceLock<RwLock<HashMap<u64, Box<AtomicU8>>>> = OnceLock::new();
+    SLOTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Address of `bead_id`'s arm slot, allocating it if this is the first
+/// call. Stable for as long as the bead is registered.
+pub fn arm_slot_addr(bead_id: u64) -> *const u8 {
+    let mut slots = arm_slots().write().unwrap();
+    let slot = slots
+        .entry(bead_id)
+        .or_insert_with(|| Box::new(AtomicU8::new(0)));
+    (&**slot) as *const AtomicU8 as *const u8
+}
+
+/// Mark `bead_id` as having OSR entries, so its back-edges start taking the
+/// probe path. Idempotent.
+pub fn arm_bead(bead_id: u64) {
+    let mut slots = arm_slots().write().unwrap();
+    slots
+        .entry(bead_id)
+        .or_insert_with(|| Box::new(AtomicU8::new(0)))
+        .store(1, Ordering::Release);
+}
+
+/// Whether `bead_id` is currently armed. Test-facing; generated code reads
+/// the byte directly.
+pub fn is_armed(bead_id: u64) -> bool {
+    arm_slots()
+        .read()
+        .unwrap()
+        .get(&bead_id)
+        .is_some_and(|s| s.load(Ordering::Acquire) != 0)
 }
 
 /// Allocate a fresh sequential `bead_id`. Call once per registered
@@ -174,35 +220,11 @@ fn osr_trace_enabled() -> bool {
 /// Cranelift backend's symbol table at construction.
 pub const OSR_PROBE_SYMBOL: &str = "__zyntax_osr_probe";
 
-/// Symbol name for [`osr_sample_tick`].
-pub const OSR_SAMPLE_TICK_SYMBOL: &str = "__zyntax_osr_sample_tick";
-
-/// Sampling tick called at every back-edge probe site. Returns 0 when the
-/// caller should run the (more expensive) probe lookup, non-zero
-/// otherwise. Sampling rate is 1/64.
-///
-/// Encapsulating the counter inside an extern function keeps the JIT IR
-/// short — no globals to declare, no atomic ops to emit inline. The
-/// sampling is 1-in-64 but this call is on every back-edge, so an enabled
-/// probe site costs a call plus a branch per iteration. Tier ≥ 1 doesn't
-/// emit this.
-///
-/// `Ordering::Relaxed` is sufficient: we only need rough sampling, not
-/// strict ordering.
-#[no_mangle]
-pub extern "C" fn osr_sample_tick() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed) & 63
-}
-
 /// `(name, function_pointer)` pairs to feed
 /// `CraneliftBackend::with_runtime_symbols` so JIT'd code can resolve
 /// the OSR runtime functions at link time.
-pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 2] {
-    [
-        (OSR_PROBE_SYMBOL, osr_probe as *const u8),
-        (OSR_SAMPLE_TICK_SYMBOL, osr_sample_tick as *const u8),
-    ]
+pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 1] {
+    [(OSR_PROBE_SYMBOL, osr_probe as *const u8)]
 }
 
 /// Backwards-compatible alias for callers that only care about the probe.

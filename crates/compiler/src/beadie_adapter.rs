@@ -115,6 +115,9 @@ impl JitBackend for ZyntaxCraneliftBackend {
                     .map(|(site, code)| beadie::OsrEntry { site, code })
                     .collect();
                 bead.swap_compiled_with_osr(entry, osr_entries);
+                // Arm only after the entries are visible, so a back-edge
+                // that observes the flag always finds a helper behind it.
+                crate::osr::arm_bead(bead_id);
                 Ok(std::ptr::null_mut())
             } else {
                 Ok(entry)

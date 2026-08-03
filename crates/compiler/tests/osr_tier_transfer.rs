@@ -230,6 +230,19 @@ fn a_tier1_promotion_installs_an_osr_entry() {
     config.verbosity = 2;
     let mut backend = TieredBackend::new(config).expect("tiered backend");
     backend.compile_module(module).expect("tier-0 compile");
+
+    // The probe is only worth leaving on if an unarmed loop is cheap, so
+    // the bead's arm byte must stay clear until helpers actually exist.
+    let ids: Vec<u64> = osr::bead_registry()
+        .read()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    assert!(
+        ids.iter().all(|id| !osr::is_armed(*id)),
+        "no bead should be armed while only tier-0 code exists"
+    );
     backend
         .optimize_function(func_id, OptimizationTier::Standard)
         .expect("force promote to tier 1");
@@ -247,5 +260,46 @@ fn a_tier1_promotion_installs_an_osr_entry() {
     assert!(
         landed,
         "tier-1 promotion should install an OSR entry under site 0x{site:x}"
+    );
+    assert!(
+        ids.iter().any(|id| osr::is_armed(*id)),
+        "installing helpers should arm the bead so back-edges take the probe path"
+    );
+}
+
+/// The probe's steady-state cost is what decides whether it can stay on, so
+/// pin the emitted shape: an inline load of the arm byte, and no call on
+/// the fall-through path.
+#[test]
+fn an_unarmed_probe_site_costs_a_load_not_a_call() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+
+    let (function, _header_id) = counted_loop();
+    let func_id = function.id;
+
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut backend = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    backend.set_capture_ir(true);
+    backend.set_compile_tier(0);
+    backend.set_compile_bead_id(0xBEAD);
+    backend
+        .compile_function(func_id, &function)
+        .expect("tier-0 compile");
+
+    let (clif, _) = backend.take_captured_ir().expect("captured CLIF");
+
+    // CLIF prints callees positionally (`fn0 = u0:1 sig0`), so match on the
+    // instruction shape rather than the symbol name.
+    assert!(
+        clif.contains("load.i8"),
+        "the arm check should be an inline byte load:\n{clif}"
+    );
+    assert!(
+        !clif.contains("osr_sample_tick"),
+        "the per-iteration tick call should be gone:\n{clif}"
+    );
+    assert!(
+        clif.contains("call_indirect"),
+        "an armed site should still dispatch to the helper:\n{clif}"
     );
 }
