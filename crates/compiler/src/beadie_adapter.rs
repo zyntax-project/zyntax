@@ -90,6 +90,13 @@ impl JitBackend for ZyntaxCraneliftBackend {
                 .map_err(|e| {
                     CompileError::new(format!("cranelift compile_function failed: {e}"))
                 })?;
+            // Resolve the new definition before reading any pointer from
+            // it: `get_function_ptr` would otherwise hand back the
+            // *previous* generation's code, and resolving an OSR helper
+            // FuncId panics outright on an unfinalized module.
+            backend.finalize_definitions().map_err(|e| {
+                CompileError::new(format!("cranelift finalize_definitions failed: {e}"))
+            })?;
             let entry = backend
                 .get_function_ptr(def.id)
                 .map(|p| p as *mut ())

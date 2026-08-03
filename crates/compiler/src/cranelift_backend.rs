@@ -361,6 +361,10 @@ pub struct CraneliftBackend {
     /// [`Self::set_only_compile_reachable`] to shave the ~30-40 ms spent on
     /// prelude helpers that a benchmark kernel never calls.
     only_compile_reachable: Option<HashSet<HirId>>,
+    /// Redefinition counter per function. Bumped each time an
+    /// already-defined function is declared again so the new body gets a
+    /// distinct symbol and the previous one stays resident.
+    compile_generation: HashMap<HirId, u32>,
 }
 
 /// Hot-reload state management
@@ -484,6 +488,7 @@ impl CraneliftBackend {
             compile_osr_layout: None,
             compile_osr_func_id: None,
             only_compile_reachable: None,
+            compile_generation: HashMap::new(),
         })
     }
 
@@ -893,7 +898,25 @@ impl CraneliftBackend {
                 .name
                 .resolve_global()
                 .unwrap_or_else(|| format!("{:?}", function.name));
-            let unique_name = format!("{}__{:?}", base_name, id);
+
+            // Recompiling a function that already has a definition (tier-up,
+            // hot reload) must produce a *new* symbol: Cranelift refuses a
+            // second `define_function` on the same `FuncId`, and the old code
+            // has to stay resident because frames may still be executing it.
+            // Each redefinition therefore gets its own generation suffix.
+            let generation = if self.compiled_functions.contains_key(&id) {
+                let next = self.compile_generation.entry(id).or_insert(0);
+                *next += 1;
+                *next
+            } else {
+                *self.compile_generation.entry(id).or_insert(0)
+            };
+            let unique_name = if generation == 0 {
+                format!("{}__{:?}", base_name, id)
+            } else {
+                format!("{}__{:?}__g{}", base_name, id, generation)
+            };
+
             let func_id = self
                 .module
                 .declare_function(&unique_name, Linkage::Export, &sig)
