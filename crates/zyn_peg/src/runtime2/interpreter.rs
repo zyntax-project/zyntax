@@ -722,8 +722,20 @@ impl<'g> GrammarInterpreter<'g> {
             }
             "StringLiteral" => {
                 let value = self.get_field_as_string("value", fields, state)?;
-                // Strip quotes from string literal
-                let unquoted = value.trim_matches('"').to_string();
+                // Take the contents as written: strip exactly one
+                // delimiter from each end and interpret nothing.
+                //
+                // `trim_matches('"')` stripped REPEATEDLY, so a string
+                // whose content ended in an escaped quote lost
+                // characters off the end. Escape sequences stay as the
+                // author wrote them — only f-strings interpret, because
+                // only they have to find `{}` boundaries.
+                let unquoted = value
+                    .strip_prefix('"')
+                    .unwrap_or(&value)
+                    .strip_suffix('"')
+                    .unwrap_or_else(|| value.strip_prefix('"').unwrap_or(&value))
+                    .to_string();
                 let interned = state.intern(&unquoted);
                 TypedExpression::Literal(TypedLiteral::String(interned))
             }

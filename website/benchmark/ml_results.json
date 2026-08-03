@@ -49,31 +49,31 @@
     "pending": false,
     "tiers": {
       "cranelift": {
-        "compile_ms": 0.10629200000000001,
-        "exec_ms": 0.23575000000000002,
-        "throughput": 8.895660657476139,
-        "speedup_vs_interp": 212.5719321314952,
+        "compile_ms": 0.08075,
+        "exec_ms": 0.052416000000000004,
+        "throughput": 40.009768009768,
+        "speedup_vs_interp": 976.4973290598289,
         "result": 1048576
       },
       "interp": {
-        "compile_ms": 0.339666,
-        "exec_ms": 50.11383300000001,
-        "throughput": 0.041847766863093466,
+        "compile_ms": 0.35724999999999996,
+        "exec_ms": 51.184084,
+        "throughput": 0.04097273675934105,
         "speedup_vs_interp": 1.0,
         "result": 1048576
       },
       "tiered": {
-        "compile_ms": 0.5650409999999999,
-        "exec_ms": 0.05425,
-        "throughput": 38.6571797235023,
-        "speedup_vs_interp": 923.7572903225807,
+        "compile_ms": 0.5822499999999999,
+        "exec_ms": 0.06175,
+        "throughput": 33.961975708502024,
+        "speedup_vs_interp": 828.8920485829959,
         "result": 1048576
       },
       "tiered-llvm": {
-        "compile_ms": 0.619041,
+        "compile_ms": 0.5283749999999999,
         "exec_ms": 0.052917,
         "throughput": 39.630969253736986,
-        "speedup_vs_interp": 947.0270990418959,
+        "speedup_vs_interp": 967.252187387796,
         "result": 1048576
       }
     }
@@ -82,8 +82,38 @@
     "phase": 0,
     "metric": "GOP/s",
     "baseline": "qdot_u8i8_baseline",
-    "note": "roadmap Phase 0: same dot via explicit dot_u8i8 intrinsic",
-    "pending": true
+    "note": "roadmap Phase 0: the same dot written in pure ZynML",
+    "pending": false,
+    "tiers": {
+      "cranelift": {
+        "compile_ms": 0.165542,
+        "exec_ms": 0.054,
+        "throughput": 38.83614814814815,
+        "speedup_vs_interp": 933.2361111111112,
+        "result": 1048576
+      },
+      "interp": {
+        "compile_ms": 0.328083,
+        "exec_ms": 50.39475,
+        "throughput": 0.04161449357323927,
+        "speedup_vs_interp": 1.0,
+        "result": 1048576
+      },
+      "tiered": {
+        "compile_ms": 0.56025,
+        "exec_ms": 0.054459,
+        "throughput": 38.508823151361575,
+        "speedup_vs_interp": 925.3704621825594,
+        "result": 1048576
+      },
+      "tiered-llvm": {
+        "compile_ms": 0.507667,
+        "exec_ms": 0.052666,
+        "throughput": 39.81984582083317,
+        "speedup_vs_interp": 956.8744541070141,
+        "result": 1048576
+      }
+    }
   },
   "qgemm_int8": {
     "phase": 3,
@@ -124,6 +154,6 @@
     "arch": "aarch64",
     "os": "macos",
     "runs": 7,
-    "commit": "57e718a"
+    "commit": "1c0b94c"
   }
 }
