@@ -39,6 +39,7 @@ use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
 use inkwell::{
     context::Context,
+    execution_engine::ExecutionEngine,
     passes::PassBuilderOptions,
     targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine},
     OptimizationLevel,
@@ -112,6 +113,16 @@ pub struct LLVMJitBackend<'ctx> {
     /// runtime-address fingerprint) and short-circuits the install
     /// pipeline on a hit. See [`Self::set_cache_key`].
     cache_key: Option<String>,
+
+    /// Install code through an in-process MCJIT engine instead of the
+    /// object-file + linker + `dlopen` pipeline. See
+    /// [`Self::set_use_mcjit`].
+    use_mcjit: bool,
+
+    /// Engines from MCJIT installs. Each owns its code pages, so they
+    /// are retained for as long as any handed-out pointer might be
+    /// called — that is, the lifetime of the backend.
+    engines: Vec<ExecutionEngine<'ctx>>,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
@@ -139,6 +150,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             symbol_signatures: Vec::new(),
             only_compile_reachable: None,
             cache_key: None,
+            use_mcjit: Self::default_use_mcjit(),
+            engines: Vec::new(),
         })
     }
 
@@ -155,6 +168,72 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// Pass `None` to disable caching for this backend.
     pub fn set_cache_key(&mut self, key: Option<String>) {
         self.cache_key = key;
+    }
+
+    /// Default install path: MCJIT on Linux, the object-file pipeline
+    /// elsewhere.
+    ///
+    /// `ZYNTAX_LLVM_MCJIT` overrides in both directions — `0`/`off`/`false`
+    /// forces the object path, any other value forces MCJIT.
+    fn default_use_mcjit() -> bool {
+        match std::env::var("ZYNTAX_LLVM_MCJIT")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("0") | Some("off") | Some("false") => false,
+            Some(_) => true,
+            None => cfg!(target_os = "linux"),
+        }
+    }
+
+    /// Install through an in-process MCJIT engine rather than emitting an
+    /// object file, invoking the system linker and `dlopen`-ing the result.
+    ///
+    /// The object-file path needs a C toolchain and a writable temp
+    /// directory on the machine running the code, which a deployed runtime
+    /// may not have. MCJIT needs neither, and installs without a link step.
+    ///
+    /// See [`Self::default_use_mcjit`] for what the default is.
+    pub fn set_use_mcjit(&mut self, on: bool) {
+        self.use_mcjit = on;
+    }
+
+    /// Whether installs go through MCJIT.
+    pub fn uses_mcjit(&self) -> bool {
+        self.use_mcjit
+    }
+
+    /// Install `hir_module` through an in-process execution engine.
+    ///
+    /// Runtime symbols are bound with `add_global_mapping` — the direct
+    /// equivalent of the trampoline stubs the object path synthesises.
+    /// The engine is retained because it owns the code pages.
+    fn install_via_mcjit(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
+        let (backend, _target_machine) = self.compile_module_to_ir(hir_module)?;
+
+        let engine = backend
+            .module()
+            .create_jit_execution_engine(self.opt_level)
+            .map_err(|e| CompilerError::Backend(format!("MCJIT engine: {e}")))?;
+
+        // Bind host functions the module declares but does not define.
+        for (name, addr) in &self.runtime_symbols {
+            if let Some(f) = backend.module().get_function(name) {
+                if f.count_basic_blocks() == 0 {
+                    engine.add_global_mapping(&f, *addr);
+                }
+            }
+        }
+
+        for (hir_id, name) in self.get_function_symbols(hir_module) {
+            if let Ok(addr) = engine.get_function_address(&name) {
+                self.function_pointers.insert(hir_id, addr as usize);
+            }
+        }
+
+        self.engines.push(engine);
+        Ok(())
     }
 
     /// Register symbol signatures for auto-boxing support.
@@ -491,6 +570,10 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // Reset state from any previous compile.
         self.function_pointers.clear();
         self.loaded_lib = None;
+
+        if self.use_mcjit {
+            return self.install_via_mcjit(hir_module);
+        }
 
         // Cache check. The effective key is `caller_key ⊕ runtime-
         // address fingerprint`: the fingerprint catches stale entries

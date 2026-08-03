@@ -653,9 +653,21 @@ impl InterpRuntime {
 
         // Cranelift for Tier 0. Wire OSR runtime symbols so the
         // back-edge probes baked into the JIT'd code can resolve
-        // back through the OSR registry for further tier-up.
-        let osr_syms = osr::osr_runtime_symbols();
-        let cranelift_inner = CraneliftBackend::with_runtime_symbols(&osr_syms)
+        // back through the OSR registry for further tier-up, plus every
+        // FFI symbol the interpreter knows about.
+        //
+        // The JIT falls back to `dlsym` for anything it wasn't given, and
+        // on Linux the executable's symbols are absent from `.dynsym`
+        // unless it was linked `-rdynamic`, so helpers like
+        // `zyntax_box_f64` resolve on macOS and fail here. Handing the
+        // table over makes resolution explicit on both platforms.
+        let interp_syms = self.symbol_table_snapshot();
+        let mut syms: Vec<(&str, *const u8)> = interp_syms
+            .iter()
+            .map(|(name, ptr, _)| (name.as_str(), *ptr))
+            .collect();
+        syms.extend(osr::osr_runtime_symbols());
+        let cranelift_inner = CraneliftBackend::with_runtime_symbols(&syms)
             .map_err(|e| CompilerError::Backend(format!("cranelift init failed: {e}")))?;
         let cranelift = Arc::new(ZyntaxCraneliftBackend::new(cranelift_inner));
 
