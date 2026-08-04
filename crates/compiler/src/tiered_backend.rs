@@ -132,6 +132,18 @@ pub struct TieredConfig {
     /// iteration 2+ of the same kernel. When `None`, caching is off
     /// and every install pays the full pipeline cost.
     pub llvm_cache_key: Option<String>,
+    /// Emit on-stack-replacement probes at tier-0 loop back-edges.
+    ///
+    /// A function entered once that runs a long loop cannot be promoted by
+    /// call count — it never returns to be re-dispatched. With this on, its
+    /// back-edges pick up a tier-1 helper as soon as one is installed and
+    /// the frame finishes in the faster tier, which is what a cold-start
+    /// workload needs: a worker or serverless invocation is often a single
+    /// long call, and warming up first is not an option.
+    ///
+    /// Costs a load and a not-taken branch per back-edge while no helper
+    /// exists, measured at under 1% across the bench kernels.
+    pub enable_osr: bool,
 }
 
 impl Default for TieredConfig {
@@ -144,6 +156,7 @@ impl Default for TieredConfig {
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 0,
             llvm_cache_key: None,
+            enable_osr: true,
         }
     }
 }
@@ -158,6 +171,7 @@ impl TieredConfig {
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 2,
             llvm_cache_key: None,
+            enable_osr: true,
         }
     }
 
@@ -170,6 +184,7 @@ impl TieredConfig {
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 0,
             llvm_cache_key: None,
+            enable_osr: true,
         }
     }
 
@@ -183,6 +198,7 @@ impl TieredConfig {
             tier2_backend: Tier2Backend::LLVM,
             verbosity: 0,
             llvm_cache_key: None,
+            enable_osr: true,
         }
     }
 }

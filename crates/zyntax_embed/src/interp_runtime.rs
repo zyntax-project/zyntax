@@ -729,6 +729,7 @@ impl InterpRuntime {
         // interp's lazy-compile fallback.
         let reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
         let bead_ids_for_cranelift = self.bead_ids.clone();
+        let enable_osr = config.enable_osr;
         cranelift.with_lock(|be| -> Result<(), CompilerError> {
             be.set_only_compile_reachable(Some(reachable));
             be.set_compile_tier(0);
@@ -736,9 +737,7 @@ impl InterpRuntime {
             // bead; site keys are only unique within a function, so sharing
             // one bead across the module would alias them.
             be.set_bead_ids(bead_ids_for_cranelift);
-            // Kill switch for the back-edge probe, which is newly on by
-            // default. `ZYNTAX_OSR_PROBES=0` compiles tier 0 without it.
-            be.set_emit_osr_probes(std::env::var("ZYNTAX_OSR_PROBES").as_deref() != Ok("0"));
+            be.set_emit_osr_probes(enable_osr);
             be.compile_module(&module)
                 .map_err(|e| CompilerError::Backend(format!("tier-up compile: {e}")))?;
             be.finalize_definitions()

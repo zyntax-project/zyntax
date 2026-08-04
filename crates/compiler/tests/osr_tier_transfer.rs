@@ -335,3 +335,41 @@ fn a_helper_published_mid_flight_is_picked_up_by_the_running_loop() {
         "every run should agree with the un-transferred result {baseline}"
     );
 }
+
+/// `TieredConfig::enable_osr` should decide whether back-edges carry a
+/// probe at all.
+///
+/// Cold-start serving wants it on — a worker invocation is often one long
+/// call that call-count promotion can never reach — while a deployment that
+/// warms up first can pay nothing for it.
+#[test]
+fn the_osr_config_cog_controls_probe_emission() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+    use zyntax_compiler::tiered_backend::TieredConfig;
+
+    assert!(
+        TieredConfig::default().enable_osr,
+        "cold start is the default case, so probes default to on"
+    );
+
+    let (function, _header) = counted_loop();
+    let func_id = function.id;
+
+    for enabled in [true, false] {
+        let mut backend = CraneliftBackend::new().expect("backend");
+        backend.set_capture_ir(true);
+        backend.set_compile_tier(0);
+        backend.set_emit_osr_probes(enabled);
+        backend
+            .compile_function(func_id, &function)
+            .expect("tier-0 compile");
+        let (clif, _) = backend.take_captured_ir().expect("captured CLIF");
+
+        assert_eq!(
+            clif.contains("call_indirect"),
+            enabled,
+            "enable_osr = {enabled} should decide whether the back-edge can \
+             transfer:\n{clif}"
+        );
+    }
+}
