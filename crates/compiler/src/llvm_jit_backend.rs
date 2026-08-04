@@ -282,14 +282,27 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     continue;
                 }
                 for header in crate::osr::find_loop_headers(func) {
-                    let Ok(layout) = crate::osr::osr_layout(func, header) else {
-                        continue;
+                    let layout = match crate::osr::osr_layout(func, header) {
+                        Ok(l) => l,
+                        Err(reason) => {
+                            if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+                                eprintln!(
+                                    "[osr] no layout for {:?} {header:?}: {reason:?}",
+                                    func.name.resolve_global().unwrap_or_default()
+                                );
+                            }
+                            continue;
+                        }
                     };
                     match backend.compile_osr_helper(func, &layout) {
                         Ok(name) => helper_names.push((*func_id, layout.site_key(), name)),
                         // A header the helper shape cannot express just
                         // means no resume point for that loop.
-                        Err(e) => log::debug!("[LLVM] no OSR helper for {header:?}: {e}"),
+                        Err(e) => {
+                            if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+                                eprintln!("[osr] no helper for {header:?}: {e}");
+                            }
+                        }
                     }
                 }
             }

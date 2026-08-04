@@ -769,6 +769,9 @@ pub fn helper_slot_addr(bead_id: u64, site_key: u64) -> *const u8 {
 /// Publish `helper` for `(bead_id, site_key)`, so back-edges start
 /// transferring into it.
 pub fn publish_helper(bead_id: u64, site_key: u64, helper: *mut ()) {
+    if osr_trace_enabled() {
+        eprintln!("[osr] publish bead={bead_id} site=0x{site_key:x} -> {helper:?}");
+    }
     let mut slots = helper_slots().write().unwrap();
     slots
         .entry((bead_id, site_key))

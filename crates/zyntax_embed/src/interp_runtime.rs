@@ -736,6 +736,9 @@ impl InterpRuntime {
             // bead; site keys are only unique within a function, so sharing
             // one bead across the module would alias them.
             be.set_bead_ids(bead_ids_for_cranelift);
+            // Kill switch for the back-edge probe, which is newly on by
+            // default. `ZYNTAX_OSR_PROBES=0` compiles tier 0 without it.
+            be.set_emit_osr_probes(std::env::var("ZYNTAX_OSR_PROBES").as_deref() != Ok("0"));
             be.compile_module(&module)
                 .map_err(|e| CompilerError::Backend(format!("tier-up compile: {e}")))?;
             be.finalize_definitions()
