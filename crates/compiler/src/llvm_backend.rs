@@ -724,6 +724,211 @@ impl<'ctx> LLVMBackend<'ctx> {
         Ok(())
     }
 
+    /// Emit an OSR helper for `header`: a standalone function that resumes
+    /// `func` at that loop header instead of at its entry.
+    ///
+    /// The signature is `(i64 x OSR_MAX_LIVE_INS) -> <func's return type>`,
+    /// matching what a tier-0 back-edge marshals, and the body is `func`'s
+    /// own blocks. A synthetic prologue recovers the live-ins from the
+    /// arguments and jumps to the header, so the header's phis take their
+    /// loop-entry values from the prologue rather than from the original
+    /// preheader.
+    ///
+    /// Returns the helper's name; the caller resolves it to an address once
+    /// the module is installed.
+    pub fn compile_osr_helper(
+        &mut self,
+        func: &HirFunction,
+        layout: &crate::osr::OsrLayout,
+    ) -> CompilerResult<String> {
+        let i64_ty = self.context.i64_type();
+        let params: Vec<BasicMetadataTypeEnum> = (0..crate::osr::OSR_MAX_LIVE_INS)
+            .map(|_| i64_ty.into())
+            .collect();
+        let fn_ty = match &layout.return_type {
+            HirType::Void => self.context.void_type().fn_type(&params, false),
+            ty => self.translate_type(ty)?.fn_type(&params, false),
+        };
+
+        let name = format!(
+            "osr${}${:x}",
+            func.name
+                .resolve_global()
+                .unwrap_or_else(|| format!("{:?}", func.name)),
+            layout.site_key()
+        );
+        let helper = self.module.add_function(&name, fn_ty, None);
+
+        self.current_function = Some(helper);
+        self.block_map.clear();
+        self.phi_map.clear();
+        self.value_map.clear();
+        self.type_map.clear();
+
+        // Seed the constants and globals the body refers to, exactly as a
+        // normal compile would.
+        for (value_id, value) in &func.values {
+            self.type_map.insert(*value_id, value.ty.clone());
+            match &value.kind {
+                HirValueKind::Constant(constant) => {
+                    let c = self.compile_constant(constant)?;
+                    self.value_map.insert(*value_id, c);
+                }
+                HirValueKind::Undef | HirValueKind::Instruction => {
+                    let llvm_type = self.translate_type(&value.ty)?;
+                    self.value_map.insert(*value_id, llvm_type.const_zero());
+                }
+                HirValueKind::Global(global_id) => {
+                    if let Some(&g) = self.globals_map.get(global_id) {
+                        self.value_map.insert(*value_id, g);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // The prologue is created first so it becomes the entry block.
+        let prologue = self.context.append_basic_block(helper, "osr_prologue");
+        for (block_id, _) in func.blocks.iter() {
+            let llvm_block = self
+                .context
+                .append_basic_block(helper, &format!("bb_{block_id:?}"));
+            self.block_map.insert(*block_id, llvm_block);
+        }
+
+        // Recover each live-in from its argument. The leading `phi_count`
+        // become the header's phi inputs; the rest are ordinary values the
+        // body reads, so they go straight into the value map.
+        self.builder.position_at_end(prologue);
+        let mut phi_seeds: Vec<(HirId, BasicValueEnum<'ctx>)> = Vec::new();
+        for (i, hir_id) in layout
+            .live_ins
+            .iter()
+            .enumerate()
+            .take(crate::osr::OSR_MAX_LIVE_INS)
+        {
+            let raw = helper
+                .get_nth_param(i as u32)
+                .ok_or_else(|| CompilerError::CodeGen("OSR helper missing a parameter".into()))?;
+            let target = self.translate_type(&layout.live_in_types[i])?;
+            let recovered = self.reinterpret_from_i64(raw, target)?;
+            if i < layout.phi_count {
+                phi_seeds.push((*hir_id, recovered));
+            } else {
+                self.value_map.insert(*hir_id, recovered);
+                self.type_map
+                    .insert(*hir_id, layout.live_in_types[i].clone());
+            }
+        }
+        let header_block = *self.block_map.get(&layout.header).ok_or_else(|| {
+            CompilerError::CodeGen(format!(
+                "OSR header {:?} is not in the function",
+                layout.header
+            ))
+        })?;
+        self.builder
+            .build_unconditional_branch(header_block)
+            .map_err(|e| CompilerError::CodeGen(format!("OSR prologue branch: {e}")))?;
+
+        for (block_id, hir_block) in func.blocks.iter() {
+            if let Some(llvm_block) = self.block_map.get(block_id) {
+                self.builder.position_at_end(*llvm_block);
+                self.compile_block_with_terminator(block_id, hir_block, func)?;
+            }
+        }
+
+        // Blocks reachable from the header are the loop itself; anything
+        // else only reached the header on the way in, and the prologue now
+        // replaces that path.
+        let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
+
+        // Wire the phis. Back-edges carry over unchanged, the header takes
+        // the prologue edge in place of its loop-entry edges, and blocks
+        // outside the loop stop contributing entirely.
+        for (block_id, hir_block) in func.blocks.iter() {
+            for phi in &hir_block.phis {
+                let Some(phi_value) = self.phi_map.get(&phi.result).copied() else {
+                    continue;
+                };
+                let is_header = *block_id == layout.header;
+                for (value_id, pred_block_id) in &phi.incoming {
+                    if is_header && !in_loop.contains(pred_block_id) {
+                        continue;
+                    }
+                    let incoming_value = self.get_value(*value_id)?;
+                    let incoming_block = self.block_map.get(pred_block_id).ok_or_else(|| {
+                        CompilerError::CodeGen(format!(
+                            "Phi node references unknown block: {pred_block_id:?}"
+                        ))
+                    })?;
+                    phi_value.add_incoming(&[(&incoming_value, *incoming_block)]);
+                }
+                if is_header {
+                    if let Some((_, seed)) = phi_seeds.iter().find(|(id, _)| *id == phi.result) {
+                        phi_value.add_incoming(&[(seed, prologue)]);
+                    }
+                }
+            }
+        }
+
+        // Everything outside the loop is unreachable from the prologue now.
+        // Deleting it keeps the helper to the code it actually runs.
+        for (block_id, llvm_block) in self.block_map.clone() {
+            if !in_loop.contains(&block_id) {
+                unsafe {
+                    let _ = llvm_block.delete();
+                }
+                self.block_map.shift_remove(&block_id);
+            }
+        }
+
+        self.current_function = None;
+        Ok(name)
+    }
+
+    /// Recover a live-in from the i64 slot a back-edge marshalled it into.
+    fn reinterpret_from_i64(
+        &self,
+        raw: BasicValueEnum<'ctx>,
+        target: BasicTypeEnum<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let raw = raw.into_int_value();
+        Ok(match target {
+            BasicTypeEnum::IntType(t) => {
+                if t.get_bit_width() == 64 {
+                    raw.into()
+                } else {
+                    self.builder
+                        .build_int_truncate(raw, t, "osr_live_in")
+                        .map_err(|e| CompilerError::CodeGen(format!("OSR live-in trunc: {e}")))?
+                        .into()
+                }
+            }
+            BasicTypeEnum::FloatType(t) => {
+                let bits = if t == self.context.f32_type() {
+                    self.builder
+                        .build_int_truncate(raw, self.context.i32_type(), "osr_live_in_bits")
+                        .map_err(|e| CompilerError::CodeGen(format!("OSR live-in trunc: {e}")))?
+                } else {
+                    raw
+                };
+                self.builder
+                    .build_bit_cast(bits, t, "osr_live_in")
+                    .map_err(|e| CompilerError::CodeGen(format!("OSR live-in bitcast: {e}")))?
+            }
+            BasicTypeEnum::PointerType(t) => self
+                .builder
+                .build_int_to_ptr(raw, t, "osr_live_in")
+                .map_err(|e| CompilerError::CodeGen(format!("OSR live-in int-to-ptr: {e}")))?
+                .into(),
+            other => {
+                return Err(CompilerError::CodeGen(format!(
+                    "OSR live-in type {other:?} does not fit an i64 slot"
+                )))
+            }
+        })
+    }
+
     /// Compile a global variable (including vtables)
     ///
     /// This creates LLVM global variables with appropriate linkage and initializers.

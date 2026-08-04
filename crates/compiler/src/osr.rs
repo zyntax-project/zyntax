@@ -786,3 +786,26 @@ pub fn helper_for(bead_id: u64, site_key: u64) -> *mut () {
         .map(|s| s.load(Ordering::Acquire) as *mut ())
         .unwrap_or(std::ptr::null_mut())
 }
+
+/// Blocks reachable from `start` by following successors, including
+/// `start` itself.
+///
+/// An OSR helper resumes at a loop header, so this is the region it can
+/// still execute — everything else in the function was only on the path
+/// leading up to the header.
+pub fn blocks_reachable_from(
+    function: &HirFunction,
+    start: HirId,
+) -> std::collections::HashSet<HirId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(block) = function.blocks.get(&id) {
+            stack.extend(block.successors.iter().copied());
+        }
+    }
+    seen
+}

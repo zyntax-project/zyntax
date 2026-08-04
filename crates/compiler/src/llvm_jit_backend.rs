@@ -197,7 +197,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// directory on the machine running the code, which a deployed runtime
     /// may not have. MCJIT needs neither, and installs without a link step.
     ///
-    /// See [`Self::default_use_mcjit`] for what the default is.
+    /// Defaults to MCJIT; `ZYNTAX_LLVM_MCJIT=0`/`off`/`false` selects the
+    /// object-file path instead.
     pub fn set_use_mcjit(&mut self, on: bool) {
         self.use_mcjit = on;
     }
