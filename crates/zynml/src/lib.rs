@@ -114,6 +114,50 @@ pub enum ZynMLRuntimeProfile {
     TieredProductionLlvm,
 }
 
+/// Adjustments to a profile's tier configuration.
+///
+/// Each field left `None` keeps whatever the profile chose, so a caller
+/// only states what it wants to differ.
+#[derive(Debug, Clone, Default)]
+pub struct TierOverrides {
+    /// Invocations before a function is compiled by the first JIT tier.
+    pub warm_threshold: Option<u64>,
+    /// Invocations before it is promoted to the top tier.
+    pub hot_threshold: Option<u64>,
+    /// Sampling rate for the profile counters.
+    pub sample_rate: Option<u64>,
+    /// Whether tier-0 loops carry an on-stack-replacement probe. Worth
+    /// keeping on where a program is entered once and must reach the fast
+    /// tier without being called again.
+    pub enable_osr: Option<bool>,
+}
+
+impl TierOverrides {
+    /// Whether anything is actually overridden.
+    pub fn is_empty(&self) -> bool {
+        self.warm_threshold.is_none()
+            && self.hot_threshold.is_none()
+            && self.sample_rate.is_none()
+            && self.enable_osr.is_none()
+    }
+
+    /// Apply to a tier configuration.
+    pub fn apply(&self, config: &mut zyntax_embed::TieredConfig) {
+        if let Some(v) = self.warm_threshold {
+            config.profile_config.warm_threshold = v;
+        }
+        if let Some(v) = self.hot_threshold {
+            config.profile_config.hot_threshold = v;
+        }
+        if let Some(v) = self.sample_rate {
+            config.profile_config.sample_rate = v;
+        }
+        if let Some(v) = self.enable_osr {
+            config.enable_osr = v;
+        }
+    }
+}
+
 /// ZynML runtime configuration
 #[derive(Debug, Clone)]
 pub struct ZynMLConfig {
@@ -128,6 +172,10 @@ pub struct ZynMLConfig {
 
     /// Runtime profile / backend tiering mode.
     pub runtime_profile: ZynMLRuntimeProfile,
+
+    /// Overrides applied on top of the profile's tier configuration.
+    /// Ignored by the classic single-tier profile, which has no ladder.
+    pub tier_overrides: TierOverrides,
 }
 
 impl Default for ZynMLConfig {
@@ -137,6 +185,7 @@ impl Default for ZynMLConfig {
             load_optional: false,
             verbose: false,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: TierOverrides::default(),
         }
     }
 }
@@ -167,20 +216,29 @@ impl ZynML {
         let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR)
             .map_err(|e| ZynMLError::GrammarError(e.to_string()))?;
 
-        // Create runtime engine according to profile.
+        // Create runtime engine according to profile, with any per-run
+        // overrides applied on top of the profile's tier settings.
+        let tier_config = |base: zyntax_embed::TieredConfig| {
+            let mut cfg = base;
+            config.tier_overrides.apply(&mut cfg);
+            cfg
+        };
         let mut runtime = match config.runtime_profile {
             ZynMLRuntimeProfile::Classic => RuntimeEngine::Classic(
                 ZyntaxRuntime::new().context("Failed to create Zyntax runtime")?,
             ),
             ZynMLRuntimeProfile::TieredDevelopment => RuntimeEngine::Tiered(
-                TieredRuntime::development().context("Failed to create tiered runtime")?,
+                TieredRuntime::new(tier_config(zyntax_embed::TieredConfig::development()))
+                    .context("Failed to create tiered runtime")?,
             ),
             ZynMLRuntimeProfile::TieredProduction => RuntimeEngine::Tiered(
-                TieredRuntime::production().context("Failed to create tiered runtime")?,
+                TieredRuntime::new(tier_config(zyntax_embed::TieredConfig::production()))
+                    .context("Failed to create tiered runtime")?,
             ),
             #[cfg(feature = "llvm-backend")]
             ZynMLRuntimeProfile::TieredProductionLlvm => RuntimeEngine::Tiered(
-                TieredRuntime::production_llvm().context("Failed to create tiered LLVM runtime")?,
+                TieredRuntime::new(tier_config(zyntax_embed::TieredConfig::production_llvm()))
+                    .context("Failed to create tiered LLVM runtime")?,
             ),
         };
 
@@ -667,6 +725,7 @@ mod tests {
             load_optional: false,
             verbose: true,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: TierOverrides::default(),
         };
 
         // Create runtime (this loads plugins and registers grammar)

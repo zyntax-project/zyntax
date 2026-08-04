@@ -3442,6 +3442,7 @@ mod runtime {
             load_optional: false,
             verbose: false,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: Default::default(),
         };
 
         let result = ZynML::with_config(config);
@@ -3485,6 +3486,7 @@ mod runtime {
             load_optional: false,
             verbose: false,
             runtime_profile: ZynMLRuntimeProfile::TieredDevelopment,
+            tier_overrides: Default::default(),
         };
 
         let mut zynml = ZynML::with_config(config).expect("tiered runtime should initialize");
@@ -3510,6 +3512,7 @@ mod runtime {
             load_optional: false,
             verbose: false,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: Default::default(),
         };
 
         let mut zynml = ZynML::with_config(config).expect("runtime should initialize");
@@ -3595,6 +3598,7 @@ mod runtime {
             load_optional: false,
             verbose: false,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: Default::default(),
         };
 
         let mut zynml = ZynML::with_config(config).expect("runtime should initialize");
@@ -3648,6 +3652,7 @@ mod runtime {
             load_optional: false,
             verbose: true,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: Default::default(),
         };
 
         let result = ZynML::with_config(config);
@@ -3702,6 +3707,7 @@ mod execution {
             load_optional: true,
             verbose: false,
             runtime_profile: ZynMLRuntimeProfile::Classic,
+            tier_overrides: Default::default(),
         };
 
         ZynML::with_config(config).ok()

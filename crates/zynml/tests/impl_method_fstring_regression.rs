@@ -44,6 +44,7 @@ fn create_runtime() -> Option<ZynML> {
         load_optional: true,
         verbose: false,
         runtime_profile: ZynMLRuntimeProfile::Classic,
+        tier_overrides: Default::default(),
     };
     ZynML::with_config(config).ok()
 }

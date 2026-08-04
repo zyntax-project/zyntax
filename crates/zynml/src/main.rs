@@ -54,6 +54,23 @@ enum Commands {
         /// Load optional plugins (image, json, http)
         #[arg(long)]
         all_plugins: bool,
+
+        /// Execution profile
+        #[arg(long, value_enum, default_value_t = Profile::Classic)]
+        profile: Profile,
+
+        /// Override tier thresholds as warm/hot, e.g. 0/5
+        #[arg(long, value_name = "W/H")]
+        tier_thresholds: Option<TierThresholds>,
+
+        /// Override the tier profiling sample rate
+        #[arg(long, value_name = "N")]
+        tier_sample_rate: Option<u64>,
+
+        /// Let a long-running loop reach the fast tier without being called
+        /// again, which a program entered once otherwise never can
+        #[arg(long, value_name = "BOOL")]
+        osr: Option<bool>,
     },
 
     /// Parse a ZynML program and show the AST
@@ -103,7 +120,20 @@ fn main() -> Result<()> {
             plugins,
             verbose,
             all_plugins,
-        } => run_program(&file, &plugins, verbose, all_plugins),
+            profile,
+            tier_thresholds,
+            tier_sample_rate,
+            osr,
+        } => run_program(
+            &file,
+            &plugins,
+            verbose,
+            all_plugins,
+            profile,
+            tier_thresholds,
+            tier_sample_rate,
+            osr,
+        ),
         Commands::Parse { file, format } => parse_and_display(&file, &format),
         Commands::Repl { plugins, verbose } => run_repl(&plugins, verbose),
         Commands::Info => show_info(),
@@ -111,32 +141,87 @@ fn main() -> Result<()> {
     }
 }
 
+/// Execution profile for `run`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum Profile {
+    /// Single-tier Cranelift; no promotion, no profiling overhead
+    Classic,
+    /// Tiered, tuned for short iterations
+    TieredDev,
+    /// Tiered, tuned for sustained runs
+    TieredProd,
+    /// Tiered with the LLVM top tier
+    #[cfg(feature = "llvm-backend")]
+    TieredLlvm,
+}
+
+impl From<Profile> for zynml::ZynMLRuntimeProfile {
+    fn from(p: Profile) -> Self {
+        match p {
+            Profile::Classic => zynml::ZynMLRuntimeProfile::Classic,
+            Profile::TieredDev => zynml::ZynMLRuntimeProfile::TieredDevelopment,
+            Profile::TieredProd => zynml::ZynMLRuntimeProfile::TieredProduction,
+            #[cfg(feature = "llvm-backend")]
+            Profile::TieredLlvm => zynml::ZynMLRuntimeProfile::TieredProductionLlvm,
+        }
+    }
+}
+
+/// `warm/hot` invocation counts, accepting `/`, `,` or `:` as separator.
+#[derive(Clone, Copy, Debug)]
+struct TierThresholds {
+    warm: u64,
+    hot: u64,
+}
+
+impl std::str::FromStr for TierThresholds {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<_> = s
+            .split(['/', ',', ':'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() != 2 {
+            return Err(format!("expected warm/hot, got {s:?}"));
+        }
+        let parse = |p: &str| p.parse::<u64>().map_err(|e| format!("{p:?}: {e}"));
+        Ok(Self {
+            warm: parse(parts[0])?,
+            hot: parse(parts[1])?,
+        })
+    }
+}
+
 /// Run a ZynML program
+#[allow(clippy::too_many_arguments)]
 fn run_program(
     file: &PathBuf,
     plugins_dir: &PathBuf,
     verbose: bool,
     all_plugins: bool,
+    profile: Profile,
+    tier_thresholds: Option<TierThresholds>,
+    tier_sample_rate: Option<u64>,
+    osr: Option<bool>,
 ) -> Result<()> {
     if verbose {
         println!("ZynML v{}", env!("CARGO_PKG_VERSION"));
         println!("Loading program: {}", file.display());
     }
 
-    let runtime_profile = match std::env::var("ZYNML_RUNTIME_PROFILE")
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("tiered-dev") | Ok("tiered_dev") => zynml::ZynMLRuntimeProfile::TieredDevelopment,
-        Ok("tiered-prod") | Ok("tiered_prod") => zynml::ZynMLRuntimeProfile::TieredProduction,
-        _ => zynml::ZynMLRuntimeProfile::Classic,
-    };
-
     let config = ZynMLConfig {
         plugins_dir: plugins_dir.to_string_lossy().to_string(),
         load_optional: all_plugins,
         verbose,
-        runtime_profile,
+        runtime_profile: profile.into(),
+        tier_overrides: zynml::TierOverrides {
+            warm_threshold: tier_thresholds.map(|t| t.warm),
+            hot_threshold: tier_thresholds.map(|t| t.hot),
+            sample_rate: tier_sample_rate,
+            enable_osr: osr,
+        },
     };
 
     let mut zynml = ZynML::with_config(config)?;
@@ -280,6 +365,7 @@ fn run_repl(plugins_dir: &PathBuf, verbose: bool) -> Result<()> {
         verbose,
         load_optional: true,
         runtime_profile: zynml::ZynMLRuntimeProfile::Classic,
+        tier_overrides: zynml::TierOverrides::default(),
     };
 
     let mut zynml = ZynML::with_config(config)?;
