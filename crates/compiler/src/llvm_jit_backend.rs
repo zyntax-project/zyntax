@@ -170,8 +170,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.cache_key = key;
     }
 
-    /// Default install path: MCJIT on Linux, the object-file pipeline
-    /// elsewhere.
+    /// Default install path: MCJIT.
+    ///
+    /// The object path needs a C toolchain and a writable temp directory on
+    /// the machine running the code, which a deployed runtime may not have,
+    /// and it costs a link plus `dlopen` per install rather than compiling
+    /// in process.
     ///
     /// `ZYNTAX_LLVM_MCJIT` overrides in both directions — `0`/`off`/`false`
     /// forces the object path, any other value forces MCJIT.
@@ -182,8 +186,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             .map(str::trim)
         {
             Some("0") | Some("off") | Some("false") => false,
-            Some(_) => true,
-            None => cfg!(target_os = "linux"),
+            _ => true,
         }
     }
 
