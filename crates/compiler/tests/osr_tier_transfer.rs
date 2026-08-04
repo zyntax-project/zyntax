@@ -135,8 +135,12 @@ static STUB_ARGS: std::sync::Mutex<Option<[i64; 4]>> = std::sync::Mutex::new(Non
 /// Stand-in for a tier-1 helper. Records what the back-edge handed over and
 /// returns a sentinel, so a transfer is distinguishable from tier-0 code
 /// simply running the loop to completion.
-extern "C" fn stub_helper(a: i64, b: i64, c: i64, d: i64) -> i32 {
-    *STUB_ARGS.lock().unwrap() = Some([a, b, c, d]);
+extern "C" fn stub_helper(frame: *mut u8) -> i32 {
+    // count_to's live-ins are (i, sum, n), all i32, so they sit at the
+    // first three slots of the frame.
+    let read =
+        |off: usize| unsafe { std::ptr::read_unaligned(frame.add(off) as *const i32) as i64 };
+    *STUB_ARGS.lock().unwrap() = Some([read(0), read(4), read(8), 0]);
     999
 }
 
@@ -255,11 +259,13 @@ static MIDFLIGHT_I: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64:
 
 /// Stands in for a tier-1 helper: records where the loop had got to, then
 /// finishes it the way the original would.
-extern "C" fn midflight_helper(i: i64, sum: i64, n: i64, _unused: i64) -> i32 {
-    MIDFLIGHT_I.fetch_max(i, std::sync::atomic::Ordering::AcqRel);
-    let mut s = sum as i32;
-    let mut k = i as i32;
-    while k < n as i32 {
+extern "C" fn midflight_helper(frame: *mut u8) -> i32 {
+    let read = |off: usize| unsafe { std::ptr::read_unaligned(frame.add(off) as *const i32) };
+    let (i, sum, n) = (read(0), read(4), read(8));
+    MIDFLIGHT_I.fetch_max(i as i64, std::sync::atomic::Ordering::AcqRel);
+    let mut s = sum;
+    let mut k = i;
+    while k < n {
         s = s.wrapping_add(k);
         k += 1;
     }

@@ -351,6 +351,8 @@ pub struct OsrLayout {
     /// HirIds in the helper's value_map for the body to consume.
     pub phi_count: usize,
     pub return_type: HirType,
+    /// Where each live-in sits in the frame the back-edge hands over.
+    pub frame: OsrFrame,
 }
 
 impl OsrLayout {
@@ -459,11 +461,16 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
     if live_ins.len() > OSR_MAX_LIVE_INS {
         return Err(OsrReject::TooManyLiveIns(live_ins.len()));
     }
-    if !live_in_types.iter().all(type_fits_i64) {
+
+    // Live-ins travel through a frame rather than registers, so a type only
+    // has to have a layout — an aggregate is copied, not squeezed into a
+    // slot. A type with no known size still has nowhere to live.
+    if live_in_types.iter().any(|t| frame_size_of(t) == 0) {
         return Err(OsrReject::LiveInDoesntFit);
     }
 
     let block_index = block_index_of(function, header).unwrap_or(u64::MAX);
+    let frame = OsrFrame::for_types(&live_in_types);
 
     Ok(OsrLayout {
         header,
@@ -472,6 +479,7 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
         live_in_types,
         phi_count,
         return_type,
+        frame,
     })
 }
 
@@ -859,6 +867,21 @@ pub fn frame_align_of(ty: &HirType) -> usize {
         HirType::Array(elem, _) => frame_align_of(elem),
         HirType::Vector(elem, _) => frame_align_of(elem),
         other => frame_size_of(other).min(16).max(1),
+    }
+}
+
+/// Whether a value of this type is held as a pointer to its storage rather
+/// than as the value itself.
+///
+/// Cranelift gives a multi-field struct a pointer, so writing one into a
+/// frame means copying the bytes it points at rather than storing the
+/// value. LLVM holds the same struct by value, which is precisely why the
+/// frame exists.
+pub fn is_held_by_reference(ty: &HirType) -> bool {
+    match ty {
+        HirType::Struct(s) => s.fields.len() > 1,
+        HirType::Array(_, _) => true,
+        _ => false,
     }
 }
 

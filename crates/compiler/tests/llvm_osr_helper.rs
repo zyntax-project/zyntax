@@ -32,12 +32,12 @@ fn the_llvm_tier_emits_a_helper_that_resumes_at_the_header() {
         .get_function(&name)
         .expect("helper should be in the module");
 
-    // Four i64 slots in, the function's own return type out — the shape a
-    // tier-0 back-edge marshals into.
+    // One frame pointer in, the function's own return type out — the shape
+    // a tier-0 back-edge hands over.
     assert_eq!(
         helper.count_params(),
-        osr::OSR_MAX_LIVE_INS as u32,
-        "helper should take one slot per live-in cap:\n{ir}"
+        1,
+        "helper should take a single frame pointer:\n{ir}"
     );
 
     // Entry must be the prologue, and it must branch to the header rather
@@ -112,9 +112,9 @@ fn a_cranelift_frame_finishes_inside_an_llvm_helper() {
     const BEAD: u64 = 0x11FA;
     let (function, header_id) = counted_loop();
     let func_id = function.id;
-    let site = osr::osr_layout(&function, header_id)
-        .expect("counted loop should have an OSR layout")
-        .site_key();
+    let layout =
+        osr::osr_layout(&function, header_id).expect("counted loop should have an OSR layout");
+    let site = layout.site_key();
 
     // Tier 0 in Cranelift: the loop, plus a back-edge that loads this
     // site's helper slot.
@@ -149,12 +149,16 @@ fn a_cranelift_frame_finishes_inside_an_llvm_helper() {
     // Enter the helper directly from mid-loop state. Tier-0 code can only
     // ever start at i = 0, so an answer that accounts for a non-zero
     // starting point could not have come from anywhere else.
-    let helper: extern "C" fn(i64, i64, i64, i64) -> i32 =
-        unsafe { std::mem::transmute(helper_code) };
+    let helper: extern "C" fn(*mut u8) -> i32 = unsafe { std::mem::transmute(helper_code) };
     // Resuming at i = 5 with sum = 10 and n = 100 adds 5..99 to 10.
     let expected_resume: i32 = 10 + (5..100).sum::<i32>();
+    let mut frame = vec![0u8; layout.frame.size as usize];
+    for (slot, value) in [5i32, 10, 100].iter().enumerate() {
+        let off = layout.frame.offsets[slot] as usize;
+        frame[off..off + 4].copy_from_slice(&value.to_ne_bytes());
+    }
     assert_eq!(
-        helper(5, 10, 100, 0),
+        helper(frame.as_mut_ptr()),
         expected_resume,
         "the helper should continue the loop from the state handed to it"
     );
@@ -181,11 +185,13 @@ static LLVM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// where the loop had reached, then hands the frame to the real LLVM
 /// helper — which therefore runs on the worker thread, not the one that
 /// compiled it.
-extern "C" fn recording_shim(i: i64, sum: i64, n: i64, d: i64) -> i32 {
-    LLVM_MIDFLIGHT_I.fetch_max(i, std::sync::atomic::Ordering::AcqRel);
+extern "C" fn recording_shim(frame: *mut u8) -> i32 {
+    // The loop counter is the first live-in, so it sits at offset 0.
+    let i = unsafe { std::ptr::read_unaligned(frame as *const i32) };
+    LLVM_MIDFLIGHT_I.fetch_max(i as i64, std::sync::atomic::Ordering::AcqRel);
     let addr = LLVM_HELPER.load(std::sync::atomic::Ordering::Acquire);
-    let helper: extern "C" fn(i64, i64, i64, i64) -> i32 = unsafe { std::mem::transmute(addr) };
-    helper(i, sum, n, d)
+    let helper: extern "C" fn(*mut u8) -> i32 = unsafe { std::mem::transmute(addr) };
+    helper(frame)
 }
 
 /// A real LLVM compile landing while a loop is in flight, with the code

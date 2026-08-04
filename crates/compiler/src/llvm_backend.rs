@@ -760,10 +760,11 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
-        let i64_ty = self.context.i64_type();
-        let params: Vec<BasicMetadataTypeEnum> = (0..crate::osr::OSR_MAX_LIVE_INS)
-            .map(|_| i64_ty.into())
-            .collect();
+        // One pointer to the frame carrying the live-ins.
+        let params: Vec<BasicMetadataTypeEnum> = vec![self
+            .context
+            .ptr_type(inkwell::AddressSpace::default())
+            .into()];
         let fn_ty = match &layout.return_type {
             HirType::Void => self.context.void_type().fn_type(&params, false),
             ty => self.translate_type(ty)?.fn_type(&params, false),
@@ -825,24 +826,41 @@ impl<'ctx> LLVMBackend<'ctx> {
         // become the header's phi inputs; the rest are ordinary values the
         // body reads, so they go straight into the value map.
         self.builder.position_at_end(prologue);
+        let frame_ptr = helper
+            .get_nth_param(0)
+            .ok_or_else(|| CompilerError::CodeGen("OSR helper missing its frame pointer".into()))?
+            .into_pointer_value();
+        let i8_ty = self.context.i8_type();
         let mut phi_seeds: Vec<(HirId, BasicValueEnum<'ctx>)> = Vec::new();
-        for (i, hir_id) in layout
-            .live_ins
-            .iter()
-            .enumerate()
-            .take(crate::osr::OSR_MAX_LIVE_INS)
-        {
-            let raw = helper
-                .get_nth_param(i as u32)
-                .ok_or_else(|| CompilerError::CodeGen("OSR helper missing a parameter".into()))?;
-            let target = self.translate_type(&layout.live_in_types[i])?;
-            let recovered = self.reinterpret_from_i64(raw, target)?;
+        for (i, hir_id) in layout.live_ins.iter().enumerate() {
+            let Some(&offset) = layout.frame.offsets.get(i) else {
+                break;
+            };
+            let hir_ty = &layout.live_in_types[i];
+            let target = self.translate_type(hir_ty)?;
+            // Byte-offset into the frame, then load the value out. An
+            // aggregate is loaded by value here even though the writing
+            // backend held it as a pointer — the frame is the agreed
+            // representation, not the register one.
+            let slot = unsafe {
+                self.builder
+                    .build_in_bounds_gep(
+                        i8_ty,
+                        frame_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "osr_slot",
+                    )
+                    .map_err(|e| CompilerError::CodeGen(format!("OSR frame gep: {e}")))?
+            };
+            let recovered = self
+                .builder
+                .build_load(target, slot, "osr_live_in")
+                .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?;
             if i < layout.phi_count {
                 phi_seeds.push((*hir_id, recovered));
             } else {
                 self.value_map.insert(*hir_id, recovered);
-                self.type_map
-                    .insert(*hir_id, layout.live_in_types[i].clone());
+                self.type_map.insert(*hir_id, hir_ty.clone());
             }
         }
         let header_block = *self.block_map.get(&layout.header).ok_or_else(|| {

@@ -1228,10 +1228,9 @@ impl CraneliftBackend {
         let osr_helper = self.compile_osr_layout.clone();
 
         let sig = if let Some(layout) = &osr_helper {
+            // One pointer to the frame carrying the live-ins.
             let mut s = self.module.make_signature();
-            for _ in 0..crate::osr::OSR_MAX_LIVE_INS {
-                s.params.push(AbiParam::new(types::I64));
-            }
+            s.params.push(AbiParam::new(types::I64));
             if !matches!(layout.return_type, HirType::Void) {
                 let ret_ty = self.translate_type(&layout.return_type)?;
                 s.returns.push(AbiParam::new(ret_ty));
@@ -1243,7 +1242,7 @@ impl CraneliftBackend {
 
         // Pre-calculate parameter types before creating builder
         let param_types: Vec<_> = if osr_helper.is_some() {
-            vec![types::I64; crate::osr::OSR_MAX_LIVE_INS]
+            vec![types::I64]
         } else {
             let pt: Result<Vec<_>, _> = function
                 .signature
@@ -1680,26 +1679,29 @@ impl CraneliftBackend {
             // emitted at the end of Phase 3.
             let mut osr_phi_jump_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
             if let Some(layout) = &osr_helper {
-                let entry_params = builder.block_params(entry_block).to_vec();
-                // Bit-cast each helper arg from i64 to its live-in type.
-                // First `phi_count` are loop-carried values used as block
-                // params on the jump to header; the rest are stored in
-                // value_map under their HirIds for the body to consume.
+                // The sole argument is the frame's address. Recover each
+                // live-in from its offset: a value held by reference is
+                // already in the frame, so its address is the value; a
+                // scalar is loaded out.
+                let frame_ptr = builder.block_params(entry_block)[0];
                 for (i, hir_id) in layout.live_ins.iter().enumerate() {
-                    if i >= crate::osr::OSR_MAX_LIVE_INS {
+                    let Some(&offset) = layout.frame.offsets.get(i) else {
                         break;
-                    }
-                    let raw = entry_params[i]; // i64
-                    let target = type_cache
-                        .get(&layout.live_in_types[i])
-                        .copied()
-                        .unwrap_or(types::I64);
-                    let casted = bitcast_from_i64(&mut builder, raw, target);
+                    };
+                    let hir_ty = &layout.live_in_types[i];
+                    let recovered = if crate::osr::is_held_by_reference(hir_ty) {
+                        builder.ins().iadd_imm(frame_ptr, offset as i64)
+                    } else {
+                        let target = type_cache.get(hir_ty).copied().unwrap_or(types::I64);
+                        builder
+                            .ins()
+                            .load(target, MemFlags::new(), frame_ptr, offset as i32)
+                    };
                     if i < layout.phi_count {
-                        osr_phi_jump_args.push(casted);
+                        osr_phi_jump_args.push(recovered);
                     } else {
                         // Non-phi live-in — value_map for body consumption.
-                        self.value_map.insert(*hir_id, casted);
+                        self.value_map.insert(*hir_id, recovered);
                     }
                 }
             } else {
@@ -1910,22 +1912,30 @@ impl CraneliftBackend {
                 if osr_loop_headers.contains(hir_block_id) {
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
-                    let (site_key, live_in_clir, return_clir) =
+                    let empty_frame = crate::osr::OsrFrame::for_types(&[]);
+                    let (site_key, live_in_clir, live_in_types, frame, return_clir) =
                         if let Some(layout) = osr_layouts.get(hir_block_id) {
-                            // Marshal phi-result Cranelift values for live-ins.
+                            // Collect the Cranelift value backing each live-in.
                             let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
                             for hir_id in &layout.live_ins {
                                 if let Some(&v) = self.value_map.get(hir_id) {
                                     clir_vals.push(v);
                                 }
                             }
-                            let live_ins_ok = clir_vals.len() == layout.live_ins.len();
-                            if live_ins_ok {
-                                (layout.site_key(), clir_vals, osr_return_clir)
+                            if clir_vals.len() == layout.live_ins.len() {
+                                (
+                                    layout.site_key(),
+                                    clir_vals,
+                                    layout.live_in_types.clone(),
+                                    layout.frame.clone(),
+                                    osr_return_clir,
+                                )
                             } else {
                                 (
                                     crate::osr::encode_osr_site(block_index, 0),
                                     Vec::new(),
+                                    Vec::new(),
+                                    empty_frame.clone(),
                                     None,
                                 )
                             }
@@ -1934,6 +1944,8 @@ impl CraneliftBackend {
                             (
                                 crate::osr::encode_osr_site(block_index, 0),
                                 Vec::new(),
+                                Vec::new(),
+                                empty_frame.clone(),
                                 None,
                             )
                         };
@@ -1951,7 +1963,9 @@ impl CraneliftBackend {
                         &mut self.module,
                         osr_bead_id,
                         site_key,
+                        &frame,
                         &live_in_clir,
+                        &live_in_types,
                         return_clir,
                     );
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
@@ -8737,26 +8751,26 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
 /// On exit the builder is positioned in `b_post_probe` so subsequent
 /// instruction/terminator emission lands there.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_osr_back_edge_probe(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     bead_id: u64,
     site_key: u64,
+    frame: &crate::osr::OsrFrame,
     live_ins: &[cranelift_codegen::ir::Value],
+    live_in_types: &[HirType],
     return_clir: Option<cranelift_codegen::ir::Type>,
 ) {
-    use cranelift_codegen::ir::condcodes::IntCC;
+    let target_config = module.target_config();
 
-    // Sample-tick signature: () -> i64
-
-    // Helper signature for indirect call: (i64,i64,i64,i64) -> return_clir.
-    // Built only if dispatch is possible.
+    // Helper signature: one pointer to the frame carrying the live-ins.
+    // Passing them as arguments would force each to fit a register, which
+    // rules out the aggregates real loops carry.
     let dispatch_enabled = !live_ins.is_empty() || return_clir.is_some();
     let helper_sig_ref = if dispatch_enabled {
         let mut hs = module.make_signature();
-        for _ in 0..crate::osr::OSR_MAX_LIVE_INS {
-            hs.params.push(AbiParam::new(types::I64));
-        }
+        hs.params.push(AbiParam::new(types::I64));
         if let Some(rt) = return_clir {
             hs.returns.push(AbiParam::new(rt));
         }
@@ -8793,20 +8807,14 @@ fn emit_osr_back_edge_probe(
     builder.seal_block(dispatch_block);
     match helper_sig_ref {
         Some(sig_ref) => {
-            // Marshal live-ins into the helper's slots and hand the frame
-            // over; its result is this function's result. Slots a loop does
-            // not use are zero-filled so every helper has the same shape.
-            let zero = builder.ins().iconst(types::I64, 0);
-            let mut args: Vec<cranelift_codegen::ir::Value> =
-                vec![zero; crate::osr::OSR_MAX_LIVE_INS];
-            for (i, &v) in live_ins
-                .iter()
-                .take(crate::osr::OSR_MAX_LIVE_INS)
-                .enumerate()
-            {
-                args[i] = marshal_to_i64(builder, v);
-            }
-            let call = builder.ins().call_indirect(sig_ref, helper_ptr, &args);
+            // Write each live-in into the frame at its offset, then hand
+            // the frame's address over; the helper's result is this
+            // function's result.
+            let frame_addr =
+                emit_osr_frame_store(builder, target_config, frame, live_ins, live_in_types);
+            let call = builder
+                .ins()
+                .call_indirect(sig_ref, helper_ptr, &[frame_addr]);
             let results: smallvec::SmallVec<[cranelift_codegen::ir::Value; 1]> =
                 builder.inst_results(call).iter().copied().collect();
             builder.ins().return_(&results);
@@ -8819,6 +8827,53 @@ fn emit_osr_back_edge_probe(
 
     builder.switch_to_block(post_probe_block);
     builder.seal_block(post_probe_block);
+}
+
+/// Spill the live-ins into a stack frame and return its address.
+///
+/// A value held by reference has its bytes copied out of whatever it points
+/// at; a scalar is stored directly. Either way the frame ends up holding
+/// the value itself, which is what lets a helper compiled by a different
+/// backend read it without agreeing on how it is held in registers.
+fn emit_osr_frame_store(
+    builder: &mut FunctionBuilder<'_>,
+    target_config: cranelift_codegen::isa::TargetFrontendConfig,
+    frame: &crate::osr::OsrFrame,
+    live_ins: &[cranelift_codegen::ir::Value],
+    live_in_types: &[HirType],
+) -> cranelift_codegen::ir::Value {
+    use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        frame.size.max(1),
+        frame.align.max(1).trailing_zeros() as u8,
+    ));
+    let base = builder.ins().stack_addr(types::I64, slot, 0);
+
+    for (i, &v) in live_ins.iter().enumerate() {
+        let (Some(&offset), Some(ty)) = (frame.offsets.get(i), live_in_types.get(i)) else {
+            continue;
+        };
+        let dst = builder.ins().iadd_imm(base, offset as i64);
+        if crate::osr::is_held_by_reference(ty) {
+            let size = crate::osr::frame_size_of(ty) as u64;
+            let align = crate::osr::frame_align_of(ty) as u8;
+            builder.emit_small_memory_copy(
+                target_config,
+                dst,
+                v,
+                size,
+                align,
+                align,
+                true,
+                MemFlags::new(),
+            );
+        } else {
+            builder.ins().store(MemFlags::new(), v, dst, 0);
+        }
+    }
+    base
 }
 
 /// Reverse of [`marshal_to_i64`]: take an i64 helper arg and bit-cast /
