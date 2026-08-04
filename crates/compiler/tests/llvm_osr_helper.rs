@@ -96,3 +96,78 @@ fn the_llvm_tier_emits_a_helper_that_resumes_at_the_header() {
         eprintln!("{ir}");
     }
 }
+
+/// End to end: a frame running Cranelift tier-0 code should be able to
+/// finish inside an LLVM-compiled helper.
+///
+/// This is the link the gradient depends on — the speedup lives in the LLVM
+/// tier, so a resume point that only Cranelift can produce is worth nothing.
+#[test]
+fn a_cranelift_frame_finishes_inside_an_llvm_helper() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+    use zyntax_compiler::hir::HirModule;
+    use zyntax_compiler::llvm_jit_backend::LLVMJitBackend;
+    use zyntax_typed_ast::InternedString;
+
+    const BEAD: u64 = 0x11FA;
+    let (function, header_id) = counted_loop();
+    let func_id = function.id;
+    let site = osr::osr_layout(&function, header_id)
+        .expect("counted loop should have an OSR layout")
+        .site_key();
+
+    // Tier 0 in Cranelift: the loop, plus a back-edge that loads this
+    // site's helper slot.
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut cranelift = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    cranelift.set_compile_tier(0);
+    cranelift.set_compile_bead_id(BEAD);
+    cranelift
+        .compile_function(func_id, &function)
+        .expect("tier-0 compile");
+    cranelift.finalize_definitions().expect("finalize");
+    let tier0 = cranelift.get_function_ptr(func_id).expect("tier-0 pointer");
+
+    // Tier 1 in LLVM: same function, which now also emits the resume point.
+    let context = Context::create();
+    let mut llvm = LLVMJitBackend::new(&context).expect("llvm jit backend");
+    llvm.set_compile_tier(1);
+    llvm.set_compile_bead_id(BEAD);
+    let mut module = HirModule::new(InternedString::new_global("llvm_osr"));
+    module.functions.insert(func_id, function);
+    llvm.compile_module(&module).expect("llvm compile");
+
+    let helpers = llvm.take_pending_osr_helpers();
+    let (helper_site, helper_code) = helpers
+        .into_iter()
+        .find(|(s, _)| *s == site)
+        .expect("LLVM should have produced a helper for the loop header");
+    assert!(!helper_code.is_null(), "helper should have an address");
+
+    let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+    assert_eq!(f(10), 45, "tier-0 alone should sum 0..10");
+
+    // Enter the helper directly from mid-loop state. Tier-0 code can only
+    // ever start at i = 0, so an answer that accounts for a non-zero
+    // starting point could not have come from anywhere else.
+    let helper: extern "C" fn(i64, i64, i64, i64) -> i32 =
+        unsafe { std::mem::transmute(helper_code) };
+    // Resuming at i = 5 with sum = 10 and n = 100 adds 5..99 to 10.
+    let expected_resume: i32 = 10 + (5..100).sum::<i32>();
+    assert_eq!(
+        helper(5, 10, 100, 0),
+        expected_resume,
+        "the helper should continue the loop from the state handed to it"
+    );
+
+    // And through the back-edge, the whole loop still produces the same
+    // answers as running it entirely in tier-0 code.
+    osr::publish_helper(BEAD, helper_site, helper_code);
+    for (n, expected) in [(10, 45), (100, 4950), (1000, 499_500)] {
+        assert_eq!(
+            f(n),
+            expected,
+            "sum 0..{n} finished in the LLVM helper should be {expected}"
+        );
+    }
+}

@@ -123,6 +123,18 @@ pub struct LLVMJitBackend<'ctx> {
     /// are retained for as long as any handed-out pointer might be
     /// called — that is, the lifetime of the backend.
     engines: Vec<ExecutionEngine<'ctx>>,
+
+    /// Tier the next compile targets. OSR helpers are emitted at tier >= 1
+    /// only; tier 0 is what back-edges are probed from.
+    compile_tier: usize,
+
+    /// Bead this compile belongs to. Pairs with a site key to name the slot
+    /// a back-edge loads its helper from.
+    compile_bead_id: u64,
+
+    /// `(site_key, helper_address)` from the last install, drained by the
+    /// caller to publish into the slots back-edges read.
+    pending_osr_helpers: Vec<(u64, usize)>,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
@@ -152,6 +164,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             cache_key: None,
             use_mcjit: Self::default_use_mcjit(),
             engines: Vec::new(),
+            compile_tier: 0,
+            compile_bead_id: 0,
+            pending_osr_helpers: Vec::new(),
         })
     }
 
@@ -188,6 +203,26 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             Some("0") | Some("off") | Some("false") => false,
             _ => true,
         }
+    }
+
+    /// Set the tier the next compile targets. OSR helpers are emitted at
+    /// tier >= 1 only.
+    pub fn set_compile_tier(&mut self, tier: usize) {
+        self.compile_tier = tier;
+    }
+
+    /// Set the bead the next compile belongs to; used to name the helper
+    /// slots a back-edge loads from.
+    pub fn set_compile_bead_id(&mut self, bead_id: u64) {
+        self.compile_bead_id = bead_id;
+    }
+
+    /// Drain `(site_key, helper_address)` from the last install.
+    pub fn take_pending_osr_helpers(&mut self) -> Vec<(u64, *mut ())> {
+        std::mem::take(&mut self.pending_osr_helpers)
+            .into_iter()
+            .map(|(site, addr)| (site, addr as *mut ()))
+            .collect()
     }
 
     /// Install through an in-process MCJIT engine rather than emitting an
@@ -242,7 +277,31 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// equivalent of the trampoline stubs the object path synthesises.
     /// The engine is retained because it owns the code pages.
     fn install_via_mcjit(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
-        let (backend, _target_machine) = self.compile_module_to_ir(hir_module)?;
+        let (mut backend, _target_machine) = self.compile_module_to_ir(hir_module)?;
+
+        // Tier >= 1 additionally emits a resume point per loop header, so a
+        // frame already running tier-0 code can finish here rather than
+        // waiting for the next call. Emitted before the engine is created,
+        // since that consumes the module.
+        let mut helper_names: Vec<(u64, String)> = Vec::new();
+        if self.compile_tier >= 1 {
+            for func in hir_module.functions.values() {
+                if func.is_external {
+                    continue;
+                }
+                for header in crate::osr::find_loop_headers(func) {
+                    let Ok(layout) = crate::osr::osr_layout(func, header) else {
+                        continue;
+                    };
+                    match backend.compile_osr_helper(func, &layout) {
+                        Ok(name) => helper_names.push((layout.site_key(), name)),
+                        // A header the helper shape cannot express just
+                        // means no resume point for that loop.
+                        Err(e) => log::debug!("[LLVM] no OSR helper for {header:?}: {e}"),
+                    }
+                }
+            }
+        }
 
         // The engine builds its own target machine and defaults to a
         // generic CPU, where the object path tunes one from the host. Carry
@@ -267,6 +326,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         for (hir_id, name) in self.get_function_symbols(hir_module) {
             if let Ok(addr) = engine.get_function_address(&name) {
                 self.function_pointers.insert(hir_id, addr as usize);
+            }
+        }
+
+        for (site, name) in helper_names {
+            if let Ok(addr) = engine.get_function_address(&name) {
+                self.pending_osr_helpers.push((site, addr as usize));
             }
         }
 

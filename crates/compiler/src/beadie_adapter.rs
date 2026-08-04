@@ -181,14 +181,22 @@ mod llvm_impl {
             _bead: &std::sync::Arc<Bead>,
             def: Self::FunctionDef,
         ) -> Result<*mut (), Self::Error> {
-            // LLVM tier-2 ignores `tier` / `bead_id` for now — OSR is wired
-            // through the Cranelift path (tiers 0/1) only. Once LLVM gains
-            // an OSR-aware codegen path these would propagate similarly to
-            // the Cranelift wrapper above.
+            let tier = def.tier;
+            let bead_id = def.bead_id;
             self.with_lock(|backend| {
+                backend.set_compile_tier(tier);
+                backend.set_compile_bead_id(bead_id);
                 backend
                     .compile_function(def.id, &def.function)
                     .map_err(|e| CompileError::new(format!("llvm compile_function failed: {e}")))?;
+
+                // Publish this tier's resume points so back-edges still
+                // running tier-0 code can finish here instead of waiting
+                // for the next call.
+                for (site, code) in backend.take_pending_osr_helpers() {
+                    crate::osr::publish_helper(bead_id, site, code);
+                }
+
                 backend
                     .get_function_pointer(def.id)
                     .map(|p| p as *mut ())
