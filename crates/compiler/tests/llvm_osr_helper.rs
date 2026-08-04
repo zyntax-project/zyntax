@@ -132,15 +132,14 @@ fn a_cranelift_frame_finishes_inside_an_llvm_helper() {
     let context = Context::create();
     let mut llvm = LLVMJitBackend::new(&context).expect("llvm jit backend");
     llvm.set_compile_tier(1);
-    llvm.set_compile_bead_id(BEAD);
     let mut module = HirModule::new(InternedString::new_global("llvm_osr"));
     module.functions.insert(func_id, function);
     llvm.compile_module(&module).expect("llvm compile");
 
     let helpers = llvm.take_pending_osr_helpers();
-    let (helper_site, helper_code) = helpers
+    let (_, helper_site, helper_code) = helpers
         .into_iter()
-        .find(|(s, _)| *s == site)
+        .find(|(_, s, _)| *s == site)
         .expect("LLVM should have produced a helper for the loop header");
     assert!(!helper_code.is_null(), "helper should have an address");
 
@@ -170,4 +169,103 @@ fn a_cranelift_frame_finishes_inside_an_llvm_helper() {
             "sum 0..{n} finished in the LLVM helper should be {expected}"
         );
     }
+}
+
+/// Highest counter the running loop was at when it entered LLVM code.
+static LLVM_MIDFLIGHT_I: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Address of the LLVM-compiled helper the shim forwards to.
+static LLVM_HELPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Published in the helper's place so the transfer is observable. Records
+/// where the loop had reached, then hands the frame to the real LLVM
+/// helper — which therefore runs on the worker thread, not the one that
+/// compiled it.
+extern "C" fn recording_shim(i: i64, sum: i64, n: i64, d: i64) -> i32 {
+    LLVM_MIDFLIGHT_I.fetch_max(i, std::sync::atomic::Ordering::AcqRel);
+    let addr = LLVM_HELPER.load(std::sync::atomic::Ordering::Acquire);
+    let helper: extern "C" fn(i64, i64, i64, i64) -> i32 = unsafe { std::mem::transmute(addr) };
+    helper(i, sum, n, d)
+}
+
+/// A real LLVM compile landing while a loop is in flight, with the code
+/// executed from a different thread than compiled it.
+///
+/// The mid-flight Cranelift test uses a Rust stub as the helper, so it
+/// proves the back-edge re-reads its slot but not that MCJIT code is
+/// callable from another thread — the concern the object-file backend was
+/// originally built around. Promotion runs on a broker thread, so that is
+/// the shape production would hit.
+#[test]
+fn an_llvm_compile_lands_on_a_loop_running_in_another_thread() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+    use zyntax_compiler::hir::HirModule;
+    use zyntax_compiler::llvm_jit_backend::LLVMJitBackend;
+    use zyntax_typed_ast::InternedString;
+
+    const BEAD: u64 = 0x50AC;
+    let (function, header_id) = counted_loop();
+    let func_id = function.id;
+    let site = osr::osr_layout(&function, header_id)
+        .expect("counted loop should have an OSR layout")
+        .site_key();
+
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut cranelift = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    cranelift.set_compile_tier(0);
+    cranelift.set_compile_bead_id(BEAD);
+    cranelift
+        .compile_function(func_id, &function)
+        .expect("tier-0 compile");
+    cranelift.finalize_definitions().expect("finalize");
+    let tier0 = cranelift.get_function_ptr(func_id).expect("tier-0 pointer") as usize;
+
+    const N: i32 = 400_000_000;
+    let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+    let baseline = f(N);
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_stop = std::sync::Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+        let mut results = Vec::new();
+        while !worker_stop.load(Ordering::Acquire) {
+            results.push(f(N));
+        }
+        results
+    });
+
+    // Compile and publish on this thread while the worker runs on another,
+    // so the code MCJIT emits here is entered there.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let context = Context::create();
+    let mut llvm = LLVMJitBackend::new(&context).expect("llvm jit backend");
+    llvm.set_compile_tier(1);
+    let mut module = HirModule::new(InternedString::new_global("llvm_osr_soak"));
+    module.functions.insert(func_id, function);
+    llvm.compile_module(&module).expect("llvm compile");
+    let (_, helper_site, helper_code) = llvm
+        .take_pending_osr_helpers()
+        .into_iter()
+        .find(|(_, s, _)| *s == site)
+        .expect("LLVM should have produced a helper");
+    assert_eq!(helper_site, site);
+    LLVM_HELPER.store(helper_code as usize, Ordering::Release);
+    osr::publish_helper(BEAD, helper_site, recording_shim as *mut ());
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, Ordering::Release);
+    let results = worker.join().expect("worker should not fault in LLVM code");
+
+    let observed = LLVM_MIDFLIGHT_I.load(Ordering::Acquire);
+    assert!(
+        observed > 0 && observed < N as i64,
+        "the loop should have entered LLVM code mid-flight; observed i = {observed}"
+    );
+    assert!(
+        results.iter().all(|r| *r == baseline),
+        "every run, including those finished in LLVM code, should agree with \
+         the un-transferred result {baseline}"
+    );
 }

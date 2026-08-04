@@ -128,13 +128,12 @@ pub struct LLVMJitBackend<'ctx> {
     /// only; tier 0 is what back-edges are probed from.
     compile_tier: usize,
 
-    /// Bead this compile belongs to. Pairs with a site key to name the slot
-    /// a back-edge loads its helper from.
-    compile_bead_id: u64,
-
-    /// `(site_key, helper_address)` from the last install, drained by the
-    /// caller to publish into the slots back-edges read.
-    pending_osr_helpers: Vec<(u64, usize)>,
+    /// `(function, site_key, helper_address)` from the last install.
+    ///
+    /// The function is carried because `compile_module` installs a whole
+    /// module at once while helper slots are keyed by bead, and only the
+    /// caller knows which bead a function belongs to.
+    pending_osr_helpers: Vec<(HirId, u64, usize)>,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
@@ -165,7 +164,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             use_mcjit: Self::default_use_mcjit(),
             engines: Vec::new(),
             compile_tier: 0,
-            compile_bead_id: 0,
             pending_osr_helpers: Vec::new(),
         })
     }
@@ -211,17 +209,11 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.compile_tier = tier;
     }
 
-    /// Set the bead the next compile belongs to; used to name the helper
-    /// slots a back-edge loads from.
-    pub fn set_compile_bead_id(&mut self, bead_id: u64) {
-        self.compile_bead_id = bead_id;
-    }
-
-    /// Drain `(site_key, helper_address)` from the last install.
-    pub fn take_pending_osr_helpers(&mut self) -> Vec<(u64, *mut ())> {
+    /// Drain `(function, site_key, helper_address)` from the last install.
+    pub fn take_pending_osr_helpers(&mut self) -> Vec<(HirId, u64, *mut ())> {
         std::mem::take(&mut self.pending_osr_helpers)
             .into_iter()
-            .map(|(site, addr)| (site, addr as *mut ()))
+            .map(|(id, site, addr)| (id, site, addr as *mut ()))
             .collect()
     }
 
@@ -283,9 +275,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // frame already running tier-0 code can finish here rather than
         // waiting for the next call. Emitted before the engine is created,
         // since that consumes the module.
-        let mut helper_names: Vec<(u64, String)> = Vec::new();
+        let mut helper_names: Vec<(HirId, u64, String)> = Vec::new();
         if self.compile_tier >= 1 {
-            for func in hir_module.functions.values() {
+            for (func_id, func) in hir_module.functions.iter() {
                 if func.is_external {
                     continue;
                 }
@@ -294,7 +286,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                         continue;
                     };
                     match backend.compile_osr_helper(func, &layout) {
-                        Ok(name) => helper_names.push((layout.site_key(), name)),
+                        Ok(name) => helper_names.push((*func_id, layout.site_key(), name)),
                         // A header the helper shape cannot express just
                         // means no resume point for that loop.
                         Err(e) => log::debug!("[LLVM] no OSR helper for {header:?}: {e}"),
@@ -329,9 +321,10 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
-        for (site, name) in helper_names {
+        for (func_id, site, name) in helper_names {
             if let Ok(addr) = engine.get_function_address(&name) {
-                self.pending_osr_helpers.push((site, addr as usize));
+                self.pending_osr_helpers
+                    .push((func_id, site, addr as usize));
             }
         }
 

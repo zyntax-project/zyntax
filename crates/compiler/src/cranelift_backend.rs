@@ -320,6 +320,11 @@ pub struct CraneliftBackend {
     /// On a ~100 M-iteration mandelbrot the unconditional probe stream
     /// costs ~100 ms of pure overhead.
     emit_osr_probes: bool,
+    /// Per-function bead ids for whole-module compiles. `compile_module`
+    /// emits every function in one pass, but helper slots are keyed by
+    /// bead, so a single `compile_bead_id` would make every function probe
+    /// the same slot — and site keys are only unique within a function.
+    bead_ids: HashMap<HirId, u64>,
     /// Bead id this function is registered under in the OSR registry.
     /// Embedded as a constant into probe call sites so the runtime can
     /// look up the bead without a global function-pointer table.
@@ -504,6 +509,7 @@ impl CraneliftBackend {
             compile_osr_func_id: None,
             only_compile_reachable: None,
             compile_generation: HashMap::new(),
+            bead_ids: HashMap::new(),
             probe_sites: Vec::new(),
             last_code_len: None,
         })
@@ -544,10 +550,17 @@ impl CraneliftBackend {
     }
 
     /// Set the bead id for subsequent `compile_function` calls. Embedded
-    /// as a constant in tier-0 probe call sites so [`crate::osr::osr_probe`]
-    /// can find the bead in the registry.
+    /// as a constant in tier-0 probe sites so a back-edge loads the right
+    /// helper slot.
     pub fn set_compile_bead_id(&mut self, bead_id: u64) {
         self.compile_bead_id = bead_id;
+    }
+
+    /// Supply per-function bead ids for whole-module compiles, where one
+    /// `compile_bead_id` cannot be right for every function. Falls back to
+    /// [`Self::set_compile_bead_id`] for functions absent from the map.
+    pub fn set_bead_ids(&mut self, bead_ids: HashMap<HirId, u64>) {
+        self.bead_ids = bead_ids;
     }
 
     /// Enable / disable OSR back-edge probe emission for subsequent
@@ -1483,7 +1496,11 @@ impl CraneliftBackend {
                 .enumerate()
                 .map(|(i, id)| (*id, i as u64))
                 .collect();
-            let osr_bead_id = self.compile_bead_id;
+            let osr_bead_id = self
+                .bead_ids
+                .get(&id)
+                .copied()
+                .unwrap_or(self.compile_bead_id);
             // Pre-resolve per-header layouts and the function's return
             // Cranelift type. Doing this before the FunctionBuilder is
             // created avoids re-borrowing `self` during emission.

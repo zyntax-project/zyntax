@@ -185,15 +185,15 @@ mod llvm_impl {
             let bead_id = def.bead_id;
             self.with_lock(|backend| {
                 backend.set_compile_tier(tier);
-                backend.set_compile_bead_id(bead_id);
                 backend
                     .compile_function(def.id, &def.function)
                     .map_err(|e| CompileError::new(format!("llvm compile_function failed: {e}")))?;
 
                 // Publish this tier's resume points so back-edges still
                 // running tier-0 code can finish here instead of waiting
-                // for the next call.
-                for (site, code) in backend.take_pending_osr_helpers() {
+                // for the next call. Only this function's own helpers are
+                // in play, so they all belong to this bead.
+                for (_, site, code) in backend.take_pending_osr_helpers() {
                     crate::osr::publish_helper(bead_id, site, code);
                 }
 

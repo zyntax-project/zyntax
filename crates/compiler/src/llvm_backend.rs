@@ -741,6 +741,25 @@ impl<'ctx> LLVMBackend<'ctx> {
         func: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<String> {
+        // Reject shapes the helper cannot express before creating anything.
+        // An LLVM function or block cannot be safely removed once other
+        // values reference it — deleting one leaves dangling uses that crash
+        // the pass pipeline rather than failing cleanly.
+        let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
+        for block_id in &in_loop {
+            if *block_id == layout.header {
+                continue;
+            }
+            if let Some(block) = func.blocks.get(block_id) {
+                if block.predecessors.iter().any(|p| !in_loop.contains(p)) {
+                    return Err(CompilerError::CodeGen(format!(
+                        "OSR helper for {:?}: block {block_id:?} is also reached from outside the loop",
+                        layout.header
+                    )));
+                }
+            }
+        }
+
         let i64_ty = self.context.i64_type();
         let params: Vec<BasicMetadataTypeEnum> = (0..crate::osr::OSR_MAX_LIVE_INS)
             .map(|_| i64_ty.into())
@@ -787,9 +806,15 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
+        // Only the loop is materialised: compiling the rest would redefine
+        // the values seeded from the arguments below.
+        //
         // The prologue is created first so it becomes the entry block.
         let prologue = self.context.append_basic_block(helper, "osr_prologue");
         for (block_id, _) in func.blocks.iter() {
+            if !in_loop.contains(block_id) {
+                continue;
+            }
             let llvm_block = self
                 .context
                 .append_basic_block(helper, &format!("bb_{block_id:?}"));
@@ -831,28 +856,29 @@ impl<'ctx> LLVMBackend<'ctx> {
             .map_err(|e| CompilerError::CodeGen(format!("OSR prologue branch: {e}")))?;
 
         for (block_id, hir_block) in func.blocks.iter() {
+            if !in_loop.contains(block_id) {
+                continue;
+            }
             if let Some(llvm_block) = self.block_map.get(block_id) {
                 self.builder.position_at_end(*llvm_block);
                 self.compile_block_with_terminator(block_id, hir_block, func)?;
             }
         }
 
-        // Blocks reachable from the header are the loop itself; anything
-        // else only reached the header on the way in, and the prologue now
-        // replaces that path.
-        let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
-
         // Wire the phis. Back-edges carry over unchanged, the header takes
         // the prologue edge in place of its loop-entry edges, and blocks
         // outside the loop stop contributing entirely.
         for (block_id, hir_block) in func.blocks.iter() {
+            if !in_loop.contains(block_id) {
+                continue;
+            }
             for phi in &hir_block.phis {
                 let Some(phi_value) = self.phi_map.get(&phi.result).copied() else {
                     continue;
                 };
                 let is_header = *block_id == layout.header;
                 for (value_id, pred_block_id) in &phi.incoming {
-                    if is_header && !in_loop.contains(pred_block_id) {
+                    if !in_loop.contains(pred_block_id) {
                         continue;
                     }
                     let incoming_value = self.get_value(*value_id)?;
@@ -871,19 +897,20 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
-        // Everything outside the loop is unreachable from the prologue now.
-        // Deleting it keeps the helper to the code it actually runs.
-        for (block_id, llvm_block) in self.block_map.clone() {
-            if !in_loop.contains(&block_id) {
-                unsafe {
-                    let _ = llvm_block.delete();
-                }
-                self.block_map.shift_remove(&block_id);
-            }
-        }
-
         self.current_function = None;
-        Ok(name)
+
+        // The precondition above should have caught anything malformed, so
+        // a failure here means the emitted body is wrong rather than the
+        // loop being unrepresentable. Report it and leave the function in
+        // place: removing it would dangle whatever already refers to it.
+        if helper.verify(false) {
+            Ok(name)
+        } else {
+            Err(CompilerError::CodeGen(format!(
+                "OSR helper for {:?} did not verify",
+                layout.header
+            )))
+        }
     }
 
     /// Recover a live-in from the i64 slot a back-edge marshalled it into.

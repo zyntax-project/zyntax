@@ -717,16 +717,10 @@ impl InterpRuntime {
         // and naive-recursive fib doing the same for the same
         // reason. Compiling the module once at install time fixes
         // both with cross-function symbol resolution.
-        // OSR back-edge probes are useful only when a tier ≥ 1 backend
-        // installs OSR helpers via `swap_compiled_with_osr`. The
-        // Cranelift-only ladder never does (it uses plain
-        // `swap_compiled`), and the current `feature = "llvm-backend"`
-        // path also uses `swap_compiled`, not the OSR variant. Until a
-        // backend wires the OSR producer side, probes are pure
-        // overhead — every loop iteration calls `osr_sample_tick`, and
-        // one-in-64 calls also hit `osr_probe → RwLock::read →
-        // HashMap::get` on an empty OSR table. On a ~100 M-iteration
-        // mandelbrot inner loop that's ~100 ms of pure overhead.
+        // Tier-0 code carries a back-edge probe so a frame already
+        // running it can transfer into tier-1 LLVM code instead of
+        // finishing in the slower tier. The probe is a load of this
+        // site's helper slot plus a not-taken branch.
         // Reachability DCE: restrict Cranelift body-compilation to functions
         // transitively callable from `main`. `import prelude` pulls in ~100
         // helpers; on the bench kernels (mandelbrot, nbody, naive-recursive
@@ -734,10 +728,14 @@ impl InterpRuntime {
         // codegen per install. Any unexpected call still works via the BC
         // interp's lazy-compile fallback.
         let reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
+        let bead_ids_for_cranelift = self.bead_ids.clone();
         cranelift.with_lock(|be| -> Result<(), CompilerError> {
             be.set_only_compile_reachable(Some(reachable));
-            be.set_emit_osr_probes(false);
             be.set_compile_tier(0);
+            // Probe sites embed the slot address for their own function's
+            // bead; site keys are only unique within a function, so sharing
+            // one bead across the module would alias them.
+            be.set_bead_ids(bead_ids_for_cranelift);
             be.compile_module(&module)
                 .map_err(|e| CompilerError::Backend(format!("tier-up compile: {e}")))?;
             be.finalize_definitions()
@@ -828,12 +826,35 @@ impl InterpRuntime {
             // no-op there but costs nothing.
             let llvm_for_bg = Arc::clone(&llvm);
             let llvm_ready_for_bg = Arc::clone(&llvm_ready);
+            let bead_ids_for_bg = self.bead_ids.clone();
             let module_for_bg = module.clone();
             let trace = std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok();
             std::thread::Builder::new()
                 .name("zyntax-llvm-tierup".to_string())
+                // LLVM's pass pipeline recurses deeply — SimplifyCFG and the
+                // inliner in particular — and a spawned thread gets 2 MB by
+                // default, which it overruns on a module of any size.
+                .stack_size(64 * 1024 * 1024)
                 .spawn(move || {
-                    let r = llvm_for_bg.with_lock(|be| be.compile_module(&module_for_bg));
+                    let r = llvm_for_bg.with_lock(|be| {
+                        // Tier 1 additionally emits a resume point per loop
+                        // header, so a frame already running tier-0 code can
+                        // finish in LLVM rather than waiting for the next
+                        // call.
+                        be.set_compile_tier(1);
+                        let r = be.compile_module(&module_for_bg);
+                        if r.is_ok() {
+                            // Slots are keyed by bead, and a whole-module
+                            // install covers many, so each helper is
+                            // published against its own function's bead.
+                            for (func_id, site, code) in be.take_pending_osr_helpers() {
+                                if let Some(bead_id) = bead_ids_for_bg.get(&func_id) {
+                                    zyntax_compiler::osr::publish_helper(*bead_id, site, code);
+                                }
+                            }
+                        }
+                        r
+                    });
                     match r {
                         Ok(()) => {
                             llvm_ready_for_bg.store(true, std::sync::atomic::Ordering::Release);
