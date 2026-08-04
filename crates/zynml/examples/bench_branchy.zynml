@@ -1,0 +1,42 @@
+// Data-dependent multi-way dispatch — a second shape the HIR passes leave
+// alone.
+//
+// The branch taken each iteration depends on the running value, so the
+// chain cannot be flattened, hoisted or vectorized. It stresses branch
+// ordering and register pressure rather than loop shape.
+
+def main(): i64 {
+    let mut acc: i64 = 1
+    let mut i: i64 = 0
+    while i < 20000000 {
+        let k: i64 = acc % 7
+        if k == 0 {
+            acc = acc + 3
+        } else {
+            if k == 1 {
+                acc = acc * 2 + 1
+            } else {
+                if k == 2 {
+                    acc = acc - 5
+                } else {
+                    if k == 3 {
+                        acc = acc + 11
+                    } else {
+                        if k == 4 {
+                            acc = acc * 3
+                        } else {
+                            if k == 5 {
+                                acc = acc + 7
+                            } else {
+                                acc = acc - 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        acc = acc % 1000003
+        i = i + 1
+    }
+    return acc
+}

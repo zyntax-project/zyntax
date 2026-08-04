@@ -426,7 +426,15 @@ impl CraneliftBackend {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
-        flag_builder.set("opt_level", "speed").unwrap(); // Optimize for JIT speed
+        // Opt level is fixed on the ISA, so it is process-wide rather than
+        // per-tier. `ZYNTAX_OPT_LEVEL` exists to measure what Cranelift's own
+        // optimizer contributes, which the tier ladder cannot currently vary.
+        flag_builder
+            .set(
+                "opt_level",
+                &std::env::var("ZYNTAX_OPT_LEVEL").unwrap_or_else(|_| "speed".into()),
+            )
+            .unwrap();
         flag_builder.set("enable_verifier", "true").unwrap();
 
         let isa_builder = cranelift_native::builder().unwrap();

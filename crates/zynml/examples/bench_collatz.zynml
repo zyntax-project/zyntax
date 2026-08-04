@@ -1,0 +1,28 @@
+// Collatz step-count sum — deliberately resistant to the HIR passes.
+//
+// The inner loop's trip count is data-dependent, its branch is
+// unpredictable, nothing is loop-invariant to hoist, and the recurrence is
+// strictly sequential so there is nothing to vectorize. What is left is
+// branch layout, register allocation and scalar simplification — the work
+// Cranelift's own optimizer does, which the numeric kernels hide because
+// LICM and auto-vectorization have already reshaped them.
+
+def main(): i64 {
+    let mut total: i64 = 0
+    let mut n: i64 = 1
+    while n < 300000 {
+        let mut x: i64 = n
+        let mut steps: i64 = 0
+        while x > 1 {
+            if x % 2 == 0 {
+                x = x / 2
+            } else {
+                x = 3 * x + 1
+            }
+            steps = steps + 1
+        }
+        total = total + steps
+        n = n + 1
+    }
+    return total
+}

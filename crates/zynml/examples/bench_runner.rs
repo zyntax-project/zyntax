@@ -200,6 +200,12 @@ const KERNELS: &[(&str, &str)] = &[
     ("bench_op_overload_ref", "Int(21000000)"),
     ("bench_any_field", "Int(1500000)"),
     ("bench_any_cast", "Int(2500000)"),
+    // Branch-heavy, data-dependent kernels. The others are numeric loops
+    // that the HIR passes reshape before Cranelift sees them, which hides
+    // what Cranelift's own optimizer contributes; these two do not give
+    // LICM, auto-vectorization or SROA anything to work with.
+    ("bench_collatz", "Int(35669673)"),
+    ("bench_branchy", "Int(140)"),
 ];
 
 /// Each target produces one [`TargetResult`] per kernel.
@@ -223,6 +229,8 @@ const TARGETS: &[Target] = &[
             "fib",
             "inlined_call",
             "free_function_call",
+            "collatz",
+            "branchy",
         ],
     },
     Target {
@@ -238,6 +246,8 @@ const TARGETS: &[Target] = &[
             "fib",
             "inlined_call",
             "free_function_call",
+            "collatz",
+            "branchy",
         ],
     },
     Target {
