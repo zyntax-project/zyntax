@@ -1926,7 +1926,6 @@ impl CraneliftBackend {
                         &mut self.module,
                         osr_bead_id,
                         site_key,
-                        crate::osr::arm_slot_addr(osr_bead_id),
                         &live_in_clir,
                         return_clir,
                     );
@@ -8718,24 +8717,12 @@ fn emit_osr_back_edge_probe(
     module: &mut JITModule,
     bead_id: u64,
     site_key: u64,
-    arm_slot: *const u8,
     live_ins: &[cranelift_codegen::ir::Value],
     return_clir: Option<cranelift_codegen::ir::Type>,
 ) {
     use cranelift_codegen::ir::condcodes::IntCC;
 
     // Sample-tick signature: () -> i64
-    // Probe signature: (i64, i64) -> i64
-    let mut probe_sig = module.make_signature();
-    probe_sig.params.push(AbiParam::new(types::I64));
-    probe_sig.params.push(AbiParam::new(types::I64));
-    probe_sig.returns.push(AbiParam::new(types::I64));
-    let probe_id =
-        match module.declare_function(crate::osr::OSR_PROBE_SYMBOL, Linkage::Import, &probe_sig) {
-            Ok(id) => id,
-            Err(_) => return,
-        };
-    let probe_func = module.declare_func_in_func(probe_id, builder.func);
 
     // Helper signature for indirect call: (i64,i64,i64,i64) -> return_clir.
     // Built only if dispatch is possible.
@@ -8757,58 +8744,54 @@ fn emit_osr_back_edge_probe(
     // only when a tier ≥ 1 compile installs helpers for this bead. The load
     // must observe a store from a broker thread, so it cannot be hoisted
     // out of the loop, and it splits the header into extra blocks.
-    let slot_v = builder.ins().iconst(types::I64, arm_slot as i64);
-    let armed = builder.ins().load(types::I8, MemFlags::new(), slot_v, 0);
+    // Load the helper pointer for this site. Null means no tier >= 1 code
+    // exists yet, which is the steady state, so an unarmed loop pays one
+    // load and a not-taken branch.
+    //
+    // Storing the helper rather than a flag is what keeps this cheap: a
+    // flag would still need a runtime lookup, and a call that returns into
+    // the loop forces the register allocator to treat caller-saved
+    // registers as clobbered across the whole body. The dispatch below
+    // returns instead of continuing, so nothing in the loop is constrained
+    // by it.
+    let slot = crate::osr::helper_slot_addr(bead_id, site_key);
+    let slot_v = builder.ins().iconst(types::I64, slot as i64);
+    let helper_ptr = builder.ins().load(types::I64, MemFlags::new(), slot_v, 0);
 
-    let call_probe_block = builder.create_block();
+    let dispatch_block = builder.create_block();
     let post_probe_block = builder.create_block();
-    let dispatch_block = if helper_sig_ref.is_some() {
-        Some(builder.create_block())
-    } else {
-        None
-    };
-
     builder
         .ins()
-        .brif(armed, call_probe_block, &[], post_probe_block, &[]);
+        .brif(helper_ptr, dispatch_block, &[], post_probe_block, &[]);
 
-    // call_probe block: ask the runtime for a helper.
-    builder.switch_to_block(call_probe_block);
-    builder.seal_block(call_probe_block);
-    let bead_id_v = builder.ins().iconst(types::I64, bead_id as i64);
-    let site_v = builder.ins().iconst(types::I64, site_key as i64);
-    let probe_call = builder.ins().call(probe_func, &[bead_id_v, site_v]);
-    let helper_ptr = builder.inst_results(probe_call)[0];
-
-    if let (Some(disp), Some(sig_ref)) = (dispatch_block, helper_sig_ref) {
-        // helper_ptr non-zero ⇒ dispatch; zero ⇒ continue.
-        builder
-            .ins()
-            .brif(helper_ptr, disp, &[], post_probe_block, &[]);
-
-        // dispatch block: marshal live-ins to 4 i64s, call_indirect, return.
-        builder.switch_to_block(disp);
-        builder.seal_block(disp);
-
-        let mut args: [cranelift_codegen::ir::Value; 4] = [
-            builder.ins().iconst(types::I64, 0),
-            builder.ins().iconst(types::I64, 0),
-            builder.ins().iconst(types::I64, 0),
-            builder.ins().iconst(types::I64, 0),
-        ];
-        for (i, &v) in live_ins.iter().take(4).enumerate() {
-            args[i] = marshal_to_i64(builder, v);
+    builder.switch_to_block(dispatch_block);
+    builder.seal_block(dispatch_block);
+    match helper_sig_ref {
+        Some(sig_ref) => {
+            // Marshal live-ins into the helper's four i64 slots and hand
+            // the frame over; its result is this function's result.
+            let mut args: [cranelift_codegen::ir::Value; 4] = [
+                builder.ins().iconst(types::I64, 0),
+                builder.ins().iconst(types::I64, 0),
+                builder.ins().iconst(types::I64, 0),
+                builder.ins().iconst(types::I64, 0),
+            ];
+            for (i, &v) in live_ins
+                .iter()
+                .take(crate::osr::OSR_MAX_LIVE_INS)
+                .enumerate()
+            {
+                args[i] = marshal_to_i64(builder, v);
+            }
+            let call = builder.ins().call_indirect(sig_ref, helper_ptr, &args);
+            let results: smallvec::SmallVec<[cranelift_codegen::ir::Value; 1]> =
+                builder.inst_results(call).iter().copied().collect();
+            builder.ins().return_(&results);
         }
-        let dispatch_call = builder.ins().call_indirect(sig_ref, helper_ptr, &args);
-        let results: smallvec::SmallVec<[cranelift_codegen::ir::Value; 1]> = builder
-            .inst_results(dispatch_call)
-            .iter()
-            .copied()
-            .collect();
-        builder.ins().return_(&results);
-    } else {
-        // No dispatch — discard the probe result and fall through.
-        builder.ins().jump(post_probe_block, &[]);
+        // No representable layout for this header — nothing to transfer to.
+        None => {
+            builder.ins().jump(post_probe_block, &[]);
+        }
     }
 
     builder.switch_to_block(post_probe_block);

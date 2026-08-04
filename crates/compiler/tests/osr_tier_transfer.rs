@@ -48,8 +48,8 @@ fn a_tier1_promotion_installs_an_osr_entry() {
     let mut backend = TieredBackend::new(config).expect("tiered backend");
     backend.compile_module(module).expect("tier-0 compile");
 
-    // The probe is only worth leaving on if an unarmed loop is cheap, so
-    // the bead's arm byte must stay clear until helpers actually exist.
+    // Back-edges load the helper slot directly, so it must read null while
+    // only tier-0 code exists or a loop would branch into nothing.
     let ids: Vec<u64> = osr::bead_registry()
         .read()
         .unwrap()
@@ -57,8 +57,8 @@ fn a_tier1_promotion_installs_an_osr_entry() {
         .copied()
         .collect();
     assert!(
-        ids.iter().all(|id| !osr::is_armed(*id)),
-        "no bead should be armed while only tier-0 code exists"
+        ids.iter().all(|id| osr::helper_for(*id, site).is_null()),
+        "no helper should be published while only tier-0 code exists"
     );
     backend
         .optimize_function(func_id, OptimizationTier::Standard)
@@ -79,14 +79,16 @@ fn a_tier1_promotion_installs_an_osr_entry() {
         "tier-1 promotion should install an OSR entry under site 0x{site:x}"
     );
     assert!(
-        ids.iter().any(|id| osr::is_armed(*id)),
-        "installing helpers should arm the bead so back-edges take the probe path"
+        ids.iter().any(|id| !osr::helper_for(*id, site).is_null()),
+        "installing helpers should publish one into the slot back-edges load"
     );
 }
 
-/// The probe's steady-state cost is what decides whether it can stay on, so
-/// pin the emitted shape: an inline load of the arm byte, and no call on
-/// the fall-through path.
+/// The probe's steady-state cost is what decides whether it can stay on.
+/// An unarmed back-edge must be a load of the helper slot and a branch —
+/// no call into the runtime, because a call that returns into the loop
+/// forces caller-saved registers to be treated as clobbered across the
+/// whole body.
 #[test]
 fn an_unarmed_probe_site_costs_a_load_not_a_call() {
     use zyntax_compiler::cranelift_backend::CraneliftBackend;
@@ -105,18 +107,24 @@ fn an_unarmed_probe_site_costs_a_load_not_a_call() {
 
     let (clif, _) = backend.take_captured_ir().expect("captured CLIF");
 
-    // CLIF prints callees positionally (`fn0 = u0:1 sig0`), so match on the
-    // instruction shape rather than the symbol name.
     assert!(
-        clif.contains("load.i8"),
-        "the arm check should be an inline byte load:\n{clif}"
+        clif.contains("load.i64"),
+        "the arm check should load the helper slot:\n{clif}"
     );
     assert!(
         !clif.contains("osr_sample_tick"),
         "the per-iteration tick call should be gone:\n{clif}"
     );
+    // The only call is the transfer itself, which returns rather than
+    // continuing, so `call` and `call_indirect` counts must match.
+    let calls = clif.matches("call ").count();
+    let indirect = clif.matches("call_indirect").count();
+    assert_eq!(
+        calls, 0,
+        "no direct call should remain in the loop:\n{clif}"
+    );
     assert!(
-        clif.contains("call_indirect"),
+        indirect >= 1,
         "an armed site should still dispatch to the helper:\n{clif}"
     );
 }

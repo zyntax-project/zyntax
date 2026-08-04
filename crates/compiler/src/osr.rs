@@ -46,7 +46,7 @@
 //! `bead_id` as a constant in the probe call.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use beadie::Bead;
@@ -116,53 +116,15 @@ pub fn register_bead(bead_id: u64, bead: Arc<Bead>) {
 /// Drop a previously-registered bead. No-op if absent.
 pub fn unregister_bead(bead_id: u64) {
     bead_registry().write().unwrap().remove(&bead_id);
-    arm_slots().write().unwrap().remove(&bead_id);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Arm slots
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One byte per bead, read directly by generated code at every back-edge:
-/// zero while the bead has no OSR entries, non-zero once it does.
-///
-/// The address is baked into tier-0 code as a constant, so it has to
-/// outlive every compile that embeds it — hence the boxed value, whose
-/// address is stable regardless of map rehashing.
-fn arm_slots() -> &'static RwLock<HashMap<u64, Box<AtomicU8>>> {
-    static SLOTS: OnceLock<RwLock<HashMap<u64, Box<AtomicU8>>>> = OnceLock::new();
-    SLOTS.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Address of `bead_id`'s arm slot, allocating it if this is the first
-/// call. Stable for as long as the bead is registered.
-pub fn arm_slot_addr(bead_id: u64) -> *const u8 {
-    let mut slots = arm_slots().write().unwrap();
-    let slot = slots
-        .entry(bead_id)
-        .or_insert_with(|| Box::new(AtomicU8::new(0)));
-    (&**slot) as *const AtomicU8 as *const u8
-}
-
-/// Mark `bead_id` as having OSR entries, so its back-edges start taking the
-/// probe path. Idempotent.
-pub fn arm_bead(bead_id: u64) {
-    let mut slots = arm_slots().write().unwrap();
-    slots
-        .entry(bead_id)
-        .or_insert_with(|| Box::new(AtomicU8::new(0)))
-        .store(1, Ordering::Release);
-}
-
-/// Whether `bead_id` is currently armed. Test-facing; generated code reads
-/// the byte directly.
-pub fn is_armed(bead_id: u64) -> bool {
-    arm_slots()
-        .read()
+    helper_slots()
+        .write()
         .unwrap()
-        .get(&bead_id)
-        .is_some_and(|s| s.load(Ordering::Acquire) != 0)
+        .retain(|(b, _), _| *b != bead_id);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper slots
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Allocate a fresh sequential `bead_id`. Call once per registered
 /// function; the value is stored alongside the function's metadata and
@@ -780,4 +742,47 @@ mod tests {
 /// position. Bit 31 distinguishes ours from a real source offset.
 pub fn probe_srcloc_tag(site_key: u64) -> u32 {
     0x8000_0000 | (site_key as u32 & 0x7FFF_FFFF)
+}
+
+/// One pointer per `(bead_id, site_key)`, holding the OSR helper for that
+/// site or null. Generated code loads it directly at the back-edge.
+///
+/// Storing the helper rather than a flag removes the runtime lookup from
+/// the loop: an armed site branches straight to the helper instead of
+/// calling `osr_probe` to find it, so the loop contains no call that
+/// returns to it.
+fn helper_slots() -> &'static RwLock<HashMap<(u64, u64), Box<AtomicU64>>> {
+    static SLOTS: OnceLock<RwLock<HashMap<(u64, u64), Box<AtomicU64>>>> = OnceLock::new();
+    SLOTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Address of the helper slot for `(bead_id, site_key)`, allocating it on
+/// first call. Stable for as long as the bead is registered.
+pub fn helper_slot_addr(bead_id: u64, site_key: u64) -> *const u8 {
+    let mut slots = helper_slots().write().unwrap();
+    let slot = slots
+        .entry((bead_id, site_key))
+        .or_insert_with(|| Box::new(AtomicU64::new(0)));
+    (&**slot) as *const AtomicU64 as *const u8
+}
+
+/// Publish `helper` for `(bead_id, site_key)`, so back-edges start
+/// transferring into it.
+pub fn publish_helper(bead_id: u64, site_key: u64, helper: *mut ()) {
+    let mut slots = helper_slots().write().unwrap();
+    slots
+        .entry((bead_id, site_key))
+        .or_insert_with(|| Box::new(AtomicU64::new(0)))
+        .store(helper as u64, Ordering::Release);
+}
+
+/// Helper currently published for `(bead_id, site_key)`, or null. Reads
+/// what generated code reads.
+pub fn helper_for(bead_id: u64, site_key: u64) -> *mut () {
+    helper_slots()
+        .read()
+        .unwrap()
+        .get(&(bead_id, site_key))
+        .map(|s| s.load(Ordering::Acquire) as *mut ())
+        .unwrap_or(std::ptr::null_mut())
 }

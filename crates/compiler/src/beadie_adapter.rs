@@ -114,10 +114,13 @@ impl JitBackend for ZyntaxCraneliftBackend {
                     .into_iter()
                     .map(|(site, code)| beadie::OsrEntry { site, code })
                     .collect();
+                // Publish each helper into the slot its back-edge loads,
+                // after the bead swap so a transfer never lands on a
+                // half-installed entry.
+                for e in &osr_entries {
+                    crate::osr::publish_helper(bead_id, e.site, e.code);
+                }
                 bead.swap_compiled_with_osr(entry, osr_entries);
-                // Arm only after the entries are visible, so a back-edge
-                // that observes the flag always finds a helper behind it.
-                crate::osr::arm_bead(bead_id);
                 Ok(std::ptr::null_mut())
             } else {
                 Ok(entry)
