@@ -8793,14 +8793,12 @@ fn emit_osr_back_edge_probe(
     builder.seal_block(dispatch_block);
     match helper_sig_ref {
         Some(sig_ref) => {
-            // Marshal live-ins into the helper's four i64 slots and hand
-            // the frame over; its result is this function's result.
-            let mut args: [cranelift_codegen::ir::Value; 4] = [
-                builder.ins().iconst(types::I64, 0),
-                builder.ins().iconst(types::I64, 0),
-                builder.ins().iconst(types::I64, 0),
-                builder.ins().iconst(types::I64, 0),
-            ];
+            // Marshal live-ins into the helper's slots and hand the frame
+            // over; its result is this function's result. Slots a loop does
+            // not use are zero-filled so every helper has the same shape.
+            let zero = builder.ins().iconst(types::I64, 0);
+            let mut args: Vec<cranelift_codegen::ir::Value> =
+                vec![zero; crate::osr::OSR_MAX_LIVE_INS];
             for (i, &v) in live_ins
                 .iter()
                 .take(crate::osr::OSR_MAX_LIVE_INS)

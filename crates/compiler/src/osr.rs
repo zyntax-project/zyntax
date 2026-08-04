@@ -57,10 +57,16 @@ use crate::hir::{HirFunction, HirId, HirTerminator, HirType};
 // Site-key encoding
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maximum number of live-ins a single OSR helper accepts. Loops with more
-/// live-ins than this are skipped at codegen time — the running tier-0 frame
-/// just runs the loop to completion.
-pub const OSR_MAX_LIVE_INS: usize = 4;
+/// Maximum number of live-ins a single OSR helper accepts. Loops carrying
+/// more are skipped at codegen time and the running tier-0 frame just
+/// finishes the loop itself.
+///
+/// Every helper takes this many slots whatever it needs, so the cost of
+/// raising it is arguments passed and ignored, not a wider frame per loop.
+/// Real loops routinely carry five to ten live-ins — the nbody kernel's
+/// headers need six, nine and ten — and at four every one of them was
+/// rejected, which left OSR unable to fire on anything but a toy.
+pub const OSR_MAX_LIVE_INS: usize = 16;
 
 /// Pack `(loop_header_block_index, live_in_count)` into a 64-bit site key.
 ///
