@@ -204,6 +204,34 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.use_mcjit
     }
 
+    /// Tag every defined function with the host's `target-cpu` and
+    /// `target-features`.
+    ///
+    /// A `TargetMachine` handed an explicit CPU applies it to the whole
+    /// module, but MCJIT constructs its own and would otherwise generate
+    /// for a generic CPU. Per-function attributes reach the same codegen
+    /// decisions, so the two install paths tune identically.
+    fn stamp_host_target_attributes(context: &'ctx Context, backend: &LLVMBackend<'ctx>) {
+        let cpu = TargetMachine::get_host_cpu_name();
+        let features = TargetMachine::get_host_cpu_features();
+        let cpu = cpu.to_str().unwrap_or("generic");
+        let features = features.to_str().unwrap_or("");
+
+        let cpu_attr = context.create_string_attribute("target-cpu", cpu);
+        let feat_attr = context.create_string_attribute("target-features", features);
+
+        let mut func = backend.module().get_first_function();
+        while let Some(f) = func {
+            // Declarations carry no body to generate, and attributing them
+            // would say something about host code we do not compile.
+            if f.count_basic_blocks() > 0 {
+                f.add_attribute(inkwell::attributes::AttributeLoc::Function, cpu_attr);
+                f.add_attribute(inkwell::attributes::AttributeLoc::Function, feat_attr);
+            }
+            func = f.get_next_function();
+        }
+    }
+
     /// Install `hir_module` through an in-process execution engine.
     ///
     /// Runtime symbols are bound with `add_global_mapping` — the direct
@@ -211,6 +239,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// The engine is retained because it owns the code pages.
     fn install_via_mcjit(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
         let (backend, _target_machine) = self.compile_module_to_ir(hir_module)?;
+
+        // The engine builds its own target machine and defaults to a
+        // generic CPU, where the object path tunes one from the host. Carry
+        // the host's CPU and features across as function attributes, which
+        // is what codegen consults per function.
+        Self::stamp_host_target_attributes(self.context, &backend);
 
         let engine = backend
             .module()
