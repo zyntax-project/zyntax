@@ -61,12 +61,12 @@ use crate::hir::{HirFunction, HirId, HirTerminator, HirType};
 /// more are skipped at codegen time and the running tier-0 frame just
 /// finishes the loop itself.
 ///
-/// Every helper takes this many slots whatever it needs, so the cost of
-/// raising it is arguments passed and ignored, not a wider frame per loop.
-/// Real loops routinely carry five to ten live-ins — the nbody kernel's
-/// headers need six, nine and ten — and at four every one of them was
-/// rejected, which left OSR unable to fire on anything but a toy.
-pub const OSR_MAX_LIVE_INS: usize = 16;
+/// They travel in a frame rather than registers, so the cost of a large
+/// one is stack bytes and a copy taken once when the transfer happens, not
+/// per iteration. Resuming at a deeply nested header legitimately needs
+/// many: nbody's headers range from three to ninety-nine, because
+/// everything computed before the resume point has to arrive with it.
+pub const OSR_MAX_LIVE_INS: usize = 128;
 
 /// Pack `(loop_header_block_index, live_in_count)` into a 64-bit site key.
 ///
@@ -378,6 +378,10 @@ pub enum OsrReject {
     /// conservative analysis can't enumerate (effects, atomics, trait
     /// method calls, etc.). Helper compile would mishandle it.
     UnsupportedInstruction,
+    /// A block in the resumed region can also be entered from outside it,
+    /// so a value it defines would be recomputed rather than taken from
+    /// the frame. Resuming there needs more than one entry point.
+    RegionHasExternalEntry,
 }
 
 /// Compute an [`OsrLayout`] for `header`, or report why it's rejected.
@@ -419,7 +423,11 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
     // Non-phi live-ins. Walk reachable blocks, collect uses minus
     // locally-defined-or-rematerializable values.
     let reachable = reachable_from(function, header);
-    let local_defs = locally_defined_in(function, &reachable);
+    // Only values defined in blocks the header dominates are guaranteed to
+    // have been computed by the time the resumed code reads them. Anything
+    // else — an enclosing loop's counter, say — must arrive in the frame.
+    let dominated: Vec<HirId> = blocks_dominated_by(function, header).into_iter().collect();
+    let local_defs = locally_defined_in(function, &dominated);
 
     let mut seen_extra: std::collections::HashSet<HirId> = live_ins.iter().copied().collect();
 
@@ -467,6 +475,26 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
     // slot. A type with no known size still has nowhere to live.
     if live_in_types.iter().any(|t| frame_size_of(t) == 0) {
         return Err(OsrReject::LiveInDoesntFit);
+    }
+
+    // A block other than the header that is also entered from outside the
+    // region would redefine, on entry, values the frame is supposed to
+    // supply — its phi takes an incoming edge the helper does not have.
+    // The enclosing loop's header is the usual case.
+    for &block_id in &reachable {
+        if block_id == header {
+            continue;
+        }
+        let Some(block) = function.blocks.get(&block_id) else {
+            continue;
+        };
+        if block
+            .predecessors
+            .iter()
+            .any(|p| !reachable.contains(p) && *p != header)
+        {
+            return Err(OsrReject::RegionHasExternalEntry);
+        }
     }
 
     let block_index = block_index_of(function, header).unwrap_or(u64::MAX);
@@ -922,4 +950,67 @@ impl OsrFrame {
             align: align as u32,
         }
     }
+}
+
+/// Blocks that `header` dominates — every path to them from the function
+/// entry passes through it.
+///
+/// A helper resumes at `header`, so only these are guaranteed to have run
+/// by the time their values are used. A block that is merely *reachable*
+/// from the header may also be reached without it — an enclosing loop's
+/// header is the common case — and anything it defines has to arrive as a
+/// live-in instead.
+pub fn blocks_dominated_by(
+    function: &HirFunction,
+    header: HirId,
+) -> std::collections::HashSet<HirId> {
+    let entry = match function.blocks.keys().next() {
+        Some(&id) => id,
+        None => return std::collections::HashSet::new(),
+    };
+    let all: Vec<HirId> = function.blocks.keys().copied().collect();
+
+    // Standard iterative dominators: everything dominates everything until
+    // the predecessors say otherwise.
+    let mut dom: HashMap<HirId, std::collections::HashSet<HirId>> = HashMap::new();
+    for &b in &all {
+        if b == entry {
+            dom.insert(b, std::collections::HashSet::from([entry]));
+        } else {
+            dom.insert(b, all.iter().copied().collect());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &all {
+            if b == entry {
+                continue;
+            }
+            let preds: Vec<HirId> = function
+                .blocks
+                .get(&b)
+                .map(|blk| blk.predecessors.clone())
+                .unwrap_or_default();
+            let mut next: Option<std::collections::HashSet<HirId>> = None;
+            for p in preds {
+                let Some(dp) = dom.get(&p) else { continue };
+                next = Some(match next {
+                    None => dp.clone(),
+                    Some(acc) => acc.intersection(dp).copied().collect(),
+                });
+            }
+            let mut next = next.unwrap_or_default();
+            next.insert(b);
+            if dom.get(&b) != Some(&next) {
+                dom.insert(b, next);
+                changed = true;
+            }
+        }
+    }
+
+    all.into_iter()
+        .filter(|b| dom.get(b).is_some_and(|d| d.contains(&header)))
+        .collect()
 }
