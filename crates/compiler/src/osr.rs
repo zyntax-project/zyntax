@@ -818,3 +818,85 @@ pub fn blocks_reachable_from(
     }
     seen
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frame layout
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Byte size of `ty` as laid out in an OSR frame.
+///
+/// Fields are placed at their natural alignment and the struct is padded to
+/// its own alignment, which is what both backends already assume of an
+/// in-memory aggregate. Frames are written by one backend and read by the
+/// other, so the two must agree byte for byte.
+pub fn frame_size_of(ty: &HirType) -> usize {
+    match ty {
+        HirType::Bool | HirType::I8 | HirType::U8 => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Struct(s) => {
+            let mut size = 0usize;
+            for field in &s.fields {
+                let a = frame_align_of(field);
+                size = size.div_ceil(a) * a;
+                size += frame_size_of(field);
+            }
+            let a = frame_align_of(ty);
+            size.div_ceil(a) * a
+        }
+        HirType::Array(elem, n) => frame_size_of(elem).saturating_mul(*n as usize),
+        HirType::Vector(elem, n) => frame_size_of(elem).saturating_mul(*n as usize),
+        _ => 8,
+    }
+}
+
+/// Alignment of `ty` in an OSR frame.
+pub fn frame_align_of(ty: &HirType) -> usize {
+    match ty {
+        HirType::Struct(s) => s.fields.iter().map(frame_align_of).max().unwrap_or(1),
+        HirType::Array(elem, _) => frame_align_of(elem),
+        HirType::Vector(elem, _) => frame_align_of(elem),
+        other => frame_size_of(other).min(16).max(1),
+    }
+}
+
+/// Where each live-in sits in the frame a back-edge hands to a helper.
+///
+/// Passing live-ins as arguments forced every one to fit a register, which
+/// ruled out aggregates — and the backends do not even agree on how to hold
+/// one: a multi-field struct is a pointer in Cranelift and a value in LLVM.
+/// A frame sidesteps both. The writer stores bytes, the reader loads them,
+/// and neither has to care how the other represents the value in registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsrFrame {
+    /// Byte offset of each live-in, parallel to `OsrLayout::live_ins`.
+    pub offsets: Vec<u32>,
+    /// Total frame size in bytes.
+    pub size: u32,
+    /// Alignment the frame must be allocated at.
+    pub align: u32,
+}
+
+impl OsrFrame {
+    /// Lay out `types` in order, each at its natural alignment.
+    pub fn for_types(types: &[HirType]) -> Self {
+        let mut offsets = Vec::with_capacity(types.len());
+        let mut cursor = 0usize;
+        let mut align = 1usize;
+        for ty in types {
+            let a = frame_align_of(ty);
+            align = align.max(a);
+            cursor = cursor.div_ceil(a) * a;
+            offsets.push(cursor as u32);
+            cursor += frame_size_of(ty);
+        }
+        let size = cursor.div_ceil(align.max(1)) * align.max(1);
+        Self {
+            offsets,
+            size: size as u32,
+            align: align as u32,
+        }
+    }
+}

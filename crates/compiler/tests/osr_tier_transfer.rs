@@ -373,3 +373,54 @@ fn the_osr_config_cog_controls_probe_emission() {
         );
     }
 }
+
+/// The frame both backends read and write must agree with the layout a
+/// C-style aggregate has in memory, since one writes it and the other
+/// reads it.
+#[test]
+fn the_osr_frame_lays_out_live_ins_at_natural_alignment() {
+    use zyntax_compiler::hir::{HirStructType, HirType};
+    use zyntax_compiler::osr::OsrFrame;
+    use zyntax_typed_ast::InternedString;
+
+    // nbody's Body: seven doubles, which is what forced this design — it
+    // cannot travel in a register.
+    let body = HirType::Struct(HirStructType {
+        name: Some(InternedString::new_global("Body")),
+        fields: vec![HirType::F64; 7],
+        packed: false,
+    });
+    assert_eq!(
+        zyntax_compiler::osr::frame_size_of(&body),
+        56,
+        "seven doubles occupy 56 bytes"
+    );
+    assert_eq!(zyntax_compiler::osr::frame_align_of(&body), 8);
+
+    // A mixed frame: each entry starts at its own alignment, and the frame
+    // is padded to the widest.
+    let frame = OsrFrame::for_types(&[
+        HirType::I32,
+        HirType::F64,
+        body.clone(),
+        HirType::I8,
+        HirType::I64,
+    ]);
+    assert_eq!(
+        frame.offsets,
+        vec![0, 8, 16, 72, 80],
+        "i32 at 0, f64 realigned to 8, Body at 16, i8 after it, i64 realigned"
+    );
+    assert_eq!(frame.align, 8);
+    assert_eq!(frame.size, 88, "padded to the frame's own alignment");
+
+    // A frame of one scalar is just that scalar.
+    let single = OsrFrame::for_types(&[HirType::I64]);
+    assert_eq!(single.offsets, vec![0]);
+    assert_eq!(single.size, 8);
+
+    // No live-ins is a valid, empty frame rather than an error.
+    let empty = OsrFrame::for_types(&[]);
+    assert_eq!(empty.size, 0);
+    assert!(empty.offsets.is_empty());
+}
