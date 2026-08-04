@@ -361,6 +361,13 @@ pub struct CraneliftBackend {
     /// [`Self::set_only_compile_reachable`] to shave the ~30-40 ms spent on
     /// prelude helpers that a benchmark kernel never calls.
     only_compile_reachable: Option<HashSet<HirId>>,
+    /// Code offsets of tier-0 probe sites from the most recent compile,
+    /// as `(site_key, offset_from_function_start)`. Recovered from the
+    /// source-location table, which is the only post-codegen mapping from
+    /// an instruction back to where it landed.
+    probe_sites: Vec<(u64, u32)>,
+    /// Byte length of the most recently emitted function body.
+    last_code_len: Option<usize>,
     /// Redefinition counter per function. Bumped each time an
     /// already-defined function is declared again so the new body gets a
     /// distinct symbol and the previous one stays resident.
@@ -489,6 +496,8 @@ impl CraneliftBackend {
             compile_osr_func_id: None,
             only_compile_reachable: None,
             compile_generation: HashMap::new(),
+            probe_sites: Vec::new(),
+            last_code_len: None,
         })
     }
 
@@ -508,6 +517,16 @@ impl CraneliftBackend {
                 (site, ptr as *mut ())
             })
             .collect()
+    }
+
+    /// Drain the probe-site offsets recorded by the last compile.
+    pub fn take_probe_sites(&mut self) -> Vec<(u64, u32)> {
+        std::mem::take(&mut self.probe_sites)
+    }
+
+    /// Byte length of the most recently emitted function body.
+    pub fn last_code_len(&self) -> Option<usize> {
+        self.last_code_len
     }
 
     /// Set the tier for subsequent `compile_function` calls. Read by OSR
@@ -1399,6 +1418,10 @@ impl CraneliftBackend {
             sig.clone(),
         );
 
+        // `(site_key, srcloc_tag)` for every probe emitted in this function;
+        // resolved to code offsets after `define_function` below.
+        let mut probe_site_tags: Vec<(u64, u32)> = Vec::new();
+
         {
             // ================================================================
             // MULTI-BLOCK CONTROL FLOW IMPLEMENTATION
@@ -1890,6 +1913,14 @@ impl CraneliftBackend {
                             )
                         };
 
+                    // Tag the probe's first instruction with a srcloc that
+                    // encodes which site it is. `get_srclocs_sorted` is the
+                    // only post-codegen mapping from an instruction back to
+                    // its code offset, and a patchable site needs that
+                    // offset. Bit 31 marks the tag as ours so it can't be
+                    // confused with a real source position.
+                    let tag = crate::osr::probe_srcloc_tag(site_key);
+                    builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(tag));
                     emit_osr_back_edge_probe(
                         &mut builder,
                         &mut self.module,
@@ -1899,6 +1930,8 @@ impl CraneliftBackend {
                         &live_in_clir,
                         return_clir,
                     );
+                    builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
+                    probe_site_tags.push((site_key, tag));
                 }
 
                 // Process all instructions in this block
@@ -5535,6 +5568,25 @@ impl CraneliftBackend {
                 signature: sig,
             };
             self.compiled_functions.insert(id, compiled_func);
+        }
+
+        // Resolve the tagged probe sites to code offsets. `MachSrcLoc.start`
+        // is relative to the start of the function, which is what a patcher
+        // needs once the JIT hands back the function's address.
+        self.probe_sites.clear();
+        self.last_code_len = None;
+        if let Some(cc) = self.codegen_context.compiled_code() {
+            self.last_code_len = Some(cc.buffer.data().len());
+            if !probe_site_tags.is_empty() {
+                for loc in cc.buffer.get_srclocs_sorted() {
+                    let bits = loc.loc.bits();
+                    if let Some((site_key, _)) =
+                        probe_site_tags.iter().find(|(_, tag)| *tag == bits)
+                    {
+                        self.probe_sites.push((*site_key, loc.start));
+                    }
+                }
+            }
         }
 
         // Verification capture: grab the native disassembly the just-completed

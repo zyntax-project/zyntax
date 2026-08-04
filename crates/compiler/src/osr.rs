@@ -771,3 +771,13 @@ mod tests {
         )));
     }
 }
+
+/// Source-location value used to mark a probe site so codegen can find
+/// where it landed.
+///
+/// `MachSrcLoc` is the only post-codegen mapping from an instruction back
+/// to a code offset, so probe emission borrows it as a tag rather than a
+/// position. Bit 31 distinguishes ours from a real source offset.
+pub fn probe_srcloc_tag(site_key: u64) -> u32 {
+    0x8000_0000 | (site_key as u32 & 0x7FFF_FFFF)
+}
