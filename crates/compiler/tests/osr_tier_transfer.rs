@@ -246,3 +246,92 @@ fn the_tier1_helper_completes_the_loop_it_inherits() {
         );
     }
 }
+
+/// Highest loop counter the mid-flight helper has been entered with, or -1
+/// if it has not run. It must be the maximum rather than the latest: once a
+/// helper is published every subsequent call transfers at i = 0, which would
+/// overwrite the mid-flight observation this test exists to make.
+static MIDFLIGHT_I: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Stands in for a tier-1 helper: records where the loop had got to, then
+/// finishes it the way the original would.
+extern "C" fn midflight_helper(i: i64, sum: i64, n: i64, _unused: i64) -> i32 {
+    MIDFLIGHT_I.fetch_max(i, std::sync::atomic::Ordering::AcqRel);
+    let mut s = sum as i32;
+    let mut k = i as i32;
+    while k < n as i32 {
+        s = s.wrapping_add(k);
+        k += 1;
+    }
+    s
+}
+
+/// A helper published while a loop is already running should be picked up
+/// on the next back-edge, not only on the next call.
+///
+/// Every other transfer test publishes before calling, which cannot
+/// distinguish "the back-edge observes the slot each iteration" from "the
+/// slot is read once on entry". Promotion happens on a broker thread while
+/// the frame is live, so this is the case that matters.
+#[test]
+fn a_helper_published_mid_flight_is_picked_up_by_the_running_loop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+
+    const BEAD: u64 = 0xD1F5;
+    let (function, header_id) = counted_loop();
+    let func_id = function.id;
+    let site = osr::osr_layout(&function, header_id)
+        .expect("counted loop should have an OSR layout")
+        .site_key();
+
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut backend = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    backend.set_compile_tier(0);
+    backend.set_compile_bead_id(BEAD);
+    backend
+        .compile_function(func_id, &function)
+        .expect("tier-0 compile");
+    backend.finalize_definitions().expect("finalize");
+    let tier0 = backend.get_function_ptr(func_id).expect("tier-0 pointer") as usize;
+
+    // Long enough that one call spans the publish below, so the transfer
+    // lands on a loop already in flight rather than on the next call.
+    const N: i32 = 400_000_000;
+    let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+    let baseline = f(N);
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_stop = std::sync::Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+        let mut results = Vec::new();
+        while !worker_stop.load(Ordering::Acquire) {
+            results.push(f(N));
+        }
+        results
+    });
+
+    // Publish while the worker is mid-loop, then let it run long enough to
+    // cross a back-edge and take the new path.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    osr::publish_helper(BEAD, site, midflight_helper as *mut ());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    stop.store(true, Ordering::Release);
+    let results = worker.join().expect("worker should not fault");
+
+    let observed = MIDFLIGHT_I.load(Ordering::Acquire);
+    assert!(
+        observed >= 0,
+        "the running loop should have reached the published helper"
+    );
+    assert!(
+        observed > 0 && observed < N as i64,
+        "the transfer should happen mid-loop, not at entry or after the \
+         bound; observed i = {observed}"
+    );
+    assert!(
+        results.iter().all(|r| *r == baseline),
+        "every run should agree with the un-transferred result {baseline}"
+    );
+}
