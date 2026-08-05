@@ -2042,6 +2042,7 @@ impl AstHostFunctions for TypedAstBuilder {
 
         let type_def = zyntax_typed_ast::type_registry::TypeDefinition {
             id: type_id,
+            module: None,
             name: name_interned,
             kind: zyntax_typed_ast::type_registry::TypeKind::Struct {
                 fields: field_defs.clone(),
@@ -2231,6 +2232,7 @@ impl AstHostFunctions for TypedAstBuilder {
 
         let type_def = zyntax_typed_ast::type_registry::TypeDefinition {
             id: type_id,
+            module: None,
             name: name_interned,
             kind: zyntax_typed_ast::type_registry::TypeKind::Abstract {
                 underlying_type: underlying_type.clone(),

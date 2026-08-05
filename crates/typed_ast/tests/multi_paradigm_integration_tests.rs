@@ -138,6 +138,7 @@ fn test_type_registry_integration() {
     // Register a custom type
     let custom_type_id = checker.register_type(TypeDefinition {
         id: TypeId::next(),
+        module: None,
         name: InternedString::from_symbol(
             string_interner::DefaultSymbol::try_from_usize(1).unwrap(),
         ),

@@ -962,6 +962,7 @@ fn eval_input(
 
                 let type_def = TypeDefinition {
                     id: *id,
+                    module: None,
                     name: class.name,
                     kind: TypeKind::Struct {
                         fields: field_defs.clone(),

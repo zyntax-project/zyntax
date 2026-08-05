@@ -885,6 +885,7 @@ pub(crate) fn process_extern_declarations_mut(
                 let type_id = TypeId::next();
                 let type_def = TypeDefinition {
                     id: type_id,
+                    module: None,
                     name: extern_struct.name,
                     kind: TypeKind::Atomic, // Extern types are atomic/opaque
                     type_params: vec![],
@@ -1003,6 +1004,7 @@ pub(crate) fn register_struct_declarations(
 
             let type_def = TypeDefinition {
                 id: type_id,
+                module: None,
                 name: class_decl.name,
                 kind: TypeKind::Struct {
                     fields: fields.clone(),
@@ -1103,6 +1105,7 @@ pub(crate) fn register_enum_declarations(
 
             let type_def = TypeDefinition {
                 id: type_id,
+                module: None,
                 name: enum_decl.name,
                 kind: TypeKind::Enum { variants },
                 type_params,

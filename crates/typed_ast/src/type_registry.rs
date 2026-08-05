@@ -609,6 +609,14 @@ pub enum TypeVarKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypeDefinition {
     pub id: TypeId,
+    /// Module this type was declared in.
+    ///
+    /// `None` marks a type that belongs to no module: a builtin, a type
+    /// registered before any module was in scope, and the placeholders a
+    /// parser creates for a name it has only seen referenced.
+    #[serde(default)]
+    pub module: Option<InternedString>,
+    /// Name as written, without the module qualifier.
     pub name: InternedString,
     pub kind: TypeKind,
     pub type_params: Vec<TypeParam>,
@@ -984,13 +992,26 @@ impl Default for TypeMetadata {
     }
 }
 
+/// A type's fully-qualified name: the module it was declared in, and its
+/// bare name. `None` for the module means the type belongs to no module.
+pub type QualifiedName = (Option<InternedString>, InternedString);
+
 /// The type registry that manages all registered types
 #[derive(Debug, Clone)]
 pub struct TypeRegistry {
     /// Distinguishes one registry from another in trace output.
     instance: u64,
     types: HashMap<TypeId, TypeDefinition>,
-    name_to_id: HashMap<InternedString, TypeId>,
+    name_to_id: HashMap<QualifiedName, TypeId>,
+    /// Every id ever registered under a bare name, in registration order.
+    /// Backs the last-resort tier of name resolution.
+    bare_names: HashMap<InternedString, Vec<TypeId>>,
+    /// Module whose declarations are being registered, and which
+    /// [`Self::get_type_by_name`] searches first.
+    current_module: Option<InternedString>,
+    /// Modules the current module imports, searched after it in the order
+    /// they were imported.
+    imported_modules: Vec<InternedString>,
     aliases: HashMap<InternedString, Type>,
 
     // Trait system
@@ -1013,6 +1034,9 @@ impl TypeRegistry {
             instance,
             types: HashMap::new(),
             name_to_id: HashMap::new(),
+            bare_names: HashMap::new(),
+            current_module: None,
+            imported_modules: Vec::new(),
             aliases: HashMap::new(),
             traits: HashMap::new(),
             trait_name_to_id: HashMap::new(),
@@ -1024,9 +1048,60 @@ impl TypeRegistry {
         }
     }
 
-    /// Register a new type definition
+    /// The module whose declarations this registry is currently recording.
+    pub fn current_module(&self) -> Option<InternedString> {
+        self.current_module
+    }
+
+    /// Record which module's declarations are being registered from here on.
+    ///
+    /// Every type registered afterwards that does not already name a module
+    /// is qualified with this one, and [`Self::get_type_by_name`] searches it
+    /// before anything else.
+    pub fn set_current_module(&mut self, module: Option<InternedString>) {
+        self.current_module = module;
+    }
+
+    /// Add a module to the import scope searched after the current module.
+    pub fn add_imported_module(&mut self, module: InternedString) {
+        if Some(module) != self.current_module && !self.imported_modules.contains(&module) {
+            self.imported_modules.push(module);
+        }
+    }
+
+    /// Modules in the import scope, in the order they were added.
+    pub fn imported_modules(&self) -> &[InternedString] {
+        &self.imported_modules
+    }
+
+    /// Whether a definition only stands in for a name that has been
+    /// referenced but not declared. Such an entry carries a name and
+    /// nothing else, so a real declaration always outranks it.
+    fn is_placeholder(def: &TypeDefinition) -> bool {
+        matches!(def.kind, TypeKind::Atomic) && def.fields.is_empty()
+    }
+
+    /// Register a new type definition.
+    ///
+    /// The definition is filed under its module-qualified name. A definition
+    /// that names no module takes the current module, so a parse registers
+    /// what it declares into the module being parsed.
     pub fn register_type(&mut self, type_def: TypeDefinition) -> TypeId {
+        let module = type_def.module.or(self.current_module);
+        self.register_type_in_module(module, type_def)
+    }
+
+    /// Register a type definition under an explicit module, whatever the
+    /// registry's current module is. Registering a module's declarations
+    /// into another module's registry goes through here.
+    pub fn register_type_in_module(
+        &mut self,
+        module: Option<InternedString>,
+        mut type_def: TypeDefinition,
+    ) -> TypeId {
         let id = type_def.id;
+        type_def.module = module;
+        let key = (module, type_def.name);
         // A name registered twice is worth seeing: the second definition
         // takes the name, and if it is a placeholder standing in for a type
         // that has not been declared yet, every reference resolved through
@@ -1036,25 +1111,49 @@ impl TypeRegistry {
             let watched = filter != "1"
                 && (filter == "*"
                     || type_def.name.resolve_global().as_deref() == Some(filter.as_str()));
-            if watched || self.name_to_id.contains_key(&type_def.name) {
+            if watched || self.name_to_id.contains_key(&key) {
                 eprintln!(
-                    "[type] reg#{} register {:?} id={id:?} kind={} (was {:?})",
+                    "[type] reg#{} register {:?}::{:?} id={id:?} kind={} (was {:?})",
                     self.instance,
+                    type_def.module.and_then(|m| m.resolve_global()),
                     type_def.name.resolve_global().unwrap_or_default(),
                     match &type_def.kind {
                         TypeKind::Struct { fields, .. } => format!("struct({})", fields.len()),
                         other => format!("{other:?}").chars().take(24).collect::<String>(),
                     },
-                    self.name_to_id.get(&type_def.name)
+                    self.name_to_id.get(&key)
                 );
             }
         }
-        self.name_to_id.insert(type_def.name, id);
+        self.bind_name(key, id, &type_def);
         self.types.insert(id, type_def);
         id
     }
 
-    /// Create and register a new atomic type (like int, bool, string)
+    /// Bind a qualified name to an id, declining to hand the name to a
+    /// placeholder while a definition with fields already holds it.
+    fn bind_name(&mut self, key: QualifiedName, id: TypeId, type_def: &TypeDefinition) {
+        let slot = self.bare_names.entry(key.1).or_default();
+        if !slot.contains(&id) {
+            slot.push(id);
+        }
+        let held_by_definition = self
+            .name_to_id
+            .get(&key)
+            .and_then(|held| self.types.get(held))
+            .is_some_and(|held| !held.fields.is_empty());
+        if !(Self::is_placeholder(type_def) && held_by_definition) {
+            self.name_to_id.insert(key, id);
+        }
+    }
+
+    /// Create and register a new atomic type (like int, bool, string).
+    ///
+    /// An atomic type carries a name and nothing else, which is also the
+    /// shape a parser gives a name it has only seen referenced. Both belong
+    /// to no module: a reference is not a declaration, and letting one claim
+    /// a module's namespace would shadow the declaration that module makes
+    /// under the same name.
     pub fn register_atomic_type(
         &mut self,
         name: InternedString,
@@ -1064,6 +1163,7 @@ impl TypeRegistry {
         let id = TypeId::next();
         let type_def = TypeDefinition {
             id,
+            module: None,
             name,
             kind: TypeKind::Atomic,
             type_params: vec![],
@@ -1074,7 +1174,7 @@ impl TypeRegistry {
             metadata,
             span,
         };
-        self.register_type(type_def)
+        self.register_type_in_module(None, type_def)
     }
 
     /// Create and register a new struct type
@@ -1091,6 +1191,7 @@ impl TypeRegistry {
         let id = TypeId::next();
         let type_def = TypeDefinition {
             id,
+            module: None,
             name,
             kind: TypeKind::Struct {
                 fields: fields.clone(),
@@ -1120,6 +1221,7 @@ impl TypeRegistry {
         let id = TypeId::next();
         let type_def = TypeDefinition {
             id,
+            module: None,
             name,
             kind: TypeKind::Enum {
                 variants: variants.clone(),
@@ -1187,27 +1289,25 @@ impl TypeRegistry {
         }
     }
 
-    /// Merge types, traits, and implementations from another TypeRegistry
+    /// Merge types, traits, and implementations from another TypeRegistry.
+    ///
+    /// Each incoming definition keeps the module it was declared in, so two
+    /// modules that spell a type name the same way stay distinct. The other
+    /// registry's module also joins this one's import scope.
     pub fn merge_from(&mut self, other: &TypeRegistry) {
-        // Merge type definitions.
-        //
-        // A name the imported module only ever referenced arrives as a
-        // placeholder with no fields. Letting one take a name this registry
-        // already has a definition for would resolve every later use to
-        // something fieldless — which is what happens when a module's
-        // generic parameter is spelled the same as a type declared here.
-        for (type_id, type_def) in &other.types {
-            let incoming_is_placeholder =
-                matches!(type_def.kind, TypeKind::Atomic) && type_def.fields.is_empty();
-            let existing_is_defined = self
-                .name_to_id
-                .get(&type_def.name)
-                .and_then(|id| self.types.get(id))
-                .is_some_and(|d| !d.fields.is_empty());
+        // Merge type definitions in a stable order so a name bound twice
+        // resolves the same way from run to run.
+        let mut incoming: Vec<(&TypeId, &TypeDefinition)> = other.types.iter().collect();
+        incoming.sort_by_key(|(id, _)| id.as_u32());
+        for (type_id, type_def) in incoming {
             self.types.insert(*type_id, type_def.clone());
-            if !(incoming_is_placeholder && existing_is_defined) {
-                self.name_to_id.insert(type_def.name, *type_id);
-            }
+            self.bind_name((type_def.module, type_def.name), *type_id, type_def);
+        }
+        if let Some(module) = other.current_module {
+            self.add_imported_module(module);
+        }
+        for module in &other.imported_modules {
+            self.add_imported_module(*module);
         }
 
         // Merge type aliases
@@ -1267,9 +1367,51 @@ impl TypeRegistry {
         }
     }
 
-    /// Look up a type by name
+    /// Look up a type by its module-qualified name.
+    pub fn get_type_in_module(
+        &self,
+        module: Option<InternedString>,
+        name: InternedString,
+    ) -> Option<&TypeDefinition> {
+        self.name_to_id
+            .get(&(module, name))
+            .and_then(|id| self.types.get(id))
+    }
+
+    /// Resolve a bare type name against the current scope.
+    ///
+    /// Searches the current module, then each imported module in import
+    /// order, then the unqualified names — builtins and the placeholders
+    /// standing in for names that were referenced but never declared. A
+    /// declaration is preferred to a placeholder at every tier, so a module
+    /// that merely mentions a name never outranks the module that declares
+    /// it. Names bound nowhere in scope fall back to any module that has
+    /// one, most recently registered first.
     pub fn get_type_by_name(&self, name: InternedString) -> Option<&TypeDefinition> {
-        self.name_to_id.get(&name).and_then(|id| self.types.get(id))
+        let scope = std::iter::once(self.current_module)
+            .chain(self.imported_modules.iter().map(|m| Some(*m)))
+            .chain(std::iter::once(None));
+
+        let mut placeholder = None;
+        for module in scope {
+            match self.get_type_in_module(module, name) {
+                Some(def) if !Self::is_placeholder(def) => return Some(def),
+                Some(def) => placeholder = placeholder.or(Some(def)),
+                None => {}
+            }
+        }
+
+        // Nothing in scope declares the name. Registries built without a
+        // module in scope — and modules merged from outside the import
+        // chain — still bind names, so fall back to whatever holds one.
+        let out_of_scope = self.bare_names.get(&name).into_iter().flatten().rev();
+        for def in out_of_scope.filter_map(|id| self.types.get(id)) {
+            if !Self::is_placeholder(def) {
+                return Some(def);
+            }
+            placeholder = placeholder.or(Some(def));
+        }
+        placeholder
     }
 
     /// Look up a type by ID
@@ -1455,8 +1597,8 @@ impl TypeRegistry {
 
     /// Create a Type::Named instance for a given type name
     pub fn make_type_by_name(&self, name: InternedString, type_args: Vec<Type>) -> Option<Type> {
-        self.name_to_id.get(&name).map(|&id| Type::Named {
-            id,
+        self.get_type_by_name(name).map(|def| Type::Named {
+            id: def.id,
             type_args,
             const_args: Vec::new(),
             variance: Vec::new(),
