@@ -115,16 +115,21 @@ fn an_unarmed_probe_site_costs_a_load_not_a_call() {
         !clif.contains("osr_sample_tick"),
         "the per-iteration tick call should be gone:\n{clif}"
     );
-    // The only call is the transfer itself, which returns rather than
-    // continuing, so `call` and `call_indirect` counts must match.
-    let calls = clif.matches("call ").count();
-    let indirect = clif.matches("call_indirect").count();
+    // Exactly one direct call, and it is the promotion request in the entry
+    // block — a function holding a resumable loop says so once per
+    // invocation. Anything else would mean a call inside the loop, which is
+    // what forces caller-saved registers to be treated as clobbered across
+    // the body.
+    let entry_end = clif.find("block1").unwrap_or(clif.len());
+    let calls_before_loop = clif[..entry_end].matches("call ").count();
+    let calls_total = clif.matches("call ").count();
     assert_eq!(
-        calls, 0,
-        "no direct call should remain in the loop:\n{clif}"
+        (calls_before_loop, calls_total),
+        (1, 1),
+        "the only direct call should be the entry-block promotion request:\n{clif}"
     );
     assert!(
-        indirect >= 1,
+        clif.matches("call_indirect").count() >= 1,
         "an armed site should still dispatch to the helper:\n{clif}"
     );
 }

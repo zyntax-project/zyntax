@@ -1670,6 +1670,25 @@ impl CraneliftBackend {
                 builder.seal_block(entry_block);
             }
 
+            // A tier-0 function with a resumable loop says so on entry, so a
+            // frame that never returns can still reach the tier worth
+            // transferring into. Promotion is otherwise driven by
+            // invocation count, which advances one tier per call. One call
+            // per invocation, not per iteration; the runtime dedups.
+            if osr_helper.is_none() && !osr_layouts.is_empty() {
+                let mut sig = self.module.make_signature();
+                sig.params.push(AbiParam::new(types::I64));
+                if let Ok(fid) = self.module.declare_function(
+                    crate::osr::OSR_REQUEST_SYMBOL,
+                    Linkage::Import,
+                    &sig,
+                ) {
+                    let f = self.module.declare_func_in_func(fid, builder.func);
+                    let bead_v = builder.ins().iconst(types::I64, osr_bead_id as i64);
+                    builder.ins().call(f, &[bead_v]);
+                }
+            }
+
             // Store block map for use in helper methods
             self.block_map = block_map.clone();
 

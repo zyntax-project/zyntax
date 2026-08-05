@@ -191,10 +191,11 @@ pub const OSR_PROBE_SYMBOL: &str = "__zyntax_osr_probe";
 /// `(name, function_pointer)` pairs to feed
 /// `CraneliftBackend::with_runtime_symbols` so JIT'd code can resolve
 /// the OSR runtime functions at link time.
-pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 2] {
+pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 3] {
     [
         (OSR_PROBE_SYMBOL, osr_probe as *const u8),
         (OSR_TRANSFER_SYMBOL, osr_transfer as *const u8),
+        (OSR_REQUEST_SYMBOL, osr_request_promotion as *const u8),
     ]
 }
 
@@ -1027,5 +1028,57 @@ pub extern "C" fn osr_transfer(site: u64) {
     *n += 1;
     if *n == 1 {
         eprintln!("[osr] FIRST TRANSFER at site 0x{site:x}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Promotion requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Symbol a tier-0 function with a resumable loop calls on entry.
+pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
+
+/// Installed by the runtime to queue a top-tier compile for a bead.
+type PromotionRequester = Box<dyn Fn(u64) + Send + Sync>;
+
+fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
+    static R: OnceLock<RwLock<Option<PromotionRequester>>> = OnceLock::new();
+    R.get_or_init(|| RwLock::new(None))
+}
+
+/// Register how a promotion request is fulfilled. The runtime owns the
+/// policy — whether to queue, and to which tier.
+pub fn set_promotion_requester(f: impl Fn(u64) + Send + Sync + 'static) {
+    *promotion_requester().write().unwrap() = Some(Box::new(f));
+}
+
+/// Beads that have already asked, so a function called repeatedly does not
+/// queue the same compile over and over.
+fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
+    static S: OnceLock<RwLock<std::collections::HashSet<u64>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Called on entry to a tier-0 function that has a resumable loop.
+///
+/// Promotion is otherwise driven by invocation count, which advances one
+/// tier per call — so a function entered once and left running can never
+/// climb to the tier worth transferring into. A loop is the evidence that
+/// the function may run long, and entry is where saying so costs one call
+/// rather than one per iteration.
+///
+/// # Safety
+/// Called from generated code with C ABI.
+#[no_mangle]
+pub extern "C" fn osr_request_promotion(bead_id: u64) {
+    if !requested().write().unwrap().insert(bead_id) {
+        return;
+    }
+    if osr_trace_enabled() {
+        eprintln!("[osr] promotion requested for bead={bead_id}");
+    }
+    let guard = promotion_requester().read().unwrap();
+    if let Some(f) = guard.as_ref() {
+        f(bead_id);
     }
 }

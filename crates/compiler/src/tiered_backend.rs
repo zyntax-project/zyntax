@@ -231,7 +231,9 @@ struct RuntimeSymbol {
 
 pub struct TieredBackend {
     /// Beadie's tiered adapter: owns broker threads + per-bead state.
-    adapter: TieredAdapter,
+    /// Shared so a promotion request raised from running JIT'd code can
+    /// submit a compile without reaching back into the backend.
+    adapter: Arc<TieredAdapter>,
 
     /// Cranelift backend, locked behind a `Mutex` and shared with worker
     /// threads via `Arc`.
@@ -281,7 +283,7 @@ impl TieredBackend {
             (None, None)
         };
 
-        let adapter = TieredAdapter::new(make_policies(&config));
+        let adapter = Arc::new(TieredAdapter::new(make_policies(&config)));
 
         Ok(Self {
             adapter,
@@ -362,6 +364,9 @@ impl TieredBackend {
             );
         }
 
+        // Every bead now exists, so the handler can capture them.
+        self.install_promotion_requester();
+
         Ok(())
     }
 
@@ -428,6 +433,69 @@ impl TieredBackend {
     }
 
     /// Force-recompile `func_id` at `target_tier`, bypassing thresholds.
+    /// Install the handler for a tier-0 function asking for the top tier
+    /// because it holds a resumable loop.
+    ///
+    /// It jumps straight there rather than one tier per call: a frame that
+    /// is still running cannot supply the extra invocations the ladder
+    /// needs, and the intermediate tier produces the same code as the one
+    /// it is already in. Called once every function is registered, since
+    /// the handler captures their beads.
+    fn install_promotion_requester(&self) {
+        // Aim at whichever tier actually differs from the one the frame is
+        // already in. Without LLVM the ladder emits the same code at every
+        // tier, so there is nothing above Standard worth reaching.
+        #[cfg(feature = "llvm-backend")]
+        let target = match self.config.tier2_backend {
+            Tier2Backend::LLVM => OptimizationTier::Optimized,
+            Tier2Backend::Cranelift => OptimizationTier::Standard,
+        };
+        #[cfg(not(feature = "llvm-backend"))]
+        let target = OptimizationTier::Standard;
+        let tier_idx = target.index();
+        let tier2_backend = self.config.tier2_backend;
+        let verbosity = self.config.verbosity;
+        let adapter = Arc::clone(&self.adapter);
+        let cranelift = Arc::clone(&self.cranelift);
+        #[cfg(feature = "llvm-backend")]
+        let llvm = self.llvm.as_ref().map(Arc::clone);
+
+        // bead id -> everything a compile needs, so the handler can run on
+        // the thread that raised the request without reaching for `self`.
+        let by_bead: HashMap<u64, (HirId, TieredBound, Arc<HirFunction>)> = self
+            .functions
+            .iter()
+            .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.function))))
+            .collect();
+
+        osr::set_promotion_requester(move |bead_id| {
+            let Some((func_id, bound, func_arc)) = by_bead.get(&bead_id) else {
+                return;
+            };
+            let func_arc = Arc::clone(func_arc);
+            let cranelift = Arc::clone(&cranelift);
+            #[cfg(feature = "llvm-backend")]
+            let llvm = llvm.clone();
+            let func_id = *func_id;
+            // The compile itself runs on a broker thread, so raising the
+            // request costs the running loop only the submission.
+            let _ = adapter.force_promote(bound, tier_idx, move |bead| {
+                compile_at_tier(
+                    tier_idx,
+                    bead,
+                    func_id,
+                    bead_id,
+                    &func_arc,
+                    &cranelift,
+                    #[cfg(feature = "llvm-backend")]
+                    llvm.as_ref(),
+                    tier2_backend,
+                    verbosity,
+                )
+            });
+        });
+    }
+
     pub fn optimize_function(
         &mut self,
         func_id: HirId,
