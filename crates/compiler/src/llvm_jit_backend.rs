@@ -317,7 +317,15 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                         }
                     };
                     match backend.compile_osr_helper(func, &layout) {
-                        Ok(name) => helper_names.push((*func_id, layout.site_key(), name)),
+                        Ok(name) => {
+                            if crate::osr::osr_trace_enabled() {
+                                eprintln!(
+                                    "[osr] {name}: phis={} live_ins={:?}",
+                                    layout.phi_count, layout.live_in_types
+                                );
+                            }
+                            helper_names.push((*func_id, layout.site_key(), name))
+                        }
                         // A header the helper shape cannot express just
                         // means no resume point for that loop.
                         Err(e) => {

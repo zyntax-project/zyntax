@@ -3694,6 +3694,63 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// Compile a function call
+    /// Box the arguments a registered signature marks dynamic.
+    ///
+    /// A runtime symbol taking dynamic values declares those parameters as
+    /// integer handles, so a raw scalar or pointer has to go through the
+    /// matching `zyntax_box_*` before it can be passed. Arguments the
+    /// signature does not mark travel unchanged.
+    fn box_dynamic_args(
+        &mut self,
+        sig: &crate::zrtl::ZrtlSymbolSig,
+        raw: &[BasicValueEnum<'ctx>],
+    ) -> Vec<BasicMetadataValueEnum<'ctx>> {
+        raw.iter()
+            .enumerate()
+            .map(|(i, &arg_val)| {
+                if !sig.param_is_dynamic(i) {
+                    return arg_val.into();
+                }
+                let func_name = if arg_val.is_int_value() {
+                    let int_ty = arg_val.into_int_value().get_type();
+                    if int_ty == self.context.i32_type() {
+                        "zyntax_box_i32"
+                    } else if int_ty == self.context.i8_type() {
+                        "zyntax_box_bool"
+                    } else {
+                        "zyntax_box_i64"
+                    }
+                } else if arg_val.is_float_value() {
+                    if arg_val.into_float_value().get_type() == self.context.f32_type() {
+                        "zyntax_box_f32"
+                    } else {
+                        "zyntax_box_f64"
+                    }
+                } else {
+                    "zyntax_box_ptr"
+                };
+
+                let box_fn_type = self
+                    .context
+                    .i64_type()
+                    .fn_type(&[arg_val.get_type().into()], false);
+                let box_fn = self
+                    .module
+                    .get_function(func_name)
+                    .unwrap_or_else(|| self.module.add_function(func_name, box_fn_type, None));
+
+                match self.builder.build_call(box_fn, &[arg_val.into()], "box") {
+                    Ok(call_site) => call_site
+                        .try_as_basic_value()
+                        .basic()
+                        .unwrap_or(arg_val)
+                        .into(),
+                    Err(_) => arg_val.into(),
+                }
+            })
+            .collect()
+    }
+
     /// `expects_value` is whether the HIR call binds a result. A void
     /// callee still has to yield something for the return type; when no
     /// result was asked for that stand-in is dropped, and when one was it
@@ -3712,14 +3769,61 @@ impl<'ctx> LLVMBackend<'ctx> {
                     CompilerError::CodeGen(format!("Function not found: {:?}", func_id))
                 })?;
 
-                // Compile arguments
-                let arg_values: Vec<BasicMetadataValueEnum> = args
+                // An extern declared from a runtime signature describes its
+                // dynamic parameters as integer handles, so the arguments
+                // need the same boxing the symbol path applies. Without it
+                // the call passes a raw pointer where the declaration says
+                // integer and the module fails to verify.
+                let function = *function;
+                let sig_info = self
+                    .symbol_signatures
+                    .get(function.get_name().to_string_lossy().as_ref())
+                    .cloned();
+                let raw_args: Vec<BasicValueEnum> = args
                     .iter()
-                    .map(|arg_id| self.get_value(*arg_id).map(|v| v.into()))
+                    .map(|arg_id| self.get_value(*arg_id))
                     .collect::<CompilerResult<Vec<_>>>()?;
+                let arg_values: Vec<BasicMetadataValueEnum> = match &sig_info {
+                    Some(sig) => self.box_dynamic_args(sig, &raw_args),
+                    // No signature to box against. A declaration can still
+                    // describe an address as an integer — the two are one
+                    // register class to Cranelift, so only LLVM sees the
+                    // difference — and the declared form is what the callee
+                    // reads.
+                    None => {
+                        let param_types = function.get_type().get_param_types();
+                        let mut out = Vec::with_capacity(raw_args.len());
+                        for (i, &raw) in raw_args.iter().enumerate() {
+                            let coerced: BasicValueEnum = match (param_types.get(i), raw.get_type())
+                            {
+                                (
+                                    Some(BasicMetadataTypeEnum::IntType(it)),
+                                    BasicTypeEnum::PointerType(_),
+                                ) => self
+                                    .builder
+                                    .build_ptr_to_int(
+                                        raw.into_pointer_value(),
+                                        *it,
+                                        "call_arg_p2i",
+                                    )?
+                                    .into(),
+                                (
+                                    Some(BasicMetadataTypeEnum::PointerType(pt)),
+                                    BasicTypeEnum::IntType(_),
+                                ) => self
+                                    .builder
+                                    .build_int_to_ptr(raw.into_int_value(), *pt, "call_arg_i2p")?
+                                    .into(),
+                                _ => raw,
+                            };
+                            out.push(coerced.into());
+                        }
+                        out
+                    }
+                };
 
                 // Build call
-                let call_site = self.builder.build_call(*function, &arg_values, "call")?;
+                let call_site = self.builder.build_call(function, &arg_values, "call")?;
 
                 // Mirror the callee's declared calling convention at
                 // the call site — LLVM's verifier rejects fastcc
