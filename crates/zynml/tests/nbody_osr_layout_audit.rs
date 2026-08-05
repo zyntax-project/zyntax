@@ -68,6 +68,43 @@ fn audit_nbody_osr_layouts() {
                 }
                 Err(reason) => {
                     println!("  header {idx} [{depth}]: {reason:?}");
+                    // Distinguish the coarse guard (a block in the region is
+                    // also entered from outside) from the conflict it exists
+                    // to prevent (a value the frame supplies is redefined by
+                    // a phi inside the region, so the seeded value would be
+                    // shadowed).
+                    let region = osr::blocks_reachable_from(func, header);
+                    println!(
+                        "      region via cached successors: {} blocks (function has {})",
+                        region.len(),
+                        func.blocks.len()
+                    );
+                    let dominated = osr::blocks_dominated_by(func, header);
+                    let mut external_entries = Vec::new();
+                    let mut shadowed = Vec::new();
+                    for b in &region {
+                        let Some(blk) = func.blocks.get(b) else {
+                            continue;
+                        };
+                        if *b != header
+                            && blk
+                                .predecessors
+                                .iter()
+                                .any(|p| !region.contains(p) && *p != header)
+                        {
+                            external_entries.push(*b);
+                        }
+                        if !dominated.contains(b) {
+                            for phi in &blk.phis {
+                                shadowed.push((*b, phi.result));
+                            }
+                        }
+                    }
+                    println!(
+                        "      blocks entered from outside: {}, phis outside the dominated set: {}",
+                        external_entries.len(),
+                        shadowed.len()
+                    );
                     // Show what the live-ins actually are so the rejection
                     // reason can be tied to a concrete type.
                     if let Some(block) = func.blocks.get(&header) {

@@ -842,17 +842,11 @@ pub fn blocks_reachable_from(
     function: &HirFunction,
     start: HirId,
 ) -> std::collections::HashSet<HirId> {
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![start];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Some(block) = function.blocks.get(&id) {
-            stack.extend(block.successors.iter().copied());
-        }
-    }
-    seen
+    // Walks terminators rather than `HirBlock::successors`. That cached
+    // field is not maintained by the passes that run before codegen — on
+    // optimized nbody it reports one successor for a ten-block function —
+    // so anything reading it sees almost no CFG at all.
+    reachable_from(function, start).into_iter().collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
