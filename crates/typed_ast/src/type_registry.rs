@@ -1003,9 +1003,6 @@ pub struct TypeRegistry {
     instance: u64,
     types: HashMap<TypeId, TypeDefinition>,
     name_to_id: HashMap<QualifiedName, TypeId>,
-    /// Every id ever registered under a bare name, in registration order.
-    /// Backs the last-resort tier of name resolution.
-    bare_names: HashMap<InternedString, Vec<TypeId>>,
     /// Module whose declarations are being registered, and which
     /// [`Self::get_type_by_name`] searches first.
     current_module: Option<InternedString>,
@@ -1034,7 +1031,6 @@ impl TypeRegistry {
             instance,
             types: HashMap::new(),
             name_to_id: HashMap::new(),
-            bare_names: HashMap::new(),
             current_module: None,
             imported_modules: Vec::new(),
             aliases: HashMap::new(),
@@ -1140,19 +1136,9 @@ impl TypeRegistry {
                 );
             }
         }
-        self.bind_name(key, id);
+        self.name_to_id.insert(key, id);
         self.types.insert(id, type_def);
         id
-    }
-
-    /// Bind a qualified name to an id, and record the id under the bare
-    /// name for the last-resort tier of resolution.
-    fn bind_name(&mut self, key: QualifiedName, id: TypeId) {
-        let slot = self.bare_names.entry(key.1).or_default();
-        if !slot.contains(&id) {
-            slot.push(id);
-        }
-        self.name_to_id.insert(key, id);
     }
 
     /// Create and register a new atomic type (like int, bool, string).
@@ -1309,7 +1295,8 @@ impl TypeRegistry {
         incoming.sort_by_key(|(id, _)| id.as_u32());
         for (type_id, type_def) in incoming {
             self.types.insert(*type_id, type_def.clone());
-            self.bind_name((type_def.module, type_def.name), *type_id);
+            self.name_to_id
+                .insert((type_def.module, type_def.name), *type_id);
         }
         if let Some(module) = other.current_module {
             self.add_imported_module(module);
@@ -1393,8 +1380,7 @@ impl TypeRegistry {
     /// standing in for names that were referenced but never declared. A
     /// declaration is preferred to a placeholder at every tier, so a module
     /// that merely mentions a name never outranks the module that declares
-    /// it. Names bound nowhere in scope fall back to any module that has
-    /// one, most recently registered first.
+    /// it.
     pub fn get_type_by_name(&self, name: InternedString) -> Option<&TypeDefinition> {
         let scope = std::iter::once(self.current_module)
             .chain(self.imported_modules.iter().map(|m| Some(*m)))
@@ -1407,17 +1393,6 @@ impl TypeRegistry {
                 Some(def) => placeholder = placeholder.or(Some(def)),
                 None => {}
             }
-        }
-
-        // Nothing in scope declares the name. Registries built without a
-        // module in scope — and modules merged from outside the import
-        // chain — still bind names, so fall back to whatever holds one.
-        let out_of_scope = self.bare_names.get(&name).into_iter().flatten().rev();
-        for def in out_of_scope.filter_map(|id| self.types.get(id)) {
-            if !Self::is_placeholder(def) {
-                return Some(def);
-            }
-            placeholder = placeholder.or(Some(def));
         }
         placeholder
     }

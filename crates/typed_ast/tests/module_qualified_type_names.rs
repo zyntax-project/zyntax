@@ -132,19 +132,3 @@ fn a_referenced_name_never_outranks_a_declared_one() {
     );
     assert_eq!(resolved.module, Some(InternedString::new_global("main")));
 }
-
-#[test]
-fn a_name_declared_only_out_of_scope_still_resolves() {
-    // Registries built without a module in scope, and modules merged
-    // outside the import chain, still bind names.
-    let mut importer = module_with_struct("main", "Vector", &["x"]);
-    let orphan = module_with_struct("elsewhere", "Point", &["a", "b", "c"]);
-    for def in orphan.get_all_types() {
-        importer.register_type(def.clone());
-    }
-
-    let resolved = importer
-        .get_type_by_name(InternedString::new_global("Point"))
-        .expect("`Point` should still be reachable");
-    assert_eq!(resolved.fields.len(), 3);
-}
