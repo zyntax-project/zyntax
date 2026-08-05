@@ -1909,7 +1909,13 @@ impl CraneliftBackend {
                 // representable, also emit the dispatch path: marshal
                 // phi results into i64 args, call_indirect the helper,
                 // return its result.
-                if osr_loop_headers.contains(hir_block_id) {
+                // A header with no representable layout can never have a
+                // helper, so a probe there would load a slot that stays null
+                // for the life of the program. Skip it rather than pay a
+                // load and a branch per iteration for a transfer that cannot
+                // happen.
+                if osr_loop_headers.contains(hir_block_id) && osr_layouts.contains_key(hir_block_id)
+                {
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
                     let empty_frame = crate::osr::OsrFrame::for_types(&[]);
