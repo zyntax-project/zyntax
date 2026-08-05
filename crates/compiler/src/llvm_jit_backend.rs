@@ -276,6 +276,13 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // waiting for the next call. Emitted before the engine is created,
         // since that consumes the module.
         let mut helper_names: Vec<(HirId, u64, String)> = Vec::new();
+        if crate::osr::osr_trace_enabled() {
+            eprintln!(
+                "[osr] llvm install tier={} functions={}",
+                self.compile_tier,
+                hir_module.functions.len()
+            );
+        }
         if self.compile_tier >= 1 {
             for (func_id, func) in hir_module.functions.iter() {
                 if func.is_external {

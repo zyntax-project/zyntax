@@ -470,6 +470,9 @@ impl TieredBackend {
 
         osr::set_promotion_requester(move |bead_id| {
             let Some((func_id, bound, func_arc)) = by_bead.get(&bead_id) else {
+                if osr::osr_trace_enabled() {
+                    eprintln!("[osr] request for unknown bead={bead_id}");
+                }
                 return;
             };
             let func_arc = Arc::clone(func_arc);
@@ -479,7 +482,7 @@ impl TieredBackend {
             let func_id = *func_id;
             // The compile itself runs on a broker thread, so raising the
             // request costs the running loop only the submission.
-            let _ = adapter.force_promote(bound, tier_idx, move |bead| {
+            let submitted = adapter.force_promote(bound, tier_idx, move |bead| {
                 compile_at_tier(
                     tier_idx,
                     bead,
@@ -493,6 +496,9 @@ impl TieredBackend {
                     verbosity,
                 )
             });
+            if osr::osr_trace_enabled() {
+                eprintln!("[osr] force_promote(bead={bead_id}, tier={tier_idx}) -> {submitted}");
+            }
         });
     }
 
@@ -719,7 +725,7 @@ pub fn compile_at_tier(
         bead_id,
     };
 
-    if verbosity >= 1 {
+    if verbosity >= 1 || crate::osr::osr_trace_enabled() {
         eprintln!(
             "[TieredBackend] Recompiling {:?} at tier {} ({:?})",
             func_id,
@@ -734,7 +740,11 @@ pub fn compile_at_tier(
             return match llvm.compile(bead, def) {
                 Ok(p) => p,
                 Err(e) => {
-                    if verbosity >= 1 {
+                    // A failure here means the function silently stays in
+                    // the tier below, which looks identical from the outside
+                    // to a tier that simply never fired. Say so.
+                    log::warn!("[TieredBackend] LLVM compile failed: {e}");
+                    if verbosity >= 1 || crate::osr::osr_trace_enabled() {
                         eprintln!("[TieredBackend] LLVM compile failed: {e}");
                     }
                     ptr::null_mut()
@@ -749,7 +759,8 @@ pub fn compile_at_tier(
     match cranelift.compile(bead, def) {
         Ok(p) => p,
         Err(e) => {
-            if verbosity >= 1 {
+            log::warn!("[TieredBackend] Cranelift compile failed: {e}");
+            if verbosity >= 1 || crate::osr::osr_trace_enabled() {
                 eprintln!("[TieredBackend] Cranelift compile failed: {e}");
             }
             ptr::null_mut()

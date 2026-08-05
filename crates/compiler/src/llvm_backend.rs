@@ -921,7 +921,7 @@ impl<'ctx> LLVMBackend<'ctx> {
         // a failure here means the emitted body is wrong rather than the
         // loop being unrepresentable. Report it and leave the function in
         // place: removing it would dangle whatever already refers to it.
-        if helper.verify(false) {
+        if helper.verify(crate::osr::osr_trace_enabled()) {
             Ok(name)
         } else {
             Err(CompilerError::CodeGen(format!(
