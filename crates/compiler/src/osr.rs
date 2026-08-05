@@ -468,6 +468,24 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
                 &mut live_in_types,
             );
         }
+        // A phi inside the region can name a value produced before it. The
+        // header's own phis are the exception: their incoming values are
+        // precisely what resuming replaces, and pulling them in would ask
+        // the frame for the entry values it exists to supersede.
+        if block_id != header {
+            for phi in &block.phis {
+                for (value_id, _) in &phi.incoming {
+                    consider_live_in(
+                        function,
+                        *value_id,
+                        &local_defs,
+                        &mut seen_extra,
+                        &mut live_ins,
+                        &mut live_in_types,
+                    );
+                }
+            }
+        }
     }
 
     if live_ins.len() > OSR_MAX_LIVE_INS {

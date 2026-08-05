@@ -33,11 +33,38 @@ use std::collections::HashSet;
 /// If the analysis cannot prove indirect-call targets are safe to prune, it
 /// returns the full set of function ids (conservative).
 pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashSet<HirId> {
+    let mut roots: Vec<HirId> = Vec::new();
+    for (id, function) in &module.functions {
+        if let Some(name) = function.name.resolve_global() {
+            if entry_names.iter().any(|e| *e == name) {
+                roots.push(*id);
+            }
+        }
+    }
+
+    // If no entry-point function is present (e.g. embedded / test scenarios
+    // where the host calls arbitrary user-defined functions via
+    // `call_function_raw`), there is no safe basis for pruning — fall back
+    // to compiling every function in the module.
+    if roots.is_empty() {
+        return all_function_ids(module);
+    }
+
+    reachable_from_roots(module, roots)
+}
+
+/// [`reachable_function_ids`] seeded from function ids rather than entry
+/// names.
+///
+/// Recompiling one function at a higher tier needs the same closure: its
+/// body alone is not self-contained, and anything it calls has to come
+/// along or the call dangles.
+pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<HirId> {
     // Walk: collect direct calls, FuncRef-style escapes, and detect any
     // indirect-call site. On indirect-call detection, fall back to "everything
     // reachable" (the full function-id set).
     let mut reachable: HashSet<HirId> = HashSet::new();
-    let mut worklist: Vec<HirId> = Vec::new();
+    let mut worklist: Vec<HirId> = roots;
     // Track every extern symbol name observed in a `HirCallable::Symbol`
     // call site so we can resolve them back to extern HirIds after the
     // walk and add only the externs actually referenced. Without this,
@@ -47,22 +74,6 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
     // (with RTLD_NOW) then pays to resolve, adding ~270 ms per install
     // on macOS.
     let mut called_extern_names: HashSet<String> = HashSet::new();
-    // Roots: entry-point function ids matched by name.
-    for (id, function) in &module.functions {
-        if let Some(name) = function.name.resolve_global() {
-            if entry_names.iter().any(|e| *e == name) {
-                worklist.push(*id);
-            }
-        }
-    }
-
-    // If no entry-point function is present (e.g. embedded / test scenarios
-    // where the host calls arbitrary user-defined functions via
-    // `call_function_raw`), there is no safe basis for pruning — fall back
-    // to compiling every function in the module.
-    if worklist.is_empty() {
-        return all_function_ids(module);
-    }
 
     // Function refs taken anywhere in the module (used to seed reachability
     // for FuncRef'd functions even if no direct call reaches them).

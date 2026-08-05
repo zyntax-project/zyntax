@@ -1,30 +1,36 @@
-//! # LLVM AOT-via-Object JIT Backend
+//! # LLVM JIT Backend
 //!
-//! This backend compiles HIR → LLVM IR, lowers to a position-
-//! independent object file, links it via the system linker into a
-//! shared object, and `dlopen`s the result. Function pointers are
-//! extracted with `dlsym`.
+//! Compiles HIR → LLVM IR and installs the result into the running
+//! process. Two installers are available, selected by `use_mcjit`.
 //!
-//! ## Why not MCJIT?
-//! The previous incarnation used `module.create_jit_execution_engine(...)`
-//! (LLVM MCJIT). MCJIT runs into MAP_JIT cross-thread invalidation
-//! issues on Apple Silicon, and on x86_64 its TargetMachine selection
-//! is conservative compared to a host-tuned AOT compile.
-//!
-//! ## Pipeline
+//! ## MCJIT (default)
 //!
 //! 1. **Lower**: HIR → LLVM IR (via `LLVMBackend`).
-//! 2. **Verify + optimise**: pre-pass `module.verify()`, then
-//!    `default<O3>` (or matching level), then post-pass `verify()`.
-//! 3. **Emit**: `TargetMachine::write_to_file(FileType::Object)` to a
+//! 2. **Stamp**: give each function the host's `target-cpu` and
+//!    `target-features`, which the engine does not infer on its own.
+//! 3. **Verify**: `module.verify()`.
+//! 4. **Install**: `create_jit_execution_engine`, binding runtime symbols
+//!    with `add_global_mapping` and reading back function addresses.
+//!
+//! Nothing outside the process is involved, so installation costs
+//! milliseconds and needs no toolchain on the machine running the code.
+//!
+//! ## Object-file fallback
+//!
+//! 1. **Lower**, then pre-pass `module.verify()`, `default<O3>` (or the
+//!    matching level), then post-pass `verify()`.
+//! 2. **Emit**: `TargetMachine::write_to_file(FileType::Object)` to a
 //!    tempfile. Reloc mode `PIC`, code model `Default`.
-//! 4. **Trampolines**: synthesise an assembly file defining each
-//!    runtime symbol as a real function whose body loads the host
-//!    pointer and tail-jumps. Replaces MCJIT's `add_global_mapping`.
-//! 5. **Link**: shell out to `cc`/`clang`/`gcc` with `-shared` (Linux)
-//!    or `-dynamiclib` (macOS). See [`crate::llvm_link::link_to_dylib`].
-//! 6. **Load**: `dlopen(RTLD_NOW | RTLD_GLOBAL)` and `dlsym` each
-//!    function symbol into `function_pointers`.
+//! 3. **Trampolines**: synthesise an assembly file defining each runtime
+//!    symbol as a real function whose body loads the host pointer and
+//!    tail-jumps — this path's stand-in for `add_global_mapping`.
+//! 4. **Link**: shell out to `cc`/`clang`/`gcc` with `-shared` (Linux) or
+//!    `-dynamiclib` (macOS). See [`crate::llvm_link::link_to_dylib`].
+//! 5. **Load**: `dlopen(RTLD_NOW | RTLD_GLOBAL)` and `dlsym` each function
+//!    symbol into `function_pointers`.
+//!
+//! This route needs a C toolchain present at run time, so it suits
+//! producing an artefact more than serving a process.
 //!
 //! ## vs AOT LLVM Backend
 //! - AOT (`llvm_backend.rs`): compile entire program to standalone exe.
@@ -79,6 +85,14 @@ static AOT_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub struct LLVMJitBackend<'ctx> {
     /// LLVM context reference.
     context: &'ctx Context,
+
+    /// The module a promotion recompiles out of.
+    ///
+    /// A tier-up hands over one function, but a function body is not
+    /// self-contained: anything it calls has to be compiled alongside it or
+    /// the call has nothing to bind to. Set once when the module is first
+    /// compiled; promotions read it back.
+    module_context: Option<std::sync::Arc<HirModule>>,
 
     /// Loaded shared object. Holding this `Library` keeps the mapped
     /// code pages alive — dropping it would munmap them and any held
@@ -154,6 +168,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
         Ok(Self {
             context,
+            module_context: None,
             loaded_lib: None,
             function_pointers: IndexMap::new(),
             opt_level,
@@ -576,9 +591,16 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // Pre-pass verification — catches HIR→LLVM lowering bugs
         // before the optimiser amplifies them.
         if let Err(msg) = backend.module().verify() {
+            let path = std::env::temp_dir().join("zyntax_llvm_ir_failed.ll");
+            let _ = std::fs::write(&path, backend.module().print_to_string().to_string());
+            let _ = std::fs::write(
+                std::env::temp_dir().join("zyntax_llvm_verify_msg.txt"),
+                msg.to_string(),
+            );
             return Err(CompilerError::Backend(format!(
-                "LLVM module verification failed (pre-opt): {}",
-                msg.to_string()
+                "LLVM module verification failed (pre-opt): {} (IR at {})",
+                msg.to_string(),
+                path.display()
             )));
         }
 
@@ -809,26 +831,67 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         Ok(())
     }
 
-    /// Compile a single function. Kept as a thin wrapper around
-    /// `compile_module` for source compatibility with the older
-    /// MCJIT-era API. The single-function shape is incorrect in
-    /// general (any call to another function in the original module
-    /// dangles) — callers should prefer `compile_module`.
+    /// The module a later promotion recompiles out of.
+    ///
+    /// Call this with the whole module before promoting any function from
+    /// it; see [`Self::module_context`].
+    pub fn set_module_context(&mut self, module: std::sync::Arc<HirModule>) {
+        self.module_context = Some(module);
+    }
+
+    /// Compile a single function, together with everything it calls.
+    ///
+    /// The callees come from the module context, so they are recompiled at
+    /// this tier rather than called across to another one — which also lets
+    /// the optimiser see through them. Without a context the function is
+    /// compiled alone, which only holds if it calls nothing in its module.
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         use std::collections::HashSet;
 
+        let mut functions: IndexMap<HirId, HirFunction> = IndexMap::new();
+        functions.insert(id, function.clone());
+        let mut globals = IndexMap::new();
+        let mut types = IndexMap::new();
+        let mut effects = IndexMap::new();
+        let mut handlers = IndexMap::new();
+        if let Some(ctx) = self.module_context.clone() {
+            for callee in crate::dce::reachable_from_roots(&ctx, vec![id]) {
+                if callee == id {
+                    continue;
+                }
+                if let Some(f) = ctx.functions.get(&callee) {
+                    functions.insert(callee, f.clone());
+                }
+            }
+            // Globals and type/effect tables are shared by whatever came
+            // along; carrying the module's wholesale is cheaper than
+            // tracing which of them each callee touches.
+            globals = ctx.globals.clone();
+            types = ctx.types.clone();
+            effects = ctx.effects.clone();
+            handlers = ctx.handlers.clone();
+        }
+
+        if crate::osr::osr_trace_enabled() {
+            eprintln!(
+                "[osr] promote {:?}: context={} closure={}",
+                id,
+                self.module_context.is_some(),
+                functions.len()
+            );
+        }
         let temp_module = HirModule {
             id: HirId::new(),
             name: function.name,
-            functions: [(id, function.clone())].iter().cloned().collect(),
-            globals: IndexMap::new(),
-            types: IndexMap::new(),
+            functions,
+            globals,
+            types,
             imports: Vec::new(),
             exports: Vec::new(),
             version: 0,
             dependencies: HashSet::new(),
-            effects: IndexMap::new(),
-            handlers: IndexMap::new(),
+            effects,
+            handlers,
         };
         self.compile_module(&temp_module)?;
         Ok(())

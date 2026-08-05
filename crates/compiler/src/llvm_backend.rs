@@ -727,12 +727,11 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// Emit an OSR helper for `header`: a standalone function that resumes
     /// `func` at that loop header instead of at its entry.
     ///
-    /// The signature is `(i64 x OSR_MAX_LIVE_INS) -> <func's return type>`,
-    /// matching what a tier-0 back-edge marshals, and the body is `func`'s
-    /// own blocks. A synthetic prologue recovers the live-ins from the
-    /// arguments and jumps to the header, so the header's phis take their
-    /// loop-entry values from the prologue rather than from the original
-    /// preheader.
+    /// The signature is `(ptr) -> <func's return type>`: the pointer is the
+    /// frame a tier-0 back-edge fills with the live-ins. A synthetic
+    /// prologue reads them back and jumps to the header, so the header's
+    /// phis take their loop-entry values from the prologue rather than from
+    /// the original preheader.
     ///
     /// Returns the helper's name; the caller resolves it to an address once
     /// the module is installed.
@@ -807,8 +806,10 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
-        // Only the loop is materialised: compiling the rest would redefine
-        // the values seeded from the arguments below.
+        // Everything reachable from the header is materialised — the loop
+        // and whatever follows it — so the helper runs to the function's
+        // own return. Blocks before the header are not: their values arrive
+        // in the frame instead, and recompiling them would redefine those.
         //
         // The prologue is created first so it becomes the entry block.
         let prologue = self.context.append_basic_block(helper, "osr_prologue");
@@ -1581,7 +1582,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 const_args: _,
                 is_tail,
             } => {
-                let result_val = self.compile_call(callee, args, *is_tail)?;
+                let result_val = self.compile_call(callee, args, *is_tail, result.is_some())?;
                 if let Some(res_id) = result {
                     self.value_map.insert(*res_id, result_val);
                 }
@@ -3693,11 +3694,16 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// Compile a function call
+    /// `expects_value` is whether the HIR call binds a result. A void
+    /// callee still has to yield something for the return type; when no
+    /// result was asked for that stand-in is dropped, and when one was it
+    /// means the call site and the callee disagree.
     fn compile_call(
         &mut self,
         callee: &HirCallable,
         args: &[HirId],
         is_tail: bool,
+        expects_value: bool,
     ) -> CompilerResult<BasicValueEnum<'ctx>> {
         match callee {
             HirCallable::Function(func_id) => {
@@ -3738,9 +3744,13 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Return value (or void)
                 match call_site.try_as_basic_value() {
                     ValueKind::Basic(val) => Ok(val),
-                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen(
-                        "Function call returned void when value expected".to_string(),
-                    )),
+                    ValueKind::Instruction(_) if !expects_value => {
+                        Ok(self.context.i32_type().get_undef().into())
+                    }
+                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen(format!(
+                        "call to {} returns void but its result is bound",
+                        function.get_name().to_string_lossy()
+                    ))),
                 }
             }
             HirCallable::Indirect(func_ptr_id) => {
@@ -3847,8 +3857,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Return value (or void)
                 match call_site.try_as_basic_value() {
                     ValueKind::Basic(val) => Ok(val),
+                    ValueKind::Instruction(_) if !expects_value => {
+                        Ok(self.context.i32_type().get_undef().into())
+                    }
                     ValueKind::Instruction(_) => Err(CompilerError::CodeGen(
-                        "Function call returned void when value expected".to_string(),
+                        "indirect call returns void but its result is bound".to_string(),
                     )),
                 }
             }

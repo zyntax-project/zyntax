@@ -337,6 +337,15 @@ impl TieredBackend {
 
         self.cranelift.with_lock(|be| be.compile_module(&module))?;
 
+        // Hand the LLVM tier the whole module before anything promotes out
+        // of it: a promotion recompiles one function, and that function's
+        // callees have to come with it.
+        #[cfg(feature = "llvm-backend")]
+        if let Some(llvm) = &self.llvm {
+            let shared = Arc::new(module.clone());
+            llvm.with_lock(|be| be.set_module_context(Arc::clone(&shared)));
+        }
+
         for (func_id, function) in module.functions.iter() {
             let bound = self.adapter.register(ptr::null_mut(), None);
 
