@@ -1062,6 +1062,21 @@ impl TypeRegistry {
         self.current_module = module;
     }
 
+    /// Run `f` with `module` as the current module, then restore the
+    /// previous one. Registering another module's declarations into this
+    /// registry goes through here so they keep that module's name.
+    pub fn with_module<R>(
+        &mut self,
+        module: Option<InternedString>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.current_module;
+        self.current_module = module;
+        let result = f(self);
+        self.current_module = previous;
+        result
+    }
+
     /// Add a module to the import scope searched after the current module.
     pub fn add_imported_module(&mut self, module: InternedString) {
         if Some(module) != self.current_module && !self.imported_modules.contains(&module) {
@@ -1125,26 +1140,19 @@ impl TypeRegistry {
                 );
             }
         }
-        self.bind_name(key, id, &type_def);
+        self.bind_name(key, id);
         self.types.insert(id, type_def);
         id
     }
 
-    /// Bind a qualified name to an id, declining to hand the name to a
-    /// placeholder while a definition with fields already holds it.
-    fn bind_name(&mut self, key: QualifiedName, id: TypeId, type_def: &TypeDefinition) {
+    /// Bind a qualified name to an id, and record the id under the bare
+    /// name for the last-resort tier of resolution.
+    fn bind_name(&mut self, key: QualifiedName, id: TypeId) {
         let slot = self.bare_names.entry(key.1).or_default();
         if !slot.contains(&id) {
             slot.push(id);
         }
-        let held_by_definition = self
-            .name_to_id
-            .get(&key)
-            .and_then(|held| self.types.get(held))
-            .is_some_and(|held| !held.fields.is_empty());
-        if !(Self::is_placeholder(type_def) && held_by_definition) {
-            self.name_to_id.insert(key, id);
-        }
+        self.name_to_id.insert(key, id);
     }
 
     /// Create and register a new atomic type (like int, bool, string).
@@ -1301,7 +1309,7 @@ impl TypeRegistry {
         incoming.sort_by_key(|(id, _)| id.as_u32());
         for (type_id, type_def) in incoming {
             self.types.insert(*type_id, type_def.clone());
-            self.bind_name((type_def.module, type_def.name), *type_id, type_def);
+            self.bind_name((type_def.module, type_def.name), *type_id);
         }
         if let Some(module) = other.current_module {
             self.add_imported_module(module);
