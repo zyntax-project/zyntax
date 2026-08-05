@@ -1025,16 +1025,21 @@ impl TypeRegistry {
         // A name registered twice is worth seeing: the second definition
         // takes the name, and if it is a placeholder standing in for a type
         // that has not been declared yet, every reference resolved through
-        // it loses the real definition's fields.
-        if std::env::var_os("ZYNML_TYPE_TRACE").is_some() {
-            if let Some(previous) = self.name_to_id.get(&type_def.name) {
+        // it loses the real definition's fields. Set the variable to a type
+        // name to follow every registration under it instead.
+        if let Ok(filter) = std::env::var("ZYNML_TYPE_TRACE") {
+            let watched = filter != "1"
+                && (filter == "*"
+                    || type_def.name.resolve_global().as_deref() == Some(filter.as_str()));
+            if watched || self.name_to_id.contains_key(&type_def.name) {
                 eprintln!(
-                    "[type] re-register {:?} id={id:?} kind={} (was {previous:?})",
+                    "[type] register {:?} id={id:?} kind={} (was {:?})",
                     type_def.name.resolve_global().unwrap_or_default(),
                     match &type_def.kind {
                         TypeKind::Struct { fields, .. } => format!("struct({})", fields.len()),
                         other => format!("{other:?}").chars().take(24).collect::<String>(),
                     },
+                    self.name_to_id.get(&type_def.name)
                 );
             }
         }
