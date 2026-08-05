@@ -8816,6 +8816,19 @@ fn emit_osr_back_edge_probe(
             // Write each live-in into the frame at its offset, then hand
             // the frame's address over; the helper's result is this
             // function's result.
+            // Trace hook: the dispatch path runs exactly once per transfer,
+            // which is the only place one can be observed outside a test.
+            if crate::osr::osr_trace_enabled() {
+                let mut sig = module.make_signature();
+                sig.params.push(AbiParam::new(types::I64));
+                if let Ok(id) =
+                    module.declare_function(crate::osr::OSR_TRANSFER_SYMBOL, Linkage::Import, &sig)
+                {
+                    let f = module.declare_func_in_func(id, builder.func);
+                    let site_v = builder.ins().iconst(types::I64, site_key as i64);
+                    builder.ins().call(f, &[site_v]);
+                }
+            }
             let frame_addr =
                 emit_osr_frame_store(builder, target_config, frame, live_ins, live_in_types);
             let call = builder

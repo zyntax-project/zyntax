@@ -3299,15 +3299,11 @@ impl TieredRuntime {
     pub fn new(config: TieredConfig) -> RuntimeResult<Self> {
         let mut backend = TieredBackend::new(config.clone())?;
 
-        // OSR back-edge probes fire on every loop header but the
-        // tier-up consumer side is not wired on this path. Until it
-        // is, they are pure overhead — disable them so the production
-        // tier matches the interp-jit path (see interp_runtime.rs).
-        // Mirrors the gate in `compile_module`; applied at construction
-        // so consumers that reach the backend through other entry
-        // points (e.g. plugin loading before any `compile_module`
-        // call) also avoid the tax.
-        backend.set_emit_osr_probes(false);
+        // Tier-0 loops carry a back-edge probe so a frame already running
+        // them can transfer into tier-1 code. Applied at construction so
+        // consumers reaching the backend through other entry points get the
+        // same setting.
+        backend.set_emit_osr_probes(config.enable_osr);
 
         Ok(Self {
             backend,
@@ -3385,11 +3381,7 @@ impl TieredRuntime {
             }
         }
 
-        // OSR back-edge probes fire on every loop header but the
-        // tier-up consumer side is not wired on this path. Until it
-        // is, they are pure overhead — disable them so the production
-        // tier matches the interp-jit path (see interp_runtime.rs).
-        self.backend.set_emit_osr_probes(false);
+        self.backend.set_emit_osr_probes(self.config.enable_osr);
 
         // Compile the module (consumes it)
         self.backend.compile_module(module)?;

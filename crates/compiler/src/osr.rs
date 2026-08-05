@@ -179,7 +179,7 @@ pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
     }
 }
 
-fn osr_trace_enabled() -> bool {
+pub fn osr_trace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("ZYNML_OSR_TRACE").is_some())
 }
@@ -191,8 +191,11 @@ pub const OSR_PROBE_SYMBOL: &str = "__zyntax_osr_probe";
 /// `(name, function_pointer)` pairs to feed
 /// `CraneliftBackend::with_runtime_symbols` so JIT'd code can resolve
 /// the OSR runtime functions at link time.
-pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 1] {
-    [(OSR_PROBE_SYMBOL, osr_probe as *const u8)]
+pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 2] {
+    [
+        (OSR_PROBE_SYMBOL, osr_probe as *const u8),
+        (OSR_TRANSFER_SYMBOL, osr_transfer as *const u8),
+    ]
 }
 
 /// Backwards-compatible alias for callers that only care about the probe.
@@ -1007,4 +1010,22 @@ pub fn blocks_dominated_by(
     all.into_iter()
         .filter(|b| dom.get(b).is_some_and(|d| d.contains(&header)))
         .collect()
+}
+
+/// Symbol the dispatch path calls once per transfer when tracing is on.
+pub const OSR_TRANSFER_SYMBOL: &str = "__zyntax_osr_transfer";
+
+/// Counts transfers per site. Generated code calls this from the dispatch
+/// path, which runs exactly when a frame moves into a helper — the one
+/// place a transfer can be observed from outside a test.
+#[no_mangle]
+pub extern "C" fn osr_transfer(site: u64) {
+    static COUNTS: OnceLock<RwLock<HashMap<u64, u64>>> = OnceLock::new();
+    let counts = COUNTS.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut guard = counts.write().unwrap();
+    let n = guard.entry(site).or_insert(0);
+    *n += 1;
+    if *n == 1 {
+        eprintln!("[osr] FIRST TRANSFER at site 0x{site:x}");
+    }
 }

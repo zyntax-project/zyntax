@@ -320,6 +320,19 @@ impl TieredBackend {
             }
         })?;
 
+        // Bead ids have to exist before codegen, not after: a tier-0 probe
+        // bakes its function's id into the address of the slot it loads, so
+        // allocating them afterwards left every probe reading slot zero
+        // while helpers published under the real ids — the transfer could
+        // never happen.
+        let bead_ids: HashMap<HirId, u64> = module
+            .functions
+            .keys()
+            .map(|id| (*id, osr::next_bead_id()))
+            .collect();
+        self.cranelift
+            .with_lock(|be| be.set_bead_ids(bead_ids.clone()));
+
         self.cranelift.with_lock(|be| be.compile_module(&module))?;
 
         for (func_id, function) in module.functions.iter() {
@@ -333,7 +346,10 @@ impl TieredBackend {
 
             // Allocate a stable id and publish the bead in the OSR
             // registry so JIT'd probes can find it.
-            let bead_id = osr::next_bead_id();
+            let bead_id = bead_ids
+                .get(func_id)
+                .copied()
+                .unwrap_or_else(osr::next_bead_id);
             osr::register_bead(bead_id, Arc::clone(bound.bead()));
 
             self.functions.insert(
