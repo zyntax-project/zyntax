@@ -342,7 +342,14 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         }
 
         for (func_id, site, name) in helper_names {
-            if let Ok(addr) = engine.get_function_address(&name) {
+            let resolved = engine.get_function_address(&name);
+            if crate::osr::osr_trace_enabled() {
+                eprintln!(
+                    "[osr] llvm helper {name} site={site:#x} -> {:?}",
+                    resolved.as_ref().ok().map(|a| *a as usize)
+                );
+            }
+            if let Ok(addr) = resolved {
                 self.pending_osr_helpers
                     .push((func_id, site, addr as usize));
             }

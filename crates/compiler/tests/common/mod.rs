@@ -1,4 +1,8 @@
 //! Shared HIR fixtures for the tier / OSR integration tests.
+//!
+//! Every test binary that includes this module compiles all of it, so a
+//! fixture only some of them need still has to be allowed to go unused.
+#![allow(dead_code)]
 
 use indexmap::IndexMap;
 
@@ -7,6 +11,74 @@ use zyntax_compiler::hir::{
     HirParam, HirPhi, HirTerminator, HirType, HirValue, HirValueKind,
 };
 use zyntax_typed_ast::InternedString;
+
+/// [`counted_loop`] with an extra loop-carried aggregate, plus the header's
+/// `HirId`.
+///
+/// An aggregate is where the two backends stop agreeing about
+/// representation — one holds it as a pointer, the other as a value — so a
+/// live-in of this shape is what a helper's frame has to reconcile.
+pub fn aggregate_carrying_loop() -> (HirFunction, HirId) {
+    let (mut function, header_id) = counted_loop();
+
+    // The phi is declared as the aggregate, but every value feeding it is
+    // already a pointer to one, so the emitted phi takes the producers'
+    // pointer shape rather than the declared aggregate's.
+    let aggregate_ty = HirType::Array(Box::new(HirType::F64), 3);
+    let producer_ty = HirType::Ptr(Box::new(HirType::F64));
+
+    // Carried around the loop untouched: the header phi's only other input
+    // is itself, which is precisely the self-referential shape that has to
+    // agree with whatever the frame hands back.
+    let body_param = HirId::new();
+    let phi_body = HirId::new();
+    function.values.insert(
+        body_param,
+        HirValue {
+            id: body_param,
+            ty: producer_ty.clone(),
+            kind: HirValueKind::Parameter(1),
+            uses: Default::default(),
+            span: None,
+        },
+    );
+    function.values.insert(
+        phi_body,
+        HirValue {
+            id: phi_body,
+            ty: producer_ty.clone(),
+            kind: HirValueKind::Instruction,
+            uses: Default::default(),
+            span: None,
+        },
+    );
+
+    let entry_id = function.entry_block;
+    let body_id = function
+        .blocks
+        .get(&header_id)
+        .and_then(|b| b.successors.first().copied())
+        .expect("header should branch into a body");
+    function
+        .blocks
+        .get_mut(&header_id)
+        .expect("header exists")
+        .phis
+        .push(HirPhi {
+            result: phi_body,
+            ty: aggregate_ty.clone(),
+            incoming: vec![(body_param, entry_id), (phi_body, body_id)],
+        });
+
+    function.signature.params.push(HirParam {
+        id: body_param,
+        name: InternedString::new_global("body"),
+        ty: producer_ty,
+        attributes: Default::default(),
+    });
+
+    (function, header_id)
+}
 
 /// `fn count_to(n: i32) -> i32 { let mut sum = 0; for i in 0..n { sum += i } sum }`
 /// as hand-built HIR, plus the loop header's `HirId`.

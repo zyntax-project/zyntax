@@ -275,3 +275,40 @@ fn an_llvm_compile_lands_on_a_loop_running_in_another_thread() {
          the un-transferred result {baseline}"
     );
 }
+
+/// An aggregate is where the backends stop agreeing: one holds it as a
+/// pointer, the other as a value, and a header phi can want either — the
+/// declared type alone does not say which. Seeding one from the frame with
+/// the wrong shape produces a helper LLVM rejects, so this pins the emitted
+/// IR to whatever the phi it feeds actually asks for.
+#[test]
+fn a_helper_seeds_a_loop_carried_aggregate_with_the_shape_its_phi_wants() {
+    let (function, header_id) = common::aggregate_carrying_loop();
+    let layout = osr::osr_layout(&function, header_id)
+        .expect("an aggregate-carrying loop should still have an OSR layout");
+    assert!(
+        layout
+            .live_in_types
+            .iter()
+            .any(zyntax_compiler::osr::is_held_by_reference),
+        "fixture should carry a live-in the backends hold by reference"
+    );
+
+    let context = Context::create();
+    let mut backend = LLVMBackend::new(&context, "osr_aggregate_test");
+    // `compile_osr_helper` runs the verifier and reports a shape mismatch
+    // as an error rather than emitting IR that cannot be installed.
+    let name = backend
+        .compile_osr_helper(&function, &layout)
+        .expect("LLVM should emit a helper for an aggregate-carrying loop");
+
+    let helper = backend
+        .module()
+        .get_function(&name)
+        .expect("helper should be in the module");
+    assert!(
+        helper.verify(false),
+        "helper must verify:\n{}",
+        backend.module().print_to_string().to_string()
+    );
+}

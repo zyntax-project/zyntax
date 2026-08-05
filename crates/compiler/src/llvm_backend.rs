@@ -832,16 +832,15 @@ impl<'ctx> LLVMBackend<'ctx> {
             .into_pointer_value();
         let i8_ty = self.context.i8_type();
         let mut phi_seeds: Vec<(HirId, BasicValueEnum<'ctx>)> = Vec::new();
+        let mut phi_seed_slots: Vec<(HirId, inkwell::values::PointerValue<'ctx>, HirType)> =
+            Vec::new();
         for (i, hir_id) in layout.live_ins.iter().enumerate() {
             let Some(&offset) = layout.frame.offsets.get(i) else {
                 break;
             };
             let hir_ty = &layout.live_in_types[i];
             let target = self.translate_type(hir_ty)?;
-            // Byte-offset into the frame, then load the value out. An
-            // aggregate is loaded by value here even though the writing
-            // backend held it as a pointer — the frame is the agreed
-            // representation, not the register one.
+            // Byte-offset into the frame.
             let slot = unsafe {
                 self.builder
                     .build_in_bounds_gep(
@@ -852,13 +851,21 @@ impl<'ctx> LLVMBackend<'ctx> {
                     )
                     .map_err(|e| CompilerError::CodeGen(format!("OSR frame gep: {e}")))?
             };
-            let recovered = self
-                .builder
-                .build_load(target, slot, "osr_live_in")
-                .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?;
             if i < layout.phi_count {
-                phi_seeds.push((*hir_id, recovered));
+                // Deferred: the phi this seeds does not exist yet, and its
+                // type is what the load has to match.
+                phi_seed_slots.push((*hir_id, slot, hir_ty.clone()));
             } else {
+                // A value the backends hold by reference was written as the
+                // pointee's bytes, so the slot already is the pointer the
+                // body expects.
+                let recovered = if crate::osr::is_held_by_reference(hir_ty) {
+                    slot.into()
+                } else {
+                    self.builder
+                        .build_load(target, slot, "osr_live_in")
+                        .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
+                };
                 self.value_map.insert(*hir_id, recovered);
                 self.type_map.insert(*hir_id, hir_ty.clone());
             }
@@ -881,6 +888,33 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.builder.position_at_end(*llvm_block);
                 self.compile_block_with_terminator(block_id, hir_block, func)?;
             }
+        }
+
+        // Now that the header's phis exist, seed them from the frame. Their
+        // LLVM types are the ones the loads must match, and `translate_type`
+        // cannot stand in: the backends disagree over whether a multi-field
+        // struct travels as a value or as a pointer, and a single loop can
+        // carry both shapes.
+        if let Some(terminator) = prologue.get_terminator() {
+            self.builder.position_before(&terminator);
+        }
+        for (hir_id, slot, hir_ty) in &phi_seed_slots {
+            let Some(phi_value) = self.phi_map.get(hir_id).copied() else {
+                continue;
+            };
+            let want = phi_value.as_basic_value().get_type();
+            // Held by reference means the writer copied the pointee's bytes,
+            // so the slot is itself the pointer; load only where the phi
+            // wants the value.
+            let seed: BasicValueEnum<'ctx> =
+                if crate::osr::is_held_by_reference(hir_ty) && want.is_pointer_type() {
+                    (*slot).into()
+                } else {
+                    self.builder
+                        .build_load(want, *slot, "osr_live_in")
+                        .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
+                };
+            phi_seeds.push((*hir_id, seed));
         }
 
         // Wire the phis. Back-edges carry over unchanged, the header takes
