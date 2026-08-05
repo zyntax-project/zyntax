@@ -38,18 +38,36 @@ fn audit_nbody_osr_layouts() {
         }
         let name = func.name.resolve_global().unwrap_or_default();
         println!("\n=== {name} ({} blocks) ===", func.blocks.len());
+        // A header is outermost when no other header dominates it.
+        let dominated_by: Vec<(u64, bool)> = headers
+            .iter()
+            .map(|h| {
+                let idx = osr::block_index_of(func, *h).unwrap_or(u64::MAX);
+                let nested = headers
+                    .iter()
+                    .any(|other| other != h && osr::blocks_dominated_by(func, *other).contains(h));
+                (idx, nested)
+            })
+            .collect();
         for header in headers {
             let idx = osr::block_index_of(func, header).unwrap_or(u64::MAX);
+            let nested = dominated_by
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, n)| *n)
+                .unwrap_or(false);
+            let depth = if nested { "inner" } else { "OUTERMOST" };
             match osr::osr_layout(func, header) {
                 Ok(layout) => {
                     println!(
-                        "  header {idx}: OK — {} live-ins ({} phi)",
+                        "  header {idx} [{depth}]: OK — {} live-ins ({} phi), frame {} bytes",
                         layout.live_ins.len(),
-                        layout.phi_count
+                        layout.phi_count,
+                        layout.frame.size
                     );
                 }
                 Err(reason) => {
-                    println!("  header {idx}: {reason:?}");
+                    println!("  header {idx} [{depth}]: {reason:?}");
                     // Show what the live-ins actually are so the rejection
                     // reason can be tied to a concrete type.
                     if let Some(block) = func.blocks.get(&header) {
