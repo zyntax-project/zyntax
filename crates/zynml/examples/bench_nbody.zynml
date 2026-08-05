@@ -15,12 +15,7 @@ import prelude
 //   * `0.5 * 1e-6 * (v² · m - Σ pair-potential)` as the energy
 //     calculation, scaled by 1_000_000 and truncated.
 //
-// ZynML difference today: prelude's `sqrt` is a 12-iteration
-// Newton-Raphson rather than a hardware FSQRT, so a meaningful
-// chunk of the bench time is in `prelude::sqrt`. Wiring
-// `Intrinsic::Sqrt` from the Cranelift backend (already plumbed)
-// to the ZynML `sqrt` name is the natural follow-up — call sites
-// don't change.
+// `sqrt` lowers to the hardware square-root instruction.
 
 struct Body {
     x: f64,

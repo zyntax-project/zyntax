@@ -194,6 +194,7 @@ mod llvm_impl {
                 // for the next call. Only this function's own helpers are
                 // in play, so they all belong to this bead.
                 for (_, site, code) in backend.take_pending_osr_helpers() {
+                    crate::osr::note_llvm_helper(code as usize);
                     crate::osr::publish_helper(bead_id, site, code);
                 }
 

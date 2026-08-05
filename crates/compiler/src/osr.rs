@@ -1038,15 +1038,38 @@ pub const OSR_TRANSFER_SYMBOL: &str = "__zyntax_osr_transfer";
 /// path, which runs exactly when a frame moves into a helper — the one
 /// place a transfer can be observed from outside a test.
 #[no_mangle]
-pub extern "C" fn osr_transfer(site: u64) {
+pub extern "C" fn osr_transfer(site: u64, helper: u64) {
     static COUNTS: OnceLock<RwLock<HashMap<u64, u64>>> = OnceLock::new();
     let counts = COUNTS.get_or_init(|| RwLock::new(HashMap::new()));
     let mut guard = counts.write().unwrap();
     let n = guard.entry(site).or_insert(0);
     *n += 1;
     if *n == 1 {
-        eprintln!("[osr] FIRST TRANSFER at site 0x{site:x}");
+        let tier = if is_llvm_helper(helper as usize) {
+            "llvm"
+        } else {
+            "cranelift"
+        };
+        eprintln!("[osr] FIRST TRANSFER at site 0x{site:x} -> {helper:#x} ({tier})");
     }
+}
+
+fn llvm_helpers() -> &'static RwLock<std::collections::HashSet<usize>> {
+    static H: OnceLock<RwLock<std::collections::HashSet<usize>>> = OnceLock::new();
+    H.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Record that `addr` is a helper the LLVM tier produced.
+///
+/// A transfer only reports which tier it landed in if the address can be
+/// attributed, and the address is all the dispatch path has.
+pub fn note_llvm_helper(addr: usize) {
+    llvm_helpers().write().unwrap().insert(addr);
+}
+
+/// Whether `addr` was published by the LLVM tier.
+pub fn is_llvm_helper(addr: usize) -> bool {
+    llvm_helpers().read().unwrap().contains(&addr)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

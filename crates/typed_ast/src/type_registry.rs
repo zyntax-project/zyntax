@@ -1022,6 +1022,22 @@ impl TypeRegistry {
     /// Register a new type definition
     pub fn register_type(&mut self, type_def: TypeDefinition) -> TypeId {
         let id = type_def.id;
+        // A name registered twice is worth seeing: the second definition
+        // takes the name, and if it is a placeholder standing in for a type
+        // that has not been declared yet, every reference resolved through
+        // it loses the real definition's fields.
+        if std::env::var_os("ZYNML_TYPE_TRACE").is_some() {
+            if let Some(previous) = self.name_to_id.get(&type_def.name) {
+                eprintln!(
+                    "[type] re-register {:?} id={id:?} kind={} (was {previous:?})",
+                    type_def.name.resolve_global().unwrap_or_default(),
+                    match &type_def.kind {
+                        TypeKind::Struct { fields, .. } => format!("struct({})", fields.len()),
+                        other => format!("{other:?}").chars().take(24).collect::<String>(),
+                    },
+                );
+            }
+        }
         self.name_to_id.insert(type_def.name, id);
         self.types.insert(id, type_def);
         id

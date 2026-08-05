@@ -8840,12 +8840,13 @@ fn emit_osr_back_edge_probe(
             if crate::osr::osr_trace_enabled() {
                 let mut sig = module.make_signature();
                 sig.params.push(AbiParam::new(types::I64));
+                sig.params.push(AbiParam::new(types::I64));
                 if let Ok(id) =
                     module.declare_function(crate::osr::OSR_TRANSFER_SYMBOL, Linkage::Import, &sig)
                 {
                     let f = module.declare_func_in_func(id, builder.func);
                     let site_v = builder.ins().iconst(types::I64, site_key as i64);
-                    builder.ins().call(f, &[site_v]);
+                    builder.ins().call(f, &[site_v, helper_ptr]);
                 }
             }
             let frame_addr =

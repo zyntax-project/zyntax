@@ -10650,8 +10650,20 @@ impl SsaBuilder {
         }
 
         Err(crate::CompilerError::Analysis(format!(
-            "Field {:?} not found in type {:?}",
-            field_name, type_def.name
+            "Field '{}' not found in type '{}' (has: {})",
+            field_name
+                .resolve_global()
+                .unwrap_or_else(|| format!("{field_name:?}")),
+            type_def
+                .name
+                .resolve_global()
+                .unwrap_or_else(|| format!("{:?}", type_def.name)),
+            type_def
+                .fields
+                .iter()
+                .filter_map(|f| f.name.resolve_global())
+                .collect::<Vec<_>>()
+                .join(", ")
         )))
     }
 
