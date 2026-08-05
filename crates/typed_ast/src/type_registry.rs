@@ -987,6 +987,8 @@ impl Default for TypeMetadata {
 /// The type registry that manages all registered types
 #[derive(Debug, Clone)]
 pub struct TypeRegistry {
+    /// Distinguishes one registry from another in trace output.
+    instance: u64,
     types: HashMap<TypeId, TypeDefinition>,
     name_to_id: HashMap<InternedString, TypeId>,
     aliases: HashMap<InternedString, Type>,
@@ -1005,7 +1007,10 @@ pub struct TypeRegistry {
 
 impl TypeRegistry {
     pub fn new() -> Self {
+        static INSTANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let instance = INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
+            instance,
             types: HashMap::new(),
             name_to_id: HashMap::new(),
             aliases: HashMap::new(),
@@ -1033,7 +1038,8 @@ impl TypeRegistry {
                     || type_def.name.resolve_global().as_deref() == Some(filter.as_str()));
             if watched || self.name_to_id.contains_key(&type_def.name) {
                 eprintln!(
-                    "[type] register {:?} id={id:?} kind={} (was {:?})",
+                    "[type] reg#{} register {:?} id={id:?} kind={} (was {:?})",
+                    self.instance,
                     type_def.name.resolve_global().unwrap_or_default(),
                     match &type_def.kind {
                         TypeKind::Struct { fields, .. } => format!("struct({})", fields.len()),
@@ -1183,10 +1189,25 @@ impl TypeRegistry {
 
     /// Merge types, traits, and implementations from another TypeRegistry
     pub fn merge_from(&mut self, other: &TypeRegistry) {
-        // Merge type definitions
+        // Merge type definitions.
+        //
+        // A name the imported module only ever referenced arrives as a
+        // placeholder with no fields. Letting one take a name this registry
+        // already has a definition for would resolve every later use to
+        // something fieldless — which is what happens when a module's
+        // generic parameter is spelled the same as a type declared here.
         for (type_id, type_def) in &other.types {
+            let incoming_is_placeholder =
+                matches!(type_def.kind, TypeKind::Atomic) && type_def.fields.is_empty();
+            let existing_is_defined = self
+                .name_to_id
+                .get(&type_def.name)
+                .and_then(|id| self.types.get(id))
+                .is_some_and(|d| !d.fields.is_empty());
             self.types.insert(*type_id, type_def.clone());
-            self.name_to_id.insert(type_def.name, *type_id);
+            if !(incoming_is_placeholder && existing_is_defined) {
+                self.name_to_id.insert(type_def.name, *type_id);
+            }
         }
 
         // Merge type aliases
