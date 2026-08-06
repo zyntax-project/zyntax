@@ -358,6 +358,33 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
+        // Whatever is still undefined resolves from the process, the same
+        // way the ground tier's JIT does — `malloc` and the compiler's own
+        // runtime externs are found this way, not through registration. A
+        // name neither registered nor found must fail the compile here:
+        // the engine would otherwise bind it to null and the compiled code
+        // would call it.
+        let mut f = backend.module().get_first_function();
+        while let Some(func) = f {
+            let next = func.get_next_function();
+            if func.count_basic_blocks() == 0 {
+                let name = func.get_name().to_string_lossy().to_string();
+                if !name.starts_with("llvm.") && !self.runtime_symbols.contains_key(&name) {
+                    let c_name = std::ffi::CString::new(name.clone()).map_err(|_| {
+                        CompilerError::Backend(format!("symbol name {name:?} contains NUL"))
+                    })?;
+                    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) as usize };
+                    if addr == 0 {
+                        return Err(CompilerError::Backend(format!(
+                            "unresolved symbol {name} in MCJIT install"
+                        )));
+                    }
+                    engine.add_global_mapping(&func, addr);
+                }
+            }
+            f = next;
+        }
+
         for (hir_id, name) in self.get_function_symbols(hir_module) {
             if let Ok(addr) = engine.get_function_address(&name) {
                 self.function_pointers.insert(hir_id, addr as usize);

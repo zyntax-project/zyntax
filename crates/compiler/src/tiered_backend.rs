@@ -616,6 +616,14 @@ impl TieredBackend {
         });
         self.cranelift
             .with_lock(|be| be.register_runtime_symbol(name, ptr));
+        // The LLVM tier binds externals with `add_global_mapping`, and a
+        // declaration it has no mapping for resolves to null — which a
+        // promoted function then calls. Every symbol the ground tier can
+        // reach must be visible to the tiers above it.
+        #[cfg(feature = "llvm-backend")]
+        if let Some(llvm) = &self.llvm {
+            llvm.with_lock(|be| be.register_symbol(name, ptr));
+        }
     }
 
     /// Rebuild the inner Cranelift JIT module with all accumulated runtime
@@ -642,6 +650,10 @@ impl TieredBackend {
     pub fn register_symbol_signatures(&mut self, symbols: &[crate::zrtl::RuntimeSymbolInfo]) {
         self.cranelift
             .with_lock(|be| be.register_symbol_signatures(symbols));
+        #[cfg(feature = "llvm-backend")]
+        if let Some(llvm) = &self.llvm {
+            llvm.with_lock(|be| be.register_symbol_signatures(symbols));
+        }
     }
 
     /// Toggle emission of OSR back-edge probes in tier-0 code.
