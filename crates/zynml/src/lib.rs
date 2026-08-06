@@ -130,6 +130,9 @@ pub struct TierOverrides {
     /// keeping on where a program is entered once and must reach the fast
     /// tier without being called again.
     pub enable_osr: Option<bool>,
+    /// Whether calls between compiled functions go through reload
+    /// cells, so edited functions can be swapped under running code.
+    pub enable_hot_reload: Option<bool>,
 }
 
 impl TierOverrides {
@@ -139,6 +142,7 @@ impl TierOverrides {
             && self.hot_threshold.is_none()
             && self.sample_rate.is_none()
             && self.enable_osr.is_none()
+            && self.enable_hot_reload.is_none()
     }
 
     /// Apply to a tier configuration.
@@ -154,6 +158,9 @@ impl TierOverrides {
         }
         if let Some(v) = self.enable_osr {
             config.enable_osr = v;
+        }
+        if let Some(v) = self.enable_hot_reload {
+            config.enable_hot_reload = v;
         }
     }
 }
@@ -333,6 +340,23 @@ impl ZynML {
             RuntimeEngine::Tiered(rt) => rt.load_module("zynml", source),
         }
         .context("Failed to compile ZynML program")
+    }
+
+    /// Reload edited source against the running program.
+    ///
+    /// Only functions whose content changed are replaced; everything
+    /// else — state, unchanged code, functions the edit removed but
+    /// running code may still reference — stays as it is. Requires a
+    /// tiered runtime with hot reload enabled.
+    pub fn reload_source(&mut self, source: &str) -> Result<zyntax_embed::ReloadReport> {
+        match &mut self.runtime {
+            RuntimeEngine::Classic(_) => Err(anyhow::anyhow!(
+                "hot reload requires a tiered runtime profile"
+            )),
+            RuntimeEngine::Tiered(rt) => rt
+                .reload_module_source("zynml", source)
+                .context("Failed to reload ZynML program"),
+        }
     }
 
     /// Parse source and return the AST as JSON

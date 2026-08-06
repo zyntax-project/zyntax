@@ -1317,7 +1317,10 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
         let entry_comment = if is_entry { "  ; entry" } else { "" };
 
         // Predecessors comment
-        let preds: Vec<String> = block.predecessors.iter().map(|p| mapper.block(p)).collect();
+        // Sorted: predecessor order is bookkeeping, not semantics, and a
+        // stable dump keeps equal functions comparing equal.
+        let mut preds: Vec<String> = block.predecessors.iter().map(|p| mapper.block(p)).collect();
+        preds.sort();
         let preds_comment = if preds.is_empty() || is_entry {
             String::new()
         } else {

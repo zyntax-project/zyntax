@@ -1315,7 +1315,7 @@ impl ZyntaxRuntime {
     ) -> RuntimeResult<()> {
         // Parse source to TypedAST with plugin signatures for proper extern declarations
         let typed_program = grammar
-            .parse_with_signatures(source, "source.zynml", &self.plugin_signatures)
+            .parse_with_signatures(source, "<source>", &self.plugin_signatures)
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
 
         // Lower to HIR with grammar builtins
@@ -2765,7 +2765,7 @@ impl ZyntaxRuntime {
                 .map_err(|e| RuntimeError::Execution(e.to_string()))?
         } else {
             grammar
-                .parse_with_signatures(source, "module.zynml", &self.plugin_signatures)
+                .parse_with_signatures(source, &format!("<{language}>"), &self.plugin_signatures)
                 .map_err(|e| RuntimeError::Execution(e.to_string()))?
         };
         capture_runtime_events_from_program(
@@ -3002,8 +3002,8 @@ impl ZyntaxRuntime {
 
 const INTERNAL_RENDER_EVENT_ALIAS: &str = "__internal_render_event";
 const INTERNAL_STREAM_EVENT_ALIAS: &str = "__internal_stream_event";
-const INTERNAL_RENDER_EVENT_SYMBOL: &str = "$ZynML$render_event";
-const INTERNAL_STREAM_EVENT_SYMBOL: &str = "$ZynML$stream_event";
+const INTERNAL_RENDER_EVENT_SYMBOL: &str = "$Zyntax$render_event";
+const INTERNAL_STREAM_EVENT_SYMBOL: &str = "$Zyntax$stream_event";
 
 fn resolve_interned_name(name: zyntax_typed_ast::InternedString) -> String {
     name.resolve_global().unwrap_or_default()
@@ -3794,6 +3794,58 @@ impl TieredRuntime {
     /// Load a module from source code using a registered language grammar
     ///
     /// See `ZyntaxRuntime::load_module` for full documentation.
+    /// Reload edited source against the running module.
+    ///
+    /// Parses and lowers exactly as [`Self::load_module`] does, then
+    /// hands the edited module to the backend, which swaps only the
+    /// functions whose content changed. State is untouched; the next
+    /// call to a reloaded function runs the new code.
+    pub fn reload_module_source(
+        &mut self,
+        language: &str,
+        source: &str,
+    ) -> RuntimeResult<zyntax_compiler::reload::ReloadReport> {
+        let grammar = self.grammars.get(language).cloned().ok_or_else(|| {
+            RuntimeError::Execution(format!(
+                "Unknown language '{}'. Registered languages: {:?}",
+                language,
+                self.languages()
+            ))
+        })?;
+
+        let mut typed_program = grammar
+            .parse_with_signatures(source, &format!("<{language}>"), &self.plugin_signatures)
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+        capture_runtime_events_from_program(
+            &mut typed_program,
+            &mut self.runtime_events,
+            self.event_sink.as_ref(),
+        );
+
+        let builtins: indexmap::IndexMap<String, String> = grammar
+            .builtins()
+            .functions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
+        apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
+
+        // The running module went through the same optimization pipeline
+        // on load; diffing an optimized function against an unoptimized
+        // lowering of identical source would report every function
+        // changed.
+        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+            let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
+        }
+
+        self.backend
+            .reload_module(&hir_module)
+            .map_err(|e| RuntimeError::Execution(e.to_string()))
+    }
+
     pub fn load_module(&mut self, language: &str, source: &str) -> RuntimeResult<Vec<String>> {
         let grammar = self.grammars.get(language).cloned().ok_or_else(|| {
             RuntimeError::Execution(format!(
@@ -3805,7 +3857,7 @@ impl TieredRuntime {
 
         // Parse source to TypedAST with plugin signatures for proper extern declarations
         let mut typed_program = grammar
-            .parse_with_signatures(source, "module.zynml", &self.plugin_signatures)
+            .parse_with_signatures(source, &format!("<{language}>"), &self.plugin_signatures)
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
         capture_runtime_events_from_program(
             &mut typed_program,

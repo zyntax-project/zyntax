@@ -308,6 +308,14 @@ pub struct CraneliftBackend {
     /// [`Self::publish_osr_helpers`].
     publish_osr_helpers: bool,
 
+    /// Route calls between compiled functions through per-function
+    /// reload cells instead of direct references. See
+    /// [`Self::set_reloadable_calls`].
+    reloadable_calls: bool,
+
+    /// This backend's identity in the reload cell registry.
+    reload_key: u64,
+
     /// Defaults to 0; set via [`Self::set_compile_tier`] before each
     /// `compile_function` call from the tiered runtime.
     compile_tier: usize,
@@ -507,6 +515,8 @@ impl CraneliftBackend {
             effect_context: EffectCodegenContext::new(),
             compile_tier: 0,
             publish_osr_helpers: true,
+            reloadable_calls: false,
+            reload_key: crate::reload::next_backend_key(),
             emit_osr_probes: true,
             compile_bead_id: 0,
             pending_osr_helpers: Vec::new(),
@@ -565,6 +575,19 @@ impl CraneliftBackend {
     /// See [`Self::publish_osr_helpers`].
     pub fn set_publish_osr_helpers(&mut self, publish: bool) {
         self.publish_osr_helpers = publish;
+    }
+
+    /// Dispatch calls between compiled functions through per-function
+    /// cells, so replacing a function's code is one store that every
+    /// caller observes on its next call. Off by default: the cell load
+    /// is a cost only a runtime that intends to reload should pay.
+    pub fn set_reloadable_calls(&mut self, on: bool) {
+        self.reloadable_calls = on;
+    }
+
+    /// This backend's key in the reload cell registry.
+    pub fn reload_key(&self) -> u64 {
+        self.reload_key
     }
 
     /// Set the bead id for subsequent `compile_function` calls. Embedded
@@ -717,6 +740,7 @@ impl CraneliftBackend {
                 .write()
                 .unwrap()
                 .insert(*hir_id, code_ptr);
+            crate::reload::set_call_target(self.reload_key, *hir_id, code_ptr as usize);
         }
 
         // Note: Symbols are NOT automatically exported for cross-module linking.
@@ -1091,7 +1115,7 @@ impl CraneliftBackend {
         }
 
         let bead_id = self.compile_bead_id;
-        let trace = std::env::var_os("ZYNML_OSR_TRACE").is_some();
+        let trace = std::env::var_os("ZYNTAX_OSR_TRACE").is_some();
 
         for header in headers {
             let layout = match crate::osr::osr_layout(function, header) {
@@ -1183,7 +1207,7 @@ impl CraneliftBackend {
 
         self.pending_osr_helpers.push((layout.site_key(), func_id));
 
-        if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+        if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
             eprintln!(
                 "[osr] declared helper {} site=0x{:x}",
                 helper_name,
@@ -2839,20 +2863,19 @@ impl CraneliftBackend {
                                         if let Some(&cranelift_func_id) =
                                             self.function_map.get(func_id)
                                         {
-                                            let local_callee = self.module.declare_func_in_func(
-                                                cranelift_func_id,
-                                                builder.func,
-                                            );
+                                            let declared_sig = self
+                                                .module
+                                                .declarations()
+                                                .get_function_decl(cranelift_func_id)
+                                                .signature
+                                                .clone();
 
                                             // Coerce argument types to match declared signature
-                                            let sig_ref =
-                                                builder.func.dfg.ext_funcs[local_callee].signature;
-                                            let expected_types: Vec<_> =
-                                                builder.func.dfg.signatures[sig_ref]
-                                                    .params
-                                                    .iter()
-                                                    .map(|p| p.value_type)
-                                                    .collect();
+                                            let expected_types: Vec<_> = declared_sig
+                                                .params
+                                                .iter()
+                                                .map(|p| p.value_type)
+                                                .collect();
                                             let mut coerced = arg_values.clone();
                                             for (i, &expected) in expected_types.iter().enumerate()
                                             {
@@ -2870,7 +2893,34 @@ impl CraneliftBackend {
                                                 }
                                             }
 
-                                            let call = builder.ins().call(local_callee, &coerced);
+                                            let call = if self.reloadable_calls {
+                                                let sig_ref =
+                                                    builder.import_signature(declared_sig);
+                                                let ptr_ty =
+                                                    self.module.target_config().pointer_type();
+                                                let cell = crate::reload::call_cell_addr(
+                                                    self.reload_key,
+                                                    *func_id,
+                                                )
+                                                    as i64;
+                                                let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                                let entry = builder.ins().load(
+                                                    ptr_ty,
+                                                    MemFlags::trusted(),
+                                                    cell_v,
+                                                    0,
+                                                );
+                                                builder
+                                                    .ins()
+                                                    .call_indirect(sig_ref, entry, &coerced)
+                                            } else {
+                                                let local_callee =
+                                                    self.module.declare_func_in_func(
+                                                        cranelift_func_id,
+                                                        builder.func,
+                                                    );
+                                                builder.ins().call(local_callee, &coerced)
+                                            };
 
                                             if let Some(result_id) = result {
                                                 if let Some(&ret_val) =
@@ -6776,9 +6826,6 @@ impl CraneliftBackend {
                 match callee {
                     HirCallable::Function(func_id) => {
                         let cranelift_func = self.function_map[func_id];
-                        let func_ref = self
-                            .module
-                            .declare_func_in_func(cranelift_func, builder.func);
 
                         // `return_call` is a Cranelift terminator. Our
                         // block-level lowering still emits the HIR
@@ -6790,7 +6837,31 @@ impl CraneliftBackend {
                         // (LLVM gets the hint), but Cranelift falls
                         // back to the standard call until the
                         // terminator-skip plumbing lands.
-                        let call = builder.ins().call(func_ref, &arg_vals);
+                        let call = if self.reloadable_calls
+                            && !self.external_link_names.contains_key(func_id)
+                        {
+                            // Reloadable dispatch: the callee's current
+                            // entry lives in its cell, and replacing it
+                            // is one store every caller observes.
+                            let sig = self
+                                .module
+                                .declarations()
+                                .get_function_decl(cranelift_func)
+                                .signature
+                                .clone();
+                            let sig_ref = builder.import_signature(sig);
+                            let ptr_ty = self.module.target_config().pointer_type();
+                            let cell =
+                                crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
+                            let cell_v = builder.ins().iconst(ptr_ty, cell);
+                            let entry = builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0);
+                            builder.ins().call_indirect(sig_ref, entry, &arg_vals)
+                        } else {
+                            let func_ref = self
+                                .module
+                                .declare_func_in_func(cranelift_func, builder.func);
+                            builder.ins().call(func_ref, &arg_vals)
+                        };
 
                         if let Some(result_id) = result {
                             let results = builder.inst_results(call);
@@ -8137,6 +8208,7 @@ impl CraneliftBackend {
                 .write()
                 .unwrap()
                 .insert(*hir_id, code_ptr);
+            crate::reload::set_call_target(self.reload_key, *hir_id, code_ptr as usize);
         }
 
         Ok(())

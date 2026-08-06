@@ -165,6 +165,7 @@ pub use runtime::{
 pub use string::ZyntaxString;
 pub use value::ZyntaxValue;
 pub use zyntax_compiler::hir_interp::{HirInterpreter, InterpError, JitDispatch, ProfileSample};
+pub use zyntax_compiler::reload::ReloadReport;
 
 // Re-export zyn_peg types for custom AST builders and advanced grammar use
 pub use zyn_peg::runtime::{

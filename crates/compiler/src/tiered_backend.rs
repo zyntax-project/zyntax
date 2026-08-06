@@ -144,6 +144,9 @@ pub struct TieredConfig {
     /// Costs a load and a not-taken branch per back-edge while no helper
     /// exists, measured at under 1% across the bench kernels.
     pub enable_osr: bool,
+    /// Route calls between compiled functions through reload cells so
+    /// `reload_module` can replace a function under running code.
+    pub enable_hot_reload: bool,
 }
 
 impl Default for TieredConfig {
@@ -157,6 +160,7 @@ impl Default for TieredConfig {
             verbosity: 0,
             llvm_cache_key: None,
             enable_osr: true,
+            enable_hot_reload: false,
         }
     }
 }
@@ -172,6 +176,7 @@ impl TieredConfig {
             verbosity: 2,
             llvm_cache_key: None,
             enable_osr: true,
+            enable_hot_reload: false,
         }
     }
 
@@ -185,6 +190,7 @@ impl TieredConfig {
             verbosity: 0,
             llvm_cache_key: None,
             enable_osr: true,
+            enable_hot_reload: false,
         }
     }
 
@@ -199,6 +205,7 @@ impl TieredConfig {
             verbosity: 0,
             llvm_cache_key: None,
             enable_osr: true,
+            enable_hot_reload: false,
         }
     }
 }
@@ -250,6 +257,9 @@ pub struct TieredBackend {
 
     /// Per-function entries keyed by HIR function id.
     functions: HashMap<HirId, FunctionEntry>,
+    /// The module the compiled code came from. A reload diffs the
+    /// edited module against this and replaces it piecewise.
+    current_module: Option<HirModule>,
 
     /// Profile counters (for `get_statistics` only — promotion is driven by
     /// beadie's own counters).
@@ -291,6 +301,10 @@ impl TieredBackend {
             cranelift.with_lock(|be| be.set_publish_osr_helpers(false));
         }
 
+        if config.enable_hot_reload {
+            cranelift.with_lock(|be| be.set_reloadable_calls(true));
+        }
+
         let adapter = Arc::new(TieredAdapter::new(make_policies(&config)));
 
         Ok(Self {
@@ -301,6 +315,7 @@ impl TieredBackend {
             #[cfg(feature = "llvm-backend")]
             _llvm_context,
             functions: HashMap::new(),
+            current_module: None,
             profile_data: ProfileData::new(config.profile_config.clone()),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
@@ -345,6 +360,8 @@ impl TieredBackend {
 
         self.cranelift.with_lock(|be| be.compile_module(&module))?;
 
+        self.current_module = Some(module.clone());
+
         // Hand the LLVM tier the whole module before anything promotes out
         // of it: a promotion recompiles one function, and that function's
         // callees have to come with it.
@@ -385,6 +402,181 @@ impl TieredBackend {
         self.install_promotion_requester();
 
         Ok(())
+    }
+
+    /// Replace the parts of the running module the edited one changed.
+    ///
+    /// Functions are matched by name and compared by content
+    /// fingerprint, so a fresh parse's disjoint `HirId`s and
+    /// formatting-only edits both diff as unchanged. A changed function
+    /// is recompiled under its existing id — its bead, reload cell and
+    /// pointer-table entries all stay keyed as before — with the edited
+    /// body's callee references remapped onto the running module's ids.
+    /// Old code is retained; frames already inside it complete safely.
+    pub fn reload_module(
+        &mut self,
+        new_module: &HirModule,
+    ) -> CompilerResult<crate::reload::ReloadReport> {
+        use std::collections::HashMap as Map;
+
+        let old_module = self.current_module.clone().ok_or_else(|| {
+            CompilerError::Backend("reload before any module was compiled".into())
+        })?;
+
+        let name_of = |f: &HirFunction| f.name.resolve_global();
+
+        let mut old_by_name: Map<String, HirId> = Map::new();
+        for (id, f) in &old_module.functions {
+            if !f.is_external {
+                if let Some(n) = name_of(f) {
+                    old_by_name.insert(n, *id);
+                }
+            }
+        }
+
+        // Edited ids -> running ids, for every name present in both.
+        let mut id_remap: Map<HirId, HirId> = Map::new();
+        for (new_id, f) in &new_module.functions {
+            if let Some(n) = name_of(f) {
+                if let Some(old_id) = old_by_name.get(&n) {
+                    id_remap.insert(*new_id, *old_id);
+                }
+            }
+        }
+
+        let mut report = crate::reload::ReloadReport::default();
+        let mut updated_functions: Vec<(HirId, HirFunction)> = Vec::new();
+        let mut seen_names: std::collections::HashSet<String> = Default::default();
+
+        for (new_id, new_fn) in &new_module.functions {
+            if new_fn.is_external {
+                continue;
+            }
+            let Some(name) = name_of(new_fn) else {
+                continue;
+            };
+            seen_names.insert(name.clone());
+
+            match old_by_name.get(&name) {
+                Some(&old_id) => {
+                    let old_fn = &old_module.functions[&old_id];
+                    let fp_old = crate::reload::function_fingerprint(old_fn, &old_module);
+                    let fp_new = crate::reload::function_fingerprint(new_fn, new_module);
+                    if fp_old == fp_new {
+                        report.unchanged += 1;
+                        continue;
+                    }
+                    if std::env::var_os("ZYNTAX_RELOAD_TRACE").is_some() {
+                        let d_old = crate::hir_dump::dump_function(old_fn, &old_module);
+                        let d_new = crate::hir_dump::dump_function(new_fn, new_module);
+                        eprintln!(
+                            "[reload] {name} differs: fp {fp_old:x} vs {fp_new:x}, {} vs {} bytes",
+                            d_old.len(),
+                            d_new.len()
+                        );
+                        if let Some(pos) =
+                            d_old.bytes().zip(d_new.bytes()).position(|(a, b)| a != b)
+                        {
+                            let lo = pos.saturating_sub(40);
+                            eprintln!(
+                                "  first diff at byte {pos}:\n  -...{:?}\n  +...{:?}",
+                                &d_old[lo..(pos + 20).min(d_old.len())],
+                                &d_new[lo..(pos + 20).min(d_new.len())]
+                            );
+                        } else {
+                            eprintln!("  (byte-identical dumps?!)");
+                        }
+                        if d_old.lines().count() != d_new.lines().count() {
+                            eprintln!(
+                                "  (line counts {} vs {})",
+                                d_old.lines().count(),
+                                d_new.lines().count()
+                            );
+                        }
+                    }
+
+                    let mut body = new_fn.clone();
+                    remap_callees(&mut body, &id_remap);
+
+                    let bead_id = self
+                        .functions
+                        .get(&old_id)
+                        .map(|e| e.bead_id)
+                        .unwrap_or_else(osr::next_bead_id);
+                    let compiled = self.cranelift.with_lock(|be| {
+                        be.set_compile_tier(0);
+                        be.set_compile_bead_id(bead_id);
+                        be.compile_function(old_id, &body)?;
+                        be.finalize_definitions()?;
+                        Ok::<_, CompilerError>(be.get_function_ptr(old_id))
+                    });
+                    match compiled {
+                        Ok(Some(entry_ptr)) => {
+                            if let Some(fn_entry) = self.functions.get_mut(&old_id) {
+                                fn_entry.bound.bead().swap_compiled(entry_ptr as *mut ());
+                                fn_entry.function = Arc::new(body.clone());
+                            }
+                            updated_functions.push((old_id, body));
+                            report.reloaded.push(name);
+                        }
+                        Ok(None) => report
+                            .failed
+                            .push((name, "recompile produced no entry pointer".into())),
+                        Err(e) => report.failed.push((name, e.to_string())),
+                    }
+                }
+                None => {
+                    // Introduced by the edit: compile fresh under its
+                    // own id and register it like `compile_module` does.
+                    let mut body = new_fn.clone();
+                    remap_callees(&mut body, &id_remap);
+                    let bead_id = osr::next_bead_id();
+                    let compiled = self.cranelift.with_lock(|be| {
+                        be.set_compile_tier(0);
+                        be.set_compile_bead_id(bead_id);
+                        be.compile_function(*new_id, &body)?;
+                        be.finalize_definitions()?;
+                        Ok::<_, CompilerError>(be.get_function_ptr(*new_id))
+                    });
+                    match compiled {
+                        Ok(Some(p)) => {
+                            let bound = self.adapter.register(ptr::null_mut(), None);
+                            bound.bead().eager_install(p as *mut ());
+                            osr::register_bead(bead_id, Arc::clone(bound.bead()));
+                            self.functions.insert(
+                                *new_id,
+                                FunctionEntry {
+                                    bound,
+                                    function: Arc::new(body.clone()),
+                                    bead_id,
+                                },
+                            );
+                            updated_functions.push((*new_id, body));
+                            report.added.push(name);
+                        }
+                        Ok(None) => report
+                            .failed
+                            .push((name, "compile produced no entry pointer".into())),
+                        Err(e) => report.failed.push((name, e.to_string())),
+                    }
+                }
+            }
+        }
+
+        for (name, _) in old_by_name.iter() {
+            if !seen_names.contains(name) {
+                report.removed_retained.push(name.clone());
+            }
+        }
+
+        // The next reload diffs against what is now running.
+        if let Some(module) = &mut self.current_module {
+            for (id, body) in updated_functions {
+                module.functions.insert(id, body);
+            }
+        }
+
+        Ok(report)
     }
 
     /// Current native-code pointer for `func_id`, or `None` if unknown.
@@ -824,5 +1016,32 @@ impl TieredStatistics {
             self.currently_optimizing,
             self.profile_stats.format()
         )
+    }
+}
+
+/// Rewrite the callee ids an edited function carries onto the running
+/// module's ids, matched by name beforehand. Only id-carrying callables
+/// change; symbol and intrinsic calls are name-based already.
+fn remap_callees(func: &mut HirFunction, id_remap: &std::collections::HashMap<HirId, HirId>) {
+    for block in func.blocks.values_mut() {
+        for inst in &mut block.instructions {
+            match inst {
+                crate::hir::HirInstruction::Call { callee, .. } => match callee {
+                    crate::hir::HirCallable::Function(id)
+                    | crate::hir::HirCallable::FuncRef(id) => {
+                        if let Some(mapped) = id_remap.get(id) {
+                            *id = *mapped;
+                        }
+                    }
+                    _ => {}
+                },
+                crate::hir::HirInstruction::CreateClosure { function, .. } => {
+                    if let Some(mapped) = id_remap.get(function) {
+                        *function = *mapped;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }

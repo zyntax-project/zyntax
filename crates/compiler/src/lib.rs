@@ -93,6 +93,7 @@ pub mod beadie_adapter; // beadie::JitBackend wrappers for our backends
 pub mod osr; // On-stack replacement infrastructure (probe, registry, layout)
 pub mod plugin; // Plugin system for frontend runtime registration
 pub mod profiling; // Runtime profiling for tiered compilation
+pub mod reload; // Hot-reload fingerprints, call cells, reports
 pub mod string_intrinsics; // Runtime intrinsics for string operations (e.g. string-eq for BinaryOp::Eq)
 #[cfg(feature = "cranelift-backend")]
 pub mod tiered_backend; // Tiered JIT/AOT compilation system

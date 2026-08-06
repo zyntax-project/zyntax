@@ -7187,15 +7187,18 @@ impl SsaBuilder {
     fn scan_cfg_for_variable_writes(
         &self,
         cfg: &crate::typed_cfg::TypedControlFlowGraph,
-    ) -> IndexMap<HirId, HashSet<InternedString>> {
+    ) -> IndexMap<HirId, indexmap::IndexSet<InternedString>> {
         use zyntax_typed_ast::typed_ast::{BinaryOp, TypedExpression, TypedStatement};
 
-        let mut writes: IndexMap<HirId, HashSet<InternedString>> = IndexMap::new();
+        let mut writes: IndexMap<HirId, indexmap::IndexSet<InternedString>> = IndexMap::new();
 
         for node_idx in cfg.graph.node_indices() {
             let typed_block = &cfg.graph[node_idx];
             let block_id = typed_block.id;
-            let mut block_writes = HashSet::new();
+            // Insertion-ordered on purpose: this set's iteration order
+            // becomes phi order in the blocks that need one, and a
+            // hash-ordered set makes that order vary run to run.
+            let mut block_writes = indexmap::IndexSet::new();
 
             // Scan all statements in the block
             for stmt in &typed_block.statements {
@@ -7415,7 +7418,7 @@ impl SsaBuilder {
         cfg: &crate::typed_cfg::TypedControlFlowGraph,
         block_id: HirId,
         header_id: HirId,
-        vars: &mut HashSet<InternedString>,
+        vars: &mut indexmap::IndexSet<InternedString>,
     ) {
         use zyntax_typed_ast::typed_ast::{TypedExpression, TypedStatement};
 
@@ -7460,7 +7463,7 @@ impl SsaBuilder {
     fn collect_assigned_vars(
         &self,
         expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
-        vars: &mut HashSet<InternedString>,
+        vars: &mut indexmap::IndexSet<InternedString>,
     ) {
         use zyntax_typed_ast::typed_ast::{BinaryOp, TypedExpression};
 
@@ -7488,7 +7491,7 @@ impl SsaBuilder {
 
     fn collect_lvalue_root(
         target: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
-        vars: &mut HashSet<InternedString>,
+        vars: &mut indexmap::IndexSet<InternedString>,
     ) {
         use zyntax_typed_ast::typed_ast::TypedExpression;
         match &target.node {

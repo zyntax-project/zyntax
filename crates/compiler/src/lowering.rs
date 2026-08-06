@@ -4548,7 +4548,7 @@ impl LoweringContext {
             };
 
             // Mangle the method name to include trait and type info
-            // For extern struct methods WITH bodies (wrappers): use _zynml_{Type}_{method} to avoid ZRTL collision
+            // For extern struct methods WITH bodies (wrappers): use _zyntax_ext_{Type}_{method} to avoid ZRTL collision
             // For extern struct methods WITHOUT bodies: auto-map creates external function with ZRTL link
             // For regular structs: {TypeName}${method_name} or {TypeName}${TraitName}${method_name}
             let mangled_name = {
@@ -5509,8 +5509,8 @@ impl LoweringContext {
         method_name: &str,
     ) -> Option<String> {
         // First, check for inherent impl methods (including extern struct methods)
-        // Try wrapper method name first: _zynml_{Type}_{method}
-        let wrapper_name = format!("_zynml_{}_{}", type_name, method_name);
+        // Try wrapper method name first: _zyntax_ext_{Type}_{method}
+        let wrapper_name = format!("_zyntax_ext_{}_{}", type_name, method_name);
         let wrapper_interned = InternedString::new_global(&wrapper_name);
         if self.symbols.functions.contains_key(&wrapper_interned) {
             return Some(wrapper_name);

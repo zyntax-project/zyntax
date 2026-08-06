@@ -73,6 +73,24 @@ enum Commands {
         osr: Option<bool>,
     },
 
+    /// Run a ZynML program and reload edited functions between runs
+    Watch {
+        /// Path to the .ml or .zynml file
+        file: PathBuf,
+
+        /// Directory containing ZRTL plugins
+        #[arg(long, default_value = "plugins/target/zrtl")]
+        plugins: PathBuf,
+
+        /// Load optional plugins (image, json, http)
+        #[arg(long)]
+        all_plugins: bool,
+
+        /// Execution profile; hot reload needs a tiered one
+        #[arg(long, value_enum, default_value_t = Profile::TieredDev)]
+        profile: Profile,
+    },
+
     /// Parse a ZynML program and show the AST
     Parse {
         /// Path to the .ml or .zynml file
@@ -134,10 +152,89 @@ fn main() -> Result<()> {
             tier_sample_rate,
             osr,
         ),
+        Commands::Watch {
+            file,
+            plugins,
+            all_plugins,
+            profile,
+        } => watch_program(&file, &plugins, all_plugins, profile),
         Commands::Parse { file, format } => parse_and_display(&file, &format),
         Commands::Repl { plugins, verbose } => run_repl(&plugins, verbose),
         Commands::Info => show_info(),
         Commands::Check { file } => check_program(&file),
+    }
+}
+
+/// Run the program, then re-run it after each source change, reloading
+/// only the functions the edit changed.
+fn watch_program(
+    file: &PathBuf,
+    plugins_dir: &PathBuf,
+    all_plugins: bool,
+    profile: Profile,
+) -> Result<()> {
+    use std::time::Duration;
+
+    let config = ZynMLConfig {
+        plugins_dir: plugins_dir.to_string_lossy().to_string(),
+        load_optional: all_plugins,
+        verbose: false,
+        runtime_profile: profile.into(),
+        tier_overrides: zynml::TierOverrides {
+            warm_threshold: None,
+            hot_threshold: None,
+            sample_rate: None,
+            enable_osr: None,
+            enable_hot_reload: Some(true),
+        },
+    };
+    let mut zynml = ZynML::with_config(config)?;
+
+    let read = || std::fs::read_to_string(file).map_err(anyhow::Error::from);
+    let mtime = || {
+        std::fs::metadata(file)
+            .and_then(|m| m.modified())
+            .map_err(anyhow::Error::from)
+    };
+
+    zynml.load_source(&read()?)?;
+    let mut last = mtime()?;
+    loop {
+        match zynml.call("main") {
+            Ok(()) => println!("[watch] main completed"),
+            Err(e) => eprintln!("[watch] main failed: {e}"),
+        }
+        println!(
+            "[watch] waiting for changes to {} (ctrl-c to stop)",
+            file.display()
+        );
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = mtime()?;
+            if now != last {
+                last = now;
+                break;
+            }
+        }
+        match zynml.reload_source(&read()?) {
+            Ok(report) => {
+                if report.is_noop() && report.unchanged > 0 {
+                    println!(
+                        "[watch] no functional change ({} unchanged)",
+                        report.unchanged
+                    );
+                } else {
+                    println!(
+                        "[watch] reloaded {:?}, added {:?}, retained-removed {:?}, unchanged {}",
+                        report.reloaded, report.added, report.removed_retained, report.unchanged
+                    );
+                    for (name, err) in &report.failed {
+                        eprintln!("[watch] {name} failed to reload: {err}");
+                    }
+                }
+            }
+            Err(e) => eprintln!("[watch] reload failed (previous code keeps running): {e}"),
+        }
     }
 }
 
@@ -221,6 +318,7 @@ fn run_program(
             hot_threshold: tier_thresholds.map(|t| t.hot),
             sample_rate: tier_sample_rate,
             enable_osr: osr,
+            enable_hot_reload: None,
         },
     };
 

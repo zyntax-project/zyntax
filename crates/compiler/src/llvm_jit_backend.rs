@@ -307,7 +307,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     let layout = match crate::osr::osr_layout(func, header) {
                         Ok(l) => l,
                         Err(reason) => {
-                            if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+                            if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
                                 eprintln!(
                                     "[osr] no layout for {:?} {header:?}: {reason:?}",
                                     func.name.resolve_global().unwrap_or_default()
@@ -329,7 +329,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                         // A header the helper shape cannot express just
                         // means no resume point for that loop.
                         Err(e) => {
-                            if std::env::var_os("ZYNML_OSR_TRACE").is_some() {
+                            if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
                                 eprintln!("[osr] no helper for {header:?}: {e}");
                             }
                         }

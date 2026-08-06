@@ -181,7 +181,7 @@ pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
 
 pub fn osr_trace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZYNML_OSR_TRACE").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("ZYNTAX_OSR_TRACE").is_some())
 }
 
 /// Symbol name JIT'd code uses to reference the probe. Registered with the
