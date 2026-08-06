@@ -151,6 +151,7 @@ fn test_enum_type_resolution() {
     let option_id = TypeId::next();
     let type_def = zyntax_typed_ast::TypeDefinition {
         id: option_id,
+        module: None,
         name: option_name,
         kind: TypeKind::Enum {
             variants: vec![
@@ -277,6 +278,7 @@ fn test_type_alias_resolution() {
     let alias_id = TypeId::next();
     let alias_type_def = TypeDefinition {
         id: alias_id,
+        module: None,
         name: int_alias_name,
         kind: TypeKind::Alias {
             target: Type::Primitive(PrimitiveType::I32),

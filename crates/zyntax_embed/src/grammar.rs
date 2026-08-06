@@ -67,6 +67,19 @@ pub enum GrammarError {
 /// Result type for grammar operations
 pub type GrammarResult<T> = Result<T, GrammarError>;
 
+/// The module a source file declares its types into.
+///
+/// Takes the file's stem, so `stdlib/prelude.zynml` and the import path
+/// `prelude` name the same module. A name with no directory or extension
+/// is already a module name and passes through.
+pub fn module_name_of(filename: &str) -> zyntax_typed_ast::InternedString {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    zyntax_typed_ast::InternedString::new_global(stem)
+}
+
 /// A compiled language grammar for parsing source code
 ///
 /// `LanguageGrammar` wraps a compiled ZynPEG module and provides methods
@@ -305,6 +318,12 @@ impl LanguageGrammar {
         // Add source file for proper diagnostics
         program.source_files = vec![SourceFile::new(filename.to_string(), source.to_string())];
 
+        // The registry does not survive serialization, so name the module
+        // the rebuilt one records.
+        program
+            .type_registry
+            .set_current_module(Some(module_name_of(filename)));
+
         // Inject extern function declarations for all builtins from @builtin directive
         // This ensures the type checker can find these symbols in scope
         self.inject_builtin_externs(&mut program, None)?;
@@ -361,12 +380,15 @@ impl LanguageGrammar {
             let source_owned = source.to_string();
             let filename_owned = filename.to_string();
 
+            let module = module_name_of(filename);
+
             let parse_result: GrammarResult<TypedProgram> = std::thread::Builder::new()
                 .stack_size(64 * 1024 * 1024) // 64 MB
                 .spawn(move || {
                     let interpreter = GrammarInterpreter::new(&grammar2);
                     let mut builder = TypedASTBuilder::new();
                     let mut registry = TypeRegistry::new();
+                    registry.set_current_module(Some(module));
                     let mut state = ParserState::new(&source_owned, &mut builder, &mut registry);
 
                     match interpreter.parse(&mut state) {
@@ -425,7 +447,10 @@ impl LanguageGrammar {
         // Get the TypedProgram directly from the builder
         // We don't need the program_handle - just call build_program() which
         // returns the TypedProgram with the TypeRegistry intact
-        let program = interpreter.host_mut().build_program();
+        let mut program = interpreter.host_mut().build_program();
+        program
+            .type_registry
+            .set_current_module(Some(module_name_of(filename)));
 
         Ok(program)
     }

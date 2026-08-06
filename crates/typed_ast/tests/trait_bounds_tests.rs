@@ -958,6 +958,7 @@ fn test_where_clause_constraints() {
     // Register the type with the method
     let type_def = zyntax_typed_ast::type_registry::TypeDefinition {
         id: container_type_id,
+        module: None,
         name: arena.intern_string("Container"),
         kind: zyntax_typed_ast::type_registry::TypeKind::Struct {
             fields: vec![],

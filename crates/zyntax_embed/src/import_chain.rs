@@ -121,27 +121,37 @@ fn process_imports_inner(
 
                 // First, merge the TypeRegistry from the imported module
                 // This includes struct definitions, trait definitions, etc.
+                // The merge also puts the imported module into this
+                // registry's resolution scope.
                 type_registry.merge_from(&imported_program.type_registry);
 
-                // Register struct types from Class declarations in the imported module
-                // This ensures structs are available before impl block processing
-                if let Err(e) = register_struct_declarations(&imported_program, type_registry) {
-                    log::warn!(
-                        "Failed to register struct declarations from '{}': {}",
-                        module_name,
-                        e
-                    );
-                }
+                // The declarations that follow belong to the imported
+                // module, so register them under its name rather than the
+                // importing module's.
+                let imported_module = imported_program.type_registry.current_module();
+                type_registry.with_module(imported_module, |type_registry| {
+                    // Register struct types from Class declarations in the imported module
+                    // This ensures structs are available before impl block processing
+                    if let Err(e) = register_struct_declarations(&imported_program, type_registry) {
+                        log::warn!(
+                            "Failed to register struct declarations from '{}': {}",
+                            module_name,
+                            e
+                        );
+                    }
 
-                // Process extern declarations from the imported module
-                // to register opaque types in the type registry
-                if let Err(e) = process_extern_declarations_mut(&imported_program, type_registry) {
-                    log::warn!(
-                        "Failed to process extern declarations from '{}': {}",
-                        module_name,
-                        e
-                    );
-                }
+                    // Process extern declarations from the imported module
+                    // to register opaque types in the type registry
+                    if let Err(e) =
+                        process_extern_declarations_mut(&imported_program, type_registry)
+                    {
+                        log::warn!(
+                            "Failed to process extern declarations from '{}': {}",
+                            module_name,
+                            e
+                        );
+                    }
+                });
 
                 // Merge declarations from imported module into main program
                 // Filter out the import declarations themselves to avoid re-processing
@@ -829,8 +839,16 @@ pub(crate) fn resolve_in_type(
 
             // Canonicalize Named IDs by name in case this ID came from a placeholder
             // registry entry created before imports/externs were merged.
+            //
+            // An id that already names a module keeps to that module, so a
+            // type is never redirected to a same-named type from elsewhere;
+            // an unqualified one is resolved against the scope.
             if let Some(type_def) = type_registry.get_type_by_id(*id) {
-                if let Some(canonical) = type_registry.get_type_by_name(type_def.name) {
+                let canonical = match type_def.module {
+                    Some(module) => type_registry.get_type_in_module(Some(module), type_def.name),
+                    None => type_registry.get_type_by_name(type_def.name),
+                };
+                if let Some(canonical) = canonical {
                     if canonical.id != *id {
                         *id = canonical.id;
                     }
@@ -885,6 +903,7 @@ pub(crate) fn process_extern_declarations_mut(
                 let type_id = TypeId::next();
                 let type_def = TypeDefinition {
                     id: type_id,
+                    module: None,
                     name: extern_struct.name,
                     kind: TypeKind::Atomic, // Extern types are atomic/opaque
                     type_params: vec![],
@@ -1003,6 +1022,7 @@ pub(crate) fn register_struct_declarations(
 
             let type_def = TypeDefinition {
                 id: type_id,
+                module: None,
                 name: class_decl.name,
                 kind: TypeKind::Struct {
                     fields: fields.clone(),
@@ -1103,6 +1123,7 @@ pub(crate) fn register_enum_declarations(
 
             let type_def = TypeDefinition {
                 id: type_id,
+                module: None,
                 name: enum_decl.name,
                 kind: TypeKind::Enum { variants },
                 type_params,

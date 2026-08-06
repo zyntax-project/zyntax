@@ -114,6 +114,7 @@ fn synthesize_handler_state(program: &mut zyntax_typed_ast::TypedProgram) {
         metadata.is_reference = true;
         program.type_registry.register_type(TypeDefinition {
             id: info.state_id,
+            module: None,
             name: info.state_name,
             kind: TypeKind::Struct {
                 fields: field_defs.clone(),
@@ -1436,6 +1437,7 @@ impl ZyntaxRuntime {
 
                         let type_def = TypeDefinition {
                             id: existing_id,
+                            module: None,
                             name: class.name,
                             kind: TypeKind::Struct {
                                 fields: field_defs.clone(),
@@ -1508,6 +1510,7 @@ impl ZyntaxRuntime {
 
                 let type_def = TypeDefinition {
                     id: type_id,
+                    module: None,
                     name: class.name,
                     kind: TypeKind::Struct {
                         fields: field_defs.clone(),
@@ -1589,6 +1592,7 @@ impl ZyntaxRuntime {
 
                     let type_def = TypeDefinition {
                         id: type_id,
+                        module: None,
                         name: enum_decl.name,
                         kind: TypeKind::Enum { variants },
                         type_params,
@@ -3888,6 +3892,7 @@ impl TieredRuntime {
 
                 let type_def = TypeDefinition {
                     id: type_id,
+                    module: None,
                     name: class.name,
                     kind: TypeKind::Struct {
                         fields: field_defs.clone(),

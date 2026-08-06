@@ -500,6 +500,7 @@ fn lower_to_hir(
 
             let type_def = TypeDefinition {
                 id: type_id,
+                module: None,
                 name: class.name,
                 kind: TypeKind::Struct {
                     fields: fields.clone(),

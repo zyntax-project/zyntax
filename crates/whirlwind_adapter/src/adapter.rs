@@ -1141,6 +1141,7 @@ impl WhirlwindAdapter {
 
                     let type_def = TypeDefinition {
                         id: type_id,
+                        module: None,
                         name: type_name,
                         kind: TypeKind::Class,
                         type_params,
@@ -1255,6 +1256,7 @@ impl WhirlwindAdapter {
 
                     let type_def = TypeDefinition {
                         id: type_id,
+                        module: None,
                         name: type_name,
                         kind: TypeKind::Interface {
                             methods: methods_sigs.clone(),
@@ -1351,6 +1353,7 @@ impl WhirlwindAdapter {
 
                     let type_def = TypeDefinition {
                         id: type_id,
+                        module: None,
                         name: type_name,
                         kind: TypeKind::Enum { variants },
                         type_params,
@@ -1404,6 +1407,7 @@ impl WhirlwindAdapter {
 
                     let type_def = TypeDefinition {
                         id: type_id,
+                        module: None,
                         name: type_name,
                         kind: TypeKind::Alias { target },
                         type_params,
