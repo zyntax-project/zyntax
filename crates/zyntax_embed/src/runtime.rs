@@ -1064,6 +1064,13 @@ pub struct ZyntaxRuntime {
     /// Plugin signatures (symbol name -> ZRTL signature)
     /// Collected from loaded plugins for proper extern function type checking
     plugin_signatures: HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
+    /// Plugins whose symbols have been registered.
+    ///
+    /// Registration hands out raw pointers into the plugin's library, so the
+    /// library has to outlive them. Dropping it closes the handle, and on a
+    /// platform where that actually unmaps the image every registered
+    /// pointer is left dangling.
+    loaded_plugins: Vec<zyntax_compiler::zrtl::ZrtlPlugin>,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
@@ -1133,6 +1140,7 @@ impl ZyntaxRuntime {
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             plugin_signatures: HashMap::new(),
+            loaded_plugins: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
@@ -1181,6 +1189,7 @@ impl ZyntaxRuntime {
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             plugin_signatures: HashMap::new(),
+            loaded_plugins: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
@@ -2410,6 +2419,7 @@ impl ZyntaxRuntime {
         // Rebuild the JIT module to include the new symbols
         self.backend.rebuild_with_accumulated_symbols()?;
 
+        self.loaded_plugins.push(plugin);
         Ok(())
     }
 
@@ -3288,6 +3298,13 @@ pub struct TieredRuntime {
     /// Plugin signatures (symbol name -> ZRTL signature)
     /// Collected from loaded plugins for proper extern function type checking
     plugin_signatures: HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
+    /// Plugins whose symbols have been registered.
+    ///
+    /// Registration hands out raw pointers into the plugin's library, so the
+    /// library has to outlive them. Dropping it closes the handle, and on a
+    /// platform where that actually unmaps the image every registered
+    /// pointer is left dangling.
+    loaded_plugins: Vec<zyntax_compiler::zrtl::ZrtlPlugin>,
     /// Import resolver callbacks. Same role as `ZyntaxRuntime.import_resolvers`
     /// — consulted during `lower_typed_program` to pull in stdlib source
     /// (`prelude`, `tensor`, …) and any user-supplied module sources.
@@ -3317,6 +3334,7 @@ impl TieredRuntime {
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             plugin_signatures: HashMap::new(),
+            loaded_plugins: Vec::new(),
             import_resolvers: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
@@ -3609,6 +3627,7 @@ impl TieredRuntime {
             .rebuild_with_accumulated_symbols()
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
 
+        self.loaded_plugins.push(plugin);
         Ok(())
     }
 
