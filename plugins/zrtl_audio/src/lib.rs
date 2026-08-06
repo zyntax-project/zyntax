@@ -38,7 +38,7 @@ use symphonia::core::probe::Hint;
 use zrtl::zrtl_plugin;
 
 // Import SIMD functions for optimized operations
-use zrtl_simd::{vec_max_f32, vec_scale_f32, vec_dot_product_f32};
+use zrtl_simd_kernels::{vec_max_f32, vec_scale_f32, vec_dot_product_f32};
 
 // ============================================================================
 // Audio Handle

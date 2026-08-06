@@ -14,5 +14,8 @@ zrtl = { path = "../../sdk/zrtl" }
 # SIMD support with runtime feature detection
 wide = "0.7"
 
+# Kernels shared with the plugins that build on this one
+zrtl_simd_kernels = { path = "../../sdk/zrtl_simd_kernels" }
+
 [lints]
 workspace = true

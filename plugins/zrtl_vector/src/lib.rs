@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use zrtl::zrtl_plugin;
 
 // Import SIMD functions for high-performance vector operations
-use zrtl_simd::{
+use zrtl_simd_kernels::{
     vec_dot_product_f32, vec_euclidean_f32, vec_euclidean_sq_f32,
     vec_manhattan_f32, vec_cosine_similarity_f32, vec_l2_normalize_f32,
 };

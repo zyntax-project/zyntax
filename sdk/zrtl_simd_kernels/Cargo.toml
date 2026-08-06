@@ -1,0 +1,10 @@
+[package]
+name = "zrtl_simd_kernels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wide = "0.7"
+
+[lints]
+workspace = true

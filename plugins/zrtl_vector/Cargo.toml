@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 zrtl = { path = "../../sdk/zrtl" }
 
 # SIMD operations for high-performance compute
-zrtl_simd = { path = "../zrtl_simd" }
+zrtl_simd_kernels = { path = "../../sdk/zrtl_simd_kernels" }
 
 # Parallel processing for batch operations
 rayon = "1.10"

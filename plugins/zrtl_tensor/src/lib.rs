@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use zrtl::zrtl_plugin;
 
 // Import SIMD functions for optimized operations
-use zrtl_simd::{
+use zrtl_simd_kernels::{
     vec_fill_f32, vec_sum_f32, vec_max_f32, vec_min_f32,
     vec_argmax_with_val_f32,
 };
