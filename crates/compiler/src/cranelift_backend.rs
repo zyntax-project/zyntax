@@ -192,7 +192,7 @@ fn dynamic_box_opaque_tag(opaque_name: &str) -> u32 {
     .0
 }
 
-fn dynamic_box_tag_and_size_for_hir_type(ty: &HirType) -> (u32, u32) {
+pub(crate) fn dynamic_box_tag_and_size_for_hir_type(ty: &HirType) -> (u32, u32) {
     match ty {
         HirType::I8 => (crate::zrtl::TypeTag::I8.0, 1),
         HirType::I16 => (crate::zrtl::TypeTag::I16.0, 2),
@@ -251,7 +251,7 @@ fn default_dynamic_box_opaque_tag_and_size() -> (u32, u32) {
     )
 }
 
-fn dynamic_box_uses_direct_pointer(ty: &HirType) -> bool {
+pub(crate) fn dynamic_box_uses_direct_pointer(ty: &HirType) -> bool {
     match ty {
         HirType::Opaque(_) => true,
         HirType::Ptr(inner) => matches!(inner.as_ref(), HirType::Opaque(_) | HirType::I8),

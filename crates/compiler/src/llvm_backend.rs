@@ -3708,12 +3708,28 @@ impl<'ctx> LLVMBackend<'ctx> {
         &mut self,
         sig: &crate::zrtl::ZrtlSymbolSig,
         raw: &[BasicValueEnum<'ctx>],
-    ) -> Vec<BasicMetadataValueEnum<'ctx>> {
+        hir_types: &[Option<HirType>],
+    ) -> CompilerResult<Vec<BasicMetadataValueEnum<'ctx>>> {
         raw.iter()
             .enumerate()
             .map(|(i, &arg_val)| {
                 if !sig.param_is_dynamic(i) {
-                    return arg_val.into();
+                    return Ok(arg_val.into());
+                }
+
+                // A value whose dynamic representation the box carries by
+                // pointer — a string, an opaque handle — is boxed by its
+                // HIR type, not by how this backend happens to hold it: a
+                // string travels as an address, and choosing the box from
+                // the register type would box the address as an integer.
+                if let Some(Some(hir_ty)) = hir_types.get(i) {
+                    if crate::cranelift_backend::dynamic_box_uses_direct_pointer(hir_ty) {
+                        let (tag, size) =
+                            crate::cranelift_backend::dynamic_box_tag_and_size_for_hir_type(hir_ty);
+                        return self
+                            .build_stack_dynamic_box(arg_val, tag, size)
+                            .map(Into::into);
+                    }
                 }
                 let func_name = if arg_val.is_int_value() {
                     let int_ty = arg_val.into_int_value().get_type();
@@ -3744,15 +3760,85 @@ impl<'ctx> LLVMBackend<'ctx> {
                     .unwrap_or_else(|| self.module.add_function(func_name, box_fn_type, None));
 
                 match self.builder.build_call(box_fn, &[arg_val.into()], "box") {
-                    Ok(call_site) => call_site
+                    Ok(call_site) => Ok(call_site
                         .try_as_basic_value()
                         .basic()
                         .unwrap_or(arg_val)
-                        .into(),
-                    Err(_) => arg_val.into(),
+                        .into()),
+                    Err(_) => Ok(arg_val.into()),
                 }
             })
             .collect()
+    }
+
+    /// Build the 32-byte dynamic box the runtime reads — tag, payload
+    /// size, data word, then a null dropper and display slot — and hand
+    /// back its address as the i64 the callee takes. `data` is stored
+    /// as-is: for a by-pointer payload the pointer itself is the data.
+    fn build_stack_dynamic_box(
+        &mut self,
+        data: BasicValueEnum<'ctx>,
+        tag: u32,
+        size: u32,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let i32t = self.context.i32_type();
+        let i64t = self.context.i64_type();
+        let box_ty = self.context.struct_type(
+            &[
+                i32t.into(),
+                i32t.into(),
+                i64t.into(),
+                i64t.into(),
+                i64t.into(),
+            ],
+            false,
+        );
+        let slot = self
+            .builder
+            .build_alloca(box_ty, "dynbox")
+            .map_err(|e| CompilerError::CodeGen(format!("dynbox alloca: {e}")))?;
+
+        let data_word: BasicValueEnum = match data {
+            BasicValueEnum::PointerValue(p) => self
+                .builder
+                .build_ptr_to_int(p, i64t, "dynbox_data")
+                .map_err(|e| CompilerError::CodeGen(format!("dynbox data: {e}")))?
+                .into(),
+            BasicValueEnum::IntValue(v) => {
+                if v.get_type().get_bit_width() == 64 {
+                    v.into()
+                } else {
+                    self.builder
+                        .build_int_z_extend(v, i64t, "dynbox_data")
+                        .map_err(|e| CompilerError::CodeGen(format!("dynbox data: {e}")))?
+                        .into()
+                }
+            }
+            other => other,
+        };
+
+        let stores: [(u32, BasicValueEnum); 5] = [
+            (0, i32t.const_int(tag as u64, false).into()),
+            (1, i32t.const_int(size as u64, false).into()),
+            (2, data_word),
+            (3, i64t.const_zero().into()),
+            (4, i64t.const_zero().into()),
+        ];
+        for (idx, value) in stores {
+            let field = self
+                .builder
+                .build_struct_gep(box_ty, slot, idx, "dynbox_field")
+                .map_err(|e| CompilerError::CodeGen(format!("dynbox gep: {e}")))?;
+            self.builder
+                .build_store(field, value)
+                .map_err(|e| CompilerError::CodeGen(format!("dynbox store: {e}")))?;
+        }
+
+        Ok(self
+            .builder
+            .build_ptr_to_int(slot, i64t, "dynbox_addr")
+            .map_err(|e| CompilerError::CodeGen(format!("dynbox addr: {e}")))?
+            .into())
     }
 
     /// `expects_value` is whether the HIR call binds a result. A void
@@ -3787,50 +3873,43 @@ impl<'ctx> LLVMBackend<'ctx> {
                     .iter()
                     .map(|arg_id| self.get_value(*arg_id))
                     .collect::<CompilerResult<Vec<_>>>()?;
-                let arg_values: Vec<BasicMetadataValueEnum> = match &sig_info {
-                    Some(sig) => self.box_dynamic_args(sig, &raw_args),
-                    // No signature to box against. A declaration can still
-                    // describe an address as an integer — the two are one
-                    // register class to the ground tier, so only LLVM sees
-                    // the difference — and the declared form is what the
-                    // callee reads. With a signature present this is NOT
-                    // applied: a parameter it does not mark dynamic may
-                    // expect a boxed representation, and an address forced
-                    // through as an integer satisfies the verifier while
-                    // handing the callee a meaningless handle. The compile
-                    // failing verification keeps the tier below running
-                    // instead.
-                    None => {
-                        let param_types = function.get_type().get_param_types();
-                        let mut out = Vec::with_capacity(raw_args.len());
-                        for (i, &raw) in raw_args.iter().enumerate() {
-                            let coerced: BasicValueEnum = match (param_types.get(i), raw.get_type())
-                            {
-                                (
-                                    Some(BasicMetadataTypeEnum::IntType(it)),
-                                    BasicTypeEnum::PointerType(_),
-                                ) => self
-                                    .builder
-                                    .build_ptr_to_int(
-                                        raw.into_pointer_value(),
-                                        *it,
-                                        "call_arg_p2i",
-                                    )?
-                                    .into(),
-                                (
-                                    Some(BasicMetadataTypeEnum::PointerType(pt)),
-                                    BasicTypeEnum::IntType(_),
-                                ) => self
-                                    .builder
-                                    .build_int_to_ptr(raw.into_int_value(), *pt, "call_arg_i2p")?
-                                    .into(),
-                                _ => raw,
-                            };
-                            out.push(coerced.into());
-                        }
-                        out
-                    }
+                let arg_hir_types: Vec<Option<HirType>> = args
+                    .iter()
+                    .map(|id| self.type_map.get(id).cloned())
+                    .collect();
+                let boxed: Vec<BasicMetadataValueEnum> = match &sig_info {
+                    Some(sig) => self.box_dynamic_args(sig, &raw_args, &arg_hir_types)?,
+                    None => raw_args.iter().map(|&v| v.into()).collect(),
                 };
+                // Reconcile what remains with the declared parameters. A
+                // declaration can describe an address as an integer — the
+                // two are one register class to the ground tier, so only
+                // LLVM sees the difference — and the declared form is what
+                // the callee reads. Boxing above already produced i64
+                // handles for the parameters the signature marks dynamic,
+                // so this touches only the pass-through ones.
+                let param_types = function.get_type().get_param_types();
+                let mut arg_values: Vec<BasicMetadataValueEnum> = Vec::with_capacity(boxed.len());
+                for (i, v) in boxed.into_iter().enumerate() {
+                    let coerced: BasicMetadataValueEnum = match (param_types.get(i), v) {
+                        (
+                            Some(BasicMetadataTypeEnum::IntType(it)),
+                            BasicMetadataValueEnum::PointerValue(pv),
+                        ) => self
+                            .builder
+                            .build_ptr_to_int(pv, *it, "call_arg_p2i")?
+                            .into(),
+                        (
+                            Some(BasicMetadataTypeEnum::PointerType(pt)),
+                            BasicMetadataValueEnum::IntValue(iv),
+                        ) => self
+                            .builder
+                            .build_int_to_ptr(iv, *pt, "call_arg_i2p")?
+                            .into(),
+                        (_, other) => other,
+                    };
+                    arg_values.push(coerced);
+                }
 
                 // Build call
                 let call_site = self.builder.build_call(function, &arg_values, "call")?;

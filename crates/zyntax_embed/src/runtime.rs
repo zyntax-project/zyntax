@@ -3326,6 +3326,14 @@ impl TieredRuntime {
         // same setting.
         backend.set_emit_osr_probes(config.enable_osr);
 
+        // The boxing runtime the upper tier calls into. The ground tier
+        // builds dynamic boxes inline and never needs these; a tier that
+        // calls them by name has to be able to resolve them, and on Linux
+        // the executable's own symbols are not in `.dynsym`.
+        for (name, ptr, _) in zyntax_compiler::zrtl::box_runtime_symbols() {
+            backend.register_runtime_symbol(name, ptr);
+        }
+
         Ok(Self {
             backend,
             function_ids: HashMap::new(),
