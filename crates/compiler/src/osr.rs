@@ -68,26 +68,37 @@ use crate::hir::{HirFunction, HirId, HirTerminator, HirType};
 /// everything computed before the resume point has to arrive with it.
 pub const OSR_MAX_LIVE_INS: usize = 128;
 
-/// Pack `(loop_header_block_index, live_in_count)` into a 64-bit site key.
+/// Pack `(loop_ordinal, live_in_count)` into a 64-bit site key.
 ///
-/// `block_index` is the 0-based position of the header inside
+/// `loop_ordinal` is the 0-based position of the header among the
 /// `HirFunction.blocks`. `live_in_count` must fit in 16 bits; in practice
 /// it's ≤ [`OSR_MAX_LIVE_INS`].
 #[inline]
-pub fn encode_osr_site(block_index: u64, live_in_count: u16) -> u64 {
-    (block_index << 16) | (live_in_count as u64)
+pub fn encode_osr_site(loop_ordinal: u64, live_in_count: u16) -> u64 {
+    (loop_ordinal << 16) | (live_in_count as u64)
 }
 
-/// Unpack a site key. Returns `(block_index, live_in_count)`.
+/// Unpack a site key. Returns `(loop_ordinal, live_in_count)`.
 #[inline]
 pub fn decode_osr_site(site: u64) -> (u64, u16) {
-    let block_index = site >> 16;
+    let loop_ordinal = site >> 16;
     let live_in_count = (site & 0xFFFF) as u16;
-    (block_index, live_in_count)
+    (loop_ordinal, live_in_count)
 }
 
 /// Block-index lookup: returns the 0-based position of `block_id` inside
 /// the function's block iteration order, or `None` if not present.
+/// 0-based position of `header` among the function's loop headers, in
+/// discovery order. Stable under edits elsewhere in the function, which
+/// is what lets a site in running code match a helper compiled from an
+/// edited body.
+pub fn loop_ordinal_of(function: &HirFunction, header: HirId) -> Option<u64> {
+    find_loop_headers(function)
+        .iter()
+        .position(|h| *h == header)
+        .map(|i| i as u64)
+}
+
 pub fn block_index_of(function: &HirFunction, block_id: HirId) -> Option<u64> {
     function
         .blocks
@@ -346,7 +357,9 @@ fn successors_of(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
 #[derive(Debug, Clone)]
 pub struct OsrLayout {
     pub header: HirId,
-    pub block_index: u64,
+    /// Position of `header` among the function's loop headers — the
+    /// stable half of the site key.
+    pub loop_ordinal: u64,
     pub live_ins: Vec<HirId>,
     pub live_in_types: Vec<HirType>,
     /// Number of leading entries in `live_ins` that are phi results at
@@ -362,7 +375,7 @@ pub struct OsrLayout {
 impl OsrLayout {
     /// Encoded site key for this layout — see [`encode_osr_site`].
     pub fn site_key(&self) -> u64 {
-        encode_osr_site(self.block_index, self.live_ins.len() as u16)
+        encode_osr_site(self.loop_ordinal, self.live_ins.len() as u16)
     }
 }
 
@@ -519,12 +532,12 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
         }
     }
 
-    let block_index = block_index_of(function, header).unwrap_or(u64::MAX);
+    let loop_ordinal = loop_ordinal_of(function, header).unwrap_or(u64::MAX);
     let frame = OsrFrame::for_types(&live_in_types);
 
     Ok(OsrLayout {
         header,
-        block_index,
+        loop_ordinal,
         live_ins,
         live_in_types,
         phi_count,

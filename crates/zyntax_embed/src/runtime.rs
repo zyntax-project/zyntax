@@ -3794,6 +3794,14 @@ impl TieredRuntime {
     /// Load a module from source code using a registered language grammar
     ///
     /// See `ZyntaxRuntime::load_module` for full documentation.
+    /// Native entry pointer for `name`, or `None` if unknown. The
+    /// pointer stays valid for the life of the runtime; a reload swaps
+    /// what new calls dispatch to, not what this pointer points at.
+    pub fn function_pointer(&self, name: &str) -> Option<*const u8> {
+        let id = self.function_ids.get(name)?;
+        self.backend.get_function_pointer(*id)
+    }
+
     /// Reload edited source against the running module.
     ///
     /// Parses and lowers exactly as [`Self::load_module`] does, then

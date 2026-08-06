@@ -1142,7 +1142,7 @@ impl CraneliftBackend {
                 if trace {
                     eprintln!(
                         "[osr] helper emission failed for bead={} header_idx={}: {}",
-                        bead_id, layout.block_index, e
+                        bead_id, layout.loop_ordinal, e
                     );
                 }
                 // Reset OSR-helper state in case it was partially set.
@@ -1178,9 +1178,13 @@ impl CraneliftBackend {
             sig.returns.push(AbiParam::new(ret_clir));
         }
 
+        // Generation-suffixed like entry symbols: a recompile — promotion
+        // or reload — declares fresh helpers rather than colliding with
+        // the previous generation's definitions.
+        let generation = self.compile_generation.get(&id).copied().unwrap_or(0);
         let helper_name = format!(
-            "__zyntax_osr_{}_{}",
-            self.compile_bead_id, layout.block_index
+            "__zyntax_osr_{}_{}_g{}",
+            self.compile_bead_id, layout.loop_ordinal, generation
         );
         let func_id = self
             .module

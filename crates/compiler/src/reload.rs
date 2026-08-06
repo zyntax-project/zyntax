@@ -84,6 +84,14 @@ pub struct ReloadReport {
     /// Functions that failed to recompile, with the error. The
     /// previous code keeps running for each.
     pub failed: Vec<(String, String)>,
+    /// Reloaded functions whose running loops can finish in the edited
+    /// code: at least one resume point was published against the sites
+    /// the old code is probing.
+    pub resume_published: Vec<String>,
+    /// Loops that could not get a resume point, with the reason. The
+    /// enclosing call still completes on the old code; the *next* call
+    /// runs the edit.
+    pub resume_fell_back: Vec<(String, String)>,
 }
 
 impl ReloadReport {

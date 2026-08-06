@@ -302,7 +302,15 @@ impl TieredBackend {
         }
 
         if config.enable_hot_reload {
-            cranelift.with_lock(|be| be.set_reloadable_calls(true));
+            cranelift.with_lock(|be| {
+                be.set_reloadable_calls(true);
+                // A helper carries no probes, so a frame that transfers
+                // into one can never migrate again. Under hot reload the
+                // migration worth keeping available is into *edited*
+                // code, and the ladder's own helpers re-emit the code the
+                // loop is already running.
+                be.set_publish_osr_helpers(false);
+            });
         }
 
         let adapter = Arc::new(TieredAdapter::new(make_policies(&config)));
@@ -503,6 +511,28 @@ impl TieredBackend {
                         .get(&old_id)
                         .map(|e| e.bead_id)
                         .unwrap_or_else(osr::next_bead_id);
+
+                    // Resume points for loops already running the old
+                    // code. Compiled from the edited body before the
+                    // entry recompile, so the pointer table and reload
+                    // cells end up holding the probe-carrying entry.
+                    let mut pending_resume: Vec<(u64, *mut ())> = Vec::new();
+                    if self.config.enable_osr {
+                        let helpers = self.cranelift.with_lock(|be| {
+                            be.set_compile_tier(1);
+                            be.set_compile_bead_id(bead_id);
+                            be.compile_function(old_id, &body)?;
+                            be.finalize_definitions()?;
+                            Ok::<_, CompilerError>(be.take_pending_osr_helpers())
+                        });
+                        match helpers {
+                            Ok(pairs) => pending_resume = pairs,
+                            Err(e) => report
+                                .resume_fell_back
+                                .push((name.clone(), format!("helper compile failed: {e}"))),
+                        }
+                    }
+
                     let compiled = self.cranelift.with_lock(|be| {
                         be.set_compile_tier(0);
                         be.set_compile_bead_id(bead_id);
@@ -516,6 +546,40 @@ impl TieredBackend {
                                 fn_entry.bound.bead().swap_compiled(entry_ptr as *mut ());
                                 fn_entry.function = Arc::new(body.clone());
                             }
+
+                            // A resume point is only sound where the old
+                            // code's probe writes the frame the edited
+                            // body's helper reads: same site, same
+                            // live-ins. Anything else completes on the
+                            // old code and picks up the edit next call.
+                            if !pending_resume.is_empty() {
+                                let old_sites = site_layouts(old_fn);
+                                let new_sites = site_layouts(&body);
+                                let mut published = 0usize;
+                                for (site, code) in pending_resume {
+                                    match (old_sites.get(&site), new_sites.get(&site)) {
+                                        (Some(old_l), Some(new_l)) if old_l == new_l => {
+                                            osr::publish_helper(bead_id, site, code);
+                                            published += 1;
+                                        }
+                                        (Some(_), Some(_)) => report.resume_fell_back.push((
+                                            name.clone(),
+                                            format!("site {site:#x}: live-in layout changed"),
+                                        )),
+                                        (None, _) => report.resume_fell_back.push((
+                                            name.clone(),
+                                            format!(
+                                                "site {site:#x}: running code has no such loop"
+                                            ),
+                                        )),
+                                        (_, None) => {}
+                                    }
+                                }
+                                if published > 0 {
+                                    report.resume_published.push(name.clone());
+                                }
+                            }
+
                             updated_functions.push((old_id, body));
                             report.reloaded.push(name);
                         }
@@ -575,6 +639,11 @@ impl TieredBackend {
                 module.functions.insert(id, body);
             }
         }
+
+        // The promotion requester captured each function's body when it
+        // was installed; reinstall so a later promotion compiles the
+        // edited bodies rather than the ones it captured.
+        self.install_promotion_requester();
 
         Ok(report)
     }
@@ -1017,6 +1086,25 @@ impl TieredStatistics {
             self.profile_stats.format()
         )
     }
+}
+
+/// Per-site live-in layout of a function's loops: site key to
+/// `(phi_count, live-in types)`. Two functions agree at a site exactly
+/// when the frame one's probe writes is the frame the other's helper
+/// reads.
+fn site_layouts(
+    func: &HirFunction,
+) -> std::collections::HashMap<u64, (usize, Vec<crate::hir::HirType>)> {
+    let mut map = std::collections::HashMap::new();
+    for header in osr::find_loop_headers(func) {
+        if let Ok(layout) = osr::osr_layout(func, header) {
+            map.insert(
+                layout.site_key(),
+                (layout.phi_count, layout.live_in_types.clone()),
+            );
+        }
+    }
+    map
 }
 
 /// Rewrite the callee ids an edited function carries onto the running
