@@ -352,9 +352,15 @@ fn bench_runtime() -> Result<ZyntaxRuntime, String> {
 /// `install_llvm = true` lowers it to 5 so LLVM kicks in after a
 /// handful of warmup calls (still only effective when the cargo
 /// feature is enabled; otherwise the install path is a no-op).
+/// Set by `--osr`; read when each target builds its tier config.
+static OSR_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn jit_tier_config(install_llvm: bool, llvm_cache_key: Option<String>) -> TieredConfig {
     let mut cfg = TieredConfig::default();
     cfg.llvm_cache_key = llvm_cache_key;
+    // On-stack replacement is off by default: it emits a probe on every
+    // back edge, which is a cost the other numbers should not carry.
+    cfg.enable_osr = OSR_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     cfg.profile_config = ProfileConfig {
         // `warm_threshold = 0` fires the Cranelift dispatch on the
         // very first invocation. Without it, beadie's `on_invoke`
@@ -396,6 +402,9 @@ fn main() {
             "--runs" => {
                 runs_override = args.next().and_then(|s| s.parse().ok());
             }
+            "--osr" => {
+                OSR_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             "--no-cache" => {
                 cache_enabled = false;
             }
@@ -407,7 +416,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: bench_runner [--out <path>] [--runs <n>] [--no-cache]\n\
+                    "Usage: bench_runner [--out <path>] [--runs <n>] [--no-cache] [--osr]\n\
                      Defaults: out = website/benchmark/results.json, runs = {RUNS}, cache = on"
                 );
                 return;
