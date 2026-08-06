@@ -257,7 +257,7 @@ impl LanguageGrammar {
     /// # Returns
     /// The TypedAST serialized as JSON
     pub fn parse_to_json(&self, source: &str) -> GrammarResult<String> {
-        self.parse_to_json_with_filename(source, "unknown.zynml")
+        self.parse_to_json_with_filename(source, "<source>")
     }
 
     /// Parse source code with a specific filename and return the TypedAST as JSON
@@ -296,7 +296,7 @@ impl LanguageGrammar {
     /// # Returns
     /// The parsed TypedProgram ready for lowering to HIR
     pub fn parse(&self, source: &str) -> GrammarResult<TypedProgram> {
-        self.parse_with_filename(source, "unknown.zynml")
+        self.parse_with_filename(source, "<source>")
     }
 
     /// Parse source code with a specific filename (for diagnostics)

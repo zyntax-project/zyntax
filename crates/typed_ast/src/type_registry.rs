@@ -1118,7 +1118,7 @@ impl TypeRegistry {
         // that has not been declared yet, every reference resolved through
         // it loses the real definition's fields. Set the variable to a type
         // name to follow every registration under it instead.
-        if let Ok(filter) = std::env::var("ZYNML_TYPE_TRACE") {
+        if let Ok(filter) = std::env::var("ZYNTAX_TYPE_TRACE") {
             let watched = filter != "1"
                 && (filter == "*"
                     || type_def.name.resolve_global().as_deref() == Some(filter.as_str()));

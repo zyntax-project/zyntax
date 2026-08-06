@@ -1699,7 +1699,7 @@ test = { "test" }
     }
 
     #[test]
-    fn test_parse_zynml_grammar() {
+    fn test_parse_zyntax_ext_grammar() {
         let input = include_str!("../../../zynml/ml.zyn");
 
         match parse_grammar(input) {

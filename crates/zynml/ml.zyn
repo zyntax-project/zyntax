@@ -30,9 +30,9 @@
 
 @builtin {
     // Internal dispatch aliases (language-level constructs lowered to plugin calls)
-    __internal_compute_dispatch: "$ZynML$compute",
-    __internal_render_event: "$ZynML$render_event",
-    __internal_stream_event: "$ZynML$stream_event",
+    __internal_compute_dispatch: "$Zyntax$compute",
+    __internal_render_event: "$Zyntax$render_event",
+    __internal_stream_event: "$Zyntax$stream_event",
 
     // === Tensor Operations (zrtl_tensor) ===
     tensor: "tensor_from_array",          // tensor([1.0, 2.0]) -> tensor_from_array([1.0, 2.0])
