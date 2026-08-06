@@ -4,7 +4,7 @@ use zyntax_embed::ZyntaxRuntime;
 #[ignore = "kernel probe — slow; run with cargo test -- --ignored"]
 #[test]
 fn fib_kernel_runs() {
-    let src = include_str!("../examples/bench_fib.zynml");
+    let src = include_str!("../benchmarks/bench_fib.zynml");
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
     let program = grammar.parse_with_filename(src, "<probe>").expect("parse");
     let rt = ZyntaxRuntime::new().expect("rt");

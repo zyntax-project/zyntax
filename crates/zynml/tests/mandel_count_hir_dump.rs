@@ -5,7 +5,7 @@ use zyntax_embed::ZyntaxRuntime;
 #[test]
 #[ignore = "diagnostic only"]
 fn dump_mandel_count_hir() {
-    let src = include_str!("../examples/bench_mandelbrot.zynml");
+    let src = include_str!("../benchmarks/bench_mandelbrot.zynml");
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
     let program = grammar.parse_with_filename(src, "<dump>").expect("parse");
     let rt = ZyntaxRuntime::new().expect("rt");

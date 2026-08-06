@@ -1,6 +1,6 @@
 //! ML micro-benchmark runner for ZynML (`ml_bench`).
 //!
-//! Mirrors `crates/zynml/examples/bench_runner.rs` in spirit — a
+//! Mirrors `crates/zynml/benchmarks/bench_runner.rs` in spirit — a
 //! phase-tagged registry of ML kernels, each measured on the tiers we
 //! control, separating compile time from execute time, median-of-N,
 //! JSON out — but oriented at the ML roadmap (`docs/ML_ROADMAP.md`)

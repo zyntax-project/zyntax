@@ -14,8 +14,8 @@ use zyntax_compiler::{
 };
 use zyntax_embed::{LanguageGrammar, ZyntaxRuntime, ZyntaxValue};
 
-const MANDEL: &str = include_str!("../examples/bench_mandelbrot.zynml");
-const NBODY: &str = include_str!("../examples/bench_nbody.zynml");
+const MANDEL: &str = include_str!("../benchmarks/bench_mandelbrot.zynml");
+const NBODY: &str = include_str!("../benchmarks/bench_nbody.zynml");
 
 fn lower(source: &str) -> HirModule {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");

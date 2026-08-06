@@ -11,8 +11,8 @@ use zyntax_embed::ZyntaxRuntime;
 #[test]
 #[ignore = "diagnostic only"]
 fn audit_nbody_osr_layouts() {
-    let src = std::fs::read_to_string("examples/bench_nbody.zynml")
-        .or_else(|_| std::fs::read_to_string("crates/zynml/examples/bench_nbody.zynml"))
+    let src = std::fs::read_to_string("benchmarks/bench_nbody.zynml")
+        .or_else(|_| std::fs::read_to_string("crates/zynml/benchmarks/bench_nbody.zynml"))
         .expect("nbody source");
 
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");

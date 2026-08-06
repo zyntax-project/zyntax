@@ -34,8 +34,8 @@ fn report(label: &str, source: &str) {
 fn inline_check_all_benches() {
     report(
         "mandelbrot",
-        include_str!("../examples/bench_mandelbrot.zynml"),
+        include_str!("../benchmarks/bench_mandelbrot.zynml"),
     );
-    report("nbody", include_str!("../examples/bench_nbody.zynml"));
-    report("fib", include_str!("../examples/bench_fib.zynml"));
+    report("nbody", include_str!("../benchmarks/bench_nbody.zynml"));
+    report("fib", include_str!("../benchmarks/bench_fib.zynml"));
 }

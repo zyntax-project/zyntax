@@ -45,6 +45,12 @@ indexmap = "2.2"
 name = "computational_kernels"
 harness = false
 
+# Lives under `benchmarks/` rather than `examples/` so the suite and its
+# kernels are not mistaken for sample programs.
+[[example]]
+name = "bench_runner"
+path = "benchmarks/bench_runner.rs"
+
 [features]
 default = []
 llvm-backend = ["zyntax_embed/llvm-backend"]

@@ -10,7 +10,7 @@ use zyntax_embed::ZyntaxRuntime;
 #[test]
 #[ignore = "diagnostic only — reports tier-up behavior call by call"]
 fn mandelbrot_tiered_call_sequence() {
-    let src = include_str!("../examples/bench_mandelbrot.zynml");
+    let src = include_str!("../benchmarks/bench_mandelbrot.zynml");
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
     let program = grammar.parse_with_filename(src, "<probe>").expect("parse");
     let rt = ZyntaxRuntime::new().expect("rt");

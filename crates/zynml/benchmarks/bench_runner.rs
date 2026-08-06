@@ -1,7 +1,7 @@
 //! Benchmark suite runner for ZynML.
 //!
 //! Measures each `bench_*.zynml` source under
-//! `crates/zynml/examples/` across the targets we control today:
+//! `crates/zynml/benchmarks/` across the targets we control today:
 //!
 //!   * `zyntax-interp`     — BC interpreter, NO HIR optimization
 //!                            pipeline. Floor for what the
@@ -25,11 +25,10 @@
 //!     cargo run --release --package zynml --example bench_runner -- --out /tmp/bench.json
 //!     cargo run --release --package zynml --example bench_runner -- --runs 5
 //!
-//! Sibling-project precedent: the layout (per-kernel JSON, page
-//! reads JSON and renders bars) mirrors `wren_lift/site/benchmark/`
-//! and `rayzor/compiler/benchmarks/`. Kept deliberately small —
-//! adds external-language targets (python3, node, …) as a
-//! follow-up once the comparison story is worth the CI complexity.
+//! The layout — per-kernel JSON, page reads the JSON and renders bars
+//! — is kept deliberately small. External-language targets (python3,
+//! node, …) are a follow-up, once the comparison is worth the CI
+//! complexity.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -175,7 +174,7 @@ struct Meta {
 }
 
 /// Each benchmark source lives at
-/// `crates/zynml/examples/<name>.zynml` and gets run across every
+/// `crates/zynml/benchmarks/<name>.zynml` and gets run across every
 /// target listed in [`TARGETS`]. The second tuple element is the
 /// expected `Debug`-formatted result; the bench harness asserts
 /// every successful iteration matches it and fails the run with a
@@ -455,7 +454,7 @@ fn main() {
             }
         }
         let source_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("examples/{kernel}.zynml"));
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("benchmarks/{kernel}.zynml"));
         let source = fs::read_to_string(&source_path)
             .unwrap_or_else(|e| panic!("read {source_path:?}: {e}"));
 

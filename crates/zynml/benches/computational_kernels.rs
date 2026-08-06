@@ -32,8 +32,8 @@ use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_compiler::{run_interp_safe_opts, HirModule};
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
-const MANDELBROT_SRC: &str = include_str!("../examples/bench_mandelbrot.zynml");
-const NBODY_SRC: &str = include_str!("../examples/bench_nbody.zynml");
+const MANDELBROT_SRC: &str = include_str!("../benchmarks/bench_mandelbrot.zynml");
+const NBODY_SRC: &str = include_str!("../benchmarks/bench_nbody.zynml");
 
 /// Lower a ZynML source the same way the runtime does, but stop at
 /// the raw `HirModule` so the harness can apply (or skip) opts.
