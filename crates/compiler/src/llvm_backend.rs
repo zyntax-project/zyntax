@@ -543,7 +543,11 @@ impl<'ctx> LLVMBackend<'ctx> {
             .name
             .resolve_global()
             .unwrap_or_else(|| format!("{:?}", func.name));
-        let fn_name = if func.is_external || actual_name == "main" {
+        let fn_name = if func.is_external {
+            // An extern's declared name is an alias; the symbol the host
+            // actually provides is the link name, when one is set.
+            func.link_name.clone().unwrap_or(actual_name)
+        } else if actual_name == "main" {
             actual_name
         } else {
             // Regular functions use mangled name with HirId
@@ -3787,9 +3791,15 @@ impl<'ctx> LLVMBackend<'ctx> {
                     Some(sig) => self.box_dynamic_args(sig, &raw_args),
                     // No signature to box against. A declaration can still
                     // describe an address as an integer — the two are one
-                    // register class to Cranelift, so only LLVM sees the
-                    // difference — and the declared form is what the callee
-                    // reads.
+                    // register class to the ground tier, so only LLVM sees
+                    // the difference — and the declared form is what the
+                    // callee reads. With a signature present this is NOT
+                    // applied: a parameter it does not mark dynamic may
+                    // expect a boxed representation, and an address forced
+                    // through as an integer satisfies the verifier while
+                    // handing the callee a meaningless handle. The compile
+                    // failing verification keeps the tier below running
+                    // instead.
                     None => {
                         let param_types = function.get_type().get_param_types();
                         let mut out = Vec::with_capacity(raw_args.len());

@@ -667,8 +667,15 @@ impl InterpRuntime {
             .map(|(name, ptr, _)| (name.as_str(), *ptr))
             .collect();
         syms.extend(osr::osr_runtime_symbols());
-        let cranelift_inner = CraneliftBackend::with_runtime_symbols(&syms)
+        #[allow(unused_mut)]
+        let mut cranelift_inner = CraneliftBackend::with_runtime_symbols(&syms)
             .map_err(|e| CompilerError::Backend(format!("cranelift init failed: {e}")))?;
+        // With an LLVM tier above it, Cranelift's helpers are not resume
+        // points worth having: tier 1 emits the same code as tier 0, and a
+        // transfer into a probe-free helper consumes the loop's one chance
+        // to move up.
+        #[cfg(feature = "llvm-backend")]
+        cranelift_inner.set_publish_osr_helpers(false);
         let cranelift = Arc::new(ZyntaxCraneliftBackend::new(cranelift_inner));
 
         let func_arcs: HashMap<HirId, (Arc<zyntax_compiler::hir::HirFunction>, u64)> = module
@@ -851,6 +858,7 @@ impl InterpRuntime {
                             // published against its own function's bead.
                             for (func_id, site, code) in be.take_pending_osr_helpers() {
                                 if let Some(bead_id) = bead_ids_for_bg.get(&func_id) {
+                                    zyntax_compiler::osr::note_llvm_helper(code as usize);
                                     zyntax_compiler::osr::publish_helper(*bead_id, site, code);
                                 }
                             }

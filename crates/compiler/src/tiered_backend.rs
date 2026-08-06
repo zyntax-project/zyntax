@@ -283,6 +283,14 @@ impl TieredBackend {
             (None, None)
         };
 
+        // With an LLVM tier above it, Cranelift's helpers are not resume
+        // points worth having: tier 1 emits the same code as tier 0, and a
+        // transfer into it consumes the loop's one chance to move up.
+        #[cfg(feature = "llvm-backend")]
+        if llvm.is_some() {
+            cranelift.with_lock(|be| be.set_publish_osr_helpers(false));
+        }
+
         let adapter = Arc::new(TieredAdapter::new(make_policies(&config)));
 
         Ok(Self {

@@ -120,11 +120,26 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
                         }
                         // Intrinsics don't reach HIR functions in this module.
                         HirCallable::Intrinsic(_) => {}
-                        // Symbol calls reference an extern function by name.
-                        // Record the name so we can resolve it back to a HirId
-                        // (and emit a declaration for it) after the walk.
+                        // Symbol calls reference a function by name. Usually
+                        // that is an extern, recorded here and resolved to a
+                        // declaration after the walk — but a synthesized
+                        // module function can be called this way too, and its
+                        // body has to come along like any direct callee's.
                         HirCallable::Symbol(name) => {
-                            called_extern_names.insert(name.clone());
+                            let mut defined_here = false;
+                            for (fid, f) in &module.functions {
+                                if !f.is_external
+                                    && f.name.resolve_global().as_deref() == Some(name.as_str())
+                                {
+                                    defined_here = true;
+                                    if !reachable.contains(fid) {
+                                        worklist.push(*fid);
+                                    }
+                                }
+                            }
+                            if !defined_here {
+                                called_extern_names.insert(name.clone());
+                            }
                         }
                     },
                     HirInstruction::IndirectCall { .. }

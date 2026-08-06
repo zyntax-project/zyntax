@@ -108,8 +108,13 @@ impl JitBackend for ZyntaxCraneliftBackend {
             // alongside the new entry pointer atomically. Returning the
             // null sentinel suppresses the broker's own swap_compiled
             // call so the OSR-aware swap is the only one that runs.
+            //
+            // When a higher tier will publish its own helpers, this
+            // tier's stay unpublished: they would fill the slots first
+            // with code no better than what the loop is already running,
+            // and a frame resumed in a helper never probes again.
             let osr_pairs = backend.take_pending_osr_helpers();
-            if !osr_pairs.is_empty() {
+            if !osr_pairs.is_empty() && backend.publish_osr_helpers() {
                 let osr_entries: Vec<beadie::OsrEntry> = osr_pairs
                     .into_iter()
                     .map(|(site, code)| beadie::OsrEntry { site, code })

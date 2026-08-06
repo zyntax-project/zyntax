@@ -304,6 +304,10 @@ pub struct CraneliftBackend {
     /// Tier the next `compile_function` call should target. 0 = baseline,
     /// 1+ = optimized. Used by OSR codegen to decide whether to emit
     /// back-edge probes (tier 0 only) and OSR helpers (tier ≥ 1 only).
+    /// Whether OSR helpers from this backend get published. See
+    /// [`Self::publish_osr_helpers`].
+    publish_osr_helpers: bool,
+
     /// Defaults to 0; set via [`Self::set_compile_tier`] before each
     /// `compile_function` call from the tiered runtime.
     compile_tier: usize,
@@ -502,6 +506,7 @@ impl CraneliftBackend {
             inferred_extern_sigs: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
             compile_tier: 0,
+            publish_osr_helpers: true,
             emit_osr_probes: true,
             compile_bead_id: 0,
             pending_osr_helpers: Vec::new(),
@@ -547,6 +552,19 @@ impl CraneliftBackend {
     /// codegen to decide whether to emit back-edge probes / helpers.
     pub fn set_compile_tier(&mut self, tier: usize) {
         self.compile_tier = tier;
+    }
+
+    /// Whether this backend's OSR helpers should be published as resume
+    /// points. When a higher tier exists its helper is the one worth
+    /// resuming into; publishing this tier's would win the race to the
+    /// slot with code no better than what is already running.
+    pub fn publish_osr_helpers(&self) -> bool {
+        self.publish_osr_helpers
+    }
+
+    /// See [`Self::publish_osr_helpers`].
+    pub fn set_publish_osr_helpers(&mut self, publish: bool) {
+        self.publish_osr_helpers = publish;
     }
 
     /// Set the bead id for subsequent `compile_function` calls. Embedded
