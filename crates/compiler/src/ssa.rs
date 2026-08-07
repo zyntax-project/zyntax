@@ -786,6 +786,7 @@ impl SsaBuilder {
         }
 
         // Fill remaining incomplete phis
+        self.recompute_cfg_edges();
         self.fill_incomplete_phis();
 
         // Build def-use chains
@@ -1090,6 +1091,7 @@ impl SsaBuilder {
         }
 
         // Fill remaining incomplete phis (from IDF placement)
+        self.recompute_cfg_edges();
         self.fill_incomplete_phis();
 
         // NOTE: verify_and_fix_phi_incoming() is DISABLED because it can create new phis
@@ -6430,6 +6432,17 @@ impl SsaBuilder {
     /// Write a variable in SSA form
     fn write_variable(&mut self, var: InternedString, block: HirId, value: HirId) {
         log::debug!("[SSA] write_variable({:?}, {:?}, {:?})", var, block, value);
+        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+            eprintln!(
+                "[ssa] write {} at {:?} = {:?}",
+                var.resolve_global().unwrap_or_default(),
+                block,
+                value
+            );
+            if std::env::var("ZYNTAX_SSA_TRACE").as_deref() == Ok("2") {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
         self.definitions.get_mut(&block).unwrap().insert(var, value);
 
         // Track variable writes for loop phi placement
@@ -6449,13 +6462,29 @@ impl SsaBuilder {
     }
 
     fn read_variable(&mut self, var: InternedString, block: HirId) -> HirId {
-        if let Some(&value) = self.definitions.get(&block).and_then(|defs| defs.get(&var)) {
-            log::debug!(
-                "[SSA] read_variable({:?}, {:?}) = {:?} (found in definitions)",
-                var,
+        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+            let preds = self
+                .function
+                .blocks
+                .get(&block)
+                .map(|b| b.predecessors.len())
+                .unwrap_or(0);
+            eprintln!(
+                "[ssa] read {} at {:?} (preds={}, in_defs={}, sealed={}, idf_done={})",
+                var.resolve_global().unwrap_or_default(),
                 block,
-                value
+                preds,
+                self.definitions
+                    .get(&block)
+                    .is_some_and(|d| d.contains_key(&var)),
+                self.sealed_blocks.contains(&block),
+                self.idf_placement_done
             );
+        }
+        if let Some(&value) = self.definitions.get(&block).and_then(|defs| defs.get(&var)) {
+            if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+                eprintln!("[ssa]   -> {value:?} (defs)");
+            }
             return value;
         }
 
@@ -6497,52 +6526,82 @@ impl SsaBuilder {
             // After IDF placement, don't create new phis
             // Instead, try to read from predecessors to find the value
             if self.idf_placement_done {
-                // CRITICAL: Create a temporary placeholder phi to break cycles in loops
-                // Without this, while loop CFG (header -> body -> header) causes infinite recursion
+                // A block the IDF pass never saw — desugaring creates
+                // blocks after phi placement ran. The rules are the same
+                // as the sealed multi-predecessor case below: agreeing
+                // predecessors collapse to their value, disagreeing ones
+                // require a real phi here. Taking the first value found
+                // instead would thread one arm's definition across a
+                // merge the other arms also reach.
+                //
+                // The placeholder breaks read cycles on loop back-edges;
+                // it either becomes the phi's result or is substituted
+                // away.
                 let ty = self.var_types.get(&var).cloned().unwrap_or(HirType::I64);
                 let placeholder = self.create_value(ty.clone(), HirValueKind::Instruction);
-
-                // Write the placeholder to break cycles
                 self.write_variable(var, block, placeholder);
 
-                // Now try reading from each predecessor
-                let mut found_value = None;
+                let mut incoming: Vec<(HirId, HirId)> = Vec::new();
                 for pred in &predecessors {
                     let val = self.read_variable(var, *pred);
-                    // Check if it's not undef and not our placeholder
-                    if val != placeholder {
-                        if let Some(v) = self.function.values.get(&val) {
-                            if !matches!(v.kind, HirValueKind::Undef) {
-                                found_value = Some(val);
-                                break;
-                            }
-                        }
+                    incoming.push((val, *pred));
+                }
+
+                let unique: HashSet<HirId> = incoming
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .filter(|v| *v != placeholder)
+                    .filter(|v| {
+                        !matches!(
+                            self.function.values.get(v).map(|v| &v.kind),
+                            Some(HirValueKind::Undef)
+                        )
+                    })
+                    .collect();
+
+                return match unique.len() {
+                    0 => {
+                        let undef = self.create_undef(ty);
+                        self.write_variable(var, block, undef);
+                        self.substitute_value(placeholder, undef);
+                        undef
                     }
-                }
-
-                if let Some(val) = found_value {
-                    // Found a real value - update definition to use it.
-                    self.write_variable(var, block, val);
-                    // The recursive `read_variable(pred)` calls above
-                    // may have observed `placeholder` on a CFG back-
-                    // edge (loop header → body → header) and threaded
-                    // it into an instruction operand or phi-incoming
-                    // by the time we determined the real value. Those
-                    // references would otherwise dangle — the
-                    // placeholder HirId has no defining instruction
-                    // or phi anywhere, so the final SSA validator
-                    // fails with "Use has undefined definition". A
-                    // global substitution of placeholder→val
-                    // patches up every consumer in one sweep.
-                    self.substitute_value(placeholder, val);
-                    return val;
-                }
-
-                // All predecessors returned undef or placeholder - variable is truly undefined
-                let undef = self.create_undef(ty);
-                self.write_variable(var, block, undef);
-                self.substitute_value(placeholder, undef);
-                return undef;
+                    1 => {
+                        let val = *unique.iter().next().unwrap();
+                        self.write_variable(var, block, val);
+                        self.substitute_value(placeholder, val);
+                        val
+                    }
+                    _ => {
+                        // Preds disagree: the placeholder becomes a real
+                        // phi. An incoming that resolved to the
+                        // placeholder itself is loop-invariance on a
+                        // back edge; on a forward edge it means no
+                        // definition reaches, and the value is undef.
+                        let incoming = incoming
+                            .into_iter()
+                            .map(|(val, pred)| {
+                                if val == placeholder && !self.edge_is_back(block, pred) {
+                                    (self.create_undef(ty.clone()), pred)
+                                } else {
+                                    (val, pred)
+                                }
+                            })
+                            .collect();
+                        self.incomplete_phis.insert(phi_key, placeholder);
+                        self.function
+                            .blocks
+                            .get_mut(&block)
+                            .unwrap()
+                            .phis
+                            .push(HirPhi {
+                                result: placeholder,
+                                ty,
+                                incoming,
+                            });
+                        placeholder
+                    }
+                };
             }
 
             let ty = self.var_types.get(&var).cloned().unwrap_or(HirType::I64); // Default type
@@ -6588,23 +6647,26 @@ impl SsaBuilder {
                 // Temporarily write to break cycles
                 self.write_variable(var, block, phi_val);
 
-                // Try reading from each predecessor until we find the value
+                // Read every predecessor. A phi needs an incoming for
+                // each edge — an undef predecessor contributes an
+                // explicit undef, not a missing argument.
                 let mut found_values = Vec::new();
                 for pred in &predecessors {
                     let val = self.read_variable(var, *pred);
-                    // Check if it's not undef
-                    if let Some(v) = self.function.values.get(&val) {
-                        if !matches!(v.kind, HirValueKind::Undef) {
-                            found_values.push((val, *pred));
-                        }
-                    }
+                    found_values.push((val, *pred));
                 }
 
-                // If all values are the same (and not the phi itself), just return that value
+                // Uniqueness is judged on real values only.
                 let unique_vals: HashSet<_> = found_values
                     .iter()
                     .map(|(v, _)| v)
                     .filter(|&&v| v != phi_val)
+                    .filter(|&&v| {
+                        !matches!(
+                            self.function.values.get(&v).map(|v| &v.kind),
+                            Some(HirValueKind::Undef)
+                        )
+                    })
                     .collect();
 
                 if unique_vals.len() == 1 {
@@ -6623,7 +6685,20 @@ impl SsaBuilder {
                     self.substitute_value(phi_val, undef);
                     return undef;
                 } else {
-                    // Need a real phi node
+                    // Need a real phi node. A self-incoming is
+                    // loop-invariance on a back edge; on a forward edge
+                    // it means no definition reaches, and the value is
+                    // undef.
+                    let incoming = found_values
+                        .into_iter()
+                        .map(|(val, pred)| {
+                            if val == phi_val && !self.edge_is_back(block, pred) {
+                                (self.create_undef(ty.clone()), pred)
+                            } else {
+                                (val, pred)
+                            }
+                        })
+                        .collect();
                     self.function
                         .blocks
                         .get_mut(&block)
@@ -6632,7 +6707,7 @@ impl SsaBuilder {
                         .push(HirPhi {
                             result: phi_val,
                             ty,
-                            incoming: found_values,
+                            incoming,
                         });
                     return phi_val;
                 }
@@ -6818,6 +6893,19 @@ impl SsaBuilder {
                 // Use read_variable to get the value - this will traverse phis if needed
                 let pred_val = self.read_variable(var, pred);
                 log::debug!("[SSA]   from pred {:?} → value {:?}", pred, pred_val);
+                // A read that resolves to this phi through a forward
+                // edge found no definition on that path.
+                let pred_val = if pred_val == phi_val && !self.edge_is_back(block, pred) {
+                    let ty = self
+                        .function
+                        .values
+                        .get(&phi_val)
+                        .map(|v| v.ty.clone())
+                        .unwrap_or(crate::hir::HirType::I64);
+                    self.create_undef(ty)
+                } else {
+                    pred_val
+                };
                 incoming.push((pred_val, pred));
             }
 
@@ -6832,6 +6920,56 @@ impl SsaBuilder {
             {
                 phi.incoming = incoming;
             }
+        }
+    }
+
+    /// Whether the CFG edge `pred -> block` is a back edge: `block`
+    /// dominates `pred`. A phi incoming that names the phi itself is
+    /// meaningful only on such an edge (the value is loop-invariant);
+    /// on any other edge it means no definition reaches, and the
+    /// incoming is undef. Reachability is not enough here — inside an
+    /// enclosing loop every block reaches every other.
+    fn edge_is_back(&self, block: HirId, pred: HirId) -> bool {
+        crate::osr::blocks_dominated_by(&self.function, block).contains(&pred)
+    }
+
+    /// Recompute every block's predecessor and successor lists from its
+    /// terminator. Desugaring — match arms, pattern chains, operators —
+    /// creates blocks and wires terminators without maintaining the
+    /// edge lists, and phi filling walks predecessors: a block whose
+    /// list is missing an edge reads as unreachable and resolves
+    /// variables to undef, silently collapsing phis its merges need.
+    /// The terminators are the truth; derive the lists from them.
+    fn recompute_cfg_edges(&mut self) {
+        use std::collections::HashMap as Map;
+        let mut preds: Map<HirId, Vec<HirId>> = Map::new();
+        let mut succs: Map<HirId, Vec<HirId>> = Map::new();
+        for (id, block) in &self.function.blocks {
+            let targets: Vec<HirId> = match &block.terminator {
+                crate::hir::HirTerminator::Branch { target } => vec![*target],
+                crate::hir::HirTerminator::CondBranch {
+                    true_target,
+                    false_target,
+                    ..
+                } => vec![*true_target, *false_target],
+                crate::hir::HirTerminator::Switch { cases, default, .. } => {
+                    let mut t: Vec<HirId> = cases.iter().map(|(_, b)| *b).collect();
+                    t.push(*default);
+                    t
+                }
+                _ => vec![],
+            };
+            for target in &targets {
+                let entry = preds.entry(*target).or_default();
+                if !entry.contains(id) {
+                    entry.push(*id);
+                }
+            }
+            succs.insert(*id, targets);
+        }
+        for (id, block) in self.function.blocks.iter_mut() {
+            block.predecessors = preds.remove(id).unwrap_or_default();
+            block.successors = succs.remove(id).unwrap_or_default();
         }
     }
 

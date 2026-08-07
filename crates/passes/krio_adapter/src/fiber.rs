@@ -231,6 +231,15 @@ impl FiberCfg for KrioFiberBackend {
         if fiber.is_cancelled() {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
         }
+        // A finished fiber stays finished: resuming past exhaustion is an
+        // ordinary thing for a consumer loop to do, and it means Done —
+        // matching `next()` returning None forever, not a panic.
+        if matches!(
+            fiber.state(),
+            krio_fiber::FiberState::Done | krio_fiber::FiberState::Errored
+        ) {
+            return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
+        }
         let step = fiber.resume();
         encode_step(step, fiber)
     }
@@ -238,6 +247,12 @@ impl FiberCfg for KrioFiberBackend {
     unsafe fn fiber_resume_with(&self, fiber: *mut FiberRepr, value: i64) -> i64 {
         let fiber = &mut *(fiber as *mut Fiber);
         if fiber.is_cancelled() {
+            return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
+        }
+        if matches!(
+            fiber.state(),
+            krio_fiber::FiberState::Done | krio_fiber::FiberState::Errored
+        ) {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
         }
         let step = fiber.resume_with_u64(value as u64);
