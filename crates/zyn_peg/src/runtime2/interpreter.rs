@@ -1466,6 +1466,16 @@ impl<'g> GrammarInterpreter<'g> {
             "Inferred" => Type::Any,
             "Named" => {
                 let name = self.get_field_as_interned("name", fields, state)?;
+                // The gradual-typing names are language types, not
+                // nominal ones — resolving them through the registry
+                // would mint a placeholder that shadows their meaning
+                // (an `Any` field would silently lose its autoboxing).
+                match name.resolve_global().as_deref() {
+                    Some("Any") => return Ok(ParsedValue::Type(Type::Any)),
+                    Some("Unknown") => return Ok(ParsedValue::Type(Type::Unknown)),
+                    Some("Dynamic") => return Ok(ParsedValue::Type(Type::Dynamic)),
+                    _ => {}
+                }
                 // A generic argument list mixes type args and integer const
                 // args (`Buffer<f32, 4>`); partition by ParsedValue kind.
                 let (mut type_args, mut const_args) =
