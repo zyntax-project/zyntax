@@ -6500,13 +6500,17 @@ impl SsaBuilder {
     /// Recursively read variable, inserting phis as needed (before IDF)
     /// After IDF placement, this won't create new phis - it will only traverse existing ones
     fn read_variable_recursive(&mut self, var: InternedString, block: HirId) -> HirId {
-        let (predecessors, is_sealed) = {
-            let block_info = self.function.blocks.get(&block).unwrap();
-            (
-                block_info.predecessors.clone(),
-                self.sealed_blocks.contains(&block),
-            )
-        };
+        let predecessors = self.current_preds_of(block);
+        let is_sealed = self.sealed_blocks.contains(&block);
+        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+            eprintln!(
+                "[ssa]   recursive {} at {:?}: live_preds={:?} sealed={}",
+                var.resolve_global().unwrap_or_default(),
+                block,
+                predecessors,
+                is_sealed
+            );
+        }
         log::trace!(
             "[SSA] read_variable_recursive({:?}, {:?}): sealed={}, predecessors={:?}",
             var,
@@ -6921,6 +6925,34 @@ impl SsaBuilder {
                 phi.incoming = incoming;
             }
         }
+    }
+
+    /// Current predecessors of `block`, derived from terminators.
+    ///
+    /// The stored predecessor lists go stale while desugaring wires new
+    /// blocks, and a read that trusts them resolves a reachable path as
+    /// undef — which collapses merges that need a phi. Terminators are
+    /// always current.
+    fn current_preds_of(&self, block: HirId) -> Vec<HirId> {
+        let mut preds = Vec::new();
+        for (id, b) in &self.function.blocks {
+            let hits = match &b.terminator {
+                crate::hir::HirTerminator::Branch { target } => *target == block,
+                crate::hir::HirTerminator::CondBranch {
+                    true_target,
+                    false_target,
+                    ..
+                } => *true_target == block || *false_target == block,
+                crate::hir::HirTerminator::Switch { cases, default, .. } => {
+                    *default == block || cases.iter().any(|(_, b)| *b == block)
+                }
+                _ => false,
+            };
+            if hits && !preds.contains(id) {
+                preds.push(*id);
+            }
+        }
+        preds
     }
 
     /// Whether the CFG edge `pred -> block` is a back edge: `block`
@@ -11946,6 +11978,9 @@ impl SsaBuilder {
     }
 
     fn propagate_pattern_definitions(&mut self, source: HirId, target: HirId) {
+        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+            eprintln!("[ssa] propagate defs {source:?} -> {target:?}");
+        }
         let definitions = self.definitions.get(&source).cloned().unwrap_or_default();
         self.definitions
             .get_mut(&target)

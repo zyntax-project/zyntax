@@ -480,6 +480,10 @@ impl TieredBackend {
                         report.unchanged += 1;
                         continue;
                     }
+                    if let Err(reason) = reload_reaches(new_fn) {
+                        report.failed.push((name, reason.to_string()));
+                        continue;
+                    }
                     if std::env::var_os("ZYNTAX_RELOAD_TRACE").is_some() {
                         let d_old = crate::hir_dump::dump_function(old_fn, &old_module);
                         let d_new = crate::hir_dump::dump_function(new_fn, new_module);
@@ -596,6 +600,10 @@ impl TieredBackend {
                     }
                 }
                 None => {
+                    if let Err(reason) = reload_reaches(new_fn) {
+                        report.failed.push((name, reason.to_string()));
+                        continue;
+                    }
                     // Introduced by the edit: compile fresh under its
                     // own id and register it like `compile_module` does.
                     let mut body = new_fn.clone();
@@ -1092,6 +1100,36 @@ impl TieredStatistics {
             self.profile_stats.format()
         )
     }
+}
+
+/// Whether reloading `func` is within the call/loop machinery's reach.
+///
+/// A function that carries effect scaffolding — handler push/pop, op
+/// dispatch, performs — references module globals and runtime wiring
+/// the per-function recompile cannot reproduce yet; swapping it would
+/// tear dispatch out from under running scopes. Until op-table
+/// patching lands, such functions keep their running code and the
+/// report says why.
+fn reload_reaches(func: &HirFunction) -> Result<(), &'static str> {
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            match inst {
+                crate::hir::HirInstruction::PerformEffect { .. } => {
+                    return Err("performs an effect; effect reload lands with op-table patching")
+                }
+                crate::hir::HirInstruction::Call {
+                    callee: crate::hir::HirCallable::Symbol(name),
+                    ..
+                } if name.starts_with("__zyntax_effect_") => {
+                    return Err(
+                        "uses effect scaffolding; effect reload lands with op-table patching",
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Per-site live-in layout of a function's loops: site key to

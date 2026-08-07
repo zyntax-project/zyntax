@@ -703,6 +703,14 @@ impl CraneliftBackend {
 
         // Pass 2: Compile all function bodies
         for (id, function) in &module.functions {
+            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                eprintln!(
+                    "[pass2] {:?} {} external={}",
+                    id,
+                    function.name.resolve_global().unwrap_or_default(),
+                    function.is_external
+                );
+            }
             if !function.is_external {
                 // Reachability DCE: when a caller has restricted the set of
                 // functions we should compile, skip bodies outside that set.
@@ -714,7 +722,11 @@ impl CraneliftBackend {
                     }
                 }
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
-                if let Err(e) = self.compile_function_body(*id, function, module) {
+                let body_result = self.compile_function_body(*id, function, module);
+                if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                    eprintln!("[pass2] {:?} result_err={}", id, body_result.is_err());
+                }
+                if let Err(e) = body_result {
                     CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
                     let name = function.name.resolve_global().unwrap_or_default();
                     log::debug!("[CRANELIFT] Skipping function '{}': {:?}", function.name, e);
@@ -735,6 +747,9 @@ impl CraneliftBackend {
             let code_ptr = self
                 .module
                 .get_finalized_function(compiled_func.function_id);
+            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                eprintln!("[ptrs] {hir_id:?} -> {code_ptr:?}");
+            }
             self.hot_reload
                 .function_pointers
                 .write()
@@ -5733,6 +5748,13 @@ impl CraneliftBackend {
         // Store compiled function info - will get actual pointer after finalization.
         // OSR helpers don't share id-space with HIR functions; we track their
         // FuncIds in pending_osr_helpers instead, so skip this insert.
+        if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+            eprintln!(
+                "[reg] {id:?} helper_mode={} registered={}",
+                osr_helper.is_some(),
+                osr_helper.is_none()
+            );
+        }
         if osr_helper.is_none() {
             let compiled_func = CompiledFunction {
                 function_id: func_id,
@@ -8256,6 +8278,9 @@ impl CraneliftBackend {
             let code_ptr = self
                 .module
                 .get_finalized_function(compiled_func.function_id);
+            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                eprintln!("[ptrs] {hir_id:?} -> {code_ptr:?}");
+            }
             self.hot_reload
                 .function_pointers
                 .write()
