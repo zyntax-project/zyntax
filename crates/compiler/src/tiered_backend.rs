@@ -386,6 +386,12 @@ impl TieredBackend {
             // `Compiled(gen=0)` from the very first invocation.
             if let Some(p) = self.cranelift.with_lock(|be| be.get_function_ptr(*func_id)) {
                 bound.bead().eager_install(p as *mut ());
+            } else if osr::osr_trace_enabled() {
+                eprintln!(
+                    "[reload] no entry pointer for {:?} ({:?}) after module compile",
+                    function.name.resolve_global().unwrap_or_default(),
+                    func_id
+                );
             }
 
             // Allocate a stable id and publish the bead in the OSR

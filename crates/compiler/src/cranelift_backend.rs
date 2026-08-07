@@ -2948,11 +2948,29 @@ impl CraneliftBackend {
                                     // Get function address as a pointer value
                                     if let Some(&cranelift_func_id) = self.function_map.get(func_id)
                                     {
-                                        let func_ref = self
-                                            .module
-                                            .declare_func_in_func(cranelift_func_id, builder.func);
                                         let ptr_ty = types::I64;
-                                        let addr = builder.ins().func_addr(ptr_ty, func_ref);
+                                        let addr = if self.reloadable_calls
+                                            && !self.external_link_names.contains_key(func_id)
+                                        {
+                                            let cell = crate::reload::call_cell_addr(
+                                                self.reload_key,
+                                                *func_id,
+                                            )
+                                                as i64;
+                                            let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                            builder.ins().load(
+                                                ptr_ty,
+                                                MemFlags::trusted(),
+                                                cell_v,
+                                                0,
+                                            )
+                                        } else {
+                                            let func_ref = self.module.declare_func_in_func(
+                                                cranelift_func_id,
+                                                builder.func,
+                                            );
+                                            builder.ins().func_addr(ptr_ty, func_ref)
+                                        };
                                         if let Some(result_id) = result {
                                             self.value_map.insert(*result_id, addr);
                                         }
@@ -4122,10 +4140,25 @@ impl CraneliftBackend {
 
                             // For simple single-block functions, just return the function pointer
                             if let Some(&cranelift_func_id) = self.function_map.get(function) {
-                                let local_func_ref = self
-                                    .module
-                                    .declare_func_in_func(cranelift_func_id, builder.func);
-                                let func_ptr = builder.ins().func_addr(ptr_ty, local_func_ref);
+                                // The address taken is what a fiber or callback
+                                // enters through later — under reload it has to
+                                // be the function's *current* entry, read at
+                                // creation time, not the one this caller was
+                                // compiled against.
+                                let func_ptr = if self.reloadable_calls
+                                    && !self.external_link_names.contains_key(function)
+                                {
+                                    let cell =
+                                        crate::reload::call_cell_addr(self.reload_key, *function)
+                                            as i64;
+                                    let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                    builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
+                                } else {
+                                    let local_func_ref = self
+                                        .module
+                                        .declare_func_in_func(cranelift_func_id, builder.func);
+                                    builder.ins().func_addr(ptr_ty, local_func_ref)
+                                };
                                 self.value_map.insert(*result, func_ptr);
                             } else {
                                 warn!(" CreateClosure: Lambda function {:?} not found", function);
@@ -5639,6 +5672,12 @@ impl CraneliftBackend {
                 "[Cranelift] IR verification failed for function '{}': {}",
                 function.name, errors
             );
+            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                eprintln!(
+                    "[CRANELIFT-SKIP] failing CLIF:\n{}",
+                    self.codegen_context.func.display()
+                );
+            }
             return Err(CompilerError::Backend(format!(
                 "Cranelift IR verification failed for function '{}': {}",
                 function.name, errors
@@ -6876,12 +6915,22 @@ impl CraneliftBackend {
                     }
                     HirCallable::FuncRef(func_id) => {
                         // Get function address (same as main path)
-                        let cranelift_func = self.function_map[func_id];
-                        let func_ref = self
-                            .module
-                            .declare_func_in_func(cranelift_func, builder.func);
                         let ptr_ty = self.module.target_config().pointer_type();
-                        let addr = builder.ins().func_addr(ptr_ty, func_ref);
+                        let addr = if self.reloadable_calls
+                            && self.function_map.contains_key(func_id)
+                            && !self.external_link_names.contains_key(func_id)
+                        {
+                            let cell =
+                                crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
+                            let cell_v = builder.ins().iconst(ptr_ty, cell);
+                            builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
+                        } else {
+                            let cranelift_func = self.function_map[func_id];
+                            let func_ref = self
+                                .module
+                                .declare_func_in_func(cranelift_func, builder.func);
+                            builder.ins().func_addr(ptr_ty, func_ref)
+                        };
                         if let Some(result_id) = result {
                             self.value_map.insert(*result_id, addr);
                         }

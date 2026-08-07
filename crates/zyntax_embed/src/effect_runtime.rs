@@ -969,7 +969,34 @@ const fn params6(
 /// will introduce an equivalent for their interpreter-backed runtime
 /// in Phase B.
 #[cfg(feature = "native")]
-pub fn register_effect_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
+/// Where typed runtime symbols land — both runtimes expose the same
+/// registration method.
+pub trait TypedSymbolSink {
+    fn register_function_typed(&mut self, name: &'static str, ptr: *const u8, sig: ZrtlSymbolSig);
+
+    /// Hand the same table to an interpreter tier, where one exists.
+    /// Runtimes that dispatch natively from the start have nothing to
+    /// feed and keep the default.
+    fn register_zrtl_symbols(&mut self, _symbols: &[zyntax_compiler::zrtl::RuntimeSymbolInfo]) {}
+}
+
+impl TypedSymbolSink for crate::runtime::ZyntaxRuntime {
+    fn register_function_typed(&mut self, name: &'static str, ptr: *const u8, sig: ZrtlSymbolSig) {
+        crate::runtime::ZyntaxRuntime::register_function_typed(self, name, ptr, sig);
+    }
+
+    fn register_zrtl_symbols(&mut self, symbols: &[zyntax_compiler::zrtl::RuntimeSymbolInfo]) {
+        crate::runtime::ZyntaxRuntime::register_zrtl_symbols(self, symbols);
+    }
+}
+
+impl TypedSymbolSink for crate::runtime::TieredRuntime {
+    fn register_function_typed(&mut self, name: &'static str, ptr: *const u8, sig: ZrtlSymbolSig) {
+        crate::runtime::TieredRuntime::register_function_typed(self, name, ptr, sig);
+    }
+}
+
+pub fn register_effect_runtime_symbols(runtime: &mut impl TypedSymbolSink) {
     // push_handler(effect_id: u64, handler_state: *u8, op_table: *u8, async_mask: u64) -> u64
     runtime.register_function_typed(
         "__zyntax_effect_push_handler",
@@ -1785,7 +1812,7 @@ pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolI
 /// (`crate::runtime`, gated behind `native`); the wasm/parse-only build
 /// never constructs that runtime.
 #[cfg(feature = "native")]
-pub fn register_fiber_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime) {
+pub fn register_fiber_runtime_symbols(runtime: &mut impl TypedSymbolSink) {
     let infos = fiber_runtime_symbol_infos();
     for info in &infos {
         runtime.register_function_typed(info.name, info.ptr, info.sig.unwrap());

@@ -3334,7 +3334,7 @@ impl TieredRuntime {
             backend.register_runtime_symbol(name, ptr);
         }
 
-        Ok(Self {
+        let mut runtime = Self {
             backend,
             function_ids: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -3346,7 +3346,19 @@ impl TieredRuntime {
             import_resolvers: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
-        })
+        };
+
+        // The effect and fiber runtime, exactly as the classic runtime
+        // registers it — handler stacks, op dispatch, `krio_fiber_*`.
+        crate::effect_runtime::register_effect_runtime_symbols(&mut runtime);
+        crate::effect_runtime::register_fiber_runtime_symbols(&mut runtime);
+        let _ = krio_adapter::fiber::install();
+        runtime
+            .backend
+            .rebuild_with_accumulated_symbols()
+            .map_err(|e| RuntimeError::Execution(format!("rebuild_jit: {e}")))?;
+
+        Ok(runtime)
     }
 
     /// Register an import resolver callback. Same shape as
@@ -3794,6 +3806,78 @@ impl TieredRuntime {
     /// Load a module from source code using a registered language grammar
     ///
     /// See `ZyntaxRuntime::load_module` for full documentation.
+    /// Register a host function with its call signature, mirroring
+    /// [`ZyntaxRuntime::register_function_typed`]: the symbol reaches
+    /// the JIT's resolution table and the signature reaches call-site
+    /// lowering and the parser's extern declarations.
+    pub fn register_function_typed(
+        &mut self,
+        name: &'static str,
+        ptr: *const u8,
+        sig: zyntax_compiler::zrtl::ZrtlSymbolSig,
+    ) {
+        self.backend.register_runtime_symbol(name, ptr);
+        self.plugin_signatures.insert(name.to_string(), sig);
+        let info = zyntax_compiler::zrtl::RuntimeSymbolInfo {
+            name,
+            ptr,
+            sig: Some(sig),
+        };
+        self.backend.register_symbol_signatures(&[info]);
+    }
+
+    /// Compile a pre-parsed typed program, mirroring
+    /// [`ZyntaxRuntime::compile_typed_program`]. This is the path a
+    /// `Grammar2`-based frontend takes; `load_module` covers the
+    /// interpreter-grammar one.
+    pub fn compile_typed_program(
+        &mut self,
+        mut program: zyntax_typed_ast::TypedProgram,
+    ) -> RuntimeResult<Vec<String>> {
+        capture_runtime_events_from_program(
+            &mut program,
+            &mut self.runtime_events,
+            self.event_sink.as_ref(),
+        );
+        let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
+
+        let function_names: Vec<String> = hir_module
+            .functions
+            .values()
+            .filter(|f| !f.is_external)
+            .filter_map(|f| f.name.resolve_global())
+            .collect();
+
+        self.compile_module(hir_module)?;
+        Ok(function_names)
+    }
+
+    /// Reload a pre-parsed typed program against the running module —
+    /// the typed-program twin of [`Self::reload_module_source`].
+    pub fn reload_typed_program(
+        &mut self,
+        mut program: zyntax_typed_ast::TypedProgram,
+    ) -> RuntimeResult<zyntax_compiler::reload::ReloadReport> {
+        capture_runtime_events_from_program(
+            &mut program,
+            &mut self.runtime_events,
+            self.event_sink.as_ref(),
+        );
+        let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
+        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+            let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
+        }
+        self.backend
+            .reload_module(&hir_module)
+            .map_err(|e| RuntimeError::Execution(e.to_string()))
+    }
+
     /// Native entry pointer for `name`, or `None` if unknown. The
     /// pointer stays valid for the life of the runtime; a reload swaps
     /// what new calls dispatch to, not what this pointer points at.
