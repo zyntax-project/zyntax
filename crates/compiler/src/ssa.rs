@@ -6927,14 +6927,24 @@ impl SsaBuilder {
         }
     }
 
-    /// Current predecessors of `block`, derived from terminators.
+    /// Current predecessors of `block`: the stored list unioned with
+    /// what terminators say.
     ///
-    /// The stored predecessor lists go stale while desugaring wires new
-    /// blocks, and a read that trusts them resolves a reachable path as
-    /// undef — which collapses merges that need a phi. Terminators are
-    /// always current.
+    /// Each source alone lies in a different direction. The stored
+    /// lists are seeded from the typed CFG — the whole truth for
+    /// CFG-level merges whose arms have not been translated yet — but
+    /// desugaring wires new blocks without maintaining them. The
+    /// terminators cover the desugared wiring, but say nothing about a
+    /// CFG edge whose block the scheduler simply has not reached. A
+    /// read that misses an edge from either side resolves a reachable
+    /// path as undef and collapses a merge that needs a phi.
     fn current_preds_of(&self, block: HirId) -> Vec<HirId> {
-        let mut preds = Vec::new();
+        let mut preds: Vec<HirId> = self
+            .function
+            .blocks
+            .get(&block)
+            .map(|b| b.predecessors.clone())
+            .unwrap_or_default();
         for (id, b) in &self.function.blocks {
             let hits = match &b.terminator {
                 crate::hir::HirTerminator::Branch { target } => *target == block,

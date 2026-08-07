@@ -168,13 +168,12 @@ fn a_handler_edit_reloads_but_dispatch_keeps_the_old_implementation_for_now() {
 }
 
 /// The FSM shape that observes an event and folds it in a match arm,
-/// all inside a `with` scope, still loses the arm's assignment across
-/// the merge: the read that resolves the merge runs before the match's
-/// edges are fully wired, so the collapse fires on incomplete
-/// predecessors and no join phi forms. Un-ignore when the
-/// translation-order gap is closed.
+/// all inside a `with` scope: the arm's assignment must reach the
+/// merge. The scheduler can translate the merge's reader before every
+/// arm is wired, so predecessor knowledge has to combine the CFG's
+/// up-front edges with the terminators desugaring wires later — losing
+/// either side collapses the merge without its phi.
 #[test]
-#[ignore = "match-arm assignment inside `with` reads its merge before the match's edges exist"]
 fn a_match_arm_assignment_inside_with_reaches_the_merge() {
     let mut rt = runtime();
     let src = r#"
