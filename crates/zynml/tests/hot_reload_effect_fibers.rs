@@ -132,13 +132,13 @@ fn an_observing_machine_declines_the_edit_safely_for_now() {
     );
 }
 
-/// Editing the HANDLER is the phase-3 boundary: the reload recompiles
-/// it, but effect op tables still hold the pointers baked at module
-/// compile, so dispatch keeps reaching the old implementation until
-/// op-table patching lands. This pins today's contract — flip the
-/// dispatch assertion when phase 3 does.
+/// Editing the handler retargets dispatch in place: the reload
+/// recompiles the implementation and patches the handler's
+/// dispatch-table slot, so the next perform — even from a scope
+/// entered long before the edit — reaches the new body. Handler state
+/// and the running program are untouched.
 #[test]
-fn a_handler_edit_reloads_but_dispatch_keeps_the_old_implementation_for_now() {
+fn a_handler_edit_retargets_dispatch_at_the_next_perform() {
     let mut rt = runtime();
     rt.compile_typed_program(parse(&source(1)))
         .expect("v1 should compile");
@@ -153,17 +153,62 @@ fn a_handler_edit_reloads_but_dispatch_keeps_the_old_implementation_for_now() {
         .expect("reload should succeed");
     assert!(
         report
-            .reloaded
+            .dispatch_patched
             .iter()
-            .any(|n| n.contains("next_event") || n.contains("Feed")),
-        "the handler implementation must diff as changed: {report:?}"
+            .any(|n| n.contains("next_event")),
+        "the handler's dispatch slot must be patched: {report:?}"
     );
 
     let v = rt.call_raw("first_step", &[]).expect("first_step");
     assert_eq!(
         v,
-        ZyntaxValue::Int(3),
-        "op tables are not patched yet; dispatch still reaches the old body"
+        ZyntaxValue::Int(5),
+        "a fresh perform must reach the edited handler"
+    );
+}
+
+/// The event source is edited under a machine that is mid-run: the
+/// machine itself never reloads, its state and handler segment are
+/// untouched, and from its next perform the events it observes carry
+/// the edited value. The transition count lands strictly between the
+/// all-old and all-new extremes only if dispatch retargeted mid-flight.
+#[test]
+fn a_running_machine_observes_the_edited_event_source() {
+    const CAP: i64 = 3_000_000;
+
+    let mut rt = runtime();
+    rt.compile_typed_program(parse(&source(1)))
+        .expect("v1 should compile");
+
+    let entry = rt
+        .function_pointer("drive")
+        .expect("drive should have an entry pointer");
+    // SAFETY: `drive` was compiled with signature () -> i64, and the
+    // code stays mapped for the life of the runtime.
+    let drive: extern "C" fn() -> i64 = unsafe { std::mem::transmute(entry) };
+    let worker = std::thread::spawn(move || drive());
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let edited = source(1).replace("return 3", "return 30");
+    let report = rt
+        .reload_typed_program(parse(&edited))
+        .expect("reload should succeed");
+    let count = worker.join().expect("drive should complete");
+
+    assert!(
+        report
+            .dispatch_patched
+            .iter()
+            .any(|n| n.contains("next_event")),
+        "{report:?}"
+    );
+    assert!(
+        count < CAP / 3,
+        "every event carried the old value; dispatch never retargeted (count = {count})"
+    );
+    assert!(
+        count > CAP / 30,
+        "the machine cannot outpace the edited events (count = {count})"
     );
 }
 
@@ -201,4 +246,41 @@ def observe(): i64 {
         .expect("should compile");
     let v = rt.call_raw("observe", &[]).expect("observe should exist");
     assert_eq!(v, ZyntaxValue::Int(3));
+}
+
+/// Reload is itself an observable event: one `RuntimeEvent::Reload`
+/// per applied reload, carrying the per-function outcomes — the
+/// boundary a UI framework subscribes to for invalidation.
+#[test]
+fn a_reload_is_observable_as_a_runtime_event() {
+    use std::sync::{Arc, Mutex};
+
+    let mut rt = runtime();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    rt.set_event_sink(move |event| {
+        if let zyntax_embed::RuntimeEvent::Reload {
+            reloaded,
+            dispatch_patched,
+            ..
+        } = event
+        {
+            sink.lock().unwrap().push(format!(
+                "reloaded={reloaded:?} patched={dispatch_patched:?}"
+            ));
+        }
+    });
+
+    rt.compile_typed_program(parse(&source(1)))
+        .expect("v1 should compile");
+    let edited = source(1).replace("return 3", "return 9");
+    rt.reload_typed_program(parse(&edited))
+        .expect("reload should succeed");
+
+    let events = seen.lock().unwrap();
+    assert_eq!(events.len(), 1, "one reload, one event: {events:?}");
+    assert!(
+        events[0].contains("next_event"),
+        "the event names what changed: {events:?}"
+    );
 }

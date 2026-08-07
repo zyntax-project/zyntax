@@ -590,6 +590,49 @@ impl TieredBackend {
                                 }
                             }
 
+                            // Dispatch tables hold this function's old
+                            // entry wherever a handler exposes it as an
+                            // effect op; patch those slots so scopes
+                            // already entered reach the edit at their
+                            // next perform.
+                            let mut patched = 0usize;
+                            for (gid, global) in &old_module.globals {
+                                let Some(crate::hir::HirConstant::VTable(vt)) = &global.initializer
+                                else {
+                                    continue;
+                                };
+                                for (slot, entry) in vt.methods.iter().enumerate() {
+                                    if entry.function_id != old_id {
+                                        continue;
+                                    }
+                                    let addr =
+                                        self.cranelift.with_lock(|be| be.global_data_addr(*gid));
+                                    if let Some((base, size)) = addr {
+                                        let offset = slot * std::mem::size_of::<usize>();
+                                        if offset + std::mem::size_of::<usize>() <= size {
+                                            // SAFETY: the vtable global is
+                                            // declared writable and sized to
+                                            // its slots; running threads read
+                                            // the slot with plain loads, so
+                                            // an atomic store publishes the
+                                            // new entry without tearing.
+                                            unsafe {
+                                                let slot_ptr = base.add(offset)
+                                                    as *const std::sync::atomic::AtomicUsize;
+                                                (*slot_ptr).store(
+                                                    entry_ptr as usize,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                            }
+                                            patched += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            if patched > 0 {
+                                report.dispatch_patched.push(name.clone());
+                            }
+
                             updated_functions.push((old_id, body));
                             report.reloaded.push(name);
                         }

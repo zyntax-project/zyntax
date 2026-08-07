@@ -92,6 +92,10 @@ pub struct ReloadReport {
     /// enclosing call still completes on the old code; the *next* call
     /// runs the edit.
     pub resume_fell_back: Vec<(String, String)>,
+    /// Reloaded functions whose dispatch-table slots were patched, so
+    /// effect scopes already entered reach the edited implementation
+    /// at their next perform.
+    pub dispatch_patched: Vec<String>,
 }
 
 impl ReloadReport {

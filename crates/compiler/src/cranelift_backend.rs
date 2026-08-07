@@ -548,6 +548,14 @@ impl CraneliftBackend {
             .collect()
     }
 
+    /// Runtime address and size of a compiled global's data, once the
+    /// module is finalized. Reload uses this to patch dispatch-table
+    /// slots in place.
+    pub fn global_data_addr(&self, id: HirId) -> Option<(*const u8, usize)> {
+        let data_id = self.global_map.get(&id)?;
+        Some(self.module.get_finalized_data(*data_id))
+    }
+
     /// Drain the probe-site offsets recorded by the last compile.
     pub fn take_probe_sites(&mut self) -> Vec<(u64, u32)> {
         std::mem::take(&mut self.probe_sites)
@@ -5821,14 +5829,17 @@ impl CraneliftBackend {
         // For vtables, we need to emit an array of function pointers
         // For now, emit a simple data declaration
 
-        // Declare the global data
+        // Declare the global data. A vtable is a dispatch table — hot
+        // reload patches its slots in place, so it must stay writable;
+        // everything else is immutable.
         let unique_name = format!("global__{:?}", id);
+        let writable = matches!(&global.initializer, Some(HirConstant::VTable(_)));
         let data_id = self
             .module
             .declare_data(
                 &unique_name,
                 cranelift_module::Linkage::Export,
-                false,
+                writable,
                 false,
             )
             .map_err(|e| CompilerError::CodeGen(format!("Failed to declare global: {}", e)))?;

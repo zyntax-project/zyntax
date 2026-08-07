@@ -252,6 +252,15 @@ pub enum RuntimeEvent {
         pipeline: String,
         stage_count: usize,
     },
+    /// A hot reload was applied. One event per reload, carrying the
+    /// per-function outcomes — the observable boundary a framework
+    /// subscribes to for invalidation.
+    Reload {
+        reloaded: Vec<String>,
+        added: Vec<String>,
+        dispatch_patched: Vec<String>,
+        failed: Vec<(String, String)>,
+    },
 }
 
 // ============================================================================
@@ -3873,9 +3882,25 @@ impl TieredRuntime {
         if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
         }
-        self.backend
+        let report = self
+            .backend
             .reload_module(&hir_module)
-            .map_err(|e| RuntimeError::Execution(e.to_string()))
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+        // Reload is an observable event: frameworks subscribe to
+        // invalidate whatever the edit touched.
+        let event = RuntimeEvent::Reload {
+            reloaded: report.reloaded.clone(),
+            added: report.added.clone(),
+            dispatch_patched: report.dispatch_patched.clone(),
+            failed: report.failed.clone(),
+        };
+        if let Some(sink) = &self.event_sink {
+            sink(&event);
+        }
+        self.runtime_events.push(event);
+
+        Ok(report)
     }
 
     /// Native entry pointer for `name`, or `None` if unknown. The
@@ -3933,9 +3958,25 @@ impl TieredRuntime {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
         }
 
-        self.backend
+        let report = self
+            .backend
             .reload_module(&hir_module)
-            .map_err(|e| RuntimeError::Execution(e.to_string()))
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+        // Reload is an observable event: frameworks subscribe to
+        // invalidate whatever the edit touched.
+        let event = RuntimeEvent::Reload {
+            reloaded: report.reloaded.clone(),
+            added: report.added.clone(),
+            dispatch_patched: report.dispatch_patched.clone(),
+            failed: report.failed.clone(),
+        };
+        if let Some(sink) = &self.event_sink {
+            sink(&event);
+        }
+        self.runtime_events.push(event);
+
+        Ok(report)
     }
 
     pub fn load_module(&mut self, language: &str, source: &str) -> RuntimeResult<Vec<String>> {
