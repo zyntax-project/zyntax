@@ -3322,6 +3322,192 @@ pub struct TieredRuntime {
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
     event_sink: Option<Arc<dyn Fn(&RuntimeEvent) + Send + Sync>>,
+    /// Extern aliases threaded into typed-program lowering (e.g.
+    /// `sleep` → `__zyntax_async_set_timeout`), the counterpart of the
+    /// classic runtime's `config.builtins`. Grammar-driven loads carry
+    /// their own map; this one serves the typed-program entry points.
+    builtin_aliases: indexmap::IndexMap<String, String>,
+    /// Host-driven fibers, keyed by token. See [`TieredRuntime::get_fiber`].
+    host_fibers: HashMap<u64, HostFiber>,
+    next_fiber_token: u64,
+    /// Source-declared yield shape of each `fiber def`, with a
+    /// generation that bumps when a reload changes the shape.
+    fiber_shapes: HashMap<String, FiberShape>,
+    /// Resolved handler names pinned by [`TieredRuntime::get_handler`],
+    /// keyed by token.
+    handler_tokens: HashMap<u64, String>,
+    next_handler_token: u64,
+    /// Undo record for the fiber-handle metadata the most recent
+    /// applied reload changed, consumed by
+    /// [`TieredRuntime::rollback_last_reload`] alongside the backend's
+    /// code rollback.
+    fiber_meta_undo: Option<FiberMetaUndo>,
+    /// Built-in wrapper classes, extended via
+    /// [`TieredRuntime::register_builtin_class`] before compilation —
+    /// the same seam the classic runtime exposes.
+    builtin_registry: Arc<std::sync::Mutex<zyntax_compiler::builtin_class::BuiltinRegistry>>,
+}
+
+/// What a reload did to fiber-handle metadata, for rollback.
+#[derive(Default)]
+struct FiberMetaUndo {
+    /// Shape entries as they were before the reload replaced or
+    /// removed them: `(function, prior entry — None if newly added)`.
+    shapes: Vec<(String, Option<FiberShape>)>,
+    /// Tokens the reload marked `machine_gone`.
+    marked_gone: Vec<u64>,
+}
+
+/// Opaque host handle to a runtime-owned fiber. Stable across reloads
+/// and OSR: the token names the machine, not its code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FiberToken(u64);
+
+/// Opaque host handle to a resolved handler. [`TieredRuntime::get_handler`]
+/// resolves the (possibly unqualified) name ONCE and pins the fully
+/// qualified result, so later edits that introduce same-named handlers
+/// in other modules cannot re-aim or ambiguate the host's binding —
+/// bare strings resolve per call and can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HandlerToken(u64);
+
+/// One step of a host-driven machine.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostFiberStep {
+    /// The machine yielded. The payload decodes with the shape the
+    /// handle was created against — a machine in flight always yields
+    /// that shape, because an incompatible edit leaves it completing
+    /// on the code it started with.
+    Yielded(ZyntaxValue),
+    /// The machine completed. Later resumes return `Done` again.
+    Done,
+    /// The machine aborted (`Fiber.abort` semantics). The host signal
+    /// is the state itself; a UI typically unmounts or remounts.
+    Errored,
+    /// An edit removed the machine's function. The fiber was NOT
+    /// resumed: a machine whose source is gone should stop observing,
+    /// and the host acts on the value — typically drop + remount.
+    MachineGone,
+}
+
+/// What the runtime knows about a host-driven fiber.
+#[derive(Debug, Clone)]
+pub struct HostFiberInfo {
+    pub function: String,
+    /// Yield shape this handle decodes, captured at creation.
+    pub yield_shape: String,
+    /// The shape generation the handle was created against.
+    pub shape_generation: u64,
+    /// True when reloads changed the function's declared yield shape
+    /// after this fiber was created. Payloads still decode with the
+    /// creation shape — the running machine is of that generation —
+    /// but the source has moved on; recreate the machine to adopt it.
+    pub shape_stale: bool,
+    /// True when an edit removed the machine's function.
+    pub machine_gone: bool,
+    pub done: bool,
+}
+
+/// How a yielded payload is decoded for the host. Captured at fiber
+/// creation so a later edit never changes how this handle reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostYieldKind {
+    Int,
+    Bool,
+    /// Anything that isn't a scalar the host channel can carry —
+    /// surfaced as the raw payload.
+    Opaque,
+}
+
+struct HostFiber {
+    ptr: usize,
+    function: String,
+    yield_shape: String,
+    yield_kind: HostYieldKind,
+    shape_generation: u64,
+    machine_gone: bool,
+    done: bool,
+}
+
+#[derive(Clone)]
+struct FiberShape {
+    shape: String,
+    kind: HostYieldKind,
+    generation: u64,
+}
+
+fn yield_kind_of(ty: &zyntax_typed_ast::Type) -> HostYieldKind {
+    use zyntax_typed_ast::{PrimitiveType as P, Type as T};
+    match ty {
+        T::Primitive(P::Bool) => HostYieldKind::Bool,
+        T::Primitive(
+            P::I8
+            | P::I16
+            | P::I32
+            | P::I64
+            | P::U8
+            | P::U16
+            | P::U32
+            | P::U64
+            | P::ISize
+            | P::USize,
+        ) => HostYieldKind::Int,
+        _ => HostYieldKind::Opaque,
+    }
+}
+
+fn decode_yield(kind: HostYieldKind, payload: i64) -> ZyntaxValue {
+    match kind {
+        HostYieldKind::Int | HostYieldKind::Opaque => ZyntaxValue::Int(payload),
+        HostYieldKind::Bool => ZyntaxValue::Bool(payload != 0),
+    }
+}
+
+/// Resolve a possibly-unqualified `name` against module-scoped
+/// candidates. An exact match wins; otherwise `name` matches a single
+/// candidate spelled `path::name`. Zero or several matches error with
+/// the candidates, so the caller can qualify.
+fn resolve_scoped_name<'a>(
+    name: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Result<String, Vec<String>> {
+    let suffix = format!("::{name}");
+    let mut matches: Vec<&str> = Vec::new();
+    for c in candidates {
+        if c == name {
+            return Ok(c.to_string());
+        }
+        if c.ends_with(&suffix) {
+            matches.push(c);
+        }
+    }
+    match matches.as_slice() {
+        [one] => Ok(one.to_string()),
+        _ => Err(matches.into_iter().map(String::from).collect()),
+    }
+}
+
+/// The `(name, shape, kind)` of every `fiber def` in a parsed program,
+/// snapshotted before lowering consumes it.
+fn collect_fiber_decls(
+    program: &zyntax_typed_ast::TypedProgram,
+) -> Vec<(String, String, HostYieldKind)> {
+    use zyntax_typed_ast::TypedDeclaration;
+    program
+        .declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            TypedDeclaration::Function(f) if f.is_fiber => {
+                let name = f.name.resolve_global()?;
+                Some((
+                    name,
+                    format!("{:?}", f.return_type),
+                    yield_kind_of(&f.return_type),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 impl TieredRuntime {
@@ -3355,6 +3541,16 @@ impl TieredRuntime {
             import_resolvers: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
+            builtin_aliases: indexmap::IndexMap::new(),
+            host_fibers: HashMap::new(),
+            next_fiber_token: 1,
+            fiber_shapes: HashMap::new(),
+            handler_tokens: HashMap::new(),
+            next_handler_token: 1,
+            fiber_meta_undo: None,
+            builtin_registry: Arc::new(std::sync::Mutex::new(
+                zyntax_compiler::builtin_class::BuiltinRegistry::with_defaults(),
+            )),
         };
 
         // The effect and fiber runtime, exactly as the classic runtime
@@ -3374,6 +3570,15 @@ impl TieredRuntime {
     /// [`ZyntaxRuntime::add_import_resolver`].
     pub fn add_import_resolver(&mut self, resolver: ImportResolverCallback) {
         self.import_resolvers.push(resolver);
+    }
+
+    /// Extern aliases for typed-program compiles, the counterpart of
+    /// the classic runtime's `config_mut().builtins` — e.g. `sleep` →
+    /// `__zyntax_async_set_timeout`. Applied by
+    /// [`Self::compile_typed_program`] and
+    /// [`Self::reload_typed_program`].
+    pub fn builtin_aliases_mut(&mut self) -> &mut indexmap::IndexMap<String, String> {
+        &mut self.builtin_aliases
     }
 
     /// Resolve a module name through the registered resolvers.
@@ -3609,8 +3814,16 @@ impl TieredRuntime {
         &self.config
     }
 
-    /// Shutdown the runtime (stops background optimization)
+    /// Shutdown the runtime (stops background optimization). Frees any
+    /// host-driven fibers still registered — their stacks and handler
+    /// segments do not outlive the runtime that owns them.
     pub fn shutdown(&mut self) {
+        for (_, hf) in self.host_fibers.drain() {
+            let ptr = hf.ptr as *mut u8;
+            crate::effect_runtime::__zyntax_effect_fiber_forget(ptr);
+            // SAFETY: the registry owned the handle exclusively.
+            unsafe { zyntax_compiler::zrtl::krio_fiber_free(ptr as *mut _) };
+        }
         self.backend.shutdown();
     }
 
@@ -3848,7 +4061,8 @@ impl TieredRuntime {
             &mut self.runtime_events,
             self.event_sink.as_ref(),
         );
-        let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        let fiber_decls = collect_fiber_decls(&program);
+        let mut hir_module = self.lower_typed_program(program, self.builtin_aliases.clone())?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -3861,6 +4075,7 @@ impl TieredRuntime {
             .collect();
 
         self.compile_module(hir_module)?;
+        let _ = self.apply_fiber_decls(fiber_decls);
         Ok(function_names)
     }
 
@@ -3875,7 +4090,8 @@ impl TieredRuntime {
             &mut self.runtime_events,
             self.event_sink.as_ref(),
         );
-        let mut hir_module = self.lower_typed_program(program, indexmap::IndexMap::new())?;
+        let fiber_decls = collect_fiber_decls(&program);
+        let mut hir_module = self.lower_typed_program(program, self.builtin_aliases.clone())?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -3886,6 +4102,12 @@ impl TieredRuntime {
             .backend
             .reload_module(&hir_module)
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+        // An aborted reload changed nothing, so the handles' view of
+        // shapes and machines must not move either.
+        if !report.aborted {
+            self.apply_reload_fiber_meta(fiber_decls, &report);
+        }
 
         // Reload is an observable event: frameworks subscribe to
         // invalidate whatever the edit touched.
@@ -3901,6 +4123,475 @@ impl TieredRuntime {
         self.runtime_events.push(event);
 
         Ok(report)
+    }
+
+    /// Restore the generation the most recent applied reload replaced.
+    /// The embedder's escape hatch when an edit turns out wrong at
+    /// runtime: beads, reload cells, resume points and dispatch tables
+    /// all swing back; state is untouched, exactly as in a reload.
+    /// Returns the restored function names, and emits the same
+    /// observable event a reload does — rolling back is a code change
+    /// too, and a subscribed framework must invalidate again.
+    pub fn rollback_last_reload(&mut self) -> RuntimeResult<Vec<String>> {
+        let restored = self
+            .backend
+            .rollback_last_reload()
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+        // The handles' view rolls back with the code: shape entries
+        // (and their generations) return to their prior state, and
+        // tokens this reload marked gone resume again.
+        if let Some(undo) = self.fiber_meta_undo.take() {
+            for (name, prior) in undo.shapes.into_iter().rev() {
+                match prior {
+                    Some(entry) => {
+                        self.fiber_shapes.insert(name, entry);
+                    }
+                    None => {
+                        self.fiber_shapes.remove(&name);
+                    }
+                }
+            }
+            for token in undo.marked_gone {
+                if let Some(hf) = self.host_fibers.get_mut(&token) {
+                    hf.machine_gone = false;
+                }
+            }
+        }
+
+        let event = RuntimeEvent::Reload {
+            reloaded: restored.clone(),
+            added: Vec::new(),
+            dispatch_patched: Vec::new(),
+            failed: Vec::new(),
+        };
+        if let Some(sink) = &self.event_sink {
+            sink(&event);
+        }
+        self.runtime_events.push(event);
+
+        Ok(restored)
+    }
+
+    // ── Host-driven fibers ──────────────────────────────────────────
+    //
+    // A downstream framework drives FSMs from outside the language:
+    // it constructs a machine from a compiled `fiber def`, holds a
+    // token, and steps the machine on its own schedule — with effect
+    // handlers installed around each step when the machine observes
+    // events. Tokens survive reloads and OSR; the edge cases an edit
+    // creates (function deleted, yield shape changed) surface as
+    // values and handle metadata, never as traps.
+
+    /// Get a runtime-owned instance of the machine the `fiber def`
+    /// named `function` declares, as a token the host drives.
+    ///
+    /// Each call hands back a FRESH paused instance — two tokens are
+    /// two independent machines. The machine must be parameterless:
+    /// host-driven FSMs take their inputs through effects, which is
+    /// what [`Self::resume_fiber_within`] installs handlers for.
+    pub fn get_fiber(&mut self, function: &str) -> RuntimeResult<FiberToken> {
+        // FQN-aware: `machine` finds `app::machine` when unambiguous;
+        // a qualified name is exact.
+        let function = &resolve_scoped_name(function, self.fiber_shapes.keys().map(String::as_str))
+            .map_err(|candidates| {
+                if candidates.is_empty() {
+                    RuntimeError::Execution(format!(
+                        "`{function}` is not a fiber function in the loaded program"
+                    ))
+                } else {
+                    RuntimeError::Execution(format!(
+                        "`{function}` is ambiguous; qualify it: {candidates:?}"
+                    ))
+                }
+            })?;
+        let shape = self.fiber_shapes.get(function).ok_or_else(|| {
+            RuntimeError::Execution(format!(
+                "`{function}` is not a fiber function in the loaded program"
+            ))
+        })?;
+        let id = *self
+            .function_ids
+            .get(function)
+            .ok_or_else(|| RuntimeError::FunctionNotFound(function.to_string()))?;
+        if self
+            .function_signatures
+            .get(function)
+            .map(|s| !s.params.is_empty())
+            .unwrap_or(false)
+        {
+            return Err(RuntimeError::Execution(format!(
+                "`{function}` takes parameters; a host-constructed machine must be \
+                 parameterless — feed it through effects instead"
+            )));
+        }
+        let entry = self.backend.get_function_pointer(id).ok_or_else(|| {
+            RuntimeError::Execution(format!("no compiled entry for `{function}`"))
+        })?;
+        // SAFETY: `entry` is the compiled trampoline of a parameterless
+        // `fiber def`; the installed fiber backend interprets the
+        // closure pointer as exactly that.
+        let ptr = unsafe { zyntax_compiler::zrtl::krio_fiber_new(entry as *mut u8, 0) };
+        if ptr.is_null() {
+            return Err(RuntimeError::Execution(format!(
+                "fiber construction failed for `{function}`"
+            )));
+        }
+        let token = self.next_fiber_token;
+        self.next_fiber_token += 1;
+        self.host_fibers.insert(
+            token,
+            HostFiber {
+                ptr: ptr as usize,
+                function: function.to_string(),
+                yield_shape: shape.shape.clone(),
+                yield_kind: shape.kind,
+                shape_generation: shape.generation,
+                machine_gone: false,
+                done: false,
+            },
+        );
+        Ok(FiberToken(token))
+    }
+
+    /// Drive the machine one step: run to its next yield or completion.
+    pub fn resume_fiber(&mut self, token: FiberToken) -> RuntimeResult<HostFiberStep> {
+        self.resume_fiber_within(token, &[])
+    }
+
+    /// Drive the machine one step with handler scopes installed around
+    /// it — the host equivalent of wrapping the resume in `with H { }`
+    /// blocks, leftmost outermost. The machine's own handler segment
+    /// layers on top, so its interior scopes keep precedence.
+    ///
+    /// Names resolve per call (FQN-aware). For a binding that cannot
+    /// drift across edits, resolve once with [`Self::get_handler`] and
+    /// drive with [`Self::resume_fiber_handled`].
+    pub fn resume_fiber_within(
+        &mut self,
+        token: FiberToken,
+        handlers: &[&str],
+    ) -> RuntimeResult<HostFiberStep> {
+        let (ptr, kind) = {
+            let hf = self.host_fibers.get(&token.0).ok_or_else(|| {
+                RuntimeError::Execution("unknown or dropped fiber token".to_string())
+            })?;
+            if hf.machine_gone {
+                return Ok(HostFiberStep::MachineGone);
+            }
+            if hf.done {
+                return Ok(HostFiberStep::Done);
+            }
+            (hf.ptr as *mut u8, hf.yield_kind)
+        };
+
+        let mut frames: Vec<u64> = Vec::with_capacity(handlers.len());
+        for h in handlers {
+            match self.push_named_handler(h) {
+                Ok(frame) => frames.push(frame),
+                Err(e) => {
+                    // A partial install must not leak: unwind the
+                    // frames already pushed before surfacing the error.
+                    for frame in frames.into_iter().rev() {
+                        crate::effect_runtime::__zyntax_effect_pop_handler(frame);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let baseline = crate::effect_runtime::__zyntax_effect_fiber_enter(ptr);
+        // SAFETY: `ptr` is a live handle owned by this registry; the
+        // enter/leave bracket mirrors generated `FiberResume` lowering.
+        let raw = unsafe { zyntax_compiler::zrtl::krio_fiber_resume(ptr as *mut _) };
+        crate::effect_runtime::__zyntax_effect_fiber_leave(ptr, baseline);
+        for frame in frames.into_iter().rev() {
+            crate::effect_runtime::__zyntax_effect_pop_handler(frame);
+        }
+
+        use zyntax_compiler::fiber_backend::{
+            unpack_fiber_step, FIBER_STEP_DONE, FIBER_STEP_YIELDED,
+        };
+        let (tag, payload) = unpack_fiber_step(raw);
+        let step = if tag == FIBER_STEP_YIELDED {
+            HostFiberStep::Yielded(decode_yield(kind, payload))
+        } else if tag == FIBER_STEP_DONE {
+            HostFiberStep::Done
+        } else {
+            HostFiberStep::Errored
+        };
+        if !matches!(step, HostFiberStep::Yielded(_)) {
+            if let Some(hf) = self.host_fibers.get_mut(&token.0) {
+                hf.done = true;
+            }
+        }
+        Ok(step)
+    }
+
+    /// Resolve a handler name ONCE — FQN-aware, ambiguity is an error —
+    /// and pin the result as a token. The token stays aimed at exactly
+    /// that handler no matter what names later edits introduce; use it
+    /// with [`Self::resume_fiber_handled`] and
+    /// [`Self::bind_fiber_handler`].
+    pub fn get_handler(&mut self, name: &str) -> RuntimeResult<HandlerToken> {
+        let (resolved, _, _, _, _) = self.backend.handler_push_info(name).ok_or_else(|| {
+            RuntimeError::Execution(format!(
+                "no unambiguous handler named `{name}` in the loaded program"
+            ))
+        })?;
+        let token = self.next_handler_token;
+        self.next_handler_token += 1;
+        self.handler_tokens.insert(token, resolved);
+        Ok(HandlerToken(token))
+    }
+
+    /// The fully qualified name a handler token is pinned to.
+    pub fn handler_name(&self, token: HandlerToken) -> Option<&str> {
+        self.handler_tokens.get(&token.0).map(String::as_str)
+    }
+
+    /// [`Self::resume_fiber_within`] with pinned handler tokens instead
+    /// of per-call name resolution.
+    pub fn resume_fiber_handled(
+        &mut self,
+        token: FiberToken,
+        handlers: &[HandlerToken],
+    ) -> RuntimeResult<HostFiberStep> {
+        let names: Vec<String> = handlers
+            .iter()
+            .map(|h| {
+                self.handler_tokens
+                    .get(&h.0)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Execution("unknown handler token".to_string()))
+            })
+            .collect::<RuntimeResult<_>>()?;
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.resume_fiber_within(token, &name_refs)
+    }
+
+    /// Free the machine and forget its token — what a UI does when the
+    /// component unmounts, or when an edit made the machine stale and
+    /// it chooses to remount. Frees the fiber's stack and its saved
+    /// handler segment; the token is dead afterwards.
+    pub fn drop_fiber(&mut self, token: FiberToken) -> RuntimeResult<()> {
+        let hf = self
+            .host_fibers
+            .remove(&token.0)
+            .ok_or_else(|| RuntimeError::Execution("unknown or dropped fiber token".to_string()))?;
+        let ptr = hf.ptr as *mut u8;
+        crate::effect_runtime::__zyntax_effect_fiber_forget(ptr);
+        // SAFETY: the registry owned this handle exclusively; nothing
+        // holds it after removal.
+        unsafe { zyntax_compiler::zrtl::krio_fiber_free(ptr as *mut _) };
+        Ok(())
+    }
+
+    /// What the runtime knows about a host-driven fiber, including the
+    /// staleness signals a reload leaves on the handle.
+    pub fn fiber_info(&self, token: FiberToken) -> Option<HostFiberInfo> {
+        let hf = self.host_fibers.get(&token.0)?;
+        let shape_stale = self
+            .fiber_shapes
+            .get(&hf.function)
+            .map(|s| s.generation != hf.shape_generation)
+            .unwrap_or(false);
+        Some(HostFiberInfo {
+            function: hf.function.clone(),
+            yield_shape: hf.yield_shape.clone(),
+            shape_generation: hf.shape_generation,
+            shape_stale,
+            machine_gone: hf.machine_gone,
+            done: hf.done,
+        })
+    }
+
+    /// Resolve the named handler into the frame a push (or bind)
+    /// installs: `(effect_id, state, op_table, async_mask)`, with
+    /// fresh handler state allocated when it is stateful.
+    fn named_handler_frame(&self, handler: &str) -> RuntimeResult<(u64, *mut u8, *mut u8, u64)> {
+        let (resolved, effect_id, table_addr, async_mask, stateful) =
+            self.backend.handler_push_info(handler).ok_or_else(|| {
+                RuntimeError::Execution(format!(
+                    "no unambiguous handler named `{handler}` in the loaded program"
+                ))
+            })?;
+        let state: *mut u8 = if stateful {
+            let ctor = format!("{resolved}$new");
+            let id = *self.function_ids.get(&ctor).ok_or_else(|| {
+                RuntimeError::Execution(format!("stateful handler `{resolved}` has no constructor"))
+            })?;
+            let p = self.backend.get_function_pointer(id).ok_or_else(|| {
+                RuntimeError::Execution(format!("no compiled entry for `{ctor}`"))
+            })?;
+            // SAFETY: `H$new` is synthesized as `(): *state`.
+            let f: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(p) };
+            f()
+        } else {
+            std::ptr::null_mut()
+        };
+        Ok((effect_id, state, table_addr as *mut u8, async_mask))
+    }
+
+    /// Push a `with H`-equivalent frame for the named handler,
+    /// allocating fresh handler state when it is stateful. Returns the
+    /// frame id for the matching pop.
+    fn push_named_handler(&self, handler: &str) -> RuntimeResult<u64> {
+        let (effect_id, state, table, async_mask) = self.named_handler_frame(handler)?;
+        Ok(crate::effect_runtime::__zyntax_effect_push_handler(
+            effect_id, state, table, async_mask,
+        ))
+    }
+
+    /// Bind the named handler to the machine persistently: the frame —
+    /// including its handler state, allocated ONCE here — joins the
+    /// fiber's saved handler segment, so every resume installs it and
+    /// state carries across steps. This is the durable event-source
+    /// binding; [`Self::resume_fiber_within`] is the per-step
+    /// alternative, whose stateful handlers start fresh each call.
+    ///
+    /// Bound handlers layer beneath the machine's own `with` scopes,
+    /// which keep precedence; among bound handlers, the earliest bound
+    /// wins. Unbinding is dropping the fiber.
+    ///
+    /// A durable binding deserves a durable name: prefer resolving the
+    /// handler once with [`Self::get_handler`] and binding the token.
+    pub fn bind_fiber_handler(
+        &mut self,
+        token: FiberToken,
+        handler: HandlerToken,
+    ) -> RuntimeResult<()> {
+        let name = self
+            .handler_tokens
+            .get(&handler.0)
+            .cloned()
+            .ok_or_else(|| RuntimeError::Execution("unknown handler token".to_string()))?;
+        self.bind_fiber_handler_named(token, &name)
+    }
+
+    /// [`Self::bind_fiber_handler`] by (FQN-aware) name, resolved at
+    /// this call.
+    pub fn bind_fiber_handler_named(
+        &mut self,
+        token: FiberToken,
+        handler: &str,
+    ) -> RuntimeResult<()> {
+        let ptr = {
+            let hf = self.host_fibers.get(&token.0).ok_or_else(|| {
+                RuntimeError::Execution("unknown or dropped fiber token".to_string())
+            })?;
+            hf.ptr as *mut u8
+        };
+        let (effect_id, state, table, async_mask) = self.named_handler_frame(handler)?;
+        crate::effect_runtime::fiber_bind_handler(ptr, effect_id, state, table, async_mask);
+        Ok(())
+    }
+
+    /// Register an additional built-in wrapper class, joining the
+    /// compiler defaults in the registry each compilation snapshots —
+    /// the same seam [`ZyntaxRuntime::register_builtin_class`]
+    /// exposes. Call before the compilation that should see it.
+    pub fn register_builtin_class(
+        &self,
+        class: Arc<dyn zyntax_compiler::builtin_class::BuiltinClass + Send + Sync>,
+    ) {
+        if let Ok(mut reg) = self.builtin_registry.lock() {
+            reg.register(class);
+        }
+    }
+
+    /// Snapshot the built-in registry for a lowering run.
+    fn snapshot_builtin_registry(&self) -> Arc<zyntax_compiler::builtin_class::BuiltinRegistry> {
+        let mut snapshot = zyntax_compiler::builtin_class::BuiltinRegistry::new();
+        if let Ok(reg) = self.builtin_registry.lock() {
+            for class in reg.classes() {
+                snapshot.register(class.clone());
+            }
+        }
+        Arc::new(snapshot)
+    }
+
+    /// Fold a parsed program's `fiber def` yield shapes into the shape
+    /// registry, bumping the generation of any function whose shape
+    /// changed — the signal [`Self::fiber_info`] exposes as staleness.
+    /// Returns each touched entry's prior state, for rollback.
+    fn apply_fiber_decls(
+        &mut self,
+        decls: Vec<(String, String, HostYieldKind)>,
+    ) -> Vec<(String, Option<FiberShape>)> {
+        let mut prior = Vec::new();
+        for (name, shape, kind) in decls {
+            match self.fiber_shapes.get_mut(&name) {
+                Some(existing) if existing.shape != shape => {
+                    prior.push((name.clone(), Some(existing.clone())));
+                    existing.generation += 1;
+                    existing.shape = shape;
+                    existing.kind = kind;
+                }
+                Some(_) => {}
+                None => {
+                    prior.push((name.clone(), None));
+                    self.fiber_shapes.insert(
+                        name,
+                        FiberShape {
+                            shape,
+                            kind,
+                            generation: 0,
+                        },
+                    );
+                }
+            }
+        }
+        prior
+    }
+
+    /// Retire the machines of removed functions: their declarations
+    /// leave the shape registry (so no new machine of a deleted
+    /// function can be constructed) and their live tokens answer
+    /// `MachineGone` from now on instead of resuming. Returns what was
+    /// removed and which tokens were marked, for rollback.
+    fn retire_removed_machines(
+        &mut self,
+        removed: &[String],
+    ) -> (Vec<(String, Option<FiberShape>)>, Vec<u64>) {
+        let mut prior_shapes = Vec::new();
+        let mut marked = Vec::new();
+        for name in removed {
+            if let Some(entry) = self.fiber_shapes.remove(name) {
+                prior_shapes.push((name.clone(), Some(entry)));
+            }
+            for (token, hf) in self.host_fibers.iter_mut() {
+                if &hf.function == name && !hf.machine_gone {
+                    hf.machine_gone = true;
+                    marked.push(*token);
+                }
+            }
+        }
+        (prior_shapes, marked)
+    }
+
+    /// Record a non-aborted reload's fiber-metadata changes so a
+    /// rollback can restore the handles' view along with the code. The
+    /// undo record is (re)set exactly when the backend sets its own —
+    /// a reload that changed the module — so the two halves of a
+    /// rollback always describe the same reload.
+    fn apply_reload_fiber_meta(
+        &mut self,
+        decls: Vec<(String, String, HostYieldKind)>,
+        report: &zyntax_compiler::reload::ReloadReport,
+    ) {
+        let mut undo = FiberMetaUndo {
+            shapes: self.apply_fiber_decls(decls),
+            marked_gone: Vec::new(),
+        };
+        let (removed_shapes, marked) = self.retire_removed_machines(&report.removed_retained);
+        undo.shapes.extend(removed_shapes);
+        undo.marked_gone = marked;
+        if !report.reloaded.is_empty()
+            || !report.added.is_empty()
+            || !report.removed_retained.is_empty()
+        {
+            self.fiber_meta_undo = Some(undo);
+        }
     }
 
     /// Native entry pointer for `name`, or `None` if unknown. The
@@ -3945,6 +4636,7 @@ impl TieredRuntime {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let fiber_decls = collect_fiber_decls(&typed_program);
         let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
@@ -3962,6 +4654,12 @@ impl TieredRuntime {
             .backend
             .reload_module(&hir_module)
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+        // An aborted reload changed nothing, so the handles' view of
+        // shapes and machines must not move either.
+        if !report.aborted {
+            self.apply_reload_fiber_meta(fiber_decls, &report);
+        }
 
         // Reload is an observable event: frameworks subscribe to
         // invalidate whatever the edit touched.
@@ -4005,6 +4703,7 @@ impl TieredRuntime {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let fiber_decls = collect_fiber_decls(&typed_program);
         let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
@@ -4023,6 +4722,7 @@ impl TieredRuntime {
 
         // Compile the module
         self.compile_module(hir_module)?;
+        let _ = self.apply_fiber_decls(fiber_decls);
 
         Ok(function_names)
     }
@@ -4062,6 +4762,11 @@ impl TieredRuntime {
         use zyntax_typed_ast::{
             type_registry::*, AstArena, InternedString, TypeRegistry, TypedDeclaration,
         };
+
+        // Stateful handlers need their state struct, ctor and implicit
+        // `self` synthesized before the registry snapshot, exactly as
+        // in the classic runtime's lowering above.
+        synthesize_handler_state(&mut program);
 
         // Rebuild type registry from declarations
         for decl_node in &program.declarations {
@@ -4207,6 +4912,7 @@ impl TieredRuntime {
             std::sync::Arc::new(std::sync::Mutex::new(arena)),
             lowering_config,
         );
+        lowering_ctx.set_builtin_registry(self.snapshot_builtin_registry());
 
         let mut hir_module = lowering_ctx
             .lower_program(&mut program)

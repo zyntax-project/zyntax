@@ -316,6 +316,22 @@ pub struct CraneliftBackend {
     /// This backend's identity in the reload cell registry.
     reload_key: u64,
 
+    /// When set, finalization records cell updates into
+    /// `deferred_cells` instead of publishing them, so a reload can
+    /// compile a whole edit set and publish nothing unless every
+    /// function compiled.
+    defer_cell_publish: bool,
+    /// Cell updates recorded while `defer_cell_publish` was set, in
+    /// finalization order.
+    deferred_cells: Vec<(HirId, usize)>,
+    /// The function currently being compiled. A FuncRef or
+    /// CreateClosure that names it is a frame handing out its own
+    /// continuation (an async poll fn re-parking itself, a recursive
+    /// closure); that address must stay inside this generation — a
+    /// reload-cell read there would resume a suspended frame in code
+    /// with different state numbering.
+    current_compile_id: Option<HirId>,
+
     /// Defaults to 0; set via [`Self::set_compile_tier`] before each
     /// `compile_function` call from the tiered runtime.
     compile_tier: usize,
@@ -517,6 +533,9 @@ impl CraneliftBackend {
             publish_osr_helpers: true,
             reloadable_calls: false,
             reload_key: crate::reload::next_backend_key(),
+            defer_cell_publish: false,
+            deferred_cells: Vec::new(),
+            current_compile_id: None,
             emit_osr_probes: true,
             compile_bead_id: 0,
             pending_osr_helpers: Vec::new(),
@@ -596,6 +615,26 @@ impl CraneliftBackend {
     /// This backend's key in the reload cell registry.
     pub fn reload_key(&self) -> u64 {
         self.reload_key
+    }
+
+    /// Defer reload-cell publication: while set, finalization records
+    /// cell updates instead of applying them. A reload turns this on
+    /// for its compile pass so nothing becomes callable unless the
+    /// whole edit set compiled.
+    pub fn set_defer_cell_publish(&mut self, on: bool) {
+        self.defer_cell_publish = on;
+    }
+
+    /// Drain the cell updates recorded while deferral was on, in
+    /// finalization order (a later entry for the same id supersedes an
+    /// earlier one).
+    pub fn take_deferred_cells(&mut self) -> Vec<(HirId, usize)> {
+        std::mem::take(&mut self.deferred_cells)
+    }
+
+    /// Publish `ptr` as `id`'s current entry in this backend's cell.
+    pub fn publish_call_target(&self, id: HirId, ptr: usize) {
+        crate::reload::set_call_target(self.reload_key, id, ptr);
     }
 
     /// Set the bead id for subsequent `compile_function` calls. Embedded
@@ -763,7 +802,11 @@ impl CraneliftBackend {
                 .write()
                 .unwrap()
                 .insert(*hir_id, code_ptr);
-            crate::reload::set_call_target(self.reload_key, *hir_id, code_ptr as usize);
+            if self.defer_cell_publish {
+                self.deferred_cells.push((*hir_id, code_ptr as usize));
+            } else {
+                crate::reload::set_call_target(self.reload_key, *hir_id, code_ptr as usize);
+            }
         }
 
         // Note: Symbols are NOT automatically exported for cross-module linking.
@@ -1255,6 +1298,9 @@ impl CraneliftBackend {
         function: &HirFunction,
         hir_module: &HirModule,
     ) -> CompilerResult<()> {
+        // Address-taking sites use this to spot self-references, which
+        // pin to this generation instead of the reload cell.
+        self.current_compile_id = Some(id);
         // Reset per-function scratch state on every entry. The success
         // path clears these at the *end* of the function (~line 4784);
         // the OSR helper error path clears them inline. But any error
@@ -2974,6 +3020,7 @@ impl CraneliftBackend {
                                         let ptr_ty = types::I64;
                                         let addr = if self.reloadable_calls
                                             && !self.external_link_names.contains_key(func_id)
+                                            && self.current_compile_id != Some(*func_id)
                                         {
                                             let cell = crate::reload::call_cell_addr(
                                                 self.reload_key,
@@ -4167,9 +4214,13 @@ impl CraneliftBackend {
                                 // enters through later — under reload it has to
                                 // be the function's *current* entry, read at
                                 // creation time, not the one this caller was
-                                // compiled against.
+                                // compiled against. Except when a function hands
+                                // out its own address: that is a frame's
+                                // continuation, and it must stay in this
+                                // generation.
                                 let func_ptr = if self.reloadable_calls
                                     && !self.external_link_names.contains_key(function)
+                                    && self.current_compile_id != Some(*function)
                                 {
                                     let cell =
                                         crate::reload::call_cell_addr(self.reload_key, *function)
@@ -6952,6 +7003,7 @@ impl CraneliftBackend {
                         let addr = if self.reloadable_calls
                             && self.function_map.contains_key(func_id)
                             && !self.external_link_names.contains_key(func_id)
+                            && self.current_compile_id != Some(*func_id)
                         {
                             let cell =
                                 crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
@@ -8297,7 +8349,11 @@ impl CraneliftBackend {
                 .write()
                 .unwrap()
                 .insert(*hir_id, code_ptr);
-            crate::reload::set_call_target(self.reload_key, *hir_id, code_ptr as usize);
+            if self.defer_cell_publish {
+                self.deferred_cells.push((*hir_id, code_ptr as usize));
+            } else {
+                crate::reload::set_call_target(self.reload_key, *hir_id, code_ptr as usize);
+            }
         }
 
         Ok(())

@@ -641,6 +641,16 @@ impl AstLowering for LoweringContext {
             }
         }
 
+        // Every declared handler gets an op table, whether or not a
+        // `with` scope in this module names it: an embedder can push a
+        // handler frame around code it drives (a host-resumed fiber),
+        // and that push needs the table compiled into the module.
+        // Cached, so handlers the scopes above already built are free.
+        let handler_names: Vec<_> = self.module.handlers.values().map(|h| h.name).collect();
+        for name in handler_names {
+            let _ = self.build_op_table(name);
+        }
+
         // New Phase: Lower trait implementations and generate vtables
         self.lower_implementations()?;
 

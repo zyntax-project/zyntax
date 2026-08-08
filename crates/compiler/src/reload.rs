@@ -96,6 +96,12 @@ pub struct ReloadReport {
     /// effect scopes already entered reach the edited implementation
     /// at their next perform.
     pub dispatch_patched: Vec<String>,
+    /// True when a compile failure aborted the whole reload: nothing
+    /// was swapped, published, or patched, and the running generation
+    /// is untouched. `failed` holds the reasons. Per-function declines
+    /// (unsupported shapes) do not abort — they are skips, and the
+    /// rest of the edit set still applies.
+    pub aborted: bool,
 }
 
 impl ReloadReport {

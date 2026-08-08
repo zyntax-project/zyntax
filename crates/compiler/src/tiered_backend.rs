@@ -224,6 +224,27 @@ struct FunctionEntry {
     bead_id: u64,
 }
 
+/// Everything needed to restore the generation a reload replaced.
+#[derive(Default)]
+struct ReloadUndo {
+    swapped: Vec<UndoSwap>,
+}
+
+/// Per-function undo record. Raw addresses are stored as `usize`; the
+/// cells, beads and vtable globals they point at live for the process.
+struct UndoSwap {
+    id: HirId,
+    name: String,
+    /// Entry pointer the bead held before the swap (0 if none).
+    old_entry: usize,
+    old_body: Arc<HirFunction>,
+    /// OSR resume points this reload published, to be unpublished.
+    helper_sites: Vec<(u64, u64)>,
+    /// Dispatch-table slots this reload patched: (slot address, value
+    /// the slot held before).
+    vtable_slots: Vec<(usize, usize)>,
+}
+
 /// Runtime symbol entry for FFI registration.
 #[derive(Clone)]
 struct RuntimeSymbol {
@@ -260,6 +281,9 @@ pub struct TieredBackend {
     /// The module the compiled code came from. A reload diffs the
     /// edited module against this and replaces it piecewise.
     current_module: Option<HirModule>,
+    /// Undo record for the most recent applied reload, consumed by
+    /// [`Self::rollback_last_reload`].
+    last_undo: Option<ReloadUndo>,
 
     /// Profile counters (for `get_statistics` only — promotion is driven by
     /// beadie's own counters).
@@ -324,6 +348,7 @@ impl TieredBackend {
             _llvm_context,
             functions: HashMap::new(),
             current_module: None,
+            last_undo: None,
             profile_data: ProfileData::new(config.profile_config.clone()),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
@@ -459,8 +484,92 @@ impl TieredBackend {
         }
 
         let mut report = crate::reload::ReloadReport::default();
-        let mut updated_functions: Vec<(HirId, HirFunction)> = Vec::new();
         let mut seen_names: std::collections::HashSet<String> = Default::default();
+
+        // The compile pass prepares these; nothing is applied unless
+        // the whole edit set compiled.
+        struct PreparedChange {
+            old_id: HirId,
+            name: String,
+            body: HirFunction,
+            bead_id: u64,
+            entry_ptr: usize,
+            pending_resume: Vec<(u64, *mut ())>,
+        }
+        struct PreparedAdd {
+            new_id: HirId,
+            name: String,
+            body: HirFunction,
+            bead_id: u64,
+            entry_ptr: usize,
+        }
+        let mut changes: Vec<PreparedChange> = Vec::new();
+        let mut adds: Vec<PreparedAdd> = Vec::new();
+        let mut compile_failed: Vec<(String, String)> = Vec::new();
+        // Test hook: treat the named function as a compile failure, to
+        // exercise the all-or-nothing apply.
+        let inject_fail = std::env::var("ZYNTAX_RELOAD_INJECT_FAIL").ok();
+
+        // A stateful handler's state struct is shared between its ctor
+        // (which allocates it) and its ops (which read it through
+        // `self`). If an edit changes that layout, no piecewise reload
+        // is sound: patched ops would read new offsets out of state old
+        // ctors allocated, and vice versa. Decline every changed member
+        // of such a handler — ops and ctor together — so every
+        // generation in flight keeps a consistent view.
+        let mut layout_declined: Map<String, String> = Map::new();
+        {
+            let new_ctors: Map<String, &HirFunction> = new_module
+                .functions
+                .values()
+                .filter(|f| !f.is_external)
+                .filter_map(|f| name_of(f).map(|n| (n, f)))
+                .filter(|(n, _)| n.ends_with("$new"))
+                .collect();
+            for global in old_module.globals.values() {
+                let Some(crate::hir::HirConstant::VTable(vt)) = &global.initializer else {
+                    continue;
+                };
+                let Some(gname) = global.name.resolve_global() else {
+                    continue;
+                };
+                let Some(handler) = gname.strip_prefix("$optable$") else {
+                    continue;
+                };
+                let ctor_name = format!("{handler}$new");
+                // A stateless handler has no ctor and no shared layout.
+                let Some(&old_ctor_id) = old_by_name.get(&ctor_name) else {
+                    continue;
+                };
+                let Some(new_ctor) = new_ctors.get(&ctor_name) else {
+                    continue;
+                };
+                let old_ctor = &old_module.functions[&old_ctor_id];
+                let old_layout = old_ctor.signature.returns.first().map(type_layout_key);
+                let new_layout = new_ctor.signature.returns.first().map(type_layout_key);
+                if old_layout == new_layout {
+                    continue;
+                }
+                let reason = format!(
+                    "handler {handler}: state layout changed; the running \
+                     state cannot be read through the edited shape, so the \
+                     handler keeps its previous implementation"
+                );
+                for entry in &vt.methods {
+                    if let Some(op_name) = old_module
+                        .functions
+                        .get(&entry.function_id)
+                        .and_then(name_of)
+                    {
+                        layout_declined.insert(op_name, reason.clone());
+                    }
+                }
+                layout_declined.insert(ctor_name, reason);
+            }
+        }
+
+        self.cranelift
+            .with_lock(|be| be.set_defer_cell_publish(true));
 
         for (new_id, new_fn) in &new_module.functions {
             if new_fn.is_external {
@@ -482,6 +591,10 @@ impl TieredBackend {
                     }
                     if let Err(reason) = reload_reaches(new_fn) {
                         report.failed.push((name, reason.to_string()));
+                        continue;
+                    }
+                    if let Some(reason) = layout_declined.get(&name) {
+                        report.failed.push((name, reason.clone()));
                         continue;
                     }
                     if std::env::var_os("ZYNTAX_RELOAD_TRACE").is_some() {
@@ -515,6 +628,11 @@ impl TieredBackend {
 
                     let mut body = new_fn.clone();
                     remap_callees(&mut body, &id_remap);
+
+                    if inject_fail.as_deref() == Some(name.as_str()) {
+                        compile_failed.push((name, "injected compile failure (test hook)".into()));
+                        continue;
+                    }
 
                     let bead_id = self
                         .functions
@@ -551,95 +669,17 @@ impl TieredBackend {
                         Ok::<_, CompilerError>(be.get_function_ptr(old_id))
                     });
                     match compiled {
-                        Ok(Some(entry_ptr)) => {
-                            if let Some(fn_entry) = self.functions.get_mut(&old_id) {
-                                fn_entry.bound.bead().swap_compiled(entry_ptr as *mut ());
-                                fn_entry.function = Arc::new(body.clone());
-                            }
-
-                            // A resume point is only sound where the old
-                            // code's probe writes the frame the edited
-                            // body's helper reads: same site, same
-                            // live-ins. Anything else completes on the
-                            // old code and picks up the edit next call.
-                            if !pending_resume.is_empty() {
-                                let old_sites = site_layouts(old_fn);
-                                let new_sites = site_layouts(&body);
-                                let mut published = 0usize;
-                                for (site, code) in pending_resume {
-                                    match (old_sites.get(&site), new_sites.get(&site)) {
-                                        (Some(old_l), Some(new_l)) if old_l == new_l => {
-                                            osr::publish_helper(bead_id, site, code);
-                                            published += 1;
-                                        }
-                                        (Some(_), Some(_)) => report.resume_fell_back.push((
-                                            name.clone(),
-                                            format!("site {site:#x}: live-in layout changed"),
-                                        )),
-                                        (None, _) => report.resume_fell_back.push((
-                                            name.clone(),
-                                            format!(
-                                                "site {site:#x}: running code has no such loop"
-                                            ),
-                                        )),
-                                        (_, None) => {}
-                                    }
-                                }
-                                if published > 0 {
-                                    report.resume_published.push(name.clone());
-                                }
-                            }
-
-                            // Dispatch tables hold this function's old
-                            // entry wherever a handler exposes it as an
-                            // effect op; patch those slots so scopes
-                            // already entered reach the edit at their
-                            // next perform.
-                            let mut patched = 0usize;
-                            for (gid, global) in &old_module.globals {
-                                let Some(crate::hir::HirConstant::VTable(vt)) = &global.initializer
-                                else {
-                                    continue;
-                                };
-                                for (slot, entry) in vt.methods.iter().enumerate() {
-                                    if entry.function_id != old_id {
-                                        continue;
-                                    }
-                                    let addr =
-                                        self.cranelift.with_lock(|be| be.global_data_addr(*gid));
-                                    if let Some((base, size)) = addr {
-                                        let offset = slot * std::mem::size_of::<usize>();
-                                        if offset + std::mem::size_of::<usize>() <= size {
-                                            // SAFETY: the vtable global is
-                                            // declared writable and sized to
-                                            // its slots; running threads read
-                                            // the slot with plain loads, so
-                                            // an atomic store publishes the
-                                            // new entry without tearing.
-                                            unsafe {
-                                                let slot_ptr = base.add(offset)
-                                                    as *const std::sync::atomic::AtomicUsize;
-                                                (*slot_ptr).store(
-                                                    entry_ptr as usize,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
-                                            }
-                                            patched += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            if patched > 0 {
-                                report.dispatch_patched.push(name.clone());
-                            }
-
-                            updated_functions.push((old_id, body));
-                            report.reloaded.push(name);
-                        }
-                        Ok(None) => report
-                            .failed
+                        Ok(Some(entry_ptr)) => changes.push(PreparedChange {
+                            old_id,
+                            name,
+                            body,
+                            bead_id,
+                            entry_ptr: entry_ptr as usize,
+                            pending_resume,
+                        }),
+                        Ok(None) => compile_failed
                             .push((name, "recompile produced no entry pointer".into())),
-                        Err(e) => report.failed.push((name, e.to_string())),
+                        Err(e) => compile_failed.push((name, e.to_string())),
                     }
                 }
                 None => {
@@ -648,9 +688,14 @@ impl TieredBackend {
                         continue;
                     }
                     // Introduced by the edit: compile fresh under its
-                    // own id and register it like `compile_module` does.
+                    // own id, registered like `compile_module` does if
+                    // the whole set applies.
                     let mut body = new_fn.clone();
                     remap_callees(&mut body, &id_remap);
+                    if inject_fail.as_deref() == Some(name.as_str()) {
+                        compile_failed.push((name, "injected compile failure (test hook)".into()));
+                        continue;
+                    }
                     let bead_id = osr::next_bead_id();
                     let compiled = self.cranelift.with_lock(|be| {
                         be.set_compile_tier(0);
@@ -660,28 +705,194 @@ impl TieredBackend {
                         Ok::<_, CompilerError>(be.get_function_ptr(*new_id))
                     });
                     match compiled {
-                        Ok(Some(p)) => {
-                            let bound = self.adapter.register(ptr::null_mut(), None);
-                            bound.bead().eager_install(p as *mut ());
-                            osr::register_bead(bead_id, Arc::clone(bound.bead()));
-                            self.functions.insert(
-                                *new_id,
-                                FunctionEntry {
-                                    bound,
-                                    function: Arc::new(body.clone()),
-                                    bead_id,
-                                },
-                            );
-                            updated_functions.push((*new_id, body));
-                            report.added.push(name);
+                        Ok(Some(p)) => adds.push(PreparedAdd {
+                            new_id: *new_id,
+                            name,
+                            body,
+                            bead_id,
+                            entry_ptr: p as usize,
+                        }),
+                        Ok(None) => {
+                            compile_failed.push((name, "compile produced no entry pointer".into()))
                         }
-                        Ok(None) => report
-                            .failed
-                            .push((name, "compile produced no entry pointer".into())),
-                        Err(e) => report.failed.push((name, e.to_string())),
+                        Err(e) => compile_failed.push((name, e.to_string())),
                     }
                 }
             }
+        }
+
+        self.cranelift
+            .with_lock(|be| be.set_defer_cell_publish(false));
+        let deferred_cells = self.cranelift.with_lock(|be| be.take_deferred_cells());
+
+        if !compile_failed.is_empty() {
+            // Abort: no bead was swapped, no resume point published, no
+            // dispatch slot patched, and the deferred cell updates are
+            // dropped — the running generation is exactly as it was.
+            // (A cell update a concurrent tier promotion deferred into
+            // this window is dropped with them; its bead still holds
+            // the promoted code, and the next promotion or reload
+            // republishes the cell.)
+            report.failed.extend(compile_failed);
+            report.aborted = true;
+            return Ok(report);
+        }
+
+        // Apply: everything compiled, so the swaps, resume points,
+        // dispatch patches and cell publications land together.
+        let relevant: std::collections::HashSet<HirId> = changes
+            .iter()
+            .map(|c| c.old_id)
+            .chain(adds.iter().map(|a| a.new_id))
+            .collect();
+        let mut undo = ReloadUndo::default();
+        let mut updated_functions: Vec<(HirId, HirFunction)> = Vec::new();
+
+        for change in changes {
+            let PreparedChange {
+                old_id,
+                name,
+                body,
+                bead_id,
+                entry_ptr,
+                pending_resume,
+            } = change;
+            let old_fn = &old_module.functions[&old_id];
+
+            let mut old_entry = 0usize;
+            let mut old_body: Option<Arc<HirFunction>> = None;
+            if let Some(fn_entry) = self.functions.get_mut(&old_id) {
+                old_entry = fn_entry
+                    .bound
+                    .bead()
+                    .compiled()
+                    .map(|p| p as usize)
+                    .unwrap_or(0);
+                old_body = Some(Arc::clone(&fn_entry.function));
+                fn_entry.bound.bead().swap_compiled(entry_ptr as *mut ());
+                fn_entry.function = Arc::new(body.clone());
+            }
+
+            // A resume point is only sound where the old code's probe
+            // writes the frame the edited body's helper reads: same
+            // site, same live-ins. Anything else completes on the old
+            // code and picks up the edit next call.
+            let mut helper_sites: Vec<(u64, u64)> = Vec::new();
+            if !pending_resume.is_empty() {
+                let old_sites = site_layouts(old_fn);
+                let new_sites = site_layouts(&body);
+                for (site, code) in pending_resume {
+                    match (old_sites.get(&site), new_sites.get(&site)) {
+                        (Some(old_l), Some(new_l)) if old_l == new_l => {
+                            osr::publish_helper(bead_id, site, code);
+                            helper_sites.push((bead_id, site));
+                        }
+                        (Some(_), Some(_)) => report.resume_fell_back.push((
+                            name.clone(),
+                            format!("site {site:#x}: live-in layout changed"),
+                        )),
+                        (None, _) => report.resume_fell_back.push((
+                            name.clone(),
+                            format!("site {site:#x}: running code has no such loop"),
+                        )),
+                        (_, None) => {}
+                    }
+                }
+                if !helper_sites.is_empty() {
+                    report.resume_published.push(name.clone());
+                }
+            }
+
+            // Dispatch tables hold this function's old entry wherever a
+            // handler exposes it as an effect op; patch those slots so
+            // scopes already entered reach the edit at their next
+            // perform.
+            let mut vtable_slots: Vec<(usize, usize)> = Vec::new();
+            for (gid, global) in &old_module.globals {
+                let Some(crate::hir::HirConstant::VTable(vt)) = &global.initializer else {
+                    continue;
+                };
+                for (slot, entry) in vt.methods.iter().enumerate() {
+                    if entry.function_id != old_id {
+                        continue;
+                    }
+                    let addr = self.cranelift.with_lock(|be| be.global_data_addr(*gid));
+                    if let Some((base, size)) = addr {
+                        let offset = slot * std::mem::size_of::<usize>();
+                        if offset + std::mem::size_of::<usize>() <= size {
+                            // SAFETY: the vtable global is declared
+                            // writable and sized to its slots; running
+                            // threads read the slot with plain loads,
+                            // so an atomic store publishes the new
+                            // entry without tearing.
+                            unsafe {
+                                let slot_ptr =
+                                    base.add(offset) as *const std::sync::atomic::AtomicUsize;
+                                let prev = (*slot_ptr)
+                                    .swap(entry_ptr, std::sync::atomic::Ordering::AcqRel);
+                                vtable_slots.push((slot_ptr as usize, prev));
+                            }
+                        }
+                    }
+                }
+            }
+            if !vtable_slots.is_empty() {
+                report.dispatch_patched.push(name.clone());
+            }
+
+            undo.swapped.push(UndoSwap {
+                id: old_id,
+                name: name.clone(),
+                old_entry,
+                old_body: old_body.unwrap_or_else(|| Arc::new(old_fn.clone())),
+                helper_sites,
+                vtable_slots,
+            });
+            updated_functions.push((old_id, body));
+            report.reloaded.push(name);
+        }
+
+        for add in adds {
+            let PreparedAdd {
+                new_id,
+                name,
+                body,
+                bead_id,
+                entry_ptr,
+            } = add;
+            let bound = self.adapter.register(ptr::null_mut(), None);
+            bound.bead().eager_install(entry_ptr as *mut ());
+            osr::register_bead(bead_id, Arc::clone(bound.bead()));
+            self.functions.insert(
+                new_id,
+                FunctionEntry {
+                    bound,
+                    function: Arc::new(body.clone()),
+                    bead_id,
+                },
+            );
+            updated_functions.push((new_id, body));
+            report.added.push(name);
+        }
+
+        // Publish the deferred cell updates: the final value per id,
+        // restricted to the functions this reload touched (finalization
+        // also re-records every already-compiled function's pointer,
+        // and publishing those snapshots could roll a concurrently
+        // promoted cell backwards).
+        {
+            use std::collections::HashMap as Map;
+            let mut last: Map<HirId, usize> = Map::new();
+            for (id, ptr) in deferred_cells {
+                if relevant.contains(&id) {
+                    last.insert(id, ptr);
+                }
+            }
+            self.cranelift.with_lock(|be| {
+                for (id, ptr) in last {
+                    be.publish_call_target(id, ptr);
+                }
+            });
         }
 
         for (name, _) in old_by_name.iter() {
@@ -702,7 +913,120 @@ impl TieredBackend {
         // edited bodies rather than the ones it captured.
         self.install_promotion_requester();
 
+        // A reload that changed nothing keeps the previous undo record:
+        // "roll back the last reload" means the last one that changed
+        // the running module. Removals and additions count — their undo
+        // has nothing to restore at this level (retained code is
+        // untouched), but the embedder's metadata rollback pairs with
+        // this record and must not pair with an older one.
+        if !undo.swapped.is_empty()
+            || !report.removed_retained.is_empty()
+            || !report.added.is_empty()
+        {
+            self.last_undo = Some(undo);
+        }
+
         Ok(report)
+    }
+
+    /// Restore the generation the most recent applied reload replaced:
+    /// beads and reload cells swing back to the previous entry
+    /// pointers, resume points it published are withdrawn, and
+    /// dispatch-table slots it patched get their prior values back.
+    /// Functions the reload *added* stay registered but become
+    /// unreachable as their callers roll back. One-shot: consumes the
+    /// undo record; a second call errors until another reload applies.
+    pub fn rollback_last_reload(&mut self) -> CompilerResult<Vec<String>> {
+        let undo = self
+            .last_undo
+            .take()
+            .ok_or_else(|| CompilerError::Backend("no applied reload to roll back".into()))?;
+
+        let mut restored = Vec::new();
+        for swap in undo.swapped.into_iter().rev() {
+            if let Some(fn_entry) = self.functions.get_mut(&swap.id) {
+                if swap.old_entry != 0 {
+                    fn_entry
+                        .bound
+                        .bead()
+                        .swap_compiled(swap.old_entry as *mut ());
+                }
+                fn_entry.function = Arc::clone(&swap.old_body);
+            }
+            self.cranelift
+                .with_lock(|be| be.publish_call_target(swap.id, swap.old_entry));
+            for (bead_id, site) in swap.helper_sites {
+                osr::publish_helper(bead_id, site, ptr::null_mut());
+            }
+            for (addr, prev) in swap.vtable_slots {
+                // SAFETY: `addr` was recorded from the same writable
+                // vtable global the reload patched; the global lives
+                // for the process.
+                unsafe {
+                    (*(addr as *const std::sync::atomic::AtomicUsize))
+                        .store(prev, std::sync::atomic::Ordering::Release);
+                }
+            }
+            if let Some(module) = &mut self.current_module {
+                module.functions.insert(swap.id, (*swap.old_body).clone());
+            }
+            restored.push(swap.name);
+        }
+
+        self.install_promotion_requester();
+        Ok(restored)
+    }
+
+    /// What a host-side handler push needs for the handler named
+    /// `handler` in the running module: `(resolved name, effect id,
+    /// op-table data address, async mask, stateful?)`. Mirrors the
+    /// arguments the `with H { }` lowering computes for
+    /// `__zyntax_effect_push_handler`. FQN-aware: an exact name wins,
+    /// and an unqualified name matches a single `path::name` handler.
+    pub fn handler_push_info(&self, handler: &str) -> Option<(String, u64, usize, u64, bool)> {
+        let module = self.current_module.as_ref()?;
+        let suffix = format!("::{handler}");
+        let mut matched: Option<(&crate::hir::HirEffectHandler, String)> = None;
+        for h in module.handlers.values() {
+            let Some(name) = h.name.resolve_global() else {
+                continue;
+            };
+            if name == handler {
+                matched = Some((h, name));
+                break;
+            }
+            if name.ends_with(&suffix) {
+                if matched.is_some() {
+                    return None; // ambiguous — the caller must qualify
+                }
+                matched = Some((h, name));
+            }
+        }
+        let (h, resolved) = matched?;
+        let effect = module.effects.get(&h.effect_id)?;
+        let mut async_mask = 0u64;
+        for (idx, op) in effect.operations.iter().enumerate().take(64) {
+            if h.implementations
+                .iter()
+                .any(|i| i.op_name == op.name && i.is_async)
+            {
+                async_mask |= 1u64 << idx;
+            }
+        }
+        let table_name = format!("$optable${resolved}");
+        let gid = module
+            .globals
+            .iter()
+            .find(|(_, g)| g.name.resolve_global().as_deref() == Some(table_name.as_str()))
+            .map(|(id, _)| *id)?;
+        let (addr, _size) = self.cranelift.with_lock(|be| be.global_data_addr(gid))?;
+        Some((
+            resolved,
+            h.effect_id.as_u32() as u64,
+            addr as usize,
+            async_mask,
+            !h.state_fields.is_empty(),
+        ))
     }
 
     /// Current native-code pointer for `func_id`, or `None` if unknown.
@@ -1158,14 +1482,18 @@ fn reload_reaches(func: &HirFunction) -> Result<(), &'static str> {
         for inst in &block.instructions {
             match inst {
                 crate::hir::HirInstruction::PerformEffect { .. } => {
-                    return Err("performs an effect; effect reload lands with op-table patching")
+                    return Err(
+                        "performs an effect; its perform sites reference the edited \
+                         module's globals, and reloading it needs global remapping",
+                    )
                 }
                 crate::hir::HirInstruction::Call {
                     callee: crate::hir::HirCallable::Symbol(name),
                     ..
                 } if name.starts_with("__zyntax_effect_") => {
                     return Err(
-                        "uses effect scaffolding; effect reload lands with op-table patching",
+                        "uses effect scaffolding that references the edited module's \
+                         globals; reloading it needs global remapping",
                     )
                 }
                 _ => {}
@@ -1192,6 +1520,59 @@ fn site_layouts(
         }
     }
     map
+}
+
+/// Canonical layout of a type: the structural shape two generations
+/// must share to read each other's state. Struct and union names are
+/// ignored — only field order, types and packing bear on layout.
+fn type_layout_key(ty: &crate::hir::HirType) -> String {
+    fn go(ty: &crate::hir::HirType, out: &mut String, depth: usize) {
+        use crate::hir::HirType as T;
+        if depth > 16 {
+            out.push('…');
+            return;
+        }
+        match ty {
+            T::Ptr(inner) => {
+                out.push('*');
+                go(inner, out, depth + 1);
+            }
+            T::Ref { pointee, .. } => {
+                out.push('&');
+                go(pointee, out, depth + 1);
+            }
+            T::Array(inner, n) => {
+                out.push_str(&format!("[{n}]"));
+                go(inner, out, depth + 1);
+            }
+            T::Vector(inner, n) => {
+                out.push_str(&format!("<{n}>"));
+                go(inner, out, depth + 1);
+            }
+            T::Struct(s) => {
+                out.push_str(if s.packed { "s!{" } else { "s{" });
+                for f in &s.fields {
+                    go(f, out, depth + 1);
+                    out.push(',');
+                }
+                out.push('}');
+            }
+            T::Union(u) => {
+                out.push_str("u{");
+                go(&u.discriminant_type, out, depth + 1);
+                out.push(';');
+                for v in &u.variants {
+                    go(&v.ty, out, depth + 1);
+                    out.push(',');
+                }
+                out.push('}');
+            }
+            other => out.push_str(&format!("{other:?}")),
+        }
+    }
+    let mut out = String::new();
+    go(ty, &mut out, 0);
+    out
 }
 
 /// Rewrite the callee ids an edited function carries onto the running

@@ -359,6 +359,20 @@ impl ZynML {
         }
     }
 
+    /// Restore the generation the most recent applied reload replaced.
+    /// Returns the restored function names. Requires a tiered runtime
+    /// with hot reload enabled, and errors when no reload has applied.
+    pub fn rollback_last_reload(&mut self) -> Result<Vec<String>> {
+        match &mut self.runtime {
+            RuntimeEngine::Classic(_) => Err(anyhow::anyhow!(
+                "hot reload requires a tiered runtime profile"
+            )),
+            RuntimeEngine::Tiered(rt) => rt
+                .rollback_last_reload()
+                .context("Failed to roll back the last reload"),
+        }
+    }
+
     /// Parse source and return the AST as JSON
     pub fn parse_to_json(&self, source: &str) -> Result<String> {
         self.grammar

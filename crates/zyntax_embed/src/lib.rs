@@ -105,6 +105,7 @@ pub use effect_runtime::{
     __zyntax_async_set_timeout, __zyntax_effect_abort, __zyntax_effect_lookup_handler,
     __zyntax_effect_pop_handler, __zyntax_effect_push_handler, __zyntax_effect_resume,
     __zyntax_runtime_release_sm, __zyntax_runtime_release_sm_by_offset, __zyntax_runtime_retain_sm,
+    handler_stack_depth,
 };
 // Cooperative-async externs. Phase G plumbing — the browser shim
 // in zyntax_wasm exports thin wrappers around these so JS-side
@@ -135,6 +136,10 @@ pub use runtime::{
     BuiltinResolver,
     ChainedResolver,
     ExportedSymbol,
+    FiberToken,
+    HandlerToken,
+    HostFiberInfo,
+    HostFiberStep,
     ImportContext,
     ImportError,
     ImportManager,

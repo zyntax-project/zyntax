@@ -358,6 +358,31 @@ pub extern "C" fn __zyntax_effect_fiber_forget(fiber: *mut u8) {
     });
 }
 
+/// Bind a handler frame into a fiber's saved segment so every
+/// enter/resume installs it and every leave saves it back — the
+/// persistent counterpart of a per-resume push. Inserted at the
+/// segment's bottom: the fiber's own `with` scopes (and earlier
+/// binds) sit above it and keep precedence during lookup.
+pub(crate) fn fiber_bind_handler(
+    fiber: *mut u8,
+    effect_id: u64,
+    handler_state: *mut u8,
+    op_table: *mut u8,
+    async_mask: u64,
+) {
+    HANDLER_SEGMENTS.with(|segs| {
+        segs.borrow_mut().entry(fiber as usize).or_default().insert(
+            0,
+            HandlerFrame {
+                effect_id,
+                handler_state,
+                op_table,
+                async_mask,
+            },
+        );
+    });
+}
+
 thread_local! {
     /// Per-async-task saved handler-stack segments — the async analogue of
     /// `HANDLER_SEGMENTS` (per fiber). Cooperative tasks share the one

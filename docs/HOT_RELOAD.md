@@ -113,11 +113,50 @@ A built-in `Reload` effect surfaces reload events to the program —
 the UI DSL's observable boundary: a framework installs a handler and
 receives `{function, kind: swapped|migrated|fell_back}` performs.
 
-**Phase 4 — hardening.** Layout-migration hooks (a user-supplied
-migration function per type, for the cases a hash mismatch is fixable);
-rollback integration (a failed reload restores the previous
-generation); interaction with async tasks (await frames are state
-machines like fibers and take the same cell treatment).
+**Phase 4 — hardening.**
+
+- *All-or-nothing apply.* The reload compiles the whole edit set with
+  cell publication deferred; a compile failure anywhere aborts the
+  reload — nothing swapped, published, or patched, `aborted` set on
+  the report. Per-function declines (unsupported shapes) stay skips.
+- *Rollback.* `rollback_last_reload()` restores the generation the
+  last applied reload replaced: beads, reload cells, resume points and
+  dispatch-table slots all swing back; state untouched. One-shot, and
+  observable as the same event a reload emits.
+- *Handler-state layout guard.* A stateful handler's state struct is
+  shared between its ctor and its ops; an edit that changes that
+  layout declines the whole handler group together, so every
+  generation keeps a consistent view. Same-shape edits (an initializer
+  value) reload freely.
+- *Async tasks.* A frame that hands out its own address — an async
+  poll fn re-parking itself — pins that address to its own generation
+  instead of reading the reload cell: a suspended task completes on
+  the code it started with, and a task spawned after the edit runs the
+  edited code from its first poll.
+- *Host-driven fibers.* `get_fiber` / `resume_fiber[_within]` /
+  `bind_fiber_handler` / `drop_fiber` / `fiber_info` on the tiered
+  runtime: a framework gets a machine instance from a compiled
+  `fiber def`, holds a `FiberToken` across reloads and OSR, and steps
+  it with handler scopes installed around each step. Handler-state
+  persistence is explicit: `resume_fiber_within` opens fresh scopes
+  per step; `bind_fiber_handler` allocates state once and carries it
+  in the fiber's handler segment for the machine's lifetime. The edit
+  edges surface as values: a deleted function answers `MachineGone`
+  (drop + remount, not a trap) and leaves the shape registry, and a
+  changed yield shape marks the handle stale via a shape generation
+  while payloads keep decoding with the creation shape. Rollback
+  restores the handles' metadata along with the code. A failed
+  multi-handler install unwinds its pushed frames; runtime shutdown
+  frees any machines still registered. Names are FQN-aware —
+  unqualified names resolve when unambiguous — and `get_effect_handler`
+  resolves a handler once into a pinned `EffectHandlerToken` for drives and
+  binds, so a host never re-resolves a bare name that a later edit
+  could ambiguate. `register_builtin_class` exists on the tiered
+  runtime, same seam as the classic one.
+
+Still open from the phase list: layout-migration hooks (a
+user-supplied migration function per type, for the cases a mismatch is
+fixable). The guard + fallback ladder covers soundness meanwhile.
 
 ## Costs, measured before shipped
 
