@@ -6,7 +6,10 @@
 //! values and handle metadata, never as traps.
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_embed::{HostFiberStep, TieredConfig, TieredRuntime, ZyntaxValue};
+use zyntax_embed::{
+    HostFiberStep, TieredConfig, TieredRuntime, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, ZyntaxValue,
+};
+use zyntax_typed_ast::{PrimitiveType, Span, Type, TypedASTBuilder, TypedStatement, Visibility};
 
 fn runtime() -> TieredRuntime {
     let mut config = TieredConfig::development();
@@ -67,6 +70,69 @@ fn a_plain_function_is_not_a_machine() {
     rt.compile_typed_program(parse("def plain(): i64 { return 1 }"))
         .expect("should compile");
     assert!(rt.get_fiber("plain").is_err());
+}
+
+extern "C" fn host_fiber_value() -> i64 {
+    17
+}
+
+/// Typed embedders can batch-register host functions, publish them into
+/// the tier-0 JIT once, and call them from a host-driven fiber.
+#[test]
+fn a_tiered_host_symbol_is_finalized_before_fiber_compilation() {
+    let mut rt = runtime();
+    rt.register_function_typed(
+        "$Host$fiber_value",
+        host_fiber_value as *const u8,
+        ZrtlSymbolSig {
+            param_count: 0,
+            flags: ZrtlSigFlags::NONE,
+            return_type: TypeTag::I64,
+            params: [TypeTag::VOID; 16],
+        },
+    );
+    rt.finalize_runtime_symbols().expect("publish host symbol");
+
+    let mut builder = TypedASTBuilder::new();
+    let span = Span::new(0, 0);
+    let i64_type = Type::Primitive(PrimitiveType::I64);
+    let external = builder.extern_function(
+        "$Host$fiber_value",
+        vec![],
+        i64_type.clone(),
+        Visibility::Private,
+        span,
+    );
+    let callee = builder.variable("$Host$fiber_value", i64_type.clone(), span);
+    let value = builder.call_positional(callee, vec![], i64_type.clone(), span);
+    let yielded = zyntax_typed_ast::typed_ast::typed_node(
+        TypedStatement::Yield(Box::new(value)),
+        Type::Primitive(PrimitiveType::Unit),
+        span,
+    );
+    let body = builder.block(vec![yielded], span);
+    let mut machine = builder.function(
+        "host_value_machine",
+        vec![],
+        i64_type,
+        body,
+        Visibility::Public,
+        false,
+        span,
+    );
+    let zyntax_typed_ast::TypedDeclaration::Function(function) = &mut machine.node else {
+        unreachable!("builder returned a non-function")
+    };
+    function.is_fiber = true;
+    let program = builder.program(vec![external, machine], span);
+
+    rt.compile_typed_program(program).expect("compile");
+    let token = rt.get_fiber("host_value_machine").expect("get");
+    assert_eq!(
+        rt.resume_fiber(token).expect("step"),
+        HostFiberStep::Yielded(ZyntaxValue::Int(17))
+    );
+    rt.drop_fiber(token).expect("drop");
 }
 
 const OBSERVER: &str = r#"

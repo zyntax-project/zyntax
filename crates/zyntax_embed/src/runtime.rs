@@ -4048,6 +4048,19 @@ impl TieredRuntime {
         self.backend.register_symbol_signatures(&[info]);
     }
 
+    /// Publish host functions registered through
+    /// [`Self::register_function_typed`] into the live tier-0 JIT module.
+    ///
+    /// Registering is deliberately batchable: embedders add every host
+    /// symbol first, call this once, and only then compile a typed program
+    /// that declares those externs. This mirrors
+    /// [`ZyntaxRuntime::finalize_runtime_symbols`].
+    pub fn finalize_runtime_symbols(&mut self) -> RuntimeResult<()> {
+        self.backend
+            .rebuild_with_accumulated_symbols()
+            .map_err(|error| RuntimeError::Execution(error.to_string()))
+    }
+
     /// Compile a pre-parsed typed program, mirroring
     /// [`ZyntaxRuntime::compile_typed_program`]. This is the path a
     /// `Grammar2`-based frontend takes; `load_module` covers the
