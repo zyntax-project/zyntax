@@ -3375,6 +3375,10 @@ pub struct TieredRuntime {
     /// keyed by token.
     handler_tokens: HashMap<u64, String>,
     next_handler_token: u64,
+    /// Handler state regions the host allocated explicitly, keyed by
+    /// instance handle. See [`TieredRuntime::new_handler_instance`].
+    handler_instances: HashMap<u64, HandlerInstanceEntry>,
+    next_handler_instance: u64,
     /// Undo record for the fiber-handle metadata the most recent
     /// applied reload changed, consumed by
     /// [`TieredRuntime::rollback_last_reload`] alongside the backend's
@@ -3417,6 +3421,28 @@ pub struct EffectHandlerToken(u64);
 /// frame is ended exactly once.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct HandlerFrame(u64);
+
+/// Opaque handle to ONE allocated instance of a stateful handler's
+/// state.
+///
+/// Creating an instance and installing it are separate steps, so the
+/// same state can back several installs: a machine can advance it
+/// through [`TieredRuntime::bind_fiber_handler_instance`] while host
+/// code reads it through [`TieredRuntime::push_handler_instance`].
+/// Installs borrow the instance; the runtime owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HandlerInstance(u64);
+
+/// A host-allocated handler state and the dispatch shape it installs with.
+struct HandlerInstanceEntry {
+    handler: String,
+    effect_id: u64,
+    /// The state region, as `usize` so the entry stays `Send`/`Sync`.
+    /// Null for a stateless handler.
+    state: usize,
+    table: usize,
+    async_mask: u64,
+}
 
 /// One step of a host-driven machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -3501,6 +3527,30 @@ fn yield_kind_of(ty: &zyntax_typed_ast::Type) -> HostYieldKind {
         ) => HostYieldKind::Int,
         _ => HostYieldKind::Opaque,
     }
+}
+
+/// Move one handler-state region into the edited layout: allocate with
+/// the edited constructor and copy each field the two layouts share.
+fn migrate_one(
+    moves: &[(usize, usize, usize)],
+    ctor: extern "C" fn() -> *mut u8,
+    old_state: *mut u8,
+) -> Option<*mut u8> {
+    let fresh = ctor();
+    if fresh.is_null() {
+        return None;
+    }
+    for (from, to, size) in moves {
+        // SAFETY: both regions are handler states of this handler, the
+        // old one allocated by the previous constructor and the new one
+        // just returned by the edited one, and every (offset, size)
+        // came from the layout of the matching generation. The regions
+        // are distinct allocations.
+        unsafe {
+            std::ptr::copy_nonoverlapping(old_state.add(*from), fresh.add(*to), *size);
+        }
+    }
+    Some(fresh)
 }
 
 fn decode_yield(kind: HostYieldKind, payload: i64) -> ZyntaxValue {
@@ -3594,6 +3644,8 @@ impl TieredRuntime {
             fiber_shapes: HashMap::new(),
             handler_tokens: HashMap::new(),
             next_handler_token: 1,
+            handler_instances: HashMap::new(),
+            next_handler_instance: 1,
             fiber_meta_undo: None,
             builtin_registry: Arc::new(std::sync::Mutex::new(
                 zyntax_compiler::builtin_class::BuiltinRegistry::with_defaults(),
@@ -4214,23 +4266,28 @@ impl TieredRuntime {
             // SAFETY: a synthesized handler constructor is `(): *state`.
             let ctor: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(ctor_ptr) };
 
+            // A host-owned instance that is not installed anywhere is
+            // named by no frame, so the live-frame walk below cannot
+            // see it. Migrate the registry's own regions first, and
+            // record the moves so a frame still holding one is updated
+            // to the same replacement rather than a second copy.
+            let mut moved: HashMap<usize, usize> = HashMap::new();
+            for entry in self.handler_instances.values_mut() {
+                if entry.effect_id != plan.effect_id || entry.state == 0 {
+                    continue;
+                }
+                if let Some(fresh) = migrate_one(&plan.moves, ctor, entry.state as *mut u8) {
+                    moved.insert(entry.state, fresh as usize);
+                    entry.state = fresh as usize;
+                    total += 1;
+                }
+            }
+
             total += crate::effect_runtime::migrate_handler_states(plan.effect_id, |old_state| {
-                let fresh = ctor();
-                if fresh.is_null() {
-                    return None;
+                if let Some(already) = moved.get(&(old_state as usize)) {
+                    return Some(*already as *mut u8);
                 }
-                for (from, to, size) in &plan.moves {
-                    // SAFETY: both regions are handler states of this
-                    // handler — the old one allocated by the previous
-                    // constructor, the new one just returned by the
-                    // edited one — and every (offset, size) came from
-                    // the layout of the matching generation. The
-                    // regions are distinct allocations.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(old_state.add(*from), fresh.add(*to), *size);
-                    }
-                }
-                Some(fresh)
+                migrate_one(&plan.moves, ctor, old_state)
             });
         }
         total
@@ -4495,6 +4552,10 @@ impl TieredRuntime {
     /// Every frame must be handed to [`Self::pop_effect_handler`], in
     /// reverse order of installation. Leaving one installed leaks it
     /// into unrelated work on the same thread.
+    ///
+    /// Each call allocates its own state, so successive extents do not
+    /// share one and neither does a machine bound to the same handler.
+    /// Use [`Self::push_handler_instance`] when they should.
     pub fn push_effect_handler(&self, handler: EffectHandlerToken) -> RuntimeResult<HandlerFrame> {
         let name = self
             .handler_tokens
@@ -4507,6 +4568,116 @@ impl TieredRuntime {
     /// End the extent a [`Self::push_effect_handler`] frame opened.
     pub fn pop_effect_handler(&self, frame: HandlerFrame) {
         crate::effect_runtime::__zyntax_effect_pop_handler(frame.0);
+    }
+
+    /// Allocate ONE instance of a handler's state and hand back a
+    /// handle to it.
+    ///
+    /// This is the seam that lets a single state back more than one
+    /// install. [`Self::push_effect_handler`] and
+    /// [`Self::bind_fiber_handler`] each allocate their own, so a
+    /// machine and the host reading after it see different storage;
+    /// create an instance here instead and install THAT in both places
+    /// with [`Self::bind_fiber_handler_instance`] and
+    /// [`Self::push_handler_instance`].
+    ///
+    /// A stateless handler has no state to share, but still gets an
+    /// instance so callers need not special-case it.
+    ///
+    /// The runtime owns the instance and every install borrows it, so
+    /// dropping a fiber never invalidates one. Handler state is not
+    /// reclaimed today — the same is true of the state a `with H { }`
+    /// scope allocates — so an instance's region lives as long as the
+    /// runtime; [`Self::drop_handler_instance`] releases the handle,
+    /// not the memory.
+    pub fn new_handler_instance(
+        &mut self,
+        handler: EffectHandlerToken,
+    ) -> RuntimeResult<HandlerInstance> {
+        let name = self
+            .handler_tokens
+            .get(&handler.0)
+            .cloned()
+            .ok_or_else(|| RuntimeError::Execution("unknown handler token".to_string()))?;
+        let (resolved, effect_id, table, async_mask, stateful) = self.handler_shape(&name)?;
+        let state = self.alloc_handler_state(&resolved, stateful)?;
+        let id = self.next_handler_instance;
+        self.next_handler_instance += 1;
+        self.handler_instances.insert(
+            id,
+            HandlerInstanceEntry {
+                handler: resolved,
+                effect_id,
+                state: state as usize,
+                table: table as usize,
+                async_mask,
+            },
+        );
+        Ok(HandlerInstance(id))
+    }
+
+    /// Install `instance` for a host-controlled extent, the way
+    /// [`Self::push_effect_handler`] does but against state the caller
+    /// already owns. Pair with [`Self::pop_effect_handler`].
+    pub fn push_handler_instance(&self, instance: HandlerInstance) -> RuntimeResult<HandlerFrame> {
+        let e = self.handler_instance_entry(instance)?;
+        Ok(HandlerFrame(
+            crate::effect_runtime::__zyntax_effect_push_handler(
+                e.effect_id,
+                e.state as *mut u8,
+                e.table as *mut u8,
+                e.async_mask,
+            ),
+        ))
+    }
+
+    /// Bind `instance` to a machine for its lifetime, the way
+    /// [`Self::bind_fiber_handler`] does but against state the caller
+    /// already owns, so the same region is readable from a pushed
+    /// frame afterwards.
+    pub fn bind_fiber_handler_instance(
+        &mut self,
+        token: FiberToken,
+        instance: HandlerInstance,
+    ) -> RuntimeResult<()> {
+        let ptr = {
+            let hf = self.host_fibers.get(&token.0).ok_or_else(|| {
+                RuntimeError::Execution("unknown or dropped fiber token".to_string())
+            })?;
+            hf.ptr as *mut u8
+        };
+        let e = self.handler_instance_entry(instance)?;
+        let (effect_id, state, table, async_mask) = (
+            e.effect_id,
+            e.state as *mut u8,
+            e.table as *mut u8,
+            e.async_mask,
+        );
+        crate::effect_runtime::fiber_bind_handler(ptr, effect_id, state, table, async_mask);
+        Ok(())
+    }
+
+    /// The handler an instance is an instance OF, fully qualified.
+    pub fn handler_instance_name(&self, instance: HandlerInstance) -> Option<&str> {
+        self.handler_instances
+            .get(&instance.0)
+            .map(|e| e.handler.as_str())
+    }
+
+    /// Release the handle. Installs already made keep working — they
+    /// hold the state pointer directly — and the region itself is not
+    /// reclaimed, as described on [`Self::new_handler_instance`].
+    pub fn drop_handler_instance(&mut self, instance: HandlerInstance) {
+        self.handler_instances.remove(&instance.0);
+    }
+
+    fn handler_instance_entry(
+        &self,
+        instance: HandlerInstance,
+    ) -> RuntimeResult<&HandlerInstanceEntry> {
+        self.handler_instances
+            .get(&instance.0)
+            .ok_or_else(|| RuntimeError::Execution("unknown handler instance".to_string()))
     }
 
     /// Resolve a handler name ONCE — FQN-aware, ambiguity is an error —
@@ -4587,31 +4758,51 @@ impl TieredRuntime {
         })
     }
 
-    /// Resolve the named handler into the frame a push (or bind)
-    /// installs: `(effect_id, state, op_table, async_mask)`, with
-    /// fresh handler state allocated when it is stateful.
-    fn named_handler_frame(&self, handler: &str) -> RuntimeResult<(u64, *mut u8, *mut u8, u64)> {
+    /// Everything about a handler that does NOT depend on which
+    /// instance of its state you mean: `(resolved name, effect id,
+    /// op table, async mask, stateful?)`.
+    fn handler_shape(&self, handler: &str) -> RuntimeResult<(String, u64, *mut u8, u64, bool)> {
         let (resolved, effect_id, table_addr, async_mask, stateful) =
             self.backend.handler_push_info(handler).ok_or_else(|| {
                 RuntimeError::Execution(format!(
                     "no unambiguous handler named `{handler}` in the loaded program"
                 ))
             })?;
-        let state: *mut u8 = if stateful {
-            let ctor = format!("{resolved}$new");
-            let id = *self.function_ids.get(&ctor).ok_or_else(|| {
-                RuntimeError::Execution(format!("stateful handler `{resolved}` has no constructor"))
-            })?;
-            let p = self.backend.get_function_pointer(id).ok_or_else(|| {
-                RuntimeError::Execution(format!("no compiled entry for `{ctor}`"))
-            })?;
-            // SAFETY: `H$new` is synthesized as `(): *state`.
-            let f: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(p) };
-            f()
-        } else {
-            std::ptr::null_mut()
-        };
-        Ok((effect_id, state, table_addr as *mut u8, async_mask))
+        Ok((
+            resolved,
+            effect_id,
+            table_addr as *mut u8,
+            async_mask,
+            stateful,
+        ))
+    }
+
+    /// Run a stateful handler's synthesized constructor to allocate one
+    /// state region. Null for a stateless handler, which has none.
+    fn alloc_handler_state(&self, resolved: &str, stateful: bool) -> RuntimeResult<*mut u8> {
+        if !stateful {
+            return Ok(std::ptr::null_mut());
+        }
+        let ctor = format!("{resolved}$new");
+        let id = *self.function_ids.get(&ctor).ok_or_else(|| {
+            RuntimeError::Execution(format!("stateful handler `{resolved}` has no constructor"))
+        })?;
+        let p = self
+            .backend
+            .get_function_pointer(id)
+            .ok_or_else(|| RuntimeError::Execution(format!("no compiled entry for `{ctor}`")))?;
+        // SAFETY: `H$new` is synthesized as `(): *state`.
+        let f: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(p) };
+        Ok(f())
+    }
+
+    /// Resolve the named handler into the frame a push (or bind)
+    /// installs: `(effect_id, state, op_table, async_mask)`, with
+    /// fresh handler state allocated when it is stateful.
+    fn named_handler_frame(&self, handler: &str) -> RuntimeResult<(u64, *mut u8, *mut u8, u64)> {
+        let (resolved, effect_id, table, async_mask, stateful) = self.handler_shape(handler)?;
+        let state = self.alloc_handler_state(&resolved, stateful)?;
+        Ok((effect_id, state, table, async_mask))
     }
 
     /// Push a `with H`-equivalent frame for the named handler,
@@ -4637,6 +4828,10 @@ impl TieredRuntime {
     ///
     /// A durable binding deserves a durable name: prefer resolving the
     /// handler once with [`Self::get_effect_handler`] and binding the token.
+    ///
+    /// This allocates the machine's state, so nothing outside the
+    /// machine can read it. To share one region with host code, create
+    /// it with [`Self::new_handler_instance`] and bind that instead.
     pub fn bind_fiber_handler(
         &mut self,
         token: FiberToken,

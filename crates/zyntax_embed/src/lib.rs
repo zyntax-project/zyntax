@@ -139,6 +139,7 @@ pub use runtime::{
     ExportedSymbol,
     FiberToken,
     HandlerFrame,
+    HandlerInstance,
     HostFiberInfo,
     HostFiberStep,
     ImportContext,
