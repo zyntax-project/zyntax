@@ -1,11 +1,21 @@
 //! Aggregates and handler state.
 //!
-//! A struct literal is fine inside a handler op body, and the state it
-//! computes survives fiber resumes and reads from a pushed frame. What
-//! does not parse is a struct literal as a handler FIELD initializer —
-//! `var at: Point = Point { x: 0, y: 0 }` — even though the identical
-//! literal parses in a `let`. Field defaults appear to accept scalar
-//! literals only.
+//! A handler can declare a struct-typed field, default it to a struct
+//! literal, and read through it; the state survives fiber resumes and
+//! reads from a pushed frame.
+//!
+//! One shape does not parse: a nested WRITE through `self` —
+//! `self.at.x = ...`. Everything adjacent to it does, which is what
+//! makes it look like a regression rather than a limit:
+//!
+//! | shape | parses |
+//! | --- | --- |
+//! | `self.at.x` as a read | yes |
+//! | `self.n = ...` one level | yes |
+//! | `p.x = ...` on a local | yes |
+//! | `let mut p = self.at` then `p.x = ...` | yes |
+//! | `self.at.x = ...` | NO |
+//! | same with `@reference` on the struct | NO |
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
 
@@ -82,36 +92,33 @@ fn a_struct_literal_works_inside_a_handler_op() {
     rt.drop_fiber(walker).expect("drop");
 }
 
-/// A struct literal as a handler field's default.
+/// A nested write through `self` in a handler body.
 ///
-/// Fails at the initializer with a parse error, where the same literal
-/// in a `let` inside an op body parses. Ignored because it documents a
-/// grammar gap rather than a regression.
+/// Ignored: it fails at parse, where the read of the same path and a
+/// one-level write both succeed. See the table above.
 #[test]
-#[ignore = "handler field initializers take scalar literals, not struct literals"]
-fn a_handler_field_can_default_to_a_struct_literal() {
-    const WITH_FIELD: &str = r#"
-struct Point:
-    x: i64
+#[ignore = "nested write through self does not parse: self.at.x = ..."]
+fn a_handler_can_write_through_a_nested_field() {
+    const NESTED_WRITE: &str = r#"
+struct Point {
+    x: i64,
     y: i64
+}
 
 effect Tracker {
-    def get_x(): i64
+    def bump()
 }
 
 handler Trail for Tracker {
     var at: Point = Point { x: 7, y: 0 }
-    def get_x(): i64 { return self.at.x }
+    def bump() { self.at.x = self.at.x + 1 }
 }
-
-@effect(Tracker)
-def read_x(): i64 { return get_x() }
 "#;
     let g = Grammar2::from_source(ZYNML_GRAMMAR).expect("g");
-    let parsed = g.parse_with_filename(WITH_FIELD, "field_default.zyn");
+    let parsed = g.parse_with_filename(NESTED_WRITE, "nested_write.zyn");
     assert!(
         parsed.is_ok(),
-        "a struct literal should be usable as a field default: {:?}",
+        "a nested write through self should parse: {:?}",
         parsed.err()
     );
 }
