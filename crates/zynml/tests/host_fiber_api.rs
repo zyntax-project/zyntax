@@ -341,8 +341,8 @@ fn a_bound_handler_carries_state_across_steps() {
 
     // Bound: one state for the machine's lifetime.
     let bound = rt.get_fiber("watcher").expect("get");
-    let seq = rt.get_handler("Seq").expect("resolve once");
-    assert_eq!(rt.handler_name(seq), Some("Seq"));
+    let seq = rt.get_effect_handler("Seq").expect("resolve once");
+    assert_eq!(rt.effect_handler_name(seq), Some("Seq"));
     rt.bind_fiber_handler(bound, seq).expect("bind");
     for expect in 1..=3 {
         assert_eq!(
@@ -529,7 +529,7 @@ fn a_handler_token_pins_its_resolution() {
     rt.compile_typed_program(parse(OBSERVER))
         .expect("should compile");
     let machine = rt.get_fiber("machine").expect("get");
-    let feed = rt.get_handler("Feed").expect("resolve once");
+    let feed = rt.get_effect_handler("Feed").expect("resolve once");
 
     assert_eq!(
         rt.resume_fiber_handled(machine, &[feed]).expect("step"),
@@ -539,6 +539,6 @@ fn a_handler_token_pins_its_resolution() {
         rt.resume_fiber_handled(machine, &[feed]).expect("step"),
         HostFiberStep::Yielded(ZyntaxValue::Int(6))
     );
-    assert!(rt.get_handler("NoSuchHandler").is_err());
+    assert!(rt.get_effect_handler("NoSuchHandler").is_err());
     rt.drop_fiber(machine).expect("drop");
 }

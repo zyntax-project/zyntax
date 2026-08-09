@@ -358,6 +358,59 @@ pub extern "C" fn __zyntax_effect_fiber_forget(fiber: *mut u8) {
     });
 }
 
+/// Replace the state pointer of every live frame handling `effect_id`
+/// — on the current stack, in a fiber's saved segment, or in a parked
+/// task's — with whatever `migrate` returns for it. Each distinct
+/// region is migrated once, so two frames sharing a region keep
+/// sharing it.
+///
+/// This is how a reload moves handler state into an edited layout: the
+/// regions themselves are unreachable from the compiler, but every
+/// live one is named by a frame here.
+pub(crate) fn migrate_handler_states(
+    effect_id: u64,
+    mut migrate: impl FnMut(*mut u8) -> Option<*mut u8>,
+) -> usize {
+    let mut done: std::collections::HashMap<usize, *mut u8> = std::collections::HashMap::new();
+    let mut migrated = 0usize;
+
+    let mut visit = |frames: &mut Vec<HandlerFrame>| {
+        for frame in frames.iter_mut() {
+            if frame.effect_id != effect_id || frame.handler_state.is_null() {
+                continue;
+            }
+            let key = frame.handler_state as usize;
+            let replacement = match done.get(&key) {
+                Some(p) => Some(*p),
+                None => match migrate(frame.handler_state) {
+                    Some(p) => {
+                        done.insert(key, p);
+                        migrated += 1;
+                        Some(p)
+                    }
+                    None => None,
+                },
+            };
+            if let Some(p) = replacement {
+                frame.handler_state = p;
+            }
+        }
+    };
+
+    HANDLER_STACK.with(|stack| visit(&mut stack.borrow_mut()));
+    HANDLER_SEGMENTS.with(|segs| {
+        for frames in segs.borrow_mut().values_mut() {
+            visit(frames);
+        }
+    });
+    TASK_HANDLER_SEGMENTS.with(|segs| {
+        for frames in segs.borrow_mut().values_mut() {
+            visit(frames);
+        }
+    });
+    migrated
+}
+
 /// Bind a handler frame into a fiber's saved segment so every
 /// enter/resume installs it and every leave saves it back — the
 /// persistent counterpart of a per-resume push. Inserted at the

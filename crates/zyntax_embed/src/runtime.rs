@@ -54,6 +54,21 @@ fn synthesize_handler_state(program: &mut zyntax_typed_ast::TypedProgram) {
         resumable: Vec<bool>,
     }
 
+    // Every handler of an effect must take its operations the same
+    // way, because a perform site passes its arguments to whichever
+    // handler is in scope at run time. So state-ness is a property of
+    // the EFFECT: once one handler carries state, the effect's ops take
+    // a leading state argument and the handlers without state ignore
+    // theirs.
+    let stateful_effects: std::collections::HashSet<InternedString> = program
+        .declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            TypedDeclaration::EffectHandler(h) if !h.fields.is_empty() => Some(h.effect_name),
+            _ => None,
+        })
+        .collect();
+
     // Phase A: collect stateful handlers + per-op resumability.
     let mut infos: Vec<StateInfo> = program
         .declarations
@@ -139,21 +154,44 @@ fn synthesize_handler_state(program: &mut zyntax_typed_ast::TypedProgram) {
     };
 
     // Phase B: prepend `self: H$state` to every non-resumable op impl.
+    // A stateless handler of a stateful effect gets the same leading
+    // slot, typed as a plain machine word it never reads — it only has
+    // to accept the argument the perform site passes.
     for d in &mut program.declarations {
         if let TypedDeclaration::EffectHandler(h) = &mut d.node {
-            if let Some(info) = infos.iter().find(|i| i.handler == h.name) {
-                for (j, imp) in h.handlers.iter_mut().enumerate() {
-                    if !info.resumable[j] {
-                        imp.params.insert(
-                            0,
-                            TypedParameter {
-                                name: InternedString::new_global("self"),
-                                ty: named(info.state_id),
-                                mutability: Mutability::Mutable,
-                                ..Default::default()
-                            },
-                        );
-                    }
+            let self_ty = match infos.iter().find(|i| i.handler == h.name) {
+                Some(info) => Some(named(info.state_id)),
+                None if stateful_effects.contains(&h.effect_name) => {
+                    Some(Type::Primitive(PrimitiveType::I64))
+                }
+                None => None,
+            };
+            let Some(self_ty) = self_ty else {
+                continue;
+            };
+            let resumable: Vec<bool> = match infos.iter().find(|i| i.handler == h.name) {
+                Some(info) => info.resumable.clone(),
+                None => h
+                    .handlers
+                    .iter()
+                    .map(|imp| {
+                        imp.params
+                            .iter()
+                            .any(|p| is_resume_param(&p.ty, &program.type_registry))
+                    })
+                    .collect(),
+            };
+            for (j, imp) in h.handlers.iter_mut().enumerate() {
+                if !resumable[j] {
+                    imp.params.insert(
+                        0,
+                        TypedParameter {
+                            name: InternedString::new_global("self"),
+                            ty: self_ty.clone(),
+                            mutability: Mutability::Mutable,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
         }
@@ -3333,7 +3371,7 @@ pub struct TieredRuntime {
     /// Source-declared yield shape of each `fiber def`, with a
     /// generation that bumps when a reload changes the shape.
     fiber_shapes: HashMap<String, FiberShape>,
-    /// Resolved handler names pinned by [`TieredRuntime::get_handler`],
+    /// Resolved handler names pinned by [`TieredRuntime::get_effect_handler`],
     /// keyed by token.
     handler_tokens: HashMap<u64, String>,
     next_handler_token: u64,
@@ -3363,13 +3401,15 @@ struct FiberMetaUndo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FiberToken(u64);
 
-/// Opaque host handle to a resolved handler. [`TieredRuntime::get_handler`]
-/// resolves the (possibly unqualified) name ONCE and pins the fully
-/// qualified result, so later edits that introduce same-named handlers
-/// in other modules cannot re-aim or ambiguate the host's binding —
-/// bare strings resolve per call and can.
+/// Opaque host handle to a resolved EFFECT handler — a `handler H for
+/// E { ... }` declaration, not any other sense of the word.
+/// [`TieredRuntime::get_effect_handler`] resolves the (possibly
+/// unqualified) name ONCE and pins the fully qualified result, so later
+/// edits that introduce same-named handlers in other modules cannot
+/// re-aim or ambiguate the host's binding — bare strings resolve per
+/// call and can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HandlerToken(u64);
+pub struct EffectHandlerToken(u64);
 
 /// One step of a host-driven machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -4120,6 +4160,10 @@ impl TieredRuntime {
         // shapes and machines must not move either.
         if !report.aborted {
             self.apply_reload_fiber_meta(fiber_decls, &report);
+            if !report.state_migrations.is_empty() {
+                let plans = report.state_migrations.clone();
+                self.apply_state_migrations(&plans);
+            }
         }
 
         // Reload is an observable event: frameworks subscribe to
@@ -4136,6 +4180,53 @@ impl TieredRuntime {
         self.runtime_events.push(event);
 
         Ok(report)
+    }
+
+    /// Choose what a reload does with live handler state whose layout
+    /// an edit changed: keep the previous implementation (the default),
+    /// or move the fields the two layouts share into a region the
+    /// edited constructor allocates.
+    pub fn set_state_migration(&mut self, policy: zyntax_compiler::reload::StateMigration) {
+        self.backend.set_state_migration(policy);
+    }
+
+    /// Move every live region of the handlers a reload planned
+    /// migrations for. Returns how many regions moved.
+    fn apply_state_migrations(
+        &mut self,
+        plans: &[zyntax_compiler::reload::StateMigrationPlan],
+    ) -> usize {
+        let mut total = 0;
+        for plan in plans {
+            let Some(&ctor_id) = self.function_ids.get(&plan.ctor) else {
+                continue;
+            };
+            let Some(ctor_ptr) = self.backend.get_function_pointer(ctor_id) else {
+                continue;
+            };
+            // SAFETY: a synthesized handler constructor is `(): *state`.
+            let ctor: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(ctor_ptr) };
+
+            total += crate::effect_runtime::migrate_handler_states(plan.effect_id, |old_state| {
+                let fresh = ctor();
+                if fresh.is_null() {
+                    return None;
+                }
+                for (from, to, size) in &plan.moves {
+                    // SAFETY: both regions are handler states of this
+                    // handler — the old one allocated by the previous
+                    // constructor, the new one just returned by the
+                    // edited one — and every (offset, size) came from
+                    // the layout of the matching generation. The
+                    // regions are distinct allocations.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(old_state.add(*from), fresh.add(*to), *size);
+                    }
+                }
+                Some(fresh)
+            });
+        }
+        total
     }
 
     /// Restore the generation the most recent applied reload replaced.
@@ -4278,7 +4369,7 @@ impl TieredRuntime {
     /// layers on top, so its interior scopes keep precedence.
     ///
     /// Names resolve per call (FQN-aware). For a binding that cannot
-    /// drift across edits, resolve once with [`Self::get_handler`] and
+    /// drift across edits, resolve once with [`Self::get_effect_handler`] and
     /// drive with [`Self::resume_fiber_handled`].
     pub fn resume_fiber_within(
         &mut self,
@@ -4345,7 +4436,7 @@ impl TieredRuntime {
     /// that handler no matter what names later edits introduce; use it
     /// with [`Self::resume_fiber_handled`] and
     /// [`Self::bind_fiber_handler`].
-    pub fn get_handler(&mut self, name: &str) -> RuntimeResult<HandlerToken> {
+    pub fn get_effect_handler(&mut self, name: &str) -> RuntimeResult<EffectHandlerToken> {
         let (resolved, _, _, _, _) = self.backend.handler_push_info(name).ok_or_else(|| {
             RuntimeError::Execution(format!(
                 "no unambiguous handler named `{name}` in the loaded program"
@@ -4354,11 +4445,11 @@ impl TieredRuntime {
         let token = self.next_handler_token;
         self.next_handler_token += 1;
         self.handler_tokens.insert(token, resolved);
-        Ok(HandlerToken(token))
+        Ok(EffectHandlerToken(token))
     }
 
     /// The fully qualified name a handler token is pinned to.
-    pub fn handler_name(&self, token: HandlerToken) -> Option<&str> {
+    pub fn effect_handler_name(&self, token: EffectHandlerToken) -> Option<&str> {
         self.handler_tokens.get(&token.0).map(String::as_str)
     }
 
@@ -4367,7 +4458,7 @@ impl TieredRuntime {
     pub fn resume_fiber_handled(
         &mut self,
         token: FiberToken,
-        handlers: &[HandlerToken],
+        handlers: &[EffectHandlerToken],
     ) -> RuntimeResult<HostFiberStep> {
         let names: Vec<String> = handlers
             .iter()
@@ -4467,11 +4558,11 @@ impl TieredRuntime {
     /// wins. Unbinding is dropping the fiber.
     ///
     /// A durable binding deserves a durable name: prefer resolving the
-    /// handler once with [`Self::get_handler`] and binding the token.
+    /// handler once with [`Self::get_effect_handler`] and binding the token.
     pub fn bind_fiber_handler(
         &mut self,
         token: FiberToken,
-        handler: HandlerToken,
+        handler: EffectHandlerToken,
     ) -> RuntimeResult<()> {
         let name = self
             .handler_tokens
@@ -4672,6 +4763,10 @@ impl TieredRuntime {
         // shapes and machines must not move either.
         if !report.aborted {
             self.apply_reload_fiber_meta(fiber_decls, &report);
+            if !report.state_migrations.is_empty() {
+                let plans = report.state_migrations.clone();
+                self.apply_state_migrations(&plans);
+            }
         }
 
         // Reload is an observable event: frameworks subscribe to

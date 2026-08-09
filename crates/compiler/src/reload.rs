@@ -69,6 +69,41 @@ pub fn call_target(backend: u64, func: HirId) -> usize {
     unsafe { &*(addr as *const AtomicUsize) }.load(Ordering::Acquire)
 }
 
+/// How a reload treats live state whose layout the edit changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StateMigration {
+    /// Keep the previous implementation: the running state stays
+    /// readable by the code that allocated it. The default — a layout
+    /// change is not silently coerced.
+    #[default]
+    Decline,
+    /// Move each field the two layouts share, matched by name and
+    /// type, into a fresh region allocated by the edited constructor.
+    /// Fields only the edit declares start from its initializers;
+    /// fields only the previous version had are dropped.
+    ByFieldName,
+}
+
+/// One live state region's migration: where to move each surviving
+/// field. Produced by a reload, applied by the runtime that owns the
+/// handler frames holding the state.
+#[derive(Debug, Clone)]
+pub struct StateMigrationPlan {
+    /// Handler whose state is migrating, fully qualified.
+    pub handler: String,
+    /// Effect the handler implements — the id its frames are keyed by.
+    pub effect_id: u64,
+    /// Constructor that allocates a region in the edited layout.
+    pub ctor: String,
+    /// `(from offset, to offset, size)` per field present in both
+    /// layouts, in the edited layout's declaration order.
+    pub moves: Vec<(usize, usize, usize)>,
+    /// Fields the edit adds, which keep the constructor's initializer.
+    pub introduced: Vec<String>,
+    /// Fields the edit drops.
+    pub dropped: Vec<String>,
+}
+
 /// What a reload did, per function, by name.
 #[derive(Debug, Default, Clone)]
 pub struct ReloadReport {
@@ -96,6 +131,10 @@ pub struct ReloadReport {
     /// effect scopes already entered reach the edited implementation
     /// at their next perform.
     pub dispatch_patched: Vec<String>,
+    /// Live state regions whose layout the edit changed and which the
+    /// migration policy says to move rather than decline. The runtime
+    /// applies these to the handler frames it owns.
+    pub state_migrations: Vec<StateMigrationPlan>,
     /// True when a compile failure aborted the whole reload: nothing
     /// was swapped, published, or patched, and the running generation
     /// is untouched. `failed` holds the reasons. Per-function declines

@@ -123,11 +123,29 @@ receives `{function, kind: swapped|migrated|fell_back}` performs.
   last applied reload replaced: beads, reload cells, resume points and
   dispatch-table slots all swing back; state untouched. One-shot, and
   observable as the same event a reload emits.
-- *Handler-state layout guard.* A stateful handler's state struct is
-  shared between its ctor and its ops; an edit that changes that
-  layout declines the whole handler group together, so every
-  generation keeps a consistent view. Same-shape edits (an initializer
-  value) reload freely.
+- *Handler-state layout guard, and the migration escape hatch.* A
+  stateful handler's state struct is shared between its ctor and its
+  ops; an edit that changes that layout declines the whole handler
+  group together, so every generation keeps a consistent view.
+  Same-shape edits (an initializer value) reload freely. Set
+  `StateMigration::ByFieldName` and the group reloads instead: the
+  reload plans, per handler, where each field present in both layouts
+  moves, and the runtime walks the live frames that name those regions
+  — the current stack, fibers' saved segments, parked tasks' — moving
+  each one into a region the edited constructor allocated. Fields the
+  edit adds start from its initializers; fields it drops are dropped;
+  the report names both.
+- *Effect-performing functions reload.* An effect's identity crosses
+  generations as a number, and a dispatch table is named by an id too,
+  so a freshly parsed edit numbers everything differently. A reloaded
+  body is rewritten onto the running program's ids — the effect it
+  performs, the table it reads, the constant a `with` scope pushes
+  under — and matched globals are reused rather than recompiled, since
+  their addresses are live in handler frames. Whichever side of a
+  perform/scope pair reloads, the other still finds it. Reloaded
+  bodies compile against the running module, so a perform keeps its
+  operation index. A table the edit introduces is emitted with empty
+  slots and filled once its functions are compiled.
 - *Async tasks.* A frame that hands out its own address — an async
   poll fn re-parking itself — pins that address to its own generation
   instead of reading the reload cell: a suspended task completes on
@@ -154,9 +172,8 @@ receives `{function, kind: swapped|migrated|fell_back}` performs.
   could ambiguate. `register_builtin_class` exists on the tiered
   runtime, same seam as the classic one.
 
-Still open from the phase list: layout-migration hooks (a
-user-supplied migration function per type, for the cases a mismatch is
-fixable). The guard + fallback ladder covers soundness meanwhile.
+Migrating a live frame's locals across an incompatible edit remains a
+non-goal: the fallback ladder exists so it is never needed.
 
 ## Costs, measured before shipped
 

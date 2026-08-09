@@ -219,6 +219,10 @@ struct FunctionEntry {
     bound: TieredBound,
     /// Pre-cloned HIR function, captured by promotion closures.
     function: Arc<HirFunction>,
+    /// Shared module context needed to recompile effectful functions. A
+    /// per-function promotion cannot resolve effects, handlers, globals, or
+    /// callees from the function body alone.
+    module: Arc<HirModule>,
     /// OSR registry id for this function. Embedded as a constant in
     /// tier-0 probe call sites so JIT'd code can find the bead.
     bead_id: u64,
@@ -284,6 +288,8 @@ pub struct TieredBackend {
     /// Undo record for the most recent applied reload, consumed by
     /// [`Self::rollback_last_reload`].
     last_undo: Option<ReloadUndo>,
+    /// What a reload does with live state whose layout an edit changed.
+    state_migration: crate::reload::StateMigration,
 
     /// Profile counters (for `get_statistics` only — promotion is driven by
     /// beadie's own counters).
@@ -349,6 +355,7 @@ impl TieredBackend {
             functions: HashMap::new(),
             current_module: None,
             last_undo: None,
+            state_migration: crate::reload::StateMigration::default(),
             profile_data: ProfileData::new(config.profile_config.clone()),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
@@ -404,6 +411,7 @@ impl TieredBackend {
             llvm.with_lock(|be| be.set_module_context(Arc::clone(&shared)));
         }
 
+        let module_context = Arc::new(module.clone());
         for (func_id, function) in module.functions.iter() {
             let bound = self.adapter.register(ptr::null_mut(), None);
 
@@ -432,6 +440,7 @@ impl TieredBackend {
                 FunctionEntry {
                     bound,
                     function: Arc::new(function.clone()),
+                    module: Arc::clone(&module_context),
                     bead_id,
                 },
             );
@@ -481,6 +490,93 @@ impl TieredBackend {
                     id_remap.insert(*new_id, *old_id);
                 }
             }
+        }
+
+        // Globals are matched by name and REUSED, never recompiled:
+        // their addresses are live — handler frames on the stack hold
+        // op-table pointers, module state lives in the data itself — so
+        // the edited bodies are rewritten onto the running ids instead.
+        // A global the edit introduces has no counterpart and is
+        // compiled into the running module below.
+        let mut old_globals_by_name: Map<String, HirId> = Map::new();
+        for (id, g) in &old_module.globals {
+            if let Some(n) = g.name.resolve_global() {
+                old_globals_by_name.insert(n, *id);
+            }
+        }
+        let mut global_remap: Map<HirId, HirId> = Map::new();
+        let mut fresh_globals: Vec<HirId> = Vec::new();
+        for (new_gid, g) in &new_module.globals {
+            match g
+                .name
+                .resolve_global()
+                .and_then(|n| old_globals_by_name.get(&n))
+            {
+                Some(old_gid) => {
+                    global_remap.insert(*new_gid, *old_gid);
+                }
+                None => fresh_globals.push(*new_gid),
+            }
+        }
+
+        // An effect's identity crosses generations as a number: a
+        // `with` scope pushes its handler under the effect's id and a
+        // perform looks the handler up by the same number. An edited
+        // body carries the EDITED module's ids, so every one of them —
+        // the typed `PerformEffect` field and the constant a `with`
+        // scope passes to the push — is rewritten onto the running
+        // program's, or a reloaded perform would miss handlers pushed
+        // by code that did not reload (and vice versa).
+        let mut old_effects_by_name: Map<String, HirId> = Map::new();
+        for (id, e) in &old_module.effects {
+            if let Some(n) = e.name.resolve_global() {
+                old_effects_by_name.insert(n, *id);
+            }
+        }
+        let mut effect_remap: Map<HirId, HirId> = Map::new();
+        for (new_eid, e) in &new_module.effects {
+            if let Some(old_eid) = e
+                .name
+                .resolve_global()
+                .and_then(|n| old_effects_by_name.get(&n))
+            {
+                if old_eid != new_eid {
+                    effect_remap.insert(*new_eid, *old_eid);
+                }
+            }
+        }
+        let effect_const_remap: Map<i64, i64> = effect_remap
+            .iter()
+            .map(|(n, o)| (n.as_u32() as i64, o.as_u32() as i64))
+            .collect();
+
+        // The module the reloaded bodies compile against: the running
+        // program plus whatever the edit introduced. Codegen consults
+        // it for an effect's operation order at a perform site, so it
+        // has to be keyed by the ids the remapped bodies carry.
+        let mut merged = old_module.clone();
+        for (new_eid, e) in &new_module.effects {
+            if !effect_remap.contains_key(new_eid) && !merged.effects.contains_key(new_eid) {
+                merged.effects.insert(*new_eid, e.clone());
+            }
+        }
+        for (new_hid, h) in &new_module.handlers {
+            if !merged.handlers.values().any(|o| o.name == h.name) {
+                let mut h = h.clone();
+                h.effect_id = *effect_remap.get(&h.effect_id).unwrap_or(&h.effect_id);
+                merged.handlers.insert(*new_hid, h);
+            }
+        }
+        for gid in &fresh_globals {
+            let mut g = new_module.globals[gid].clone();
+            if let Some(crate::hir::HirConstant::VTable(vt)) = &mut g.initializer {
+                for entry in &mut vt.methods {
+                    if let Some(mapped) = id_remap.get(&entry.function_id) {
+                        entry.function_id = *mapped;
+                    }
+                }
+            }
+            merged.globals.insert(*gid, g);
         }
 
         let mut report = crate::reload::ReloadReport::default();
@@ -550,6 +646,23 @@ impl TieredBackend {
                 if old_layout == new_layout {
                     continue;
                 }
+                // With a migration policy the group reloads instead,
+                // and every live region moves field-by-field into the
+                // edited layout; without one the whole group keeps its
+                // previous implementation so ctor and ops agree.
+                if self.state_migration == crate::reload::StateMigration::ByFieldName {
+                    if let Some(plan) = self.plan_state_migration(
+                        handler,
+                        &ctor_name,
+                        old_ctor,
+                        new_ctor,
+                        &old_module,
+                        new_module,
+                    ) {
+                        report.state_migrations.push(plan);
+                        continue;
+                    }
+                }
                 let reason = format!(
                     "handler {handler}: state layout changed; the running \
                      state cannot be read through the edited shape, so the \
@@ -571,6 +684,40 @@ impl TieredBackend {
         self.cranelift
             .with_lock(|be| be.set_defer_cell_publish(true));
 
+        // A dispatch table the edit introduces holds the addresses of
+        // that edit's own functions, which are not compiled yet. It is
+        // emitted with empty slots here — so nothing it names dangles
+        // through the finalizes that follow each compile — and filled
+        // once the addresses exist, by the same atomic store that
+        // patches a table already in use.
+        if !fresh_globals.is_empty() {
+            let merged_ref = &merged;
+            let prepared = self.cranelift.with_lock(|be| {
+                for gid in &fresh_globals {
+                    let global = &merged_ref.globals[gid];
+                    be.declare_global(*gid, global)?;
+                    match &global.initializer {
+                        Some(crate::hir::HirConstant::VTable(vt)) => {
+                            be.define_empty_vtable(*gid, vt.methods.len())?
+                        }
+                        _ => be.define_global(*gid, global)?,
+                    }
+                }
+                Ok::<_, CompilerError>(())
+            });
+            if let Err(e) = prepared {
+                self.cranelift
+                    .with_lock(|be| be.set_defer_cell_publish(false));
+                let _ = self.cranelift.with_lock(|be| be.take_deferred_cells());
+                report.failed.push((
+                    "<globals>".to_string(),
+                    format!("could not emit the edit's dispatch tables: {e}"),
+                ));
+                report.aborted = true;
+                return Ok(report);
+            }
+        }
+
         for (new_id, new_fn) in &new_module.functions {
             if new_fn.is_external {
                 continue;
@@ -587,10 +734,6 @@ impl TieredBackend {
                     let fp_new = crate::reload::function_fingerprint(new_fn, new_module);
                     if fp_old == fp_new {
                         report.unchanged += 1;
-                        continue;
-                    }
-                    if let Err(reason) = reload_reaches(new_fn) {
-                        report.failed.push((name, reason.to_string()));
                         continue;
                     }
                     if let Some(reason) = layout_declined.get(&name) {
@@ -627,7 +770,13 @@ impl TieredBackend {
                     }
 
                     let mut body = new_fn.clone();
-                    remap_callees(&mut body, &id_remap);
+                    remap_body(
+                        &mut body,
+                        &id_remap,
+                        &global_remap,
+                        &effect_remap,
+                        &effect_const_remap,
+                    );
 
                     if inject_fail.as_deref() == Some(name.as_str()) {
                         compile_failed.push((name, "injected compile failure (test hook)".into()));
@@ -649,7 +798,7 @@ impl TieredBackend {
                         let helpers = self.cranelift.with_lock(|be| {
                             be.set_compile_tier(1);
                             be.set_compile_bead_id(bead_id);
-                            be.compile_function(old_id, &body)?;
+                            be.compile_function_in_module(old_id, &body, &merged)?;
                             be.finalize_definitions()?;
                             Ok::<_, CompilerError>(be.take_pending_osr_helpers())
                         });
@@ -664,7 +813,7 @@ impl TieredBackend {
                     let compiled = self.cranelift.with_lock(|be| {
                         be.set_compile_tier(0);
                         be.set_compile_bead_id(bead_id);
-                        be.compile_function(old_id, &body)?;
+                        be.compile_function_in_module(old_id, &body, &merged)?;
                         be.finalize_definitions()?;
                         Ok::<_, CompilerError>(be.get_function_ptr(old_id))
                     });
@@ -683,15 +832,17 @@ impl TieredBackend {
                     }
                 }
                 None => {
-                    if let Err(reason) = reload_reaches(new_fn) {
-                        report.failed.push((name, reason.to_string()));
-                        continue;
-                    }
                     // Introduced by the edit: compile fresh under its
                     // own id, registered like `compile_module` does if
                     // the whole set applies.
                     let mut body = new_fn.clone();
-                    remap_callees(&mut body, &id_remap);
+                    remap_body(
+                        &mut body,
+                        &id_remap,
+                        &global_remap,
+                        &effect_remap,
+                        &effect_const_remap,
+                    );
                     if inject_fail.as_deref() == Some(name.as_str()) {
                         compile_failed.push((name, "injected compile failure (test hook)".into()));
                         continue;
@@ -700,7 +851,7 @@ impl TieredBackend {
                     let compiled = self.cranelift.with_lock(|be| {
                         be.set_compile_tier(0);
                         be.set_compile_bead_id(bead_id);
-                        be.compile_function(*new_id, &body)?;
+                        be.compile_function_in_module(*new_id, &body, &merged)?;
                         be.finalize_definitions()?;
                         Ok::<_, CompilerError>(be.get_function_ptr(*new_id))
                     });
@@ -868,11 +1019,41 @@ impl TieredBackend {
                 FunctionEntry {
                     bound,
                     function: Arc::new(body.clone()),
+                    module: Arc::new(merged.clone()),
                     bead_id,
                 },
             );
             updated_functions.push((new_id, body));
             report.added.push(name);
+        }
+
+        // Every function is compiled, so a table the edit introduced
+        // can take their addresses.
+        for gid in &fresh_globals {
+            let Some(crate::hir::HirConstant::VTable(vt)) = &merged.globals[gid].initializer else {
+                continue;
+            };
+            let Some((base, size)) = self.cranelift.with_lock(|be| be.global_data_addr(*gid))
+            else {
+                continue;
+            };
+            for (slot, entry) in vt.methods.iter().enumerate() {
+                let Some(ptr) = self.get_function_pointer(entry.function_id) else {
+                    continue;
+                };
+                let offset = slot * std::mem::size_of::<usize>();
+                if offset + std::mem::size_of::<usize>() > size {
+                    continue;
+                }
+                // SAFETY: the table was declared writable and defined
+                // with exactly these slots; no thread can be reading it
+                // yet — the code that references it is only reachable
+                // once this reload applies.
+                unsafe {
+                    let slot_ptr = base.add(offset) as *const std::sync::atomic::AtomicUsize;
+                    (*slot_ptr).store(ptr as usize, std::sync::atomic::Ordering::Release);
+                }
+            }
         }
 
         // Publish the deferred cell updates: the final value per id,
@@ -901,12 +1082,17 @@ impl TieredBackend {
             }
         }
 
-        // The next reload diffs against what is now running.
-        if let Some(module) = &mut self.current_module {
-            for (id, body) in updated_functions {
-                module.functions.insert(id, body);
-            }
+        // The next reload diffs against what is now running: the
+        // merged view, including the effects, handlers and globals the
+        // edit introduced.
+        for (id, body) in updated_functions {
+            merged.functions.insert(id, body);
         }
+        let module_context = Arc::new(merged.clone());
+        for entry in self.functions.values_mut() {
+            entry.module = Arc::clone(&module_context);
+        }
+        self.current_module = Some(merged);
 
         // The promotion requester captured each function's body when it
         // was installed; reinstall so a later promotion compiles the
@@ -973,8 +1159,93 @@ impl TieredBackend {
             restored.push(swap.name);
         }
 
+        if let Some(module) = &self.current_module {
+            let module_context = Arc::new(module.clone());
+            for entry in self.functions.values_mut() {
+                entry.module = Arc::clone(&module_context);
+            }
+        }
+
         self.install_promotion_requester();
         Ok(restored)
+    }
+
+    /// Choose what a reload does with live state whose layout an edit
+    /// changed. Declining is the default; migrating moves the fields
+    /// the two layouts share and lets the rest start from the edited
+    /// constructor's initializers.
+    pub fn set_state_migration(&mut self, policy: crate::reload::StateMigration) {
+        self.state_migration = policy;
+    }
+
+    /// Work out how to move a handler's live state from the running
+    /// layout into the edited one. `None` when the shapes cannot be
+    /// related — the caller then declines as it would without a policy.
+    fn plan_state_migration(
+        &self,
+        handler: &str,
+        ctor_name: &str,
+        old_ctor: &HirFunction,
+        new_ctor: &HirFunction,
+        old_module: &HirModule,
+        new_module: &HirModule,
+    ) -> Option<crate::reload::StateMigrationPlan> {
+        let by_name = |m: &HirModule, want: &str| -> Option<crate::hir::HirEffectHandler> {
+            m.handlers
+                .values()
+                .find(|h| h.name.resolve_global().as_deref() == Some(want))
+                .cloned()
+        };
+        let old_h = by_name(old_module, handler)?;
+        let new_h = by_name(new_module, handler)?;
+
+        let old_ty = old_ctor.signature.returns.first()?;
+        let new_ty = new_ctor.signature.returns.first()?;
+        let (old_ext, new_ext) = self.cranelift.with_lock(|be| {
+            (
+                be.struct_field_extents(old_ty),
+                be.struct_field_extents(new_ty),
+            )
+        });
+        let (old_ext, new_ext) = (old_ext?, new_ext?);
+        if old_ext.len() != old_h.state_fields.len() || new_ext.len() != new_h.state_fields.len() {
+            return None;
+        }
+
+        let mut moves = Vec::new();
+        let mut introduced = Vec::new();
+        for (i, f) in new_h.state_fields.iter().enumerate() {
+            let name = f.name.resolve_global()?;
+            match old_h
+                .state_fields
+                .iter()
+                .position(|o| o.name == f.name && o.ty == f.ty)
+            {
+                // Same name and same type: the value carries over.
+                Some(j) => moves.push((old_ext[j].0, new_ext[i].0, new_ext[i].1.min(old_ext[j].1))),
+                None => introduced.push(name),
+            }
+        }
+        let dropped = old_h
+            .state_fields
+            .iter()
+            .filter(|o| {
+                !new_h
+                    .state_fields
+                    .iter()
+                    .any(|n| n.name == o.name && n.ty == o.ty)
+            })
+            .filter_map(|o| o.name.resolve_global())
+            .collect();
+
+        Some(crate::reload::StateMigrationPlan {
+            handler: handler.to_string(),
+            effect_id: old_h.effect_id.as_u32() as u64,
+            ctor: ctor_name.to_string(),
+            moves,
+            introduced,
+            dropped,
+        })
     }
 
     /// What a host-side handler push needs for the handler named
@@ -1063,6 +1334,7 @@ impl TieredBackend {
 
         // Build a closure beadie can call from any tier broker thread.
         let func_arc = Arc::clone(&entry.function);
+        let module_arc = Arc::clone(&entry.module);
         let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
         #[cfg(feature = "llvm-backend")]
@@ -1077,6 +1349,7 @@ impl TieredBackend {
                 func_id,
                 bead_id,
                 &func_arc,
+                &module_arc,
                 &cranelift,
                 #[cfg(feature = "llvm-backend")]
                 llvm.as_ref(),
@@ -1121,20 +1394,31 @@ impl TieredBackend {
 
         // bead id -> everything a compile needs, so the handler can run on
         // the thread that raised the request without reaching for `self`.
-        let by_bead: HashMap<u64, (HirId, TieredBound, Arc<HirFunction>)> = self
+        let by_bead: HashMap<u64, (HirId, TieredBound, Arc<HirFunction>, Arc<HirModule>)> = self
             .functions
             .iter()
-            .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.function))))
+            .map(|(id, e)| {
+                (
+                    e.bead_id,
+                    (
+                        *id,
+                        e.bound.clone(),
+                        Arc::clone(&e.function),
+                        Arc::clone(&e.module),
+                    ),
+                )
+            })
             .collect();
 
         osr::set_promotion_requester(move |bead_id| {
-            let Some((func_id, bound, func_arc)) = by_bead.get(&bead_id) else {
+            let Some((func_id, bound, func_arc, module_arc)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
                     eprintln!("[osr] request for unknown bead={bead_id}");
                 }
                 return;
             };
             let func_arc = Arc::clone(func_arc);
+            let module_arc = Arc::clone(module_arc);
             let cranelift = Arc::clone(&cranelift);
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.clone();
@@ -1148,6 +1432,7 @@ impl TieredBackend {
                     func_id,
                     bead_id,
                     &func_arc,
+                    &module_arc,
                     &cranelift,
                     #[cfg(feature = "llvm-backend")]
                     llvm.as_ref(),
@@ -1172,6 +1457,7 @@ impl TieredBackend {
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?;
 
         let func_arc = Arc::clone(&entry.function);
+        let module_arc = Arc::clone(&entry.module);
         let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
         #[cfg(feature = "llvm-backend")]
@@ -1189,6 +1475,7 @@ impl TieredBackend {
                     func_id,
                     bead_id,
                     &func_arc,
+                    &module_arc,
                     &cranelift,
                     #[cfg(feature = "llvm-backend")]
                     llvm.as_ref(),
@@ -1384,6 +1671,7 @@ pub fn compile_at_tier(
     func_id: HirId,
     bead_id: u64,
     func_arc: &Arc<HirFunction>,
+    module_arc: &Arc<HirModule>,
     cranelift: &Arc<ZyntaxCraneliftBackend>,
     #[cfg(feature = "llvm-backend")] llvm: Option<&Arc<ZyntaxLlvmBackend>>,
     tier2_backend: Tier2Backend,
@@ -1392,6 +1680,7 @@ pub fn compile_at_tier(
     let def = ZyntaxFunctionDef {
         id: func_id,
         function: (**func_arc).clone(),
+        module: Arc::clone(module_arc),
         tier: tier_idx,
         bead_id,
     };
@@ -1469,40 +1758,6 @@ impl TieredStatistics {
     }
 }
 
-/// Whether reloading `func` is within the call/loop machinery's reach.
-///
-/// A function that carries effect scaffolding — handler push/pop, op
-/// dispatch, performs — references module globals and runtime wiring
-/// the per-function recompile cannot reproduce yet; swapping it would
-/// tear dispatch out from under running scopes. Until op-table
-/// patching lands, such functions keep their running code and the
-/// report says why.
-fn reload_reaches(func: &HirFunction) -> Result<(), &'static str> {
-    for block in func.blocks.values() {
-        for inst in &block.instructions {
-            match inst {
-                crate::hir::HirInstruction::PerformEffect { .. } => {
-                    return Err(
-                        "performs an effect; its perform sites reference the edited \
-                         module's globals, and reloading it needs global remapping",
-                    )
-                }
-                crate::hir::HirInstruction::Call {
-                    callee: crate::hir::HirCallable::Symbol(name),
-                    ..
-                } if name.starts_with("__zyntax_effect_") => {
-                    return Err(
-                        "uses effect scaffolding that references the edited module's \
-                         globals; reloading it needs global remapping",
-                    )
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Per-site live-in layout of a function's loops: site key to
 /// `(phi_count, live-in types)`. Two functions agree at a site exactly
 /// when the frame one's probe writes is the frame the other's helper
@@ -1578,15 +1833,44 @@ fn type_layout_key(ty: &crate::hir::HirType) -> String {
 /// Rewrite the callee ids an edited function carries onto the running
 /// module's ids, matched by name beforehand. Only id-carrying callables
 /// change; symbol and intrinsic calls are name-based already.
-fn remap_callees(func: &mut HirFunction, id_remap: &std::collections::HashMap<HirId, HirId>) {
+fn remap_body(
+    func: &mut HirFunction,
+    id_remap: &std::collections::HashMap<HirId, HirId>,
+    global_remap: &std::collections::HashMap<HirId, HirId>,
+    effect_remap: &std::collections::HashMap<HirId, HirId>,
+    effect_const_remap: &std::collections::HashMap<i64, i64>,
+) {
+    use crate::hir::{HirConstant, HirValueKind};
+
+    // A value naming a global names the running program's global.
+    for value in func.values.values_mut() {
+        if let HirValueKind::Global(gid) = &mut value.kind {
+            if let Some(mapped) = global_remap.get(gid) {
+                *gid = *mapped;
+            }
+        }
+    }
+
+    let mut push_effect_args: Vec<HirId> = Vec::new();
     for block in func.blocks.values_mut() {
         for inst in &mut block.instructions {
             match inst {
-                crate::hir::HirInstruction::Call { callee, .. } => match callee {
+                crate::hir::HirInstruction::Call { callee, args, .. } => match callee {
                     crate::hir::HirCallable::Function(id)
                     | crate::hir::HirCallable::FuncRef(id) => {
                         if let Some(mapped) = id_remap.get(id) {
                             *id = *mapped;
+                        }
+                    }
+                    crate::hir::HirCallable::Symbol(name) => {
+                        // The effect id a `with` scope pushes under is
+                        // a plain constant by the time it reaches here;
+                        // only its position in this call names it as an
+                        // effect.
+                        if name == "__zyntax_effect_push_handler" {
+                            if let Some(arg) = args.first() {
+                                push_effect_args.push(*arg);
+                            }
                         }
                     }
                     _ => {}
@@ -1596,7 +1880,22 @@ fn remap_callees(func: &mut HirFunction, id_remap: &std::collections::HashMap<Hi
                         *function = *mapped;
                     }
                 }
+                crate::hir::HirInstruction::PerformEffect { effect_id, .. } => {
+                    if let Some(mapped) = effect_remap.get(effect_id) {
+                        *effect_id = *mapped;
+                    }
+                }
                 _ => {}
+            }
+        }
+    }
+
+    for arg in push_effect_args {
+        if let Some(value) = func.values.get_mut(&arg) {
+            if let HirValueKind::Constant(HirConstant::I64(n)) = &mut value.kind {
+                if let Some(mapped) = effect_const_remap.get(n) {
+                    *n = *mapped;
+                }
             }
         }
     }

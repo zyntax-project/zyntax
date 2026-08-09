@@ -8,7 +8,7 @@
 //! dispatch path — while the edited transition takes over.
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
+use zyntax_embed::{OptimizationTier, TieredConfig, TieredRuntime, ZyntaxValue};
 
 /// `machine` observes events via `next_event()` (handler-provided 3),
 /// folds them into `state` with a reloadable transition, and yields
@@ -94,13 +94,57 @@ fn an_effectful_fiber_observes_events_under_the_tiered_runtime() {
     assert_eq!(v, ZyntaxValue::Int(3));
 }
 
-/// The machine performs effects, and reloading an effect-bearing
-/// function is beyond the call/loop machinery until op-table patching
-/// lands: the reload must decline it — reported, not crashed — and the
-/// running machine completes untouched on the code it started with.
-/// Flip this into a migration test when phase 3 reaches effects.
+/// A hot effect-bearing function must be recompiled with the complete module
+/// context. Compiling its body in isolation loses the effect and handler
+/// tables; the promoter used to panic after emitting a trap for the missing
+/// handler and then trying to append a result instruction to that block.
 #[test]
-fn an_observing_machine_declines_the_edit_safely_for_now() {
+fn an_effectful_function_promotes_with_its_module_context() {
+    let mut rt = runtime();
+    let src = r#"
+effect Event { def next_event(): i64 }
+handler Feed for Event { def next_event(): i64 { return 3 } }
+
+@effect(Event)
+def observe(): i64 {
+    let mut out: i64 = 0
+    with Feed { out = next_event() }
+    return out
+}
+"#;
+    rt.compile_typed_program(parse(src)).expect("compile");
+    assert_eq!(
+        rt.call_raw("observe", &[]).expect("baseline call"),
+        ZyntaxValue::Int(3)
+    );
+    let baseline = rt.function_pointer("observe").expect("baseline pointer");
+
+    rt.optimize_function("observe", OptimizationTier::Standard)
+        .expect("request promotion");
+    let mut promoted = false;
+    for _ in 0..100 {
+        if rt.function_pointer("observe") != Some(baseline) {
+            promoted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(promoted, "tier-1 promotion must install a new entry");
+    assert_eq!(
+        rt.call_raw("observe", &[]).expect("promoted call"),
+        ZyntaxValue::Int(3)
+    );
+}
+
+/// An effect-performing function reloads like any other: the edited
+/// transition is live for machines constructed afterwards, while the
+/// machine already running completes on the generation it started
+/// with. The performing body carries the edited module's ids for the
+/// effect it performs and the dispatch table it reads; both are
+/// rewritten onto the running program's, or the reloaded perform
+/// would miss the handler `drive` pushed before the edit.
+#[test]
+fn an_observing_machine_reloads_and_the_running_one_finishes_its_generation() {
     const CAP: i64 = 3_000_000;
 
     let mut rt = runtime();
@@ -122,13 +166,30 @@ fn an_observing_machine_declines_the_edit_safely_for_now() {
     let count = worker.join().expect("drive should complete");
 
     assert!(
-        report.failed.iter().any(|(n, _)| n == "machine"),
-        "the effectful machine must be declined with a reason: {report:?}"
+        report.reloaded.contains(&"machine".to_string()),
+        "the effect-performing machine must reload: {report:?}"
     );
+    assert!(report.failed.is_empty(), "{report:?}");
     assert_eq!(
         count,
         CAP / 3,
-        "the running machine completes on the code it started with"
+        "the machine already running completes on its own generation"
+    );
+
+    // The edit is live for the next machine: each event now folds in
+    // 3 * 100, so the same cap takes a hundredth of the transitions.
+    let after: i64 = {
+        let entry = rt
+            .function_pointer("drive")
+            .expect("drive should have an entry pointer");
+        // SAFETY: as above — `drive` is `() -> i64` and stays mapped.
+        let drive: extern "C" fn() -> i64 = unsafe { std::mem::transmute(entry) };
+        drive()
+    };
+    assert_eq!(
+        after,
+        CAP / 300,
+        "a machine constructed after the edit runs the edited transition"
     );
 }
 

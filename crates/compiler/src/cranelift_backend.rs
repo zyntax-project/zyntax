@@ -1138,19 +1138,41 @@ impl CraneliftBackend {
     /// Note: This legacy path does not support algebraic effects. Use compile_module() for
     /// full effect support.
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
-        log::trace!("[Backend] compile_function called for {:?}", id);
-        let empty_module_for_decl =
+        let empty_module =
             HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
-        self.declare_function(id, function, &empty_module_for_decl)?;
+        self.compile_function_in_module(id, function, &empty_module)
+    }
+
+    /// Declare `function` without compiling its body, so data
+    /// definitions that take its address (a dispatch table) and other
+    /// functions that call it can be emitted before it is compiled.
+    pub fn declare_function_only(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &HirModule,
+    ) -> CompilerResult<()> {
+        self.declare_function(id, function, module)
+    }
+
+    /// [`Self::compile_function`] against a module, so codegen that
+    /// consults module-level declarations — an effect's operation
+    /// order at a perform site, for one — resolves against the running
+    /// program rather than an empty stand-in.
+    pub fn compile_function_in_module(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &HirModule,
+    ) -> CompilerResult<()> {
+        log::trace!("[Backend] compile_function called for {:?}", id);
+        self.declare_function(id, function, module)?;
         log::trace!(
             "[Backend] After declare_function, IR:\n{}",
             self.codegen_context.func
         );
         if !function.is_external {
-            // Create empty module for legacy path (effects won't work)
-            let empty_module =
-                HirModule::new(zyntax_typed_ast::InternedString::new_global("__legacy__"));
-            self.compile_function_body(id, function, &empty_module)?;
+            self.compile_function_body(id, function, module)?;
             log::trace!(
                 "[Backend] After compile_function_body, IR:\n{}",
                 self.codegen_context.func
@@ -4648,6 +4670,25 @@ impl CraneliftBackend {
                             // the handler body to `__zyntax_effect_resume(k, v)`,
                             // so the sentinel value itself is irrelevant —
                             // only the arity matters today).
+                            // The calling convention belongs to the
+                            // EFFECT, not to whichever handler happens to
+                            // be declared first: this site passes its
+                            // arguments to whatever handler is in scope at
+                            // run time. Reading state-ness or resumability
+                            // off one handler makes every scope's ABI
+                            // depend on declaration order, and a scope
+                            // whose handler disagrees reads its arguments
+                            // one slot out.
+                            let effect_has_state = hir_module
+                                .handlers
+                                .values()
+                                .any(|h| h.effect_id == *effect_id && !h.state_fields.is_empty());
+                            let op_is_resumable = hir_module
+                                .handlers
+                                .values()
+                                .filter(|h| h.effect_id == *effect_id)
+                                .flat_map(|h| h.implementations.iter())
+                                .any(|i| i.op_name == *op_name && i.is_resumable);
                             let (handler_func_name, is_resumable, has_state) =
                                 if let Some(handler) = hir_module
                                     .handlers
@@ -4661,8 +4702,12 @@ impl CraneliftBackend {
                                     {
                                         (
                                             mangle_handler_op_name(handler.name, impl_.op_name),
-                                            impl_.is_resumable,
-                                            !handler.state_fields.is_empty(),
+                                            op_is_resumable,
+                                            // A resumable op takes its
+                                            // continuation, not an implicit
+                                            // `self` — the synthesis that
+                                            // adds `self` skips those.
+                                            effect_has_state && !op_is_resumable,
                                         )
                                     } else {
                                         warn!(
@@ -5877,12 +5922,18 @@ impl CraneliftBackend {
     /// This emits global data declarations for constants, static variables,
     /// and vtables (arrays of function pointers for trait dispatch).
     pub fn compile_global(&mut self, id: HirId, global: &HirGlobal) -> CompilerResult<()> {
-        // For vtables, we need to emit an array of function pointers
-        // For now, emit a simple data declaration
+        self.declare_global(id, global)?;
+        self.define_global(id, global)
+    }
 
-        // Declare the global data. A vtable is a dispatch table — hot
-        // reload patches its slots in place, so it must stay writable;
-        // everything else is immutable.
+    /// Reserve `id`'s data slot without emitting its contents, so code
+    /// that references the global can compile before the definition —
+    /// which a dispatch table needs, since its contents are the
+    /// addresses of functions compiled afterwards.
+    pub fn declare_global(&mut self, id: HirId, global: &HirGlobal) -> CompilerResult<()> {
+        // A vtable is a dispatch table — hot reload patches its slots
+        // in place, so it must stay writable; everything else is
+        // immutable.
         let unique_name = format!("global__{:?}", id);
         let writable = matches!(&global.initializer, Some(HirConstant::VTable(_)));
         let data_id = self
@@ -5894,9 +5945,37 @@ impl CraneliftBackend {
                 false,
             )
             .map_err(|e| CompilerError::CodeGen(format!("Failed to declare global: {}", e)))?;
+        self.global_map.insert(id, data_id);
+        Ok(())
+    }
 
-        // For now, just define empty data
-        // TODO: Initialize with actual vtable contents (array of function pointers)
+    /// Reserve a dispatch table and define it as empty slots, for a
+    /// caller that fills them with function addresses afterwards.
+    ///
+    /// Emitting the table with relocations instead would bind it to
+    /// symbols that are not defined yet, and every later finalize —
+    /// including the ones that follow each function compile — would
+    /// fail on them. Empty slots are a complete definition, so nothing
+    /// dangles, and the addresses land through the same atomic store
+    /// that reload uses to patch a table already in use.
+    pub fn define_empty_vtable(&mut self, id: HirId, slots: usize) -> CompilerResult<()> {
+        let ptr_size = self.module.target_config().pointer_bytes() as usize;
+        let data_id = *self.global_map.get(&id).ok_or_else(|| {
+            CompilerError::CodeGen(format!("global {id:?} defined before it was declared"))
+        })?;
+        self.data_desc.clear();
+        self.data_desc.define_zeroinit(slots * ptr_size);
+        self.module
+            .define_data(data_id, &self.data_desc)
+            .map_err(|e| CompilerError::CodeGen(format!("Failed to define global: {}", e)))?;
+        Ok(())
+    }
+
+    /// Emit the contents of a global declared by [`Self::declare_global`].
+    pub fn define_global(&mut self, id: HirId, global: &HirGlobal) -> CompilerResult<()> {
+        let data_id = *self.global_map.get(&id).ok_or_else(|| {
+            CompilerError::CodeGen(format!("global {id:?} defined before it was declared"))
+        })?;
         self.data_desc.clear();
 
         // If this is a vtable, emit function pointer array
@@ -5966,9 +6045,6 @@ impl CraneliftBackend {
         self.module
             .define_data(data_id, &self.data_desc)
             .map_err(|e| CompilerError::CodeGen(format!("Failed to define global: {}", e)))?;
-
-        // Store the data ID for later reference
-        self.global_map.insert(id, data_id);
 
         Ok(())
     }
@@ -9213,6 +9289,27 @@ fn marshal_to_i64(
 
 impl CraneliftBackend {
     /// Calculate struct layout with proper alignment
+    /// Byte offset and size of each field of a struct type, in
+    /// declaration order — what a caller needs to move a value from one
+    /// generation's layout into another's.
+    pub fn struct_field_extents(&self, ty: &HirType) -> Option<Vec<(usize, usize)>> {
+        let struct_ty = match ty {
+            HirType::Struct(s) => s,
+            HirType::Ptr(inner) | HirType::Ref { pointee: inner, .. } => match inner.as_ref() {
+                HirType::Struct(s) => s,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let layout = self.calculate_struct_layout(struct_ty).ok()?;
+        let mut out = Vec::with_capacity(struct_ty.fields.len());
+        for (i, field_ty) in struct_ty.fields.iter().enumerate() {
+            let offset = *layout.field_offsets.get(i)? as usize;
+            out.push((offset, self.type_size(field_ty).ok()?));
+        }
+        Some(out)
+    }
+
     fn calculate_struct_layout(&self, struct_ty: &HirStructType) -> CompilerResult<StructLayout> {
         let mut offset = 0u32;
         let mut field_offsets = Vec::new();

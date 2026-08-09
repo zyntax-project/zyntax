@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use beadie::{Bead, JitBackend};
 
 use crate::cranelift_backend::CraneliftBackend;
-use crate::hir::{HirFunction, HirId};
+use crate::hir::{HirFunction, HirId, HirModule};
 
 /// IR container handed to the JIT backend per-compile.
 ///
@@ -32,6 +32,9 @@ use crate::hir::{HirFunction, HirId};
 pub struct ZyntaxFunctionDef {
     pub id: HirId,
     pub function: HirFunction,
+    /// Module-level effect, handler, global, and callee context required when
+    /// a single hot function is recompiled outside the initial bulk pass.
+    pub module: std::sync::Arc<HirModule>,
     pub tier: usize,
     pub bead_id: u64,
 }
@@ -86,7 +89,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
             backend.set_compile_tier(tier);
             backend.set_compile_bead_id(bead_id);
             backend
-                .compile_function(def.id, &def.function)
+                .compile_function_in_module(def.id, &def.function, &def.module)
                 .map_err(|e| {
                     CompileError::new(format!("cranelift compile_function failed: {e}"))
                 })?;
@@ -190,6 +193,7 @@ mod llvm_impl {
             let bead_id = def.bead_id;
             self.with_lock(|backend| {
                 backend.set_compile_tier(tier);
+                backend.set_module_context(std::sync::Arc::clone(&def.module));
                 backend
                     .compile_function(def.id, &def.function)
                     .map_err(|e| CompileError::new(format!("llvm compile_function failed: {e}")))?;
