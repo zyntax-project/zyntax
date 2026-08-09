@@ -138,6 +138,7 @@ pub use runtime::{
     EffectHandlerToken,
     ExportedSymbol,
     FiberToken,
+    HandlerFrame,
     HostFiberInfo,
     HostFiberStep,
     ImportContext,

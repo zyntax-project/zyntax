@@ -3411,6 +3411,13 @@ pub struct FiberToken(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EffectHandlerToken(u64);
 
+/// An installed handler frame, returned by
+/// [`TieredRuntime::push_effect_handler`] and consumed by
+/// [`TieredRuntime::pop_effect_handler`]. Deliberately not `Copy`: a
+/// frame is ended exactly once.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct HandlerFrame(u64);
+
 /// One step of a host-driven machine.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostFiberStep {
@@ -4475,6 +4482,31 @@ impl TieredRuntime {
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
         self.backend.register_runtime_symbol(name, ptr);
         Ok(())
+    }
+
+    /// Install `handler` for a dynamic extent the HOST controls, and
+    /// return the frame that ends it.
+    ///
+    /// The fiber entry points scope a handler around a machine step.
+    /// This scopes one around whatever the host does next — a render, a
+    /// query, any plain call — which is what an embedder needs when the
+    /// code that performs is not a fiber.
+    ///
+    /// Every frame must be handed to [`Self::pop_effect_handler`], in
+    /// reverse order of installation. Leaving one installed leaks it
+    /// into unrelated work on the same thread.
+    pub fn push_effect_handler(&self, handler: EffectHandlerToken) -> RuntimeResult<HandlerFrame> {
+        let name = self
+            .handler_tokens
+            .get(&handler.0)
+            .cloned()
+            .ok_or_else(|| RuntimeError::Execution("unknown handler token".to_string()))?;
+        self.push_named_handler(&name).map(HandlerFrame)
+    }
+
+    /// End the extent a [`Self::push_effect_handler`] frame opened.
+    pub fn pop_effect_handler(&self, frame: HandlerFrame) {
+        crate::effect_runtime::__zyntax_effect_pop_handler(frame.0);
     }
 
     /// Resolve a handler name ONCE — FQN-aware, ambiguity is an error —
