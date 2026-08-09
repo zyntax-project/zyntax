@@ -1,19 +1,11 @@
 //! Reading a field of a value struct that is itself a field of another
 //! value struct.
 //!
-//! `l.from.x` returns a value with a neighbouring field in its high
-//! bits, while `l.to.x` at the same depth is correct, so the defect is
-//! in how a nested aggregate field is materialised rather than in
-//! offsets. `ExtractValue` in the Cranelift backend loads on its last
-//! index unconditionally; a field that is itself an aggregate needs a
-//! different treatment, and the surrounding SSA has to agree on what
-//! that is (returning the address alone makes it worse, so the
-//! representation contract is what needs settling).
-//!
-//! This blocks nested WRITES on value structs too: a write rebuilds the
-//! aggregate from a read, so it inherits the read's wrong value.
-//! Handler state is unaffected because it is a `@reference` struct and
-//! goes through the pointer path.
+//! `l.from.x` used to return a neighbouring field in its high bits: an
+//! integer literal types as i32, and the struct-literal lowering
+//! inserted it into an i64 field without widening, so the high half of
+//! the slot kept whatever was there. The value path now coerces to the
+//! field's declared width, as the reference path already did.
 
 use zynml::ZynML;
 
@@ -40,7 +32,6 @@ def to_y(): i64 {
 "#;
 
 #[test]
-#[ignore = "known defect: a nested value-struct field read returns a neighbouring field in its high bits"]
 fn a_nested_value_struct_read_is_correct() {
     let mut rt = ZynML::new().expect("rt");
     rt.load_source(SRC).expect("load");

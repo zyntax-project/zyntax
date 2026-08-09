@@ -1058,6 +1058,7 @@ pub trait TypedSymbolSink {
     fn register_zrtl_symbols(&mut self, _symbols: &[zyntax_compiler::zrtl::RuntimeSymbolInfo]) {}
 }
 
+#[cfg(feature = "native")]
 impl TypedSymbolSink for crate::runtime::ZyntaxRuntime {
     fn register_function_typed(&mut self, name: &'static str, ptr: *const u8, sig: ZrtlSymbolSig) {
         crate::runtime::ZyntaxRuntime::register_function_typed(self, name, ptr, sig);
@@ -1068,12 +1069,14 @@ impl TypedSymbolSink for crate::runtime::ZyntaxRuntime {
     }
 }
 
+#[cfg(feature = "native")]
 impl TypedSymbolSink for crate::runtime::TieredRuntime {
     fn register_function_typed(&mut self, name: &'static str, ptr: *const u8, sig: ZrtlSymbolSig) {
         crate::runtime::TieredRuntime::register_function_typed(self, name, ptr, sig);
     }
 }
 
+#[cfg(feature = "native")]
 pub fn register_effect_runtime_symbols(runtime: &mut impl TypedSymbolSink) {
     // push_handler(effect_id: u64, handler_state: *u8, op_table: *u8, async_mask: u64) -> u64
     runtime.register_function_typed(

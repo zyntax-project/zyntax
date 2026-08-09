@@ -4868,7 +4868,18 @@ impl SsaBuilder {
                     0
                 };
 
-                if num_fields == 1 && field_index == 0 {
+                // Only take the shortcut when the value really HAS been
+                // flattened. A locally built struct literal still carries
+                // `HirType::Struct{..}` and its field has to come out with
+                // ExtractValue; bitcasting there hands back the aggregate
+                // itself, which composes into nonsense once the field is
+                // another struct.
+                let object_still_aggregate = matches!(
+                    self.function.values.get(&object_val).map(|v| &v.ty),
+                    Some(HirType::Struct(hs)) if !hs.fields.is_empty()
+                );
+
+                if num_fields == 1 && field_index == 0 && !object_still_aggregate {
                     // Cranelift's ABI flattens single-field structs at
                     // function-arg/return boundaries — the param's actual
                     // Cranelift value is the bare scalar even though the
@@ -5477,6 +5488,18 @@ impl SsaBuilder {
                     if let Some(types) = field_typed_types.as_ref() {
                         if matches!(types.get(i), Some(Type::Any)) {
                             field_val = self.maybe_box_for_any_field(block_id, field_val);
+                        }
+                    }
+
+                    // Coerce to the field's declared width, exactly as the
+                    // reference path above does. An integer literal types
+                    // as i32, so `x: i64 = 1` would otherwise insert a
+                    // 4-byte value into an 8-byte slot and leave the high
+                    // half undefined — which reads back as the field plus
+                    // whatever shared the slot.
+                    if let HirType::Struct(ref hir_struct) = struct_ty {
+                        if let Some(field_ty) = hir_struct.fields.get(i).cloned() {
+                            field_val = self.coerce_scalar_to(block_id, field_val, &field_ty);
                         }
                     }
 
@@ -11023,6 +11046,11 @@ impl SsaBuilder {
                             );
                             self.add_use(gep_id, field_ptr);
 
+                            // Match the slot's declared width: an integer
+                            // literal types as i32, and storing that into an
+                            // i64 field leaves the high half holding whatever
+                            // was there.
+                            let value = self.coerce_scalar_to(block_id, value, &field_ty);
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Store {
@@ -11044,6 +11072,17 @@ impl SsaBuilder {
                 // Create an InsertValue instruction to update the field
                 let result_type = self.convert_type(&resolved_object_ty);
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
+
+                // Same width rule as the pointer path and the struct
+                // literal: the value has to match the field it lands in.
+                let value = if let HirType::Struct(ref hs) = result_type {
+                    match hs.fields.get(field_index as usize).cloned() {
+                        Some(field_ty) => self.coerce_scalar_to(block_id, value, &field_ty),
+                        None => value,
+                    }
+                } else {
+                    value
+                };
 
                 let inst = HirInstruction::InsertValue {
                     result,

@@ -11,7 +11,6 @@ use zynml::ZynML;
 
 /// A nested write on a local, read back through the same chain.
 #[test]
-#[ignore = "blocked by the nested value-struct read defect; see nested_value_struct_access.rs"]
 fn a_nested_write_on_a_local_lands() {
     let mut rt = ZynML::new().expect("rt");
     rt.load_source(
@@ -44,7 +43,10 @@ def go(): i64 {
 
 /// The write has to reach the original, not a copy of the inner struct.
 #[test]
-#[ignore = "blocked by the nested value-struct read defect; see nested_value_struct_access.rs"]
+#[ignore = "a single-field struct nested in a struct: translate_type flattens it to its \
+           scalar, so extractvalue loads the value and the next extract treats it as an \
+           address. Needs the backend to carry every HirType::Struct as a pointer and \
+           flatten only at ABI boundaries."]
 fn a_nested_write_mutates_in_place() {
     let mut rt = ZynML::new().expect("rt");
     rt.load_source(
@@ -68,7 +70,10 @@ def go(): i64 {
 /// Three levels deep, to show the fold is a chain and not a special
 /// case for two.
 #[test]
-#[ignore = "blocked by the nested value-struct read defect; see nested_value_struct_access.rs"]
+#[ignore = "a single-field struct nested in a struct: translate_type flattens it to its \
+           scalar, so extractvalue loads the value and the next extract treats it as an \
+           address. Needs the backend to carry every HirType::Struct as a pointer and \
+           flatten only at ABI boundaries."]
 fn a_write_three_levels_deep_lands() {
     let mut rt = ZynML::new().expect("rt");
     rt.load_source(
