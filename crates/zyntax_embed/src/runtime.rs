@@ -4431,6 +4431,52 @@ impl TieredRuntime {
         Ok(step)
     }
 
+    /// Call a compiled function with an explicit native signature.
+    ///
+    /// The signature is what makes the call safe: it names the argument
+    /// and return representation, so the pointer is invoked through a
+    /// matching ABI rather than an inferred one. [`Self::call_raw`]
+    /// infers, and cannot for every function.
+    ///
+    /// Mirrors `ZyntaxRuntime::call_function`.
+    pub fn call_function(
+        &self,
+        name: &str,
+        args: &[ZyntaxValue],
+        signature: &NativeSignature,
+    ) -> RuntimeResult<ZyntaxValue> {
+        if args.len() != signature.params.len() {
+            return Err(RuntimeError::Execution(format!(
+                "Function '{name}' expects {} arguments, got {}",
+                signature.params.len(),
+                args.len()
+            )));
+        }
+        let ptr = self
+            .function_pointer(name)
+            .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
+        // SAFETY: `ptr` is a compiled entry point owned by this runtime,
+        // and `signature` is the caller's statement of its ABI — the same
+        // contract the classic runtime's `call_function` carries.
+        unsafe { call_native_with_signature(ptr, args, signature) }
+    }
+
+    /// Publish `name` as a symbol later modules can link against.
+    ///
+    /// Registered as a runtime symbol rather than into one tier's export
+    /// table: every tier that can call the symbol has to be able to
+    /// resolve it, and a function exported while cold may be running
+    /// from a higher tier by the time something links to it.
+    ///
+    /// Mirrors `ZyntaxRuntime::export_function`.
+    pub fn export_function(&mut self, name: &str) -> RuntimeResult<()> {
+        let ptr = self
+            .function_pointer(name)
+            .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
+        self.backend.register_runtime_symbol(name, ptr);
+        Ok(())
+    }
+
     /// Resolve a handler name ONCE — FQN-aware, ambiguity is an error —
     /// and pin the result as a token. The token stays aimed at exactly
     /// that handler no matter what names later edits introduce; use it
