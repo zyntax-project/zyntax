@@ -2263,13 +2263,12 @@ typed_let = { name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ init:expr }
 // x = expr  (or  arr[idx] = expr  or  obj.field = expr)
 assign_stmt = { field_assign_stmt | index_assign_stmt | simple_assign_stmt }
 
-// self.field = expr
-field_assign_stmt = { obj:identifier ~ "." ~ field:identifier ~ "=" ~ value:expr }
+// self.field = expr, and nested targets like self.at.x = expr.
+// The target is a chain of field accesses, folded with the same helper
+// the read path uses, so a write reaches as deep as a read does.
+field_assign_stmt = { obj:identifier ~ path:suffix_field+ ~ "=" ~ value:expr }
   -> TypedStatement::Assignment {
-      target: TypedExpression::FieldAccess {
-          object: Box::new(TypedExpression::Variable { name: intern(obj) }),
-          field: intern(field),
-      },
+      target: fold_postfix(TypedExpression::Variable { name: intern(obj) }, path),
       value: value,
   }
 

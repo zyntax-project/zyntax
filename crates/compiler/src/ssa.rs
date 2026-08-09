@@ -11057,9 +11057,20 @@ impl SsaBuilder {
                 self.add_use(object_val, result);
                 self.add_use(value, result);
 
-                // If the object is a variable, write the updated value back
-                if let TypedExpression::Variable(var_name) = &object.node {
-                    self.write_variable(*var_name, block_id, result);
+                // `InsertValue` builds a NEW aggregate, so the result has
+                // to reach whatever holds the object or the write is
+                // lost. A variable is the base case; a nested target
+                // (`a.b.c = v`) is the same problem one level out, so
+                // storing the rebuilt `a.b` into `a` finishes the job at
+                // any depth.
+                match &object.node {
+                    TypedExpression::Variable(var_name) => {
+                        self.write_variable(*var_name, block_id, result);
+                    }
+                    TypedExpression::Field(_) | TypedExpression::Index(_) => {
+                        self.translate_lvalue_assign(block_id, object, result)?;
+                    }
+                    _ => {}
                 }
 
                 Ok(())

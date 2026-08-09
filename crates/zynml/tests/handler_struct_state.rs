@@ -4,18 +4,10 @@
 //! literal, and read through it; the state survives fiber resumes and
 //! reads from a pushed frame.
 //!
-//! One shape does not parse: a nested WRITE through `self` —
-//! `self.at.x = ...`. Everything adjacent to it does, which is what
-//! makes it look like a regression rather than a limit:
-//!
-//! | shape | parses |
-//! | --- | --- |
-//! | `self.at.x` as a read | yes |
-//! | `self.n = ...` one level | yes |
-//! | `p.x = ...` on a local | yes |
-//! | `let mut p = self.at` then `p.x = ...` | yes |
-//! | `self.at.x = ...` | NO |
-//! | same with `@reference` on the struct | NO |
+//! A nested WRITE through `self`, `self.at.x = ...`, works too: the
+//! assignment target is a chain of field accesses rather than a single
+//! field, and the rebuilt aggregate is stored back through the outer
+//! lvalue instead of being dropped.
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
 
@@ -65,8 +57,11 @@ fn runtime() -> TieredRuntime {
     config.enable_osr = true;
     let mut rt = TieredRuntime::new(config).expect("rt");
     let g = Grammar2::from_source(ZYNML_GRAMMAR).expect("g");
-    rt.compile_typed_program(g.parse_with_filename(SRC, "struct_state.zyn").expect("parse"))
-        .expect("compile");
+    rt.compile_typed_program(
+        g.parse_with_filename(SRC, "struct_state.zyn")
+            .expect("parse"),
+    )
+    .expect("compile");
     rt
 }
 
@@ -94,10 +89,10 @@ fn a_struct_literal_works_inside_a_handler_op() {
 
 /// A nested write through `self` in a handler body.
 ///
-/// Ignored: it fails at parse, where the read of the same path and a
-/// one-level write both succeed. See the table above.
+/// A nested write through `self` parses. It is executed end to end in
+/// `nested_field_write.rs`, which drives the handler and checks the
+/// state advanced.
 #[test]
-#[ignore = "nested write through self does not parse: self.at.x = ..."]
 fn a_handler_can_write_through_a_nested_field() {
     const NESTED_WRITE: &str = r#"
 struct Point {
