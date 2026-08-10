@@ -411,6 +411,24 @@ pub(crate) fn migrate_handler_states(
     migrated
 }
 
+/// Release a handler-state region.
+///
+/// The synthesized `H$new` allocates through `Intrinsic::Malloc`, which
+/// lowers to libc `malloc`, so the matching release is libc `free` and
+/// not the Rust allocator.
+///
+/// # Safety
+/// `state` must have come from a handler constructor and must not be
+/// installed in any live frame.
+pub(crate) unsafe fn free_handler_state(state: *mut u8) {
+    unsafe extern "C" {
+        fn free(p: *mut core::ffi::c_void);
+    }
+    if !state.is_null() {
+        unsafe { free(state as *mut core::ffi::c_void) };
+    }
+}
+
 /// Bind a handler frame into a fiber's saved segment so every
 /// enter/resume installs it and every leave saves it back — the
 /// persistent counterpart of a per-resume push. Inserted at the

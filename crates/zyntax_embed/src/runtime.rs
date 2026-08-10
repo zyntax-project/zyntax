@@ -3421,7 +3421,7 @@ pub struct EffectHandlerToken(u64);
 /// [`TieredRuntime::pop_effect_handler`]. Deliberately not `Copy`: a
 /// frame is ended exactly once.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct HandlerFrame(u64);
+pub struct HandlerFrame(u64, Option<u64>);
 
 /// Opaque handle to ONE allocated instance of a stateful handler's
 /// state.
@@ -3434,7 +3434,13 @@ pub struct HandlerFrame(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HandlerInstance(u64);
 
-/// A host-allocated handler state and the dispatch shape it installs with.
+/// A host-allocated handler state and the dispatch shape it installs
+/// with, plus what it takes to know when the region can go.
+///
+/// Freeing is owner-driven rather than scope-driven: one region can
+/// back a bind and any number of pushes, so no single install may
+/// release it. Each install holds a count, the owner asks for the drop,
+/// and the last one out frees.
 struct HandlerInstanceEntry {
     handler: String,
     effect_id: u64,
@@ -3443,6 +3449,12 @@ struct HandlerInstanceEntry {
     state: usize,
     table: usize,
     async_mask: u64,
+    /// Installs currently naming this region.
+    installs: usize,
+    /// The owner has released its handle; free once `installs` is zero.
+    /// Set at creation for a region the runtime allocated implicitly on
+    /// a caller's behalf, which nothing else can ever name.
+    dropped_by_owner: bool,
 }
 
 /// One step of a host-driven machine.
@@ -3495,6 +3507,8 @@ enum HostYieldKind {
 
 struct HostFiber {
     ptr: usize,
+    /// Handler instances this machine holds an install of.
+    bound_instances: Vec<u64>,
     function: String,
     yield_shape: String,
     yield_kind: HostYieldKind,
@@ -3924,6 +3938,15 @@ impl TieredRuntime {
             crate::effect_runtime::__zyntax_effect_fiber_forget(ptr);
             // SAFETY: the registry owned the handle exclusively.
             unsafe { zyntax_compiler::zrtl::krio_fiber_free(ptr as *mut _) };
+        }
+        // Nothing can be installed any more, so every region the
+        // runtime is holding goes, whether or not its owner got round
+        // to dropping it.
+        for (_, e) in self.handler_instances.drain() {
+            // SAFETY: the fibers that could have named these are freed
+            // above and the thread's handler stack cannot outlive the
+            // runtime that owns the code its frames point into.
+            unsafe { crate::effect_runtime::free_handler_state(e.state as *mut u8) };
         }
         self.backend.shutdown();
     }
@@ -4414,6 +4437,7 @@ impl TieredRuntime {
             token,
             HostFiber {
                 ptr: ptr as usize,
+                bound_instances: Vec::new(),
                 function: function.to_string(),
                 yield_shape: shape.shape.clone(),
                 yield_kind: shape.kind,
@@ -4559,18 +4583,28 @@ impl TieredRuntime {
     /// Each call allocates its own state, so successive extents do not
     /// share one and neither does a machine bound to the same handler.
     /// Use [`Self::push_handler_instance`] when they should.
-    pub fn push_effect_handler(&self, handler: EffectHandlerToken) -> RuntimeResult<HandlerFrame> {
-        let name = self
-            .handler_tokens
-            .get(&handler.0)
-            .cloned()
-            .ok_or_else(|| RuntimeError::Execution("unknown handler token".to_string()))?;
-        self.push_named_handler(&name).map(HandlerFrame)
+    pub fn push_effect_handler(
+        &mut self,
+        handler: EffectHandlerToken,
+    ) -> RuntimeResult<HandlerFrame> {
+        // Allocate through an instance the runtime owns and immediately
+        // disowns: nothing else can ever name this region, so it dies
+        // with the frame rather than leaking.
+        let instance = self.new_handler_instance(handler)?;
+        let frame = self.push_handler_instance(instance)?;
+        if let Some(e) = self.handler_instances.get_mut(&instance.0) {
+            e.dropped_by_owner = true;
+        }
+        Ok(frame)
     }
 
-    /// End the extent a [`Self::push_effect_handler`] frame opened.
-    pub fn pop_effect_handler(&self, frame: HandlerFrame) {
+    /// End the extent a [`Self::push_effect_handler`] frame opened, and
+    /// release the install this frame held on its handler state.
+    pub fn pop_effect_handler(&mut self, frame: HandlerFrame) {
         crate::effect_runtime::__zyntax_effect_pop_handler(frame.0);
+        if let Some(id) = frame.1 {
+            self.release_handler_install(id);
+        }
     }
 
     /// Allocate ONE instance of a handler's state and hand back a
@@ -4614,6 +4648,8 @@ impl TieredRuntime {
                 state: state as usize,
                 table: table as usize,
                 async_mask,
+                installs: 0,
+                dropped_by_owner: false,
             },
         );
         Ok(HandlerInstance(id))
@@ -4622,16 +4658,24 @@ impl TieredRuntime {
     /// Install `instance` for a host-controlled extent, the way
     /// [`Self::push_effect_handler`] does but against state the caller
     /// already owns. Pair with [`Self::pop_effect_handler`].
-    pub fn push_handler_instance(&self, instance: HandlerInstance) -> RuntimeResult<HandlerFrame> {
+    pub fn push_handler_instance(
+        &mut self,
+        instance: HandlerInstance,
+    ) -> RuntimeResult<HandlerFrame> {
         let e = self.handler_instance_entry(instance)?;
-        Ok(HandlerFrame(
-            crate::effect_runtime::__zyntax_effect_push_handler(
-                e.effect_id,
-                e.state as *mut u8,
-                e.table as *mut u8,
-                e.async_mask,
-            ),
-        ))
+        let (effect_id, state, table, async_mask) = (
+            e.effect_id,
+            e.state as *mut u8,
+            e.table as *mut u8,
+            e.async_mask,
+        );
+        let frame = crate::effect_runtime::__zyntax_effect_push_handler(
+            effect_id, state, table, async_mask,
+        );
+        if let Some(e) = self.handler_instances.get_mut(&instance.0) {
+            e.installs += 1;
+        }
+        Ok(HandlerFrame(frame, Some(instance.0)))
     }
 
     /// Bind `instance` to a machine for its lifetime, the way
@@ -4657,6 +4701,12 @@ impl TieredRuntime {
             e.async_mask,
         );
         crate::effect_runtime::fiber_bind_handler(ptr, effect_id, state, table, async_mask);
+        if let Some(e) = self.handler_instances.get_mut(&instance.0) {
+            e.installs += 1;
+        }
+        if let Some(hf) = self.host_fibers.get_mut(&token.0) {
+            hf.bound_instances.push(instance.0);
+        }
         Ok(())
     }
 
@@ -4667,11 +4717,43 @@ impl TieredRuntime {
             .map(|e| e.handler.as_str())
     }
 
-    /// Release the handle. Installs already made keep working — they
-    /// hold the state pointer directly — and the region itself is not
-    /// reclaimed, as described on [`Self::new_handler_instance`].
+    /// Give up ownership of the instance. The region is released once
+    /// nothing is installed against it: a frame still open or a machine
+    /// still bound keeps it alive until that install ends, so this is
+    /// safe to call while either is outstanding.
     pub fn drop_handler_instance(&mut self, instance: HandlerInstance) {
-        self.handler_instances.remove(&instance.0);
+        if let Some(e) = self.handler_instances.get_mut(&instance.0) {
+            e.dropped_by_owner = true;
+        }
+        self.reap_handler_instance(instance.0);
+    }
+
+    /// Drop one install's claim, freeing the region if it was the last
+    /// and the owner is done with it.
+    fn release_handler_install(&mut self, id: u64) {
+        if let Some(e) = self.handler_instances.get_mut(&id) {
+            e.installs = e.installs.saturating_sub(1);
+        }
+        self.reap_handler_instance(id);
+    }
+
+    /// Free and forget an instance once no install names it and its
+    /// owner has let it go.
+    fn reap_handler_instance(&mut self, id: u64) {
+        let ready = self
+            .handler_instances
+            .get(&id)
+            .map(|e| e.dropped_by_owner && e.installs == 0)
+            .unwrap_or(false);
+        if !ready {
+            return;
+        }
+        if let Some(e) = self.handler_instances.remove(&id) {
+            // SAFETY: no frame names this region — every install has
+            // been released — and it came from the handler's
+            // constructor, so libc `free` is the matching release.
+            unsafe { crate::effect_runtime::free_handler_state(e.state as *mut u8) };
+        }
     }
 
     fn handler_instance_entry(
@@ -4739,6 +4821,11 @@ impl TieredRuntime {
         // SAFETY: the registry owned this handle exclusively; nothing
         // holds it after removal.
         unsafe { zyntax_compiler::zrtl::krio_fiber_free(ptr as *mut _) };
+        // The machine's segment is gone, so its binds are no longer
+        // installed anywhere.
+        for id in hf.bound_instances {
+            self.release_handler_install(id);
+        }
         Ok(())
     }
 
@@ -4861,8 +4948,30 @@ impl TieredRuntime {
             })?;
             hf.ptr as *mut u8
         };
-        let (effect_id, state, table, async_mask) = self.named_handler_frame(handler)?;
+        let (resolved, effect_id, table, async_mask, stateful) = self.handler_shape(handler)?;
+        let state = self.alloc_handler_state(&resolved, stateful)?;
         crate::effect_runtime::fiber_bind_handler(ptr, effect_id, state, table, async_mask);
+
+        // Register the region so dropping the machine releases it. The
+        // runtime owns and immediately disowns it: only this bind can
+        // ever name it.
+        let id = self.next_handler_instance;
+        self.next_handler_instance += 1;
+        self.handler_instances.insert(
+            id,
+            HandlerInstanceEntry {
+                handler: resolved,
+                effect_id,
+                state: state as usize,
+                table: table as usize,
+                async_mask,
+                installs: 1,
+                dropped_by_owner: true,
+            },
+        );
+        if let Some(hf) = self.host_fibers.get_mut(&token.0) {
+            hf.bound_instances.push(id);
+        }
         Ok(())
     }
 
@@ -5462,6 +5571,12 @@ impl ZyntaxPromise {
                 // Promise layout: {state_machine: *mut u8, poll_fn: fn(*mut u8) -> i64}
                 let state_machine = *(promise_ptr as *const *mut u8);
                 let poll_fn = *((promise_ptr as *const u8).offset(8) as *const *const u8);
+                // The entry function mallocs this 16-byte struct purely to
+                // hand back the pair. Both fields are copied out above and
+                // the pointer goes no further, so it is released here
+                // rather than lost. The state machine it named is a
+                // separate allocation and is NOT released.
+                crate::effect_runtime::free_handler_state(promise_ptr as *mut u8);
                 (state_machine, poll_fn)
             }
         };
