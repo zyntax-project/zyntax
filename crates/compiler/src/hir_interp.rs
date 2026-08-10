@@ -40,6 +40,49 @@
 
 use std::collections::HashMap;
 
+/// What a function uses that the bytecode interpreter cannot execute.
+///
+/// The interpreter rejects these when it compiles a function to
+/// bytecode, which is lazy, so a program that only reaches them on some
+/// path installs cleanly and fails much later. Callers for which the
+/// interpreter is the ONLY engine should ask up front. Where it is a
+/// tier with a JIT underneath, these are not errors: the JIT runs them.
+pub fn unsupported_constructs(module: &HirModule) -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    for func in module.functions.values() {
+        if func.is_external {
+            continue;
+        }
+        let mut found: Option<&'static str> = None;
+        'blocks: for block in func.blocks.values() {
+            for inst in &block.instructions {
+                found = match inst {
+                    HirInstruction::PerformEffect { .. } => Some("algebraic effects"),
+                    HirInstruction::FiberNew { .. }
+                    | HirInstruction::FiberResume { .. }
+                    | HirInstruction::FiberResumeWith { .. }
+                    | HirInstruction::FiberYield { .. }
+                    | HirInstruction::FiberTransfer { .. }
+                    | HirInstruction::FiberDrop { .. } => Some("fibers"),
+                    _ => None,
+                };
+                if found.is_some() {
+                    break 'blocks;
+                }
+            }
+        }
+        if let Some(what) = found {
+            out.push((
+                func.name
+                    .resolve_global()
+                    .unwrap_or_else(|| "?".to_string()),
+                what,
+            ));
+        }
+    }
+    out
+}
+
 use crate::hir::{
     BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValueKind, UnaryOp, VectorMinMaxKind, VectorUnaryKind,
@@ -1491,13 +1534,39 @@ fn lower_inst(
             });
         }
         other => {
-            return Err(InterpError::UnsupportedInstruction(format!(
-                "{:?}",
-                std::mem::discriminant(other)
-            )));
+            return Err(InterpError::UnsupportedInstruction(instruction_name(other)));
         }
     }
     Ok(())
+}
+
+/// Name an instruction the bytecode compiler will not take, in terms a
+/// caller can act on. The default used to be the discriminant, which
+/// says nothing about what the program did or what to do instead.
+fn instruction_name(inst: &HirInstruction) -> String {
+    let what = match inst {
+        HirInstruction::PerformEffect { op_name, .. } => {
+            return format!(
+                "performing effect operation `{}`: the bytecode interpreter cannot run \
+                 algebraic effects, so this function needs a JIT tier",
+                op_name.resolve_global().unwrap_or_default()
+            )
+        }
+        HirInstruction::FiberNew { .. } => "creating a fiber",
+        HirInstruction::FiberResume { .. } | HirInstruction::FiberResumeWith { .. } => {
+            "resuming a fiber"
+        }
+        HirInstruction::FiberYield { .. } => "yielding from a fiber",
+        HirInstruction::FiberTransfer { .. } => "transferring between fibers",
+        HirInstruction::FiberDrop { .. } => "dropping a fiber",
+        other => {
+            return format!(
+                "an instruction the bytecode interpreter does not implement ({:?})",
+                std::mem::discriminant(other)
+            )
+        }
+    };
+    format!("{what}: the bytecode interpreter cannot run fibers, so this function needs a JIT tier")
 }
 
 fn lower_terminator(
@@ -1742,6 +1811,13 @@ pub struct HirInterpreter {
     /// triggers compilation; subsequent calls reuse the same
     /// `CompiledFunction`. Keyed by `HirFunction::id`.
     cache: HashMap<HirId, CompiledFunction>,
+    /// Functions this interpreter has already refused, and why.
+    ///
+    /// A refusal is as stable as a success: a function that performs an
+    /// effect will never become interpretable. Without this, every call
+    /// re-compiles the whole body just to fail the same way, and the
+    /// host takes its fallback path afterwards regardless.
+    uncompilable: HashMap<HirId, String>,
     /// Per-function tick callbacks. Invoked once per call entry — the
     /// callback returns `Some(ptr)` to dispatch to JIT'd code instead
     /// of running the bytecode (the host-side beadie integration uses
@@ -1863,6 +1939,7 @@ impl HirInterpreter {
             profile: HashMap::new(),
             memory: Memory::new(),
             cache: HashMap::new(),
+            uncompilable: HashMap::new(),
             tick_callbacks: HashMap::new(),
             wasm_compile_hook: None,
             wasm_dispatch_hook: None,
@@ -2080,14 +2157,25 @@ impl HirInterpreter {
             }
         }
 
-        // Compile-on-first-use.
+        // Compile-on-first-use, and refuse-once.
+        if let Some(why) = self.uncompilable.get(&func_id) {
+            return Err(InterpError::UnsupportedInstruction(why.clone()));
+        }
         if !self.cache.contains_key(&func_id) {
             let func = module
                 .functions
                 .get(&func_id)
                 .ok_or(InterpError::UndefinedSsaValue(func_id))?;
-            let cf = compile_function(module, &mut self.memory, func)?;
-            self.cache.insert(func_id, cf);
+            match compile_function(module, &mut self.memory, func) {
+                Ok(cf) => {
+                    self.cache.insert(func_id, cf);
+                }
+                Err(InterpError::UnsupportedInstruction(why)) => {
+                    self.uncompilable.insert(func_id, why.clone());
+                    return Err(InterpError::UnsupportedInstruction(why));
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Lift the compiled function out of the cache so we can mutate

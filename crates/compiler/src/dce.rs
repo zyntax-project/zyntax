@@ -50,7 +50,65 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
         return all_function_ids(module);
     }
 
+    roots.extend(host_reachable_roots(module));
     reachable_from_roots(module, roots)
+}
+
+/// Functions the HOST can enter without any compiled call site naming
+/// them.
+///
+/// Reachability from `main` describes what the program calls. It cannot
+/// describe what an embedder calls: `push_effect_handler` installs any
+/// handler, and `get_fiber` constructs any machine, neither of which
+/// appears as a call in compiled code. Pruning those leaves a handler's
+/// op table full of zero slots (its ops were never defined, so
+/// `write_function_addr` had nothing to point at) and a machine with no
+/// entry pointer, which surfaces to the host as a handler that cannot be
+/// resolved.
+///
+/// They are entry points, so they are roots.
+fn host_reachable_roots(module: &HirModule) -> Vec<HirId> {
+    let mut roots = Vec::new();
+    let mut root_named = |want: &str, roots: &mut Vec<HirId>| {
+        for (id, f) in &module.functions {
+            if f.name.resolve_global().as_deref() == Some(want) {
+                roots.push(*id);
+            }
+        }
+    };
+
+    for handler in module.handlers.values() {
+        let hname = handler.name.resolve_global().unwrap_or_default();
+        // Every operation of every handler: the host chooses which
+        // handler is installed, at run time and from outside.
+        for imp in &handler.implementations {
+            let mangled = crate::effect_codegen::mangle_handler_op_name(handler.name, imp.op_name);
+            root_named(&mangled, &mut roots);
+        }
+        // And the state constructor, which only a `with` scope would
+        // otherwise call.
+        if !handler.state_fields.is_empty() {
+            root_named(&format!("{hname}$new"), &mut roots);
+        }
+    }
+
+    // A machine's body is entered through `krio_fiber_new`, never
+    // through a compiled call, so nothing names it either.
+    for (id, f) in &module.functions {
+        if f.is_external {
+            continue;
+        }
+        let is_machine_body = f.blocks.values().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::FiberYield { .. }))
+        });
+        if is_machine_body {
+            roots.push(*id);
+        }
+    }
+
+    roots
 }
 
 /// [`reachable_function_ids`] seeded from function ids rather than entry

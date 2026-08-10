@@ -377,13 +377,25 @@ impl TieredBackend {
         // from `load_plugin`), rebuild the JIT module with the accumulated
         // symbol set before compilation. Mirrors
         // `ZyntaxRuntime::compile_module` in zyntax_embed.
-        self.cranelift.with_lock(|be| {
+        // A rebuild replaces the JIT module and clears the backend's
+        // function and global maps, since both index into the module it
+        // discards. Anything already installed loses its entries, and
+        // nothing re-declares them: a handler's `$optable$` global then
+        // has no address, and the host reports the handler as missing.
+        // So recompile what was installed before, after the rebuild.
+        let rebuilt = self.cranelift.with_lock(|be| {
             if be.needs_rebuild_for_module(&module) {
-                be.rebuild_with_accumulated_symbols()
+                be.rebuild_with_accumulated_symbols().map(|()| true)
             } else {
-                Ok(())
+                Ok(false)
             }
         })?;
+        if rebuilt {
+            if let Some(previous) = self.current_module.clone() {
+                self.cranelift
+                    .with_lock(|be| be.compile_module(&previous))?;
+            }
+        }
 
         // Bead ids have to exist before codegen, not after: a tier-0 probe
         // bakes its function's id into the address of the slot it loads, so
@@ -1255,7 +1267,21 @@ impl TieredBackend {
     /// `__zyntax_effect_push_handler`. FQN-aware: an exact name wins,
     /// and an unqualified name matches a single `path::name` handler.
     pub fn handler_push_info(&self, handler: &str) -> Option<(String, u64, usize, u64, bool)> {
-        let module = self.current_module.as_ref()?;
+        self.try_handler_push_info(handler).ok()
+    }
+
+    /// [`Self::handler_push_info`] with the reason it failed. Five very
+    /// different failures used to collapse into one `None`, and the
+    /// caller reported all of them as ambiguity, which points at the
+    /// wrong line for four of them.
+    pub fn try_handler_push_info(
+        &self,
+        handler: &str,
+    ) -> Result<(String, u64, usize, u64, bool), String> {
+        let module = self
+            .current_module
+            .as_ref()
+            .ok_or_else(|| "no module has been compiled yet".to_string())?;
         let suffix = format!("::{handler}");
         let mut matched: Option<(&crate::hir::HirEffectHandler, String)> = None;
         for h in module.handlers.values() {
@@ -1267,14 +1293,22 @@ impl TieredBackend {
                 break;
             }
             if name.ends_with(&suffix) {
-                if matched.is_some() {
-                    return None; // ambiguous — the caller must qualify
+                if let Some((_, first)) = &matched {
+                    return Err(format!(
+                        "`{handler}` is ambiguous: `{first}` and `{name}` both match; qualify it"
+                    ));
                 }
                 matched = Some((h, name));
             }
         }
-        let (h, resolved) = matched?;
-        let effect = module.effects.get(&h.effect_id)?;
+        let (h, resolved) =
+            matched.ok_or_else(|| format!("no handler named `{handler}` in the loaded program"))?;
+        let effect = module.effects.get(&h.effect_id).ok_or_else(|| {
+            format!(
+                "handler `{resolved}` names effect {:?}, which is not in the module",
+                h.effect_id
+            )
+        })?;
         let mut async_mask = 0u64;
         for (idx, op) in effect.operations.iter().enumerate().take(64) {
             if h.implementations
@@ -1289,9 +1323,19 @@ impl TieredBackend {
             .globals
             .iter()
             .find(|(_, g)| g.name.resolve_global().as_deref() == Some(table_name.as_str()))
-            .map(|(id, _)| *id)?;
-        let (addr, _size) = self.cranelift.with_lock(|be| be.global_data_addr(gid))?;
-        Some((
+            .map(|(id, _)| *id)
+            .ok_or_else(|| format!("handler `{resolved}` has no `{table_name}` global"))?;
+        let (addr, _size) = self
+            .cranelift
+            .with_lock(|be| be.global_data_addr(gid))
+            .ok_or_else(|| {
+                format!(
+                    "`{table_name}` ({gid:?}) is in the module but was never declared to the \
+                     backend, so it has no address. A JIT rebuild clears the backend's global \
+                     map; anything installed before it needs recompiling."
+                )
+            })?;
+        Ok((
             resolved,
             h.effect_id.as_u32() as u64,
             addr as usize,
@@ -1576,7 +1620,16 @@ impl TieredBackend {
     /// plugins at startup, so the unsafe ordering doesn't arise.
     pub fn rebuild_with_accumulated_symbols(&mut self) -> CompilerResult<()> {
         self.cranelift
-            .with_lock(|be| be.rebuild_with_accumulated_symbols())
+            .with_lock(|be| be.rebuild_with_accumulated_symbols())?;
+        // The rebuild discarded the JIT module the installed code was
+        // declared into, taking the backend's function and global maps
+        // with it. Re-declare what is still supposed to be live, or the
+        // next lookup of an already-installed global finds nothing.
+        if let Some(previous) = self.current_module.clone() {
+            self.cranelift
+                .with_lock(|be| be.compile_module(&previous))?;
+        }
+        Ok(())
     }
 
     /// Forward plugin symbol signatures to the inner Cranelift backend.

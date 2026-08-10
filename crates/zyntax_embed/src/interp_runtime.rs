@@ -254,6 +254,21 @@ impl InterpRuntime {
     /// Also assigns an OSR bead id to each function and registers it
     /// in `zyntax_compiler::osr`'s global bead registry so JIT'd code
     /// can resolve back to the bead from a probe site.
+    /// Functions in the installed module that the bytecode interpreter
+    /// cannot execute, with what each one uses.
+    ///
+    /// Ask this where the interpreter is the ONLY engine. Bytecode
+    /// compilation is lazy, so without it a program that performs an
+    /// effect installs cleanly and only fails when the path is reached.
+    /// Where the interpreter is a tier with a JIT beneath it, a
+    /// non-empty answer is not an error: the JIT runs those functions.
+    pub fn unsupported_constructs(&self) -> Vec<(String, &'static str)> {
+        self.module
+            .as_ref()
+            .map(|m| zyntax_compiler::hir_interp::unsupported_constructs(m))
+            .unwrap_or_default()
+    }
+
     pub fn compile_module(&mut self, module: HirModule) {
         let module = Arc::new(module);
         // Beadie bookkeeping is native-only — see field docs on

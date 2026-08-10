@@ -637,6 +637,30 @@ pub fn reject_future(handle: i64, _msg: &str) -> ResolveOutcome {
     resolve_future(handle, -1)
 }
 
+/// True while any of this thread's async tables still names `sm`.
+///
+/// The state machine outlives its promise whenever something else can
+/// still reach it: a parked future waiting on a timer, a completion
+/// latched during a nested poll, or a handler/performer pairing. A
+/// caller releasing the region has to see all of them, so this is the
+/// single place that knows the full set.
+///
+/// Only meaningful on the thread that ran the task, since every table
+/// here is thread-local. A caller on another thread would see them
+/// empty and conclude, wrongly, that nothing refers to `sm`.
+pub fn sm_is_referenced(sm: *mut u8) -> bool {
+    let k = sm as usize;
+    FUTURE_TABLE.with(|t| {
+        t.borrow()
+            .values()
+            .any(|p| p.state_machine_ptr as usize == k)
+    }) || SM_COMPLETIONS.with(|c| c.borrow().contains_key(&k))
+        || HANDLER_TO_PERFORMER.with(|m| {
+            let m = m.borrow();
+            m.contains_key(&k) || m.values().any(|v| *v == k)
+        })
+}
+
 /// Test-only: peek at the number of parked futures. Lets unit
 /// tests assert "the table was cleaned up after the SM completed"
 /// without exposing the internal structure.

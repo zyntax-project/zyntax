@@ -4771,11 +4771,10 @@ impl TieredRuntime {
     /// with [`Self::resume_fiber_handled`] and
     /// [`Self::bind_fiber_handler`].
     pub fn get_effect_handler(&mut self, name: &str) -> RuntimeResult<EffectHandlerToken> {
-        let (resolved, _, _, _, _) = self.backend.handler_push_info(name).ok_or_else(|| {
-            RuntimeError::Execution(format!(
-                "no unambiguous handler named `{name}` in the loaded program"
-            ))
-        })?;
+        let (resolved, _, _, _, _) = self
+            .backend
+            .try_handler_push_info(name)
+            .map_err(RuntimeError::Execution)?;
         let token = self.next_handler_token;
         self.next_handler_token += 1;
         self.handler_tokens.insert(token, resolved);
@@ -4852,12 +4851,10 @@ impl TieredRuntime {
     /// instance of its state you mean: `(resolved name, effect id,
     /// op table, async mask, stateful?)`.
     fn handler_shape(&self, handler: &str) -> RuntimeResult<(String, u64, *mut u8, u64, bool)> {
-        let (resolved, effect_id, table_addr, async_mask, stateful) =
-            self.backend.handler_push_info(handler).ok_or_else(|| {
-                RuntimeError::Execution(format!(
-                    "no unambiguous handler named `{handler}` in the loaded program"
-                ))
-            })?;
+        let (resolved, effect_id, table_addr, async_mask, stateful) = self
+            .backend
+            .try_handler_push_info(handler)
+            .map_err(RuntimeError::Execution)?;
         Ok((
             resolved,
             effect_id,
@@ -5502,6 +5499,40 @@ struct PromiseInner {
     poll_count: usize,
     /// Waker for Rust Future integration
     waker: Option<std::task::Waker>,
+    /// Thread that ran this task. The tables that can still name the
+    /// state machine are thread-local, so only this thread can tell
+    /// whether the region is free to release.
+    owner_thread: std::thread::ThreadId,
+}
+
+impl Drop for PromiseInner {
+    fn drop(&mut self) {
+        // The state machine is a `malloc` from the async entry function
+        // and nothing else releases it. It can go once the task is
+        // finished and no async table still names it: a parked timer, a
+        // latched completion, or a handler/performer pairing all mean
+        // something can still poll it.
+        let Some(sm) = self.state_machine else {
+            return;
+        };
+        if matches!(self.state, PromiseState::Pending) {
+            return;
+        }
+        if std::thread::current().id() != self.owner_thread {
+            return;
+        }
+        // A completion latched for this task is ours and nobody can read
+        // it now, so clear it. Leaving it would keep the map growing and,
+        // once the region below is freed, let a later allocation landing
+        // on the same address look already-complete.
+        let _ = crate::host_futures::take_sm_completion(sm);
+        if crate::host_futures::sm_is_referenced(sm) {
+            return;
+        }
+        // SAFETY: the task is finished, nothing on this thread can reach
+        // the region, and it came from the entry function's `malloc`.
+        unsafe { crate::effect_runtime::free_handler_state(sm) };
+    }
 }
 
 // SAFETY: Promise state is protected by mutex
@@ -5539,6 +5570,7 @@ impl ZyntaxPromise {
                 task_id,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         }
     }
@@ -5600,6 +5632,7 @@ impl ZyntaxPromise {
                 task_id,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         }
     }
@@ -5624,6 +5657,7 @@ impl ZyntaxPromise {
                 task_id,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         }
     }
@@ -5962,6 +5996,7 @@ impl ZyntaxPromise {
                 task_id,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         };
 
@@ -6012,6 +6047,7 @@ impl ZyntaxPromise {
                 task_id,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         };
 
@@ -6869,6 +6905,7 @@ mod tests {
                 task_id: 0,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         };
 
@@ -6894,6 +6931,7 @@ mod tests {
                 task_id: 0,
                 poll_count: 0,
                 waker: None,
+                owner_thread: std::thread::current().id(),
             })),
         };
 
