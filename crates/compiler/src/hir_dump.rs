@@ -1382,3 +1382,41 @@ pub fn dump_module(module: &HirModule) -> String {
 
     out
 }
+
+/// Write `module`'s dump to `$ZYNTAX_DUMP_HIR_DIR/<stage>.hir` when that
+/// variable is set, and answer whether anything was written.
+///
+/// A file rather than a log record on purpose. The dump of a real
+/// program is thousands of lines, which a log pipeline truncates or
+/// interleaves, and an embedding host on `tracing` cannot see this
+/// crate's `log` records at all without a bridge. A path is readable by
+/// whoever asked for it regardless of either.
+///
+/// `stage` names the point in the pipeline — call it after optimisation
+/// as well as before, since the two differ and a question about what
+/// reached the backend is a question about the later one.
+pub fn dump_module_to_dir(module: &crate::hir::HirModule, stage: &str) -> bool {
+    let Ok(dir) = std::env::var("ZYNTAX_DUMP_HIR_DIR") else {
+        return false;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let safe: String = stage
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Sequenced: a program can install more than one module, and a dump
+    // keyed only by stage would leave the last one standing and hide
+    // that fact -- which is exactly the sort of thing the dump is for.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::path::Path::new(&dir).join(format!("{n:03}-{safe}.hir"));
+    std::fs::write(&path, dump_module(module)).is_ok()
+}

@@ -1273,6 +1273,7 @@ impl ZyntaxRuntime {
         if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut owned);
         }
+        zyntax_compiler::hir_dump::dump_module_to_dir(&owned, "post-opt-compile_module");
 
         // Check if we need to rebuild the backend for cross-module linking
         if self.backend.needs_rebuild_for_module(&owned) {
@@ -3724,6 +3725,7 @@ impl TieredRuntime {
         if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut module);
         }
+        zyntax_compiler::hir_dump::dump_module_to_dir(&module, "post-opt-tiered-compile_module");
 
         // Store function name -> ID mapping and signatures (resolve InternedString to actual string)
         for (id, func) in &module.functions {
@@ -4210,6 +4212,7 @@ impl TieredRuntime {
         if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
         }
+        zyntax_compiler::hir_dump::dump_module_to_dir(&hir_module, "post-opt-typed-program");
         let report = self
             .backend
             .reload_module(&hir_module)
