@@ -59,7 +59,11 @@ fn peek(addr: usize, words: usize) -> Option<Vec<u64>> {
     // Safety: the guard above rejects obvious non-pointers, and the
     // only values reaching here come from a handler region the runtime
     // allocated and still owns for the duration of the call.
-    Some((0..words).map(|i| unsafe { *(addr as *const u64).add(i) }).collect())
+    Some(
+        (0..words)
+            .map(|i| unsafe { *(addr as *const u64).add(i) })
+            .collect(),
+    )
 }
 
 fn ptr_tag() -> TypeTag {
@@ -168,11 +172,7 @@ def main(): i64 {{
 #[test]
 fn which_extern_call_form_works_in_a_handler_body() {
     let forms: [(&str, &str, &str); 5] = [
-        (
-            "no extern (control)",
-            "",
-            "",
-        ),
+        ("no extern (control)", "", ""),
         (
             "extern, no args",
             "extern def host_notify0()",
@@ -229,10 +229,7 @@ fn the_handler_round_trips_without_an_extern() {
 #[test]
 fn a_handler_body_can_call_a_host_extern() {
     reset();
-    let outcome = compile_and_run(&program(
-        "extern def host_notify0()",
-        "host_notify0()",
-    ));
+    let outcome = compile_and_run(&program("extern def host_notify0()", "host_notify0()"));
     assert_eq!(outcome, Ok(7), "the write still lands");
     assert_eq!(
         SEEN_UNIT.lock().unwrap().len(),

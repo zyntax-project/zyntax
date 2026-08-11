@@ -2893,6 +2893,8 @@ primary_expr = {
     f_string_literal |
     string_literal |
     bool_literal |
+    typed_null_expr |     // Null<T> — before var_expr, which would take `Null` as a name
+    null_literal |
     tuple_expr |          // Must come before grouped_expr (both start with '(')
     grouped_expr |
     path_expr |
@@ -3229,6 +3231,25 @@ string_inner = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 // Boolean: true, false
 bool_literal = @{ "true" | "false" }
   -> TypedExpression::BoolLiteral { value: parse_bool(text()) }
+
+// `null` — the absent value of an optional. Sugar for `None`, which is
+// the spelling the Option lowering already recognises; a bare
+// `TypedLiteral::Null` is not mapped to the union's None variant and
+// would compile to a value nothing can match on. The trailing lookahead
+// keeps the keyword from eating the front of `nullable`.
+null_literal = @{ "null" ~ !(ASCII_ALPHANUMERIC | "_") }
+  -> TypedExpression::Variable {
+      name: intern("None"),
+  }
+
+// `Null<T>` — the same absent value, written with the type it stands in
+// for. Needed where nothing else supplies the type: a generic handler
+// field has no context to infer from, so `var content: T = Null<T>`
+// says "no value yet" where the alternative is a meaningless `= 0`.
+typed_null_expr = { "Null" ~ "<" ~ ty:type_expr ~ ">" }
+  -> TypedExpression::Variable {
+      name: intern("None"),
+  }
 
 // Identifier - returns the text directly for use in bindings
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

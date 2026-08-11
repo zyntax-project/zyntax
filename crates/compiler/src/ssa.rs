@@ -2194,7 +2194,16 @@ impl SsaBuilder {
                         scrutinee_value: scrutinee_val,
                         discriminant_value: Some(discriminant_id),
                         union_type: Some(union_type.clone()),
-                        scrutinee_typed_ast_type: Some(match_stmt.scrutinee.ty.clone()),
+                        // Resolve rather than reading `.ty`: for a
+                        // variable scrutinee the parser leaves that as
+                        // the literal default, so `match p` on a
+                        // `p: ?Point` saw `Any`, the Some-arm binding
+                        // never learned it held a `Point`, and the first
+                        // field access on it dropped the whole function
+                        // with "Cannot access fields on non-struct type".
+                        scrutinee_typed_ast_type: Some(
+                            self.resolve_expr_type(&match_stmt.scrutinee),
+                        ),
                     });
 
                     log::debug!(
@@ -2208,7 +2217,16 @@ impl SsaBuilder {
                         scrutinee_value: scrutinee_val,
                         discriminant_value: None,
                         union_type: None,
-                        scrutinee_typed_ast_type: Some(match_stmt.scrutinee.ty.clone()),
+                        // Resolve rather than reading `.ty`: for a
+                        // variable scrutinee the parser leaves that as
+                        // the literal default, so `match p` on a
+                        // `p: ?Point` saw `Any`, the Some-arm binding
+                        // never learned it held a `Point`, and the first
+                        // field access on it dropped the whole function
+                        // with "Cannot access fields on non-struct type".
+                        scrutinee_typed_ast_type: Some(
+                            self.resolve_expr_type(&match_stmt.scrutinee),
+                        ),
                     });
                     log::debug!("[SSA] Match on non-union type: {:?}", scrutinee_hir_type);
                 }

@@ -1492,6 +1492,25 @@ impl<'g> GrammarInterpreter<'g> {
                 // spelled directly). Type resolution happens later;
                 // the parser's job ends with the structural variant.
                 if let Some(name_str) = name.resolve_global() {
+                    // `Null<T>` is the language's optional, not a nominal
+                    // type. Resolving it through the registry mints a
+                    // placeholder, and a value stored through it loses its
+                    // real type: a `Null<List<i64>>` read back as garbage,
+                    // a `Null<Point>` failing outright. `Type::Optional` is
+                    // the variant the backend lowers (a tagged union with
+                    // None=0, Some=1), which is what `?T` uses too.
+                    // `Null<T>`, `Option<T>` and the `?T` sugar are one
+                    // type. `Type::Optional` is the variant the compiler
+                    // reasons about: it is what tells a `case Some(v)`
+                    // binding that `v` is a `T`, and what the backend
+                    // lowers as a tagged union. Left as a nominal
+                    // `Named("Option")` the payload type is unrecoverable,
+                    // so `v` stays `Any` and any field access on it fails.
+                    if name_str == "Null" || name_str == "Option" {
+                        let inner = type_args.into_iter().next().unwrap_or(Type::Any);
+                        return Ok(ParsedValue::Type(Type::Optional(Box::new(inner))));
+                    }
+
                     if name_str == "Fiber" {
                         let inner = type_args.into_iter().next().unwrap_or(Type::Any);
                         return Ok(ParsedValue::Type(Type::Fiber(Box::new(inner))));
@@ -1755,6 +1774,10 @@ impl<'g> GrammarInterpreter<'g> {
                 let c = value.chars().next().unwrap_or('\0');
                 TypedLiteral::Char(c)
             }
+            // The absent value of an optional/nullable type. Carries no
+            // payload; the type comes from the annotation it initialises.
+            "Null" => TypedLiteral::Null,
+            "Unit" => TypedLiteral::Unit,
             _ => return Err(format!("unknown TypedLiteral variant: {}", variant)),
         };
 
