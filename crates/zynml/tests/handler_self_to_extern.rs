@@ -28,6 +28,14 @@ use zyntax_embed::{
 static SEEN_UNIT: Mutex<Vec<()>> = Mutex::new(Vec::new());
 static SEEN_INT: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 static SEEN_PTR: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// `SEEN_PTR` is process-wide, so a test that counts notifications has
+/// to be the only one running.
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+/// Take the process-wide lock, ignoring a previous test's panic.
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 extern "C" fn host_notify0() {
     SEEN_UNIT.lock().unwrap().push(());
@@ -171,6 +179,7 @@ def main(): i64 {{
 /// supports, and a hard failure on the first one hides the rest.
 #[test]
 fn which_extern_call_form_works_in_a_handler_body() {
+    let _guard = exclusive();
     let forms: [(&str, &str, &str); 5] = [
         ("no extern (control)", "", ""),
         (
@@ -217,6 +226,7 @@ fn which_extern_call_form_works_in_a_handler_body() {
 /// any extern involved. If this fails, nothing below means anything.
 #[test]
 fn the_handler_round_trips_without_an_extern() {
+    let _guard = exclusive();
     reset();
     assert_eq!(
         compile_and_run(&program("", "")),
@@ -228,6 +238,7 @@ fn the_handler_round_trips_without_an_extern() {
 /// A handler op body can reach a host extern at all.
 #[test]
 fn a_handler_body_can_call_a_host_extern() {
+    let _guard = exclusive();
     reset();
     let outcome = compile_and_run(&program("extern def host_notify0()", "host_notify0()"));
     assert_eq!(outcome, Ok(7), "the write still lands");
@@ -256,6 +267,7 @@ fn a_handler_body_can_call_a_host_extern() {
 /// region, which is internal and free to change.
 #[test]
 fn the_region_behind_self_is_opaque_to_the_host() {
+    let _guard = exclusive();
     reset();
     const WRITTEN: i64 = 0x1111_2222;
 
@@ -315,6 +327,7 @@ def main(): i64 {{
 /// later instance inherits them.
 #[test]
 fn sequential_scopes_may_reuse_one_address() {
+    let _guard = exclusive();
     reset();
     let src = r#"
 extern def host_notify_ptr(p: Ptr<i8>)
@@ -368,6 +381,7 @@ def main(): i64 {
 /// into the other, and each is installed around its own write.
 #[test]
 fn two_live_host_minted_instances_notify_from_distinct_addresses() {
+    let _guard = exclusive();
     reset();
     let src = r#"
 extern def host_notify_ptr(p: Ptr<i8>)

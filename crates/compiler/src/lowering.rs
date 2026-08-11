@@ -2217,7 +2217,16 @@ impl LoweringContext {
 
         // Create HIR function
         let mut hir_func = HirFunction::new(func.name, signature);
-        hir_func.id = *self.symbols.functions.get(&func.name).unwrap();
+        hir_func.id = match self.symbols.functions.get(&func.name) {
+            Some(&id) => id,
+            None => {
+                return Err(crate::CompilerError::Lowering(format!(
+                    "function `{}` reached lowering without a collected symbol; \
+                     it was added to the program after declaration collection ran",
+                    func.name.resolve_global().unwrap_or_default()
+                )))
+            }
+        };
 
         // Set function attributes
         self.set_function_attributes(&mut hir_func, func);

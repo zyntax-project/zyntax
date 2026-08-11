@@ -140,14 +140,11 @@ fn payload_bindings_learn_their_type() {
     );
 }
 
-/// A list payload does not work, for a reason that has nothing to do
-/// with optionals: annotating a list at all is broken. `let xs = [..]`
-/// indexes correctly, `let xs: List<i64> = [..]` returns two elements
-/// packed into one word, the same width signature as an integer literal
-/// stored into a wider slot. Verified pre-existing by stashing the
-/// optional work and re-running.
+/// A list payload, which needed the annotated-list fix as well: a
+/// literal types itself from its elements, so `[10, 20, 30]` is a list
+/// of i32 and a `List<i64>` binding laid it out four bytes apart while
+/// reading it back eight at a time.
 #[test]
-#[ignore = "pre-existing: `let xs: List<i64> = [..]` mis-reads; unrelated to optionals"]
 fn an_annotated_list_indexes_correctly() {
     assert_eq!(
         run(

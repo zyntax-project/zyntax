@@ -126,6 +126,38 @@ fn hir_ty_size(ty: &HirType) -> usize {
     }
 }
 
+/// Whether a declared list element type may override what the literal
+/// infers about itself. An integer literal types as i32 and a float
+/// literal as f64, so the annotation is what says how wide the slots
+/// really are, but it may only say so within one class of scalar: a
+/// `List<Body>` annotation over float elements describes a different
+/// layout rather than a wider one, and following it would store the
+/// elements under a size they do not have.
+fn elem_layouts_agree(declared: &Type, inferred: &Type) -> bool {
+    use zyntax_typed_ast::PrimitiveType as P;
+    let class = |t: &Type| match t {
+        Type::Primitive(p) => match p {
+            P::I8 | P::I16 | P::I32 | P::I64 | P::I128 | P::ISize => Some("int"),
+            P::U8 | P::U16 | P::U32 | P::U64 | P::U128 | P::USize => Some("uint"),
+            P::F32 | P::F64 => Some("float"),
+            P::Bool => Some("bool"),
+            P::Char => Some("char"),
+            P::String => Some("string"),
+            P::Unit => Some("unit"),
+        },
+        _ => None,
+    };
+    if matches!(inferred, Type::Any | Type::Unknown | Type::Never) {
+        return true;
+    }
+    match (class(declared), class(inferred)) {
+        // Signed and unsigned share a layout, and a literal carries no
+        // sign of its own, so an annotation may pick either.
+        (Some(a), Some(b)) => a == b || matches!((a, b), ("int", "uint") | ("uint", "int")),
+        _ => declared == inferred,
+    }
+}
+
 /// Map a scalar type name (`i8`, `u32`, `f64`, …) to its `HirType`. Used
 /// to read the element type named in a typed memory intrinsic.
 fn scalar_hir_type(name: &str) -> Option<HirType> {
@@ -186,6 +218,14 @@ pub struct SsaBuilder {
     idf_placement_done: bool,
     /// Current match context (scrutinee and discriminant for pattern matching)
     match_context: Option<MatchContext>,
+    /// Element type a list/array literal is being assigned INTO.
+    ///
+    /// A literal types itself from its elements, so `[10, 20, 30]` is a
+    /// list of i32 whatever it is being stored in. Left at that, a
+    /// `let xs: List<i64>` lays the data out with a 4-byte stride and
+    /// then reads it back 8 bytes at a time. The annotation is the
+    /// authority, so the binding pushes it down here.
+    expected_elem_ty: Option<Type>,
     /// Continuation block for control flow expressions (if/match)
     /// When set, indicates that control flow has branched and this is the merge/end block
     continuation_block: Option<HirId>,
@@ -600,6 +640,7 @@ impl SsaBuilder {
             variable_writes: IndexMap::new(),
             idf_placement_done: false,
             match_context: None,
+            expected_elem_ty: None,
             continuation_block: None,
             original_return_type: None,
             address_taken_vars: HashSet::new(),
@@ -645,6 +686,7 @@ impl SsaBuilder {
             variable_writes: IndexMap::new(),
             idf_placement_done: false,
             match_context: None,
+            expected_elem_ty: None,
             continuation_block: None,
             original_return_type: None,
             address_taken_vars: HashSet::new(),
@@ -1492,6 +1534,39 @@ impl SsaBuilder {
         Ok(())
     }
 
+    /// Element type a declared list/array type carries, when it is
+    /// concrete.
+    ///
+    /// Accepts both shapes the front-end produces: a raw `Type::Array`
+    /// and the `List<T>` / `Array<T>` spelling that resolves to a
+    /// `Type::Named` naming the prelude type.
+    fn declared_element_type(&self, ty: &Type) -> Option<Type> {
+        let concrete = |t: &Type| {
+            if matches!(t, Type::Any | Type::Unknown) {
+                None
+            } else {
+                Some(t.clone())
+            }
+        };
+        match ty {
+            Type::Array { element_type, .. } => concrete(element_type),
+            Type::Optional(inner) => self.declared_element_type(inner),
+            Type::Named { id, type_args, .. } if !type_args.is_empty() => {
+                let n = self
+                    .type_registry
+                    .get_type_by_id(*id)?
+                    .name
+                    .resolve_global()?;
+                if n == "List" || n == "Array" {
+                    concrete(&type_args[0])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Recursively extract bindings from struct/tuple patterns.
     /// `aggregate` is the HIR value being matched against `pattern`.
     /// `aggregate_ty` is the value's TypedAST type (if known) — used to record
@@ -2024,7 +2099,14 @@ impl SsaBuilder {
             TypedStatement::Let(let_stmt) => {
                 // Evaluate the initializer if present
                 if let Some(value) = &let_stmt.initializer {
-                    let value_id = self.translate_expression(block_id, value)?;
+                    // A list literal types itself from its elements, so
+                    // the annotation has to reach it before it decides
+                    // its layout. See `expected_elem_ty`.
+                    let saved_expected = self.expected_elem_ty.take();
+                    self.expected_elem_ty = self.declared_element_type(&let_stmt.ty);
+                    let translated = self.translate_expression(block_id, value);
+                    self.expected_elem_ty = saved_expected;
+                    let value_id = translated?;
 
                     // Check if a try expression set a continuation block
                     // If so, subsequent writes should go to that block
@@ -5565,7 +5647,12 @@ impl SsaBuilder {
                 // this the alloca below is `[i64; n]` regardless of the
                 // actual element type, and storing `Body` struct values
                 // into i64 slots produces a verifier panic in Cranelift.
-                let resolved_elem_ty = match &expr.ty {
+                // What the literal is being stored INTO wins over what it
+                // infers about itself. `[10, 20, 30]` is a list of i32
+                // whatever it is assigned to, so a `List<i64>` binding
+                // would otherwise lay the data out four bytes apart and
+                // read it back eight at a time.
+                let inferred_elem_ty = match &expr.ty {
                     Type::Array { element_type, .. }
                         if !matches!(**element_type, Type::Any | Type::Unknown) =>
                     {
@@ -5578,6 +5665,14 @@ impl SsaBuilder {
                             Type::Any
                         }
                     }
+                };
+                // The binding only wins where the two agree on what kind of
+                // scalar this is, so a widening annotation is honoured while
+                // a mismatched one falls back to what the elements say
+                // rather than laying them out under the wrong layout.
+                let resolved_elem_ty = match self.expected_elem_ty.clone() {
+                    Some(expected) if elem_layouts_agree(&expected, &inferred_elem_ty) => expected,
+                    _ => inferred_elem_ty,
                 };
                 let elem_ty = self.convert_type(&resolved_elem_ty);
                 let elem_ty = if matches!(elem_ty, HirType::Void) {
@@ -5706,6 +5801,11 @@ impl SsaBuilder {
                         },
                     );
 
+                    // The slot is as wide as `elem_ty`, which an
+                    // annotation may have widened past what the literal
+                    // types itself as, so the value has to reach that
+                    // width before it is written.
+                    let elem_val = self.coerce_scalar_to(block_id, elem_val, &elem_ty);
                     self.add_instruction(
                         block_id,
                         HirInstruction::Store {
@@ -5990,6 +6090,41 @@ impl SsaBuilder {
                         method_call.receiver.ty.clone()
                     };
 
+                // A receiver the parser left untyped still has a type
+                // the registry knows: `h.cell.get()` reads `cell`'s
+                // declared type off `Holder`. Without this the method
+                // is unresolvable and the whole function is dropped.
+                let receiver_type = if matches!(receiver_type, Type::Unknown | Type::Any) {
+                    self.resolve_expr_type(&method_call.receiver)
+                } else {
+                    receiver_type
+                };
+
+                // `SignalCell.init()` names a type where a value would
+                // go, which is a static call: the receiver is the type
+                // itself and there is no `self` argument to pass. Only
+                // considered once every value-shaped reading has come
+                // back unknown, so a local named like a type still wins.
+                let static_receiver = if matches!(receiver_type, Type::Unknown | Type::Any) {
+                    match &method_call.receiver.node {
+                        TypedExpression::Variable(name) => self
+                            .type_registry
+                            .get_type_by_name(*name)
+                            .map(|def| Type::Named {
+                                id: def.id,
+                                type_args: vec![],
+                                const_args: vec![],
+                                variance: vec![],
+                                nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+                            }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let is_static = static_receiver.is_some();
+                let receiver_type = static_receiver.unwrap_or(receiver_type);
+
                 // Built-in trait interception. Receivers whose type
                 // is a compiler-known first-class variant
                 // (e.g. `Type::Fiber(_)`) have their methods
@@ -6011,10 +6146,13 @@ impl SsaBuilder {
                 let mangled_name =
                     self.resolve_method_to_function(&receiver_type, method_call.method)?;
 
-                // Translate receiver and arguments
-                let receiver_val = self.translate_expression(block_id, &method_call.receiver)?;
-
-                let mut arg_vals = vec![receiver_val];
+                // Translate receiver and arguments. A static call's
+                // receiver is a type name, which has no value to pass.
+                let mut arg_vals = if is_static {
+                    vec![]
+                } else {
+                    vec![self.translate_expression(block_id, &method_call.receiver)?]
+                };
                 for arg in &method_call.positional_args {
                     let arg_val = self.translate_expression(block_id, arg)?;
                     arg_vals.push(arg_val);
@@ -8181,6 +8319,27 @@ impl SsaBuilder {
                         }
                     }
                 }
+            }
+        }
+
+        // The same `extern struct` reaches here as `Type::Extern` when
+        // it is spelled in a signature and as `Type::Named` when it is
+        // read back off a field, and only the former carries its impl
+        // methods. Accept the inherent name for the latter on the same
+        // terms: a function or extern by that name has to exist.
+        if let Some(ref type_name) = type_name_for_match {
+            let method_name_str = self
+                .arena
+                .lock()
+                .unwrap()
+                .resolve_string(method_name)
+                .unwrap_or_default();
+            let base = type_name.strip_prefix('$').unwrap_or(type_name);
+            let inherent = InternedString::new_global(&format!("{}${}", base, method_name_str));
+            if self.function_symbols.contains_key(&inherent)
+                || self.extern_link_names.contains_key(&inherent)
+            {
+                return Ok(inherent);
             }
         }
 

@@ -1,19 +1,37 @@
 //! Rewrite: TypedDeclaration::EffectHandler → functions + vtable variable
 
 use pattern_engine::{Bindings, DeclRewrite, Pattern, Priority, RewriteOutput};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
 
 pub fn handler_decl_to_impl() -> DeclRewrite {
+    // The rewrite keeps the handler declaration it matched, so the
+    // pattern would match it again on the next fixpoint iteration and
+    // emit another copy of every op function. Record which handlers
+    // have been expanded so the second visit stops matching, the way
+    // `extract_effect_annotations` reads its own output.
+    let expanded: Arc<Mutex<HashSet<InternedString>>> = Arc::default();
+    let seen = Arc::clone(&expanded);
     DeclRewrite::new(
         "handler_decl_to_impl",
         Priority::SEMANTIC,
-        Pattern::new("handler_decl", |node, _ctx| {
-            matches!(&node.node, TypedDeclaration::EffectHandler(_)).then(Bindings::new)
+        Pattern::new("handler_decl", move |node, _ctx| match &node.node {
+            TypedDeclaration::EffectHandler(h) => {
+                let already = seen.lock().map(|s| s.contains(&h.name)).unwrap_or(false);
+                (!already).then(Bindings::new)
+            }
+            _ => None,
         }),
-        |matched, _bindings, _builder| {
+        move |matched, _bindings, _builder| {
             if let TypedDeclaration::EffectHandler(handler) = &matched.node {
+                if let Ok(mut s) = expanded.lock() {
+                    if !s.insert(handler.name) {
+                        return RewriteOutput::Unchanged;
+                    }
+                }
                 let declarations = build_handler_declarations(handler);
                 // Phase H, M1: KEEP the EffectHandler declaration so
                 // `LoweringContext::lower_effect_handler` can build

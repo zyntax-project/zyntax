@@ -1,19 +1,35 @@
 //! Rewrite: TypedDeclaration::Effect → Class(OpTable)
 
 use pattern_engine::{Bindings, DeclRewrite, Pattern, Priority, RewriteOutput};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use zyntax_typed_ast::type_registry::{Mutability, PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::InternedString;
 
 pub fn effect_decl_to_vtable() -> DeclRewrite {
+    // Keeping the matched Effect declaration means the pattern matches
+    // it again next iteration, so the op-table class would be emitted
+    // once per fixpoint iteration. Record what has been built.
+    let built: Arc<Mutex<HashSet<InternedString>>> = Arc::default();
+    let seen = Arc::clone(&built);
     DeclRewrite::new(
         "effect_decl_to_vtable",
         Priority::SEMANTIC,
-        Pattern::new("effect_decl", |node, _ctx| {
-            matches!(&node.node, TypedDeclaration::Effect(_)).then(Bindings::new)
+        Pattern::new("effect_decl", move |node, _ctx| match &node.node {
+            TypedDeclaration::Effect(e) => {
+                let already = seen.lock().map(|s| s.contains(&e.name)).unwrap_or(false);
+                (!already).then(Bindings::new)
+            }
+            _ => None,
         }),
-        |matched, _bindings, _builder| {
+        move |matched, _bindings, _builder| {
             if let TypedDeclaration::Effect(effect) = &matched.node {
+                if let Ok(mut s) = built.lock() {
+                    if !s.insert(effect.name) {
+                        return RewriteOutput::Unchanged;
+                    }
+                }
                 let op_table = build_op_table(effect);
                 // Phase H, M1: KEEP the Effect declaration alongside
                 // the generated Class$OpTable. Downstream lowering
