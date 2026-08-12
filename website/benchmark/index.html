@@ -439,9 +439,12 @@
       875 × 500 / max_iter 1000 (reference checksum 112 798 515), n-body is
       the five-body solar system over 20 × 500 000 = 10 M advance steps
       returning <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">Std.int(energy · 1 000 000)</code>, fib is the naive recursive
-      <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">fib(40) = 102 334 155</code>. The page exposes where the runtime needs
-      work; source lives at
-      <a href="https://github.com/zyntax-project/zyntax/tree/main/crates/zynml/examples">crates/zynml/examples</a>.
+      <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">fib(40) = 102 334 155</code>. Two rows share the fib source and differ
+      only in pipeline: the second compiles with cross-branch pure-call
+      PRE off, so what that pass is worth on a recursive call tree is a
+      published number rather than a claim. The page exposes where the
+      runtime needs work; source lives at
+      <a href="https://github.com/zyntax-project/zyntax/tree/main/crates/zynml/benchmarks">crates/zynml/benchmarks</a>.
     </p>
   </header>
 
@@ -514,6 +517,7 @@
       nbody: 'N-body · value-type Body',
       nbody_ref: 'N-body · @reference Body',
       fib: 'Recursive Fibonacci',
+      fib_no_pure_call_pre: 'Recursive Fibonacci · no pure-call PRE',
       inlined_call: 'Inlined Call',
       free_function_call: 'Free Function Call',
       method_call: 'Method Call',
@@ -524,6 +528,7 @@
       'nbody',
       'nbody_ref',
       'fib',
+      'fib_no_pure_call_pre',
       'inlined_call',
       'free_function_call',
       'method_call',

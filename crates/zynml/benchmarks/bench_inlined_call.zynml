@@ -1,19 +1,26 @@
-// Inlined-call baseline for the method-call latency microbench.
+// Inlined baseline for the call-latency pair.
 //
-// Same arithmetic as `bench_method_call.zynml` but spelled directly
-// inline — no method dispatch, no function entry/exit. The
-// wall-clock delta between this kernel and `bench_method_call`
-// quantifies our per-call dispatch overhead at the JIT tier.
+// Same arithmetic as `bench_free_function_call.zynml`, spelled
+// directly in the loop body. The wall-clock delta between the two
+// kernels is what a call costs once every pass that can remove one
+// has run, so a delta near zero is a result about the pipeline rather
+// than a broken measurement.
 //
-// Returns sum after 100M iterations.
+// The accumulator steps by `i % 8` rather than by a constant. A
+// constant step makes the loop an affine recurrence with a closed
+// form, and the earlier version of this kernel (`sum = sum * 1.0 +
+// 1.0`) was folded away entirely: it published 0.000166 ms for a
+// hundred million iterations, which is not a measurement of anything.
+//
+// Returns the sum of `i % 8` over 100M iterations: each run of 8
+// contributes 28, so 12.5M runs give 350000000.
 
 def main(): i64 {
-    let factor: f64 = 1.0
-    let mut sum: f64 = 0.0
+    let mut sum: i64 = 0
     let mut i: i64 = 0
     while i < 100000000 {
-        sum = sum * factor + 1.0
+        sum = sum + (i % 8)
         i = i + 1
     }
-    return sum as i64
+    return sum
 }

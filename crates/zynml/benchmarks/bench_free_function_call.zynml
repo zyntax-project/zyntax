@@ -1,24 +1,29 @@
-// Free-function call latency microbench.
+// Free-function call latency, against the inlined baseline in
+// `bench_inlined_call.zynml`.
 //
-// Tracks the same arithmetic as `bench_method_call.zynml` but calls
-// a top-level `def` instead of a method on a struct. Lets us split
-// the dispatch tax into two components by comparing against
-// `bench_inlined_call.zynml` (baseline) and `bench_method_call`
-// (method dispatch on top of plain call entry/exit).
+// The loop body is one call to a top-level `def` doing arithmetic the
+// baseline does inline, so the delta between the two kernels is the
+// per-call cost that survives the pipeline. `step` is small and pure,
+// which is exactly what the inliner takes, so the delta is expected to
+// be near zero: the number says the call was removed, not that calls
+// are free.
 //
-// Returns sum after 100M iterations.
+// The accumulator steps by `i % 8` for the reason the baseline gives:
+// a constant step leaves an affine recurrence the pipeline folds to a
+// closed form, and both kernels then measure nothing.
+//
+// Returns the same 350000000 the baseline does.
 
-def step(x: f64, factor: f64): f64 {
-    return x * factor + 1.0
+def step(acc: i64, i: i64): i64 {
+    return acc + (i % 8)
 }
 
 def main(): i64 {
-    let factor: f64 = 1.0
-    let mut sum: f64 = 0.0
+    let mut sum: i64 = 0
     let mut i: i64 = 0
     while i < 100000000 {
-        sum = step(sum, factor)
+        sum = step(sum, i)
         i = i + 1
     }
-    return sum as i64
+    return sum
 }

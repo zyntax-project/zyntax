@@ -184,28 +184,95 @@ struct Meta {
 /// recursive-inline pass landed broken) still reports a "green"
 /// CI workflow because the bench harness records the value but
 /// never validates it.
-const KERNELS: &[(&str, &str)] = &[
-    ("bench_mandelbrot", "Int(112789639)"),
-    ("bench_nbody", "Int(-169077)"),
-    ("bench_nbody_ref", "Int(-169077)"),
-    ("bench_fib", "Int(102334155)"),
-    ("bench_inlined_call", "Int(100000000)"),
-    ("bench_free_function_call", "Int(100000000)"),
+const KERNELS: &[Kernel] = &[
+    Kernel::new("bench_mandelbrot", "Int(112789639)"),
+    Kernel::new("bench_nbody", "Int(-169077)"),
+    Kernel::new("bench_nbody_ref", "Int(-169077)"),
+    Kernel::new("bench_fib", "Int(102334155)"),
+    // Same source as `bench_fib`, compiled with pure-call PRE off.
+    //
+    // With the pass on, recursive self-inlining plus the cross-branch
+    // hoist collapses most of the call tree, so the kernel stops
+    // measuring the call dispatch it exists to measure. Publishing both
+    // rows keeps the dispatch number visible and makes what the pass is
+    // worth a number rather than a claim.
+    Kernel::new("bench_fib", "Int(102334155)")
+        .published_as("fib_no_pure_call_pre")
+        .without_pure_call_pre(),
+    Kernel::new("bench_inlined_call", "Int(350000000)"),
+    Kernel::new("bench_free_function_call", "Int(350000000)"),
     // diagnostic-only — kept out of CI publish surface but used for
     // tracing operator-overload lowering. Expected: a + b * 10M with
     // a=(1,2,3), b=(4,5,6) → acc = (50000000, 70000000, 90000000)
     // → sum 210000000.
-    ("bench_op_overload", "Int(210000000)"),
-    ("bench_op_overload_ref", "Int(21000000)"),
-    ("bench_any_field", "Int(1500000)"),
-    ("bench_any_cast", "Int(2500000)"),
+    Kernel::new("bench_op_overload", "Int(210000000)"),
+    Kernel::new("bench_op_overload_ref", "Int(21000000)"),
+    Kernel::new("bench_any_field", "Int(1500000)"),
+    Kernel::new("bench_any_cast", "Int(2500000)"),
     // Branch-heavy, data-dependent kernels. The others are numeric loops
     // that the HIR passes reshape before Cranelift sees them, which hides
     // what Cranelift's own optimizer contributes; these two do not give
     // LICM, auto-vectorization or SROA anything to work with.
-    ("bench_collatz", "Int(35669673)"),
-    ("bench_branchy", "Int(140)"),
+    Kernel::new("bench_collatz", "Int(35669673)"),
+    Kernel::new("bench_branchy", "Int(140)"),
 ];
+
+/// One published measurement: a source file plus the pipeline it is
+/// compiled with.
+///
+/// Two entries may name the same source and differ only in pipeline,
+/// which is how an optimisation's contribution becomes a published
+/// number instead of an assertion. They must share the source for the
+/// comparison to mean anything, so the source is named once and the
+/// row is renamed instead.
+#[derive(Debug, Clone, Copy)]
+struct Kernel {
+    /// Source file stem under `benchmarks/`.
+    source: &'static str,
+    /// Row name in the JSON, defaulting to `source` without its
+    /// `bench_` prefix.
+    published_as: Option<&'static str>,
+    /// The value `main` must return on every tier.
+    expected: &'static str,
+    /// Whether cross-branch pure-call PRE runs for this row.
+    pure_call_pre: bool,
+}
+
+impl Kernel {
+    const fn new(source: &'static str, expected: &'static str) -> Self {
+        Self {
+            source,
+            published_as: None,
+            expected,
+            pure_call_pre: true,
+        }
+    }
+
+    /// Publish under a different name, for a second pipeline over the
+    /// same source.
+    const fn published_as(mut self, name: &'static str) -> Self {
+        self.published_as = Some(name);
+        self
+    }
+
+    /// Compile this row with cross-branch pure-call PRE off.
+    const fn without_pure_call_pre(mut self) -> Self {
+        self.pure_call_pre = false;
+        self
+    }
+
+    /// The source's own name, with the `bench_` prefix stripped. Shared
+    /// by every row over that source.
+    fn source_name(&self) -> &'static str {
+        self.source.strip_prefix("bench_").unwrap_or(self.source)
+    }
+
+    /// The name this row is published and filtered under.
+    fn name(&self) -> &'static str {
+        self.published_as
+            .unwrap_or_else(|| self.source.strip_prefix("bench_").unwrap_or(self.source))
+    }
+}
 
 /// Each target produces one [`TargetResult`] per kernel.
 const TARGETS: &[Target] = &[
@@ -448,8 +515,13 @@ fn main() {
 
     let mut value_mismatches: Vec<String> = Vec::new();
 
-    for (kernel, expected) in KERNELS {
-        let pretty = kernel.strip_prefix("bench_").unwrap_or(kernel);
+    for kernel_spec in KERNELS {
+        let pretty = kernel_spec.name();
+        let kernel = kernel_spec.source;
+        let expected = &kernel_spec.expected;
+        // Each row states the pipeline it wants, so a row that opts out
+        // of a pass cannot leak that choice into the next one.
+        zyntax_compiler::pure_call_pre::set_enabled(Some(kernel_spec.pure_call_pre));
         if let Some(f) = &kernel_filter {
             // Exact-match against the stripped kernel name. Substring
             // was the old default; it silently matched `nbody` against
@@ -458,7 +530,9 @@ fn main() {
             // nbody on the same runner — and the published number was
             // the thermally-throttled second pass (~100 ms worse than
             // the dedicated job).
-            if pretty != f.as_str() {
+            // Comma-separated so two rows over one source can be
+            // compared in a single process.
+            if !f.split(',').any(|want| want.trim() == pretty) {
                 continue;
             }
         }
@@ -475,7 +549,10 @@ fn main() {
                     continue;
                 }
             }
-            if target.skip_kernels.contains(&pretty) {
+            // Opt-outs are keyed by the source, since what makes a
+            // kernel too slow for a tier is what it computes, not which
+            // pipeline row is measuring it.
+            if target.skip_kernels.contains(&kernel_spec.source_name()) {
                 eprintln!("    {:<22} SKIPPED (per-target opt-out)", target.key);
                 per_kernel.insert(target.key.to_string(), skipped_result());
                 continue;
@@ -518,6 +595,7 @@ fn main() {
         }
         suite.kernels.insert(pretty.to_string(), per_kernel);
     }
+    zyntax_compiler::pure_call_pre::set_enabled(None);
 
     // Make sure the output directory exists. `mkdir -p` shape so
     // a fresh checkout can write into `website/benchmark/` without

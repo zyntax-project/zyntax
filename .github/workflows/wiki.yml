@@ -93,6 +93,10 @@ jobs:
           - nbody
           - nbody_ref
           - fib
+          # Same source as `fib` with cross-branch pure-call PRE off.
+          # The pair is what makes the pass's contribution a published
+          # number rather than a claim.
+          - fib_no_pure_call_pre
           - inlined_call
           - free_function_call
     steps:

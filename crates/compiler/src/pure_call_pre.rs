@@ -32,7 +32,8 @@
 //! * **Availability.** The hoist target dominates both sites, so the
 //!   hoisted result is defined on every path that reaches either site.
 //!
-//! Turned off with `ZYNTAX_DISABLE_PURE_CALL_PRE=1` for A/B measurement.
+//! Turned off with `ZYNTAX_DISABLE_PURE_CALL_PRE=1`, or per-process
+//! through [`set_enabled`], for A/B measurement.
 
 use crate::analysis::DominatorTree;
 use crate::hir::{
@@ -40,6 +41,7 @@ use crate::hir::{
     HirValue, HirValueKind,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -50,13 +52,41 @@ pub struct PureCallPreStats {
     pub groups_visited: usize,
 }
 
+/// Whether the pass is on. `0` defers to the environment, `1` forces it
+/// on and `2` forces it off, so a caller compiling the same source both
+/// ways in one process does not have to mutate the environment.
+static OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Force the pass on or off for subsequent compiles on any thread, or
+/// pass `None` to go back to reading the environment.
+///
+/// Measuring what the pass is worth means compiling one source with it
+/// and without it, which an environment variable alone cannot express
+/// inside a single process.
+pub fn set_enabled(enabled: Option<bool>) {
+    let value = match enabled {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+/// Whether the next `run_module` will do anything.
+pub fn is_enabled() -> bool {
+    match OVERRIDE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => !std::env::var("ZYNTAX_DISABLE_PURE_CALL_PRE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+    }
+}
+
 /// Run the hoist over every function. Purity + speculation-safety are
 /// recomputed from `signature.is_pure`, so run [`crate::purity`] first.
 pub fn run_module(module: &mut HirModule) -> PureCallPreStats {
-    if std::env::var("ZYNTAX_DISABLE_PURE_CALL_PRE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if !is_enabled() {
         return PureCallPreStats::default();
     }
     let safe = crate::purity::speculation_safe_module(module);
