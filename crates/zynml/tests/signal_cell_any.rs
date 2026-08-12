@@ -1,10 +1,10 @@
 //! Host-owned signal storage that holds a value of ANY type.
 //!
-//! The earlier shape in `extern_struct_handler_storage.rs` needed
-//! `SignalCell<T>` plus a generic impl, which put it behind a lowering
-//! panic and, worse, would have needed one host function per element
-//! type — impossible for user-declared structs, since the emitter
-//! cannot know the closed set.
+//! The generic shape in `extern_struct_handler_storage.rs` needs a
+//! `SignalCell<T>` whose methods monomorphise per element type. That
+//! works, but it leaves the host registering symbols against a set of
+//! types the emitter cannot know: a signal can hold a user-declared
+//! struct, so the set is open.
 //!
 //! `Any` removes the generic entirely. A value crossing into an `Any`
 //! parameter is auto-boxed into a ZRTL `DynamicBox`, which is
@@ -160,15 +160,19 @@ extern def blinc_signal_cell_get(c: SignalCell): Any
 extern def blinc_signal_cell_set(c: SignalCell, v: Any)
 "#;
 
-/// What actually reaches the host for each way of getting a value into
-/// an `Any` parameter.
+/// What reaches the host for each way of getting a value into an
+/// `Any` parameter. All three box; the tags differ, and that is the
+/// point.
 ///
-/// Passing a concrete value straight to an `Any` parameter does NOT
-/// box it — the raw scalar arrives, which the host sees as an
-/// implausible pointer. Boxing is driven by a classified cast
-/// (`UpcastBox`, `ssa.rs`), so the question is which source construct
-/// produces one. Reported as (tag, size): a real box has a non-zero
-/// tag, an unboxed value shows tag 0 and the raw value in `size`.
+/// A bare literal boxes as i32 (`tag=0x302, size=4`) while a value
+/// bound as `let v: i64` boxes as i64 (`tag=0x402, size=8`), because
+/// the literal takes the default integer type. An emitter should
+/// therefore type its bindings rather than let a literal decide the
+/// element type of a signal.
+///
+/// Reported as (tag, size) rather than asserted on an exact tag: an
+/// unboxed value would show tag 0 with the raw value in `size`, which
+/// is the failure this distinguishes.
 #[test]
 fn which_construct_actually_boxes_into_an_any_parameter() {
     let rows: [(&str, String); 3] = [

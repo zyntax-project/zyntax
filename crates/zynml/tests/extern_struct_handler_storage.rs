@@ -323,15 +323,16 @@ fn try_compile(src: &str) -> Result<(), String> {
     }
 }
 
-/// Extern-struct method calls compile from a plain function but not
-/// from a handler, or the other way round, or it is the generics.
+/// Extern-struct methods resolve from every caller, generic or not.
 ///
 /// Four sources varying two axes: whether the struct and its impl are
 /// generic, and whether the caller is a plain function or a handler
-/// field plus handler ops. The failing cell names the construct that
-/// needs fixing upstream.
+/// field plus handler ops. Handler ops are synthesized functions with
+/// their own implicit `self`, so a method call on a FIELD inside one
+/// resolves a receiver that the plain-function case never exercises —
+/// which is why the handler column is worth keeping separate.
 #[test]
-fn where_extern_struct_methods_stop_working() {
+fn extern_struct_methods_resolve_from_plain_fns_and_handlers_alike() {
     let _guard = exclusive();
     let concrete_decl = r#"
 extern struct SignalCell
@@ -446,11 +447,16 @@ handler MintedSignalI64 for SignalI64 {
     println!("BARE-EXTERN-FNS -> {:?}", try_compile(src));
 }
 
-/// Within a handler, which of the two uses of an impl method trips it:
-/// initialising the field with a static method, or calling an instance
-/// method from an op body. The previous row did both at once.
+/// Both ways a handler reaches an impl method work, separately and
+/// together: a static method in the field initialiser, and an instance
+/// method called on that field from an op body.
+///
+/// Kept as two axes rather than one combined case because they resolve
+/// differently — the initialiser runs in the synthesized constructor
+/// while the instance call runs in an op body, and only the latter has
+/// to distinguish the handler's own `self` from the field's receiver.
 #[test]
-fn which_handler_use_of_an_impl_method_trips_lowering() {
+fn a_handler_reaches_impl_methods_from_both_the_initialiser_and_op_bodies() {
     let _guard = exclusive();
     let decl = r#"
 extern struct SignalCell
