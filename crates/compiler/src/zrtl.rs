@@ -1559,6 +1559,70 @@ pub unsafe extern "C" fn zyntax_box_bool(value: i32) -> *mut DynamicBoxRepr {
     Box::into_raw(boxed)
 }
 
+/// Width of the length header `zyntax_box_opaque` puts in front of its
+/// payload, and the alignment the payload therefore gets.
+const OPAQUE_BOX_HEADER: usize = 8;
+
+/// Create a DynamicBox holding a copy of `size` bytes read from `data`.
+///
+/// The scalar constructors each know the shape they box. This one does
+/// not: it takes the bytes and the size, which is what lets a value of
+/// a type declared in source (a struct the runtime has no Rust twin
+/// for) cross into an `Any` slot. The copy is owned by the box, so the
+/// original may be a stack slot that goes out of scope.
+///
+/// # Safety
+/// `data` must point to at least `size` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_opaque(
+    data: *const u8,
+    size: u32,
+    tag: u32,
+) -> *mut DynamicBoxRepr {
+    if data.is_null() || size == 0 {
+        return std::ptr::null_mut();
+    }
+    // The dropper is handed the payload pointer and nothing else, so
+    // the allocation carries its own length in a header. The header is
+    // one max-align word wide, which also leaves the payload aligned
+    // for whatever the boxed type needs.
+    let Ok(layout) =
+        std::alloc::Layout::from_size_align(OPAQUE_BOX_HEADER + size as usize, OPAQUE_BOX_HEADER)
+    else {
+        return std::ptr::null_mut();
+    };
+    let base = std::alloc::alloc(layout);
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    (base as *mut u64).write(size as u64);
+    let copied = base.add(OPAQUE_BOX_HEADER);
+    std::ptr::copy_nonoverlapping(data, copied, size as usize);
+    Box::into_raw(Box::new(DynamicBoxRepr {
+        tag,
+        size,
+        data: copied,
+        dropper: Some(drop_box_opaque),
+        display_fn: None,
+    }))
+}
+
+/// Borrow the bytes a `zyntax_box_opaque` box holds.
+///
+/// The pointer stays owned by the box, so it is valid until the box is
+/// freed, and reading a struct back out of an `Any` is a field read
+/// through it rather than a copy.
+///
+/// # Safety
+/// `boxed` must be null or a live box.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_get_opaque(boxed: *const DynamicBoxRepr) -> *mut u8 {
+    if boxed.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*boxed).data
+}
+
 /// Free a DynamicBox created by zyntax_box_* functions
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_free(boxed: *mut DynamicBoxRepr) {
@@ -1674,6 +1738,23 @@ extern "C" fn drop_box_i64(ptr: *mut u8) {
     }
 }
 
+/// Free a `zyntax_box_opaque` payload, reading the length back out of
+/// the header that sits in front of it.
+extern "C" fn drop_box_opaque(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let base = ptr.sub(OPAQUE_BOX_HEADER);
+        let size = (base as *const u64).read() as usize;
+        if let Ok(layout) =
+            std::alloc::Layout::from_size_align(OPAQUE_BOX_HEADER + size, OPAQUE_BOX_HEADER)
+        {
+            std::alloc::dealloc(base, layout);
+        }
+    }
+}
+
 extern "C" fn drop_box_f32(ptr: *mut u8) {
     unsafe {
         let _ = Box::from_raw(ptr as *mut f32);
@@ -1777,6 +1858,12 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("zyntax_box_f32", zyntax_box_f32 as *const u8, 1),
         ("zyntax_box_f64", zyntax_box_f64 as *const u8, 1),
         ("zyntax_box_bool", zyntax_box_bool as *const u8, 1),
+        ("zyntax_box_opaque", zyntax_box_opaque as *const u8, 3),
+        (
+            "zyntax_box_get_opaque",
+            zyntax_box_get_opaque as *const u8,
+            1,
+        ),
         ("zyntax_box_free", zyntax_box_free as *const u8, 1),
         ("zyntax_box_get_i32", zyntax_box_get_i32 as *const u8, 1),
         ("zyntax_box_get_i64", zyntax_box_get_i64 as *const u8, 1),

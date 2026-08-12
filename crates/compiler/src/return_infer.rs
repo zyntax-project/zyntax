@@ -1,10 +1,11 @@
 //! Return types for declarations that don't state one.
 //!
 //! `def f(x) { ... }` has no return annotation, and the parser records
-//! that absence as `Type::Any` — the same placeholder an unannotated `let`
-//! carries. `Unit` means something different and narrower: the function
-//! returns no value. Keeping the two apart is what lets the return type
-//! come from the body instead of from a guess.
+//! that absence as `Type::Unknown`. Two neighbouring types mean
+//! something narrower: `Unit` says the function returns no value, and
+//! `Any` says it returns a dynamically typed one. Keeping all three
+//! apart is what lets the return type come from the body instead of
+//! from a guess, and what lets `def f(): Any` declare a box.
 //!
 //! Both the signature the function is compiled with and the entry the
 //! call-site table records come from [`effective_return_type`], so a
@@ -53,7 +54,9 @@ pub(crate) fn infer_from_body(func_name: &str, body: &TypedBlock) -> Type {
 
 /// Whether a declaration left its return type unstated.
 pub(crate) fn is_unstated(ty: &Type) -> bool {
-    matches!(ty, Type::Any | Type::Unknown)
+    // `Any` is a stated type — it declares a dynamically typed value —
+    // so only the absence of an annotation counts as unstated.
+    matches!(ty, Type::Unknown)
 }
 
 /// The type of a body's implicit trailing-expression return, if it has

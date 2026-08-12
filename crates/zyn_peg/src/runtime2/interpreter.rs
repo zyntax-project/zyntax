@@ -1462,8 +1462,10 @@ impl<'g> GrammarInterpreter<'g> {
             "Unit" => Type::Primitive(PrimitiveType::Unit),
             // No type was written — the compiler works it out from
             // context, the same way an unannotated `let` does. Distinct
-            // from `Unit`, which states that there is no value.
-            "Inferred" => Type::Any,
+            // from `Unit`, which states that there is no value, and from
+            // `Any`, which states that the value is dynamically typed:
+            // `def f(): Any` declares a box, `def f()` declares nothing.
+            "Inferred" => Type::Unknown,
             "Named" => {
                 let name = self.get_field_as_interned("name", fields, state)?;
                 // The gradual-typing names are language types, not

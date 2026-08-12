@@ -283,6 +283,11 @@ pub struct SymbolTable {
     /// Return types for declared functions
     /// Maps function name -> return Type (for resolving call expression types in SSA)
     pub function_return_types: indexmap::IndexMap<InternedString, zyntax_typed_ast::Type>,
+    /// Declared parameter types for every function, extern included.
+    /// Maps function name -> parameter `Type`s, so a call site can
+    /// coerce each argument to what the callee declared (boxing a
+    /// concrete value passed into an `Any` parameter, for instance).
+    pub function_param_types: indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::Type>>,
     /// Names of `fiber def` functions (`signature.is_fiber == true`).
     /// SSA's Call handler consults this to detect when a call
     /// should construct a paused fiber (`FiberNew`) rather than
@@ -1726,6 +1731,10 @@ impl LoweringContext {
                     self.symbols
                         .function_return_types
                         .insert(func.name, publicly_visible_return);
+                    self.symbols.function_param_types.insert(
+                        func.name,
+                        func.params.iter().map(|p| p.ty.clone()).collect(),
+                    );
                     // Record default parameter info for functions with optional params
                     if func.params.iter().any(|p| p.default_value.is_some()) {
                         self.symbols
@@ -2356,6 +2365,7 @@ impl LoweringContext {
         .with_extern_link_names(self.symbols.extern_link_names.clone())
         .with_function_default_params(self.symbols.function_default_params.clone())
         .with_function_return_types(self.symbols.function_return_types.clone())
+        .with_function_param_types(self.symbols.function_param_types.clone())
         .with_effect_op_map(effect_op_map)
         .with_resume_param_names(resume_param_names)
         .with_param_typed_ast_types(param_typed_ast_types)
@@ -3282,6 +3292,33 @@ impl LoweringContext {
         }
     }
 
+    /// The registry entry that actually declares `id`'s layout.
+    ///
+    /// A use site can register a placeholder under a name the program
+    /// also declares, leaving two entries where only one has fields.
+    /// Returns `id` unchanged unless it names a fieldless entry that a
+    /// same-named entry with fields supersedes, so a type that is
+    /// genuinely fieldless (an `extern struct`) is left alone.
+    fn declaring_type_id(&self, id: zyntax_typed_ast::TypeId) -> zyntax_typed_ast::TypeId {
+        let Some(def) = self.type_registry.get_type_by_id(id) else {
+            return id;
+        };
+        if !def.fields.is_empty() {
+            return id;
+        }
+        let Some(name) = def.name.resolve_global() else {
+            return id;
+        };
+        self.type_registry
+            .get_all_types()
+            .find(|other| {
+                !other.fields.is_empty()
+                    && other.name.resolve_global().as_deref() == Some(name.as_str())
+            })
+            .map(|other| other.id)
+            .unwrap_or(id)
+    }
+
     fn convert_type(&self, ty: &Type) -> HirType {
         use zyntax_typed_ast::PrimitiveType;
 
@@ -3450,6 +3487,12 @@ impl LoweringContext {
                 const_args,
                 ..
             } => {
+                // A name can reach the registry twice, once as the
+                // placeholder a use site created and once as the
+                // declaration. Only the declaration carries the fields,
+                // so converting the placeholder would give a fieldless
+                // struct whose field offsets are all wrong.
+                let id = &self.declaring_type_id(*id);
                 // Look up type definition in registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
                     // `Array<T, N>` with a concrete const size lowers to a

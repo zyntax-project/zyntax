@@ -253,6 +253,9 @@ pub struct SsaBuilder {
     /// Return types for user-defined functions.
     /// Maps function name -> Type (for resolving call expression types when parser sets Unit).
     function_return_types: IndexMap<InternedString, Type>,
+    /// Declared parameter types per function, extern included, so a
+    /// call site can coerce each argument to what the callee declared.
+    function_param_types: IndexMap<InternedString, Vec<Type>>,
     /// Phase H, M1.3: effect-operation index for the enclosing
     /// function. If `self.function.signature.effects` is non-empty,
     /// the caller (LoweringContext) builds this map from the
@@ -650,6 +653,7 @@ impl SsaBuilder {
             simd_continue_block: None,
             function_default_params: IndexMap::new(),
             function_return_types: IndexMap::new(),
+            function_param_types: IndexMap::new(),
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
@@ -696,6 +700,7 @@ impl SsaBuilder {
             simd_continue_block: None,
             function_default_params: IndexMap::new(),
             function_return_types: IndexMap::new(),
+            function_param_types: IndexMap::new(),
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
@@ -776,6 +781,16 @@ impl SsaBuilder {
         return_types: IndexMap<InternedString, Type>,
     ) -> Self {
         self.function_return_types = return_types;
+        self
+    }
+
+    /// Declared parameter types per function, used to coerce each
+    /// argument at a call site to the type the callee declared.
+    pub fn with_function_param_types(
+        mut self,
+        param_types: IndexMap<InternedString, Vec<Type>>,
+    ) -> Self {
+        self.function_param_types = param_types;
         self
     }
 
@@ -1218,6 +1233,18 @@ impl SsaBuilder {
                             );
 
                             value_id = result_id;
+                        }
+                    }
+
+                    // The value leaves as the type the function declared,
+                    // so returning an `Any` from a function declared to
+                    // return a concrete type unboxes here rather than
+                    // handing the caller a `DynamicBox` pointer to read
+                    // as that type.
+                    if let Some(declared) = self.original_return_type.clone() {
+                        if !matches!(declared, Type::Result { .. }) {
+                            value_id =
+                                self.coerce_for_transfer(block_id, value_id, expr, &declared);
                         }
                     }
 
@@ -4554,8 +4581,41 @@ impl SsaBuilder {
                         }
                     }
                 } else {
-                    for arg in args {
-                        arg_vals.push(self.translate_expression(block_id, arg)?);
+                    // Each argument reaches the callee as the type the
+                    // callee declared, so a concrete value passed into
+                    // an `Any` parameter is boxed here rather than
+                    // arriving as a raw scalar the callee reads as a
+                    // pointer. Only applied when the recorded
+                    // parameter list lines up one-to-one with the
+                    // arguments, so an implicit receiver or a
+                    // defaulted tail leaves the values untouched.
+                    // The print and formatting helpers read an argument
+                    // as a raw word plus the signature they registered,
+                    // so their `Any` parameter is not a box and handing
+                    // them one prints the pointer. The `__name__`
+                    // spelling marks the ones the compiler synthesises.
+                    let takes_raw_dynamic = callee_func_key.is_some_and(|key| {
+                        let name = key.resolve_global().unwrap_or_default();
+                        name.starts_with("__")
+                            || matches!(
+                                name.as_str(),
+                                "println" | "print" | "eprintln" | "eprint" | "print_dynamic"
+                            )
+                    });
+                    let declared_params = callee_func_key
+                        .filter(|_| !takes_raw_dynamic)
+                        .and_then(|key| self.function_param_types.get(&key).cloned())
+                        .filter(|params| params.len() == args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        let value = self.translate_expression(block_id, arg)?;
+                        let value = match &declared_params {
+                            Some(params) => {
+                                let target = params[i].clone();
+                                self.coerce_for_transfer(block_id, value, arg, &target)
+                            }
+                            None => value,
+                        };
+                        arg_vals.push(value);
                     }
                 }
 
@@ -8399,7 +8459,9 @@ impl SsaBuilder {
     ) -> HirId {
         use crate::cast_classify::{classify_cast, CastKind};
         match classify_cast(source_ty, target_ty, &self.type_registry) {
-            CastKind::UpcastBox => self.emit_box_to_any(block_id, value).unwrap_or(value),
+            CastKind::UpcastBox => self
+                .emit_box_to_any(block_id, value, source_ty)
+                .unwrap_or(value),
             CastKind::DowncastUnbox => self
                 .emit_unbox_from_any(block_id, value, target_ty)
                 .unwrap_or(value),
@@ -8423,8 +8485,33 @@ impl SsaBuilder {
     /// through to passing the value through unchanged, which is sound
     /// for already-i64-shaped values that are themselves box pointers
     /// from a prior boxing.
-    fn emit_box_to_any(&mut self, block_id: HirId, value: HirId) -> Option<HirId> {
+    fn emit_box_to_any(
+        &mut self,
+        block_id: HirId,
+        value: HirId,
+        source_ty: &Type,
+    ) -> Option<HirId> {
         let value_ty = self.function.values.get(&value).map(|v| v.ty.clone())?;
+        // An aggregate is carried as a pointer to its storage, and no
+        // scalar helper describes it, so it boxes by copying its bytes.
+        // This is what lets a type declared in source cross into an
+        // `Any` slot without the runtime knowing anything about it.
+        // The width comes from the declared type: the value's own HIR
+        // type is an opaque handle for a user struct, which says
+        // nothing about how wide the storage behind it is.
+        let aggregate = match &value_ty {
+            HirType::Ptr(pointee) => {
+                matches!(**pointee, HirType::Struct(_) | HirType::Array(_, _))
+            }
+            HirType::Opaque(_) | HirType::Struct(_) => true,
+            _ => false,
+        };
+        if aggregate {
+            if let Some(size) = self.typed_ty_byte_size(source_ty) {
+                return self.emit_box_opaque(block_id, value, size, &value_ty);
+            }
+            return None;
+        }
         let box_symbol = match value_ty {
             HirType::I8 | HirType::U8 | HirType::Bool => "zyntax_box_bool",
             HirType::I16 | HirType::U16 | HirType::I32 | HirType::U32 => "zyntax_box_i32",
@@ -8446,6 +8533,160 @@ impl SsaBuilder {
             },
         );
         self.add_use(value, boxed);
+        Some(boxed)
+    }
+
+    /// Coerce a value being handed across a declared boundary (a call
+    /// argument, a return) to the type that boundary declares.
+    ///
+    /// Boxing is driven by the target, which is always declared, so it
+    /// applies freely. Unboxing is driven by the source, and a source
+    /// type of `Any` can mean either "declared dynamic" or "the
+    /// frontend never typed this", so it applies only where something
+    /// actually declares the value dynamic. Otherwise a frontend that
+    /// leaves `a + b` untyped would have its sum read as a box pointer.
+    fn coerce_for_transfer(
+        &mut self,
+        block_id: HirId,
+        value: HirId,
+        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        target_ty: &Type,
+    ) -> HirId {
+        use crate::cast_classify::{classify_cast, CastKind};
+        let source = self.resolve_expr_type(expr);
+        if matches!(
+            classify_cast(&source, target_ty, &self.type_registry),
+            CastKind::DowncastUnbox
+        ) && !self.source_is_declared_any(expr)
+        {
+            return value;
+        }
+        self.emit_coercion(block_id, value, &source, target_ty)
+    }
+
+    /// Whether something in the program declares this expression's
+    /// value dynamically typed, as opposed to the frontend having left
+    /// it untyped.
+    fn source_is_declared_any(
+        &self,
+        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> bool {
+        use zyntax_typed_ast::typed_ast::TypedExpression;
+        let declared = |ty: Option<&Type>| {
+            ty.is_some_and(|t| crate::cast_classify::is_any_type(t, &self.type_registry))
+        };
+        match &expr.node {
+            // A call carries its callee's declared return type.
+            TypedExpression::Call(call) => match &call.callee.node {
+                TypedExpression::Variable(name) => declared(self.function_return_types.get(name)),
+                _ => false,
+            },
+            // A binding carries the type its declaration stated.
+            TypedExpression::Variable(name) => declared(self.var_typed_ast_types.get(name)),
+            _ => false,
+        }
+    }
+
+    /// The registry entry that actually declares `id`'s layout.
+    ///
+    /// A use site can register a placeholder under a name the program
+    /// also declares, leaving two entries where only one has fields.
+    /// Returns `id` unchanged unless it names a fieldless entry that a
+    /// same-named entry with fields supersedes, so a type that is
+    /// genuinely fieldless (an `extern struct`) is left alone.
+    fn declaring_type_id(&self, id: zyntax_typed_ast::TypeId) -> zyntax_typed_ast::TypeId {
+        let Some(def) = self.type_registry.get_type_by_id(id) else {
+            return id;
+        };
+        if !def.fields.is_empty() {
+            return id;
+        }
+        let Some(name) = def.name.resolve_global() else {
+            return id;
+        };
+        self.type_registry
+            .get_all_types()
+            .find(|other| {
+                !other.fields.is_empty()
+                    && other.name.resolve_global().as_deref() == Some(name.as_str())
+            })
+            .map(|other| other.id)
+            .unwrap_or(id)
+    }
+
+    /// Byte width of a declared type's storage, for types the HIR
+    /// carries behind a handle rather than by value. Reads the struct's
+    /// fields out of the registry and sums their lowered widths, so it
+    /// agrees with the layout the backend allocates.
+    fn typed_ty_byte_size(&mut self, ty: &Type) -> Option<usize> {
+        let field_types = match self.get_field_typed_types(ty) {
+            Some(fields) if !fields.is_empty() => fields,
+            // A name can reach the registry twice, once as the
+            // placeholder a use site created and once as the
+            // declaration itself. Only the declaration carries the
+            // fields, so the layout comes from whichever entry has
+            // them.
+            _ => {
+                let name = match ty {
+                    Type::Named { id, .. } => self.type_registry.get_type_by_id(*id)?.name,
+                    Type::Unresolved(name) => *name,
+                    _ => return None,
+                };
+                let resolved = name.resolve_global()?;
+                self.type_registry
+                    .get_all_types()
+                    .find(|def| {
+                        !def.fields.is_empty()
+                            && def.name.resolve_global().as_deref() == Some(resolved.as_str())
+                    })
+                    .map(|def| def.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>())?
+            }
+        };
+        if field_types.is_empty() {
+            return None;
+        }
+        let mut total = 0usize;
+        for field_ty in field_types {
+            let hir = self.convert_type(&field_ty);
+            total = total.checked_add(hir_ty_size(&hir))?;
+        }
+        Some(total)
+    }
+
+    /// Box the bytes behind `ptr` through `zyntax_box_opaque`, tagging
+    /// the box with what the value is so the box stays self-describing.
+    fn emit_box_opaque(
+        &mut self,
+        block_id: HirId,
+        ptr: HirId,
+        size: usize,
+        value_ty: &HirType,
+    ) -> Option<HirId> {
+        if size == 0 {
+            return None;
+        }
+        let tag = crate::zrtl::type_tag_for_hir_type(value_ty).0;
+        let size_val = self.create_value(
+            HirType::U32,
+            HirValueKind::Constant(crate::hir::HirConstant::U32(size as u32)),
+        );
+        let tag_val = self.create_value(
+            HirType::U32,
+            HirValueKind::Constant(crate::hir::HirConstant::U32(tag)),
+        );
+        let boxed = self.create_value(HirType::I64, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Call {
+                result: Some(boxed),
+                callee: crate::hir::HirCallable::Symbol("zyntax_box_opaque".to_string()),
+                args: vec![ptr, size_val, tag_val],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        self.add_use(ptr, boxed);
         Some(boxed)
     }
 
@@ -8553,7 +8794,19 @@ impl SsaBuilder {
             Type::Primitive(PrimitiveType::F32) => ("zyntax_box_get_f32", HirType::F32),
             Type::Primitive(PrimitiveType::F64) => ("zyntax_box_get_f64", HirType::F64),
             Type::Primitive(PrimitiveType::Bool) => ("zyntax_box_get_bool", HirType::Bool),
-            _ => return None,
+            // A struct comes back as the pointer to the bytes the box
+            // holds, so reading a field is a read through it and no
+            // copy is made on the way out.
+            other => {
+                let hir = self.convert_type(other);
+                match hir {
+                    HirType::Ptr(_) | HirType::Opaque(_) => ("zyntax_box_get_opaque", hir),
+                    HirType::Struct(_) | HirType::Array(_, _) => {
+                        ("zyntax_box_get_opaque", HirType::Ptr(Box::new(hir)))
+                    }
+                    _ => return None,
+                }
+            }
         };
         let unboxed = self.create_value(result_hir_ty, HirValueKind::Instruction);
         self.add_instruction(
@@ -9900,6 +10153,12 @@ impl SsaBuilder {
                 HirType::Ptr(Box::new(HirType::Opaque(*name)))
             }
             Type::Named { id, type_args, .. } => {
+                // A name can reach the registry twice, once as the
+                // placeholder a use site created and once as the
+                // declaration. Only the declaration carries the fields,
+                // and converting the placeholder instead yields a
+                // fieldless struct whose field offsets are all wrong.
+                let id = &self.declaring_type_id(*id);
                 // Look up the type definition in the registry
                 if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
                     use crate::hir::HirStructType;
@@ -10642,7 +10901,21 @@ impl SsaBuilder {
             Type::Array { element_type, .. }
                 if matches!(**element_type, Type::Any | Type::Unknown)
         );
-        if !matches!(node.ty, Type::Any | Type::Unknown) && !array_with_unknown_elem {
+        // A call the parser typed `Unit` is as likely to be unresolved
+        // as genuinely void, and the callee's recorded return type says
+        // which. Looking it up returns `Unit` again for a real void
+        // call, so re-resolving costs nothing and recovers the rest.
+        let call_typed_unit = matches!(
+            (&node.node, &node.ty),
+            (
+                zyntax_typed_ast::typed_ast::TypedExpression::Call(_),
+                Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)
+            )
+        );
+        if !matches!(node.ty, Type::Any | Type::Unknown)
+            && !array_with_unknown_elem
+            && !call_typed_unit
+        {
             return node.ty.clone();
         }
 
