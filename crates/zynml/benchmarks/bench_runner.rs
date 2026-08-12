@@ -196,6 +196,12 @@ const KERNELS: &[Kernel] = &[
     // measuring the call dispatch it exists to measure. Publishing both
     // rows keeps the dispatch number visible and makes what the pass is
     // worth a number rather than a claim.
+    //
+    // The row moves the Cranelift tier and not the LLVM one, because
+    // LLVM's own optimizer performs the same collapse whether or not
+    // ours ran. Measured on x86_64 with the cache off: Cranelift 7.7 ms
+    // with the pass and 295 ms without, LLVM 7.1 ms either way. So the
+    // pair reads as what the pass is worth to the tier that lacks it.
     Kernel::new("bench_fib", "Int(102334155)")
         .published_as("fib_no_pure_call_pre")
         .without_pure_call_pre(),
@@ -557,7 +563,14 @@ fn main() {
                 per_kernel.insert(target.key.to_string(), skipped_result());
                 continue;
             }
-            let r = measure(&source, target, runs, pretty, cache_enabled);
+            let r = measure(
+                &source,
+                target,
+                runs,
+                pretty,
+                cache_enabled,
+                kernel_spec.pure_call_pre,
+            );
             if let Some(err) = r.error.as_ref() {
                 eprintln!("    {:<22} FAILED — {err}", target.key);
             } else {
@@ -635,6 +648,7 @@ fn measure(
     runs: usize,
     kernel: &str,
     cache_enabled: bool,
+    pure_call_pre: bool,
 ) -> TargetResult {
     let mut compile_samples = Vec::with_capacity(runs);
     let mut exec_samples = Vec::with_capacity(runs);
@@ -646,12 +660,12 @@ fn measure(
     // to the `error` shape; no point spending the runs-loop's
     // budget on something that's reliably broken.
     for _ in 0..WARMUP {
-        if let Err(e) = one_iteration(source, target, kernel, cache_enabled) {
+        if let Err(e) = one_iteration(source, target, kernel, cache_enabled, pure_call_pre) {
             return failed_result(&e);
         }
     }
     for _ in 0..runs {
-        match one_iteration(source, target, kernel, cache_enabled) {
+        match one_iteration(source, target, kernel, cache_enabled, pure_call_pre) {
             Ok((compile_ms, exec_ms, r)) => {
                 compile_samples.push(compile_ms);
                 exec_samples.push(exec_ms);
@@ -720,6 +734,7 @@ fn one_iteration(
     target: &Target,
     kernel: &str,
     cache_enabled: bool,
+    pure_call_pre: bool,
 ) -> Result<(f64, f64, ZyntaxValue), String> {
     // Fine-grained instrumentation, enabled only when the
     // `ZYNTAX_BENCH_TRACE_COMPILE` env var is set. The trace
@@ -739,7 +754,7 @@ fn one_iteration(
     // whole cache without an `rm -rf` step. A hit lets us skip
     // parse + bench_runtime_1 + lower + opts entirely; we still need
     // a runtime for `compile_module` + `install_interp_jit_with`.
-    let cache_key = compute_cache_key(source, target.run_with_opts);
+    let cache_key = compute_cache_key(source, target.run_with_opts, pure_call_pre);
     let cache_dir = bench_cache_dir();
 
     let t_cache = Instant::now();
@@ -1009,7 +1024,7 @@ fn fnv1a_64_update(state: u64, bytes: &[u8]) -> u64 {
 /// `run_interp_safe_opts` mutates the module in place, and a pair of
 /// version tags so a compiler-schema change or a workspace version
 /// bump invalidates the whole cache without any manual `rm` step.
-fn compute_cache_key(source: &str, run_with_opts: bool) -> String {
+fn compute_cache_key(source: &str, run_with_opts: bool, pure_call_pre: bool) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     let mut h = FNV_OFFSET;
     // Domain separators between sections so e.g. swapping a byte
@@ -1024,6 +1039,12 @@ fn compute_cache_key(source: &str, run_with_opts: bool) -> String {
     h = fnv1a_64_update(h, ZYNML_STDLIB_SIMD.as_bytes());
     h = fnv1a_64_update(h, b"\0opts\0");
     h = fnv1a_64_update(h, &[u8::from(run_with_opts)]);
+    // The pass configuration is part of what produced the artifact.
+    // Two rows can share a source and differ only here, and without
+    // this they collide: the second row is handed the first row's
+    // compiled dylib and reports the pipeline it opted out of.
+    h = fnv1a_64_update(h, b"\0pure_call_pre\0");
+    h = fnv1a_64_update(h, &[u8::from(pure_call_pre)]);
     h = fnv1a_64_update(h, b"\0schema\0");
     h = fnv1a_64_update(h, &CACHE_SCHEMA_VERSION.to_le_bytes());
     h = fnv1a_64_update(h, b"\0pkg\0");

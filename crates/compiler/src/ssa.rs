@@ -2139,6 +2139,17 @@ impl SsaBuilder {
                     // If so, subsequent writes should go to that block
                     let write_block = self.continuation_block.unwrap_or(block_id);
 
+                    // An annotated binding is a declared boundary like a
+                    // parameter or a return, so a dynamically typed value
+                    // bound to a concrete one unboxes here. Without this
+                    // `let n: i64 = reads_any()` binds the box pointer
+                    // and every later read of `n` sees an address.
+                    let value_id = if matches!(let_stmt.ty, Type::Any | Type::Unknown) {
+                        value_id
+                    } else {
+                        self.coerce_for_transfer(write_block, value_id, value, &let_stmt.ty)
+                    };
+
                     // Record variable type (both HIR and TypedAST versions).
                     // If let binding has no annotation (Type::Any/Unknown), resolve
                     // the actual type from the initializer expression so subsequent
@@ -11336,6 +11347,16 @@ impl SsaBuilder {
 
         // First evaluate the right-hand side (the value to assign)
         let value = self.translate_expression(block_id, value_expr)?;
+
+        // The slot being written has a declared type just as a binding
+        // does, so a dynamically typed value assigned into a concrete
+        // one unboxes here rather than storing the box pointer.
+        let target_ty = self.resolve_expr_type(target);
+        let value = if matches!(target_ty, Type::Any | Type::Unknown) {
+            value
+        } else {
+            self.coerce_for_transfer(block_id, value, value_expr, &target_ty)
+        };
 
         // Now handle different assignment targets
         match &target.node {
