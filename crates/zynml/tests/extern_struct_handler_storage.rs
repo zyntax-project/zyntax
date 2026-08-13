@@ -158,6 +158,7 @@ fn which_constructor_call_form_initialises_the_field() {
         ("SignalCell<i64>.init()", "SignalCell<i64>.init()"),
         ("extern call direct", "extern blinc_signal_cell_new()"),
     ];
+    let mut seen: Vec<(&str, bool)> = Vec::new();
     for (label, ctor) in forms {
         reset();
         let src = format!(
@@ -174,8 +175,21 @@ handler MintedSignalI64 for SignalI64 {{
 }}
 "#
         );
-        println!("CTOR {label:<24} -> {}", brief(&compile(&src)));
+        let outcome = compile(&src);
+        println!("CTOR {label:<24} -> {}", brief(&outcome));
+        seen.push((label, outcome.is_ok()));
     }
+    assert_eq!(
+        seen,
+        vec![
+            ("SignalCell.init()", true),
+            // Turbofish on a static call is not in the grammar. Pinned
+            // so the emitter is not written against a spelling that
+            // only looks plausible.
+            ("SignalCell<i64>.init()", false),
+            ("extern call direct", true),
+        ]
+    );
 }
 
 /// The declaration alone compiles: extern struct plus a generic impl
@@ -415,6 +429,11 @@ handler MintedSignalI64 for SignalI64 {{
                 Err(e) => e.clone(),
             }
         );
+        assert!(
+            outcome.is_ok(),
+            "{label} must resolve: {}",
+            outcome.unwrap_err()
+        );
     }
 }
 
@@ -444,7 +463,13 @@ handler MintedSignalI64 for SignalI64 {
     def set(val: i64) { blinc_signal_cell_set(self.cell, val) }
 }
 "#;
-    println!("BARE-EXTERN-FNS -> {:?}", try_compile(src));
+    let outcome = try_compile(src);
+    println!("BARE-EXTERN-FNS -> {outcome:?}");
+    assert!(
+        outcome.is_ok(),
+        "an extern struct as handler state, with no methods involved: {}",
+        outcome.unwrap_err()
+    );
 }
 
 /// Both ways a handler reaches an impl method work, separately and
@@ -516,12 +541,18 @@ handler MintedSignalI64 for SignalI64 {{
 }}
 "#
         );
+        let outcome = try_compile(&src);
         println!(
             "HANDLER-USE {label:<28} -> {}",
-            match try_compile(&src) {
+            match &outcome {
                 Ok(()) => "ok".to_string(),
-                Err(e) => e,
+                Err(e) => e.clone(),
             }
+        );
+        assert!(
+            outcome.is_ok(),
+            "{label} must resolve: {}",
+            outcome.unwrap_err()
         );
     }
 }

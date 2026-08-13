@@ -28,6 +28,11 @@ struct Cell {
 static CELLS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Every `set` the host saw, as (cell address, type tag, size).
 static WRITES: Mutex<Vec<(usize, u32, u32)>> = Mutex::new(Vec::new());
+/// Whether each write's box carried a dropper, i.e. whether it OWNS
+/// its payload. A borrowed box points into the caller's frame and
+/// cannot outlive the call, which decides whether host storage may
+/// hold the box or must copy the payload out.
+static OWNED: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());
 
 extern "C" fn blinc_signal_cell_new() -> *mut Cell {
     let c = Box::into_raw(Box::new(Cell {
@@ -66,6 +71,13 @@ extern "C" fn blinc_signal_cell_set(c: *mut Cell, v: *mut DynamicBoxRepr) {
     } else {
         (0, v as u32)
     };
+    if plausible_box(v) {
+        let b = unsafe { &*v };
+        OWNED
+            .lock()
+            .unwrap()
+            .push((b.dropper.is_some(), b.display_fn.is_some()));
+    }
     unsafe { (*c).boxed = v };
     WRITES.lock().unwrap().push((c as usize, tag, size));
 }
@@ -76,6 +88,7 @@ fn reset() {
         drop(unsafe { Box::from_raw(c as *mut Cell) });
     }
     WRITES.lock().unwrap().clear();
+    OWNED.lock().unwrap().clear();
 }
 
 fn ptr_tag() -> TypeTag {
@@ -190,6 +203,7 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
         ),
     ];
 
+    let mut seen: Vec<(&str, u32, u32)> = Vec::new();
     for (label, src) in rows {
         reset();
         let outcome = compile(&src);
@@ -203,6 +217,12 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
             Some((_, 0, raw)) => format!("UNBOXED (raw value {raw})"),
             Some((_, tag, size)) => format!("BOXED tag={tag:#x} size={size}"),
         };
+        assert!(
+            !matches!(writes.first(), Some((_, 0, _))),
+            "{label} reached the host unboxed -- a raw value where a box was expected",
+        );
+        assert!(writes.first().is_some(), "{label} produced no write");
+        seen.push((label, writes[0].1, writes[0].2));
         println!(
             "BOXING {label:<24} -> {verdict}  [ran={}]",
             match &ran {
@@ -211,6 +231,19 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
             }
         );
     }
+    // The widths are the emitter-facing fact: a bare literal takes the
+    // default integer type, so a signal declared i64 would be minted
+    // i32 if the emitter let a literal decide.
+    let widths: Vec<(&str, u32)> = seen.iter().map(|(l, _, size)| (*l, *size)).collect();
+    assert_eq!(
+        widths,
+        vec![
+            ("direct argument", 4),
+            ("via `let b: Any = v`", 8),
+            ("explicit zyntax_box_i64", 8),
+        ],
+        "a bare literal boxes as i32; a typed binding as i64",
+    );
 }
 
 /// Where `Any` is accepted, and whether a typed value crosses into and
@@ -237,13 +270,15 @@ fn where_any_is_accepted_and_whether_it_coerces() {
     ];
     for (label, src) in rows {
         reset();
+        let outcome = try_compile(&src);
         println!(
             "ANY {label:<24} -> {}",
-            match try_compile(&src) {
+            match &outcome {
                 Ok(()) => "ok".to_string(),
-                Err(e) => e,
+                Err(e) => e.clone(),
             }
         );
+        assert!(outcome.is_ok(), "{label}: {}", outcome.unwrap_err());
     }
 }
 
@@ -350,4 +385,181 @@ def main(): i64 {{
     let writes = WRITES.lock().unwrap().clone();
     println!("STRUCT main={ran:?} writes={writes:?} (cell, tag, size)");
     assert_eq!(ran, Ok(3), "p.x read back through the cell");
+}
+
+/// Does a box arriving at an `Any` parameter OWN its payload?
+///
+/// Decides whether host-side storage may retain the box or has to copy
+/// the payload out before returning. A box with no dropper borrows,
+/// and for a scalar that is harmless to copy; for an aggregate it is
+/// not, because a shallow copy duplicates any interior pointer without
+/// duplicating its ownership.
+#[test]
+fn whether_a_box_at_an_any_boundary_owns_its_payload() {
+    let cases: [(&str, String); 2] = [
+        (
+            "scalar",
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = 41\n    blinc_signal_cell_set(c, v)\n    return 0\n}}\n"
+            ),
+        ),
+        (
+            "struct",
+            format!(
+                "{CELL}\nstruct Point {{ x: i64, y: i64 }}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let p: Point = Point {{ x: 3, y: 4 }}\n    blinc_signal_cell_set(c, p)\n    return 0\n}}\n"
+            ),
+        ),
+    ];
+
+    for (label, src) in cases {
+        reset();
+        let compiled = compile(&src);
+        let ran = match &compiled {
+            Ok(rt) => rt.call::<i64>("main", &[]).map_err(|e| e.to_string()),
+            Err(e) => Err(e.clone()),
+        };
+        let writes = WRITES.lock().unwrap().clone();
+        let owned = OWNED.lock().unwrap().clone();
+        println!(
+            "OWNERSHIP {label:<8} ran={:?} writes={writes:x?} (dropper, display_fn)={owned:?}",
+            ran.as_ref()
+                .map_err(|e| e.chars().take(40).collect::<String>())
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Who frees a box the host RETURNS?
+// ---------------------------------------------------------------------
+
+/// Droppers fired on boxes this host handed back from an `Any` return.
+static DROPS: Mutex<usize> = Mutex::new(0);
+
+extern "C" fn counting_dropper(p: *mut u8) {
+    *DROPS.lock().unwrap() += 1;
+    if !p.is_null() {
+        drop(unsafe { Box::from_raw(p as *mut i64) });
+    }
+}
+
+/// A cell whose `get` hands back an OWNED box carrying a dropper, so
+/// the test can see whether anything on the DSL side runs it.
+static OWNED_GETS: Mutex<usize> = Mutex::new(0);
+
+extern "C" fn owning_cell_get(_c: *mut Cell) -> *mut DynamicBoxRepr {
+    *OWNED_GETS.lock().unwrap() += 1;
+    let payload = Box::into_raw(Box::new(7i64));
+    Box::into_raw(Box::new(DynamicBoxRepr {
+        tag: TypeTag::I64.0,
+        size: 8,
+        data: payload as *mut u8,
+        dropper: Some(counting_dropper),
+        display_fn: None,
+    }))
+}
+
+/// An `Any` return value unboxes wherever it lands, and the box is
+/// never freed.
+///
+/// The positions are kept apart because they were not always
+/// equivalent: implicit coercion once happened only at a return and a
+/// call argument, so a `let` or an assignment silently bound the raw
+/// box pointer until zyntax `b6721fb`. The rows with an explicit `as`
+/// stay as well, since a cast on top of a coercion must not
+/// double-unbox.
+///
+/// The dropper count is the load-bearing assertion: nothing frees a
+/// returned box, which is why `SignalCell` reuses one box per cell
+/// instead of allocating per read. If that ever changes, reusing a box
+/// becomes a use-after-free and this is what says so.
+#[test]
+fn where_an_any_return_is_unboxed_and_whether_it_is_freed() {
+    // (label, source, expected-if-unboxed)
+    let rows: [(&str, String, i64); 6] = [
+        (
+            "return position",
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    return blinc_signal_cell_get(c)\n}}\n"),
+            7,
+        ),
+        (
+            "let binding, no loop",
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = blinc_signal_cell_get(c)\n    return v\n}}\n"),
+            7,
+        ),
+        (
+            "let binding + `as i64`",
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = blinc_signal_cell_get(c) as i64\n    return v\n}}\n"),
+            7,
+        ),
+        (
+            "assignment + `as i64`",
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let mut v: i64 = 0\n    v = blinc_signal_cell_get(c) as i64\n    return v\n}}\n"),
+            7,
+        ),
+        (
+            "plain assignment, no cast",
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let mut v: i64 = 0\n    v = blinc_signal_cell_get(c)\n    return v\n}}\n"),
+            7,
+        ),
+        (
+            "let binding, 8x loop",
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let mut total: i64 = 0\n    let mut i: i64 = 0\n    while i < 8 {{\n        let v: i64 = blinc_signal_cell_get(c)\n        total = total + v\n        i = i + 1\n    }}\n    return total\n}}\n"),
+            56,
+        ),
+    ];
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    for (label, src, expect) in rows {
+        *DROPS.lock().unwrap() = 0;
+        *OWNED_GETS.lock().unwrap() = 0;
+        reset();
+
+        let mut config = TieredConfig::development();
+        config.enable_osr = true;
+        let mut rt = TieredRuntime::new(config).expect("runtime");
+        rt.register_function_typed(
+            "blinc_signal_cell_new",
+            blinc_signal_cell_new as *const u8,
+            sig(&[], ptr_tag()),
+        );
+        rt.register_function_typed(
+            "blinc_signal_cell_get",
+            owning_cell_get as *const u8,
+            sig(&[ptr_tag()], ptr_tag()),
+        );
+        rt.register_function_typed(
+            "blinc_signal_cell_set",
+            blinc_signal_cell_set as *const u8,
+            sig(&[ptr_tag(), ptr_tag()], TypeTag::VOID),
+        );
+        rt.finalize_runtime_symbols().expect("publish");
+
+        let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
+        let program = grammar
+            .parse_with_filename(&src, "<owned_get>")
+            .expect("parse");
+        rt.compile_typed_program(program).expect("compile");
+        let ran = rt.call::<i64>("main", &[]).map_err(|e| e.to_string());
+
+        let gets = *OWNED_GETS.lock().unwrap();
+        let drops = *DROPS.lock().unwrap();
+        let unboxed = ran.as_ref().map(|v| *v == expect).unwrap_or(false);
+        outcomes.push((label, unboxed));
+        assert_eq!(
+            drops, 0,
+            "{label}: a returned box was freed. Nothing did before, which is why \
+             SignalCell reuses one box per cell rather than allocating per read.",
+        );
+        println!(
+            "ANYRET {label:<22} unboxed={unboxed:<5} got={:<16} gets={gets} droppers_fired={drops}",
+            match &ran {
+                Ok(v) => format!("{v}"),
+                Err(e) => e.chars().take(14).collect::<String>(),
+            }
+        );
+    }
+    assert!(
+        outcomes.iter().all(|(_, unboxed)| *unboxed),
+        "an Any unboxes in every position, with or without a cast: {outcomes:?}",
+    );
 }
