@@ -349,6 +349,14 @@ pub extern "C" fn __zyntax_effect_fiber_leave(fiber: *mut u8, baseline: i64) {
     });
 }
 
+/// Whether any frame in scope on this thread handles `effect_id`.
+///
+/// Lets a caller check before entering compiled code, where a stateful
+/// effect with no frame would reach its handler op with a null `self`.
+pub fn has_handler_for(effect_id: u64) -> bool {
+    HANDLER_STACK.with(|stack| stack.borrow().iter().any(|f| f.effect_id == effect_id))
+}
+
 /// Snapshot the frames currently in scope on this thread.
 ///
 /// A host that registers a callback to run later needs the handler

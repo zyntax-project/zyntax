@@ -1274,6 +1274,93 @@ impl TieredBackend {
     /// different failures used to collapse into one `None`, and the
     /// caller reported all of them as ambiguity, which points at the
     /// wrong line for four of them.
+    /// The effects `function` declares whose handlers carry state, as
+    /// `(effect_id, effect_name)`.
+    ///
+    /// A perform resolves its handler op statically when nothing is in
+    /// scope, and for a stateful handler that op takes an implicit
+    /// `self` the handler stack has no frame to supply. Calling such a
+    /// function with nothing installed therefore hands the op a null
+    /// state pointer. A caller that can see this list ahead of the call
+    /// can refuse it instead.
+    ///
+    /// Empty for a function that declares no effects, or whose effects
+    /// are all handled by stateless handlers, both of which are fine to
+    /// call with nothing in scope.
+    pub fn stateful_effects_of(&self, function: &str) -> Vec<(u64, String)> {
+        let Some(module) = self.current_module.as_ref() else {
+            return Vec::new();
+        };
+        let Some(entry) = module
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.resolve_global().as_deref() == Some(function))
+            .map(|(id, _)| *id)
+        else {
+            return Vec::new();
+        };
+
+        // Effects declared anywhere the entry can reach by direct call,
+        // because a perform in a callee needs its handler just as much
+        // as one in the entry itself.
+        //
+        // Direct edges only. Following function pointers would mean
+        // treating every effect in the module as required the moment a
+        // program takes one, which would refuse calls that are fine.
+        // Missing a perform reached only indirectly leaves that case as
+        // it was; over-refusing would break working programs.
+        let mut declared: Vec<zyntax_typed_ast::InternedString> = Vec::new();
+        let mut seen: std::collections::HashSet<crate::hir::HirId> =
+            std::collections::HashSet::new();
+        let mut worklist = vec![entry];
+        while let Some(fid) = worklist.pop() {
+            if !seen.insert(fid) {
+                continue;
+            }
+            let Some(f) = module.functions.get(&fid) else {
+                continue;
+            };
+            declared.extend(f.signature.effects.iter().copied());
+            for block in f.blocks.values() {
+                for inst in &block.instructions {
+                    if let crate::hir::HirInstruction::Call {
+                        callee: crate::hir::HirCallable::Function(callee),
+                        ..
+                    } = inst
+                    {
+                        worklist.push(*callee);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(u64, String)> = Vec::new();
+        for effect_name in &declared {
+            let Some(name) = effect_name.resolve_global() else {
+                continue;
+            };
+            let Some((eid, _)) = module
+                .effects
+                .iter()
+                .find(|(_, e)| e.name.resolve_global().as_deref() == Some(name.as_str()))
+            else {
+                continue;
+            };
+            // Statefulness is a property of the effect, not of one
+            // handler: every handler of a stateful effect takes the
+            // leading state slot, so any of them answers.
+            let stateful = module
+                .handlers
+                .values()
+                .any(|h| h.effect_id == *eid && !h.state_fields.is_empty());
+            let id = eid.as_u32() as u64;
+            if stateful && !out.iter().any(|(existing, _)| *existing == id) {
+                out.push((id, name));
+            }
+        }
+        out
+    }
+
     pub fn try_handler_push_info(
         &self,
         handler: &str,

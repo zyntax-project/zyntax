@@ -30,6 +30,10 @@ def deferred_body(): i64 { bump() return total() }
 
 @effect(Counter)
 def read_total(): i64 { return total() }
+
+def plain(): i64 { return 7 }
+
+def calls_an_effectful_fn(): i64 { return read_total() }
 "#;
 
 fn runtime() -> TieredRuntime {
@@ -185,29 +189,58 @@ fn the_runtime_is_reentrant_while_a_context_is_installed() {
     rt.release_handler_context(context);
 }
 
-/// A perform with no handler in scope kills the process instead of
-/// failing.
+/// A perform whose effect has no handler in scope fails as a value.
 ///
 /// Nothing here involves captured contexts; it is what happens when an
-/// effectful function is called outside any extent. The perform site
-/// falls back to the statically resolved handler op, and for a stateful
-/// handler that op takes an implicit `self` that
-/// `__zyntax_effect_lookup_state` returns null for, so the first field
-/// access dereferences null.
-///
-/// This matters to the capture API rather than being caused by it: a
-/// host that forgets to reinstate a context, or reinstates one that
-/// does not cover the effect, gets a SIGSEGV rather than an error it
-/// can report. Ignored because the failure is a signal, which takes the
-/// whole test binary with it rather than failing one case.
+/// effectful function is called outside any extent. Left to reach
+/// compiled code, the perform site falls back to the statically
+/// resolved handler op, which for a stateful handler reads an implicit
+/// `self` that nothing supplied. The call is refused at the boundary
+/// instead, so the failure is a value the caller can report.
 #[test]
-#[ignore = "crashes the test binary: a stateful perform with no handler in scope \
-            dereferences a null `self` (SIGSEGV), rather than failing as a value"]
-fn a_perform_with_no_handler_in_scope_crashes() {
+fn a_perform_with_no_handler_in_scope_fails_as_a_value() {
     let rt = runtime();
     let out = rt
         .call::<i64>("deferred_body", &[])
         .map_err(|e| e.to_string());
-    // Never reached today.
-    assert!(out.is_err(), "expected a reportable error, got {out:?}");
+    let Err(message) = out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    assert!(
+        message.contains("Counter") && message.contains("no handler"),
+        "the error should name the effect and say what is missing, got: {message}"
+    );
+}
+
+/// The refusal is specific to effects whose handler carries state. A
+/// function that performs nothing is unaffected, so the guard cannot
+/// break ordinary calls.
+#[test]
+fn a_function_that_performs_nothing_still_calls_with_nothing_installed() {
+    let rt = runtime();
+    let out = rt.call::<i64>("plain", &[]).map_err(|e| e.to_string());
+    assert_eq!(
+        out,
+        Ok(7),
+        "a call with no effects is untouched by the guard"
+    );
+}
+
+/// The refusal follows direct calls, so an entry that performs nothing
+/// itself but calls something that does is refused too. Without this
+/// the guard would only cover functions the host names directly and a
+/// callee's perform would still meet a null `self`.
+#[test]
+fn an_entry_that_only_reaches_a_perform_indirectly_is_refused_too() {
+    let rt = runtime();
+    let out = rt
+        .call::<i64>("calls_an_effectful_fn", &[])
+        .map_err(|e| e.to_string());
+    let Err(message) = out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    assert!(
+        message.contains("Counter"),
+        "the error should name the effect the callee performs, got: {message}"
+    );
 }

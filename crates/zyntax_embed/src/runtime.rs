@@ -3803,6 +3803,21 @@ impl TieredRuntime {
             .get(name)
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
 
+        // A perform whose effect has no frame in scope resolves its
+        // handler op statically, and a stateful op then reads an
+        // implicit `self` that nothing supplied. Refusing the call is
+        // the difference between an error the host can report and a
+        // null dereference inside compiled code.
+        for (effect_id, effect_name) in self.backend.stateful_effects_of(name) {
+            if !crate::effect_runtime::has_handler_for(effect_id) {
+                return Err(RuntimeError::Execution(format!(
+                    "cannot call `{name}`: it uses effect `{effect_name}`, and no handler for \
+                     `{effect_name}` is active on this thread. Handlers for `{effect_name}` keep \
+                     their own state, so one has to be active around the call"
+                )));
+            }
+        }
+
         // Record the call for profiling
         self.backend.record_call(*func_id);
 
