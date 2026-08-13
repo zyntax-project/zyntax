@@ -660,8 +660,8 @@ fn test_matmul_missing_impl_reports_clear_error() {
     // Historic behaviour: this lowering was silently swallowed at
     // `log::trace!` level so the function would disappear from the
     // HIR module with no surfaced error. That was the mechanism
-    // behind the Blinc `Ok([])` regression — see
-    // ZYNTAX_LAMBDA_BODY_BUG.md. The new policy surfaces real
+    // behind a function disappearing into an empty success
+    // result. The policy surfaces real
     // lowering errors for non-generic functions; this test now
     // asserts that intent (matching its own name).
     let result = ctx.lower_program(&mut program);

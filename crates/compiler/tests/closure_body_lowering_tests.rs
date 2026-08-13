@@ -1,5 +1,4 @@
 //! Regression coverage for the lambda-body-drop bug
-//! (see `ZYNTAX_LAMBDA_BODY_BUG.md`).
 //!
 //! Before the fix in `ssa.rs::translate_closure`, closure bodies whose
 //! only content was a function or method call silently compiled to a
@@ -188,8 +187,7 @@ fn find_closure_fn(module: &zyntax_compiler::hir::HirModule) -> &zyntax_compiler
         .expect("closure function should be present in lowered module")
 }
 
-/// Regression test for the Blinc-reported issue (see updated
-/// ZYNTAX_LAMBDA_BODY_BUG.md "Status of the local checkout"
+/// Regression test for the reported issue ("status of the local checkout"
 /// section): the lambda-body fix shouldn't cause OTHER top-level
 /// functions to disappear from the lowered module. The bug report
 /// observed `Ok([])` — empty function list — when the program had
@@ -293,11 +291,11 @@ fn sibling_top_level_fns_survive_closure_lowering() {
     );
 }
 
-/// Closer to the Blinc-reported shape: the lambda is passed as a
+/// Closer to the reported shape: the lambda is passed as a
 /// CALL ARGUMENT (not assigned to a let), and the lambda body
 /// references an outer captured variable. This is the form
 /// `Div(on_click = || { count.set(count.get() + 1) })` reduces to
-/// after Blinc's frontend produces TypedAst.
+/// after a frontend produces TypedAst.
 ///
 /// Surfacing this as a separate test in case `let f = lambda` and
 /// `extern_call(lambda)` go through different lowering paths.
@@ -432,12 +430,12 @@ fn lambda_as_call_arg_with_capture_survives() {
     std::env::set_var("SKIP_TYPE_CHECK", "1");
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
-    let module_name = arena.intern_string("blinc_shape");
+    let module_name = arena.intern_string("frontend_shape");
     let arena = Arc::new(Mutex::new(arena));
     let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
     let module = ctx
         .lower_program(&mut program)
-        .expect("lower Blinc-shape program");
+        .expect("lower frontend-shape program");
     std::env::remove_var("SKIP_TYPE_CHECK");
 
     let names: Vec<String> = module
@@ -459,14 +457,14 @@ fn lambda_as_call_arg_with_capture_survives() {
         names
     );
 
-    // Blinc layer-4 regression check: inside the lambda body, the
+    // Regression check: inside the lambda body, the
     // call to `sink` (a known extern) should lower as
     // `HirCallable::Symbol` or `Function`, NOT `Indirect`. An
     // `Indirect` here means the lambda-body translator failed to
     // resolve the extern through `function_symbols` /
     // `extern_link_names` the same way the outer translator does,
     // which downstream surfaces as the Cranelift "function pointer
-    // not in value_map" error Blinc-side.
+    // not in value_map" error in the caller.
     let lambda_fn = module
         .functions
         .values()
@@ -496,15 +494,15 @@ fn lambda_as_call_arg_with_capture_survives() {
     }
 }
 
-/// Blinc layer-4 specific repro: a function that calls an extern
+/// Repro: a function that calls an extern
 /// in BOTH its outer body AND inside a nested lambda. The outer
 /// call should lower as `HirCallable::Symbol`/`Function`; the
-/// Blinc-reported bug is that the inner (lambda-body) call
+/// The reported bug is that the inner (lambda-body) call
 /// lowered as `HirCallable::Indirect` because the function-symbol
 /// resolution path didn't fire.
 ///
 /// If this test ever fails, the bug has reproduced — share the
-/// failing call's lower output with the dump from Blinc.
+/// failing call's lower output with the reporter's dump.
 #[test]
 fn lambda_body_extern_call_resolves_same_as_outer() {
     let mut arena = AstArena::new();
@@ -568,7 +566,7 @@ fn lambda_body_extern_call_resolves_same_as_outer() {
 
     // Find both main and the lambda; check the callee variant in
     // each. If the outer resolves Symbol but inner resolves
-    // Indirect, the Blinc-reported regression has reproduced.
+    // Indirect, the reported regression has reproduced.
     let main_fn_hir = module
         .functions
         .values()
@@ -616,25 +614,25 @@ fn lambda_body_extern_call_resolves_same_as_outer() {
     assert!(
         !inner_kinds.iter().any(|k| *k == "Indirect"),
         "lambda body's call to `sink` lowered as Indirect, but outer \
-         resolves it as Symbol/Function. This is the Blinc layer-4 \
+         resolves it as Symbol/Function. This is the reported \
          regression. Outer: {:?}, Inner: {:?}",
         outer_kinds,
         inner_kinds,
     );
 }
 
-/// Reproduces the Blinc-side bug per ZYNTAX_LAMBDA_BODY_BUG.md
+/// Reproduces the reported bug
 /// "Suggested minimum to reproduce in a Zyntax-only test": a
 /// non-extern `render_view` alongside ~20 sibling extern decls
 /// silently drops `render_view` from the lowered HIR module.
 ///
-/// Blinc's instrumented diagnostic showed:
+/// The reporter's instrumented diagnostic showed:
 ///   typed_program: 20 functions including non-extern `render_view`
 ///   after lower_typed_program: 19 functions, all extern,
 ///   `render_view` missing.
 ///
 /// This test mirrors that mix — one non-extern + 19 externs
-/// covering the union of name shapes Blinc emits (`$Blinc$…`,
+/// covering the union of name shapes a frontend emits (`$Frontend$…`,
 /// `__signal_get_…`, `__set_overlay_…`, etc.).
 #[test]
 fn many_externs_dont_drop_non_extern_render_view() {
@@ -646,21 +644,21 @@ fn many_externs_dont_drop_non_extern_render_view() {
         "__signal_get_i32",
         "__set_overlay_border_width__",
         "text",
-        "$Blinc$text",
+        "$Frontend$text",
         "__set_overlay_border_color__",
         "__signal_get_string",
         "__signal_get_f64",
         "__new_child_list__",
         "__push_child__",
         "text_int",
-        "$Blinc$text_int",
+        "$Frontend$text_int",
         "__set_overlay_opacity__",
         "__set_overlay_bg__",
         "__new_style_overlay__",
         "__fstring_format__",
-        "$Blinc$format_int",
+        "$Frontend$format_int",
         "string_concat",
-        "$Blinc$string_concat",
+        "$Frontend$string_concat",
     ];
     let mut decls: Vec<zyntax_typed_ast::TypedNode<TypedDeclaration>> = extern_names
         .iter()
@@ -713,12 +711,12 @@ fn many_externs_dont_drop_non_extern_render_view() {
     std::env::set_var("SKIP_TYPE_CHECK", "1");
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
-    let module_name = arena.intern_string("blinc_repro");
+    let module_name = arena.intern_string("frontend_repro");
     let arena = Arc::new(Mutex::new(arena));
     let mut ctx = LoweringContext::new(module_name, type_registry, arena, config);
     let module = ctx
         .lower_program(&mut program)
-        .expect("lower 20-decl Blinc-shape program");
+        .expect("lower 20-decl frontend-shape program");
     std::env::remove_var("SKIP_TYPE_CHECK");
 
     let non_extern_names: Vec<String> = module
@@ -730,7 +728,7 @@ fn many_externs_dont_drop_non_extern_render_view() {
     assert!(
         non_extern_names.iter().any(|n| n == "render_view"),
         "render_view dropped from lowered module — repro of the \
-         Blinc bug. Non-extern functions present: {:?}. Total \
+         reported bug. Non-extern functions present: {:?}. Total \
          functions: {}.",
         non_extern_names,
         module.functions.len(),
@@ -765,13 +763,13 @@ fn expression_bodied_closure_emits_call_to_extern() {
             .collect::<Vec<_>>(),
     );
 
-    // Stronger assertion (Blinc layer-4 regression): the call to
+    // Stronger assertion: the call to
     // `sink` should lower as `HirCallable::Symbol` or
     // `HirCallable::Function`, NOT `Indirect`. The latter would
     // mean the lambda-body translator failed to resolve `sink`
     // through `function_symbols` / `extern_link_names` the same
     // way the outer translator does — leading to the Cranelift
-    // "function pointer not in value_map" error Blinc-side.
+    // "function pointer not in value_map" error in the caller.
     for inst in &entry.instructions {
         if let HirInstruction::Call { callee, .. } = inst {
             match callee {
@@ -783,7 +781,7 @@ fn expression_bodied_closure_emits_call_to_extern() {
                         "Lambda body's call to `sink` lowered as \
                          HirCallable::Indirect, but `sink` is a known \
                          extern function and the outer translator \
-                         resolves it as Symbol. This is the Blinc \
+                         resolves it as Symbol. This is the reported \
                          layer-4 regression: function-name resolution \
                          doesn't work inside lambda bodies."
                     );
@@ -842,12 +840,12 @@ fn block_bodied_closure_runs_each_statement() {
     );
 }
 
-/// Layer 5 regression (ZYNTAX_LAMBDA_BODY_BUG.md): when a lambda body
+/// Regression: when a lambda body
 /// calls a function name that resolves to NOTHING in scope —
 /// undeclared as extern, undefined as a local — the SSA Call lowering
 /// must surface a clean `CompilerError::Lowering` rather than fall
 /// through to `HirCallable::Indirect(Undef)`. The Indirect-of-Undef
-/// path was Blinc's "+1 lambda fails verification, Reset lambda
+/// path was the reported "+1 lambda fails verification, Reset lambda
 /// SIGSEGVs" symmetric pair: an indirect call through a null pointer
 /// either trips Cranelift's verifier (best case) or JITs to address 0
 /// (worst case). Both hide the real bug — the embedder forgot to

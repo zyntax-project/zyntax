@@ -2078,9 +2078,8 @@ impl LoweringContext {
                 // either in the SSA builder or in the input
                 // TypedProgram. The historical code swallowed
                 // these too (at `log::trace!`, invisible by
-                // default), which hid the Blinc-side
-                // `render_view`-disappears-into-`Ok([])` regression
-                // documented in ZYNTAX_LAMBDA_BODY_BUG.md. Propagate
+                // default), which hid a function disappearing into
+                // an empty success result. Propagate
                 // the error instead — the compilation should fail
                 // loudly with the underlying SSA/lowering error
                 // instead of silently producing a module that's
@@ -2115,9 +2114,8 @@ impl LoweringContext {
                     //   * Everything else (`Lowering`, `Backend`,
                     //     `Optimization`) — propagate. These point
                     //     at SSA-builder bugs or genuinely
-                    //     malformed input (e.g. the Blinc-side
-                    //     `render_view` silently dropping —
-                    //     ZYNTAX_LAMBDA_BODY_BUG.md). Surfacing
+                    //     malformed input (a function silently
+                    //     dropping). Surfacing
                     //     them is what turned a confusing
                     //     "Function not found: render_view" into
                     //     an actionable lowering error.
@@ -3077,7 +3075,7 @@ impl LoweringContext {
         // coincidence — but on `x86_64-pc-windows-msvc` the Microsoft
         // x64 ABI (rcx/rdx/r8/r9 + 32-byte shadow space + rax return)
         // diverges sharply, and the call corrupts argument registers
-        // or the return value. Blinc's FSM guard fn (a generated
+        // or the return value. A generated FSM guard fn (a
         // private TypedFunction returning i32, invoked from Rust as
         // `extern "C" fn() -> i32`) hit this on Windows CI as a
         // 0xC0000005 access violation. Defaulting every user function

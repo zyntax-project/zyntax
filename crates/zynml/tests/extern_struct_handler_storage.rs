@@ -45,20 +45,20 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-extern "C" fn blinc_signal_cell_new() -> *mut Cell {
+extern "C" fn host_signal_cell_new() -> *mut Cell {
     let boxed = Box::into_raw(Box::new(Cell { value: 0 }));
     CELLS.lock().unwrap().push(boxed as usize);
     boxed
 }
 
-extern "C" fn blinc_signal_cell_get(c: *mut Cell) -> i64 {
+extern "C" fn host_signal_cell_get(c: *mut Cell) -> i64 {
     if c.is_null() {
         return -1;
     }
     unsafe { (*c).value }
 }
 
-extern "C" fn blinc_signal_cell_set(c: *mut Cell, v: i64) {
+extern "C" fn host_signal_cell_set(c: *mut Cell, v: i64) {
     if c.is_null() {
         return;
     }
@@ -96,18 +96,18 @@ fn runtime() -> TieredRuntime {
     config.enable_osr = true;
     let mut rt = TieredRuntime::new(config).expect("runtime should start");
     rt.register_function_typed(
-        "blinc_signal_cell_new",
-        blinc_signal_cell_new as *const u8,
+        "host_signal_cell_new",
+        host_signal_cell_new as *const u8,
         sig(&[], ptr_tag()),
     );
     rt.register_function_typed(
-        "blinc_signal_cell_get",
-        blinc_signal_cell_get as *const u8,
+        "host_signal_cell_get",
+        host_signal_cell_get as *const u8,
         sig(&[ptr_tag()], TypeTag::I64),
     );
     rt.register_function_typed(
-        "blinc_signal_cell_set",
-        blinc_signal_cell_set as *const u8,
+        "host_signal_cell_set",
+        host_signal_cell_set as *const u8,
         sig(&[ptr_tag(), TypeTag::I64], TypeTag::VOID),
     );
     rt.finalize_runtime_symbols().expect("publish host symbols");
@@ -136,14 +136,14 @@ fn brief<T>(outcome: &Result<T, String>) -> String {
 const CELL_DECL: &str = r#"
 extern struct SignalCell<T>
 
-extern def blinc_signal_cell_new(): SignalCell<i64>
-extern def blinc_signal_cell_get(c: SignalCell<i64>): i64
-extern def blinc_signal_cell_set(c: SignalCell<i64>, v: i64)
+extern def host_signal_cell_new(): SignalCell<i64>
+extern def host_signal_cell_get(c: SignalCell<i64>): i64
+extern def host_signal_cell_set(c: SignalCell<i64>, v: i64)
 
 impl<T> SignalCell<T> {
-    def init(): SignalCell<T> { extern blinc_signal_cell_new() }
-    def get(self): T { extern blinc_signal_cell_get(self) }
-    def set(self, v: T) { extern blinc_signal_cell_set(self, v) }
+    def init(): SignalCell<T> { extern host_signal_cell_new() }
+    def get(self): T { extern host_signal_cell_get(self) }
+    def set(self, v: T) { extern host_signal_cell_set(self, v) }
 }
 "#;
 
@@ -156,7 +156,7 @@ fn which_constructor_call_form_initialises_the_field() {
     let forms = [
         ("SignalCell.init()", "SignalCell.init()"),
         ("SignalCell<i64>.init()", "SignalCell<i64>.init()"),
-        ("extern call direct", "extern blinc_signal_cell_new()"),
+        ("extern call direct", "extern host_signal_cell_new()"),
     ];
     let mut seen: Vec<(&str, bool)> = Vec::new();
     for (label, ctor) in forms {
@@ -352,18 +352,18 @@ fn extern_struct_methods_resolve_from_plain_fns_and_handlers_alike() {
 extern struct SignalCell
 
 impl SignalCell {
-    def init(): SignalCell { extern blinc_signal_cell_new() }
-    def get(self): i64 { extern blinc_signal_cell_get(self) }
-    def set(self, v: i64) { extern blinc_signal_cell_set(self, v) }
+    def init(): SignalCell { extern host_signal_cell_new() }
+    def get(self): i64 { extern host_signal_cell_get(self) }
+    def set(self, v: i64) { extern host_signal_cell_set(self, v) }
 }
 "#;
     let generic_decl = r#"
 extern struct SignalCell<T>
 
 impl<T> SignalCell<T> {
-    def init(): SignalCell<T> { extern blinc_signal_cell_new() }
-    def get(self): T { extern blinc_signal_cell_get(self) }
-    def set(self, v: T) { extern blinc_signal_cell_set(self, v) }
+    def init(): SignalCell<T> { extern host_signal_cell_new() }
+    def get(self): T { extern host_signal_cell_get(self) }
+    def set(self, v: T) { extern host_signal_cell_set(self, v) }
 }
 "#;
 
@@ -448,9 +448,9 @@ fn a_handler_field_can_be_an_extern_struct_without_methods() {
     let src = r#"
 extern struct SignalCell
 
-extern def blinc_signal_cell_new(): SignalCell
-extern def blinc_signal_cell_get(c: SignalCell): i64
-extern def blinc_signal_cell_set(c: SignalCell, v: i64)
+extern def host_signal_cell_new(): SignalCell
+extern def host_signal_cell_get(c: SignalCell): i64
+extern def host_signal_cell_set(c: SignalCell, v: i64)
 
 effect SignalI64 {
     def get(): i64
@@ -458,9 +458,9 @@ effect SignalI64 {
 }
 
 handler MintedSignalI64 for SignalI64 {
-    var cell: SignalCell = blinc_signal_cell_new()
-    def get(): i64 { return blinc_signal_cell_get(self.cell) }
-    def set(val: i64) { blinc_signal_cell_set(self.cell, val) }
+    var cell: SignalCell = host_signal_cell_new()
+    def get(): i64 { return host_signal_cell_get(self.cell) }
+    def set(val: i64) { host_signal_cell_set(self.cell, val) }
 }
 "#;
     let outcome = try_compile(src);
@@ -487,14 +487,14 @@ fn a_handler_reaches_impl_methods_from_both_the_initialiser_and_op_bodies() {
 extern struct SignalCell
 
 impl SignalCell {
-    def init(): SignalCell { extern blinc_signal_cell_new() }
-    def get(self): i64 { extern blinc_signal_cell_get(self) }
-    def set(self, v: i64) { extern blinc_signal_cell_set(self, v) }
+    def init(): SignalCell { extern host_signal_cell_new() }
+    def get(self): i64 { extern host_signal_cell_get(self) }
+    def set(self, v: i64) { extern host_signal_cell_set(self, v) }
 }
 
-extern def blinc_signal_cell_new(): SignalCell
-extern def blinc_signal_cell_get(c: SignalCell): i64
-extern def blinc_signal_cell_set(c: SignalCell, v: i64)
+extern def host_signal_cell_new(): SignalCell
+extern def host_signal_cell_get(c: SignalCell): i64
+extern def host_signal_cell_set(c: SignalCell, v: i64)
 
 effect SignalI64 {
     def get(): i64
@@ -506,19 +506,19 @@ effect SignalI64 {
     let rows = [
         (
             "neither (control)",
-            "blinc_signal_cell_new()",
-            "return blinc_signal_cell_get(self.cell)",
-            "blinc_signal_cell_set(self.cell, val)",
+            "host_signal_cell_new()",
+            "return host_signal_cell_get(self.cell)",
+            "host_signal_cell_set(self.cell, val)",
         ),
         (
             "static method in field init",
             "SignalCell.init()",
-            "return blinc_signal_cell_get(self.cell)",
-            "blinc_signal_cell_set(self.cell, val)",
+            "return host_signal_cell_get(self.cell)",
+            "host_signal_cell_set(self.cell, val)",
         ),
         (
             "instance method in op body",
-            "blinc_signal_cell_new()",
+            "host_signal_cell_new()",
             "return self.cell.get()",
             "self.cell.set(val)",
         ),

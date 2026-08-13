@@ -42,7 +42,7 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-extern "C" fn blinc_signal_cell_new() -> *mut Cell {
+extern "C" fn host_signal_cell_new() -> *mut Cell {
     let c = Box::into_raw(Box::new(Cell {
         boxed: std::ptr::null_mut(),
     }));
@@ -50,7 +50,7 @@ extern "C" fn blinc_signal_cell_new() -> *mut Cell {
     c
 }
 
-extern "C" fn blinc_signal_cell_get(c: *mut Cell) -> *mut DynamicBoxRepr {
+extern "C" fn host_signal_cell_get(c: *mut Cell) -> *mut DynamicBoxRepr {
     if c.is_null() {
         return std::ptr::null_mut();
     }
@@ -66,7 +66,7 @@ fn plausible_box(p: *mut DynamicBoxRepr) -> bool {
     a >= 0x1000 && a % 8 == 0
 }
 
-extern "C" fn blinc_signal_cell_set(c: *mut Cell, v: *mut DynamicBoxRepr) {
+extern "C" fn host_signal_cell_set(c: *mut Cell, v: *mut DynamicBoxRepr) {
     if c.is_null() {
         return;
     }
@@ -119,18 +119,18 @@ fn runtime() -> TieredRuntime {
     config.enable_osr = true;
     let mut rt = TieredRuntime::new(config).expect("runtime should start");
     rt.register_function_typed(
-        "blinc_signal_cell_new",
-        blinc_signal_cell_new as *const u8,
+        "host_signal_cell_new",
+        host_signal_cell_new as *const u8,
         sig(&[], ptr_tag()),
     );
     rt.register_function_typed(
-        "blinc_signal_cell_get",
-        blinc_signal_cell_get as *const u8,
+        "host_signal_cell_get",
+        host_signal_cell_get as *const u8,
         sig(&[ptr_tag()], ptr_tag()),
     );
     rt.register_function_typed(
-        "blinc_signal_cell_set",
-        blinc_signal_cell_set as *const u8,
+        "host_signal_cell_set",
+        host_signal_cell_set as *const u8,
         sig(&[ptr_tag(), ptr_tag()], TypeTag::VOID),
     );
     rt.finalize_runtime_symbols().expect("publish host symbols");
@@ -176,9 +176,9 @@ fn try_compile(src: &str) -> Result<(), String> {
 const CELL: &str = r#"
 extern struct SignalCell
 
-extern def blinc_signal_cell_new(): SignalCell
-extern def blinc_signal_cell_get(c: SignalCell): Any
-extern def blinc_signal_cell_set(c: SignalCell, v: Any)
+extern def host_signal_cell_new(): SignalCell
+extern def host_signal_cell_get(c: SignalCell): Any
+extern def host_signal_cell_set(c: SignalCell, v: Any)
 "#;
 
 /// What reaches the host for each way of getting a value into an
@@ -200,15 +200,15 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
     let rows: [(&str, String); 3] = [
         (
             "direct argument",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    blinc_signal_cell_set(c, 41)\n    return 0\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return 0\n}}\n"),
         ),
         (
             "via `let b: Any = v`",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = 41\n    let b: Any = v\n    blinc_signal_cell_set(c, b)\n    return 0\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = 41\n    let b: Any = v\n    host_signal_cell_set(c, b)\n    return 0\n}}\n"),
         ),
         (
             "explicit zyntax_box_i64",
-            format!("{CELL}\nextern def zyntax_box_i64(v: i64): Any\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    blinc_signal_cell_set(c, zyntax_box_i64(41))\n    return 0\n}}\n"),
+            format!("{CELL}\nextern def zyntax_box_i64(v: i64): Any\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, zyntax_box_i64(41))\n    return 0\n}}\n"),
         ),
     ];
 
@@ -267,15 +267,15 @@ fn where_any_is_accepted_and_whether_it_coerces() {
         ),
         (
             "T -> Any (autobox)",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    blinc_signal_cell_set(c, 41)\n    return 0\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return 0\n}}\n"),
         ),
         (
             "Any -> T (autounbox)",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    blinc_signal_cell_set(c, 41)\n    return blinc_signal_cell_get(c)\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return host_signal_cell_get(c)\n}}\n"),
         ),
         (
             "Any held as Any",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    blinc_signal_cell_set(c, 41)\n    let v: Any = blinc_signal_cell_get(c)\n    return 0\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    let v: Any = host_signal_cell_get(c)\n    return 0\n}}\n"),
         ),
     ];
     for (label, src) in rows {
@@ -306,9 +306,9 @@ effect SignalI64 {{
 }}
 
 handler MintedSignalI64 for SignalI64 {{
-    var cell: SignalCell = blinc_signal_cell_new()
-    def get(): i64 {{ return blinc_signal_cell_get(self.cell) }}
-    def set(val: i64) {{ blinc_signal_cell_set(self.cell, val) }}
+    var cell: SignalCell = host_signal_cell_new()
+    def get(): i64 {{ return host_signal_cell_get(self.cell) }}
+    def set(val: i64) {{ host_signal_cell_set(self.cell, val) }}
 }}
 
 @effect(SignalI64)
@@ -358,9 +358,9 @@ effect SignalPoint {{
 }}
 
 handler MintedSignalPoint for SignalPoint {{
-    var cell: SignalCell = blinc_signal_cell_new()
-    def get(): Point {{ return blinc_signal_cell_get(self.cell) }}
-    def set(val: Point) {{ blinc_signal_cell_set(self.cell, val) }}
+    var cell: SignalCell = host_signal_cell_new()
+    def get(): Point {{ return host_signal_cell_get(self.cell) }}
+    def set(val: Point) {{ host_signal_cell_set(self.cell, val) }}
 }}
 
 @effect(SignalPoint)
@@ -413,13 +413,13 @@ fn whether_a_box_at_an_any_boundary_owns_its_payload() {
         (
             "scalar",
             format!(
-                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = 41\n    blinc_signal_cell_set(c, v)\n    return 0\n}}\n"
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = 41\n    host_signal_cell_set(c, v)\n    return 0\n}}\n"
             ),
         ),
         (
             "struct",
             format!(
-                "{CELL}\nstruct Point {{ x: i64, y: i64 }}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let p: Point = Point {{ x: 3, y: 4 }}\n    blinc_signal_cell_set(c, p)\n    return 0\n}}\n"
+                "{CELL}\nstruct Point {{ x: i64, y: i64 }}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let p: Point = Point {{ x: 3, y: 4 }}\n    host_signal_cell_set(c, p)\n    return 0\n}}\n"
             ),
         ),
     ];
@@ -492,32 +492,32 @@ fn where_an_any_return_is_unboxed_and_whether_it_is_freed() {
     let rows: [(&str, String, i64); 6] = [
         (
             "return position",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    return blinc_signal_cell_get(c)\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    return host_signal_cell_get(c)\n}}\n"),
             7,
         ),
         (
             "let binding, no loop",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = blinc_signal_cell_get(c)\n    return v\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = host_signal_cell_get(c)\n    return v\n}}\n"),
             7,
         ),
         (
             "let binding + `as i64`",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let v: i64 = blinc_signal_cell_get(c) as i64\n    return v\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = host_signal_cell_get(c) as i64\n    return v\n}}\n"),
             7,
         ),
         (
             "assignment + `as i64`",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let mut v: i64 = 0\n    v = blinc_signal_cell_get(c) as i64\n    return v\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut v: i64 = 0\n    v = host_signal_cell_get(c) as i64\n    return v\n}}\n"),
             7,
         ),
         (
             "plain assignment, no cast",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let mut v: i64 = 0\n    v = blinc_signal_cell_get(c)\n    return v\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut v: i64 = 0\n    v = host_signal_cell_get(c)\n    return v\n}}\n"),
             7,
         ),
         (
             "let binding, 8x loop",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = blinc_signal_cell_new()\n    let mut total: i64 = 0\n    let mut i: i64 = 0\n    while i < 8 {{\n        let v: i64 = blinc_signal_cell_get(c)\n        total = total + v\n        i = i + 1\n    }}\n    return total\n}}\n"),
+            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut total: i64 = 0\n    let mut i: i64 = 0\n    while i < 8 {{\n        let v: i64 = host_signal_cell_get(c)\n        total = total + v\n        i = i + 1\n    }}\n    return total\n}}\n"),
             56,
         ),
     ];
@@ -532,18 +532,18 @@ fn where_an_any_return_is_unboxed_and_whether_it_is_freed() {
         config.enable_osr = true;
         let mut rt = TieredRuntime::new(config).expect("runtime");
         rt.register_function_typed(
-            "blinc_signal_cell_new",
-            blinc_signal_cell_new as *const u8,
+            "host_signal_cell_new",
+            host_signal_cell_new as *const u8,
             sig(&[], ptr_tag()),
         );
         rt.register_function_typed(
-            "blinc_signal_cell_get",
+            "host_signal_cell_get",
             owning_cell_get as *const u8,
             sig(&[ptr_tag()], ptr_tag()),
         );
         rt.register_function_typed(
-            "blinc_signal_cell_set",
-            blinc_signal_cell_set as *const u8,
+            "host_signal_cell_set",
+            host_signal_cell_set as *const u8,
             sig(&[ptr_tag(), ptr_tag()], TypeTag::VOID),
         );
         rt.finalize_runtime_symbols().expect("publish");

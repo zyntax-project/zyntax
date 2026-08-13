@@ -1256,11 +1256,16 @@ impl CraneliftBackend {
         function: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<()> {
-        // Build the helper signature.
+        // One pointer to the frame carrying the live-ins, matching what
+        // `compile_function_body` builds the definition with and what
+        // the back-edge probe calls through. Declaring a parameter per
+        // possible live-in described the earlier design, where they
+        // travelled in registers; against a definition taking one
+        // pointer it leaves the declared and defined signatures
+        // disagreeing about the whole argument area, which an ABI that
+        // reserves caller space for it does not survive.
         let mut sig = self.module.make_signature();
-        for _ in 0..crate::osr::OSR_MAX_LIVE_INS {
-            sig.params.push(AbiParam::new(types::I64));
-        }
+        sig.params.push(AbiParam::new(types::I64));
         if !matches!(layout.return_type, HirType::Void) {
             let ret_clir = self.translate_type(&layout.return_type)?;
             sig.returns.push(AbiParam::new(ret_clir));
@@ -1331,9 +1336,7 @@ impl CraneliftBackend {
         // them dirty. The next call to this function then crashes
         // inside Cranelift instead of producing a clean compiler
         // error — `FunctionBuilder::new` asserts its context is
-        // empty: `assertion failed: func_ctx.is_empty()`. The Blinc
-        // bug (ZYNTAX_LAMBDA_BODY_BUG.md, "Cascade panic" section)
-        // hit exactly this cascade.
+        // empty: `assertion failed: func_ctx.is_empty()`.
         //
         // Resetting at entry is cheap and decouples error paths from
         // the next call's correctness — any future early-return is
@@ -3090,11 +3093,11 @@ impl CraneliftBackend {
                                     // into address 0 — silent SIGSEGV at runtime
                                     // with no path back to the actual cause. Same
                                     // anti-pattern as the `lower_function` silent
-                                    // swallow (see ZYNTAX_LAMBDA_BODY_BUG.md "Update
+                                    // swallow (an embedder whose
                                     // — silent-drop mechanism identified").
                                     //
                                     // Return a proper compile-time error instead.
-                                    // Blinc-side callers get a `CompilerError::Backend`
+                                    // callers get a `CompilerError::Backend`
                                     // pointing at the offending HirId; we can then
                                     // chase the missing definition.
                                     let func_ptr_val =
@@ -3499,7 +3502,7 @@ impl CraneliftBackend {
                             // hitting iconst(0) means we'd call_indirect into
                             // address 0 at runtime. Surface the missing-value
                             // as a real `CompilerError::Backend` so callers
-                            // (including Blinc) get a usable diagnostic
+                            // get a usable diagnostic
                             // instead of a runtime crash.
                             let func_ptr_val = match self.value_map.get(func_ptr).copied() {
                                 Some(v) => v,

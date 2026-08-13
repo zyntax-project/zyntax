@@ -15,7 +15,7 @@
 //!   when a function body field receives a list directly)
 //!
 //! These tests pin both paths against the multi-statement-from-
-//! one-rule shape that DSLs like Blinc's `slot <name> { ... }`
+//! one-rule shape that a DSL's `slot <name> { ... }`
 //! rely on (the slot emits `[open_marker, body..., close_marker]`
 //! from one statement-position alternate).
 

@@ -2234,7 +2234,7 @@ impl SsaBuilder {
                 // statement-form control flow split (multi-block CFG)
                 // never runs for them. Any nested `TypedStatement::Block`
                 // — emitted by frontend grammars that group statements,
-                // e.g. Blinc's `match`-arm lowering — must still execute
+                // e.g. a frontend's `match`-arm lowering — must still execute
                 // its children. Without this arm the block falls into
                 // the `_ =>` no-op below and its contents silently drop.
                 let mut current = block_id;
@@ -4433,7 +4433,7 @@ impl SsaBuilder {
                             // same underlying global string can exist
                             // when different parts of the pipeline
                             // intern through different arenas. The
-                            // Blinc layer-4 path (lambda body produced
+                            // The lambda-body path (a body produced
                             // by `resolve_signal_calls`) hit this when
                             // the rewritten `Variable("__signal_set_i32")`
                             // had a different InternedString instance
@@ -4464,7 +4464,7 @@ impl SsaBuilder {
                             )
                         } else {
                             // Debug: log every dimension of the miss so
-                            // Blinc-side / similar embedders can pinpoint
+                            // embedders can pinpoint
                             // why a known function isn't resolving.
                             let fs_keys: Vec<String> = self
                                 .function_symbols
@@ -4495,7 +4495,7 @@ impl SsaBuilder {
                             // Refuse to emit `Indirect(Undef)`. An indirect call
                             // through a null pointer either fails Cranelift
                             // verification (best case) or JITs to a call to address
-                            // 0 and SIGSEGVs at runtime (worst case, ZYNTAX_LAMBDA_BODY_BUG.md
+                            // 0 and SIGSEGVs at runtime (worst case
                             // "Update — Layer 5"). Either outcome hides the real
                             // problem — a Call to a name that resolves to nothing
                             // in scope. Surface that as a clean compiler error so
@@ -13495,7 +13495,6 @@ impl SsaBuilder {
         // and silently zeroed every other expression variant — including
         // `Call`, `MethodCall`, `Block`, `Field`, `If`, `Index` — so any
         // closure that actually did work compiled to a no-op `return 0`.
-        // See ZYNTAX_LAMBDA_BODY_BUG.md for the diagnosis.
         //
         // The real translator operates on `self.function` and the per-
         // function context fields (`definitions`, `var_types`,
@@ -13564,7 +13563,7 @@ impl SsaBuilder {
                     // so the inner translator sees a local definition.
                     // No environment-struct plumbing — that's the larger
                     // capture story called out as out-of-scope in
-                    // ZYNTAX_LAMBDA_BODY_BUG.md and still parked.
+                    // still parked.
                     let new_id = HirId::new();
                     self.function.values.insert(
                         new_id,
@@ -13585,9 +13584,7 @@ impl SsaBuilder {
                     // it defaults to `Type::Any` and `.field` /
                     // `.method()` access bails with `Cannot access
                     // fields on non-struct type: Any`. That's
-                    // exactly the path the Blinc-side `count.set(...)`
-                    // pattern hit (see ZYNTAX_LAMBDA_BODY_BUG.md
-                    // "Update — what Blinc should do next" section).
+                    // exactly the path a `count.set(...)` pattern hits.
                     if let Some(outer_typed_ast_ty) = saved_var_typed_ast_types.get(name).cloned() {
                         self.var_typed_ast_types.insert(*name, outer_typed_ast_ty);
                     }
@@ -13635,8 +13632,7 @@ impl SsaBuilder {
                                         // letting an undefined-callee
                                         // Lowering error vanish and the
                                         // lambda compile to an empty body
-                                        // returning zero (ZYNTAX_LAMBDA_BODY_BUG.md
-                                        // Layer 5: Blinc-side
+                                        // returning zero (a caller
                                         // `Indirect(Undef)` SIGSEGV).
                                         errored = Some(e);
                                         break;

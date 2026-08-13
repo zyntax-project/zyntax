@@ -866,8 +866,8 @@ pub fn colors_enabled() -> bool {
 ///
 /// The full machinery wants a [`SourceMap`] and a [`DiagnosticDisplay`],
 /// which is more than a caller holding a single file and a single error
-/// needs. Front ends that parse one file at a time -- a `.blinc`
-/// reload, a REPL line, a language server's `didSave` -- reach for this
+/// needs. Front ends that parse one file at a time -- a hot reload,
+/// a REPL line, a language server's `didSave` -- reach for this
 /// instead of assembling both.
 ///
 /// `use_colors` should be false when the output goes anywhere but a
