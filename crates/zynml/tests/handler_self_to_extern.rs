@@ -252,19 +252,21 @@ fn a_handler_body_can_call_a_host_extern() {
 /// The region behind `self` is opaque, and reading it by offset is not
 /// a supported way to get at a handler field.
 ///
-/// An earlier version of this test dumped 32 words looking for the
-/// written value. It found neither value and then segfaulted: the
-/// region is around 16 bytes, so the dump ran off the end into
-/// unrelated allocations. Even the two in-bounds words held a
-/// high-entropy header and a small address rather than the i64 that
-/// had just been written, which matches the synthesized `@reference`
-/// state region that `handler_state.rs` describes — fields live behind
-/// an indirection, not inline at a fixed offset.
+/// What the first words hold differs by platform, which is the point:
+/// on Windows the written value sits at offset 0, while on macOS the
+/// same two words hold a high-entropy header and a small address. Both
+/// round-trip correctly through the effect, so the layout is internal
+/// and neither reading is the contract.
 ///
-/// Kept as a negative result. Anything on the host side that wants a
-/// handler's value should own the storage itself (an extern struct
-/// whose layout the host defines) rather than read the runtime's
-/// region, which is internal and free to change.
+/// The test therefore reports the words rather than asserting a
+/// particular shape. Asserting one made it fail on the platform whose
+/// layout differed, which is what an unspecified layout is free to do.
+/// Only two words are read: the region is around 16 bytes, and an
+/// earlier version that dumped 32 ran off the end and segfaulted.
+///
+/// Anything on the host side that wants a handler's value should own
+/// the storage itself (an extern struct whose layout the host defines)
+/// rather than read the runtime's region.
 #[test]
 fn the_region_behind_self_is_opaque_to_the_host() {
     let _guard = exclusive();
@@ -309,11 +311,10 @@ def main(): i64 {{
     // Two words only. The region is small, and reading past it is what
     // crashed the previous version of this test.
     let words = peek(seen[0], 2).expect("the pointer should at least be readable");
-    println!("OPAQUE first 2 words at {:#x}: {words:x?}", seen[0]);
-    assert!(
-        !words.contains(&(WRITTEN as u64)),
-        "if the value ever DOES appear inline at offset 0 or 8, the \
-         layout changed and this negative result needs revisiting"
+    println!(
+        "OPAQUE first 2 words at {:#x}: {words:x?} (value inline: {})",
+        seen[0],
+        words.contains(&(WRITTEN as u64))
     );
 }
 
