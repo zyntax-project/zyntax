@@ -349,6 +349,50 @@ pub extern "C" fn __zyntax_effect_fiber_leave(fiber: *mut u8, baseline: i64) {
     });
 }
 
+/// Snapshot the frames currently in scope on this thread.
+///
+/// A host that registers a callback to run later needs the handler
+/// context that was in force where the callback was written, not
+/// whatever happens to be installed when it fires, which is usually
+/// nothing. The frames are plain and `Copy`, so the snapshot is a
+/// `Vec` clone; what it does not clone is the state each frame points
+/// at, which has to outlive the snapshot.
+pub fn capture_handler_frames() -> Vec<HandlerFrame> {
+    HANDLER_STACK.with(|stack| stack.borrow().clone())
+}
+
+/// Layer `frames` on top of whatever is installed and return the depth
+/// to restore.
+///
+/// Layering rather than replacing is what lets a callback register
+/// another callback: the inner one captures the outer one's context
+/// plus its own, exactly as a resumed fiber layers on its caller's
+/// baseline. Touches only the thread-local stack, so a caller may
+/// bracket a callback body with this without holding any runtime lock
+/// across it.
+pub fn enter_handler_frames(frames: &[HandlerFrame]) -> usize {
+    HANDLER_STACK.with(|stack| {
+        let mut s = stack.borrow_mut();
+        let baseline = s.len();
+        s.extend_from_slice(frames);
+        baseline
+    })
+}
+
+/// Drop everything above `baseline`, undoing one
+/// [`enter_handler_frames`].
+///
+/// Truncating rather than popping a fixed count means a body that left
+/// a frame open cannot strand it on the caller's stack.
+pub fn leave_handler_frames(baseline: usize) {
+    HANDLER_STACK.with(|stack| {
+        let mut s = stack.borrow_mut();
+        if s.len() > baseline {
+            s.truncate(baseline);
+        }
+    });
+}
+
 /// Drop a fiber's saved handler segment. Called when the fiber is freed so
 /// a later fiber that reuses the same address can't inherit stale frames.
 #[no_mangle]

@@ -3423,6 +3423,26 @@ pub struct EffectHandlerToken(u64);
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct HandlerFrame(u64, Option<u64>);
 
+/// The handler context in force at one point on one thread, taken by
+/// [`TieredRuntime::capture_handler_context`] so a callback registered
+/// now can run under it later.
+///
+/// Holds an install on each handler instance it names, so capturing is
+/// enough to keep that state alive past the extent that pushed it.
+/// Not `Send`: the frames point at state the compiled code reaches
+/// through a thread-local stack.
+#[derive(Debug)]
+pub struct HandlerContext {
+    frames: Vec<crate::effect_runtime::HandlerFrame>,
+    instances: Vec<u64>,
+}
+
+/// An open [`TieredRuntime::enter_handler_context`] scope, closed by
+/// [`TieredRuntime::leave_handler_context`]. Not `Copy`: a scope is
+/// closed exactly once.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct HandlerContextScope(usize);
+
 /// Opaque handle to ONE allocated instance of a stateful handler's
 /// state.
 ///
@@ -4603,6 +4623,75 @@ impl TieredRuntime {
     pub fn pop_effect_handler(&mut self, frame: HandlerFrame) {
         crate::effect_runtime::__zyntax_effect_pop_handler(frame.0);
         if let Some(id) = frame.1 {
+            self.release_handler_install(id);
+        }
+    }
+
+    /// Record the handler context in force right now, to reinstate
+    /// around a callback that runs later.
+    ///
+    /// A host that stores a zero-argument function and calls it on its
+    /// own schedule — a reactive flush, an input event — needs the
+    /// handlers that were installed where that function was written.
+    /// By the time it runs, the extent that installed them has usually
+    /// closed and nothing is in scope, so a perform would find no
+    /// handler.
+    ///
+    /// The context claims an install on every handler instance it
+    /// names, so the state stays alive for as long as the context does
+    /// even after the original extent ends. Hand it back to
+    /// [`Self::release_handler_context`] to give those claims up.
+    ///
+    /// Captures the calling thread's stack, and
+    /// [`Self::enter_handler_context`] must run on that same thread:
+    /// the stack is thread-local and the state pointers are not `Send`.
+    pub fn capture_handler_context(&mut self) -> HandlerContext {
+        let frames = crate::effect_runtime::capture_handler_frames();
+        // Claim an install per instance whose state a frame names, so
+        // the region outlives the extent that pushed it. A frame whose
+        // state the runtime did not allocate (a `with` block's, whose
+        // lifetime the compiled code owns) has no instance to claim.
+        let mut instances = Vec::new();
+        for frame in &frames {
+            let state = frame.handler_state as usize;
+            if let Some((id, entry)) = self
+                .handler_instances
+                .iter_mut()
+                .find(|(_, e)| e.state == state)
+            {
+                entry.installs += 1;
+                instances.push(*id);
+            }
+        }
+        HandlerContext { frames, instances }
+    }
+
+    /// Reinstate a captured context, returning the scope to close.
+    ///
+    /// Layers on top of whatever is installed rather than replacing it,
+    /// so a callback that captures a context of its own nests the way a
+    /// resumed fiber does.
+    ///
+    /// Takes `&self` and returns before the body runs, so the caller
+    /// holds no borrow of the runtime across the callback. That matters
+    /// because the body is compiled code that may call host externs
+    /// which re-enter the runtime.
+    pub fn enter_handler_context(&self, context: &HandlerContext) -> HandlerContextScope {
+        HandlerContextScope(crate::effect_runtime::enter_handler_frames(&context.frames))
+    }
+
+    /// Close a scope [`Self::enter_handler_context`] opened, restoring
+    /// the stack the caller had. A body that left a frame open does not
+    /// strand it on the caller's stack.
+    pub fn leave_handler_context(&self, scope: HandlerContextScope) {
+        crate::effect_runtime::leave_handler_frames(scope.0);
+    }
+
+    /// Give up the installs a context claimed. The handler state it
+    /// named is freed once nothing else names it and its owner has let
+    /// it go, on the same terms as any other install.
+    pub fn release_handler_context(&mut self, context: HandlerContext) {
+        for id in context.instances {
             self.release_handler_install(id);
         }
     }
