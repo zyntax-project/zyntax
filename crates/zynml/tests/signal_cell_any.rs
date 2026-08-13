@@ -33,6 +33,14 @@ static WRITES: Mutex<Vec<(usize, u32, u32)>> = Mutex::new(Vec::new());
 /// cannot outlive the call, which decides whether host storage may
 /// hold the box or must copy the payload out.
 static OWNED: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());
+/// `CELLS`, `WRITES` and `OWNED` are process-wide, so a test that
+/// counts them has to be the only one running.
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+/// Take the process-wide lock, ignoring a previous test's panic.
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 extern "C" fn blinc_signal_cell_new() -> *mut Cell {
     let c = Box::into_raw(Box::new(Cell {
@@ -188,6 +196,7 @@ extern def blinc_signal_cell_set(c: SignalCell, v: Any)
 /// is the failure this distinguishes.
 #[test]
 fn which_construct_actually_boxes_into_an_any_parameter() {
+    let _guard = exclusive();
     let rows: [(&str, String); 3] = [
         (
             "direct argument",
@@ -250,6 +259,7 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
 /// back out of it without an explicit cast.
 #[test]
 fn where_any_is_accepted_and_whether_it_coerces() {
+    let _guard = exclusive();
     let rows: [(&str, String); 4] = [
         (
             "declarations only",
@@ -286,6 +296,7 @@ fn where_any_is_accepted_and_whether_it_coerces() {
 /// and no impl block: write 41 through the effect, read 41 back.
 #[test]
 fn a_scalar_round_trips_through_an_any_cell() {
+    let _guard = exclusive();
     reset();
     let src = format!(
         r#"{CELL}
@@ -335,6 +346,7 @@ def main(): i64 {{
 /// size and dropper.
 #[test]
 fn a_user_struct_round_trips_through_an_any_cell() {
+    let _guard = exclusive();
     reset();
     let src = format!(
         r#"{CELL}
@@ -396,6 +408,7 @@ def main(): i64 {{
 /// duplicating its ownership.
 #[test]
 fn whether_a_box_at_an_any_boundary_owns_its_payload() {
+    let _guard = exclusive();
     let cases: [(&str, String); 2] = [
         (
             "scalar",
@@ -474,6 +487,7 @@ extern "C" fn owning_cell_get(_c: *mut Cell) -> *mut DynamicBoxRepr {
 /// becomes a use-after-free and this is what says so.
 #[test]
 fn where_an_any_return_is_unboxed_and_whether_it_is_freed() {
+    let _guard = exclusive();
     // (label, source, expected-if-unboxed)
     let rows: [(&str, String, i64); 6] = [
         (

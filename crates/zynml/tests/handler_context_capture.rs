@@ -33,7 +33,13 @@ def read_total(): i64 { return total() }
 
 def plain(): i64 { return 7 }
 
-def calls_an_effectful_fn(): i64 { return read_total() }
+def handles_it_itself(): i64 {
+    let mut out: i64 = 0
+    with Tally {
+        out = deferred_body()
+    }
+    return out
+}
 "#;
 
 fn runtime() -> TieredRuntime {
@@ -63,11 +69,8 @@ fn a_callback_runs_under_the_context_captured_where_it_was_registered() {
     let context = rt.capture_handler_context();
     rt.pop_effect_handler(frame);
 
-    // Extent closed. What a perform does here is NOT asserted: with no
-    // handler in scope the perform site hands the static fallback a null
-    // `self` and the process dies on the dereference, so calling it
-    // would take the test with it. See `a_perform_with_no_handler_in_
-    // scope_crashes` below.
+    // Extent closed. Calling now is refused rather than run — see
+    // `a_perform_with_no_handler_in_scope_fails_as_a_value`.
 
     // Reinstated: the body runs against the state the extent installed.
     let scope = rt.enter_handler_context(&context);
@@ -226,21 +229,21 @@ fn a_function_that_performs_nothing_still_calls_with_nothing_installed() {
     );
 }
 
-/// The refusal follows direct calls, so an entry that performs nothing
-/// itself but calls something that does is refused too. Without this
-/// the guard would only cover functions the host names directly and a
-/// callee's perform would still meet a null `self`.
+/// A function that installs a handler around its own performs is not
+/// refused, even though what it calls needs one.
+///
+/// This is the ordinary way to use an effect, and it is why the check
+/// reads only what the entry itself declares: a callee's effects are
+/// the callee's business, and the caller has already supplied for them.
 #[test]
-fn an_entry_that_only_reaches_a_perform_indirectly_is_refused_too() {
+fn an_entry_that_opens_its_own_handler_scope_is_not_refused() {
     let rt = runtime();
     let out = rt
-        .call::<i64>("calls_an_effectful_fn", &[])
+        .call::<i64>("handles_it_itself", &[])
         .map_err(|e| e.to_string());
-    let Err(message) = out else {
-        panic!("expected a refusal, got {out:?}");
-    };
-    assert!(
-        message.contains("Counter"),
-        "the error should name the effect the callee performs, got: {message}"
+    assert_eq!(
+        out,
+        Ok(1),
+        "the `with` scope inside the entry supplies the handler"
     );
 }

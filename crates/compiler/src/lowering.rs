@@ -3462,6 +3462,16 @@ impl LoweringContext {
                     // types its `self` from the impl target, which the
                     // parser records as a name rather than a resolved type.
                     self.convert_type(&Type::Primitive(prim))
+                } else if name
+                    .resolve_global()
+                    .is_some_and(|n| crate::cast_classify::is_optional_type_name(&n))
+                {
+                    // The language's optional, reaching lowering as a bare
+                    // name because the spelling lost its argument on the
+                    // way. The payload is unknown, so it lowers as an
+                    // optional over a dynamic value rather than as an
+                    // undeclared nominal type.
+                    self.convert_type(&Type::Optional(Box::new(Type::Any)))
                 } else {
                     let type_name = name.resolve_global().unwrap_or_default();
                     // Suppress warnings for generic type params (T, U, E, etc.)
@@ -3869,7 +3879,11 @@ impl LoweringContext {
             self.module
                 .types
                 .insert(type_id, HirType::Union(Box::new(union_type)));
-        } else {
+        } else if !enum_decl
+            .name
+            .resolve_global()
+            .is_some_and(|n| crate::cast_classify::is_optional_type_name(&n))
+        {
             // Type not found in registry - this shouldn't happen for well-typed programs
             self.emit_diagnostic(
                 LoweringDiagnostic::warning(format!(

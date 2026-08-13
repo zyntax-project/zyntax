@@ -151,6 +151,19 @@ pub fn classify_cast(source: &Type, target: &Type, type_registry: &TypeRegistry)
 /// reaches the compiler. Recognizing the standard spellings here
 /// keeps the classifier working without forcing each frontend to
 /// special-case the keyword in its own parser.
+/// Whether `name` spells the language's optional type rather than a
+/// nominal one the program declares.
+///
+/// The parser turns these spellings into [`Type::Optional`], because
+/// that is the variant carrying the payload type a `case Some(v)`
+/// binding needs. Lowering has to agree: a name that reaches it
+/// unresolved is this type, not a type the program forgot to declare,
+/// and a declaration under this name declares nothing the registry
+/// should hold.
+pub fn is_optional_type_name(name: &str) -> bool {
+    matches!(name, "Option" | "Null")
+}
+
 pub fn is_any_type(ty: &Type, registry: &TypeRegistry) -> bool {
     match ty {
         Type::Any => true,
