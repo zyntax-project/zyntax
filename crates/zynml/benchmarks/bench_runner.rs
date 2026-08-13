@@ -57,7 +57,7 @@ use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 /// schema mismatch is loud, but neither catches a *valid* old payload
 /// being deserialized into a subtly-incompatible new struct. The
 /// version byte makes that case impossible.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 // One bench iteration = a fresh `lower + compile + install_jit +
 // JIT_TIER_WARMUP_CALLS calls + 1 timed call`. At rayzor-scale that
@@ -1049,7 +1049,43 @@ fn compute_cache_key(source: &str, run_with_opts: bool, pure_call_pre: bool) -> 
     h = fnv1a_64_update(h, &CACHE_SCHEMA_VERSION.to_le_bytes());
     h = fnv1a_64_update(h, b"\0pkg\0");
     h = fnv1a_64_update(h, env!("CARGO_PKG_VERSION").as_bytes());
+    // What produced the snapshot is part of what the snapshot is. A
+    // change to lowering alters the module without altering the source,
+    // the stdlib or the schema, so a key built from those alone lets a
+    // snapshot from an older compiler answer for a newer one. The
+    // schema constant does not cover it either: it is bumped by hand,
+    // so it protects only the changes someone remembered to bump for.
+    h = fnv1a_64_update(h, b"\0build\0");
+    h = fnv1a_64_update(h, &build_fingerprint().to_le_bytes());
     format!("{h:016x}")
+}
+
+/// Identifies the binary asking for the cache.
+///
+/// The compiler is linked into this executable, so the executable
+/// changing is exactly the condition under which a snapshot it wrote
+/// earlier may no longer describe what it would produce now. Size and
+/// modification time are enough to say "a different build": a rebuild
+/// that changes nothing costs one recompile, while reusing a stale
+/// snapshot costs a wrong published number.
+///
+/// Falls back to a constant when the executable cannot be inspected,
+/// which reverts to the previous behaviour rather than disabling the
+/// cache outright.
+fn build_fingerprint() -> u64 {
+    let Ok(exe) = env::current_exe() else {
+        return 0;
+    };
+    let Ok(meta) = fs::metadata(&exe) else {
+        return 0;
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    mtime ^ meta.len().rotate_left(32)
 }
 
 /// Read a snapshot if it exists and deserializes cleanly. Any

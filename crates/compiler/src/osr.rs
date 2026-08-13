@@ -765,6 +765,72 @@ mod tests {
         }
     }
 
+    /// An unreachable block must not constrain the blocks that list it
+    /// as a predecessor.
+    ///
+    /// The shape is the one a nested loop with an early exit produces:
+    /// a latch whose predecessors are a live block and an orphan the
+    /// CFG left with no way in. Treating the orphan as dominated only
+    /// by itself empties the intersection at the latch, and the loop
+    /// header stops dominating its own latch — which reads the back
+    /// edge as a forward edge and costs the loop its carried values.
+    #[test]
+    fn an_unreachable_predecessor_does_not_break_dominance() {
+        use crate::hir::{HirBlock, HirFunctionSignature, HirTerminator};
+        use zyntax_typed_ast::InternedString;
+
+        let signature = HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut function = HirFunction::new(InternedString::new_global("f"), signature);
+        let entry = function.entry_block;
+        function.blocks.clear();
+
+        let header = HirId::new();
+        let body = HirId::new();
+        let latch = HirId::new();
+        let orphan = HirId::new();
+
+        let block = |id: HirId, preds: Vec<HirId>| HirBlock {
+            id,
+            label: None,
+            phis: Vec::new(),
+            instructions: Vec::new(),
+            terminator: HirTerminator::Unreachable,
+            dominance_frontier: Default::default(),
+            predecessors: preds,
+            successors: Vec::new(),
+        };
+
+        // entry → header → body → latch → header, plus an orphan edge
+        // into the latch from a block nothing reaches.
+        function.blocks.insert(entry, block(entry, vec![]));
+        function
+            .blocks
+            .insert(header, block(header, vec![entry, latch]));
+        function.blocks.insert(body, block(body, vec![header]));
+        function
+            .blocks
+            .insert(latch, block(latch, vec![body, orphan]));
+        function.blocks.insert(orphan, block(orphan, vec![]));
+
+        let dominated = blocks_dominated_by(&function, header);
+        assert!(
+            dominated.contains(&latch),
+            "the header dominates its latch even when an unreachable block \
+             also names the latch as a successor; got {dominated:?}"
+        );
+    }
+
     #[test]
     fn bead_ids_are_unique() {
         let a = next_bead_id();
@@ -1022,6 +1088,16 @@ pub fn blocks_dominated_by(
                 .get(&b)
                 .map(|blk| blk.predecessors.clone())
                 .unwrap_or_default();
+            // A block with no predecessors is unreachable, and the
+            // iteration only ever refines, so leaving its set at "every
+            // block" keeps it the identity for the intersections below.
+            // Collapsing it to itself instead would make it constrain
+            // its successors: every block listing it as a predecessor
+            // would come out dominated by nothing but itself, which
+            // reads a loop's back edge as a forward edge.
+            if preds.is_empty() {
+                continue;
+            }
             let mut next: Option<std::collections::HashSet<HirId>> = None;
             for p in preds {
                 let Some(dp) = dom.get(&p) else { continue };
