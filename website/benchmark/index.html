@@ -480,18 +480,16 @@
       recorded.
     </p>
     <p class="footnote" style="margin-top:0.6rem;">
-      <strong>Tier 2 (LLVM) caveat on Linux x86_64.</strong>
-      The <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">zyntax-tiered-llvm</code> column compiles HIR through LLVM to a
-      PIC object, links it via the system linker to a shared object, and
-      <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">dlopen</code>s the result for tier-up. The path is exercised
-      end-to-end on macOS aarch64 in our local runs; on the Linux x86_64 CI
-      runner the install is currently soft-falling to Cranelift on the bench
-      kernels, so <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">tiered-llvm</code> numbers there track Cranelift to the
-      millisecond. The cause (linker invocation, object layout, or
-      <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">dlopen</code> resolution differing from macOS) is under active
-      investigation. When you see the two tiers' numbers diverge in the chart
-      it is real LLVM-tier execution; when they match, the runtime took the
-      Cranelift floor on that runner.
+      <strong>Reading the tier-2 (LLVM) column.</strong>
+      The <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">zyntax-tiered-llvm</code> column lowers HIR to LLVM IR, stamps each
+      function with the host's <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">target-cpu</code> and <code style="font-family:'JetBrains Mono',monospace;font-size:0.92em;background:rgba(0,0,0,0.06);padding:0.05em 0.4em;border-radius:0.3em;">target-features</code>,
+      and installs it through an in-process MCJIT engine. Nothing outside
+      the process is involved, on either macOS aarch64 or Linux x86_64.
+      On several kernels the two tiers land within noise of each other. That
+      is not a fallback: it is how little is left for LLVM to do once the HIR
+      passes have reshaped a numeric loop. Where there is work left the gap
+      is wide on the same runner that produced the close numbers, n-body
+      among them.
     </p>
   </section>
 
