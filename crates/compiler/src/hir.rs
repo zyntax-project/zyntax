@@ -2364,7 +2364,15 @@ impl HirFunction {
             values: IndexMap::new(),
             previous_version: None,
             is_external: false,
-            calling_convention: CallingConvention::Fast,
+            // The platform C ABI, because that is what the call sites
+            // use: a signature built from the module's default convention
+            // is the platform's, and a host calling in through
+            // `extern "C"` is too. `Fast` differs from both on a target
+            // whose C convention is not SystemV-shaped, which leaves a
+            // definition and its callers disagreeing about where the
+            // arguments are. A function that genuinely wants `Fast` sets
+            // it after construction.
+            calling_convention: CallingConvention::C,
             attributes: FunctionAttributes::default(),
             link_name: None,
         }
