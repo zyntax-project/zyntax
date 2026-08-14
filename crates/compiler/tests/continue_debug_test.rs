@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Debug test for continue statement in while loops
 //! This test creates a minimal HIR representation to debug the infinite loop issue
 

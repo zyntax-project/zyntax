@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Can a tier-0 probe site be located in the finalized machine code?
 //!
 //! The arm-byte check costs 13–80% because the load is an optimization

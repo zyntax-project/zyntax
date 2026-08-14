@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Simple End-to-End Integration Test
 //!
 //! Tests that we can compile and execute real programs through the full pipeline.

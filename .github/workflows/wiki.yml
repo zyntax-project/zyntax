@@ -131,10 +131,12 @@ jobs:
         # data plus meta. `--features llvm-backend` exercises the
         # full tier-up ladder so the `zyntax-tiered-llvm` column
         # reflects honest LLVM-tier numbers. `--no-cache` compiles
-        # every kernel from source: the runner restores `target/`
-        # between runs, which includes the HIR snapshot cache, and a
-        # published number should measure the compiler in the tree
-        # rather than whatever produced the snapshot.
+        # every user kernel from source while the fixed grammar and
+        # stdlib enter through the build-time artifacts used by
+        # production ZynML. The runner restores `target/` between
+        # runs, including the HIR snapshot cache, so a published
+        # number measures the compiler in the tree rather than an
+        # old per-kernel snapshot.
         run: |
           mkdir -p bench-out
           cargo run --release --package zynml --example bench_runner --features llvm-backend -- \

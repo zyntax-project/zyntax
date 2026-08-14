@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Additional Cranelift Backend Tests
 //! Testing new features: indirect calls, multi-level extract/insert, math intrinsics, etc.
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! # Effect Execution Tests
 //!
 //! Does an algebraic effect actually RUN?

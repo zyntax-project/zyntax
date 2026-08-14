@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 // Gap 11: Extern Function Lowering Integration Tests
 //
 // These tests verify that extern functions are properly lowered from TypedAST to HIR

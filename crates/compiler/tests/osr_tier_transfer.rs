@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Does a tier-1 promotion through the real ladder install OSR entries?
 //!
 //! `test_osr_helper_emission_for_counted_loop` proves a tier-1

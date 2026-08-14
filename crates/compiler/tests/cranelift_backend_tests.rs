@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! # Cranelift Backend Tests
 //!
 //! Test the Cranelift backend IR generation and compilation.

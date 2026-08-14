@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Integration Tests - Phase 2: Control Flow
 //! These tests validate control flow constructs with actual JIT execution:
 //! 1. If/else conditionals

@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Loop-carried locals through typed-AST lowering.
 //!
 //! The existing executing loop tests build `HirFunction` by hand with

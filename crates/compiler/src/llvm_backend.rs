@@ -3723,9 +3723,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // string travels as an address, and choosing the box from
                 // the register type would box the address as an integer.
                 if let Some(Some(hir_ty)) = hir_types.get(i) {
-                    if crate::cranelift_backend::dynamic_box_uses_direct_pointer(hir_ty) {
+                    if crate::zrtl::dynamic_box_uses_direct_pointer(hir_ty) {
                         let (tag, size) =
-                            crate::cranelift_backend::dynamic_box_tag_and_size_for_hir_type(hir_ty);
+                            crate::zrtl::dynamic_box_tag_and_size_for_hir_type(hir_ty);
                         return self
                             .build_stack_dynamic_box(arg_val, tag, size)
                             .map(Into::into);

@@ -5,7 +5,7 @@
 //! function compiled when it gets hot, which is the `Tier2Backend::LLVM`
 //! route through `compile_at_tier`. This drives that route directly.
 
-#![cfg(feature = "llvm-backend")]
+#![cfg(all(feature = "llvm-backend", feature = "cranelift-backend"))]
 
 mod common;
 

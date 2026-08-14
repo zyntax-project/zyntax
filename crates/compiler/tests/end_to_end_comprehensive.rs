@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Comprehensive End-to-End Integration Tests
 //!
 //! Tests the complete Zyntax compilation pipeline using the HIR Builder API.

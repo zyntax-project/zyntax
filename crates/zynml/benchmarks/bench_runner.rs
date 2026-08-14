@@ -34,18 +34,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use zynml::{
-    Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR,
-};
+use zynml::{ZynML, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR};
 use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
 use zyntax_compiler::HirModule;
-use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
+use zyntax_embed::ZyntaxValue;
 
 /// Bumped manually when the compiler's HIR schema changes (new variants,
 /// field renames, layout shifts in `HirModule` / `HirFunction` / …).
@@ -377,40 +374,6 @@ struct Target {
     /// the BC-interp-only tiers where they would dominate runtime
     /// without telling us anything useful.
     skip_kernels: &'static [&'static str],
-}
-
-/// Build a fresh `ZyntaxRuntime` with the prelude + tensor stdlib
-/// import resolvers and the ZynML grammar registered, so
-/// `import prelude` in bench kernels actually pulls in the stdlib
-/// `abs` / `min` / `max` / List / Option / Result definitions.
-/// `lower_typed_program` walks imports through the registered
-/// grammar, so without `register_grammar` the resolver is loaded
-/// but never invoked.
-// `LanguageGrammar::compile_zyn` parses + lowers the entire .zyn
-// grammar source (rule AST, action AST, Grammar2 internal IR).
-// That's ~600 ms on a desktop CPU — fine when ZynML's CLI does it
-// once at startup, ruinous when the bench harness runs
-// `bench_runtime()` twice per kernel iteration (once for the
-// lowering rt, once for the compile/runtime rt). Cache the result.
-static SHARED_LANG_GRAMMAR: OnceLock<Result<zyntax_embed::LanguageGrammar, String>> =
-    OnceLock::new();
-
-fn bench_runtime() -> Result<ZyntaxRuntime, String> {
-    let mut rt = ZyntaxRuntime::new().map_err(|e| format!("rt: {e:?}"))?;
-    rt.add_import_resolver(Box::new(|module_name| match module_name {
-        "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
-        "tensor" => Ok(Some(ZYNML_STDLIB_TENSOR.to_string())),
-        "simd" => Ok(Some(ZYNML_STDLIB_SIMD.to_string())),
-        _ => Ok(None),
-    }));
-    let lang_grammar = SHARED_LANG_GRAMMAR
-        .get_or_init(|| {
-            use zyntax_embed::LanguageGrammar;
-            LanguageGrammar::compile_zyn(ZYNML_GRAMMAR).map_err(|e| format!("compile_zyn: {e:?}"))
-        })
-        .clone()?;
-    rt.register_grammar("zynml", lang_grammar);
-    Ok(rt)
 }
 
 /// Custom `TieredConfig` for the JIT target — warm-threshold of 1
@@ -751,9 +714,9 @@ fn one_iteration(
     // produced `HirModule`: the source itself, both stdlib files
     // (prelude, tensor), whether the opt pipeline will run, and a
     // schema-version constant so a bumped HIR layout invalidates the
-    // whole cache without an `rm -rf` step. A hit lets us skip
-    // parse + bench_runtime_1 + lower + opts entirely; we still need
-    // a runtime for `compile_module` + `install_interp_jit_with`.
+    // whole cache without an `rm -rf` step. A hit lets us skip parse,
+    // lowering and opts; we still need an artifact-backed runtime for
+    // `compile_module` + `install_interp_jit_with`.
     let cache_key = compute_cache_key(source, target.run_with_opts, pure_call_pre);
     let cache_dir = bench_cache_dir();
 
@@ -765,7 +728,16 @@ fn one_iteration(
     };
     let cache_lookup_ms = t_cache.elapsed().as_secs_f64() * 1000.0;
 
-    let (module, parse_ms, bench_rt_1_ms, lower_ms, opts_ms): (HirModule, f64, f64, f64, f64) =
+    // Construct exactly the runtime production ZynML uses. This decodes the
+    // build-time grammar and stdlib artifacts and installs their compiled
+    // import resolver. Keeping this runtime for lowering *and* compilation
+    // mirrors `ZynML::load_source`; constructing a second runtime here would
+    // charge setup twice and would no longer be a deployable cold-start metric.
+    let t0 = Instant::now();
+    let mut zynml = ZynML::new().map_err(|e| format!("runtime setup: {e:?}"))?;
+    let runtime_setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let (module, parse_ms, lower_ms, opts_ms): (HirModule, f64, f64, f64) =
         if let Some(m) = cached_module {
             if trace {
                 eprintln!(
@@ -775,7 +747,7 @@ fn one_iteration(
                     ms = cache_lookup_ms,
                 );
             }
-            (m, 0.0, 0.0, 0.0, 0.0)
+            (m, 0.0, 0.0, 0.0)
         } else {
             if trace {
                 eprintln!(
@@ -786,27 +758,25 @@ fn one_iteration(
                 );
             }
 
-            let grammar =
-                Grammar2::from_source(ZYNML_GRAMMAR).map_err(|e| format!("grammar: {e:?}"))?;
-
             let t0 = Instant::now();
-            let program = grammar
+            let program = zynml
+                .grammar2()
+                .ok_or_else(|| "compiled Grammar2 parser unavailable".to_string())?
                 .parse_with_filename(source, "<bench>")
                 .map_err(|e| format!("parse: {e:?}"))?;
             let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            let t0 = Instant::now();
-            let rt = bench_runtime()?;
-            let builtins = rt
+            let builtins = zynml
+                .runtime()
                 .config()
                 .builtins
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            let bench_rt_1_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             let t0 = Instant::now();
-            let mut module: HirModule = rt
+            let mut module: HirModule = zynml
+                .runtime()
                 .lower_typed_program(program, builtins)
                 .map_err(|e| format!("lower: {e:?}"))?;
             let lower_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -827,15 +797,13 @@ fn one_iteration(
                 try_save_cached_hir(&module, &cache_key, &cache_dir);
             }
 
-            (module, parse_ms, bench_rt_1_ms, lower_ms, opts_ms)
+            (module, parse_ms, lower_ms, opts_ms)
         };
 
     let t0 = Instant::now();
-    let mut rt = bench_runtime()?;
-    let bench_rt_2_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let t0 = Instant::now();
-    rt.compile_module(&module)
+    zynml
+        .runtime_mut()
+        .compile_module(&module)
         .map_err(|e| format!("compile_module: {e:?}"))?;
     let compile_module_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -852,7 +820,9 @@ fn one_iteration(
         } else {
             None
         };
-        rt.install_interp_jit_with(jit_tier_config(target.install_llvm, llvm_cache_key))
+        zynml
+            .runtime()
+            .install_interp_jit_with(jit_tier_config(target.install_llvm, llvm_cache_key))
             .map_err(|e| format!("install_interp_jit: {e:?}"))?;
     }
     let install_jit_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -864,20 +834,18 @@ fn one_iteration(
             "[BENCH-COMPILE] kernel={kernel} target={target_key}\n  \
              cache_lookup = {cache:.2} ms\n  \
              parse        = {parse:.2} ms\n  \
-             rt_build_1   = {rt1:.2} ms\n  \
+             runtime_setup= {runtime_setup:.2} ms\n  \
              lower        = {lower:.2} ms\n  \
              opts         = {opts:.2} ms\n  \
-             rt_build_2   = {rt2:.2} ms\n  \
              compile_mod  = {cm:.2} ms\n  \
              install_jit  = {ij:.2} ms\n  \
              TOTAL        = {total:.2} ms",
             target_key = target.key,
             cache = cache_lookup_ms,
             parse = parse_ms,
-            rt1 = bench_rt_1_ms,
+            runtime_setup = runtime_setup_ms,
             lower = lower_ms,
             opts = opts_ms,
-            rt2 = bench_rt_2_ms,
             cm = compile_module_ms,
             ij = install_jit_ms,
             total = compile_ms,
@@ -894,7 +862,9 @@ fn one_iteration(
         // measure either. The cost of getting to steady state is
         // a separate axis the page doesn't currently report.
         for _ in 0..JIT_TIER_WARMUP_CALLS {
-            rt.call_function_raw("main", vec![])
+            zynml
+                .runtime()
+                .call_function_raw("main", vec![])
                 .map_err(|e| format!("jit warmup: {e:?}"))?;
         }
     }
@@ -905,7 +875,7 @@ fn one_iteration(
     // aborting the whole suite.
     let exec_start = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.call_function_raw("main", vec![])
+        zynml.runtime().call_function_raw("main", vec![])
     }))
     .map_err(|p| {
         if let Some(s) = p.downcast_ref::<&str>() {

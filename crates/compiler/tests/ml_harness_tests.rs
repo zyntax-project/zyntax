@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! # ML test harness
 //!
 //! The correctness + codegen verification half of the ML roadmap's

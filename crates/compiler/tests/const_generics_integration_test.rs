@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! End-to-end integration tests for const generics compilation
 //!
 //! Tests the full pipeline: Generic HIR → Monomorphization → Cranelift Compilation → JIT Execution

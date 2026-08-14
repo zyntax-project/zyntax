@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Integration Tests - Phase 1: Basic Arithmetic
 //! These tests validate the ENTIRE compilation pipeline by:
 //! 1. Manually building HIR functions

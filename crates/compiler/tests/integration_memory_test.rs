@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::{
     CallingConvention, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,

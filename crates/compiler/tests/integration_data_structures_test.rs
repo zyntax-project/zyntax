@@ -1,3 +1,5 @@
+#![cfg(feature = "cranelift-backend")]
+
 //! Integration tests for data structures (structs and arrays)
 //! These tests actually execute the compiled code to verify correctness
 

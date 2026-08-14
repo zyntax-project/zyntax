@@ -52,6 +52,8 @@
 use std::ffi::{CStr, OsStr};
 use std::path::Path;
 
+use crate::hir::HirType;
+
 /// Current ZRTL format version
 pub const ZRTL_VERSION: u32 = 1;
 
@@ -215,6 +217,101 @@ impl TypeTag {
         TypeFlags::NONE,
     );
     pub const STRING: Self = Self::new(TypeCategory::String, 0, TypeFlags::NONE);
+}
+
+/// Deterministically derive a non-zero opaque sub-id from a type name.
+///
+/// We reserve `0` for unknown/legacy opaque values and keep `0xFFFF` for
+/// DynamicBox signature markers, so generated IDs stay in a safe range.
+fn stable_opaque_type_sub_id(type_name: &str) -> u16 {
+    let clean_name = type_name.trim_start_matches('$');
+    if clean_name.is_empty() {
+        return 1;
+    }
+
+    // FNV-1a (32-bit), deterministic across processes/platforms.
+    let mut hash: u32 = 0x811C_9DC5;
+    for byte in clean_name.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+
+    let mut id = (hash as u16) & 0x7FFF;
+    if id == 0 {
+        id = 1;
+    }
+    id
+}
+
+fn dynamic_box_opaque_tag(opaque_name: &str) -> u32 {
+    TypeTag::new(
+        TypeCategory::Opaque,
+        stable_opaque_type_sub_id(opaque_name),
+        TypeFlags::NONE,
+    )
+    .0
+}
+
+/// Return the ZRTL dynamic-box tag and payload size for a HIR type.
+///
+/// This mapping is shared by every native backend so LLVM-only builds do not
+/// depend on the Cranelift module being present.
+pub(crate) fn dynamic_box_tag_and_size_for_hir_type(ty: &HirType) -> (u32, u32) {
+    match ty {
+        HirType::I8 => (TypeTag::I8.0, 1),
+        HirType::I16 => (TypeTag::I16.0, 2),
+        HirType::I32 => (TypeTag::I32.0, 4),
+        HirType::I64 => (TypeTag::I64.0, 8),
+        HirType::U8 => (TypeTag::U8.0, 1),
+        HirType::U16 => (TypeTag::U16.0, 2),
+        HirType::U32 => (TypeTag::U32.0, 4),
+        HirType::U64 => (TypeTag::U64.0, 8),
+        HirType::F32 => (TypeTag::F32.0, 4),
+        HirType::F64 => (TypeTag::F64.0, 8),
+        HirType::Bool => (TypeTag::BOOL.0, 1),
+        HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::I8) => (TypeTag::STRING.0, 8),
+        HirType::Opaque(type_name) => {
+            let type_name_str = type_name.resolve_global().unwrap_or_default();
+            (dynamic_box_opaque_tag(&type_name_str), 8)
+        }
+        HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_)) => {
+            if let HirType::Opaque(type_name) = inner.as_ref() {
+                let type_name_str = type_name.resolve_global().unwrap_or_default();
+                (dynamic_box_opaque_tag(&type_name_str), 8)
+            } else {
+                unreachable!("checked by match guard");
+            }
+        }
+        HirType::Ptr(_) => (
+            TypeTag::new(
+                TypeCategory::Pointer,
+                PrimitiveSize::Pointer as u16,
+                TypeFlags::NONE,
+            )
+            .0,
+            8,
+        ),
+        other => {
+            log::warn!(
+                "[Boxing] Unhandled type: {:?}, defaulting to opaque tag",
+                other
+            );
+            default_dynamic_box_opaque_tag_and_size()
+        }
+    }
+}
+
+pub(crate) fn default_dynamic_box_opaque_tag_and_size() -> (u32, u32) {
+    (TypeTag::new(TypeCategory::Opaque, 1, TypeFlags::NONE).0, 8)
+}
+
+/// Whether a dynamic box carries this HIR value by pointer.
+pub(crate) fn dynamic_box_uses_direct_pointer(ty: &HirType) -> bool {
+    match ty {
+        HirType::Opaque(_) => true,
+        HirType::Ptr(inner) => matches!(inner.as_ref(), HirType::Opaque(_) | HirType::I8),
+        _ => false,
+    }
 }
 
 // ============================================================
@@ -1773,29 +1870,10 @@ extern "C" fn drop_box_u8(ptr: *mut u8) {
     }
 }
 
-/// Get the TypeTag for a HIR type
+/// Get the TypeTag for a HIR type.
 ///
 /// This is called at compile time (during lowering) to get the
 /// ZRTL TypeTag for a given type.
-fn stable_opaque_type_sub_id(type_name: &str) -> u16 {
-    let clean_name = type_name.trim_start_matches('$');
-    if clean_name.is_empty() {
-        return 1;
-    }
-
-    let mut hash: u32 = 0x811C_9DC5;
-    for byte in clean_name.as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-
-    let mut id = (hash as u16) & 0x7FFF;
-    if id == 0 {
-        id = 1;
-    }
-    id
-}
-
 pub fn type_tag_for_hir_type(ty: &crate::hir::HirType) -> TypeTag {
     use crate::hir::HirType;
 

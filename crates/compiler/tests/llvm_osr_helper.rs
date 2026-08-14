@@ -5,7 +5,7 @@
 //! This checks the emitted IR resumes at the loop header rather than at the
 //! function's entry.
 
-#![cfg(feature = "llvm-backend")]
+#![cfg(all(feature = "llvm-backend", feature = "cranelift-backend"))]
 
 mod common;
 
