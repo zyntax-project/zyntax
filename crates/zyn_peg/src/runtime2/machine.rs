@@ -56,6 +56,10 @@ pub enum Instr {
     Ret,
     /// Push a backtrack entry that resumes at `alt` on failure.
     Choice { alt: usize },
+    /// Push the backtrack entry a repetition leaves through. It
+    /// behaves as [`Instr::Choice`] does; keeping it apart says
+    /// whether a parse gave up on an alternative or finished a loop.
+    LoopChoice { alt: usize },
     /// Drop the most recent backtrack entry and continue at `next`.
     Commit { next: usize },
     /// Fail, unwinding to the most recent backtrack entry.
@@ -224,6 +228,7 @@ fn rebase(instr: &Instr, base: usize) -> Instr {
     let mut out = instr.clone();
     match &mut out {
         Instr::Choice { alt } => *alt += base,
+        Instr::LoopChoice { alt } => *alt += base,
         Instr::Commit { next } => *next += base,
         Instr::IfEmpty { body } => *body += base,
         Instr::RepeatEnd { body, exit, .. } => {
@@ -396,7 +401,7 @@ fn emit(
             if !atomic {
                 out.push(Instr::SkipWs);
             }
-            out.push(Instr::Choice { alt: usize::MAX });
+            out.push(Instr::LoopChoice { alt: usize::MAX });
             let choice_site = out.len() - 1;
             let mut empty_site = None;
             if let Some(sep) = separator {
@@ -421,7 +426,7 @@ fn emit(
             });
             let repeat_site = out.len() - 1;
             let exit = out.len();
-            if let Instr::Choice { alt } = &mut out[choice_site] {
+            if let Instr::LoopChoice { alt } = &mut out[choice_site] {
                 *alt = exit;
             }
             if let Instr::RepeatEnd { exit: target, .. } = &mut out[repeat_site] {
@@ -471,8 +476,10 @@ fn emit(
 /// Why a backtrack entry was pushed.
 #[derive(Clone, Copy)]
 enum CpKind {
-    /// An alternative to try, or a repetition to leave.
+    /// An alternative to try.
     Alt,
+    /// A repetition to leave.
+    Loop,
     /// A lookahead in progress.
     Look { negative: bool },
 }
@@ -484,6 +491,13 @@ struct Choicepoint {
     bindings: usize,
     lists: usize,
     kind: CpKind,
+    /// Instructions run when this entry was pushed, so abandoning it
+    /// says how much work the alternative did before giving up.
+    steps: u64,
+    /// Work already written off when this entry was pushed. An
+    /// alternative inside an abandoned alternative would otherwise
+    /// have its instructions counted once at every level above it.
+    wasted: u64,
 }
 
 /// One rule in flight.
@@ -578,6 +592,11 @@ struct Stats {
     actions: u64,
     fails: u64,
     skip_ws: u64,
+    alt_fail_cold: u64,
+    alt_fail_warm: u64,
+    loop_exits: u64,
+    steps: u64,
+    wasted_steps: u64,
 }
 
 /// Whether to count, read once per process.
@@ -611,6 +630,21 @@ impl Stats {
             "[MACHINE] skip-ws {} ({:.2}/byte)",
             self.skip_ws,
             per(self.skip_ws)
+        );
+        let alts = self.alt_fail_cold + self.alt_fail_warm;
+        eprintln!(
+            "[MACHINE] alternatives abandoned {} : {} consumed nothing ({:.0}%), {} had consumed input",
+            alts,
+            self.alt_fail_cold,
+            100.0 * self.alt_fail_cold as f64 / alts.max(1) as f64,
+            self.alt_fail_warm,
+        );
+        eprintln!("[MACHINE] repetitions ended {}", self.loop_exits);
+        eprintln!(
+            "[MACHINE] instructions {} : {} run inside alternatives later abandoned ({:.0}%)",
+            self.steps,
+            self.wasted_steps,
+            100.0 * self.wasted_steps as f64 / self.steps.max(1) as f64,
         );
     }
 }
@@ -663,6 +697,9 @@ fn run_counted<'g>(
 
     'step: loop {
         let mut failed = false;
+        if counting {
+            stats.steps += 1;
+        }
 
         match &program.code[pc] {
             Instr::Literal { text, desc } => {
@@ -754,13 +791,18 @@ fn run_counted<'g>(
 
             Instr::Fail => failed = true,
 
-            Instr::Choice { alt } => {
+            Instr::Choice { alt } | Instr::LoopChoice { alt } => {
                 cps.push(Choicepoint {
                     pc: *alt,
                     pos: state.pos(),
                     bindings: state.save_bindings(),
                     lists: lists.len(),
-                    kind: CpKind::Alt,
+                    kind: match &program.code[pc] {
+                        Instr::LoopChoice { .. } => CpKind::Loop,
+                        _ => CpKind::Alt,
+                    },
+                    steps: stats.steps,
+                    wasted: stats.wasted_steps,
                 });
                 pc += 1;
             }
@@ -845,6 +887,8 @@ fn run_counted<'g>(
                     kind: CpKind::Look {
                         negative: *negative,
                     },
+                    steps: stats.steps,
+                    wasted: stats.wasted_steps,
                 });
                 pc += 1;
             }
@@ -1023,11 +1067,29 @@ fn run_counted<'g>(
             let floor = frames.last().map_or(0, |f| f.cp_floor);
             if cps.len() > floor {
                 let cp = cps.pop().expect("choice point");
+                if counting && matches!(cp.kind, CpKind::Loop) {
+                    stats.loop_exits += 1;
+                }
+                if counting && matches!(cp.kind, CpKind::Alt) {
+                    let ran = stats.steps - cp.steps;
+                    let already = stats.wasted_steps - cp.wasted;
+                    stats.wasted_steps += ran.saturating_sub(already);
+                }
+                if counting && matches!(cp.kind, CpKind::Alt) {
+                    // An alternative that gave up without consuming
+                    // anything is one a test on the next byte could
+                    // have skipped before it ran.
+                    if state.pos() == cp.pos {
+                        stats.alt_fail_cold += 1;
+                    } else {
+                        stats.alt_fail_warm += 1;
+                    }
+                }
                 state.set_pos(cp.pos);
                 state.restore_bindings(cp.bindings);
                 lists.truncate(cp.lists);
                 match cp.kind {
-                    CpKind::Alt => {
+                    CpKind::Alt | CpKind::Loop => {
                         pc = cp.pc;
                         continue 'step;
                     }
