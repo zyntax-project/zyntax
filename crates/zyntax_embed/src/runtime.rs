@@ -1411,6 +1411,7 @@ impl ZyntaxRuntime {
         use zyntax_typed_ast::{
             type_registry::*, AstArena, InternedString, TypeRegistry, TypedDeclaration,
         };
+        let fn_start = std::time::Instant::now();
 
         // Handler state (Phase 3): a `handler H for E { var s: T = init; ... }`
         // gets a synthesized `@reference` struct `H$state` holding its fields,
@@ -1672,16 +1673,22 @@ impl ZyntaxRuntime {
         // Process imports FIRST to load stdlib traits and impls
         // This merges declarations from imported modules into the program
         // and registers their opaque types in the type registry
+        let t_imports = std::time::Instant::now();
         self.process_imports_for_traits(&mut program, &mut type_registry)?;
+        let imports_ms = t_imports.elapsed().as_secs_f64() * 1000.0;
 
         // Now process extern declarations from the merged program (main + imports)
         // to ensure all opaque types are registered (needs &mut)
+        let t_externs = std::time::Instant::now();
         self.process_extern_declarations_mut(&program, &mut type_registry)?;
+        let externs_ms = t_externs.elapsed().as_secs_f64() * 1000.0;
 
         // IMPORTANT: Resolve all Type::Unresolved in the TypedAST before lowering
         // This mutates the program to replace Unresolved types with actual types from TypeRegistry
         // The compiler's type checker and SSA builder need resolved types
+        let t_resolve = std::time::Instant::now();
         self.resolve_unresolved_types(&mut program, &type_registry);
+        let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
 
         // IMPORTANT: Sync the program's type_registry with our local copy that has merged imports
         // This is needed because process_imports_for_traits merges into `type_registry` not `program.type_registry`
@@ -1726,6 +1733,14 @@ impl ZyntaxRuntime {
             ..LoweringConfig::default()
         };
 
+        // Phase timings for the compile-time work, behind an env var so
+        // an ordinary run stays quiet. `lower_typed_program` is the
+        // largest slice of a cold compile, and it is three phases with
+        // very different costs, which a single number hides.
+        let phase_trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+        let prologue_ms = fn_start.elapsed().as_secs_f64() * 1000.0;
+        let engine_start = std::time::Instant::now();
+
         // Run pattern engine (term-rewriting passes on TypedAST)
         {
             let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
@@ -1749,6 +1764,8 @@ impl ZyntaxRuntime {
             }
         }
 
+        let engine_elapsed = engine_start.elapsed();
+
         let mut lowering_ctx = LoweringContext::new(
             module_name,
             type_registry_arc.clone(),
@@ -1762,16 +1779,36 @@ impl ZyntaxRuntime {
         // built-in set.
         lowering_ctx.set_builtin_registry(self.snapshot_builtin_registry());
 
+        let lower_start = std::time::Instant::now();
         let mut hir_module = lowering_ctx
             .lower_program(&mut program)
             .map_err(|e| RuntimeError::Execution(format!("Lowering error: {:?}", e)))?;
+        if phase_trace {
+            let engine_ms = engine_elapsed.as_secs_f64() * 1000.0;
+            let lower_ms = lower_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[LOWER-PHASES] prologue = {prologue_ms:.2} ms (imports {imports_ms:.2}, \
+                 externs {externs_ms:.2}, resolve_types {resolve_ms:.2})  \
+                 pattern_engine = {engine_ms:.2} ms  lower_program = {lower_ms:.2} ms"
+            );
+        }
+        let epilogue_start = std::time::Instant::now();
 
         // Display lowering diagnostics (type inference warnings, etc.)
         lowering_ctx.display_diagnostics(&program);
 
         // Monomorphization
+        let mono_start = std::time::Instant::now();
         zyntax_compiler::monomorphize_module(&mut hir_module)
             .map_err(|e| RuntimeError::Execution(format!("Monomorphization error: {:?}", e)))?;
+        if phase_trace {
+            eprintln!(
+                "[LOWER-PHASES]   diagnostics = {:.2} ms  monomorphize = {:.2} ms  TOTAL = {:.2} ms",
+                (mono_start - epilogue_start).as_secs_f64() * 1000.0,
+                mono_start.elapsed().as_secs_f64() * 1000.0,
+                fn_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         Ok(hir_module)
     }

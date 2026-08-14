@@ -30,6 +30,34 @@ pub(crate) fn resolve_import_with(
     Ok(None)
 }
 
+/// Parsed imports, keyed by module name and source contents.
+///
+/// The key carries the source's length and hash rather than the text so
+/// a hit costs no comparison of 30 KB, and so a module whose text
+/// changes between compiles misses rather than returning a stale tree.
+type ParsedImportKey = (String, usize, u64);
+
+fn parsed_import_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<ParsedImportKey, zyntax_typed_ast::TypedProgram>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<ParsedImportKey, zyntax_typed_ast::TypedProgram>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// FNV-1a over the source, to tell one revision of a module from another.
+fn fnv1a(bytes: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 pub(crate) fn process_imports_for_traits(
     grammars: &std::collections::HashMap<String, std::sync::Arc<crate::grammar::LanguageGrammar>>,
     plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
@@ -95,16 +123,47 @@ fn process_imports_inner(
             // Find a grammar to parse the imported module
             // Try each registered grammar until one succeeds
             // Pass plugin signatures to ensure proper extern function declarations
-            let mut parsed_program = None;
-            for (_lang_name, grammar) in grammars.iter() {
-                match grammar.parse_with_signatures(&source, &module_name, &plugin_signatures) {
-                    Ok(imported_program) => {
-                        parsed_program = Some(imported_program);
-                        break;
+            //
+            // An imported module's text does not change while the process
+            // runs, and the stdlib is imported by every program compiled,
+            // so the parse is repeated verbatim on every compile. Reusing
+            // the result costs a clone of the parsed program, which is the
+            // same order as the rest of lowering and an order below what
+            // parsing 30 KB of prelude costs.
+            let cache_key = (module_name.clone(), source.len(), fnv1a(&source));
+            let mut parsed_program = parsed_import_cache()
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&cache_key).cloned());
+            let from_cache = parsed_program.is_some();
+            if parsed_program.is_none() {
+                for (_lang_name, grammar) in grammars.iter() {
+                    let _t = std::time::Instant::now();
+                    match grammar.parse_with_signatures(&source, &module_name, &plugin_signatures) {
+                        Ok(imported_program) => {
+                            if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                                eprintln!(
+                                    "[IMPORT-PARSE] {module_name} {} bytes in {:.2} ms",
+                                    source.len(),
+                                    _t.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            if let Ok(mut c) = parsed_import_cache().lock() {
+                                c.insert(cache_key.clone(), imported_program.clone());
+                            }
+                            parsed_program = Some(imported_program);
+                            break;
+                        }
+                        Err(_) => continue,
                     }
-                    Err(_) => continue,
                 }
+            } else if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                eprintln!(
+                    "[IMPORT-PARSE] {module_name} reused ({} bytes)",
+                    source.len()
+                );
             }
+            let _ = from_cache;
 
             if let Some(mut imported_program) = parsed_program {
                 // IMPORTANT: Recursively process imports from the imported module FIRST
