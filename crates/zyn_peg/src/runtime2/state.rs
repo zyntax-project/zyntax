@@ -8,6 +8,7 @@
 
 use super::memo::{MemoCache, MemoEntry, MemoKey};
 use std::collections::HashMap;
+use std::rc::Rc;
 use zyntax_typed_ast::typed_ast::TypedCatch;
 use zyntax_typed_ast::{
     type_registry::{PrimitiveType, Type, TypeRegistry},
@@ -136,16 +137,26 @@ pub enum ParsedValue {
     Optional(Option<Box<ParsedValue>>),
     /// A generic node handle (for complex AST nodes)
     Node(NodeHandle),
+    // The node variants are shared rather than owned. Every rule's
+    // value is cloned into the memo at the position it started, and a
+    // hit clones it back out; owning them made each of those copy a
+    // whole subtree. Sharing makes the copy a reference count, and a
+    // consumer that needs the node to itself takes it back with
+    // `own`, which only copies when something else still holds it.
     /// A TypedStatement AST node
-    Statement(Box<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedStatement>>),
+    Statement(Rc<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedStatement>>),
     /// A TypedExpression AST node
-    Expression(Box<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>>),
+    Expression(Rc<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>>),
     /// A TypedDeclaration AST node
-    Declaration(Box<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>>),
+    Declaration(Rc<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>>),
     /// A TypedProgram AST node
+    ///
+    /// Owned, not shared: a program is made once at the end of a parse
+    /// and never copied on the way there, so sharing it would only put
+    /// a reference count between a caller and the tree it asked for.
     Program(Box<zyntax_typed_ast::TypedProgram>),
     /// A TypedBlock AST node
-    Block(zyntax_typed_ast::TypedBlock),
+    Block(Rc<zyntax_typed_ast::TypedBlock>),
     /// A field initialization (name -> value)
     FieldInit {
         name: InternedString,
@@ -182,6 +193,14 @@ pub enum ParsedValue {
     MatchArm(zyntax_typed_ast::TypedMatchArm),
     /// A catch clause for try/catch statements
     Catch(TypedCatch),
+}
+
+/// Take a shared value back as an owned one.
+///
+/// Copies only when the value is still held elsewhere, which for a
+/// node the memo remembers is the case exactly when a copy is needed.
+pub fn own<T: Clone>(shared: Rc<T>) -> T {
+    Rc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
 }
 
 /// Handle to an AST node (opaque, managed by builder)

@@ -178,7 +178,8 @@ fn function_body_field_flattens_nested_statement_list() {
     let ParsedValue::Declaration(decl) = value else {
         panic!("expected Declaration, got {value:?}");
     };
-    let zyntax_typed_ast::TypedDeclaration::Function(func) = decl.node else {
+    let zyntax_typed_ast::TypedDeclaration::Function(func) = zyn_peg::runtime2::own(decl).node
+    else {
         panic!("expected Function declaration");
     };
     let body = func.body.expect("function should have a body");

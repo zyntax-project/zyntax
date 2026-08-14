@@ -10,10 +10,11 @@
 //! be used instead as it produces more efficient compiled code.
 
 use super::machine;
-use super::state::{ParseFailure, ParseResult, ParsedValue, ParserState};
+use super::state::{own, ParseFailure, ParseResult, ParsedValue, ParserState};
 use crate::grammar::{ActionIR, CharClass, ExprIR, GrammarIR, PatternIR, RuleIR, RuleModifier};
 use log::{debug, trace};
 use std::collections::HashMap;
+use std::rc::Rc;
 use zyntax_typed_ast::typed_ast::{
     TypedCast, TypedCatch, TypedComputeExpr, TypedComputeModifier, TypedKernelAttr, TypedNamedArg,
     TypedTry,
@@ -477,7 +478,7 @@ impl<'g> GrammarInterpreter<'g> {
                     })
                     .map(|item| self.parsed_value_to_stmt(item))
                     .collect::<Result<Vec<_>, _>>()?,
-                ParsedValue::Statement(s) => vec![*s],
+                ParsedValue::Statement(s) => vec![own(s)],
                 ParsedValue::None => vec![],
                 _ => vec![],
             }
@@ -485,7 +486,7 @@ impl<'g> GrammarInterpreter<'g> {
             vec![]
         };
 
-        Ok(ParsedValue::Block(TypedBlock { statements, span }))
+        Ok(ParsedValue::Block(Rc::new(TypedBlock { statements, span })))
     }
 
     /// Desugar `while let PATTERN = SCRUTINEE { body }` at parse
@@ -575,7 +576,7 @@ impl<'g> GrammarInterpreter<'g> {
             span,
         );
 
-        Ok(ParsedValue::Statement(Box::new(typed_node(
+        Ok(ParsedValue::Statement(Rc::new(typed_node(
             TypedStatement::While(TypedWhile {
                 condition: Box::new(true_lit),
                 body: synthesized_body,
@@ -607,7 +608,7 @@ impl<'g> GrammarInterpreter<'g> {
             span,
         };
 
-        Ok(ParsedValue::Statement(Box::new(typed_node(
+        Ok(ParsedValue::Statement(Rc::new(typed_node(
             TypedStatement::With(TypedWith {
                 handlers: vec![handler],
                 body,
@@ -738,7 +739,7 @@ impl<'g> GrammarInterpreter<'g> {
                 // workaround.
                 let block_val = self.construct_block(fields, state, span)?;
                 let block = match block_val {
-                    ParsedValue::Block(b) => b,
+                    ParsedValue::Block(b) => own(b),
                     other => {
                         return Err(format!(
                             "TypedStatement::Block: construct_block returned non-Block value: {:?}",
@@ -793,7 +794,7 @@ impl<'g> GrammarInterpreter<'g> {
             _ => return Err(format!("unknown TypedStatement variant: {}", variant)),
         };
 
-        Ok(ParsedValue::Statement(Box::new(typed_node(
+        Ok(ParsedValue::Statement(Rc::new(typed_node(
             stmt,
             Type::Primitive(PrimitiveType::Unit),
             span,
@@ -1114,7 +1115,7 @@ impl<'g> GrammarInterpreter<'g> {
             "Block" => {
                 let block = self.construct_block(fields, state, span)?;
                 if let ParsedValue::Block(b) = block {
-                    TypedExpression::Block(b)
+                    TypedExpression::Block(own(b))
                 } else {
                     return Err(
                         "TypedExpression::Block: construct_block returned non-Block value"
@@ -1188,9 +1189,7 @@ impl<'g> GrammarInterpreter<'g> {
             _ => Type::Primitive(PrimitiveType::Unit),
         };
 
-        Ok(ParsedValue::Expression(Box::new(typed_node(
-            expr, ty, span,
-        ))))
+        Ok(ParsedValue::Expression(Rc::new(typed_node(expr, ty, span))))
     }
 
     /// Construct a TypedDeclaration variant
@@ -1521,7 +1520,7 @@ impl<'g> GrammarInterpreter<'g> {
             _ => return Err(format!("unknown TypedDeclaration variant: {}", variant)),
         };
 
-        Ok(ParsedValue::Declaration(Box::new(typed_node(
+        Ok(ParsedValue::Declaration(Rc::new(typed_node(
             decl,
             Type::Never,
             span,
@@ -1959,7 +1958,7 @@ impl<'g> GrammarInterpreter<'g> {
 
         Ok(ParsedValue::FieldInit {
             name,
-            value: Box::new(ParsedValue::Expression(Box::new(value))),
+            value: Box::new(ParsedValue::Expression(Rc::new(value))),
         })
     }
 
@@ -2720,7 +2719,7 @@ impl<'g> GrammarInterpreter<'g> {
                     );
                     acc_expr = cast_node;
                 }
-                Ok(ParsedValue::Expression(Box::new(acc_expr)))
+                Ok(ParsedValue::Expression(Rc::new(acc_expr)))
             }
             "fold_left_ops" => {
                 // fold_left_ops(first, rest) - fold binary operations with left associativity
@@ -2791,7 +2790,7 @@ impl<'g> GrammarInterpreter<'g> {
 
                     // Create Binary expression
                     let binary_op = self.string_to_binary_op(&op_str)?;
-                    acc = ParsedValue::Expression(Box::new(typed_node(
+                    acc = ParsedValue::Expression(Rc::new(typed_node(
                         TypedExpression::Binary(zyntax_typed_ast::TypedBinary {
                             op: binary_op,
                             left: Box::new(left_expr),
@@ -2839,7 +2838,7 @@ impl<'g> GrammarInterpreter<'g> {
                             let mut positional_args = vec![piped_input];
                             positional_args.append(&mut call.positional_args);
                             let ty = call_expr.ty.clone();
-                            acc = ParsedValue::Expression(Box::new(typed_node(
+                            acc = ParsedValue::Expression(Rc::new(typed_node(
                                 TypedExpression::Call(TypedCall {
                                     callee: call.callee,
                                     positional_args,
@@ -2930,7 +2929,7 @@ impl<'g> GrammarInterpreter<'g> {
                 // Handle edge cases
                 if parts_list.is_empty() {
                     // Return empty string
-                    return Ok(ParsedValue::Expression(Box::new(typed_node(
+                    return Ok(ParsedValue::Expression(Rc::new(typed_node(
                         TypedExpression::Literal(zyntax_typed_ast::TypedLiteral::String(
                             state.intern(""),
                         )),
@@ -2943,7 +2942,7 @@ impl<'g> GrammarInterpreter<'g> {
                     // Just return the single part as an expression
                     return self
                         .parsed_value_to_expr(parts_list.into_iter().next().unwrap(), state)
-                        .map(|e| ParsedValue::Expression(Box::new(e)));
+                        .map(|e| ParsedValue::Expression(Rc::new(e)));
                 }
 
                 // Build __fstring__(part1, part2, ...) call.
@@ -2974,7 +2973,7 @@ impl<'g> GrammarInterpreter<'g> {
                     fstring_args.push(unwrapped_expr);
                 }
 
-                Ok(ParsedValue::Expression(Box::new(typed_node(
+                Ok(ParsedValue::Expression(Rc::new(typed_node(
                     TypedExpression::Call(TypedCall {
                         callee: Box::new(typed_node(
                             TypedExpression::Variable(fstring_name),
@@ -3025,7 +3024,7 @@ impl<'g> GrammarInterpreter<'g> {
                             }
                         };
 
-                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                        Ok(ParsedValue::Expression(Rc::new(typed_node(
                             TypedExpression::Field(TypedFieldAccess {
                                 object: Box::new(acc_expr),
                                 field: field_name,
@@ -3063,7 +3062,7 @@ impl<'g> GrammarInterpreter<'g> {
                             None => vec![],
                         };
 
-                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                        Ok(ParsedValue::Expression(Rc::new(typed_node(
                             TypedExpression::MethodCall(TypedMethodCall {
                                 receiver: Box::new(acc_expr),
                                 method: method_name,
@@ -3089,7 +3088,7 @@ impl<'g> GrammarInterpreter<'g> {
                             None => vec![],
                         };
 
-                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                        Ok(ParsedValue::Expression(Rc::new(typed_node(
                             TypedExpression::Call(TypedCall {
                                 callee: Box::new(acc_expr),
                                 positional_args: args,
@@ -3111,7 +3110,7 @@ impl<'g> GrammarInterpreter<'g> {
                         let index_expr =
                             self.parsed_value_to_expr(index.as_ref().clone(), state)?;
 
-                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                        Ok(ParsedValue::Expression(Rc::new(typed_node(
                             TypedExpression::Index(TypedIndex {
                                 object: Box::new(acc_expr),
                                 index: Box::new(index_expr),
@@ -3158,7 +3157,7 @@ impl<'g> GrammarInterpreter<'g> {
                             None => None,
                         };
 
-                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                        Ok(ParsedValue::Expression(Rc::new(typed_node(
                             TypedExpression::Slice(zyntax_typed_ast::TypedSlice {
                                 object: Box::new(acc_expr),
                                 start,
@@ -3178,7 +3177,7 @@ impl<'g> GrammarInterpreter<'g> {
                         // SSA lowering desugars to the early-return
                         // branch.
                         let acc_expr = self.parsed_value_to_expr(acc, state)?;
-                        Ok(ParsedValue::Expression(Box::new(typed_node(
+                        Ok(ParsedValue::Expression(Rc::new(typed_node(
                             TypedExpression::Try(Box::new(acc_expr)),
                             Type::Unknown,
                             span,
@@ -3487,7 +3486,7 @@ impl<'g> GrammarInterpreter<'g> {
         match val {
             ParsedValue::Interned(s) => Ok(s),
             ParsedValue::Text(s) => Ok(state.intern(&s)),
-            ParsedValue::Expression(expr) => match expr.node {
+            ParsedValue::Expression(expr) => match own(expr).node {
                 TypedExpression::Literal(TypedLiteral::String(s)) => Ok(s),
                 _ => Err(format!("field '{}' is not a string/interned", name)),
             },
@@ -3731,7 +3730,7 @@ impl<'g> GrammarInterpreter<'g> {
                         Ok(Some(block))
                     }
                     ParsedValue::None => Ok(None),
-                    ParsedValue::Block(b) => Ok(Some(b)),
+                    ParsedValue::Block(b) => Ok(Some(own(b))),
                     other => {
                         let block = self.parsed_value_to_block(other, state)?;
                         Ok(Some(block))
@@ -3978,7 +3977,7 @@ impl<'g> GrammarInterpreter<'g> {
                 .map(|item| self.parsed_value_to_decl(item))
                 .collect(),
 
-            ParsedValue::Declaration(decl) => Ok(vec![*decl]),
+            ParsedValue::Declaration(decl) => Ok(vec![own(decl)]),
             _ => Err(format!("field '{}' is not a declaration list", name)),
         }
     }
@@ -4291,7 +4290,7 @@ impl<'g> GrammarInterpreter<'g> {
                             }
                         }
                     },
-                    ParsedValue::Declaration(d) => Ok(vec![*d]),
+                    ParsedValue::Declaration(d) => Ok(vec![own(d)]),
                     other => {
                         if let Ok(decl) = self.parsed_value_to_decl(other) {
                             Ok(vec![decl])
@@ -4325,7 +4324,7 @@ impl<'g> GrammarInterpreter<'g> {
     ) -> Result<TypedNode<TypedExpression>, String> {
         let span = Span::new(0, 0);
         match val {
-            ParsedValue::Expression(e) => Ok(*e),
+            ParsedValue::Expression(e) => Ok(own(e)),
             ParsedValue::Literal(lit) => {
                 let ty = match &lit {
                     TypedLiteral::Integer(_) => Type::Primitive(PrimitiveType::I64),
@@ -4387,7 +4386,7 @@ impl<'g> GrammarInterpreter<'g> {
         state: &mut ParserState<'a>,
     ) -> Result<TypedBlock, String> {
         match val {
-            ParsedValue::Block(b) => Ok(b),
+            ParsedValue::Block(b) => Ok(own(b)),
             ParsedValue::List(items) => {
                 // Single-level flatten — see construct_block above
                 // for the rationale. Keeps both stmt-list collection
@@ -4406,7 +4405,7 @@ impl<'g> GrammarInterpreter<'g> {
                 })
             }
             ParsedValue::Statement(s) => Ok(TypedBlock {
-                statements: vec![*s],
+                statements: vec![own(s)],
                 span: Span::new(0, 0),
             }),
             _ => Err("cannot convert value to block".to_string()),
@@ -4416,7 +4415,7 @@ impl<'g> GrammarInterpreter<'g> {
     /// Convert ParsedValue to TypedStatement
     fn parsed_value_to_stmt(&self, val: ParsedValue) -> Result<TypedNode<TypedStatement>, String> {
         match val {
-            ParsedValue::Statement(s) => Ok(*s),
+            ParsedValue::Statement(s) => Ok(own(s)),
             _ => Err("cannot convert value to statement".to_string()),
         }
     }
@@ -4438,7 +4437,7 @@ impl<'g> GrammarInterpreter<'g> {
                 TypedLiteral::Null => TypedLiteralPattern::Null,
                 TypedLiteral::Undefined => TypedLiteralPattern::Null,
             }),
-            ParsedValue::Expression(expr) => match expr.node {
+            ParsedValue::Expression(expr) => match own(expr).node {
                 TypedExpression::Literal(lit) => {
                     self.parsed_value_to_literal_pattern(ParsedValue::Literal(lit), state)
                 }
@@ -4471,7 +4470,7 @@ impl<'g> GrammarInterpreter<'g> {
                 let lit = self.parsed_value_to_literal_pattern(value, state)?;
                 Ok(typed_node(TypedPattern::Literal(lit), Type::Any, span))
             }
-            ParsedValue::Expression(expr) => match expr.node {
+            ParsedValue::Expression(expr) => match own(expr).node {
                 TypedExpression::Literal(lit) => {
                     let lit_pat =
                         self.parsed_value_to_literal_pattern(ParsedValue::Literal(lit), state)?;
@@ -4489,13 +4488,13 @@ impl<'g> GrammarInterpreter<'g> {
         val: ParsedValue,
     ) -> Result<TypedNode<TypedDeclaration>, String> {
         match val {
-            ParsedValue::Declaration(d) => Ok(*d),
+            ParsedValue::Declaration(d) => Ok(own(d)),
             ParsedValue::Statement(s) => {
                 // Top-level `let` bindings come through as TypedStatement::Let; promote them
                 // to TypedDeclaration::Variable so they integrate with the program's declaration list.
                 let span = s.span.clone();
                 let ty = s.ty.clone();
-                match s.node {
+                match own(s).node {
                     TypedStatement::Let(let_stmt) => Ok(TypedNode {
                         node: TypedDeclaration::Variable(TypedVariable {
                             name: let_stmt.name,
