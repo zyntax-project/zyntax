@@ -8,6 +8,7 @@
 
 pub mod combinator;
 pub mod interpreter;
+pub mod machine;
 pub mod memo;
 pub mod state;
 

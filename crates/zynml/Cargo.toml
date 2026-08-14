@@ -15,6 +15,7 @@ name = "zynml"
 path = "src/main.rs"
 
 [dependencies]
+zyn_peg = { path = "../zyn_peg" }
 # Zyntax embedding SDK for grammar and runtime
 zyntax_embed = { path = "../zyntax_embed" }
 
