@@ -26,16 +26,51 @@ pub enum MemoEntry {
     InProgress,
 }
 
+/// Hasher for a key that is two machine words.
+///
+/// The default hasher is SipHash, which is built to resist adversarial
+/// input. A memo key is a position and a rule index the parser derived
+/// itself, so nothing about it is adversarial, and a parse performs
+/// three cache operations per rule execution — hundreds of thousands
+/// over one file. Multiply-xor over the two words is enough to spread
+/// them and costs a few instructions instead of a full SipHash round.
+#[derive(Default, Clone, Copy)]
+pub struct MemoHasher(u64);
+
+impl std::hash::Hasher for MemoHasher {
+    fn finish(&self) -> u64 {
+        // A final mix so the low bits, which the table indexes on, carry
+        // information from the whole key.
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type MemoBuildHasher = std::hash::BuildHasherDefault<MemoHasher>;
+
 /// Memoization cache for packrat parsing
 pub struct MemoCache {
-    entries: HashMap<MemoKey, MemoEntry>,
+    entries: HashMap<MemoKey, MemoEntry, MemoBuildHasher>,
 }
 
 impl MemoCache {
     /// Create a new empty cache
     pub fn new() -> Self {
         MemoCache {
-            entries: HashMap::new(),
+            entries: HashMap::default(),
         }
     }
 

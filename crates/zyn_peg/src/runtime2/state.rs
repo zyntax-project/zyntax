@@ -95,6 +95,10 @@ pub struct ParserState<'a> {
     memo: MemoCache,
     /// Stack of local bindings for actions
     bindings: HashMap<String, ParsedValue>,
+    /// What each change to `bindings` replaced, so an alternative that
+    /// fails can be undone by rolling back to a mark instead of
+    /// restoring a copy of the whole map.
+    binding_undo: Vec<(String, Option<ParsedValue>)>,
     /// Furthest position reached (for error reporting)
     furthest_pos: usize,
     /// Expected items at furthest position
@@ -203,6 +207,7 @@ impl<'a> ParserState<'a> {
             type_registry,
             memo: MemoCache::new(),
             bindings: HashMap::new(),
+            binding_undo: Vec::new(),
             furthest_pos: 0,
             furthest_expected: Vec::new(),
         }
@@ -424,7 +429,8 @@ impl<'a> ParserState<'a> {
 
     /// Set a binding
     pub fn set_binding(&mut self, name: &str, value: ParsedValue) {
-        self.bindings.insert(name.to_string(), value);
+        let previous = self.bindings.insert(name.to_string(), value);
+        self.binding_undo.push((name.to_string(), previous));
     }
 
     /// Get a binding
@@ -433,18 +439,48 @@ impl<'a> ParserState<'a> {
     }
 
     /// Clear all bindings (between rule invocations)
+    ///
+    /// Records what it removed, so a mark taken before the clear still
+    /// rolls back to the bindings that were in place then.
     pub fn clear_bindings(&mut self) {
-        self.bindings.clear();
+        for (name, value) in self.bindings.drain() {
+            self.binding_undo.push((name, Some(value)));
+        }
     }
 
-    /// Save current bindings (for backtracking)
-    pub fn save_bindings(&self) -> HashMap<String, ParsedValue> {
-        self.bindings.clone()
+    /// Mark the current bindings, to roll back to after a failed
+    /// alternative.
+    ///
+    /// Returns a position in the undo log rather than a copy of the
+    /// bindings. A PEG takes one of these per alternative tried and per
+    /// repetition step, and copying the map made that cost the size of
+    /// everything bound so far rather than the size of what the
+    /// alternative changed.
+    pub fn save_bindings(&self) -> usize {
+        self.binding_undo.len()
     }
 
-    /// Restore bindings (after backtracking)
-    pub fn restore_bindings(&mut self, saved: HashMap<String, ParsedValue>) {
-        self.bindings = saved;
+    /// Roll back to a mark from [`Self::save_bindings`].
+    ///
+    /// Undoing in reverse order restores the value each change
+    /// replaced, so a name written several times ends at what it held
+    /// when the mark was taken. Restoring twice from one mark is
+    /// harmless: the second call finds nothing left to undo.
+    pub fn restore_bindings(&mut self, mark: usize) {
+        while self.binding_undo.len() > mark {
+            let (name, previous) = match self.binding_undo.pop() {
+                Some(entry) => entry,
+                None => break,
+            };
+            match previous {
+                Some(value) => {
+                    self.bindings.insert(name, value);
+                }
+                None => {
+                    self.bindings.remove(&name);
+                }
+            }
+        }
     }
 
     // =========================================================================

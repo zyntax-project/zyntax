@@ -33,10 +33,33 @@ use zyntax_typed_ast::{
 };
 
 /// Runtime interpreter for GrammarIR
+/// What a `RuleRef` names, decided once when the interpreter is built.
+///
+/// A reference is either one of the built-in character patterns or a
+/// rule in the grammar. Deciding that per execution meant a chain of
+/// string comparisons against every built-in name, then a lookup of the
+/// rule, then a second lookup for its memo id — three passes over the
+/// same string, tens of thousands of times per parse.
+#[derive(Clone, Copy)]
+enum RuleTarget {
+    AsciiDigit,
+    AsciiAlpha,
+    AsciiAlphanumeric,
+    AsciiHexDigit,
+    Any,
+    Soi,
+    Eoi,
+    /// A grammar rule, with the memo id it is stored under.
+    Rule(usize),
+}
+
 pub struct GrammarInterpreter<'g> {
     grammar: &'g GrammarIR,
     /// Rule ID counter for memoization
     rule_id_map: HashMap<String, usize>,
+    /// What each referenced name resolves to, and the memo id for a
+    /// rule, so executing a reference is one lookup rather than three.
+    rule_targets: HashMap<String, RuleTarget>,
 }
 
 impl<'g> GrammarInterpreter<'g> {
@@ -46,9 +69,28 @@ impl<'g> GrammarInterpreter<'g> {
         for (i, name) in grammar.rules.keys().enumerate() {
             rule_id_map.insert(name.clone(), i);
         }
+        let mut rule_targets: HashMap<String, RuleTarget> = grammar
+            .rules
+            .keys()
+            .map(|name| (name.clone(), RuleTarget::Rule(rule_id_map[name])))
+            .collect();
+        // Built-ins win over a grammar rule of the same name, which is
+        // the order the per-execution chain checked them in.
+        for (name, target) in [
+            ("ASCII_DIGIT", RuleTarget::AsciiDigit),
+            ("ASCII_ALPHA", RuleTarget::AsciiAlpha),
+            ("ASCII_ALPHANUMERIC", RuleTarget::AsciiAlphanumeric),
+            ("ASCII_HEX_DIGIT", RuleTarget::AsciiHexDigit),
+            ("ANY", RuleTarget::Any),
+            ("SOI", RuleTarget::Soi),
+            ("EOI", RuleTarget::Eoi),
+        ] {
+            rule_targets.insert(name.to_string(), target);
+        }
         GrammarInterpreter {
             grammar,
             rule_id_map,
+            rule_targets,
         }
     }
 
@@ -78,6 +120,21 @@ impl<'g> GrammarInterpreter<'g> {
         rule: &RuleIR,
         state: &mut ParserState<'a>,
     ) -> ParseResult<ParsedValue> {
+        let memo_rule_id = self
+            .rule_id_map
+            .get(&rule.name)
+            .copied()
+            .unwrap_or(usize::MAX);
+        self.execute_rule_with_id(rule, memo_rule_id, state)
+    }
+
+    /// Execute a rule whose memo id the caller already resolved.
+    fn execute_rule_with_id<'a>(
+        &self,
+        rule: &RuleIR,
+        memo_rule_id: usize,
+        state: &mut ParserState<'a>,
+    ) -> ParseResult<ParsedValue> {
         let start_pos = state.pos();
         trace!("execute_rule: {} at pos {}", rule.name, start_pos);
 
@@ -85,11 +142,6 @@ impl<'g> GrammarInterpreter<'g> {
         // This converts exponential backtracking to O(n * grammar_size) parsing.
         // InProgress entries detect left-recursive rule cycles.
         use crate::runtime2::memo::MemoEntry;
-        let memo_rule_id = self
-            .rule_id_map
-            .get(&rule.name)
-            .copied()
-            .unwrap_or(usize::MAX);
         if let Some(entry) = state.check_memo(memo_rule_id) {
             return match entry.clone() {
                 MemoEntry::Success { value, end_pos } => {
@@ -4989,48 +5041,50 @@ impl<'g> GrammarInterpreter<'g> {
             PatternIR::CharClass(class) => self.execute_char_class(class, state),
 
             PatternIR::RuleRef { rule_name, binding } => {
-                // Check for built-in patterns first
-                let result = match rule_name.as_str() {
-                    "ASCII_DIGIT" => state
+                // One lookup decides what this name is and, for a rule,
+                // the memo id it is stored under.
+                let result = match self.rule_targets.get(rule_name.as_str()).copied() {
+                    Some(RuleTarget::AsciiDigit) => state
                         .match_char(|c| c.is_ascii_digit(), "digit")
                         .map(|c| ParsedValue::Text(c.to_string())),
-                    "ASCII_ALPHA" => state
+                    Some(RuleTarget::AsciiAlpha) => state
                         .match_char(|c| c.is_ascii_alphabetic(), "letter")
                         .map(|c| ParsedValue::Text(c.to_string())),
-                    "ASCII_ALPHANUMERIC" => state
+                    Some(RuleTarget::AsciiAlphanumeric) => state
                         .match_char(|c| c.is_ascii_alphanumeric(), "alphanumeric")
                         .map(|c| ParsedValue::Text(c.to_string())),
-                    "ASCII_HEX_DIGIT" => state
+                    Some(RuleTarget::AsciiHexDigit) => state
                         .match_char(|c| c.is_ascii_hexdigit(), "hex digit")
                         .map(|c| ParsedValue::Text(c.to_string())),
-                    "ANY" => match state.peek_char() {
+                    Some(RuleTarget::Any) => match state.peek_char() {
                         Some(c) => {
                             state.advance();
                             ParseResult::Success(ParsedValue::Text(c.to_string()), state.pos())
                         }
                         None => state.fail("any character"),
                     },
-                    "SOI" => {
+                    Some(RuleTarget::Soi) => {
                         if state.pos() == 0 {
                             ParseResult::Success(ParsedValue::None, 0)
                         } else {
                             state.fail("start of input")
                         }
                     }
-                    "EOI" => {
+                    Some(RuleTarget::Eoi) => {
                         if state.is_eof() {
                             ParseResult::Success(ParsedValue::None, state.pos())
                         } else {
                             state.fail("end of input")
                         }
                     }
-                    _ => {
-                        // Look up rule in grammar
-                        match self.grammar.get_rule(rule_name) {
-                            Some(rule) => self.execute_rule(rule, state),
-                            None => state.fail(&format!("unknown rule: {}", rule_name)),
-                        }
-                    }
+                    Some(RuleTarget::Rule(memo_id)) => match self.grammar.get_rule(rule_name) {
+                        Some(rule) => self.execute_rule_with_id(rule, memo_id, state),
+                        None => state.fail(&format!("unknown rule: {}", rule_name)),
+                    },
+                    None => match self.grammar.get_rule(rule_name) {
+                        Some(rule) => self.execute_rule(rule, state),
+                        None => state.fail(&format!("unknown rule: {}", rule_name)),
+                    },
                 };
 
                 // Store binding if specified
