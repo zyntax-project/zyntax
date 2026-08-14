@@ -40,6 +40,11 @@ impl TypeId {
     pub fn as_u32(self) -> u32 {
         self.0
     }
+
+    /// Ensure subsequently allocated IDs cannot collide with restored data.
+    pub fn reserve_at_least(next_id: u32) {
+        NEXT_TYPE_ID.fetch_max(next_id, Ordering::SeqCst);
+    }
 }
 
 /// Primitive types common across languages
@@ -997,7 +1002,7 @@ impl Default for TypeMetadata {
 pub type QualifiedName = (Option<InternedString>, InternedString);
 
 /// The type registry that manages all registered types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeRegistry {
     /// Distinguishes one registry from another in trace output.
     instance: u64,
@@ -1083,6 +1088,29 @@ impl TypeRegistry {
     /// Modules in the import scope, in the order they were added.
     pub fn imported_modules(&self) -> &[InternedString] {
         &self.imported_modules
+    }
+
+    /// Advance the process-global allocator past every ID stored here.
+    ///
+    /// Build artifacts restore registries created in another process. Calling
+    /// this before parsing new source keeps those restored IDs globally unique.
+    pub fn reserve_type_ids(&self) {
+        let mut max_id = self.types.keys().map(|id| id.as_u32()).max().unwrap_or(0);
+        let mut include = |id: &TypeId| max_id = max_id.max(id.as_u32());
+
+        self.traits.keys().for_each(&mut include);
+        self.implementations.keys().for_each(&mut include);
+        self.trait_hierarchy.keys().for_each(&mut include);
+        self.trait_hierarchy
+            .values()
+            .flatten()
+            .for_each(&mut include);
+        for (type_id, trait_ids) in &self.type_implementations {
+            include(type_id);
+            trait_ids.iter().for_each(&mut include);
+        }
+
+        TypeId::reserve_at_least(max_id.saturating_add(1));
     }
 
     /// Whether a definition only stands in for a name that has been

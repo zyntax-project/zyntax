@@ -47,6 +47,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 // Re-export zyntax_embed types for convenience
@@ -84,6 +85,31 @@ pub const ZYNML_STDLIB_TENSOR: &str = include_str!("../stdlib/tensor.zynml");
 
 /// The embedded ZynML standard library - simd / typed-buffer module
 pub const ZYNML_STDLIB_SIMD: &str = include_str!("../stdlib/simd.zynml");
+
+const ZYNML_COMPILED_GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/zynml.grammar"));
+const ZYNML_COMPILED_PRELUDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prelude.zast"));
+const ZYNML_COMPILED_TENSOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tensor.zast"));
+const ZYNML_COMPILED_SIMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/simd.zast"));
+
+static PRELUDE: OnceLock<Result<zyntax_embed::CompiledImport, String>> = OnceLock::new();
+static TENSOR: OnceLock<Result<zyntax_embed::CompiledImport, String>> = OnceLock::new();
+static SIMD: OnceLock<Result<zyntax_embed::CompiledImport, String>> = OnceLock::new();
+
+fn compiled_import(
+    bytes: &'static [u8],
+    cache: &'static OnceLock<Result<zyntax_embed::CompiledImport, String>>,
+) -> &'static Result<zyntax_embed::CompiledImport, String> {
+    cache.get_or_init(|| {
+        zyntax_embed::CompiledImport::decode(bytes).map_err(|error| error.to_string())
+    })
+}
+
+fn decode_compiled_import(
+    bytes: &'static [u8],
+    cache: &'static OnceLock<Result<zyntax_embed::CompiledImport, String>>,
+) -> Result<zyntax_embed::CompiledImport, String> {
+    compiled_import(bytes, cache).clone()
+}
 
 /// Required ZRTL plugins for ZynML
 pub const REQUIRED_PLUGINS: &[&str] = &[
@@ -219,8 +245,9 @@ impl ZynML {
 
     /// Create a new ZynML runtime with custom configuration
     pub fn with_config(config: ZynMLConfig) -> Result<Self> {
-        // Compile the grammar
-        let grammar = LanguageGrammar::compile_zyn(ZYNML_GRAMMAR)
+        // The grammar and bundled stdlib are compiled by build.rs. Production
+        // startup only decodes artifacts; it never parses fixed source.
+        let grammar = LanguageGrammar::from_compiled_bytes(ZYNML_COMPILED_GRAMMAR)
             .map_err(|e| ZynMLError::GrammarError(e.to_string()))?;
 
         // Create runtime engine according to profile, with any per-run
@@ -249,10 +276,8 @@ impl ZynML {
             ),
         };
 
-        // Register stdlib import resolver. Both engines need this so
-        // `import prelude` / `import tensor` resolve to embedded source —
-        // without it, tensor methods compile to unresolved calls and
-        // segfault at runtime.
+        // Keep source imports as a development fallback for bundles that do
+        // not provide a compiled artifact for a module.
         let stdlib_resolver: zyntax_embed::ImportResolverCallback =
             Box::new(|module_name| match module_name {
                 "prelude" => Ok(Some(ZYNML_STDLIB_PRELUDE.to_string())),
@@ -263,6 +288,30 @@ impl ZynML {
         match &mut runtime {
             RuntimeEngine::Classic(rt) => rt.add_import_resolver(stdlib_resolver),
             RuntimeEngine::Tiered(rt) => rt.add_import_resolver(stdlib_resolver),
+        }
+
+        // Restore registries before any user source is parsed, reserving their
+        // build-time type IDs. The resolver still clones an AST only when its
+        // module is actually imported.
+        for (bytes, cache) in [
+            (ZYNML_COMPILED_PRELUDE, &PRELUDE),
+            (ZYNML_COMPILED_TENSOR, &TENSOR),
+            (ZYNML_COMPILED_SIMD, &SIMD),
+        ] {
+            compiled_import(bytes, cache)
+                .as_ref()
+                .map_err(|error| ZynMLError::GrammarError(error.clone()))?;
+        }
+        let compiled_stdlib: zyntax_embed::CompiledImportResolverCallback =
+            Box::new(|module_name| match module_name {
+                "prelude" => decode_compiled_import(ZYNML_COMPILED_PRELUDE, &PRELUDE).map(Some),
+                "tensor" => decode_compiled_import(ZYNML_COMPILED_TENSOR, &TENSOR).map(Some),
+                "simd" => decode_compiled_import(ZYNML_COMPILED_SIMD, &SIMD).map(Some),
+                _ => Ok(None),
+            });
+        match &mut runtime {
+            RuntimeEngine::Classic(rt) => rt.add_compiled_import_resolver(compiled_stdlib),
+            RuntimeEngine::Tiered(rt) => rt.add_compiled_import_resolver(compiled_stdlib),
         }
 
         // Load required plugins BEFORE registering grammar
@@ -314,8 +363,9 @@ impl ZynML {
             RuntimeEngine::Tiered(rt) => rt.register_grammar("zynml", grammar.clone()),
         }
 
-        // Optionally compile Grammar2 for direct TypedAST parsing
-        let grammar2 = Grammar2::from_source(ZYNML_GRAMMAR).ok();
+        // Share the already-decoded GrammarIR rather than parsing the grammar
+        // a second time for the direct AST API.
+        let grammar2 = grammar.direct_parser();
 
         Ok(Self {
             runtime,
@@ -622,6 +672,47 @@ mod tests {
         println!("Language name: {}", grammar.name());
         println!("Language version: {}", grammar.version());
         println!("File extensions: {:?}", grammar.file_extensions());
+    }
+
+    #[test]
+    fn test_embedded_compiled_artifacts_decode() {
+        let grammar = LanguageGrammar::from_compiled_bytes(ZYNML_COMPILED_GRAMMAR).unwrap();
+        assert_eq!(grammar.name(), "ZynML");
+        assert!(grammar.direct_parser().is_some());
+
+        let prelude = zyntax_embed::CompiledImport::decode(ZYNML_COMPILED_PRELUDE).unwrap();
+        assert_eq!(prelude.language(), "zynml");
+        assert_eq!(prelude.module_name(), "prelude");
+        assert!(!prelude.program().declarations.is_empty());
+        assert!(prelude
+            .program()
+            .type_registry
+            .get_all_types()
+            .next()
+            .is_some());
+    }
+
+    #[test]
+    fn test_embedded_prelude_compiles_and_executes() {
+        std::thread::Builder::new()
+            .name("compiled-prelude-test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut runtime = ZynML::new().unwrap();
+                runtime
+                    .load_source(
+                        r#"
+                        import prelude
+                        fn main() -> i64 { return sqrt(1.0) as i64 }
+                        "#,
+                    )
+                    .unwrap();
+                let result: i64 = runtime.call_with_result("main").unwrap();
+                assert_eq!(result, 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

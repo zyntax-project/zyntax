@@ -8,10 +8,11 @@
 //! - Represents repetitions directly: `items*` returns `Vec<T>`
 //! - Supports semantic actions as direct Rust code
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A complete grammar definition with all its rules and metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrammarIR {
     /// Language metadata (name, version, extensions)
     pub metadata: GrammarMetadata,
@@ -28,7 +29,7 @@ pub struct GrammarIR {
 }
 
 /// Language metadata from @language directive
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GrammarMetadata {
     pub name: String,
     pub version: String,
@@ -37,7 +38,7 @@ pub struct GrammarMetadata {
 }
 
 /// Type declarations from @types directive
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeDeclarations {
     /// Opaque type names (ZRTL-backed)
     pub opaque_types: Vec<String>,
@@ -46,7 +47,7 @@ pub struct TypeDeclarations {
 }
 
 /// Built-in function mappings from @builtin directive
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuiltinMappings {
     /// Direct function mappings: name -> symbol
     pub functions: HashMap<String, String>,
@@ -57,7 +58,7 @@ pub struct BuiltinMappings {
 }
 
 /// A single grammar rule with pattern and optional action
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleIR {
     /// Rule name (e.g., "fn_def", "expression")
     pub name: String,
@@ -72,7 +73,7 @@ pub struct RuleIR {
 }
 
 /// Rule modifiers that affect parsing behavior
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleModifier {
     /// `@` - Atomic rule (no whitespace between elements)
     Atomic,
@@ -88,7 +89,7 @@ pub enum RuleModifier {
 ///
 /// Patterns describe what to parse and how to capture the results.
 /// Named bindings (`name:rule`) create local variables accessible in actions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PatternIR {
     /// Literal string match: `"fn"`, `"("`, etc.
     /// Literals never produce bindings.
@@ -146,7 +147,7 @@ pub enum PatternIR {
 }
 
 /// Character class for matching character ranges
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CharClass {
     /// Single character: `'a'`
     Single(char),
@@ -164,7 +165,7 @@ pub enum CharClass {
 ///
 /// Actions describe how to construct AST nodes from parsed results.
 /// They can reference named bindings from the pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActionIR {
     /// Direct AST node construction
     /// ```zyn
@@ -238,7 +239,7 @@ pub enum ActionIR {
 /// Expression IR for action code
 ///
 /// Expressions can reference bindings, call methods, access fields, etc.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExprIR {
     /// Reference to a named binding: `name`
     Binding(String),

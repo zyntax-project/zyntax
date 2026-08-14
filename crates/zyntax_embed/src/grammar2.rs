@@ -193,6 +193,10 @@ pub struct Grammar2 {
 }
 
 impl Grammar2 {
+    pub(crate) fn from_shared_ir(grammar: Arc<GrammarIR>) -> Self {
+        Self { grammar }
+    }
+
     /// Create a grammar from .zyn source code
     pub fn from_source(zyn_source: &str) -> Grammar2Result<Self> {
         let grammar =

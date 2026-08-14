@@ -1020,6 +1020,13 @@ fn dynamic_to_i64(value: &DynamicValue) -> i64 {
 /// * `Err(message)` - Error resolving the module
 pub type ImportResolverCallback = Box<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
 
+/// Callback for imports parsed into build-time artifacts.
+///
+/// Compiled resolvers run before source resolvers so production deployments
+/// can keep source fallbacks for development without paying their parse cost.
+pub type CompiledImportResolverCallback =
+    Box<dyn Fn(&str) -> Result<Option<crate::CompiledImport>, String> + Send + Sync>;
+
 // Re-export the full ImportResolver trait from the compiler for advanced use cases
 pub use zyntax_compiler::{
     BuiltinResolver, ChainedResolver, ExportedSymbol, ImportContext, ImportError, ImportManager,
@@ -1102,6 +1109,8 @@ pub struct ZyntaxRuntime {
     external_functions: HashMap<String, ExternalFunction>,
     /// Import resolver callbacks (tried in order)
     import_resolvers: Vec<ImportResolverCallback>,
+    /// Build-time parsed imports, consulted before source resolvers.
+    compiled_import_resolvers: Vec<CompiledImportResolverCallback>,
     /// Registered language grammars (language name -> grammar)
     grammars: HashMap<String, Arc<LanguageGrammar>>,
     /// File extension to language mapping (e.g., ".zig" -> "zig")
@@ -1183,6 +1192,7 @@ impl ZyntaxRuntime {
             config,
             external_functions: HashMap::new(),
             import_resolvers: Vec::new(),
+            compiled_import_resolvers: Vec::new(),
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
@@ -1232,6 +1242,7 @@ impl ZyntaxRuntime {
             config: CompilationConfig::default(),
             external_functions: HashMap::new(),
             import_resolvers: Vec::new(),
+            compiled_import_resolvers: Vec::new(),
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
@@ -1825,6 +1836,7 @@ impl ZyntaxRuntime {
             &self.grammars,
             &self.plugin_signatures,
             &self.import_resolvers,
+            &self.compiled_import_resolvers,
             program,
             type_registry,
         )
@@ -2565,6 +2577,11 @@ impl ZyntaxRuntime {
     /// ```
     pub fn add_import_resolver(&mut self, resolver: ImportResolverCallback) {
         self.import_resolvers.push(resolver);
+    }
+
+    /// Register a resolver for build-time parsed import artifacts.
+    pub fn add_compiled_import_resolver(&mut self, resolver: CompiledImportResolverCallback) {
+        self.compiled_import_resolvers.push(resolver);
     }
 
     /// Add a file-system based import resolver
@@ -3394,6 +3411,8 @@ pub struct TieredRuntime {
     /// — consulted during `lower_typed_program` to pull in stdlib source
     /// (`prelude`, `tensor`, …) and any user-supplied module sources.
     import_resolvers: Vec<ImportResolverCallback>,
+    /// Build-time parsed imports, consulted before source resolvers.
+    compiled_import_resolvers: Vec<CompiledImportResolverCallback>,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
@@ -3708,6 +3727,7 @@ impl TieredRuntime {
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
             import_resolvers: Vec::new(),
+            compiled_import_resolvers: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
             builtin_aliases: indexmap::IndexMap::new(),
@@ -3741,6 +3761,11 @@ impl TieredRuntime {
     /// [`ZyntaxRuntime::add_import_resolver`].
     pub fn add_import_resolver(&mut self, resolver: ImportResolverCallback) {
         self.import_resolvers.push(resolver);
+    }
+
+    /// Register a resolver for build-time parsed import artifacts.
+    pub fn add_compiled_import_resolver(&mut self, resolver: CompiledImportResolverCallback) {
+        self.compiled_import_resolvers.push(resolver);
     }
 
     /// Extern aliases for typed-program compiles, the counterpart of
@@ -5469,6 +5494,7 @@ impl TieredRuntime {
             &self.grammars,
             &self.plugin_signatures,
             &self.import_resolvers,
+            &self.compiled_import_resolvers,
             &mut program,
             &mut type_registry,
         )?;

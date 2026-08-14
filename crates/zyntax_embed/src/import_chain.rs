@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::grammar::LanguageGrammar;
-use crate::runtime::{ImportResolverCallback, RuntimeError, RuntimeResult};
+use crate::runtime::{
+    CompiledImportResolverCallback, ImportResolverCallback, RuntimeError, RuntimeResult,
+};
 
 /// Resolve `module_path` against an ordered list of resolver callbacks.
 /// Returns `Ok(Some(source))` from the first resolver that knows about
@@ -30,12 +32,28 @@ pub(crate) fn resolve_import_with(
     Ok(None)
 }
 
-/// Parsed imports, keyed by module name and source contents.
+fn resolve_compiled_import_with(
+    import_resolvers: &[CompiledImportResolverCallback],
+    module_path: &str,
+) -> Result<Option<crate::CompiledImport>, String> {
+    for resolver in import_resolvers {
+        match resolver(module_path) {
+            Ok(Some(import)) => return Ok(Some(import)),
+            Ok(None) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// Parsed source imports, keyed by module, source, grammar, and native ABI.
 ///
 /// The key carries the source's length and hash rather than the text so
 /// a hit costs no comparison of 30 KB, and so a module whose text
-/// changes between compiles misses rather than returning a stale tree.
-type ParsedImportKey = (String, usize, u64);
+/// changes between compiles misses rather than returning a stale tree. The
+/// grammar and plugin-signature fingerprints prevent reuse across parsers or
+/// builtin ABIs that would produce a different tree.
+type ParsedImportKey = (String, usize, u64, u64, u64);
 
 fn parsed_import_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<ParsedImportKey, zyntax_typed_ast::TypedProgram>,
@@ -58,10 +76,34 @@ fn fnv1a(bytes: &str) -> u64 {
     h
 }
 
+fn plugin_signatures_fingerprint(
+    signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
+) -> u64 {
+    let mut symbols: Vec<_> = signatures.iter().collect();
+    symbols.sort_by_key(|(name, _)| name.as_str());
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut update = |bytes: &[u8]| {
+        for byte in bytes {
+            h ^= *byte as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    for (name, sig) in symbols {
+        update(name.as_bytes());
+        update(&[0, sig.param_count, sig.flags.0]);
+        update(&sig.return_type.0.to_le_bytes());
+        for param in &sig.params {
+            update(&param.0.to_le_bytes());
+        }
+    }
+    h
+}
+
 pub(crate) fn process_imports_for_traits(
     grammars: &std::collections::HashMap<String, std::sync::Arc<crate::grammar::LanguageGrammar>>,
     plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
     import_resolvers: &[crate::runtime::ImportResolverCallback],
+    compiled_import_resolvers: &[crate::runtime::CompiledImportResolverCallback],
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
@@ -78,6 +120,7 @@ pub(crate) fn process_imports_for_traits(
         grammars,
         plugin_signatures,
         import_resolvers,
+        compiled_import_resolvers,
         program,
         type_registry,
         &mut processed,
@@ -88,6 +131,7 @@ fn process_imports_inner(
     grammars: &std::collections::HashMap<String, std::sync::Arc<crate::grammar::LanguageGrammar>>,
     plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
     import_resolvers: &[crate::runtime::ImportResolverCallback],
+    compiled_import_resolvers: &[crate::runtime::CompiledImportResolverCallback],
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
     processed: &mut std::collections::HashSet<String>,
@@ -118,117 +162,139 @@ fn process_imports_inner(
         // Mark as processed BEFORE recursive processing
         processed.insert(module_name.clone());
 
-        // Try to resolve the import using our import resolvers
-        if let Ok(Some(source)) = resolve_import_with(import_resolvers, &module_name) {
-            // Find a grammar to parse the imported module
-            // Try each registered grammar until one succeeds
-            // Pass plugin signatures to ensure proper extern function declarations
-            //
-            // An imported module's text does not change while the process
-            // runs, and the stdlib is imported by every program compiled,
-            // so the parse is repeated verbatim on every compile. Reusing
-            // the result costs a clone of the parsed program, which is the
-            // same order as the rest of lowering and an order below what
-            // parsing 30 KB of prelude costs.
-            let cache_key = (module_name.clone(), source.len(), fnv1a(&source));
-            let mut parsed_program = parsed_import_cache()
-                .lock()
-                .ok()
-                .and_then(|c| c.get(&cache_key).cloned());
-            let from_cache = parsed_program.is_some();
-            if parsed_program.is_none() {
-                for (_lang_name, grammar) in grammars.iter() {
-                    let _t = std::time::Instant::now();
-                    match grammar.parse_with_signatures(&source, &module_name, &plugin_signatures) {
-                        Ok(imported_program) => {
-                            if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
-                                eprintln!(
-                                    "[IMPORT-PARSE] {module_name} {} bytes in {:.2} ms",
-                                    source.len(),
-                                    _t.elapsed().as_secs_f64() * 1000.0
-                                );
-                            }
-                            if let Ok(mut c) = parsed_import_cache().lock() {
-                                c.insert(cache_key.clone(), imported_program.clone());
-                            }
-                            parsed_program = Some(imported_program);
-                            break;
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            } else if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
-                eprintln!(
-                    "[IMPORT-PARSE] {module_name} reused ({} bytes)",
-                    source.len()
-                );
-            }
-            let _ = from_cache;
+        let compiled_import = resolve_compiled_import_with(compiled_import_resolvers, &module_name)
+            .map_err(|e| {
+                RuntimeError::Execution(format!(
+                    "Failed to resolve compiled import '{module_name}': {e}"
+                ))
+            })?;
 
-            if let Some(mut imported_program) = parsed_program {
-                // IMPORTANT: Recursively process imports from the imported module FIRST
-                // This ensures transitive dependencies (e.g., tensor -> prelude) are loaded
-                // before we process the imported module's declarations
-                process_imports_inner(
-                    grammars,
-                    plugin_signatures,
-                    import_resolvers,
-                    &mut imported_program,
-                    type_registry,
-                    processed,
-                )?;
-
-                // First, merge the TypeRegistry from the imported module
-                // This includes struct definitions, trait definitions, etc.
-                // The merge also puts the imported module into this
-                // registry's resolution scope.
-                type_registry.merge_from(&imported_program.type_registry);
-
-                // The declarations that follow belong to the imported
-                // module, so register them under its name rather than the
-                // importing module's.
-                let imported_module = imported_program.type_registry.current_module();
-                type_registry.with_module(imported_module, |type_registry| {
-                    // Register struct types from Class declarations in the imported module
-                    // This ensures structs are available before impl block processing
-                    if let Err(e) = register_struct_declarations(&imported_program, type_registry) {
-                        log::warn!(
-                            "Failed to register struct declarations from '{}': {}",
-                            module_name,
-                            e
-                        );
-                    }
-
-                    // Process extern declarations from the imported module
-                    // to register opaque types in the type registry
-                    if let Err(e) =
-                        process_extern_declarations_mut(&imported_program, type_registry)
-                    {
-                        log::warn!(
-                            "Failed to process extern declarations from '{}': {}",
-                            module_name,
-                            e
-                        );
-                    }
-                });
-
-                // Merge declarations from imported module into main program
-                // Filter out the import declarations themselves to avoid re-processing
-                for imported_decl in imported_program.declarations.drain(..) {
-                    if !matches!(imported_decl.node, TypedDeclaration::Import(_)) {
-                        program.declarations.push(imported_decl);
-                    }
-                }
-
-                log::debug!("Merged declarations from '{}'", module_name);
-            } else {
-                log::warn!(
-                    "Failed to parse imported module '{}' with any registered grammar",
+        let mut parsed_program = if let Some(compiled_import) = compiled_import {
+            if compiled_import.module_name() != module_name {
+                return Err(RuntimeError::Execution(format!(
+                    "Compiled import resolver returned module '{}' for request '{}'",
+                    compiled_import.module_name(),
                     module_name
+                )));
+            }
+            let grammar = grammars.get(compiled_import.language()).ok_or_else(|| {
+                RuntimeError::Execution(format!(
+                    "Compiled import '{}' requires unregistered language '{}'",
+                    module_name,
+                    compiled_import.language()
+                ))
+            })?;
+            let mut imported_program = compiled_import.into_program();
+            grammar
+                .inject_builtin_externs(&mut imported_program, Some(plugin_signatures))
+                .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+            if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                eprintln!(
+                    "[IMPORT-PARSE] {module_name} loaded from build artifact ({} declarations)",
+                    imported_program.declarations.len()
                 );
             }
+            Some(imported_program)
+        } else if let Some(source) =
+            resolve_import_with(import_resolvers, &module_name).map_err(|e| {
+                RuntimeError::Execution(format!("Failed to resolve import '{module_name}': {e}"))
+            })?
+        {
+            // Source imports remain available for development. Their warm
+            // cache includes the grammar and plugin-signature identities
+            // because both affect the injected TypedProgram.
+            let source_hash = fnv1a(&source);
+            let signatures_hash = plugin_signatures_fingerprint(plugin_signatures);
+            let mut parsed_program = None;
+            for (_lang_name, grammar) in grammars.iter() {
+                let cache_key = (
+                    module_name.clone(),
+                    source.len(),
+                    source_hash,
+                    grammar.cache_id(),
+                    signatures_hash,
+                );
+                parsed_program = parsed_import_cache()
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.get(&cache_key).cloned());
+                if parsed_program.is_some() {
+                    if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                        eprintln!(
+                            "[IMPORT-PARSE] {module_name} reused ({} bytes)",
+                            source.len()
+                        );
+                    }
+                    break;
+                }
+
+                let started = std::time::Instant::now();
+                if let Ok(imported_program) =
+                    grammar.parse_with_signatures(&source, &module_name, plugin_signatures)
+                {
+                    if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                        eprintln!(
+                            "[IMPORT-PARSE] {module_name} {} bytes in {:.2} ms",
+                            source.len(),
+                            started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    if let Ok(mut cache) = parsed_import_cache().lock() {
+                        cache.insert(cache_key, imported_program.clone());
+                    }
+                    parsed_program = Some(imported_program);
+                    break;
+                }
+            }
+            parsed_program
         } else {
-            log::warn!("Could not resolve import: {}", module_name);
+            None
+        };
+
+        if let Some(mut imported_program) = parsed_program.take() {
+            // Load transitive imports before merging this module.
+            process_imports_inner(
+                grammars,
+                plugin_signatures,
+                import_resolvers,
+                compiled_import_resolvers,
+                &mut imported_program,
+                type_registry,
+                processed,
+            )?;
+
+            type_registry.merge_from(&imported_program.type_registry);
+
+            let imported_module = imported_program.type_registry.current_module();
+            type_registry.with_module(imported_module, |type_registry| {
+                if let Err(e) = register_decl_types(&imported_program, type_registry) {
+                    log::warn!(
+                        "Failed to register declaration types from '{}': {}",
+                        module_name,
+                        e
+                    );
+                }
+                if let Err(e) = process_extern_declarations_mut(&imported_program, type_registry) {
+                    log::warn!(
+                        "Failed to process extern declarations from '{}': {}",
+                        module_name,
+                        e
+                    );
+                }
+            });
+
+            for imported_decl in imported_program.declarations.drain(..) {
+                if !matches!(imported_decl.node, TypedDeclaration::Import(_)) {
+                    program.declarations.push(imported_decl);
+                }
+            }
+            log::debug!("Merged declarations from '{}'", module_name);
+        } else {
+            log::warn!(
+                "Failed to load imported module '{}' with any registered grammar",
+                module_name
+            );
         }
     }
 

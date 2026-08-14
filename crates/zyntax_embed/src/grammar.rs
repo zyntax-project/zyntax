@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use pest_meta::{optimizer, parser};
 use pest_vm::Vm;
+use serde::{Deserialize, Serialize};
 use zyn_peg::grammar::{parse_grammar, GrammarIR};
 use zyn_peg::runtime::{
     AstHostFunctions, CommandInterpreter, RuntimeValue, TypedAstBuilder, ZpegModule,
@@ -95,6 +96,25 @@ pub struct LanguageGrammar {
     /// Cached pest VM for parsing (wrapped in Option for lazy initialization)
     /// Only used as fallback when grammar2 is None
     vm: Arc<Mutex<Option<PestVmCache>>>,
+    /// Process-unique identity used by parsed-import caches. Clones preserve
+    /// the identity because they describe the same compiled grammar.
+    cache_id: u64,
+}
+
+const COMPILED_GRAMMAR_MAGIC: &[u8; 4] = b"ZGRM";
+const COMPILED_GRAMMAR_SCHEMA: u32 = 1;
+const COMPILED_GRAMMAR_HEADER_LEN: usize =
+    COMPILED_GRAMMAR_MAGIC.len() + std::mem::size_of::<u32>();
+
+#[derive(Serialize, Deserialize)]
+struct CompiledGrammarPayload {
+    module: ZpegModule,
+    grammar2: Option<GrammarIR>,
+}
+
+fn next_grammar_cache_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Cache for the pest VM to avoid recompiling the grammar
@@ -119,6 +139,7 @@ impl LanguageGrammar {
             module: Arc::new(module),
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
+            cache_id: next_grammar_cache_id(),
         })
     }
 
@@ -133,6 +154,7 @@ impl LanguageGrammar {
             module: Arc::new(module),
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
+            cache_id: next_grammar_cache_id(),
         })
     }
 
@@ -181,6 +203,7 @@ impl LanguageGrammar {
             module: Arc::new(module),
             grammar2: Some(Arc::new(grammar2)),
             vm: Arc::new(Mutex::new(None)),
+            cache_id: next_grammar_cache_id(),
         })
     }
 
@@ -199,7 +222,69 @@ impl LanguageGrammar {
             module: Arc::new(module),
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
+            cache_id: next_grammar_cache_id(),
         }
+    }
+
+    /// Serialize the compiled legacy metadata and GrammarIR for embedding in
+    /// an application binary. Loading the result does not parse `.zyn` source.
+    pub fn to_compiled_bytes(&self) -> GrammarResult<Vec<u8>> {
+        let payload = CompiledGrammarPayload {
+            module: (*self.module).clone(),
+            grammar2: self.grammar2.as_deref().cloned(),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).map_err(|e| {
+            GrammarError::CompileError(format!("Failed to encode compiled grammar: {e}"))
+        })?;
+        let mut bytes = Vec::with_capacity(COMPILED_GRAMMAR_HEADER_LEN + encoded.len());
+        bytes.extend_from_slice(COMPILED_GRAMMAR_MAGIC);
+        bytes.extend_from_slice(&COMPILED_GRAMMAR_SCHEMA.to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+        Ok(bytes)
+    }
+
+    /// Load a grammar produced by [`Self::to_compiled_bytes`] without parsing
+    /// or compiling grammar source at runtime.
+    pub fn from_compiled_bytes(bytes: &[u8]) -> GrammarResult<Self> {
+        if bytes.len() < COMPILED_GRAMMAR_HEADER_LEN
+            || &bytes[..COMPILED_GRAMMAR_MAGIC.len()] != COMPILED_GRAMMAR_MAGIC
+        {
+            return Err(GrammarError::LoadError(
+                "compiled grammar has an invalid header".to_string(),
+            ));
+        }
+        let found = u32::from_le_bytes(
+            bytes[COMPILED_GRAMMAR_MAGIC.len()..COMPILED_GRAMMAR_HEADER_LEN]
+                .try_into()
+                .expect("compiled grammar header length is fixed"),
+        );
+        if found != COMPILED_GRAMMAR_SCHEMA {
+            return Err(GrammarError::LoadError(format!(
+                "unsupported compiled grammar schema {found}; expected {COMPILED_GRAMMAR_SCHEMA}"
+            )));
+        }
+        let payload: CompiledGrammarPayload =
+            ciborium::from_reader(&bytes[COMPILED_GRAMMAR_HEADER_LEN..]).map_err(|e| {
+                GrammarError::LoadError(format!("Failed to decode compiled grammar: {e}"))
+            })?;
+        Ok(Self {
+            module: Arc::new(payload.module),
+            grammar2: payload.grammar2.map(Arc::new),
+            vm: Arc::new(Mutex::new(None)),
+            cache_id: next_grammar_cache_id(),
+        })
+    }
+
+    /// Return the direct parser backed by this grammar's existing shared IR.
+    pub fn direct_parser(&self) -> Option<crate::grammar2::Grammar2> {
+        self.grammar2
+            .as_ref()
+            .map(|grammar| crate::grammar2::Grammar2::from_shared_ir(Arc::clone(grammar)))
+    }
+
+    pub(crate) fn cache_id(&self) -> u64 {
+        self.cache_id
     }
 
     /// Save the compiled grammar to a `.zpeg` file
@@ -530,7 +615,7 @@ impl LanguageGrammar {
     /// # Arguments
     /// * `program` - The TypedProgram to inject declarations into
     /// * `signatures` - Optional plugin signatures for proper parameter types
-    fn inject_builtin_externs(
+    pub(crate) fn inject_builtin_externs(
         &self,
         program: &mut TypedProgram,
         signatures: Option<

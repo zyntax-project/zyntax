@@ -56,6 +56,7 @@
 //! ```
 
 mod array;
+mod compiled_artifact;
 mod convert;
 mod effect_runtime;
 mod error;
@@ -113,6 +114,7 @@ pub use effect_runtime::{
 pub use host_futures::{__zyntax_register_future, __zyntax_reject_future, __zyntax_resolve_future};
 
 pub use array::ZyntaxArray;
+pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
 // Re-export the BC interpreter so embedders that want a bare
 // HirInterpreter without the beadie wrapper can grab it directly.
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};
@@ -135,6 +137,7 @@ pub use runtime::{
     AsyncPollResult,
     BuiltinResolver,
     ChainedResolver,
+    CompiledImportResolverCallback,
     EffectHandlerToken,
     ExportedSymbol,
     FiberToken,
