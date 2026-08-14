@@ -33,9 +33,15 @@ pub struct ParseFailure {
 }
 
 impl ParseFailure {
-    pub fn new(expected: &str, pos: usize, line: usize, column: usize) -> Self {
+    /// A failure at a position, carrying no description.
+    ///
+    /// What the parser expected is reported from the state's furthest
+    /// failure, which is the only one a reader sees. Every alternative
+    /// a PEG tries produces a failure, so describing each one allocated
+    /// a string per attempt that nothing ever read.
+    pub fn new(_expected: &str, pos: usize, line: usize, column: usize) -> Self {
         ParseFailure {
-            expected: vec![expected.to_string()],
+            expected: Vec::new(),
             pos,
             line,
             column,
