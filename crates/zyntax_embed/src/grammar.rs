@@ -99,6 +99,12 @@ pub struct LanguageGrammar {
     /// Process-unique identity used by parsed-import caches. Clones preserve
     /// the identity because they describe the same compiled grammar.
     cache_id: u64,
+    /// The grammar compiled to a parsing machine.
+    ///
+    /// Compiling belongs to loading a grammar, not to parsing a file
+    /// with it, and this outlives the parsers handed out from it, so
+    /// every parse against this grammar shares one compile.
+    program: Arc<std::sync::OnceLock<Arc<zyn_peg::runtime2::machine::Program>>>,
 }
 
 const COMPILED_GRAMMAR_MAGIC: &[u8; 4] = b"ZGRM";
@@ -140,6 +146,7 @@ impl LanguageGrammar {
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            program: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -155,6 +162,7 @@ impl LanguageGrammar {
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            program: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -204,6 +212,7 @@ impl LanguageGrammar {
             grammar2: Some(Arc::new(grammar2)),
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            program: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -223,6 +232,7 @@ impl LanguageGrammar {
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            program: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -268,19 +278,39 @@ impl LanguageGrammar {
             ciborium::from_reader(&bytes[COMPILED_GRAMMAR_HEADER_LEN..]).map_err(|e| {
                 GrammarError::LoadError(format!("Failed to decode compiled grammar: {e}"))
             })?;
-        Ok(Self {
+        let grammar = Self {
             module: Arc::new(payload.module),
             grammar2: payload.grammar2.map(Arc::new),
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
-        })
+            program: Arc::new(std::sync::OnceLock::new()),
+        };
+        grammar.prepare();
+        Ok(grammar)
+    }
+
+    /// Compile the grammar now, so no parse pays for it later.
+    ///
+    /// Loading a grammar is setup a host does once; compiling it on
+    /// the first parse instead charged one file for work every file
+    /// after it reuses.
+    pub fn prepare(&self) {
+        let _ = self.direct_parser();
     }
 
     /// Return the direct parser backed by this grammar's existing shared IR.
     pub fn direct_parser(&self) -> Option<crate::grammar2::Grammar2> {
-        self.grammar2
-            .as_ref()
-            .map(|grammar| crate::grammar2::Grammar2::from_shared_ir(Arc::clone(grammar)))
+        self.grammar2.as_ref().map(|grammar| {
+            let program = self
+                .program
+                .get_or_init(|| {
+                    zyn_peg::runtime2::GrammarInterpreter::new(grammar)
+                        .shared_program()
+                        .unwrap_or_default()
+                })
+                .clone();
+            crate::grammar2::Grammar2::from_shared_ir_with_program(Arc::clone(grammar), program)
+        })
     }
 
     pub(crate) fn cache_id(&self) -> u64 {

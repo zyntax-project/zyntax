@@ -101,7 +101,7 @@ pub enum Instr {
 }
 
 /// One rule's place in a compiled program.
-pub struct RuleSlot<'g> {
+pub struct RuleSlot {
     /// Where the rule's code begins, or `None` for a rule the compiler
     /// could not express, which runs on the interpreter instead.
     pub entry: Option<usize>,
@@ -109,27 +109,32 @@ pub struct RuleSlot<'g> {
     /// both halves read and write the same packrat entries.
     pub memo_id: usize,
     pub atomic: bool,
-    pub rule: &'g RuleIR,
+    pub name: String,
 }
 
 /// A compiled grammar.
+///
+/// Owns everything it names, so a host compiles a grammar once and
+/// keeps the program for every parse against it. Borrowing the
+/// grammar instead tied the program to a single parse, which is what
+/// made every parse recompile all of it.
 #[derive(Default)]
-pub struct Program<'g> {
+pub struct Program {
     /// Every rule's code, concatenated.
     pub code: Vec<Instr>,
     /// Every rule in the grammar, whether or not the machine runs it.
-    pub rules: Vec<RuleSlot<'g>>,
+    pub rules: Vec<RuleSlot>,
     /// Where a rule name lands in [`Self::rules`].
-    pub index_of: HashMap<&'g str, usize>,
+    pub index_of: HashMap<String, usize>,
     /// Rules the compiler could not express, by name. These keep
     /// running on the tree-walking interpreter, so a grammar using a
     /// form the machine does not cover still parses.
-    pub unsupported: Vec<&'g str>,
+    pub unsupported: Vec<String>,
     /// The byte sets [`Instr::Guard`] tests against.
     pub sets: Vec<ByteSet>,
 }
 
-impl<'g> Program<'g> {
+impl Program {
     /// Instructions emitted, for reporting.
     pub fn len(&self) -> usize {
         self.code.len()
@@ -174,16 +179,16 @@ impl<'g> Program<'g> {
 /// [`Program::unsupported`] rather than failing the whole grammar, so
 /// coverage can grow one form at a time without the machine having to
 /// be complete before it is useful.
-pub fn compile<'g>(grammar: &'g GrammarIR, memo_ids: &HashMap<String, usize>) -> Program<'g> {
-    let mut rule_index: Vec<(&'g String, &'g RuleIR)> = grammar.rules.iter().collect();
+pub fn compile(grammar: &GrammarIR, memo_ids: &HashMap<String, usize>) -> Program {
+    let mut rule_index: Vec<(&String, &RuleIR)> = grammar.rules.iter().collect();
     // A stable order so entry indices are reproducible across runs.
     rule_index.sort_by(|a, b| a.0.cmp(b.0));
 
     // Rule indices have to exist before any body is compiled, because a
     // rule can call one that appears later.
-    let mut index_of: HashMap<&'g str, usize> = HashMap::with_capacity(rule_index.len());
+    let mut index_of: HashMap<String, usize> = HashMap::with_capacity(rule_index.len());
     for (i, (name, _)) in rule_index.iter().enumerate() {
-        index_of.insert(name.as_str(), i);
+        index_of.insert((*name).clone(), i);
     }
 
     let firsts = rule_firsts(&rule_index, &index_of);
@@ -223,7 +228,7 @@ pub fn compile<'g>(grammar: &'g GrammarIR, memo_ids: &HashMap<String, usize>) ->
                 Some(at)
             }
             None => {
-                program.unsupported.push(name.as_str());
+                program.unsupported.push((*name).clone());
                 None
             }
         };
@@ -231,7 +236,7 @@ pub fn compile<'g>(grammar: &'g GrammarIR, memo_ids: &HashMap<String, usize>) ->
             entry,
             memo_id: memo_ids.get(*name).copied().unwrap_or(usize::MAX),
             atomic: rule.modifier == Some(RuleModifier::Atomic),
-            rule,
+            name: (*name).clone(),
         });
     }
 
@@ -364,7 +369,7 @@ fn class_first(class: &CharClass) -> ByteSet {
 /// skips an alternative that could have matched.
 fn pattern_first(
     pattern: &PatternIR,
-    index_of: &HashMap<&str, usize>,
+    index_of: &HashMap<String, usize>,
     rules: &[ByteSet],
 ) -> ByteSet {
     match pattern {
@@ -419,7 +424,7 @@ fn pattern_first(
 /// changing. A rule left with nothing can begin with no byte at all,
 /// which for a rule reachable only through itself is true but not
 /// worth trusting, so it reads as `any`.
-fn rule_firsts(rules: &[(&String, &RuleIR)], index_of: &HashMap<&str, usize>) -> Vec<ByteSet> {
+fn rule_firsts(rules: &[(&String, &RuleIR)], index_of: &HashMap<String, usize>) -> Vec<ByteSet> {
     let mut firsts = vec![ByteSet::empty(); rules.len()];
     loop {
         let mut changed = false;
@@ -483,7 +488,7 @@ fn direct_binding(pattern: &PatternIR) -> Option<String> {
 /// something that would parse differently.
 /// What emitting needs to know beyond the pattern itself.
 struct Ctx<'a> {
-    index_of: &'a HashMap<&'a str, usize>,
+    index_of: &'a HashMap<String, usize>,
     /// What byte each rule can begin with.
     firsts: &'a [ByteSet],
     /// Sets the guards test against, collected as they are emitted.
@@ -778,8 +783,8 @@ enum Enter {
 /// Enter a rule: check the memo, mark it in progress, and open a
 /// binding scope. This is the interpreter's rule prologue, so both
 /// halves agree on what a rule costs and what it remembers.
-fn enter<'g>(
-    program: &Program<'g>,
+fn enter(
+    program: &Program,
     rule: usize,
     state: &mut ParserState<'_>,
     return_pc: usize,
@@ -910,9 +915,9 @@ impl Stats {
 /// The caller has already checked that `rule` has machine code; a rule
 /// it calls that does not is run by the interpreter and its result
 /// taken back here.
-pub fn run<'g>(
-    program: &Program<'g>,
-    interp: &GrammarInterpreter<'g>,
+pub fn run(
+    program: &Program,
+    interp: &GrammarInterpreter<'_>,
     rule: usize,
     state: &mut ParserState<'_>,
 ) -> ParseResult<ParsedValue> {
@@ -925,9 +930,9 @@ pub fn run<'g>(
     result
 }
 
-fn run_counted<'g>(
-    program: &Program<'g>,
-    interp: &GrammarInterpreter<'g>,
+fn run_counted(
+    program: &Program,
+    interp: &GrammarInterpreter<'_>,
     rule: usize,
     state: &mut ParserState<'_>,
     stats: &mut Stats,
@@ -1233,7 +1238,11 @@ fn run_counted<'g>(
                     // back, so coverage can grow one rule at a time.
                     None => {
                         let slot = &program.rules[callee];
-                        match interp.execute_rule_with_id(slot.rule, slot.memo_id, state) {
+                        match interp.execute_rule_with_id(
+                            interp.machine_rule(callee),
+                            slot.memo_id,
+                            state,
+                        ) {
                             ParseResult::Success(value, _) => {
                                 if let Instr::Call {
                                     binding: Some(name),
@@ -1254,6 +1263,7 @@ fn run_counted<'g>(
             Instr::Ret => {
                 let frame = frames.pop().expect("frame");
                 let slot = &program.rules[frame.rule];
+                let rule_ir = interp.machine_rule(frame.rule);
                 let end_pos = state.pos();
 
                 let mut value = std::mem::replace(&mut v, ParsedValue::None);
@@ -1268,7 +1278,7 @@ fn run_counted<'g>(
                     value = ParsedValue::Text(text);
                 }
 
-                let produced = match &slot.rule.action {
+                let produced = match &rule_ir.action {
                     Some(action) => {
                         if counting {
                             stats.actions += 1;
@@ -1423,7 +1433,7 @@ mod tests {
             .collect()
     }
 
-    fn compiled(grammar: &GrammarIR) -> Program<'_> {
+    fn compiled(grammar: &GrammarIR) -> Program {
         compile(grammar, &ids(grammar))
     }
 

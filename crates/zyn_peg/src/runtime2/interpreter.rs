@@ -57,16 +57,24 @@ enum RuleTarget {
 
 pub struct GrammarInterpreter<'g> {
     grammar: &'g GrammarIR,
-    /// Rule ID counter for memoization
-    rule_id_map: HashMap<String, usize>,
+    /// Rule ID counter for memoization.
+    ///
+    /// Built when something asks for it. A parse the machine runs
+    /// never does, and building it cost every parse a copy of every
+    /// rule name in the grammar.
+    rule_id_map: std::cell::OnceCell<HashMap<String, usize>>,
     /// What each referenced name resolves to, and the memo id for a
     /// rule, so executing a reference is one lookup rather than three.
-    rule_targets: HashMap<String, RuleTarget>,
+    /// Built on demand, as [`Self::rule_id_map`] is.
+    rule_targets: std::cell::OnceCell<HashMap<String, RuleTarget>>,
     /// The grammar compiled to a parsing machine, when the machine is
     /// enabled. A rule it can run goes through [`machine::run`]; the
     /// rest, and everything a machine rule calls that has no code, come
     /// back here.
-    machine: Option<machine::Program<'g>>,
+    machine: Option<std::sync::Arc<machine::Program>>,
+    /// The rule each machine slot names, resolved once so running a
+    /// rule's action does not look its name up again.
+    machine_rules: Vec<&'g RuleIR>,
 }
 
 /// Whether the parsing machine runs, read once per process.
@@ -86,33 +94,94 @@ impl<'g> GrammarInterpreter<'g> {
         for (i, name) in grammar.rules.keys().enumerate() {
             rule_id_map.insert(name.clone(), i);
         }
-        let mut rule_targets: HashMap<String, RuleTarget> = grammar
-            .rules
-            .keys()
-            .map(|name| (name.clone(), RuleTarget::Rule(rule_id_map[name])))
-            .collect();
-        // Built-ins win over a grammar rule of the same name, which is
-        // the order the per-execution chain checked them in.
-        for (name, target) in [
-            ("ASCII_DIGIT", RuleTarget::AsciiDigit),
-            ("ASCII_ALPHA", RuleTarget::AsciiAlpha),
-            ("ASCII_ALPHANUMERIC", RuleTarget::AsciiAlphanumeric),
-            ("ASCII_HEX_DIGIT", RuleTarget::AsciiHexDigit),
-            ("ANY", RuleTarget::Any),
-            ("SOI", RuleTarget::Soi),
-            ("EOI", RuleTarget::Eoi),
-        ] {
-            rule_targets.insert(name.to_string(), target);
-        }
         // The machine memoizes under the ids built above, so a rule it
         // runs and a rule this interpreter runs share packrat entries.
-        let machine = machine_enabled().then(|| machine::compile(grammar, &rule_id_map));
+        let machine =
+            machine_enabled().then(|| std::sync::Arc::new(machine::compile(grammar, &rule_id_map)));
+        let machine_rules = Self::resolve_rules(grammar, machine.as_deref());
+        let ids = std::cell::OnceCell::new();
+        let _ = ids.set(rule_id_map);
         GrammarInterpreter {
             grammar,
-            rule_id_map,
-            rule_targets,
+            rule_id_map: ids,
+            rule_targets: std::cell::OnceCell::new(),
             machine,
+            machine_rules,
         }
+    }
+
+    /// An interpreter over a grammar already compiled.
+    ///
+    /// Compiling a grammar belongs to setting a host up, not to
+    /// parsing a file, so a host that keeps its program hands it back
+    /// here for every parse.
+    pub fn with_program(grammar: &'g GrammarIR, program: std::sync::Arc<machine::Program>) -> Self {
+        let machine = machine_enabled().then_some(program);
+        let machine_rules = Self::resolve_rules(grammar, machine.as_deref());
+        GrammarInterpreter {
+            grammar,
+            rule_id_map: std::cell::OnceCell::new(),
+            rule_targets: std::cell::OnceCell::new(),
+            machine,
+            machine_rules,
+        }
+    }
+
+    fn resolve_rules(
+        grammar: &'g GrammarIR,
+        program: Option<&machine::Program>,
+    ) -> Vec<&'g RuleIR> {
+        match program {
+            Some(program) => program
+                .rules
+                .iter()
+                .filter_map(|slot| grammar.get_rule(&slot.name))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The memo id of each rule, built the first time it is wanted.
+    fn rule_id_map(&self) -> &HashMap<String, usize> {
+        self.rule_id_map.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.grammar.rules.len());
+            for (i, name) in self.grammar.rules.keys().enumerate() {
+                map.insert(name.clone(), i);
+            }
+            map
+        })
+    }
+
+    /// What each referenced name resolves to, built the first time a
+    /// reference is executed by the tree-walking path.
+    fn rule_targets(&self) -> &HashMap<String, RuleTarget> {
+        self.rule_targets.get_or_init(|| {
+            let ids = self.rule_id_map();
+            let mut targets: HashMap<String, RuleTarget> = self
+                .grammar
+                .rules
+                .keys()
+                .map(|name| (name.clone(), RuleTarget::Rule(ids[name])))
+                .collect();
+            // Built-ins win over a grammar rule of the same name.
+            for (name, target) in [
+                ("ASCII_DIGIT", RuleTarget::AsciiDigit),
+                ("ASCII_ALPHA", RuleTarget::AsciiAlpha),
+                ("ASCII_ALPHANUMERIC", RuleTarget::AsciiAlphanumeric),
+                ("ASCII_HEX_DIGIT", RuleTarget::AsciiHexDigit),
+                ("ANY", RuleTarget::Any),
+                ("SOI", RuleTarget::Soi),
+                ("EOI", RuleTarget::Eoi),
+            ] {
+                targets.insert(name.to_string(), target);
+            }
+            targets
+        })
+    }
+
+    /// The rule a machine slot names.
+    pub(super) fn machine_rule(&self, slot: usize) -> &'g RuleIR {
+        self.machine_rules[slot]
     }
 
     /// An interpreter that walks the pattern tree, whatever the
@@ -124,12 +193,19 @@ impl<'g> GrammarInterpreter<'g> {
     pub fn without_machine(grammar: &'g GrammarIR) -> Self {
         let mut this = Self::new(grammar);
         this.machine = None;
+        this.machine_rules = Vec::new();
         this
     }
 
     /// The compiled program, when the machine is enabled.
-    pub fn program(&self) -> Option<&machine::Program<'g>> {
-        self.machine.as_ref()
+    pub fn program(&self) -> Option<&machine::Program> {
+        self.machine.as_deref()
+    }
+
+    /// The compiled program, to keep and hand back to
+    /// [`Self::with_program`].
+    pub fn shared_program(&self) -> Option<std::sync::Arc<machine::Program>> {
+        self.machine.clone()
     }
 
     /// Parse input using a specific rule
@@ -138,10 +214,10 @@ impl<'g> GrammarInterpreter<'g> {
         rule_name: &str,
         state: &mut ParserState<'a>,
     ) -> ParseResult<ParsedValue> {
-        if let Some(program) = &self.machine {
+        if let Some(program) = self.machine.clone() {
             if let Some(index) = program.rule_index(rule_name) {
                 if program.rules[index].entry.is_some() {
-                    return machine::run(program, self, index, state);
+                    return machine::run(&program, self, index, state);
                 }
             }
         }
@@ -167,7 +243,7 @@ impl<'g> GrammarInterpreter<'g> {
         state: &mut ParserState<'a>,
     ) -> ParseResult<ParsedValue> {
         let memo_rule_id = self
-            .rule_id_map
+            .rule_id_map()
             .get(&rule.name)
             .copied()
             .unwrap_or(usize::MAX);
@@ -5087,7 +5163,7 @@ impl<'g> GrammarInterpreter<'g> {
             PatternIR::RuleRef { rule_name, binding } => {
                 // One lookup decides what this name is and, for a rule,
                 // the memo id it is stored under.
-                let result = match self.rule_targets.get(rule_name.as_str()).copied() {
+                let result = match self.rule_targets().get(rule_name.as_str()).copied() {
                     Some(RuleTarget::AsciiDigit) => state
                         .match_char(|c| c.is_ascii_digit(), "digit")
                         .map(|c| ParsedValue::Text(c.to_string())),

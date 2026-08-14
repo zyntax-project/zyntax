@@ -190,11 +190,42 @@ pub type Grammar2Result<T> = Result<T, Grammar2Error>;
 pub struct Grammar2 {
     /// The parsed grammar IR
     grammar: Arc<GrammarIR>,
+    /// The grammar compiled to a parsing machine, built on the first
+    /// parse and kept for the rest. Compiling belongs to setting this
+    /// grammar up rather than to parsing a file with it.
+    program: std::sync::OnceLock<Arc<zyn_peg::runtime2::machine::Program>>,
 }
 
 impl Grammar2 {
     pub(crate) fn from_shared_ir(grammar: Arc<GrammarIR>) -> Self {
-        Self { grammar }
+        Self {
+            grammar,
+            program: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A parser over a grammar already compiled.
+    pub(crate) fn from_shared_ir_with_program(
+        grammar: Arc<GrammarIR>,
+        program: Arc<zyn_peg::runtime2::machine::Program>,
+    ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(program);
+        Self {
+            grammar,
+            program: cell,
+        }
+    }
+
+    /// The compiled program for this grammar, compiled once.
+    fn program(&self) -> Arc<zyn_peg::runtime2::machine::Program> {
+        self.program
+            .get_or_init(|| {
+                GrammarInterpreter::new(&self.grammar)
+                    .shared_program()
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 
     /// Create a grammar from .zyn source code
@@ -204,6 +235,7 @@ impl Grammar2 {
 
         Ok(Self {
             grammar: Arc::new(grammar),
+            program: std::sync::OnceLock::new(),
         })
     }
 
@@ -211,6 +243,7 @@ impl Grammar2 {
     pub fn from_ir(grammar: GrammarIR) -> Self {
         Self {
             grammar: Arc::new(grammar),
+            program: std::sync::OnceLock::new(),
         }
     }
 
@@ -256,6 +289,7 @@ impl Grammar2 {
         use zyntax_typed_ast::source::SourceFile;
 
         let grammar = Arc::clone(&self.grammar);
+        let program = self.program();
         let source_owned = source.to_string();
         let filename_owned = filename.to_string();
 
@@ -270,7 +304,7 @@ impl Grammar2 {
         // configurable stack-size knob in browser JS engines anyway.
         // Run inline.
         let parse_inline = move || -> Grammar2Result<TypedProgram> {
-            let interpreter = GrammarInterpreter::new(&grammar);
+            let interpreter = GrammarInterpreter::with_program(&grammar, program);
 
             let mut builder = TypedASTBuilder::new();
             let mut registry = TypeRegistry::new();
@@ -573,8 +607,15 @@ impl Grammar2 {
 
 impl Clone for Grammar2 {
     fn clone(&self) -> Self {
+        // A copy keeps the compiled program if there is one, so
+        // cloning a loaded grammar does not compile it again.
+        let program = std::sync::OnceLock::new();
+        if let Some(compiled) = self.program.get() {
+            let _ = program.set(Arc::clone(compiled));
+        }
         Self {
             grammar: Arc::clone(&self.grammar),
+            program,
         }
     }
 }

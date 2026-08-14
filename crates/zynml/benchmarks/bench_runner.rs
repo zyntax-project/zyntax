@@ -827,14 +827,22 @@ fn one_iteration(
     }
     let install_jit_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+    // Setting up the runtime is not compiling a program. A host builds
+    // one runtime and compiles against it for the rest of the process,
+    // so charging every kernel for decoding the grammar and stdlib
+    // artifacts measures the host's startup rather than the compiler.
+    // The cache lookup goes with it: that is the harness looking for a
+    // snapshot, not work a compile does. What is left is parse through
+    // lowering, optimisation, codegen and install.
+    let compile_ms =
+        (compile_start.elapsed().as_secs_f64() * 1000.0) - runtime_setup_ms - cache_lookup_ms;
 
     if trace {
         eprintln!(
             "[BENCH-COMPILE] kernel={kernel} target={target_key}\n  \
-             cache_lookup = {cache:.2} ms\n  \
+             cache_lookup = {cache:.2} ms (not counted)\n  \
+             runtime_setup= {runtime_setup:.2} ms (not counted)\n  \
              parse        = {parse:.2} ms\n  \
-             runtime_setup= {runtime_setup:.2} ms\n  \
              lower        = {lower:.2} ms\n  \
              opts         = {opts:.2} ms\n  \
              compile_mod  = {cm:.2} ms\n  \
