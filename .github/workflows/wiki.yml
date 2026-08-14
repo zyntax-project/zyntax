@@ -130,13 +130,18 @@ jobs:
         # kernel; the JSON naturally ends up with just that kernel's
         # data plus meta. `--features llvm-backend` exercises the
         # full tier-up ladder so the `zyntax-tiered-llvm` column
-        # reflects honest LLVM-tier numbers.
+        # reflects honest LLVM-tier numbers. `--no-cache` compiles
+        # every kernel from source: the runner restores `target/`
+        # between runs, which includes the HIR snapshot cache, and a
+        # published number should measure the compiler in the tree
+        # rather than whatever produced the snapshot.
         run: |
           mkdir -p bench-out
           cargo run --release --package zynml --example bench_runner --features llvm-backend -- \
             --out bench-out/results-${{ matrix.kernel }}.json \
             --filter ${{ matrix.kernel }} \
-            --runs 9
+            --runs 9 \
+            --no-cache
 
       - name: Upload partial benchmark result
         uses: actions/upload-artifact@v4
