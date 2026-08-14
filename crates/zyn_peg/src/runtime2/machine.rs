@@ -54,6 +54,11 @@ pub enum Instr {
     },
     /// Leave the current rule with the value register as its result.
     Ret,
+    /// Skip to `alt` when the byte ahead cannot begin this
+    /// alternative. Placed before the alternative's choice point, so
+    /// an alternative ruled out this way costs one test rather than
+    /// everything it would have run before failing.
+    Guard { set: usize, alt: usize },
     /// Push a backtrack entry that resumes at `alt` on failure.
     Choice { alt: usize },
     /// Push the backtrack entry a repetition leaves through. It
@@ -120,6 +125,8 @@ pub struct Program<'g> {
     /// running on the tree-walking interpreter, so a grammar using a
     /// form the machine does not cover still parses.
     pub unsupported: Vec<&'g str>,
+    /// The byte sets [`Instr::Guard`] tests against.
+    pub sets: Vec<ByteSet>,
 }
 
 impl<'g> Program<'g> {
@@ -179,18 +186,26 @@ pub fn compile<'g>(grammar: &'g GrammarIR, memo_ids: &HashMap<String, usize>) ->
         index_of.insert(name.as_str(), i);
     }
 
+    let firsts = rule_firsts(&rule_index, &index_of);
+
     let mut program = Program {
         code: Vec::new(),
         rules: Vec::with_capacity(rule_index.len()),
         index_of,
         unsupported: Vec::new(),
+        sets: Vec::new(),
     };
 
     let mut bodies: Vec<Option<Vec<Instr>>> = Vec::with_capacity(rule_index.len());
     for (_, rule) in &rule_index {
         let atomic = rule.modifier == Some(RuleModifier::Atomic);
         let mut out = Vec::new();
-        match emit(&rule.pattern, atomic, &program.index_of, &mut out) {
+        let mut ctx = Ctx {
+            index_of: &program.index_of,
+            firsts: &firsts,
+            sets: &mut program.sets,
+        };
+        match emit(&rule.pattern, atomic, &mut ctx, &mut out) {
             Ok(()) => {
                 out.push(Instr::Ret);
                 bodies.push(Some(out));
@@ -223,10 +238,215 @@ pub fn compile<'g>(grammar: &'g GrammarIR, memo_ids: &HashMap<String, usize>) ->
     program
 }
 
+// =========================================================================
+// First bytes
+// =========================================================================
+
+/// The bytes a pattern can begin with.
+///
+/// `any` means the pattern gives no useful answer: it matches nothing
+/// in particular, it can match the empty string, or it is a form this
+/// analysis does not read. An alternative whose set is `any` is always
+/// tried, which is what the machine did before any of this.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ByteSet {
+    bits: [u64; 4],
+    any: bool,
+}
+
+impl ByteSet {
+    fn empty() -> Self {
+        ByteSet {
+            bits: [0; 4],
+            any: false,
+        }
+    }
+
+    fn anything() -> Self {
+        ByteSet {
+            bits: [0; 4],
+            any: true,
+        }
+    }
+
+    fn of(b: u8) -> Self {
+        let mut s = ByteSet::empty();
+        s.add(b);
+        s
+    }
+
+    fn add(&mut self, b: u8) {
+        self.bits[(b >> 6) as usize] |= 1u64 << (b & 63);
+    }
+
+    fn add_range(&mut self, from: char, to: char) {
+        if !from.is_ascii() || !to.is_ascii() {
+            self.any = true;
+            return;
+        }
+        for b in from as u8..=to as u8 {
+            self.add(b);
+        }
+    }
+
+    fn merge(&mut self, other: &ByteSet) {
+        self.any |= other.any;
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a |= b;
+        }
+    }
+
+    fn is_any(&self) -> bool {
+        self.any
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.any && self.bits == [0; 4]
+    }
+
+    /// Whether a byte can begin this pattern.
+    pub fn contains(&self, b: u8) -> bool {
+        self.any || self.bits[(b >> 6) as usize] & (1u64 << (b & 63)) != 0
+    }
+}
+
+/// The bytes a character class can match.
+fn class_first(class: &CharClass) -> ByteSet {
+    let mut set = ByteSet::empty();
+    match class {
+        CharClass::Single(c) => {
+            if c.is_ascii() {
+                set.add(*c as u8);
+            } else {
+                return ByteSet::anything();
+            }
+        }
+        CharClass::Range(a, b) => set.add_range(*a, *b),
+        CharClass::Builtin(name) => match name.as_str() {
+            "ASCII_DIGIT" => set.add_range('0', '9'),
+            "ASCII_ALPHA" => {
+                set.add_range('a', 'z');
+                set.add_range('A', 'Z');
+            }
+            "ASCII_ALPHANUMERIC" => {
+                set.add_range('a', 'z');
+                set.add_range('A', 'Z');
+                set.add_range('0', '9');
+            }
+            "ASCII_HEX_DIGIT" => {
+                set.add_range('0', '9');
+                set.add_range('a', 'f');
+                set.add_range('A', 'F');
+            }
+            "NEWLINE" => {
+                set.add(b'\n');
+                set.add(b'\r');
+            }
+            _ => return ByteSet::anything(),
+        },
+        CharClass::Union(classes) => {
+            for class in classes {
+                set.merge(&class_first(class));
+            }
+        }
+        // A negated class is read as matching anything rather than
+        // worked out, since getting it wrong skips an alternative that
+        // would have matched.
+        CharClass::Negation(_) => return ByteSet::anything(),
+    }
+    set
+}
+
+/// The bytes a pattern can begin with, given what is known of the
+/// rules it calls.
+///
+/// Anything uncertain answers `any`, so a guard built from this never
+/// skips an alternative that could have matched.
+fn pattern_first(
+    pattern: &PatternIR,
+    index_of: &HashMap<&str, usize>,
+    rules: &[ByteSet],
+) -> ByteSet {
+    match pattern {
+        PatternIR::Literal(s) => match s.as_bytes().first() {
+            Some(b) => ByteSet::of(*b),
+            // An empty literal matches without consuming.
+            None => ByteSet::anything(),
+        },
+        PatternIR::CharClass(c) => class_first(c),
+        PatternIR::Any => ByteSet::anything(),
+        // These match without consuming, so the byte ahead says
+        // nothing about them.
+        PatternIR::StartOfInput | PatternIR::EndOfInput | PatternIR::Whitespace => {
+            ByteSet::anything()
+        }
+        PatternIR::RuleRef { rule_name, .. } => match rule_name.as_str() {
+            "ASCII_DIGIT" | "ASCII_ALPHA" | "ASCII_ALPHANUMERIC" | "ASCII_HEX_DIGIT" => {
+                class_first(&CharClass::Builtin(rule_name.clone()))
+            }
+            name => match index_of.get(name) {
+                Some(i) => rules[*i],
+                None => ByteSet::anything(),
+            },
+        },
+        // Only the first element is read. A sequence whose first
+        // element can match empty would need the second as well, and
+        // whitespace between them can start with anything, so the
+        // first element answering `any` ends it there.
+        PatternIR::Sequence(items) => match items.first() {
+            Some(first) => pattern_first(first, index_of, rules),
+            None => ByteSet::anything(),
+        },
+        PatternIR::Choice(alts) => {
+            let mut set = ByteSet::empty();
+            for alt in alts {
+                set.merge(&pattern_first(alt, index_of, rules));
+            }
+            set
+        }
+        // These match the empty string, so any byte can follow them.
+        PatternIR::Optional(_) => ByteSet::anything(),
+        PatternIR::Repeat { min, .. } if *min == 0 => ByteSet::anything(),
+        // A repetition skips whitespace before its first pass.
+        PatternIR::Repeat { .. } => ByteSet::anything(),
+        PatternIR::PositiveLookahead(_) | PatternIR::NegativeLookahead(_) => ByteSet::anything(),
+    }
+}
+
+/// Work out what byte each rule can begin with.
+///
+/// Rules call each other, so this grows the answer until it stops
+/// changing. A rule left with nothing can begin with no byte at all,
+/// which for a rule reachable only through itself is true but not
+/// worth trusting, so it reads as `any`.
+fn rule_firsts(rules: &[(&String, &RuleIR)], index_of: &HashMap<&str, usize>) -> Vec<ByteSet> {
+    let mut firsts = vec![ByteSet::empty(); rules.len()];
+    loop {
+        let mut changed = false;
+        for (i, (_, rule)) in rules.iter().enumerate() {
+            let next = pattern_first(&rule.pattern, index_of, &firsts);
+            if next != firsts[i] {
+                firsts[i] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for set in firsts.iter_mut() {
+        if set.is_empty() {
+            *set = ByteSet::anything();
+        }
+    }
+    firsts
+}
+
 /// Shift a body-relative jump target to where the body was placed.
 fn rebase(instr: &Instr, base: usize) -> Instr {
     let mut out = instr.clone();
     match &mut out {
+        Instr::Guard { alt, .. } => *alt += base,
         Instr::Choice { alt } => *alt += base,
         Instr::LoopChoice { alt } => *alt += base,
         Instr::Commit { next } => *next += base,
@@ -261,10 +481,19 @@ fn direct_binding(pattern: &PatternIR) -> Option<String> {
 /// Returns `Err(())` for a form the machine does not cover yet, which
 /// drops the whole rule to the interpreter rather than emitting
 /// something that would parse differently.
+/// What emitting needs to know beyond the pattern itself.
+struct Ctx<'a> {
+    index_of: &'a HashMap<&'a str, usize>,
+    /// What byte each rule can begin with.
+    firsts: &'a [ByteSet],
+    /// Sets the guards test against, collected as they are emitted.
+    sets: &'a mut Vec<ByteSet>,
+}
+
 fn emit(
     pattern: &PatternIR,
     atomic: bool,
-    index_of: &HashMap<&str, usize>,
+    ctx: &mut Ctx<'_>,
     out: &mut Vec<Instr>,
 ) -> Result<(), ()> {
     match pattern {
@@ -307,7 +536,7 @@ fn emit(
                     out.push(Instr::Class(CharClass::Builtin(rule_name.clone())))
                 }
                 name => {
-                    let rule = *index_of.get(name).ok_or(())?;
+                    let rule = *ctx.index_of.get(name).ok_or(())?;
                     out.push(Instr::Call {
                         rule,
                         binding: binding.clone(),
@@ -329,7 +558,7 @@ fn emit(
                 if !atomic && i > 0 {
                     out.push(Instr::SkipWs);
                 }
-                emit(item, atomic, index_of, out)?;
+                emit(item, atomic, ctx, out)?;
             }
             Ok(())
         }
@@ -343,19 +572,41 @@ fn emit(
             let mut commit_sites = Vec::new();
             for (i, alt) in alts.iter().enumerate() {
                 let last = i + 1 == alts.len();
+                // The last alternative has nowhere to skip to, so it
+                // is tried whatever the byte ahead says.
+                let guard_site = if last {
+                    None
+                } else {
+                    let set = pattern_first(alt, ctx.index_of, ctx.firsts);
+                    if set.is_any() {
+                        None
+                    } else {
+                        ctx.sets.push(set);
+                        out.push(Instr::Guard {
+                            set: ctx.sets.len() - 1,
+                            alt: usize::MAX,
+                        });
+                        Some(out.len() - 1)
+                    }
+                };
                 let choice_site = if last {
                     None
                 } else {
                     out.push(Instr::Choice { alt: usize::MAX });
                     Some(out.len() - 1)
                 };
-                emit(alt, atomic, index_of, out)?;
+                emit(alt, atomic, ctx, out)?;
                 if let Some(site) = choice_site {
                     out.push(Instr::Commit { next: usize::MAX });
                     commit_sites.push(out.len() - 1);
                     let here = out.len();
                     if let Instr::Choice { alt } = &mut out[site] {
                         *alt = here;
+                    }
+                    if let Some(site) = guard_site {
+                        if let Instr::Guard { alt, .. } = &mut out[site] {
+                            *alt = here;
+                        }
                     }
                 }
             }
@@ -370,7 +621,7 @@ fn emit(
         PatternIR::Optional(inner) => {
             out.push(Instr::Choice { alt: usize::MAX });
             let site = out.len() - 1;
-            emit(inner, atomic, index_of, out)?;
+            emit(inner, atomic, ctx, out)?;
             out.push(Instr::OptSome);
             out.push(Instr::Commit { next: usize::MAX });
             let commit_site = out.len() - 1;
@@ -407,7 +658,7 @@ fn emit(
             if let Some(sep) = separator {
                 out.push(Instr::IfEmpty { body: usize::MAX });
                 empty_site = Some(out.len() - 1);
-                emit(sep, atomic, index_of, out)?;
+                emit(sep, atomic, ctx, out)?;
                 if !atomic {
                     out.push(Instr::SkipWs);
                 }
@@ -418,7 +669,7 @@ fn emit(
                     *target = body;
                 }
             }
-            emit(pattern, atomic, index_of, out)?;
+            emit(pattern, atomic, ctx, out)?;
             out.push(Instr::RepeatEnd {
                 body: top,
                 exit: usize::MAX,
@@ -444,7 +695,7 @@ fn emit(
                 end: usize::MAX,
             });
             let site = out.len() - 1;
-            emit(inner, atomic, index_of, out)?;
+            emit(inner, atomic, ctx, out)?;
             out.push(Instr::EndLook { negative: false });
             let here = out.len();
             if let Instr::BeginLook { end, .. } = &mut out[site] {
@@ -458,7 +709,7 @@ fn emit(
                 end: usize::MAX,
             });
             let site = out.len() - 1;
-            emit(inner, atomic, index_of, out)?;
+            emit(inner, atomic, ctx, out)?;
             out.push(Instr::EndLook { negative: true });
             let here = out.len();
             if let Instr::BeginLook { end, .. } = &mut out[site] {
@@ -597,6 +848,7 @@ struct Stats {
     loop_exits: u64,
     steps: u64,
     wasted_steps: u64,
+    guarded: u64,
 }
 
 /// Whether to count, read once per process.
@@ -645,6 +897,10 @@ impl Stats {
             self.steps,
             self.wasted_steps,
             100.0 * self.wasted_steps as f64 / self.steps.max(1) as f64,
+        );
+        eprintln!(
+            "[MACHINE] alternatives skipped on the byte ahead {}",
+            self.guarded
         );
     }
 }
@@ -790,6 +1046,23 @@ fn run_counted<'g>(
             }
 
             Instr::Fail => failed = true,
+
+            Instr::Guard { set, alt } => {
+                // No byte ahead means nothing this guard protects can
+                // match, since a set that admits the empty string is
+                // never given one.
+                let admits = state
+                    .peek_byte()
+                    .is_some_and(|b| program.sets[*set].contains(b));
+                if admits {
+                    pc += 1;
+                } else {
+                    pc = *alt;
+                    if counting {
+                        stats.guarded += 1;
+                    }
+                }
+            }
 
             Instr::Choice { alt } | Instr::LoopChoice { alt } => {
                 cps.push(Choicepoint {
@@ -1203,9 +1476,15 @@ mod tests {
     fn a_choice_point_resumes_at_the_next_alternative() {
         let g = grammar_with(vec![("r", PatternIR::Choice(vec![lit("a"), lit("b")]))]);
         let p = compiled(&g);
-        let Instr::Choice { alt } = p.code[0] else {
-            panic!("expected a choice point first, got {:?}", p.code[0]);
+        // A guard on the byte ahead comes first, then the choice
+        // point; both send a rejected alternative to the same place.
+        let Instr::Guard { alt: guarded, .. } = p.code[0] else {
+            panic!("expected a guard first, got {:?}", p.code[0]);
         };
+        let Instr::Choice { alt } = p.code[1] else {
+            panic!("expected a choice point second, got {:?}", p.code[1]);
+        };
+        assert_eq!(guarded, alt, "guard and choice point agree on where to go");
         assert!(
             matches!(&p.code[alt], Instr::Literal { text, .. } if text == "b"),
             "the choice point lands on the second alternative, got {:?}",
@@ -1249,8 +1528,8 @@ mod tests {
         ]);
         let p = compiled(&g);
         let second = p.rules[1].entry.expect("second rule compiles");
-        let Instr::Choice { alt } = p.code[second] else {
-            panic!("expected a choice point, got {:?}", p.code[second]);
+        let Instr::Choice { alt } = p.code[second + 1] else {
+            panic!("expected a choice point, got {:?}", p.code[second + 1]);
         };
         assert!(
             alt > second,
@@ -1260,6 +1539,51 @@ mod tests {
             matches!(&p.code[alt], Instr::Literal { text, .. } if text == "q"),
             "got {:?}",
             p.code[alt]
+        );
+    }
+
+    #[test]
+    fn a_guard_carries_the_bytes_its_alternative_can_begin_with() {
+        let g = grammar_with(vec![("r", PatternIR::Choice(vec![lit("ab"), lit("cd")]))]);
+        let p = compiled(&g);
+        let Instr::Guard { set, .. } = p.code[0] else {
+            panic!("expected a guard, got {:?}", p.code[0]);
+        };
+        assert!(p.sets[set].contains(b'a'), "the alternative begins with a");
+        assert!(!p.sets[set].contains(b'c'), "c begins the other one");
+    }
+
+    #[test]
+    fn an_alternative_that_cannot_begin_here_is_skipped() {
+        let g = grammar_with(vec![("r", PatternIR::Choice(vec![lit("aaa"), lit("b")]))]);
+        assert_eq!(
+            parse(&g, "r", "b").map(|(_, pos)| pos),
+            Some(1),
+            "the second alternative still matches"
+        );
+    }
+
+    #[test]
+    fn a_guard_never_skips_an_alternative_that_could_match() {
+        // A choice whose alternatives share an opening byte has to try
+        // both, and one that can match empty cannot be guarded at all.
+        let g = grammar_with(vec![
+            (
+                "r",
+                PatternIR::Choice(vec![
+                    PatternIR::Sequence(vec![lit("a"), lit("b")]),
+                    PatternIR::Sequence(vec![lit("a"), lit("c")]),
+                ]),
+            ),
+            (
+                "opt",
+                PatternIR::Choice(vec![PatternIR::Optional(Box::new(lit("x"))), lit("y")]),
+            ),
+        ]);
+        assert_eq!(parse(&g, "r", "a c").map(|(_, p)| p), Some(3));
+        assert!(
+            parse(&g, "opt", "y").is_some(),
+            "an alternative matching the empty string is always tried"
         );
     }
 

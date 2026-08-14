@@ -306,6 +306,15 @@ impl<'a> ParserState<'a> {
     // Character/String Matching
     // =========================================================================
 
+    /// Peek at the byte at the current position.
+    ///
+    /// A byte rather than a character: what reads it only asks whether
+    /// a pattern could begin here, and every byte that begins a
+    /// multi-byte character is outside the ASCII sets it tests.
+    pub fn peek_byte(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.pos).copied()
+    }
+
     /// Peek at current character
     pub fn peek_char(&self) -> Option<char> {
         self.input[self.pos..].chars().next()
