@@ -604,21 +604,32 @@ impl AstLowering for LoweringContext {
     fn lower_program(&mut self, program: &mut TypedProgram) -> CompilerResult<HirModule> {
         // Phase -1: Initialize Copy types from the type registry
         // Types that implement the Copy trait can be duplicated instead of moved
+        // Phase timings, behind the same env var the embedder's phase
+        // trace uses, so one switch reports the whole front half.
+        let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+        let t = std::time::Instant::now();
         self.initialize_copy_types();
+        let copy_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 0: Run type checking and inference (Issue 0 Phase 1)
         // This validates types and performs type inference, reporting any errors
         // Skip type checking if SKIP_TYPE_CHECK env var is set (for debugging)
+        let t = std::time::Instant::now();
         if std::env::var("SKIP_TYPE_CHECK").is_err() {
             self.run_type_checking(program)?;
         }
+        let typecheck_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 0.5: Resolve method call return types
         // This updates MethodCall expression types by looking up trait implementations
+        let t = std::time::Instant::now();
         self.resolve_method_call_types(program)?;
+        let methods_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // First pass: collect all declarations
+        let t = std::time::Instant::now();
         self.collect_declarations(program)?;
+        let collect_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Wrap typed-AST `Call(...)` expressions for fiber defs so
         // their resolved type is `Fiber<T>` (what callers see) rather
@@ -629,6 +640,7 @@ impl AstLowering for LoweringContext {
         Self::wrap_fiber_call_types(program, &self.symbols.fiber_fn_names);
 
         // Second pass: lower each declaration
+        let t_decls = std::time::Instant::now();
         for decl in &program.declarations {
             self.lower_declaration(decl)?;
         }
@@ -638,6 +650,16 @@ impl AstLowering for LoweringContext {
         // push_handler/pop_handler for each recorded scope. The
         // function is taken out of the module while mutated so
         // `build_op_table` can read the rest of the module freely.
+        let decls_ms = t_decls.elapsed().as_secs_f64() * 1000.0;
+        if trace {
+            eprintln!(
+                "[LOWER-PROGRAM] copy_types = {copy_ms:.2}  typecheck = {typecheck_ms:.2}  \
+                 method_types = {methods_ms:.2}  collect_decls = {collect_ms:.2}  \
+                 lower_decls = {decls_ms:.2} ms ({} declarations)",
+                program.declarations.len()
+            );
+        }
+
         let pending = std::mem::take(&mut self.pending_with_scopes);
         for (fn_id, scopes) in pending {
             if let Some(mut func) = self.module.functions.swap_remove(&fn_id) {
