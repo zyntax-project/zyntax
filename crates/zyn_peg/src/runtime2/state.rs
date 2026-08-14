@@ -256,6 +256,11 @@ impl<'a> ParserState<'a> {
         &self.input[self.pos..]
     }
 
+    /// Length of the whole input, for reporting work against its size.
+    pub fn input_len(&self) -> usize {
+        self.input.len()
+    }
+
     /// Get a slice of input
     pub fn slice(&self, start: usize, end: usize) -> &str {
         &self.input[start..end]
@@ -360,12 +365,18 @@ impl<'a> ParserState<'a> {
 
     /// Create a failure result
     pub fn fail<T>(&mut self, expected: &str) -> ParseResult<T> {
-        // Track furthest failure for error reporting
+        // Track furthest failure for error reporting.
+        //
+        // A PEG fails constantly at the position it has reached, since
+        // that is where every alternative is being tried, and each one
+        // used to leave an owned string behind. Only the first few say
+        // anything a reader can act on, so the rest are dropped.
+        const MOST_EXPECTED: usize = 8;
         if self.pos > self.furthest_pos {
             self.furthest_pos = self.pos;
             self.furthest_expected.clear();
             self.furthest_expected.push(expected.to_string());
-        } else if self.pos == self.furthest_pos {
+        } else if self.pos == self.furthest_pos && self.furthest_expected.len() < MOST_EXPECTED {
             self.furthest_expected.push(expected.to_string());
         }
 

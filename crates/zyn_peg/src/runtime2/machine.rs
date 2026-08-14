@@ -559,6 +559,62 @@ fn enter<'g>(
     })
 }
 
+/// Counts of the work a parse did, reported under ZYNPEG_MACHINE_STATS.
+///
+/// Each count stands for allocation the parse cannot avoid today: a
+/// character class builds a string per character, a bind owns its name
+/// twice, an atomic rule copies the text it matched, and a memo entry
+/// holds a deep clone of a rule's whole value. Which of those to
+/// attack is a question about their counts, not their plausibility.
+#[derive(Default)]
+struct Stats {
+    calls: u64,
+    memo_hits: u64,
+    memo_stores: u64,
+    classes: u64,
+    literals: u64,
+    binds: u64,
+    atomic_rets: u64,
+    actions: u64,
+    fails: u64,
+    skip_ws: u64,
+}
+
+/// Whether to count, read once per process.
+fn stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNPEG_MACHINE_STATS").is_some())
+}
+
+impl Stats {
+    fn report(&self, input: usize) {
+        let per = |n: u64| n as f64 / input.max(1) as f64;
+        eprintln!(
+            "[MACHINE] {} bytes  calls {} ({:.2}/byte)  memo hit {} store {}  \
+             class {} ({:.2}/byte)  literal {}  bind {} ({:.2}/byte)  \
+             atomic-ret {}  action {}  fail {}",
+            input,
+            self.calls,
+            per(self.calls),
+            self.memo_hits,
+            self.memo_stores,
+            self.classes,
+            per(self.classes),
+            self.literals,
+            self.binds,
+            per(self.binds),
+            self.atomic_rets,
+            self.actions,
+            self.fails,
+        );
+        eprintln!(
+            "[MACHINE] skip-ws {} ({:.2}/byte)",
+            self.skip_ws,
+            per(self.skip_ws)
+        );
+    }
+}
+
 /// Run a compiled rule.
 ///
 /// The caller has already checked that `rule` has machine code; a rule
@@ -570,6 +626,23 @@ pub fn run<'g>(
     rule: usize,
     state: &mut ParserState<'_>,
 ) -> ParseResult<ParsedValue> {
+    let mut stats = Stats::default();
+    let input = state.input_len();
+    let result = run_counted(program, interp, rule, state, &mut stats);
+    if stats_enabled() {
+        stats.report(input);
+    }
+    result
+}
+
+fn run_counted<'g>(
+    program: &Program<'g>,
+    interp: &GrammarInterpreter<'g>,
+    rule: usize,
+    state: &mut ParserState<'_>,
+    stats: &mut Stats,
+) -> ParseResult<ParsedValue> {
+    let counting = stats_enabled();
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
     let mut cps: Vec<Choicepoint> = Vec::with_capacity(64);
     let mut lists: Vec<Vec<ParsedValue>> = Vec::with_capacity(16);
@@ -599,9 +672,15 @@ pub fn run<'g>(
                     }
                     v = ParsedValue::None;
                     pc += 1;
+                    if counting {
+                        stats.literals += 1;
+                    }
                 } else {
                     let _: ParseResult<()> = state.fail(desc);
                     failed = true;
+                    if counting {
+                        stats.fails += 1;
+                    }
                 }
             }
 
@@ -609,8 +688,16 @@ pub fn run<'g>(
                 ParseResult::Success(value, _) => {
                     v = value;
                     pc += 1;
+                    if counting {
+                        stats.classes += 1;
+                    }
                 }
-                ParseResult::Failure(_) => failed = true,
+                ParseResult::Failure(_) => {
+                    failed = true;
+                    if counting {
+                        stats.fails += 1;
+                    }
+                }
             },
 
             Instr::AnyChar => match state.advance() {
@@ -647,6 +734,9 @@ pub fn run<'g>(
             Instr::SkipWs => {
                 state.skip_ws();
                 pc += 1;
+                if counting {
+                    stats.skip_ws += 1;
+                }
             }
 
             Instr::SetNone => {
@@ -657,6 +747,9 @@ pub fn run<'g>(
             Instr::Bind(name) => {
                 state.set_binding(name, v.clone());
                 pc += 1;
+                if counting {
+                    stats.binds += 1;
+                }
             }
 
             Instr::Fail => failed = true,
@@ -734,6 +827,9 @@ pub fn run<'g>(
                 } else {
                     if let Some(name) = binding {
                         state.set_binding(name, ParsedValue::List(items.clone()));
+                        if counting {
+                            stats.binds += 1;
+                        }
                     }
                     v = ParsedValue::List(items);
                     pc += 1;
@@ -786,6 +882,9 @@ pub fn run<'g>(
                             Enter::Run(frame) => {
                                 frames.push(frame);
                                 pc = entry;
+                                if counting {
+                                    stats.calls += 1;
+                                }
                             }
                             Enter::Value(value) => {
                                 if let Instr::Call {
@@ -794,11 +893,22 @@ pub fn run<'g>(
                                 } = &program.code[pc]
                                 {
                                     state.set_binding(name, value.clone());
+                                    if counting {
+                                        stats.binds += 1;
+                                    }
                                 }
                                 v = value;
                                 pc += 1;
+                                if counting {
+                                    stats.memo_hits += 1;
+                                }
                             }
-                            Enter::Fail => failed = true,
+                            Enter::Fail => {
+                                failed = true;
+                                if counting {
+                                    stats.memo_hits += 1;
+                                }
+                            }
                         }
                     }
                     // A form the machine does not express yet. The
@@ -830,6 +940,9 @@ pub fn run<'g>(
                 let end_pos = state.pos();
 
                 let mut value = std::mem::replace(&mut v, ParsedValue::None);
+                if counting && slot.atomic {
+                    stats.atomic_rets += 1;
+                }
                 if slot.atomic {
                     // An atomic rule's value is the text it matched,
                     // which `text()` reads back through this name.
@@ -840,6 +953,9 @@ pub fn run<'g>(
 
                 let produced = match &slot.rule.action {
                     Some(action) => {
+                        if counting {
+                            stats.actions += 1;
+                        }
                         let span = Span::new(frame.start_pos, end_pos);
                         match interp.execute_action(action, state, span) {
                             Ok(result) => Some(result),
@@ -858,6 +974,9 @@ pub fn run<'g>(
 
                 match produced {
                     Some(result) => {
+                        if counting {
+                            stats.memo_stores += 1;
+                        }
                         state.store_memo_at(
                             frame.start_pos,
                             slot.memo_id,
@@ -875,6 +994,9 @@ pub fn run<'g>(
                         } = &program.code[frame.return_pc - 1]
                         {
                             state.set_binding(name, result.clone());
+                            if counting {
+                                stats.binds += 1;
+                            }
                         }
                         v = result;
                         pc = frame.return_pc;
