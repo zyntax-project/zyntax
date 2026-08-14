@@ -9,6 +9,7 @@
 //! For production use, the code generator (`codegen::ParserGenerator`) should
 //! be used instead as it produces more efficient compiled code.
 
+use super::machine;
 use super::state::{ParseFailure, ParseResult, ParsedValue, ParserState};
 use crate::grammar::{ActionIR, CharClass, ExprIR, GrammarIR, PatternIR, RuleIR, RuleModifier};
 use log::{debug, trace};
@@ -60,6 +61,21 @@ pub struct GrammarInterpreter<'g> {
     /// What each referenced name resolves to, and the memo id for a
     /// rule, so executing a reference is one lookup rather than three.
     rule_targets: HashMap<String, RuleTarget>,
+    /// The grammar compiled to a parsing machine, when the machine is
+    /// enabled. A rule it can run goes through [`machine::run`]; the
+    /// rest, and everything a machine rule calls that has no code, come
+    /// back here.
+    machine: Option<machine::Program<'g>>,
+}
+
+/// Whether the parsing machine runs, read once per process.
+///
+/// `ZYNPEG_MACHINE=0` puts every parse back on the interpreter, which
+/// is what a report of a parse the machine gets wrong is checked
+/// against.
+fn machine_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("ZYNPEG_MACHINE").as_deref(), Ok("0")))
 }
 
 impl<'g> GrammarInterpreter<'g> {
@@ -87,11 +103,32 @@ impl<'g> GrammarInterpreter<'g> {
         ] {
             rule_targets.insert(name.to_string(), target);
         }
+        // The machine memoizes under the ids built above, so a rule it
+        // runs and a rule this interpreter runs share packrat entries.
+        let machine = machine_enabled().then(|| machine::compile(grammar, &rule_id_map));
         GrammarInterpreter {
             grammar,
             rule_id_map,
             rule_targets,
+            machine,
         }
+    }
+
+    /// An interpreter that walks the pattern tree, whatever the
+    /// machine is set to.
+    ///
+    /// This is the reference the machine is checked against: the same
+    /// grammar and input through both has to produce the same value at
+    /// the same position.
+    pub fn without_machine(grammar: &'g GrammarIR) -> Self {
+        let mut this = Self::new(grammar);
+        this.machine = None;
+        this
+    }
+
+    /// The compiled program, when the machine is enabled.
+    pub fn program(&self) -> Option<&machine::Program<'g>> {
+        self.machine.as_ref()
     }
 
     /// Parse input using a specific rule
@@ -100,6 +137,14 @@ impl<'g> GrammarInterpreter<'g> {
         rule_name: &str,
         state: &mut ParserState<'a>,
     ) -> ParseResult<ParsedValue> {
+        if let Some(program) = &self.machine {
+            if let Some(index) = program.rule_index(rule_name) {
+                if program.rules[index].entry.is_some() {
+                    return machine::run(program, self, index, state);
+                }
+            }
+        }
+
         let rule = match self.grammar.get_rule(rule_name) {
             Some(r) => r,
             None => return state.fail(&format!("unknown rule: {}", rule_name)),
@@ -129,7 +174,7 @@ impl<'g> GrammarInterpreter<'g> {
     }
 
     /// Execute a rule whose memo id the caller already resolved.
-    fn execute_rule_with_id<'a>(
+    pub(super) fn execute_rule_with_id<'a>(
         &self,
         rule: &RuleIR,
         memo_rule_id: usize,
@@ -235,7 +280,7 @@ impl<'g> GrammarInterpreter<'g> {
     }
 
     /// Execute an action to construct a TypedAST node
-    fn execute_action<'a>(
+    pub(super) fn execute_action<'a>(
         &self,
         action: &ActionIR,
         state: &mut ParserState<'a>,
@@ -5349,7 +5394,7 @@ impl<'g> GrammarInterpreter<'g> {
     }
 
     /// Execute a character class pattern
-    fn execute_char_class<'a>(
+    pub(super) fn execute_char_class<'a>(
         &self,
         class: &CharClass,
         state: &mut ParserState<'a>,
