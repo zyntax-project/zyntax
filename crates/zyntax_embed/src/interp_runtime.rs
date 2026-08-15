@@ -86,6 +86,10 @@ use zyntax_typed_ast::{TypeRegistry, TypedProgram};
 /// interpreter is the only execution path until the wasm-emitting
 /// backend lands (Phase E).
 pub struct InterpRuntime {
+    /// The functions a host can enter through, which dead-code
+    /// analysis prunes from. Empty means nothing is pruned, which is
+    /// the safe answer when nobody has said.
+    entry_names: Vec<String>,
     /// The HIR module being executed. Filled by `compile_module` /
     /// `compile_typed_program`. Wrapped in `Arc` so per-function tick
     /// callbacks can hold a stable reference without re-borrowing
@@ -153,12 +157,29 @@ fn default_tier_policies() -> Vec<Box<dyn beadie::HotnessPolicy>> {
 }
 
 impl InterpRuntime {
+    /// Name the functions a host can enter the program through.
+    ///
+    /// Dead-code analysis prunes from these, so a wrong answer prunes
+    /// from the wrong root. They come from what a grammar declares or
+    /// what a host configures; this layer has no entry point of its own
+    /// to assume. With none given, nothing is pruned.
+    pub fn set_entry_names(&mut self, names: Vec<String>) {
+        self.entry_names = names;
+    }
+
+    /// What [`Self::set_entry_names`] was told, for passing to the
+    /// reachability analysis.
+    fn entry_name_refs(&self) -> Vec<&str> {
+        self.entry_names.iter().map(String::as_str).collect()
+    }
+
     /// Create an empty runtime. On native, tier policies come from
     /// [`TieredConfig::default`] (warm/hot thresholds from
     /// `ProfileConfig::default`). On wasm there is no JIT tier — the
     /// interpreter runs everything.
     pub fn new() -> Self {
         Self {
+            entry_names: Vec::new(),
             module: None,
             interp: HirInterpreter::new(),
             #[cfg(feature = "native")]
@@ -192,6 +213,7 @@ impl InterpRuntime {
             let policies: Vec<Box<dyn beadie::HotnessPolicy>> =
                 vec![Box::new(ThresholdPolicy::new(warm))];
             Self {
+                entry_names: Vec::new(),
                 module: None,
                 interp: HirInterpreter::new(),
                 tiered: Arc::new(TieredAdapter::new(policies)),
@@ -749,7 +771,7 @@ impl InterpRuntime {
         // fib) none of them are reached, so this skips ~30-40 ms of Cranelift
         // codegen per install. Any unexpected call still works via the BC
         // interp's lazy-compile fallback.
-        let reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
+        let reachable = zyntax_compiler::reachable_function_ids(&module, &self.entry_name_refs());
         let bead_ids_for_cranelift = self.bead_ids.clone();
         let enable_osr = config.enable_osr;
         cranelift.with_lock(|be| -> Result<(), CompilerError> {
@@ -816,7 +838,8 @@ impl InterpRuntime {
             // reaches. The single-kernel install measured 300-900 ms
             // before this gate landed; with it the LLVM compile sees
             // only the same subset Cranelift does.
-            let llvm_reachable = zyntax_compiler::reachable_function_ids(&module, &["main"]);
+            let llvm_reachable =
+                zyntax_compiler::reachable_function_ids(&module, &self.entry_name_refs());
             let llvm_cache_key = config.llvm_cache_key.clone();
             let box_infos = crate::effect_runtime::box_runtime_symbol_infos();
             llvm.with_lock(|be| {
@@ -940,11 +963,11 @@ impl InterpRuntime {
         // `unreachable` trap — that bug was fixed by commit 432d017
         // (SSA Unreachable → synthesised Return). The gate is now
         // stale and the priming is always-on.
-        if let Some(main_id) = module
-            .functions
-            .iter()
-            .find_map(|(id, f)| (f.name.resolve_global().as_deref() == Some("main")).then_some(*id))
-        {
+        let entry_names = self.entry_name_refs();
+        if let Some(main_id) = module.functions.iter().find_map(|(id, f)| {
+            let name = f.name.resolve_global()?;
+            entry_names.contains(&name.as_str()).then_some(*id)
+        }) {
             if let Some(bound) = self.bounds.get(&main_id).cloned() {
                 let cranelift_for_prime = Arc::clone(&cranelift);
                 self.tiered.on_invoke(&bound, move |_tier, _bead| {

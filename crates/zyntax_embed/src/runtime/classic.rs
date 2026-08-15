@@ -280,7 +280,9 @@ impl ZyntaxRuntime {
         // that never executes. Matches the filter installed at
         // `install_interp_jit_with` time so the two paths see the
         // same minimal set.
-        let reachable = zyntax_compiler::reachable_function_ids(&owned, &["main"]);
+        let names = self.entry_names();
+        let entry_names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let reachable = zyntax_compiler::reachable_function_ids(&owned, &entry_names);
         self.backend.set_only_compile_reachable(Some(reachable));
 
         // Compile the module
@@ -1069,11 +1071,26 @@ impl ZyntaxRuntime {
     /// Install the BC interp → Cranelift opt [→ LLVM] tier ladder for
     /// hot-function promotion. Beadie's `TieredAdapter` (inside the
     /// interp) is the single tier-up orchestrator.
+    /// The functions a host can enter a program through, as the
+    /// registered grammars declare them.
+    ///
+    /// Zyntax has no entry point of its own. A language names one in
+    /// its grammar metadata or a host configures it, and with nobody
+    /// saying, nothing is treated as an entry.
+    pub(super) fn entry_names(&self) -> Vec<String> {
+        self.grammars
+            .values()
+            .filter_map(|grammar| grammar.entry_point().map(str::to_string))
+            .collect()
+    }
+
     pub fn install_interp_jit(&self) -> Result<(), CompilerError> {
+        let names = self.entry_names();
         let mut interp = self
             .interp
             .lock()
             .map_err(|e| CompilerError::Backend(format!("interp lock poisoned: {e}")))?;
+        interp.set_entry_names(names);
         interp.install_jit()
     }
 
@@ -1084,10 +1101,12 @@ impl ZyntaxRuntime {
         &self,
         config: zyntax_compiler::tiered_backend::TieredConfig,
     ) -> Result<(), CompilerError> {
+        let names = self.entry_names();
         let mut interp = self
             .interp
             .lock()
             .map_err(|e| CompilerError::Backend(format!("interp lock poisoned: {e}")))?;
+        interp.set_entry_names(names);
         interp.install_jit_with(config)
     }
 
