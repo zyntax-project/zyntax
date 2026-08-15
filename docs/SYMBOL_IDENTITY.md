@@ -52,10 +52,20 @@ and the module is named in the artifact. `CompiledImport` carries
 both, and a program parsed from source carries the language the host
 registered it under.
 
-That gives `zynml::prelude::sum` for a standard library function and
-`zynml::main::train` for one in a user's file. Modules that nest give
-their own path; nothing here decides how a language spells them,
-only that whatever it spells is what the symbol carries.
+That gives `zynml::prelude::sum` for a standard library function. What
+it gives for a function in a user's file is the question, and the
+answer today is wrong: lowering is handed the module name `main`, as a
+literal, for every program it compiles. So two files would both be
+`zynml::main::` and still collide, which makes the middle segment of
+the path a constant and the path no better than the leaf.
+
+The name is already available. `module_name_of` takes it from the file
+stem, and the runtime has the filename when it parses. Identity
+depends on that being what reaches lowering, so it is part of this
+work rather than a tidy-up beside it.
+
+Nothing here decides how a language spells nested modules. Whatever it
+spells is what the symbol carries.
 
 Externs keep their own names. A function whose `link_name` is already
 set is naming a symbol somebody else owns, and prefixing it would name
@@ -66,11 +76,17 @@ a symbol nobody exports.
 The blast radius is the argument for doing this deliberately rather
 than as a patch.
 
-A host calls a function by name, and `call_function("main")` has to
-keep working when the symbol is `zynml::main::main`. That wants a
-bare-name index alongside the qualified one, resolving when a bare
-name is unambiguous and refusing when it is not, which is the same
-rule the export check uses now.
+A host calls a function by name, and it has to keep working when the
+symbol is qualified. Which name that is comes from configuration: a
+grammar declares an entry point in its metadata and a host can name
+one itself. Zyntax has no entry point of its own and must not assume
+one; a language deciding that its own is `main` is that language's
+business. So the fallback resolves whatever name it is handed, not a
+name this layer picked.
+
+That wants a bare-name index alongside the qualified one, resolving
+when a bare name is unambiguous and refusing when it is not, which is
+the same rule the export check uses now.
 
 Hot reload identifies what to replace by name. Snapshot caches key on
 it. The interpreter keeps its own symbol table. A test asserting a
