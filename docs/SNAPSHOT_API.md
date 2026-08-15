@@ -215,6 +215,9 @@ Once names are qualified, aliasing becomes what it looks like. Two
 `add`s are two symbols, an import picks one, and a local alias is
 simply a convenience for writing it.
 
+How they get qualified is its own design, in
+[SYMBOL_IDENTITY.md](SYMBOL_IDENTITY.md).
+
 What this design does not attempt is making Python's semantics
 available to TypeScript. Calling across the boundary is a call. Whether
 the callee raises where the caller expects a rejected promise is a
