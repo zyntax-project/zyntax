@@ -10,40 +10,49 @@ refuses a name a second language already exported, which stops the
 damage but does not make the two nameable. This is how they become
 nameable.
 
-## What already carries the weight
+## What the backends already do
 
-A function can already say what it links as. `TypedFunction` has a
-`link_name`, lowering copies it onto `HirFunction`, and every backend
-reads it: Cranelift and the interpreter when they register a symbol,
-LLVM as `link_name.unwrap_or(actual_name)`. The mechanism for giving a
-function a symbol other than its source name is built, shipped, and
-exercised by every extern in the tree.
+A local function cannot collide with another local function, and that
+is worth knowing before designing a scheme to stop it. Cranelift
+declares one as its name joined to its `HirId`, with a generation
+suffix so recompiling under tier-up or hot reload produces a fresh
+symbol. LLVM declares one as `func_` and the id, dropping the source
+name. Both are unique by construction.
 
-So nothing here needs a new field in HIR, a new backend path, or a new
-convention. ZRTL already spells its symbols `$Image$load`, which is the
-same idea reached by hand.
+`link_name` does not enter into that. Cranelift, LLVM and the
+interpreter all read it only when a function is external, which is what
+it is for: an extern's declared name is an alias, and the link name is
+the symbol a plugin actually provides. Setting it on an ordinary
+function changes nothing anywhere.
+
+So the collision this opened with does not live in the backends. It
+lives in the one table still keyed by a bare name, the symbols a host
+exports for later modules to link against. Qualifying that is a change
+at the export boundary, not a mangling scheme reaching into lowering.
+
+One thing found on the way belongs in its own change. LLVM keeps the
+name `main` verbatim while mangling every other local function, so a
+backend is deciding which name is an entry point. An entry point is
+configured, and nothing below the host should be naming one.
 
 ## The two halves
 
 Naming is not the same problem as resolving, and conflating them is
 what made this look small twice already.
 
-**Identity** is which symbol a function registers as. Giving each
-merged declaration a `link_name` of `language::module::name` makes
-every symbol distinct, and the backends already do the rest. A Python
-`add` and a TypeScript `add` stop being one address.
+**Identity** is which symbol a function registers as, and for anything
+a backend compiles it is already settled. What is not settled is the
+name a host exports a function under, which is its source name and
+nothing else.
 
-**Resolution** is which function a call means. A call to `add` inside
-a TypeScript file has to find TypeScript's, and today it cannot, for a
-reason that has nothing to do with symbols: imports are merged. An
-imported module's declarations are drained into the importing program
-and lowered together, so both `add`s are declarations in one program
-and a lookup by source name has nothing to choose on.
-
-Identity without resolution is worth having. It converts a silent
-wrong call into a link that fails, and it is what makes a debugger, a
-profile, or a stack trace say which `add` ran. But it does not by
-itself make the right one run.
+**Resolution** is which function a call means, and this is the real
+gap. A call to `add` inside a TypeScript file has to find TypeScript's,
+and today it cannot, for a reason that has nothing to do with symbols:
+imports are merged. An imported module's declarations are drained into
+the importing program and lowered together, so both `add`s are
+declarations in one program and a lookup by source name has nothing to
+choose on. Two functions with one name, each already compiled to its
+own symbol, and no rule for deciding which one a call meant.
 
 ## Where the path comes from
 
@@ -115,8 +124,15 @@ here, but it is the shape this keeps pointing at.
 
 ## Order
 
-Identity first, since it stands alone, needs no new machinery, and
-turns a silent overwrite into a loud failure. Bare-name fallback with
-it, because everything that looks a symbol up by name depends on it.
-Resolution after, with the scope table, once there is something to
-resolve between.
+The export boundary first. It is the only place a bare name is still
+the identity, the change is local to it, and refusing the collision is
+already there to build on.
+
+Resolution after, with the scope table, because it is the one that
+decides whether a call is right rather than whether a link is unique.
+Bare-name fallback goes with whichever of them first changes a name a
+host can ask for.
+
+Nothing about `link_name` on ordinary functions, which was the plan
+until the backends were read. It is an externs-only mechanism and the
+functions it would have qualified are unique already.
