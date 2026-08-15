@@ -1697,7 +1697,16 @@ impl ZyntaxRuntime {
         }
 
         let arena = AstArena::new();
-        let module_name = InternedString::new_global("main");
+        // The module a program lowers under is the file it came from.
+        // Naming every program `main` put them all in one module, which
+        // is the wrong answer for anything that qualifies a name by the
+        // module holding it.
+        let module_name = program
+            .source_files
+            .first()
+            .map(|file| crate::grammar::module_name_of(&file.name))
+            .or_else(|| program.type_registry.current_module())
+            .unwrap_or_else(|| InternedString::new_global("module"));
         let mut type_registry = program.type_registry.clone();
 
         // Process imports FIRST to load stdlib traits and impls
@@ -5703,7 +5712,16 @@ impl TieredRuntime {
         })?;
 
         let arena = AstArena::new();
-        let module_name = InternedString::new_global("main");
+        // The module a program lowers under is the file it came from.
+        // Naming every program `main` put them all in one module, which
+        // is the wrong answer for anything that qualifies a name by the
+        // module holding it.
+        let module_name = program
+            .source_files
+            .first()
+            .map(|file| crate::grammar::module_name_of(&file.name))
+            .or_else(|| program.type_registry.current_module())
+            .unwrap_or_else(|| InternedString::new_global("module"));
         // Use the type registry from the parsed program (now contains registered structs)
         let type_registry = std::sync::Arc::new(program.type_registry.clone());
 
