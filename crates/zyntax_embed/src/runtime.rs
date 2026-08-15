@@ -1107,6 +1107,10 @@ pub struct ZyntaxRuntime {
     config: CompilationConfig,
     /// Registered external functions
     external_functions: HashMap<String, ExternalFunction>,
+    /// What a grammar's builtin names stand for, as names rather than
+    /// as the symbols they resolve to. Kept unresolved so a plugin can
+    /// load before or after the grammar that names it.
+    builtin_aliases: HashMap<String, String>,
     /// Import resolver callbacks (tried in order)
     import_resolvers: Vec<ImportResolverCallback>,
     /// Build-time parsed imports, consulted before source resolvers.
@@ -1191,6 +1195,7 @@ impl ZyntaxRuntime {
             function_signatures: HashMap::new(),
             config,
             external_functions: HashMap::new(),
+            builtin_aliases: HashMap::new(),
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             grammars: HashMap::new(),
@@ -1241,6 +1246,7 @@ impl ZyntaxRuntime {
             function_signatures: HashMap::new(),
             config: CompilationConfig::default(),
             external_functions: HashMap::new(),
+            builtin_aliases: HashMap::new(),
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             grammars: HashMap::new(),
@@ -2655,6 +2661,61 @@ impl ZyntaxRuntime {
     // ========================================================================
     // Multi-Language Grammar Registry
     // ========================================================================
+    /// Install a language: its grammar, its standard library, and the
+    /// type ids both were built against.
+    ///
+    /// This is the whole of what a language does to become usable in a
+    /// runtime. Decoding the snapshot's modules reserves their
+    /// build-time type ids, and doing it here, in the order the build
+    /// wrote them, is why a language no longer has to remember to do
+    /// it before parsing anything.
+    ///
+    /// Hold the snapshot for the process and install the same one into
+    /// however many runtimes get built. Decoding happens once for the
+    /// snapshot rather than once per runtime.
+    ///
+    /// Returns the grammar it registered, so a host that wants one of
+    /// its own does not decode the same bytes twice.
+    ///
+    /// Plugins can load before or after this. A grammar's builtin
+    /// names are recorded as the names they stand for and resolved
+    /// when something asks, so nothing here depends on a plugin having
+    /// arrived first.
+    pub fn install_snapshot(
+        &mut self,
+        snapshot: Arc<crate::Snapshot>,
+    ) -> RuntimeResult<LanguageGrammar> {
+        let grammar =
+            LanguageGrammar::from_compiled_bytes(snapshot.grammar_bytes()).map_err(|e| {
+                RuntimeError::Execution(format!(
+                    "snapshot for '{}' has an unreadable grammar: {e}",
+                    snapshot.language()
+                ))
+            })?;
+        self.register_grammar(snapshot.language(), grammar.clone());
+
+        // Reserve the ids before anything can parse against them.
+        snapshot.modules().map_err(|e| {
+            RuntimeError::Execution(format!(
+                "snapshot for '{}' has an unreadable module: {e}",
+                snapshot.language()
+            ))
+        })?;
+
+        let compiled = Arc::clone(&snapshot);
+        self.add_compiled_import_resolver(Box::new(move |module_name| {
+            compiled.module(module_name).map_err(|e| e.to_string())
+        }));
+
+        // A module that kept its source stays available to hosts that
+        // would rather parse it than trust the artifact.
+        let sources = snapshot;
+        self.add_import_resolver(Box::new(move |module_name| {
+            Ok(sources.module_source(module_name).map(str::to_string))
+        }));
+
+        Ok(grammar)
+    }
 
     /// Register a language grammar with the runtime
     ///
@@ -2679,19 +2740,13 @@ impl ZyntaxRuntime {
     /// runtime.load_module("zig", "pub fn add(a: i32, b: i32) i32 { return a + b; }")?;
     /// ```
     pub fn register_grammar(&mut self, language: &str, grammar: LanguageGrammar) {
-        // Register builtin aliases from the grammar
-        // This maps DSL-friendly names (e.g., "image_load") to plugin symbols (e.g., "$Image$load")
+        // Record what the grammar's builtin names stand for. Copying
+        // the symbol's address here instead meant a plugin loaded
+        // after its grammar never got an alias, since there was
+        // nothing to copy at the time. The name is enough, and it is
+        // true whenever the plugin arrives.
         for (alias, target) in &grammar.builtins().functions {
-            // If the target symbol is registered, create an alias for it
-            if let Some(ext_func) = self.external_functions.get(target).cloned() {
-                self.external_functions.insert(alias.clone(), ext_func);
-            } else {
-                log::debug!(
-                    "Grammar builtin '{}' -> '{}' not found in external functions (yet)",
-                    alias,
-                    target
-                );
-            }
+            self.builtin_aliases.insert(alias.clone(), target.clone());
         }
 
         let grammar = Arc::new(grammar);
@@ -3026,7 +3081,16 @@ impl ZyntaxRuntime {
     /// [`Self::call_function`] / [`Self::call_function_raw`] rather
     /// than dispatch through a raw pointer.
     pub fn external_function_ptr(&self, name: &str) -> Option<*const u8> {
-        self.external_functions.get(name).map(|f| f.ptr)
+        self.external_functions
+            .get(name)
+            .or_else(|| {
+                // A grammar builtin stands for a symbol a plugin
+                // provides, whenever that plugin turned up.
+                self.builtin_aliases
+                    .get(name)
+                    .and_then(|target| self.external_functions.get(target))
+            })
+            .map(|f| f.ptr)
     }
 
     /// Register a runtime event sink callback.
@@ -4175,6 +4239,61 @@ impl TieredRuntime {
     // ========================================================================
     // Multi-Language Grammar Registry
     // ========================================================================
+    /// Install a language: its grammar, its standard library, and the
+    /// type ids both were built against.
+    ///
+    /// This is the whole of what a language does to become usable in a
+    /// runtime. Decoding the snapshot's modules reserves their
+    /// build-time type ids, and doing it here, in the order the build
+    /// wrote them, is why a language no longer has to remember to do
+    /// it before parsing anything.
+    ///
+    /// Hold the snapshot for the process and install the same one into
+    /// however many runtimes get built. Decoding happens once for the
+    /// snapshot rather than once per runtime.
+    ///
+    /// Returns the grammar it registered, so a host that wants one of
+    /// its own does not decode the same bytes twice.
+    ///
+    /// Plugins can load before or after this. A grammar's builtin
+    /// names are recorded as the names they stand for and resolved
+    /// when something asks, so nothing here depends on a plugin having
+    /// arrived first.
+    pub fn install_snapshot(
+        &mut self,
+        snapshot: Arc<crate::Snapshot>,
+    ) -> RuntimeResult<LanguageGrammar> {
+        let grammar =
+            LanguageGrammar::from_compiled_bytes(snapshot.grammar_bytes()).map_err(|e| {
+                RuntimeError::Execution(format!(
+                    "snapshot for '{}' has an unreadable grammar: {e}",
+                    snapshot.language()
+                ))
+            })?;
+        self.register_grammar(snapshot.language(), grammar.clone());
+
+        // Reserve the ids before anything can parse against them.
+        snapshot.modules().map_err(|e| {
+            RuntimeError::Execution(format!(
+                "snapshot for '{}' has an unreadable module: {e}",
+                snapshot.language()
+            ))
+        })?;
+
+        let compiled = Arc::clone(&snapshot);
+        self.add_compiled_import_resolver(Box::new(move |module_name| {
+            compiled.module(module_name).map_err(|e| e.to_string())
+        }));
+
+        // A module that kept its source stays available to hosts that
+        // would rather parse it than trust the artifact.
+        let sources = snapshot;
+        self.add_import_resolver(Box::new(move |module_name| {
+            Ok(sources.module_source(module_name).map(str::to_string))
+        }));
+
+        Ok(grammar)
+    }
 
     /// Register a language grammar with the runtime
     ///
