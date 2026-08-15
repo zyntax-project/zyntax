@@ -87,6 +87,7 @@ pub mod iterator;
 /// path delegates to these; the wasm `run_impl` calls them
 /// directly after `compile_to_hir`).
 pub mod krio_lowering;
+mod snapshot;
 // `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
 // loader, async executor). Native-only — the wasm-target entry point
 // (separate `zyntax_wasm` crate, Phase F) wires the BC interpreter
@@ -115,6 +116,9 @@ pub use host_futures::{__zyntax_register_future, __zyntax_reject_future, __zynta
 
 pub use array::ZyntaxArray;
 pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
+pub use snapshot::{
+    snapshot_file_name, Snapshot, SnapshotBuilder, SnapshotError, SNAPSHOT_EXTENSION,
+};
 // Re-export the BC interpreter so embedders that want a bare
 // HirInterpreter without the beadie wrapper can grab it directly.
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};
