@@ -1392,6 +1392,7 @@ impl<'g> GrammarInterpreter<'g> {
                 }
 
                 TypedDeclaration::Import(zyntax_typed_ast::TypedImport {
+                    language: None,
                     module_path,
                     items,
                     span,
@@ -1615,6 +1616,7 @@ impl<'g> GrammarInterpreter<'g> {
         let type_registry = state.type_registry().clone();
 
         Ok(ParsedValue::Program(Box::new(TypedProgram {
+            language: None,
             declarations,
             span,
             source_files: vec![],

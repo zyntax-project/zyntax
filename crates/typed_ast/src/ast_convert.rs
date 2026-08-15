@@ -259,6 +259,7 @@ pub mod typescript_example {
 
             Ok(TypedProgram {
                 declarations,
+                language: None,
                 span: Span::new(0, 0), // Would get from source
                 source_files: vec![],  // TODO: Add source file info
                 type_registry: crate::TypeRegistry::new(),

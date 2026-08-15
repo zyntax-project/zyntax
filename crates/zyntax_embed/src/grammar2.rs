@@ -190,6 +190,10 @@ pub type Grammar2Result<T> = Result<T, Grammar2Error>;
 pub struct Grammar2 {
     /// The parsed grammar IR
     grammar: Arc<GrammarIR>,
+    /// The name the host registered this under, stamped onto every
+    /// program parsed with it so an unqualified import resolves in the
+    /// language the file was written in.
+    language: Option<String>,
     /// The grammar compiled to a parsing machine, built on the first
     /// parse and kept for the rest. Compiling belongs to setting this
     /// grammar up rather than to parsing a file with it.
@@ -200,6 +204,7 @@ impl Grammar2 {
     pub(crate) fn from_shared_ir(grammar: Arc<GrammarIR>) -> Self {
         Self {
             grammar,
+            language: None,
             program: std::sync::OnceLock::new(),
         }
     }
@@ -213,8 +218,14 @@ impl Grammar2 {
         let _ = cell.set(program);
         Self {
             grammar,
+            language: None,
             program: cell,
         }
+    }
+
+    /// Record the name a host registered this grammar under.
+    pub(crate) fn set_language(&mut self, language: Option<String>) {
+        self.language = language;
     }
 
     /// The compiled program for this grammar, compiled once.
@@ -235,6 +246,7 @@ impl Grammar2 {
 
         Ok(Self {
             grammar: Arc::new(grammar),
+            language: None,
             program: std::sync::OnceLock::new(),
         })
     }
@@ -243,6 +255,7 @@ impl Grammar2 {
     pub fn from_ir(grammar: GrammarIR) -> Self {
         Self {
             grammar: Arc::new(grammar),
+            language: None,
             program: std::sync::OnceLock::new(),
         }
     }
@@ -290,6 +303,7 @@ impl Grammar2 {
 
         let grammar = Arc::clone(&self.grammar);
         let program = self.program();
+        let language = self.language.clone();
         let source_owned = source.to_string();
         let filename_owned = filename.to_string();
 
@@ -314,6 +328,9 @@ impl Grammar2 {
 
             match result {
                 ParseResult::Success(ParsedValue::Program(mut program), _) => {
+                    program.language = language
+                        .as_deref()
+                        .map(zyntax_typed_ast::InternedString::new_global);
                     program.source_files = vec![SourceFile::new(
                         filename_owned.clone(),
                         source_owned.clone(),
@@ -615,6 +632,7 @@ impl Clone for Grammar2 {
         }
         Self {
             grammar: Arc::clone(&self.grammar),
+            language: self.language.clone(),
             program,
         }
     }

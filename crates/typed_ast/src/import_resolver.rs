@@ -1236,6 +1236,7 @@ mod tests {
 
         let mut arena = AstArena::new();
         let import = TypedImport {
+            language: None,
             module_path: vec![
                 arena.intern_string("haxe"),
                 arena.intern_string("ds"),

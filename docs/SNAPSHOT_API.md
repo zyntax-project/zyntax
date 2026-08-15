@@ -185,6 +185,36 @@ between two languages then stops being a warning and a silent
 overwrite, which is the correct outcome: nothing about `add` in Python
 says it should replace `add` in TypeScript.
 
+Qualifying them costs more than qualifying modules did, and it is
+worth being clear why. A module is resolved by a runtime that can be
+handed a language alongside the name. A symbol is linked by name, at
+the backend, against a table that is a plain map of name to address. A
+qualified export that nothing else knows about is an export nothing
+can call: the name a call site emits has to be qualified in the same
+way, which makes this a mangling scheme reaching back into lowering
+rather than a lookup rule at the edge.
+
+So it splits in two. Refusing the collision needs only the language
+that exported each symbol, which the runtime already has when it loads
+a module, and it turns silent corruption into an error at the point of
+the second export. Qualifying the names, so two languages can both
+have an `add` and each call its own, is the mangling work and belongs
+with whatever decides how a language's symbols are spelled.
+
+Renaming an import does not stand in for either. An import item
+carries the name in the module it came from and an optional local
+alias, and the alias binds a name in the file doing the importing; the
+call still links against the name the module exported. So `add as
+pyAdd` reads like it settles which `add` is meant and settles nothing:
+both are one entry in the symbol table, and the second export replaces
+the first. That makes aliasing worth naming in the error, because it
+is the first thing anyone will reach for, and it is the case where the
+damage is hardest to see.
+
+Once names are qualified, aliasing becomes what it looks like. Two
+`add`s are two symbols, an import picks one, and a local alias is
+simply a convenience for writing it.
+
 What this design does not attempt is making Python's semantics
 available to TypeScript. Calling across the boundary is a call. Whether
 the callee raises where the caller expects a rejected promise is a

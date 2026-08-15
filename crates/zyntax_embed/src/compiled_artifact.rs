@@ -48,11 +48,16 @@ impl CompiledImport {
         mut program: TypedProgram,
     ) -> Self {
         let module_name = module_name.into();
+        let language = language.into();
         program
             .type_registry
             .set_current_module(Some(InternedString::new_global(&module_name)));
+        // The module carries the language it was written in, so an
+        // unqualified import inside it resolves against that language
+        // rather than against whoever registered first.
+        program.language = Some(InternedString::new_global(&language));
         Self {
-            language: language.into(),
+            language,
             module_name,
             program,
         }

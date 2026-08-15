@@ -42,6 +42,14 @@ impl<T: Default> Default for TypedNode<T> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypedProgram {
     pub declarations: Vec<TypedNode<TypedDeclaration>>,
+    /// The language this was written in, as the host registered it.
+    ///
+    /// A runtime can hold several languages at once, and a module
+    /// resolves an unqualified import against its own language before
+    /// anyone else's. `None` means nobody said, which is every program
+    /// in a host that registered one language.
+    #[serde(default)]
+    pub language: Option<InternedString>,
     #[serde(default)]
     pub span: Span,
     /// Source files used in this program (for diagnostics)
@@ -56,6 +64,7 @@ impl Default for TypedProgram {
     fn default() -> Self {
         Self {
             declarations: Vec::new(),
+            language: None,
             span: Span::default(),
             source_files: Vec::new(),
             type_registry: crate::TypeRegistry::new(),
@@ -1577,6 +1586,13 @@ pub struct TypedModule {
 /// Import declaration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypedImport {
+    /// The language the module belongs to, when the source named one.
+    ///
+    /// `None` means the language of the file doing the importing. How
+    /// a language spells this is a matter for its grammar; the field
+    /// is the whole of what resolution reads.
+    #[serde(default)]
+    pub language: Option<InternedString>,
     pub module_path: Vec<InternedString>,
     pub items: Vec<TypedImportItem>,
     pub span: Span,

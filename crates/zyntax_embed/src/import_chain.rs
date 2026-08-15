@@ -15,6 +15,38 @@ use crate::runtime::{
     CompiledImportResolverCallback, ImportResolverCallback, RuntimeError, RuntimeResult,
 };
 
+/// Modules a snapshot installed, keyed by the language that brought
+/// them.
+///
+/// Resolvers answer on a bare module name, across every language at
+/// once, so two languages that both ship a `prelude` resolve to
+/// whichever registered first. This table is read before them and
+/// keyed by language, so a name means what it means inside the
+/// language asking.
+pub(crate) type SnapshotModules = HashMap<(String, String), Arc<crate::Snapshot>>;
+
+/// Find a module, preferring the language that asked for it.
+///
+/// An import that named a language resolves in that language or not at
+/// all. An unqualified one resolves in the importing language, and
+/// falls back to the flat resolvers below, which is what a host with
+/// one language has always done.
+pub(crate) fn resolve_snapshot_module(
+    modules: &SnapshotModules,
+    importing_language: Option<&str>,
+    named_language: Option<&str>,
+    module: &str,
+) -> Result<Option<crate::CompiledImport>, String> {
+    let language = named_language.or(importing_language);
+    let Some(language) = language else {
+        return Ok(None);
+    };
+    let Some(snapshot) = modules.get(&(language.to_string(), module.to_string())) else {
+        return Ok(None);
+    };
+    snapshot.module(module).map_err(|e| e.to_string())
+}
+
 /// Resolve `module_path` against an ordered list of resolver callbacks.
 /// Returns `Ok(Some(source))` from the first resolver that knows about
 /// the module; `Ok(None)` if nobody recognised it.
@@ -104,6 +136,7 @@ pub(crate) fn process_imports_for_traits(
     plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
     import_resolvers: &[crate::runtime::ImportResolverCallback],
     compiled_import_resolvers: &[crate::runtime::CompiledImportResolverCallback],
+    snapshot_modules: &SnapshotModules,
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
@@ -121,6 +154,7 @@ pub(crate) fn process_imports_for_traits(
         plugin_signatures,
         import_resolvers,
         compiled_import_resolvers,
+        snapshot_modules,
         program,
         type_registry,
         &mut processed,
@@ -132,6 +166,7 @@ fn process_imports_inner(
     plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
     import_resolvers: &[crate::runtime::ImportResolverCallback],
     compiled_import_resolvers: &[crate::runtime::CompiledImportResolverCallback],
+    snapshot_modules: &SnapshotModules,
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
     processed: &mut std::collections::HashSet<String>,
@@ -139,6 +174,7 @@ fn process_imports_inner(
     use zyntax_typed_ast::typed_ast::TypedDeclaration;
 
     // Collect imports to process (can't mutate while iterating)
+    let importing_language = program.language.and_then(|l| l.resolve_global());
     let mut imports_to_process = Vec::new();
     for decl in &program.declarations {
         if let TypedDeclaration::Import(import) = &decl.node {
@@ -147,12 +183,13 @@ fn process_imports_inner(
                 .first()
                 .and_then(|s| s.resolve_global())
                 .unwrap_or_else(|| "unknown".to_string());
-            imports_to_process.push(module_name);
+            let named_language = import.language.and_then(|l| l.resolve_global());
+            imports_to_process.push((module_name, named_language));
         }
     }
 
     // Process each import
-    for module_name in imports_to_process {
+    for (module_name, named_language) in imports_to_process {
         // Skip if already processed (circular import detection)
         if processed.contains(&module_name) {
             log::debug!("Skipping already processed import: {}", module_name);
@@ -162,12 +199,29 @@ fn process_imports_inner(
         // Mark as processed BEFORE recursive processing
         processed.insert(module_name.clone());
 
-        let compiled_import = resolve_compiled_import_with(compiled_import_resolvers, &module_name)
-            .map_err(|e| {
-                RuntimeError::Execution(format!(
-                    "Failed to resolve compiled import '{module_name}': {e}"
-                ))
-            })?;
+        let compiled_import = match resolve_snapshot_module(
+            snapshot_modules,
+            importing_language.as_deref(),
+            named_language.as_deref(),
+            &module_name,
+        )
+        .map_err(|e| {
+            RuntimeError::Execution(format!(
+                "Failed to resolve compiled import '{module_name}': {e}"
+            ))
+        })? {
+            Some(found) => Some(found),
+            // Nothing a snapshot installed. The flat resolvers are how
+            // a host answers for a module it could not know at build
+            // time, and they see a bare name as they always have.
+            None => resolve_compiled_import_with(compiled_import_resolvers, &module_name).map_err(
+                |e| {
+                    RuntimeError::Execution(format!(
+                        "Failed to resolve compiled import '{module_name}': {e}"
+                    ))
+                },
+            )?,
+        };
 
         let mut parsed_program = if let Some(compiled_import) = compiled_import {
             if compiled_import.module_name() != module_name {
@@ -253,12 +307,16 @@ fn process_imports_inner(
         };
 
         if let Some(mut imported_program) = parsed_program.take() {
-            // Load transitive imports before merging this module.
+            // Load transitive imports before merging this module. The
+            // module carries the language it was written in, so its
+            // own unqualified imports resolve there rather than in
+            // whatever language imported it.
             process_imports_inner(
                 grammars,
                 plugin_signatures,
                 import_resolvers,
                 compiled_import_resolvers,
+                snapshot_modules,
                 &mut imported_program,
                 type_registry,
                 processed,
@@ -1276,4 +1334,80 @@ pub(crate) fn register_decl_types(
     register_struct_declarations(program, type_registry)?;
     register_enum_declarations(program, type_registry)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Snapshot, SnapshotBuilder};
+
+    /// Two languages, each shipping a module called `prelude`.
+    fn two_languages() -> SnapshotModules {
+        let mut modules = SnapshotModules::new();
+        for language in ["alpha", "beta"] {
+            let bytes = SnapshotBuilder::new(language)
+                .grammar(vec![0])
+                .module("prelude", zyntax_typed_ast::TypedProgram::default())
+                .expect("module")
+                .encode()
+                .expect("encode");
+            let snapshot = Arc::new(Snapshot::load(&bytes).expect("load"));
+            modules.insert((language.to_string(), "prelude".to_string()), snapshot);
+        }
+        modules
+    }
+
+    #[test]
+    fn an_unqualified_import_resolves_in_its_own_language() {
+        let modules = two_languages();
+        // The same name, asked for from two languages, is two modules.
+        let from_alpha = resolve_snapshot_module(&modules, Some("alpha"), None, "prelude")
+            .expect("resolve")
+            .expect("found");
+        let from_beta = resolve_snapshot_module(&modules, Some("beta"), None, "prelude")
+            .expect("resolve")
+            .expect("found");
+        assert_eq!(from_alpha.language(), "alpha");
+        assert_eq!(from_beta.language(), "beta");
+    }
+
+    #[test]
+    fn an_import_that_names_a_language_gets_that_one() {
+        let modules = two_languages();
+        let named = resolve_snapshot_module(&modules, Some("alpha"), Some("beta"), "prelude")
+            .expect("resolve")
+            .expect("found");
+        assert_eq!(
+            named.language(),
+            "beta",
+            "the language the import named wins over the one asking"
+        );
+    }
+
+    #[test]
+    fn a_language_that_installed_nothing_finds_nothing() {
+        let modules = two_languages();
+        assert!(
+            resolve_snapshot_module(&modules, Some("gamma"), None, "prelude")
+                .expect("resolve")
+                .is_none(),
+            "a module belongs to the language that installed it"
+        );
+        assert!(
+            resolve_snapshot_module(&modules, Some("alpha"), None, "missing")
+                .expect("resolve")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_program_with_no_language_falls_through() {
+        // A host that registered one language and never said which is
+        // every host today, and its imports go to the flat resolvers
+        // exactly as they did before.
+        let modules = two_languages();
+        assert!(resolve_snapshot_module(&modules, None, None, "prelude")
+            .expect("resolve")
+            .is_none());
+    }
 }

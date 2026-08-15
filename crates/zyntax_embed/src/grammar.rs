@@ -99,6 +99,11 @@ pub struct LanguageGrammar {
     /// Process-unique identity used by parsed-import caches. Clones preserve
     /// the identity because they describe the same compiled grammar.
     cache_id: u64,
+    /// The name the host registered this under, which is the name a
+    /// program written in it carries and the name its modules are
+    /// keyed by. The grammar's own metadata name is for people; this
+    /// is the one resolution uses.
+    language: Option<String>,
     /// The grammar compiled to a parsing machine.
     ///
     /// Compiling belongs to loading a grammar, not to parsing a file
@@ -146,6 +151,7 @@ impl LanguageGrammar {
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            language: None,
             program: Arc::new(std::sync::OnceLock::new()),
         })
     }
@@ -162,6 +168,7 @@ impl LanguageGrammar {
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            language: None,
             program: Arc::new(std::sync::OnceLock::new()),
         })
     }
@@ -212,6 +219,7 @@ impl LanguageGrammar {
             grammar2: Some(Arc::new(grammar2)),
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            language: None,
             program: Arc::new(std::sync::OnceLock::new()),
         })
     }
@@ -232,6 +240,7 @@ impl LanguageGrammar {
             grammar2: None, // No Grammar2 for pre-compiled modules
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            language: None,
             program: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -283,10 +292,21 @@ impl LanguageGrammar {
             grammar2: payload.grammar2.map(Arc::new),
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
+            language: None,
             program: Arc::new(std::sync::OnceLock::new()),
         };
         grammar.prepare();
         Ok(grammar)
+    }
+
+    /// Record the name a host registered this grammar under.
+    pub fn set_language(&mut self, language: &str) {
+        self.language = Some(language.to_string());
+    }
+
+    /// The name a host registered this grammar under.
+    pub fn registered_language(&self) -> Option<&str> {
+        self.language.as_deref()
     }
 
     /// Compile the grammar now, so no parse pays for it later.
@@ -309,7 +329,12 @@ impl LanguageGrammar {
                         .unwrap_or_default()
                 })
                 .clone();
-            crate::grammar2::Grammar2::from_shared_ir_with_program(Arc::clone(grammar), program)
+            let mut parser = crate::grammar2::Grammar2::from_shared_ir_with_program(
+                Arc::clone(grammar),
+                program,
+            );
+            parser.set_language(self.language.clone());
+            parser
         })
     }
 

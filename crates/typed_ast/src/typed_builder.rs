@@ -1020,6 +1020,7 @@ impl TypedASTBuilder {
 
         typed_node(
             TypedDeclaration::Import(TypedImport {
+                language: None,
                 module_path,
                 items,
                 span,
@@ -1197,6 +1198,7 @@ impl TypedASTBuilder {
 
         TypedProgram {
             declarations,
+            language: None,
             span,
             source_files,
             type_registry: self.registry.clone(),

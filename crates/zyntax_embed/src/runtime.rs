@@ -1115,6 +1115,10 @@ pub struct ZyntaxRuntime {
     import_resolvers: Vec<ImportResolverCallback>,
     /// Build-time parsed imports, consulted before source resolvers.
     compiled_import_resolvers: Vec<CompiledImportResolverCallback>,
+    /// Modules a snapshot installed, keyed by the language that
+    /// brought them, so a name means what it means inside the language
+    /// asking rather than whichever language registered first.
+    snapshot_modules: crate::import_chain::SnapshotModules,
     /// Registered language grammars (language name -> grammar)
     grammars: HashMap<String, Arc<LanguageGrammar>>,
     /// File extension to language mapping (e.g., ".zig" -> "zig")
@@ -1198,6 +1202,7 @@ impl ZyntaxRuntime {
             builtin_aliases: HashMap::new(),
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
+            snapshot_modules: Default::default(),
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
@@ -1249,6 +1254,7 @@ impl ZyntaxRuntime {
             builtin_aliases: HashMap::new(),
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
+            snapshot_modules: Default::default(),
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
@@ -1843,6 +1849,7 @@ impl ZyntaxRuntime {
             &self.plugin_signatures,
             &self.import_resolvers,
             &self.compiled_import_resolvers,
+            &self.snapshot_modules,
             program,
             type_registry,
         )
@@ -2692,6 +2699,8 @@ impl ZyntaxRuntime {
                     snapshot.language()
                 ))
             })?;
+        let mut grammar = grammar;
+        grammar.set_language(snapshot.language());
         self.register_grammar(snapshot.language(), grammar.clone());
 
         // Reserve the ids before anything can parse against them.
@@ -2702,10 +2711,12 @@ impl ZyntaxRuntime {
             ))
         })?;
 
-        let compiled = Arc::clone(&snapshot);
-        self.add_compiled_import_resolver(Box::new(move |module_name| {
-            compiled.module(module_name).map_err(|e| e.to_string())
-        }));
+        for module in snapshot.module_names() {
+            self.snapshot_modules.insert(
+                (snapshot.language().to_string(), module.to_string()),
+                Arc::clone(&snapshot),
+            );
+        }
 
         // A module that kept its source stays available to hosts that
         // would rather parse it than trust the artifact.
@@ -3477,6 +3488,10 @@ pub struct TieredRuntime {
     import_resolvers: Vec<ImportResolverCallback>,
     /// Build-time parsed imports, consulted before source resolvers.
     compiled_import_resolvers: Vec<CompiledImportResolverCallback>,
+    /// Modules a snapshot installed, keyed by the language that
+    /// brought them, so a name means what it means inside the language
+    /// asking rather than whichever language registered first.
+    snapshot_modules: crate::import_chain::SnapshotModules,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
@@ -3792,6 +3807,7 @@ impl TieredRuntime {
             loaded_plugins: Vec::new(),
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
+            snapshot_modules: Default::default(),
             runtime_events: Vec::new(),
             event_sink: None,
             builtin_aliases: indexmap::IndexMap::new(),
@@ -4270,6 +4286,8 @@ impl TieredRuntime {
                     snapshot.language()
                 ))
             })?;
+        let mut grammar = grammar;
+        grammar.set_language(snapshot.language());
         self.register_grammar(snapshot.language(), grammar.clone());
 
         // Reserve the ids before anything can parse against them.
@@ -4280,10 +4298,12 @@ impl TieredRuntime {
             ))
         })?;
 
-        let compiled = Arc::clone(&snapshot);
-        self.add_compiled_import_resolver(Box::new(move |module_name| {
-            compiled.module(module_name).map_err(|e| e.to_string())
-        }));
+        for module in snapshot.module_names() {
+            self.snapshot_modules.insert(
+                (snapshot.language().to_string(), module.to_string()),
+                Arc::clone(&snapshot),
+            );
+        }
 
         // A module that kept its source stays available to hosts that
         // would rather parse it than trust the artifact.
@@ -5614,6 +5634,7 @@ impl TieredRuntime {
             &self.plugin_signatures,
             &self.import_resolvers,
             &self.compiled_import_resolvers,
+            &self.snapshot_modules,
             &mut program,
             &mut type_registry,
         )?;

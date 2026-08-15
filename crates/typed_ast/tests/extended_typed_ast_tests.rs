@@ -263,6 +263,7 @@ fn test_comprehensive_program_structure() {
             // Import declaration
             typed_node(
                 TypedDeclaration::Import(TypedImport {
+                    language: None,
                     module_path: vec![arena.intern_string("std"), arena.intern_string("io")],
                     items: vec![TypedImportItem::Named {
                         name: arena.intern_string("println"),

@@ -1458,6 +1458,7 @@ impl TypedAstBuilder {
         );
 
         TypedProgram {
+            language: None,
             declarations: decls,
             span: self.default_span(),
             source_files,
