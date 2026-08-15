@@ -1119,6 +1119,11 @@ pub struct ZyntaxRuntime {
     /// brought them, so a name means what it means inside the language
     /// asking rather than whichever language registered first.
     snapshot_modules: crate::import_chain::SnapshotModules,
+    /// Which language exported each symbol, for the ones loaded as a
+    /// module of a named language. A symbol name is shared across
+    /// every language in a runtime, so this is what makes a second
+    /// language taking one an error rather than an overwrite.
+    exported_by: HashMap<String, String>,
     /// Registered language grammars (language name -> grammar)
     grammars: HashMap<String, Arc<LanguageGrammar>>,
     /// File extension to language mapping (e.g., ".zig" -> "zig")
@@ -1203,6 +1208,7 @@ impl ZyntaxRuntime {
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
+            exported_by: HashMap::new(),
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
@@ -1255,6 +1261,7 @@ impl ZyntaxRuntime {
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
+            exported_by: HashMap::new(),
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
@@ -2966,9 +2973,10 @@ impl ZyntaxRuntime {
         // Compile the module
         self.compile_module(&hir_module)?;
 
-        // Export specified functions
+        // Export specified functions, remembering which language they
+        // came from.
         for export_name in exports {
-            self.export_function(export_name)?;
+            self.export_function_from(export_name, Some(language))?;
         }
 
         Ok(function_names)
@@ -2982,6 +2990,34 @@ impl ZyntaxRuntime {
     /// # Arguments
     /// * `name` - The function name to export
     pub fn export_function(&mut self, name: &str) -> RuntimeResult<()> {
+        self.export_function_from(name, None)
+    }
+
+    /// Export a function loaded as part of `language`'s module.
+    ///
+    /// Every language in a runtime shares one set of symbol names, so
+    /// two languages cannot both export `add`. Taking the second one
+    /// silently would leave the first language calling the second
+    /// language's function.
+    fn export_function_from(&mut self, name: &str, language: Option<&str>) -> RuntimeResult<()> {
+        let holder = self.exported_by.get(name).map(String::as_str);
+        if export_conflicts(holder, language) {
+            let holding = holder.unwrap_or_default();
+            let taking = language.unwrap_or_default();
+            {
+                return Err(RuntimeError::Execution(format!(
+                    "'{name}' is exported by both '{holding}' and '{taking}'. Every language in a \
+                     runtime shares one set of symbol names, so the second export would replace \
+                     the first. Renaming it where it is imported does not help: an alias names \
+                     the reference, not the symbol."
+                )));
+            }
+        }
+        if let Some(language) = language {
+            self.exported_by
+                .insert(name.to_string(), language.to_string());
+        }
+
         // Get the function pointer from our function_ids map
         let ptr = self
             .get_function_ptr(name)
@@ -7195,9 +7231,44 @@ impl std::future::Future for ZyntaxPromise {
     }
 }
 
+/// Whether a language may export a name another language holds.
+///
+/// A symbol name is shared across every language in a runtime. The same
+/// language taking its own name again is a reload; a different one
+/// taking it would leave the first calling the second's function.
+fn export_conflicts(holder: Option<&str>, taker: Option<&str>) -> bool {
+    match (holder, taker) {
+        (Some(holder), Some(taker)) => holder != taker,
+        // Nobody said which language, so there is nothing to compare.
+        // A host exporting by hand is trusted, as it always was.
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_language_cannot_take_a_symbol_the_first_exported() {
+        assert!(
+            export_conflicts(Some("python"), Some("typescript")),
+            "two languages cannot share one symbol name"
+        );
+        assert!(
+            !export_conflicts(Some("python"), Some("python")),
+            "a language reloading its own module is not a collision"
+        );
+        assert!(
+            !export_conflicts(None, Some("python")),
+            "a name a host exported by hand is not claimed by any language"
+        );
+        assert!(
+            !export_conflicts(Some("python"), None),
+            "a host exporting by hand is trusted, as it always was"
+        );
+        assert!(!export_conflicts(None, None));
+    }
 
     #[test]
     fn test_promise_state() {
