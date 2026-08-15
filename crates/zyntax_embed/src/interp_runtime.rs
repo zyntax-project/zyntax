@@ -840,6 +840,8 @@ impl InterpRuntime {
             // only the same subset Cranelift does.
             let llvm_reachable =
                 zyntax_compiler::reachable_function_ids(&module, &self.entry_name_refs());
+            let llvm_entry_names: std::collections::HashSet<String> =
+                self.entry_names.iter().cloned().collect();
             let llvm_cache_key = config.llvm_cache_key.clone();
             let box_infos = crate::effect_runtime::box_runtime_symbol_infos();
             llvm.with_lock(|be| {
@@ -856,6 +858,11 @@ impl InterpRuntime {
                 // an unboxed f64 / f32 / bool value is consumed.
                 be.register_symbol_signatures(&box_infos);
                 be.set_only_compile_reachable(Some(llvm_reachable));
+                // An entry keeps the name it was written with, so a
+                // host can still ask for it by that name; every other
+                // local function is mangled to its id. Which names
+                // those are is configured, not decided here.
+                be.set_entry_names(llvm_entry_names);
                 be.set_cache_key(llvm_cache_key);
             });
 

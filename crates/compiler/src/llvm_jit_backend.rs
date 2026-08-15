@@ -120,6 +120,9 @@ pub struct LLVMJitBackend<'ctx> {
     /// `set_only_compile_reachable`; mirrors the Cranelift JIT path
     /// that the runtime already gates on `reachable_function_ids`.
     only_compile_reachable: Option<std::collections::HashSet<HirId>>,
+    /// The functions a host enters through, which keep their source
+    /// name so something outside can still ask for them by it.
+    entry_names: std::collections::HashSet<String>,
 
     /// Optional content-hash cache key supplied by the caller. When
     /// set, `compile_module` checks `DYLIB_CACHE` for a previously
@@ -175,6 +178,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             runtime_symbols: IndexMap::new(),
             symbol_signatures: Vec::new(),
             only_compile_reachable: None,
+            entry_names: Default::default(),
             cache_key: None,
             use_mcjit: Self::default_use_mcjit(),
             engines: Vec::new(),
@@ -433,6 +437,22 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.only_compile_reachable = allowed;
     }
 
+    /// Name the functions a host enters the program through.
+    ///
+    /// An entry keeps the name it was written with; every other local
+    /// function is mangled to its id, which is what stops two of them
+    /// sharing a symbol. Which names those are is configured, in a
+    /// grammar's metadata or by the host, and this layer has no entry
+    /// point of its own to guess at.
+    pub fn set_entry_names(&mut self, names: std::collections::HashSet<String>) {
+        self.entry_names = names;
+    }
+
+    /// Whether a function keeps the name it was written with.
+    fn keeps_source_name(&self, func: &HirFunction, name: &str) -> bool {
+        func.is_external || self.entry_names.contains(name)
+    }
+
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8) {
         self.runtime_symbols.insert(name.into(), ptr as usize);
     }
@@ -511,12 +531,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// The LLVM IR emit side currently uses the raw Debug form; we
     /// patch the IR-side naming to use the same mangled form in
     /// [`Self::compile_module_to_ir`].
-    fn exported_name_for(func: &HirFunction, id: HirId) -> String {
+    fn exported_name_for(&self, func: &HirFunction, id: HirId) -> String {
         let actual_name = func
             .name
             .resolve_global()
             .unwrap_or_else(|| format!("{:?}", func.name));
-        if func.is_external || actual_name == "main" {
+        if self.keeps_source_name(func, &actual_name) {
             actual_name
         } else {
             Self::mangle_function_name(&format!("func_{:?}", id))
@@ -530,16 +550,18 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// contains parens. We rename in place so the symbols come out
     /// of the linker with a name the loader will accept.
     fn rename_mangled_functions(
+        &self,
         backend: &LLVMBackend<'ctx>,
         hir_module: &HirModule,
     ) -> CompilerResult<()> {
         for (id, func) in &hir_module.functions {
-            // Skip externs and `main` — they keep their actual name.
+            // An extern names a symbol somebody else owns, and an entry
+            // keeps the name a host asks for it by.
             let actual_name = func
                 .name
                 .resolve_global()
                 .unwrap_or_else(|| format!("{:?}", func.name));
-            if func.is_external || actual_name == "main" {
+            if self.keeps_source_name(func, &actual_name) {
                 continue;
             }
             let raw = format!("func_{:?}", id);
@@ -579,7 +601,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let _llvm_ir = backend.compile_module(hir_module)?;
 
         // Patch internal function names to a linker-safe mangling.
-        Self::rename_mangled_functions(&backend, hir_module)?;
+        self.rename_mangled_functions(&backend, hir_module)?;
 
         // Step 2: Build a host-tuned TargetMachine. PIC reloc mode is
         // required for `-shared` / `-dynamiclib`; default code model
@@ -716,7 +738,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     continue;
                 }
             }
-            map.insert(*id, Self::exported_name_for(function, *id));
+            map.insert(*id, self.exported_name_for(function, *id));
         }
         map
     }

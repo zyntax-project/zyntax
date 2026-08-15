@@ -134,6 +134,12 @@ pub struct LLVMBackend<'ctx> {
     /// has.
     only_compile_reachable: Option<std::collections::HashSet<HirId>>,
 
+    /// The functions a host enters through. These keep the name they
+    /// were written with; every other local function is mangled to its
+    /// id so two of them cannot share a symbol. Configured, because
+    /// this layer has no entry point of its own.
+    entry_names: std::collections::HashSet<String>,
+
     /// Whether the compilation **target** (not the host) has x86 VNNI
     /// (`VPDPBUSD`). Set by the caller from the target-machine features:
     /// for a JIT the target is the host, so it comes from host feature
@@ -216,6 +222,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             dlsym_set: std::collections::HashSet::new(),
             self_recursive_set: std::collections::HashSet::new(),
             only_compile_reachable: None,
+            entry_names: Default::default(),
             x86_target_vnni: false,
         }
     }
@@ -340,6 +347,11 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// are still walked in full because they're constant-time and
     /// keeping them intact preserves cross-function symbol resolution
     /// against any reachable site.
+    /// Name the functions a host enters the program through.
+    pub fn set_entry_names(&mut self, names: std::collections::HashSet<String>) {
+        self.entry_names = names;
+    }
+
     pub fn set_only_compile_reachable(
         &mut self,
         allowed: Option<std::collections::HashSet<HirId>>,
@@ -547,7 +559,8 @@ impl<'ctx> LLVMBackend<'ctx> {
             // An extern's declared name is an alias; the symbol the host
             // actually provides is the link name, when one is set.
             func.link_name.clone().unwrap_or(actual_name)
-        } else if actual_name == "main" {
+        } else if self.entry_names.contains(&actual_name) {
+            // An entry keeps the name a host asks for it by.
             actual_name
         } else {
             // Regular functions use mangled name with HirId
