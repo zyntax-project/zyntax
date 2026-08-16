@@ -121,6 +121,7 @@ fn test_vtable_generation_simple() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     // 5. Create program with the method function

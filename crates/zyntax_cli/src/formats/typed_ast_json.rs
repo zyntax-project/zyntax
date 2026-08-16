@@ -160,6 +160,7 @@ fn add_runtime_function_declarations(program: &mut TypedProgram, arena: &mut Ast
             effects: vec![],
             with_handlers: vec![],
             is_pure: false,
+            module: None,
         };
 
         program.declarations.insert(

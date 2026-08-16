@@ -77,6 +77,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     TypedProgram {
@@ -115,6 +116,7 @@ fn create_bool_test_program(
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     TypedProgram {
@@ -499,6 +501,7 @@ fn test_matmul_dispatch_uses_named_type_function() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let matmul_expr = typed_node(
@@ -561,6 +564,7 @@ fn test_matmul_dispatch_uses_named_type_function() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -810,6 +814,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let take_target_name = arena.intern_string("take_target");
@@ -837,6 +842,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let entry_call = typed_node(
@@ -888,6 +894,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -1100,6 +1107,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let make_target_name = arena.intern_string("make_target");
@@ -1119,6 +1127,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let dst_name = arena.intern_string("dst");
@@ -1208,6 +1217,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {

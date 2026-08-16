@@ -43,6 +43,7 @@ fn create_extern_function(
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     }
 }
 
@@ -265,6 +266,7 @@ fn test_non_extern_function_without_body_fails() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let type_registry = TypeRegistry::new();

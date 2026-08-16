@@ -206,6 +206,7 @@ impl WhirlwindAdapter {
         let span = zyntax_typed_ast::Span::default();
 
         let mut program = TypedProgram {
+            language: None,
             declarations: all_declarations,
             span,
             source_files: vec![],
@@ -431,6 +432,7 @@ impl WhirlwindAdapter {
                 effects: vec![],
                 with_handlers: vec![],
                 is_pure: false,
+                module: None,
             }),
             return_type,
             span,
@@ -571,6 +573,7 @@ impl WhirlwindAdapter {
 
         Ok(TypedNode::new(
             TypedDeclaration::Import(TypedImport {
+                language: None,
                 module_path,
                 items: vec![], // TODO: Convert import items
                 span,

@@ -47,6 +47,7 @@ fn create_extern_function(
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     }
 }
 

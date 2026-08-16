@@ -139,6 +139,7 @@ fn program(arena: &mut AstArena) -> (TypedProgram, zyntax_typed_ast::InternedStr
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
     (
         TypedProgram {

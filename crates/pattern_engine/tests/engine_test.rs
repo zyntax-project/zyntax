@@ -61,6 +61,7 @@ fn make_program_with_literal(value: i128) -> TypedProgram {
     );
 
     TypedProgram {
+        language: None,
         declarations: vec![decl],
         span,
         source_files: vec![],

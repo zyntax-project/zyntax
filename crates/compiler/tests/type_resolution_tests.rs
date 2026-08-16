@@ -88,6 +88,7 @@ fn test_struct_type_resolution() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -207,6 +208,7 @@ fn test_enum_type_resolution() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -322,6 +324,7 @@ fn test_type_alias_resolution() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -449,6 +452,7 @@ fn test_nested_struct_resolution() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -614,6 +618,7 @@ fn test_multiple_struct_types() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let func2 = TypedFunction {
@@ -641,6 +646,7 @@ fn test_multiple_struct_types() {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {

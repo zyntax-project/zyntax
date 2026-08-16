@@ -46,6 +46,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     TypedProgram {
@@ -726,6 +727,7 @@ fn test_compilation_pipeline_with_async_function() -> CompilerResult<()> {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -813,6 +815,7 @@ fn test_compilation_pipeline_without_async_runtime() -> CompilerResult<()> {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
@@ -903,6 +906,7 @@ fn test_compilation_pipeline_mixed_sync_async() -> CompilerResult<()> {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     // Create async function
@@ -939,6 +943,7 @@ fn test_compilation_pipeline_mixed_sync_async() -> CompilerResult<()> {
         effects: vec![],
         with_handlers: vec![],
         is_pure: false,
+        module: None,
     };
 
     let mut program = TypedProgram {
