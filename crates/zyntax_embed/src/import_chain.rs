@@ -350,8 +350,17 @@ fn process_imports_inner(
                 if matches!(imported_decl.node, TypedDeclaration::Import(_)) {
                     continue;
                 }
-                if let TypedDeclaration::Function(function) = &mut imported_decl.node {
-                    function.module.get_or_insert(origin);
+                match &mut imported_decl.node {
+                    TypedDeclaration::Function(function) => {
+                        function.module.get_or_insert(origin);
+                    }
+                    // An implementation's methods become functions of
+                    // the program that imported it, so it has to carry
+                    // where it came from too.
+                    TypedDeclaration::Impl(impl_block) => {
+                        impl_block.module.get_or_insert(origin);
+                    }
+                    _ => {}
                 }
                 program.declarations.push(imported_decl);
             }

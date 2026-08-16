@@ -1515,6 +1515,7 @@ impl<'g> GrammarInterpreter<'g> {
                     methods,
                     associated_types,
                     span,
+                    module: None,
                 })
             }
             "Interface" => {

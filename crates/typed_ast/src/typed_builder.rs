@@ -1109,6 +1109,7 @@ impl TypedASTBuilder {
                 methods,
                 associated_types,
                 span,
+                module: None,
             }),
             Type::Never, // Impls don't have a value type
             span,

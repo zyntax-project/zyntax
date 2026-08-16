@@ -892,6 +892,7 @@ fn generate_binary_trait_impl(
             span: Span::default(),
         }],
         span: Span::default(),
+        module: None,
     };
 
     let impl_decl = TypedNode::new(
@@ -1247,6 +1248,7 @@ fn generate_comparison_trait_impl(
         methods: typed_methods,
         associated_types: vec![],
         span: Span::default(),
+        module: None,
     };
 
     let impl_decl = TypedNode::new(
@@ -1385,6 +1387,7 @@ fn generate_unary_trait_impl(
             span: Span::default(),
         }],
         span: Span::default(),
+        module: None,
     };
 
     let impl_decl = TypedNode::new(

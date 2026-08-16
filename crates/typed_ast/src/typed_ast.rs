@@ -1550,6 +1550,14 @@ pub struct TypedTraitImpl {
     pub methods: Vec<TypedMethod>,
     /// Associated type definitions (e.g., "type Output = Tensor")
     pub associated_types: Vec<TypedImplAssociatedType>,
+    /// The module this implementation was written in, when an import
+    /// brought it here.
+    ///
+    /// Its methods become functions of the program that imported it,
+    /// and without this they look like the program's own. `None` means
+    /// the program declared it.
+    #[serde(default)]
+    pub module: Option<InternedString>,
     pub span: Span,
 }
 

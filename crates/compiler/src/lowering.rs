@@ -2375,50 +2375,90 @@ impl LoweringContext {
         Some(roots)
     }
 
-    /// Build anything that lowered code turned out to call.
+    /// Build the bodies that lowered code turned out to call.
     ///
-    /// Skipping is an assumption: that what an import brought in and no
-    /// entry point reaches will not be called. When the module says
-    /// otherwise, the assumption is abandoned wholesale and every
-    /// skipped body is built. That is one branch with one outcome
-    /// rather than a settling loop, and its worst case is exactly the
-    /// behaviour of lowering everything, which is what happened before
-    /// any of this existed.
+    /// A body built this round can call further, so rounds continue
+    /// until one adds nothing. Each round asks the module which calls
+    /// have nowhere to land and builds exactly those, rather than
+    /// giving up and building everything: a program that calls a
+    /// handful of an import's functions would otherwise pay for all of
+    /// them the moment it called one.
+    ///
+    /// Two things end the scheme instead of settling it. A call through
+    /// a value says nothing about what it reaches, and a call whose
+    /// target was never skipped here cannot be answered by building
+    /// anything. Both fall back to building every skipped body, which
+    /// is the behaviour that came before any of this.
     fn lower_until_nothing_is_owed(&mut self, program: &TypedProgram) -> CompilerResult<()> {
         if self.wanted.is_none() {
             return Ok(());
         }
-        let owed = self.functions_called_without_a_body();
-        // Exercised deliberately, so the path that abandons skipping is
-        // not one nobody has ever run.
         let forced = std::env::var_os("ZYNTAX_LOWER_FORCE_FALLBACK").is_some();
-        if owed.is_empty() && !self.saw_indirect_call && !forced {
+
+        loop {
+            let owed = if forced {
+                Vec::new()
+            } else {
+                self.calls_with_nowhere_to_land()
+            };
+            if !forced && !self.saw_indirect_call && owed.is_empty() {
+                return Ok(());
+            }
+
+            let mut sites: Vec<usize> = Vec::new();
+            let mut progressed = false;
+            if !self.saw_indirect_call && !forced {
+                for name in &owed {
+                    if let Some(index) = self.skipped_at.get(name).copied() {
+                        if let Some(wanted) = self.wanted.as_mut() {
+                            progressed |= wanted.insert(*name);
+                        }
+                        sites.push(index);
+                    }
+                }
+            }
+
+            if progressed {
+                sites.sort_unstable();
+                sites.dedup();
+                for index in sites {
+                    self.current_decl = index;
+                    self.lower_declaration(&program.declarations[index])?;
+                }
+                continue;
+            }
+
+            // Nothing owed is anything skipped here, so no round can
+            // settle it. Build the rest and stop assuming.
+            self.wanted = None;
+            let mut rest: Vec<usize> = self.skipped_at.values().copied().collect();
+            rest.sort_unstable();
+            rest.dedup();
+            log::debug!(
+                "[LOWERING] a call cannot be answered by anything skipped here; \
+                 building the remaining {} declaration(s)",
+                rest.len(),
+            );
+            for index in rest {
+                self.current_decl = index;
+                self.lower_declaration(&program.declarations[index])?;
+            }
             return Ok(());
         }
-
-        // Build the rest. Nothing is skipped afterwards, so nothing
-        // further can come to be owed.
-        self.wanted = None;
-        let mut sites: Vec<usize> = self.skipped_at.values().copied().collect();
-        sites.sort_unstable();
-        sites.dedup();
-        log::debug!(
-            "[LOWERING] {} function(s) an import brought in are called after all; \
-             lowering the {} declaration(s) that were skipped",
-            owed.len(),
-            sites.len(),
-        );
-        for index in sites {
-            self.current_decl = index;
-            self.lower_declaration(&program.declarations[index])?;
-        }
-        Ok(())
     }
 
     /// Names of functions that lowered code calls but which have no
-    /// body, and are not declarations of something defined elsewhere.
-    fn functions_called_without_a_body(&mut self) -> Vec<InternedString> {
+    /// body to land in, either declared empty or never built at all.
+    fn calls_with_nowhere_to_land(&mut self) -> Vec<InternedString> {
         use crate::hir::{HirCallable, HirInstruction};
+
+        // A target that was skipped is not in the module, so its name
+        // has to come from what the declarations registered.
+        let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
+            std::collections::HashMap::new();
+        for (name, id) in &self.symbols.functions {
+            name_of.insert(*id, *name);
+        }
 
         let mut owed: Vec<InternedString> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -2436,14 +2476,19 @@ impl LoweringContext {
                         }
                         _ => continue,
                     };
-                    let Some(target_fn) = self.module.functions.get(&target) else {
-                        continue;
-                    };
-                    if target_fn.is_external || !target_fn.blocks.is_empty() {
-                        continue;
+                    if let Some(target_fn) = self.module.functions.get(&target) {
+                        if target_fn.is_external || !target_fn.blocks.is_empty() {
+                            continue;
+                        }
                     }
-                    if seen.insert(target_fn.name) {
-                        owed.push(target_fn.name);
+                    let Some(name) = name_of.get(&target).copied() else {
+                        // A target with no name behind it cannot be
+                        // built by visiting a declaration.
+                        self.saw_indirect_call = true;
+                        return Vec::new();
+                    };
+                    if seen.insert(name) {
+                        owed.push(name);
                     }
                 }
             }
@@ -4974,7 +5019,10 @@ impl LoweringContext {
                         calling_convention:
                             zyntax_typed_ast::type_registry::CallingConvention::Default,
                         link_name: Some(InternedString::new_global(&zrtl_symbol)), // Link to ZRTL symbol
-                        module: None,
+                        // Where the implementation came from, so a method
+                        // an import brought in is not mistaken for one the
+                        // program wrote.
+                        module: impl_block.module,
                     };
 
                     if let Err(e) = self.lower_function(&func) {
@@ -5008,7 +5056,10 @@ impl LoweringContext {
                 is_external: false,
                 calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
                 link_name: None,
-                module: None,
+                // Where the implementation came from, so a method
+                // an import brought in is not mistaken for one the
+                // program wrote.
+                module: impl_block.module,
             };
 
             // Lower the method as a regular function
