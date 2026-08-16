@@ -588,6 +588,13 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
         backend.set_only_compile_reachable(self.only_compile_reachable.clone());
+        // The name a function is declared under and the name its address
+        // is looked up by have to be decided the same way, and they are
+        // decided in two places. Without this the entry is declared
+        // mangled here and asked for by its source name there, every
+        // lookup misses, and the tier installs nothing while reporting
+        // that it is ready.
+        backend.set_entry_names(self.entry_names.clone());
         // On-host JIT: target == host, so the target's VNNI capability is
         // the host's (the TargetMachine below is likewise built from
         // `get_host_cpu_features()`). A cross/portable-AOT compile would
