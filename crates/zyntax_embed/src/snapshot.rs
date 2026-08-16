@@ -14,8 +14,9 @@ use crate::compiled_artifact::{CompiledArtifactError, CompiledImport};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 2;
-const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
+const SCHEMA_VERSION: u32 = 3;
+/// magic, schema, and the length of the directory that follows.
+const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
 /// The extension a snapshot is written under.
 ///
@@ -46,85 +47,133 @@ pub enum SnapshotError {
     #[error("snapshot for '{language}' has no grammar")]
     MissingGrammar { language: String },
 
+    #[error("snapshot is truncated: {what} runs past the end")]
+    Truncated { what: String },
+
     #[error(transparent)]
     Module(#[from] CompiledArtifactError),
 }
 
+/// Where something sits in the snapshot's bytes.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct Extent {
+    at: u32,
+    len: u32,
+}
+
+impl Extent {
+    fn of(bytes: &[u8], at: usize) -> Self {
+        Extent {
+            at: at as u32,
+            len: bytes.len() as u32,
+        }
+    }
+
+    fn slice<'a>(&self, blobs: &'a [u8], what: &str) -> Result<&'a [u8], SnapshotError> {
+        let at = self.at as usize;
+        let end = at + self.len as usize;
+        blobs.get(at..end).ok_or_else(|| SnapshotError::Truncated {
+            what: what.to_string(),
+        })
+    }
+}
+
+/// The directory: what the snapshot holds and where each part sits.
+///
+/// Small enough that reading it costs nothing, which is the point.
+/// Everything large stays in the bytes behind it and is read in place.
 #[derive(Serialize, Deserialize)]
-struct SnapshotPayload {
+struct Directory {
     language: String,
-    /// The grammar, in the form [`crate::LanguageGrammar`] loads.
-    grammar: Vec<u8>,
-    /// Each module as its own artifact, in the order they were added.
-    /// Order is kept because installing reserves type ids by walking
-    /// it, and a module's ids have to land where they did at build
-    /// time.
-    modules: Vec<SnapshotModule>,
+    grammar: Extent,
+    modules: Vec<DirectoryEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct SnapshotModule {
+struct DirectoryEntry {
     name: String,
     /// The largest type id this module mentions.
     ///
     /// Reserving ids is a high-water mark, so a host can reserve from
-    /// this number without decoding the module it came from. That is
-    /// what lets a module stay encoded until something imports it.
-    #[serde(default)]
+    /// this number without decoding the module it came from.
     max_type_id: u32,
-    /// The encoded [`CompiledImport`]. Held encoded so installing can
-    /// decode what it needs and leave the rest, and so a module's own
-    /// schema check still runs.
-    artifact: Vec<u8>,
+    /// The encoded [`CompiledImport`].
+    artifact: Extent,
     /// The module's source, when the language chose to carry it.
-    /// Development hosts fall back to parsing this.
-    source: Option<String>,
+    source: Option<Extent>,
 }
 
 /// A language's grammar and standard library, ready to install.
 ///
-/// Decoding a module reserves the type ids it was built against, so it
-/// happens once and is kept. A host holds one of these for the process
-/// and installs it into whatever runtimes it builds.
+/// Holds the artifact's bytes and reads what it needs out of them. The
+/// directory is parsed on load; a grammar or a module is a slice of
+/// what is already here, and a module is decoded only when something
+/// imports it.
 pub struct Snapshot {
+    /// Everything after the directory, addressed by the extents in it.
+    blobs: Vec<u8>,
     language: String,
-    grammar: Vec<u8>,
-    modules: Vec<SnapshotModule>,
+    grammar: Extent,
+    modules: Vec<DirectoryEntry>,
     /// Each module, decoded when something first asks for it. A module
-    /// nobody imports is never decoded, and decoding is the cost of
-    /// installing a standard library.
+    /// nobody imports is never decoded.
     decoded: Vec<std::sync::OnceLock<Result<CompiledImport, String>>>,
 }
 
 impl Snapshot {
     /// Read a snapshot, checking it is one and that this build
     /// understands it.
+    ///
+    /// Reads the directory and keeps the rest as it arrived. Parsing a
+    /// container that owned every part copied the whole artifact before
+    /// a line of it was wanted, which was most of what installing a
+    /// language cost.
     pub fn load(bytes: &[u8]) -> Result<Self, SnapshotError> {
         if bytes.len() < HEADER_LEN || &bytes[..MAGIC.len()] != MAGIC {
             return Err(SnapshotError::InvalidHeader);
         }
-        let found = u32::from_le_bytes(
-            bytes[MAGIC.len()..HEADER_LEN]
-                .try_into()
-                .expect("snapshot header length is fixed"),
-        );
+        let word = |at: usize| {
+            u32::from_le_bytes(
+                bytes[at..at + 4]
+                    .try_into()
+                    .expect("snapshot header length is fixed"),
+            )
+        };
+        let found = word(MAGIC.len());
         if found != SCHEMA_VERSION {
             return Err(SnapshotError::UnsupportedSchema {
                 found,
                 expected: SCHEMA_VERSION,
             });
         }
-        let payload: SnapshotPayload = ciborium::from_reader(&bytes[HEADER_LEN..])
+        let directory_len = word(MAGIC.len() + 4) as usize;
+        let directory_end = HEADER_LEN + directory_len;
+        let directory_bytes =
+            bytes
+                .get(HEADER_LEN..directory_end)
+                .ok_or_else(|| SnapshotError::Truncated {
+                    what: "the directory".to_string(),
+                })?;
+        let directory: Directory = ciborium::from_reader(directory_bytes)
             .map_err(|e| SnapshotError::Decode(e.to_string()))?;
-        let decoded = payload
+
+        let blobs = bytes
+            .get(directory_end..)
+            .ok_or_else(|| SnapshotError::Truncated {
+                what: "the body".to_string(),
+            })?
+            .to_vec();
+
+        let decoded = directory
             .modules
             .iter()
             .map(|_| std::sync::OnceLock::new())
             .collect();
         Ok(Self {
-            language: payload.language,
-            grammar: payload.grammar,
-            modules: payload.modules,
+            blobs,
+            language: directory.language,
+            grammar: directory.grammar,
+            modules: directory.modules,
             decoded,
         })
     }
@@ -137,7 +186,9 @@ impl Snapshot {
     /// The grammar, as [`crate::LanguageGrammar::from_compiled_bytes`]
     /// reads it.
     pub fn grammar_bytes(&self) -> &[u8] {
-        &self.grammar
+        self.grammar
+            .slice(&self.blobs, "the grammar")
+            .unwrap_or(&[])
     }
 
     /// The modules it carries, in the order they were built.
@@ -152,7 +203,12 @@ impl Snapshot {
         };
         self.decoded[index]
             .get_or_init(|| {
-                CompiledImport::decode(&self.modules[index].artifact).map_err(|e| e.to_string())
+                let entry = &self.modules[index];
+                let bytes = entry
+                    .artifact
+                    .slice(&self.blobs, &entry.name)
+                    .map_err(|e| e.to_string())?;
+                CompiledImport::decode(bytes).map_err(|e| e.to_string())
             })
             .as_ref()
             .map(|module| Some(module.clone()))
@@ -174,10 +230,10 @@ impl Snapshot {
 
     /// A module's source, when the snapshot carries it.
     pub fn module_source(&self, name: &str) -> Option<&str> {
-        self.modules
-            .iter()
-            .find(|m| m.name == name)
-            .and_then(|m| m.source.as_deref())
+        let entry = self.modules.iter().find(|m| m.name == name)?;
+        let extent = entry.source.as_ref()?;
+        let bytes = extent.slice(&self.blobs, &entry.name).ok()?;
+        std::str::from_utf8(bytes).ok()
     }
 
     /// Every module, decoded. Decodes whatever has not been asked for
@@ -204,7 +260,15 @@ impl Snapshot {
 pub struct SnapshotBuilder {
     language: String,
     grammar: Option<Vec<u8>>,
-    modules: Vec<SnapshotModule>,
+    modules: Vec<PendingModule>,
+}
+
+/// A module waiting to be written into a snapshot.
+struct PendingModule {
+    name: String,
+    max_type_id: u32,
+    artifact: Vec<u8>,
+    source: Option<String>,
 }
 
 impl SnapshotBuilder {
@@ -228,59 +292,90 @@ impl SnapshotBuilder {
     /// Modules install in the order they are added, which is the order
     /// their type ids were reserved in.
     pub fn module(
-        mut self,
+        self,
         name: impl Into<String>,
         program: zyntax_typed_ast::TypedProgram,
     ) -> Result<Self, SnapshotError> {
-        let name = name.into();
-        let max_type_id = program.type_registry.max_type_id();
-        let artifact = CompiledImport::new(self.language.clone(), name.clone(), program);
-        self.modules.push(SnapshotModule {
-            name,
-            max_type_id,
-            artifact: artifact.encode()?,
-            source: None,
-        });
-        Ok(self)
+        self.push(name, program, None)
     }
 
     /// Add a parsed module, keeping its source for hosts that want to
     /// reparse rather than trust the artifact.
     pub fn module_with_source(
-        mut self,
+        self,
         name: impl Into<String>,
         program: zyntax_typed_ast::TypedProgram,
         source: impl Into<String>,
     ) -> Result<Self, SnapshotError> {
+        self.push(name, program, Some(source.into()))
+    }
+
+    fn push(
+        mut self,
+        name: impl Into<String>,
+        program: zyntax_typed_ast::TypedProgram,
+        source: Option<String>,
+    ) -> Result<Self, SnapshotError> {
         let name = name.into();
         let max_type_id = program.type_registry.max_type_id();
         let artifact = CompiledImport::new(self.language.clone(), name.clone(), program);
-        self.modules.push(SnapshotModule {
+        self.modules.push(PendingModule {
             name,
             max_type_id,
             artifact: artifact.encode()?,
-            source: Some(source.into()),
+            source,
         });
         Ok(self)
     }
 
     /// Encode the snapshot.
+    ///
+    /// A directory of names and extents, then everything those extents
+    /// point at. Reading the directory is the whole cost of loading;
+    /// the parts are read where they lie.
     pub fn encode(self) -> Result<Vec<u8>, SnapshotError> {
         let grammar = self.grammar.ok_or_else(|| SnapshotError::MissingGrammar {
             language: self.language.clone(),
         })?;
-        let payload = SnapshotPayload {
-            language: self.language,
-            grammar,
-            modules: self.modules,
+
+        let mut blobs: Vec<u8> = Vec::new();
+        let mut put = |bytes: &[u8], blobs: &mut Vec<u8>| {
+            let extent = Extent::of(bytes, blobs.len());
+            blobs.extend_from_slice(bytes);
+            extent
         };
-        let mut encoded = Vec::new();
-        ciborium::into_writer(&payload, &mut encoded)
+
+        let grammar_extent = put(&grammar, &mut blobs);
+        let mut entries = Vec::with_capacity(self.modules.len());
+        for module in &self.modules {
+            let artifact = put(&module.artifact, &mut blobs);
+            let source = module
+                .source
+                .as_ref()
+                .map(|text| put(text.as_bytes(), &mut blobs));
+            entries.push(DirectoryEntry {
+                name: module.name.clone(),
+                max_type_id: module.max_type_id,
+                artifact,
+                source,
+            });
+        }
+
+        let directory = Directory {
+            language: self.language,
+            grammar: grammar_extent,
+            modules: entries,
+        };
+        let mut encoded_directory = Vec::new();
+        ciborium::into_writer(&directory, &mut encoded_directory)
             .map_err(|e| SnapshotError::Encode(e.to_string()))?;
-        let mut bytes = Vec::with_capacity(HEADER_LEN + encoded.len());
+
+        let mut bytes = Vec::with_capacity(HEADER_LEN + encoded_directory.len() + blobs.len());
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&encoded);
+        bytes.extend_from_slice(&(encoded_directory.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&encoded_directory);
+        bytes.extend_from_slice(&blobs);
         Ok(bytes)
     }
 
@@ -379,11 +474,31 @@ mod tests {
             .grammar(vec![0])
             .encode()
             .expect("encode");
-        bytes[MAGIC.len()..HEADER_LEN].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        // The schema sits between the magic and the directory length.
+        let schema = MAGIC.len()..MAGIC.len() + 4;
+        bytes[schema].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
         assert!(matches!(
             Snapshot::load(&bytes),
             Err(SnapshotError::UnsupportedSchema { .. })
         ));
+    }
+
+    #[test]
+    fn a_snapshot_cut_short_is_refused() {
+        // Extents address bytes that have to be there. Losing the tail
+        // must say so rather than read whatever follows.
+        let bytes = SnapshotBuilder::new("demo")
+            .grammar(vec![7; 64])
+            .module("prelude", empty_program())
+            .expect("module")
+            .encode()
+            .expect("encode");
+        let cut = &bytes[..bytes.len() - 32];
+        let snapshot = Snapshot::load(cut).expect("the directory still reads");
+        assert!(
+            snapshot.module("prelude").is_err() || snapshot.grammar_bytes().is_empty(),
+            "a part that runs past the end is refused rather than guessed at"
+        );
     }
 
     #[test]

@@ -89,6 +89,11 @@ pub const ZYNML_STDLIB_SIMD: &str = include_str!("../stdlib/simd.zynml");
 /// The grammar and standard library, compiled by build.rs.
 const ZYNML_SNAPSHOT: &[u8] = zyntax_embed::include_snapshot!("zynml");
 
+/// The snapshot as bytes, for tools that measure what loading it costs.
+pub fn snapshot_bytes() -> &'static [u8] {
+    ZYNML_SNAPSHOT
+}
+
 /// Read once for the process. Decoding a module reserves the type ids
 /// it was built against, so every runtime installs the same snapshot
 /// rather than decoding its own copy.
