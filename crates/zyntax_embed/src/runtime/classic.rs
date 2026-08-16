@@ -706,6 +706,10 @@ impl ZyntaxRuntime {
         let lowering_config = LoweringConfig {
             builtins,
             use_krio_async: cfg!(feature = "krio-async-backend"),
+            // Where a program can begin, so lowering can skip the
+            // bodies an import brought in that nothing reaches. The
+            // same names the backend filters codegen against.
+            entry_names: self.entry_names(),
             ..LoweringConfig::default()
         };
 

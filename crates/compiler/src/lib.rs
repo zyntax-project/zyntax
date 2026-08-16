@@ -1507,6 +1507,7 @@ pub fn compile_to_hir(
         // (the default) pass an empty map.
         builtins: config.builtins.clone(),
         use_krio_async: config.use_krio_async,
+        entry_names: Vec::new(),
     };
 
     // Create arena for string interning (needed for async transformation)

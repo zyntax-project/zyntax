@@ -868,6 +868,15 @@ impl TieredRuntime {
         Ok(())
     }
 
+    /// The names a program can be entered through, as each registered
+    /// language declares them.
+    fn entry_names(&self) -> Vec<String> {
+        self.grammars
+            .values()
+            .filter_map(|grammar| grammar.entry_point().map(str::to_string))
+            .collect()
+    }
+
     /// Load all ZRTL plugins from a directory
     ///
     /// Loads all `.zrtl` files from the specified directory.
@@ -2384,6 +2393,9 @@ impl TieredRuntime {
         let lowering_config = LoweringConfig {
             builtins,
             use_krio_async: cfg!(feature = "krio-async-backend"),
+            // Where a program can begin, so lowering can skip the
+            // bodies an import brought in that nothing reaches.
+            entry_names: self.entry_names(),
             ..LoweringConfig::default()
         };
 

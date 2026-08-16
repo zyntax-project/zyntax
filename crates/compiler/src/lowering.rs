@@ -217,6 +217,25 @@ pub struct LoweringContext {
     declared_in: indexmap::IndexMap<InternedString, Option<InternedString>>,
     /// Current module being lowered
     pub module: HirModule,
+    /// Bodies to lower, when lowering is skipping what nothing reaches.
+    ///
+    /// `None` lowers everything, which is what happens when no entry
+    /// point was named or when something was found that reachability
+    /// cannot account for.
+    wanted: Option<std::collections::HashSet<InternedString>>,
+    /// Functions whose bodies have been lowered, so revisiting a
+    /// declaration for one of its other functions does not lower them
+    /// a second time.
+    lowered_fns: std::collections::HashSet<InternedString>,
+    /// Where a skipped function was declared, so it can be lowered
+    /// later without searching for it.
+    skipped_at: std::collections::HashMap<InternedString, usize>,
+    /// Index of the declaration being lowered.
+    current_decl: usize,
+    /// Whether a lowered body called through a value rather than a
+    /// name. Nothing can say what such a call reaches, so skipping
+    /// stops being safe once one appears.
+    saw_indirect_call: bool,
     /// Type registry for type conversions
     pub type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
     /// String arena for creating mangled names
@@ -352,6 +371,13 @@ pub struct LoweringConfig {
     /// Builtin function mappings (e.g., "tensor_sum_f32" -> "$Tensor$sum_f32")
     /// These are added to extern_link_names for resolving extern calls
     pub builtins: indexmap::IndexMap<String, String>,
+    /// Names a program can be entered through.
+    ///
+    /// An import brings a whole module with it, and most of what it
+    /// brings is never called. Knowing where execution can begin lets
+    /// lowering skip the bodies nothing reaches. Empty means nobody
+    /// said, and then every body is lowered.
+    pub entry_names: Vec<String>,
     /// Skip the legacy `AsyncCompiler` path inside `transform_async_function`.
     /// Async functions remain marked `is_async = true` after lowering, leaving
     /// them in shape for `krio_adapter` to transform via a post-lowering pass.
@@ -385,6 +411,7 @@ impl Default for LoweringConfig {
             strict_mode: false,
             import_resolver: None,
             builtins: indexmap::IndexMap::new(),
+            entry_names: Vec::new(),
             use_krio_async: false,
         }
     }
@@ -473,6 +500,11 @@ impl LoweringContext {
         Self {
             declared_in: indexmap::IndexMap::new(),
             module: HirModule::new(module_name),
+            wanted: None,
+            lowered_fns: std::collections::HashSet::new(),
+            skipped_at: std::collections::HashMap::new(),
+            current_decl: 0,
+            saw_indirect_call: false,
             type_registry,
             arena,
             symbols,
@@ -677,11 +709,20 @@ impl AstLowering for LoweringContext {
         // can't dispatch against.
         Self::wrap_fiber_call_types(program, &self.symbols.fiber_fn_names);
 
-        // Second pass: lower each declaration
+        // Second pass: lower each declaration.
+        //
+        // An import brings a whole module, and a program calls a little
+        // of it. Bodies are built starting from where the program can
+        // be entered, then from whatever those bodies turned out to
+        // call, until nothing is left owing. What an import brought in
+        // and nothing reaches is never built.
         phase.mark();
-        for decl in &program.declarations {
+        self.wanted = self.initial_wanted(program);
+        for (index, decl) in program.declarations.iter().enumerate() {
+            self.current_decl = index;
             self.lower_declaration(decl)?;
         }
+        self.lower_until_nothing_is_owed(program)?;
 
         // `with H { }` post-pass: now that every function (including
         // synthesised handler op fns) is in the module, emit
@@ -2279,8 +2320,147 @@ impl LoweringContext {
         Ok(())
     }
 
+    /// Whether this function's body has to be built now.
+    ///
+    /// A function an import brought in is built only once something
+    /// reaches it. Anything the program itself declares is built
+    /// regardless: a host can call it by name, a handler's operations
+    /// are entered through an effect rather than a call, and a fiber's
+    /// body is entered by the scheduler. None of those appear as a call
+    /// site, so none of them can be discovered by following calls.
+    fn should_lower(&mut self, func: &TypedFunction) -> bool {
+        let Some(wanted) = self.wanted.as_ref() else {
+            return true;
+        };
+        // Declared by the program rather than brought in by an import.
+        if func.module.is_none() {
+            return true;
+        }
+        if wanted.contains(&func.name) {
+            return true;
+        }
+        self.skipped_at.insert(func.name, self.current_decl);
+        false
+    }
+
+    /// The names lowering starts from, or `None` to build everything.
+    ///
+    /// Building only what is reached needs somewhere to start. A host
+    /// that never said where a program begins can call anything, so
+    /// nothing may be skipped. Neither may anything be skipped when the
+    /// named entry points are not among the declarations, which is what
+    /// happens when a host compiles a module to call into piecemeal.
+    fn initial_wanted(
+        &self,
+        program: &TypedProgram,
+    ) -> Option<std::collections::HashSet<InternedString>> {
+        if self.config.entry_names.is_empty() {
+            return None;
+        }
+        // An escape hatch for deciding whether a miscompile is this.
+        if std::env::var_os("ZYNTAX_LOWER_ALL").is_some() {
+            return None;
+        }
+        let mut roots = std::collections::HashSet::new();
+        for name in &self.config.entry_names {
+            roots.insert(InternedString::new_global(name));
+        }
+        let declared = program.declarations.iter().any(|d| match &d.node {
+            TypedDeclaration::Function(f) => roots.contains(&f.name),
+            _ => false,
+        });
+        if !declared {
+            return None;
+        }
+        Some(roots)
+    }
+
+    /// Build anything that lowered code turned out to call.
+    ///
+    /// Skipping is an assumption: that what an import brought in and no
+    /// entry point reaches will not be called. When the module says
+    /// otherwise, the assumption is abandoned wholesale and every
+    /// skipped body is built. That is one branch with one outcome
+    /// rather than a settling loop, and its worst case is exactly the
+    /// behaviour of lowering everything, which is what happened before
+    /// any of this existed.
+    fn lower_until_nothing_is_owed(&mut self, program: &TypedProgram) -> CompilerResult<()> {
+        if self.wanted.is_none() {
+            return Ok(());
+        }
+        let owed = self.functions_called_without_a_body();
+        // Exercised deliberately, so the path that abandons skipping is
+        // not one nobody has ever run.
+        let forced = std::env::var_os("ZYNTAX_LOWER_FORCE_FALLBACK").is_some();
+        if owed.is_empty() && !self.saw_indirect_call && !forced {
+            return Ok(());
+        }
+
+        // Build the rest. Nothing is skipped afterwards, so nothing
+        // further can come to be owed.
+        self.wanted = None;
+        let mut sites: Vec<usize> = self.skipped_at.values().copied().collect();
+        sites.sort_unstable();
+        sites.dedup();
+        log::debug!(
+            "[LOWERING] {} function(s) an import brought in are called after all; \
+             lowering the {} declaration(s) that were skipped",
+            owed.len(),
+            sites.len(),
+        );
+        for index in sites {
+            self.current_decl = index;
+            self.lower_declaration(&program.declarations[index])?;
+        }
+        Ok(())
+    }
+
+    /// Names of functions that lowered code calls but which have no
+    /// body, and are not declarations of something defined elsewhere.
+    fn functions_called_without_a_body(&mut self) -> Vec<InternedString> {
+        use crate::hir::{HirCallable, HirInstruction};
+
+        let mut owed: Vec<InternedString> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for function in self.module.functions.values() {
+            for block in function.blocks.values() {
+                for inst in &block.instructions {
+                    let HirInstruction::Call { callee, .. } = inst else {
+                        continue;
+                    };
+                    let target = match callee {
+                        HirCallable::Function(target) | HirCallable::FuncRef(target) => *target,
+                        HirCallable::Indirect(_) => {
+                            self.saw_indirect_call = true;
+                            return Vec::new();
+                        }
+                        _ => continue,
+                    };
+                    let Some(target_fn) = self.module.functions.get(&target) else {
+                        continue;
+                    };
+                    if target_fn.is_external || !target_fn.blocks.is_empty() {
+                        continue;
+                    }
+                    if seen.insert(target_fn.name) {
+                        owed.push(target_fn.name);
+                    }
+                }
+            }
+        }
+        owed
+    }
+
     /// Lower a function
     fn lower_function(&mut self, func: &TypedFunction) -> CompilerResult<()> {
+        if !self.should_lower(func) {
+            return Ok(());
+        }
+        // Revisiting a declaration to reach one of its functions would
+        // otherwise lower the rest of them again.
+        if self.wanted.is_some() && !self.lowered_fns.insert(func.name) {
+            return Ok(());
+        }
         // The `@with(H)` annotation is removed. It never lowered — a
         // function tagged `@with` silently ran with NO handler scoping,
         // a quiet miscompilation. `with H { }` block statements replace

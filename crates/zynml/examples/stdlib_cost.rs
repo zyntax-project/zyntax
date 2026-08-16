@@ -16,8 +16,12 @@ fn main() {
         "{:<9} {:>8} {:>8} {:>8} {:>8}  {}",
         "source", "setup", "parse", "lower", "declared", "bytes"
     );
-    for (name, source) in [("trivial", trivial), ("real", real.as_str())] {
-        phases(name, source);
+    // Three rounds, alternating, because the first compile in a process
+    // pays for warm-up that has nothing to do with either program.
+    for round in 0..3 {
+        for (name, source) in [("real", real.as_str()), ("trivial", trivial)] {
+            phases(&format!("{name}{round}"), source);
+        }
     }
 }
 
@@ -62,4 +66,21 @@ fn phases(name: &str, source: &str) {
         reachable.len(),
         source.len(),
     );
+
+    if std::env::var_os("SHOW_NAMES").is_some() {
+        let mut kept: Vec<String> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        for (id, f) in &module.functions {
+            let n = f.name.resolve_global().unwrap_or_default();
+            if reachable.contains(id) {
+                kept.push(n);
+            } else {
+                dropped.push(n);
+            }
+        }
+        kept.sort();
+        dropped.sort();
+        eprintln!("  reachable: {kept:?}");
+        eprintln!("  dropped ({}): {:?}", dropped.len(), &dropped);
+    }
 }
