@@ -14,7 +14,7 @@ use crate::compiled_artifact::{CompiledArtifactError, CompiledImport};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
 
 /// The extension a snapshot is written under.
@@ -65,6 +65,13 @@ struct SnapshotPayload {
 #[derive(Serialize, Deserialize)]
 struct SnapshotModule {
     name: String,
+    /// The largest type id this module mentions.
+    ///
+    /// Reserving ids is a high-water mark, so a host can reserve from
+    /// this number without decoding the module it came from. That is
+    /// what lets a module stay encoded until something imports it.
+    #[serde(default)]
+    max_type_id: u32,
     /// The encoded [`CompiledImport`]. Held encoded so installing can
     /// decode what it needs and leave the rest, and so a module's own
     /// schema check still runs.
@@ -83,7 +90,10 @@ pub struct Snapshot {
     language: String,
     grammar: Vec<u8>,
     modules: Vec<SnapshotModule>,
-    decoded: std::sync::OnceLock<Result<Vec<CompiledImport>, String>>,
+    /// Each module, decoded when something first asks for it. A module
+    /// nobody imports is never decoded, and decoding is the cost of
+    /// installing a standard library.
+    decoded: Vec<std::sync::OnceLock<Result<CompiledImport, String>>>,
 }
 
 impl Snapshot {
@@ -106,11 +116,16 @@ impl Snapshot {
         }
         let payload: SnapshotPayload = ciborium::from_reader(&bytes[HEADER_LEN..])
             .map_err(|e| SnapshotError::Decode(e.to_string()))?;
+        let decoded = payload
+            .modules
+            .iter()
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
         Ok(Self {
             language: payload.language,
             grammar: payload.grammar,
             modules: payload.modules,
-            decoded: std::sync::OnceLock::new(),
+            decoded,
         })
     }
 
@@ -130,13 +145,31 @@ impl Snapshot {
         self.modules.iter().map(|m| m.name.as_str())
     }
 
-    /// One module, decoded.
+    /// One module, decoded on first use and kept after.
     pub fn module(&self, name: &str) -> Result<Option<CompiledImport>, SnapshotError> {
-        Ok(self
-            .modules()?
-            .iter()
-            .find(|m| m.module_name() == name)
-            .cloned())
+        let Some(index) = self.modules.iter().position(|m| m.name == name) else {
+            return Ok(None);
+        };
+        self.decoded[index]
+            .get_or_init(|| {
+                CompiledImport::decode(&self.modules[index].artifact).map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map(|module| Some(module.clone()))
+            .map_err(|e| SnapshotError::Decode(e.clone()))
+    }
+
+    /// Reserve the type ids every module was built against.
+    ///
+    /// Decoding a module reserves its ids as a side effect, which meant
+    /// installing a standard library decoded all of it before anything
+    /// could parse. Reserving is a high-water mark and the build wrote
+    /// each module's down, so this reserves from those numbers and
+    /// leaves the modules encoded until one is imported.
+    pub fn reserve_type_ids(&self) {
+        for module in &self.modules {
+            zyntax_typed_ast::TypeId::reserve_at_least(module.max_type_id.saturating_add(1));
+        }
     }
 
     /// A module's source, when the snapshot carries it.
@@ -147,22 +180,16 @@ impl Snapshot {
             .and_then(|m| m.source.as_deref())
     }
 
-    /// Every module, decoded, in build order.
-    ///
-    /// Decoding reserves the type ids a module was built against, so
-    /// this is done once for the snapshot and the result kept. That
-    /// order is why the modules are a list rather than a map: ids have
-    /// to land where the build put them.
-    pub fn modules(&self) -> Result<&[CompiledImport], SnapshotError> {
-        self.decoded
-            .get_or_init(|| {
-                self.modules
-                    .iter()
-                    .map(|m| CompiledImport::decode(&m.artifact).map_err(|e| e.to_string()))
-                    .collect()
+    /// Every module, decoded. Decodes whatever has not been asked for
+    /// yet, so a host wanting all of them can still say so.
+    pub fn modules(&self) -> Result<Vec<CompiledImport>, SnapshotError> {
+        self.modules
+            .iter()
+            .map(|m| {
+                self.module(&m.name)?
+                    .ok_or_else(|| SnapshotError::Decode(format!("module '{}' vanished", m.name)))
             })
-            .as_deref()
-            .map_err(|e| SnapshotError::Decode(e.clone()))
+            .collect()
     }
 }
 
@@ -206,9 +233,11 @@ impl SnapshotBuilder {
         program: zyntax_typed_ast::TypedProgram,
     ) -> Result<Self, SnapshotError> {
         let name = name.into();
+        let max_type_id = program.type_registry.max_type_id();
         let artifact = CompiledImport::new(self.language.clone(), name.clone(), program);
         self.modules.push(SnapshotModule {
             name,
+            max_type_id,
             artifact: artifact.encode()?,
             source: None,
         });
@@ -224,9 +253,11 @@ impl SnapshotBuilder {
         source: impl Into<String>,
     ) -> Result<Self, SnapshotError> {
         let name = name.into();
+        let max_type_id = program.type_registry.max_type_id();
         let artifact = CompiledImport::new(self.language.clone(), name.clone(), program);
         self.modules.push(SnapshotModule {
             name,
+            max_type_id,
             artifact: artifact.encode()?,
             source: Some(source.into()),
         });

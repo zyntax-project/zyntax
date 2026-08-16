@@ -1095,6 +1095,16 @@ impl TypeRegistry {
     /// Build artifacts restore registries created in another process. Calling
     /// this before parsing new source keeps those restored IDs globally unique.
     pub fn reserve_type_ids(&self) {
+        TypeId::reserve_at_least(self.max_type_id().saturating_add(1));
+    }
+
+    /// The largest type id this registry mentions.
+    ///
+    /// Reserving is a high-water mark rather than a running count, so
+    /// knowing this number is the same as having the registry for that
+    /// purpose. A build can record it and a host can reserve from it
+    /// without decoding anything.
+    pub fn max_type_id(&self) -> u32 {
         let mut max_id = self.types.keys().map(|id| id.as_u32()).max().unwrap_or(0);
         let mut include = |id: &TypeId| max_id = max_id.max(id.as_u32());
 
@@ -1109,8 +1119,7 @@ impl TypeRegistry {
             include(type_id);
             trait_ids.iter().for_each(&mut include);
         }
-
-        TypeId::reserve_at_least(max_id.saturating_add(1));
+        max_id
     }
 
     /// Whether a definition only stands in for a name that has been

@@ -1673,13 +1673,10 @@ impl ZyntaxRuntime {
         grammar.set_language(snapshot.language());
         self.register_grammar(snapshot.language(), grammar.clone());
 
-        // Reserve the ids before anything can parse against them.
-        snapshot.modules().map_err(|e| {
-            RuntimeError::Execution(format!(
-                "snapshot for '{}' has an unreadable module: {e}",
-                snapshot.language()
-            ))
-        })?;
+        // Reserve the ids before anything can parse against them. The
+        // build recorded what to reserve, so no module is decoded here
+        // and one nobody imports is never decoded at all.
+        snapshot.reserve_type_ids();
 
         for module in snapshot.module_names() {
             self.snapshot_modules.insert(
