@@ -685,17 +685,23 @@ macro_rules! zrtl_plugin {
             concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char,
         );
 
-        // `#[no_mangle]` exports for the dlopen path. Gated off on
-        // wasm32 where there is no dlopen and where multiple plugins
-        // are statically linked into a single module (so the unmangled
-        // names would collide at link time).
-        #[cfg(not(target_arch = "wasm32"))]
+        // `#[no_mangle]` exports for the dlopen path. Every plugin
+        // exports these under the same two names, so they can only be
+        // emitted where exactly one plugin is present in a link.
+        //
+        // Gated off on wasm32, which has no dlopen and links its
+        // plugins into a single module. Gated off by `linked-into-host`
+        // for the same reason on native: a binary that links more than
+        // one plugin gets a duplicate-symbol error from any linker that
+        // enforces it. A host that links plugins reaches them through
+        // `static_plugin()` and never looks these up.
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
         #[no_mangle]
         pub static _zrtl_info: $crate::ZrtlInfo = $crate::ZrtlInfo::new(
             concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char
         );
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
         #[no_mangle]
         pub static _zrtl_symbols: [$crate::ZrtlSymbol; _ZRTL_PLUGIN_SYMBOLS_LEN] = [
             $(

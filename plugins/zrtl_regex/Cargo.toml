@@ -14,3 +14,9 @@ regex = "1.10"
 
 [lints]
 workspace = true
+
+[features]
+# Suppress the unmangled `_zrtl_info` / `_zrtl_symbols` exports, which
+# every plugin defines under the same names. A host that links more than
+# one plugin needs them gone and uses `static_plugin()` instead.
+linked-into-host = []

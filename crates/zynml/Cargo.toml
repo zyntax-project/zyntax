@@ -38,13 +38,13 @@ env_logger = "0.11"
 # than opened at startup: a `dlopen` apiece dominates the cost of a
 # single CLI run, and the signatures they carry are needed while
 # lowering, before any of their code runs.
-zrtl_io = { path = "../../plugins/zrtl_io", optional = true }
-zrtl_fs = { path = "../../plugins/zrtl_fs", optional = true }
-zrtl_text = { path = "../../plugins/zrtl_text", optional = true }
-zrtl_vector = { path = "../../plugins/zrtl_vector", optional = true }
-zrtl_model = { path = "../../plugins/zrtl_model", optional = true }
-zrtl_tensor = { path = "../../plugins/zrtl_tensor", optional = true }
-zrtl_simd = { path = "../../plugins/zrtl_simd", optional = true }
+zrtl_io = { path = "../../plugins/zrtl_io", optional = true, features = ["linked-into-host"] }
+zrtl_fs = { path = "../../plugins/zrtl_fs", optional = true, features = ["linked-into-host"] }
+zrtl_text = { path = "../../plugins/zrtl_text", optional = true, features = ["linked-into-host"] }
+zrtl_vector = { path = "../../plugins/zrtl_vector", optional = true, features = ["linked-into-host"] }
+zrtl_model = { path = "../../plugins/zrtl_model", optional = true, features = ["linked-into-host"] }
+zrtl_tensor = { path = "../../plugins/zrtl_tensor", optional = true, features = ["linked-into-host"] }
+zrtl_simd = { path = "../../plugins/zrtl_simd", optional = true, features = ["linked-into-host"] }
 
 [dev-dependencies]
 criterion = "0.5"

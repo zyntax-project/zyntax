@@ -16,6 +16,27 @@ use zyntax_compiler::osr;
 use zyntax_compiler::tiered_backend::{OptimizationTier, TieredBackend, TieredConfig};
 use zyntax_typed_ast::InternedString;
 
+/// Direct `call` instructions in a CLIF dump.
+///
+/// Counted per line, and only where `call` is the opcode. Searching the
+/// dump for the text `call` finds it inside `call_indirect` and inside
+/// the name of a calling convention, and `windows_fastcall` appears in
+/// the signature of every function compiled for Windows.
+fn direct_calls(clif: &str) -> usize {
+    clif.lines()
+        .filter(|line| {
+            // Drop the trailing comment first: it can hold ` = `, which
+            // would otherwise be read as the result assignment.
+            let code = line.split(';').next().unwrap_or_default();
+            let opcode = match code.split_once(" = ") {
+                Some((_, rhs)) => rhs,
+                None => code,
+            };
+            opcode.trim_start().starts_with("call ")
+        })
+        .count()
+}
+
 /// Whether any registered bead holds an OSR entry under `site`.
 fn any_bead_has_entry(site: u64) -> bool {
     osr::bead_registry()
@@ -86,6 +107,44 @@ fn a_tier1_promotion_installs_an_osr_entry() {
     );
 }
 
+/// Counting calls has to survive the Windows calling convention.
+///
+/// A function compiled for Windows carries `windows_fastcall` in its
+/// signature, and the last five characters of that spell `call` with a
+/// space after them. Counting the text `call ` reads the signature line
+/// as a call site, so a probe that is a bare load looks like it calls
+/// into the runtime on Windows and nowhere else.
+#[test]
+fn counting_calls_ignores_the_calling_convention_and_indirect_calls() {
+    let windows = "\
+function u0:0(i32) -> i32 windows_fastcall {
+    sig1 = (i64) -> i32 windows_fastcall
+block0(v2: i32):
+    v3 = iconst.i64 0xbead
+    call fn0(v3)  ; v3 = 0xbead
+block4:
+    v16 = call_indirect.i64 sig1, v8(v9)
+    return v16
+}
+";
+    assert_eq!(
+        direct_calls(windows),
+        1,
+        "only `call fn0` is a direct call in:\n{windows}"
+    );
+
+    let system_v = windows.replace("windows_fastcall", "system_v");
+    assert_eq!(
+        direct_calls(&system_v),
+        direct_calls(windows),
+        "the count must not depend on the calling convention"
+    );
+
+    assert_eq!(direct_calls("    v1 = call fn0(v0)"), 1);
+    assert_eq!(direct_calls("    v1 = call_indirect.i64 sig0, v0(v2)"), 0);
+    assert_eq!(direct_calls(""), 0);
+}
+
 /// The probe's steady-state cost is what decides whether it can stay on.
 /// An unarmed back-edge must be a load of the helper slot and a branch —
 /// no call into the runtime, because a call that returns into the loop
@@ -123,8 +182,8 @@ fn an_unarmed_probe_site_costs_a_load_not_a_call() {
     // what forces caller-saved registers to be treated as clobbered across
     // the body.
     let entry_end = clif.find("block1").unwrap_or(clif.len());
-    let calls_before_loop = clif[..entry_end].matches("call ").count();
-    let calls_total = clif.matches("call ").count();
+    let calls_before_loop = direct_calls(&clif[..entry_end]);
+    let calls_total = direct_calls(&clif);
     assert_eq!(
         (calls_before_loop, calls_total),
         (1, 1),
