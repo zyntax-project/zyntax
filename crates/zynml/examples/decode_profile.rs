@@ -36,6 +36,21 @@ fn main() {
     }
     let with_prelude = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
+    // The grammar is the other half of what installing a language reads.
+    let snapshot = zyntax_embed::Snapshot::load(bytes).expect("load");
+    let grammar_bytes = snapshot.grammar_bytes().to_vec();
+    let t = Instant::now();
+    for _ in 0..iters {
+        let grammar =
+            zyntax_embed::LanguageGrammar::from_compiled_bytes(&grammar_bytes).expect("grammar");
+        std::hint::black_box(grammar.name().len());
+    }
+    eprintln!(
+        "grammar decode     {:.2} ms  ({} KB)",
+        t.elapsed().as_secs_f64() * 1000.0 / iters as f64,
+        grammar_bytes.len() / 1024
+    );
+
     eprintln!(
         "load only          {load:.2} ms\n\
          load + prelude     {with_prelude:.2} ms\n\

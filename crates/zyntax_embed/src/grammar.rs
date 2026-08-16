@@ -113,15 +113,9 @@ pub struct LanguageGrammar {
 }
 
 const COMPILED_GRAMMAR_MAGIC: &[u8; 4] = b"ZGRM";
-const COMPILED_GRAMMAR_SCHEMA: u32 = 1;
+const COMPILED_GRAMMAR_SCHEMA: u32 = 2;
 const COMPILED_GRAMMAR_HEADER_LEN: usize =
     COMPILED_GRAMMAR_MAGIC.len() + std::mem::size_of::<u32>();
-
-#[derive(Serialize, Deserialize)]
-struct CompiledGrammarPayload {
-    module: ZpegModule,
-    grammar2: Option<GrammarIR>,
-}
 
 fn next_grammar_cache_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -248,18 +242,27 @@ impl LanguageGrammar {
     /// Serialize the compiled legacy metadata and GrammarIR for embedding in
     /// an application binary. Loading the result does not parse `.zyn` source.
     pub fn to_compiled_bytes(&self) -> GrammarResult<Vec<u8>> {
-        let payload = CompiledGrammarPayload {
-            module: (*self.module).clone(),
-            grammar2: self.grammar2.as_deref().cloned(),
-        };
-        let mut encoded = Vec::new();
-        ciborium::into_writer(&payload, &mut encoded).map_err(|e| {
+        // Two sections, because they cannot share an encoding. The
+        // rules are written positionally, which is most of the payload
+        // and most of the time spent reading it back. The legacy module
+        // keeps a self-describing one: its command arguments are an
+        // untagged enum, so what a value is can only be known by
+        // looking at it, which a positional format cannot do.
+        let rules = postcard::to_allocvec(&self.grammar2.as_deref().cloned()).map_err(|e| {
             GrammarError::CompileError(format!("Failed to encode compiled grammar: {e}"))
         })?;
-        let mut bytes = Vec::with_capacity(COMPILED_GRAMMAR_HEADER_LEN + encoded.len());
+        let mut module = Vec::new();
+        ciborium::into_writer(&*self.module, &mut module).map_err(|e| {
+            GrammarError::CompileError(format!("Failed to encode compiled grammar: {e}"))
+        })?;
+
+        let mut bytes =
+            Vec::with_capacity(COMPILED_GRAMMAR_HEADER_LEN + 4 + rules.len() + module.len());
         bytes.extend_from_slice(COMPILED_GRAMMAR_MAGIC);
         bytes.extend_from_slice(&COMPILED_GRAMMAR_SCHEMA.to_le_bytes());
-        bytes.extend_from_slice(&encoded);
+        bytes.extend_from_slice(&(rules.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&rules);
+        bytes.extend_from_slice(&module);
         Ok(bytes)
     }
 
@@ -283,13 +286,31 @@ impl LanguageGrammar {
                 "unsupported compiled grammar schema {found}; expected {COMPILED_GRAMMAR_SCHEMA}"
             )));
         }
-        let payload: CompiledGrammarPayload =
-            ciborium::from_reader(&bytes[COMPILED_GRAMMAR_HEADER_LEN..]).map_err(|e| {
-                GrammarError::LoadError(format!("Failed to decode compiled grammar: {e}"))
-            })?;
+        let body = &bytes[COMPILED_GRAMMAR_HEADER_LEN..];
+        if body.len() < 4 {
+            return Err(GrammarError::LoadError(
+                "compiled grammar is truncated".to_string(),
+            ));
+        }
+        let rules_len = u32::from_le_bytes(body[..4].try_into().expect("four bytes")) as usize;
+        let rules_end = 4 + rules_len;
+        let (rules, module) = (
+            body.get(4..rules_end).ok_or_else(|| {
+                GrammarError::LoadError("compiled grammar is truncated".to_string())
+            })?,
+            body.get(rules_end..).ok_or_else(|| {
+                GrammarError::LoadError("compiled grammar is truncated".to_string())
+            })?,
+        );
+        let grammar2: Option<GrammarIR> = postcard::from_bytes(rules).map_err(|e| {
+            GrammarError::LoadError(format!("Failed to decode compiled grammar: {e}"))
+        })?;
+        let module: ZpegModule = ciborium::from_reader(module).map_err(|e| {
+            GrammarError::LoadError(format!("Failed to decode compiled grammar: {e}"))
+        })?;
         let grammar = Self {
-            module: Arc::new(payload.module),
-            grammar2: payload.grammar2.map(Arc::new),
+            module: Arc::new(module),
+            grammar2: grammar2.map(Arc::new),
             vm: Arc::new(Mutex::new(None)),
             cache_id: next_grammar_cache_id(),
             language: None,

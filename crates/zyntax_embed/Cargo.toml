@@ -28,6 +28,10 @@ log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ciborium = "0.2"
+# Positional binary encoding for the grammar artifact. CBOR names every
+# field in the payload and matches those names on the way back in, which
+# a 417-rule grammar pays for on every startup.
+postcard = { version = "1.0", features = ["alloc"] }
 indexmap = "2.0"
 
 # Dynamic grammar parsing at runtime
