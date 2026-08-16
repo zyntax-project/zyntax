@@ -87,12 +87,30 @@ struct TargetResult {
     /// expressed in seconds — the unit the static page renders.
     /// Zero when [`Self::error`] is set.
     seconds: f64,
+    /// Median time to construct the runtime: decoding the language
+    /// snapshot, installing the grammar and registering plugins.
+    ///
+    /// A deployed program pays this once before it can compile
+    /// anything, so leaving it out of the numbers understates what a
+    /// run costs. It is reported separately rather than folded into
+    /// `compile_ms` so the two can be attacked independently.
+    #[serde(default)]
+    setup_ms: f64,
     /// Median compile-only time (parse + lower + opt). Useful for
     /// pulling apart compile cost from execute cost in charts.
     compile_ms: f64,
     /// Median execute-only time (call `main`, no setup). The page
     /// can sum `compile_ms + exec_ms` if it wants total cost.
     exec_ms: f64,
+    /// Setup, compile and execute for the first iteration, before any
+    /// warmup: what the very first run of this kernel actually cost.
+    ///
+    /// Every other number here is a median of warmed iterations, which
+    /// is the right shape for comparing steady-state throughput and the
+    /// wrong shape for asking what a user waits for. The gap between
+    /// this and `setup_ms + compile_ms + exec_ms` is what warmup hides.
+    #[serde(default)]
+    cold_ms: f64,
     /// The value `main` returned, formatted via `Debug`. Tracking
     /// it pins correctness across runs — a future opt pass that
     /// silently changes the bench result fails the workflow loudly.
@@ -538,11 +556,14 @@ fn main() {
                 eprintln!("    {:<22} FAILED — {err}", target.key);
             } else {
                 eprintln!(
-                    "    {:<22} compile={:>7.2}ms exec={:>9.2}ms total={:>9.2}ms  -> {}",
+                    "    {:<22} setup={:>6.2}ms compile={:>7.2}ms exec={:>9.2}ms \
+                     total={:>9.2}ms cold={:>9.2}ms  -> {}",
                     target.key,
+                    r.setup_ms,
                     r.compile_ms,
                     r.exec_ms,
                     r.seconds * 1000.0,
+                    r.cold_ms,
                     r.result,
                 );
                 // Correctness gate: every successful tier on this
@@ -613,6 +634,7 @@ fn measure(
     cache_enabled: bool,
     pure_call_pre: bool,
 ) -> TargetResult {
+    let mut setup_samples = Vec::with_capacity(runs);
     let mut compile_samples = Vec::with_capacity(runs);
     let mut exec_samples = Vec::with_capacity(runs);
     let mut last_result_str = String::new();
@@ -622,6 +644,14 @@ fn measure(
     // baseline. A failure during warmup short-circuits straight
     // to the `error` shape; no point spending the runs-loop's
     // budget on something that's reliably broken.
+    // The first iteration is the only cold one: it pays for page-cache
+    // misses, allocator growth and every lazily-decoded artifact the
+    // process shares. Warmup exists to take that out of the timed runs,
+    // so it has to be measured here or it is never measured at all.
+    let cold = match one_iteration(source, target, kernel, cache_enabled, pure_call_pre) {
+        Ok((setup_ms, compile_ms, exec_ms, _)) => setup_ms + compile_ms + exec_ms,
+        Err(e) => return failed_result(&e),
+    };
     for _ in 0..WARMUP {
         if let Err(e) = one_iteration(source, target, kernel, cache_enabled, pure_call_pre) {
             return failed_result(&e);
@@ -629,7 +659,8 @@ fn measure(
     }
     for _ in 0..runs {
         match one_iteration(source, target, kernel, cache_enabled, pure_call_pre) {
-            Ok((compile_ms, exec_ms, r)) => {
+            Ok((setup_ms, compile_ms, exec_ms, r)) => {
+                setup_samples.push(setup_ms);
                 compile_samples.push(compile_ms);
                 exec_samples.push(exec_ms);
                 last_result_str = format!("{r:?}");
@@ -638,12 +669,15 @@ fn measure(
         }
     }
 
+    let median_setup = median(&mut setup_samples);
     let median_compile = median(&mut compile_samples);
     let median_exec = median(&mut exec_samples);
     TargetResult {
         seconds: (median_compile + median_exec) / 1000.0,
+        setup_ms: median_setup,
         compile_ms: median_compile,
         exec_ms: median_exec,
+        cold_ms: cold,
         result: last_result_str,
         error: None,
         skipped: false,
@@ -653,8 +687,10 @@ fn measure(
 fn failed_result(error: &str) -> TargetResult {
     TargetResult {
         seconds: 0.0,
+        setup_ms: 0.0,
         compile_ms: 0.0,
         exec_ms: 0.0,
+        cold_ms: 0.0,
         result: "—".to_string(),
         error: Some(error.to_string()),
         skipped: false,
@@ -664,8 +700,10 @@ fn failed_result(error: &str) -> TargetResult {
 fn skipped_result() -> TargetResult {
     TargetResult {
         seconds: 0.0,
+        setup_ms: 0.0,
         compile_ms: 0.0,
         exec_ms: 0.0,
+        cold_ms: 0.0,
         result: "—".to_string(),
         error: None,
         skipped: true,
@@ -675,7 +713,7 @@ fn skipped_result() -> TargetResult {
 /// One full kernel run: lower from source, optionally apply the
 /// HIR opt pipeline, install into a fresh runtime, drive the JIT
 /// tier-up if requested, then call `main`. Returns
-/// `(compile_ms, exec_ms, result)`.
+/// `(setup_ms, compile_ms, exec_ms, result)`.
 ///
 /// `compile_ms` is always the **cold-path setup**: parse + lower
 /// + optional HIR opts + `compile_module` + (for the tiered
@@ -698,7 +736,7 @@ fn one_iteration(
     kernel: &str,
     cache_enabled: bool,
     pure_call_pre: bool,
-) -> Result<(f64, f64, ZyntaxValue), String> {
+) -> Result<(f64, f64, f64, ZyntaxValue), String> {
     // Fine-grained instrumentation, enabled only when the
     // `ZYNTAX_BENCH_TRACE_COMPILE` env var is set. The trace
     // breaks `compile_ms` down into the individual pipeline
@@ -841,7 +879,7 @@ fn one_iteration(
         eprintln!(
             "[BENCH-COMPILE] kernel={kernel} target={target_key}\n  \
              cache_lookup = {cache:.2} ms (not counted)\n  \
-             runtime_setup= {runtime_setup:.2} ms (not counted)\n  \
+             runtime_setup= {runtime_setup:.2} ms (reported as setup_ms)\n  \
              parse        = {parse:.2} ms\n  \
              lower        = {lower:.2} ms\n  \
              opts         = {opts:.2} ms\n  \
@@ -897,7 +935,7 @@ fn one_iteration(
     .map_err(|e| format!("call: {e:?}"))?;
     let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
-    Ok((compile_ms, exec_ms, result))
+    Ok((runtime_setup_ms, compile_ms, exec_ms, result))
 }
 
 fn median(samples: &mut [f64]) -> f64 {
