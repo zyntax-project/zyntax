@@ -49,6 +49,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
     };
 
     TypedProgram {
+        language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
             Type::Primitive(PrimitiveType::Unit),
@@ -728,6 +729,7 @@ fn test_compilation_pipeline_with_async_function() -> CompilerResult<()> {
     };
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(func),
             Type::Primitive(PrimitiveType::Unit),
@@ -814,6 +816,7 @@ fn test_compilation_pipeline_without_async_runtime() -> CompilerResult<()> {
     };
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(func),
             Type::Primitive(PrimitiveType::Unit),
@@ -939,6 +942,7 @@ fn test_compilation_pipeline_mixed_sync_async() -> CompilerResult<()> {
     };
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![
             typed_node(
                 TypedDeclaration::Function(sync_func),

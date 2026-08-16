@@ -142,6 +142,7 @@ fn program(arena: &mut AstArena) -> (TypedProgram, zyntax_typed_ast::InternedStr
     };
     (
         TypedProgram {
+            language: None,
             declarations: vec![node(
                 TypedDeclaration::Function(function),
                 Type::Primitive(PrimitiveType::Unit),

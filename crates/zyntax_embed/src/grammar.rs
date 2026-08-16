@@ -758,6 +758,7 @@ impl LanguageGrammar {
                 is_external: true, // Mark as external
                 calling_convention: CallingConvention::Default,
                 link_name: Some(InternedString::new_global(target_symbol)), // Link to ZRTL symbol
+                module: None,
             };
             program.declarations.push(typed_node(
                 TypedDeclaration::Function(alias_func),
@@ -784,6 +785,7 @@ impl LanguageGrammar {
                     is_external: true, // Mark as external
                     calling_convention: CallingConvention::Default,
                     link_name: Some(InternedString::new_global(target_symbol)), // Link to ZRTL symbol
+                    module: None,
                 };
                 program.declarations.push(typed_node(
                     TypedDeclaration::Function(extern_func),

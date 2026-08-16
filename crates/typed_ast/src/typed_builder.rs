@@ -935,6 +935,7 @@ impl TypedASTBuilder {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                module: None,
             }),
             return_type,
             span,
@@ -968,6 +969,7 @@ impl TypedASTBuilder {
                 is_external: true,
                 calling_convention: CallingConvention::Cdecl,
                 link_name: None,
+                module: None,
             }),
             return_type,
             span,
@@ -1335,6 +1337,7 @@ impl FluentFunctionBuilder {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                module: None,
             }),
             Type::Function {
                 params: vec![], // Would need proper conversion from params
@@ -1412,6 +1415,7 @@ impl FluentFunctionBuilder {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                module: None,
             }),
             func_type.clone(),
             self.span,

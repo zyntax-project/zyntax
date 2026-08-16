@@ -300,6 +300,7 @@ pub fn function_decl(
         is_external: false,
         calling_convention: CallingConvention::Default,
         link_name: None,
+        module: None,
     })
 }
 

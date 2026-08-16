@@ -1134,6 +1134,7 @@ impl TypeChecker {
                 is_external: false,
                 calling_convention: CallingConvention::Default,
                 link_name: None,
+                module: None,
             };
 
             self.check_function(&func)?;

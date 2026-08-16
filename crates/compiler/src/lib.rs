@@ -1005,6 +1005,7 @@ fn generate_binary_trait_impl(
         is_external: false,
         calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
         link_name: None,
+        module: None,
     };
 
     let func_decl = TypedNode::new(
@@ -1228,6 +1229,7 @@ fn generate_comparison_trait_impl(
             is_external: false,
             calling_convention: CallingConvention::Default,
             link_name: None,
+            module: None,
         };
 
         standalone_functions.push(TypedNode::new(
@@ -1458,6 +1460,7 @@ fn generate_unary_trait_impl(
         is_external: false,
         calling_convention: CallingConvention::Default,
         link_name: None,
+        module: None,
     };
 
     let func_decl = TypedNode::new(

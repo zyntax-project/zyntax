@@ -126,6 +126,7 @@ fn test_vtable_generation_simple() {
     // 5. Create program with the method function
     use zyntax_typed_ast::{typed_node, TypedDeclaration};
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(impl_function),
             Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),

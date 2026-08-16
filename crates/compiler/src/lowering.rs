@@ -212,6 +212,9 @@ impl TargetData {
 
 /// Lowering context for a compilation unit
 pub struct LoweringContext {
+    /// Which module each function name was declared in, so a second
+    /// declaration of the same name can say what it is shadowing.
+    declared_in: indexmap::IndexMap<InternedString, Option<InternedString>>,
     /// Current module being lowered
     pub module: HirModule,
     /// Type registry for type conversions
@@ -468,6 +471,7 @@ impl LoweringContext {
         }
 
         Self {
+            declared_in: indexmap::IndexMap::new(),
             module: HirModule::new(module_name),
             type_registry,
             arena,
@@ -1764,7 +1768,29 @@ impl LoweringContext {
             match &decl.node {
                 TypedDeclaration::Function(func) => {
                     let func_id = crate::hir::HirId::new();
-                    self.symbols.functions.insert(func.name, func_id);
+                    // Imported modules are merged into the program
+                    // before this runs, so two of them declaring the
+                    // same name arrive as two declarations and the
+                    // second silently takes the name. Which one a call
+                    // then means is decided by declaration order and
+                    // nothing else. Saying so is not a fix, but it is
+                    // the difference between a wrong call and an
+                    // invisible one.
+                    if self.symbols.functions.insert(func.name, func_id).is_some() {
+                        let where_from = |module: Option<zyntax_typed_ast::InternedString>| {
+                            module
+                                .and_then(|m| m.resolve_global())
+                                .unwrap_or_else(|| "this program".to_string())
+                        };
+                        log::warn!(
+                            "'{}' is declared in {} and again in {}; calls to it reach the last \
+                             one declared",
+                            func.name.resolve_global().unwrap_or_default(),
+                            where_from(self.declared_in.get(&func.name).copied().flatten()),
+                            where_from(func.module),
+                        );
+                    }
+                    self.declared_in.insert(func.name, func.module);
                     if func.is_fiber {
                         self.symbols.fiber_fn_names.insert(func.name);
                     }
@@ -4768,6 +4794,7 @@ impl LoweringContext {
                         calling_convention:
                             zyntax_typed_ast::type_registry::CallingConvention::Default,
                         link_name: Some(InternedString::new_global(&zrtl_symbol)), // Link to ZRTL symbol
+                        module: None,
                     };
 
                     if let Err(e) = self.lower_function(&func) {
@@ -4801,6 +4828,7 @@ impl LoweringContext {
                 is_external: false,
                 calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
                 link_name: None,
+                module: None,
             };
 
             // Lower the method as a regular function
@@ -5554,6 +5582,7 @@ impl LoweringContext {
             is_external: false,
             calling_convention: zyntax_typed_ast::CallingConvention::Default,
             link_name: None,
+            module: None,
         };
 
         // Lower as a regular function
@@ -5626,6 +5655,7 @@ impl LoweringContext {
             is_external: false,
             calling_convention: zyntax_typed_ast::CallingConvention::Default,
             link_name: None,
+            module: None,
         };
 
         self.lower_function(&func)

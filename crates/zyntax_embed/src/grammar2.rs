@@ -518,6 +518,7 @@ impl Grammar2 {
                 is_external: true,
                 calling_convention: CallingConvention::Default,
                 link_name: Some(InternedString::new_global(target_symbol)),
+                module: None,
             };
             program.declarations.push(typed_node(
                 TypedDeclaration::Function(alias_func),
@@ -544,6 +545,7 @@ impl Grammar2 {
                     is_external: true,
                     calling_convention: CallingConvention::Default,
                     link_name: Some(InternedString::new_global(target_symbol)),
+                    module: None,
                 };
                 program.declarations.push(typed_node(
                     TypedDeclaration::Function(symbol_func),

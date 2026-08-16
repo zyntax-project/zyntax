@@ -328,6 +328,7 @@ impl<'a> TypedAstBuilder<'a> {
             is_external: false,
             calling_convention: crate::type_registry::CallingConvention::Default,
             link_name: None,
+            module: None,
         };
 
         self.typed_node(TypedDeclaration::Function(func), return_type, span)

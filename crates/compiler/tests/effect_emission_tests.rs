@@ -115,6 +115,7 @@ fn build_effect_program() -> TypedProgram {
     };
 
     TypedProgram {
+        language: None,
         declarations: vec![
             TypedNode::new(
                 TypedDeclaration::Effect(log_effect),
@@ -328,6 +329,7 @@ fn handler_body_calling_resume_param_emits_runtime_symbol_call() {
     };
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![TypedNode::new(
             TypedDeclaration::Function(handle_get),
             Type::Primitive(PrimitiveType::Unit),

@@ -140,6 +140,7 @@ fn build_program(closure_body: TypedLambdaBody, arena: &mut AstArena) -> TypedPr
     });
 
     TypedProgram {
+        language: None,
         declarations: vec![
             typed_node(sink_decl, Type::Primitive(PrimitiveType::Unit), span()),
             typed_node(
@@ -239,6 +240,7 @@ fn sibling_top_level_fns_survive_closure_lowering() {
     });
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![
             typed_node(
                 make_extern_sink(&mut arena),
@@ -413,6 +415,7 @@ fn lambda_as_call_arg_with_capture_survives() {
     });
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![
             typed_node(ext_decl, Type::Primitive(PrimitiveType::Unit), span()),
             typed_node(sink_decl, Type::Primitive(PrimitiveType::Unit), span()),
@@ -540,6 +543,7 @@ fn lambda_body_extern_call_resolves_same_as_outer() {
     });
 
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![
             typed_node(sink_decl, Type::Primitive(PrimitiveType::Unit), span()),
             typed_node(
@@ -702,6 +706,7 @@ fn many_externs_dont_drop_non_extern_render_view() {
     ));
 
     let mut program = TypedProgram {
+        language: None,
         declarations: decls,
         span: span(),
         source_files: vec![],

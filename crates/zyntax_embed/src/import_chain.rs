@@ -342,10 +342,18 @@ fn process_imports_inner(
                 }
             });
 
-            for imported_decl in imported_program.declarations.drain(..) {
-                if !matches!(imported_decl.node, TypedDeclaration::Import(_)) {
-                    program.declarations.push(imported_decl);
+            // Merging loses where a declaration came from unless it is
+            // written down, and where it came from is what decides
+            // which of two functions sharing a name a call meant.
+            let origin = zyntax_typed_ast::InternedString::new_global(&module_name);
+            for mut imported_decl in imported_program.declarations.drain(..) {
+                if matches!(imported_decl.node, TypedDeclaration::Import(_)) {
+                    continue;
                 }
+                if let TypedDeclaration::Function(function) = &mut imported_decl.node {
+                    function.module.get_or_insert(origin);
+                }
+                program.declarations.push(imported_decl);
             }
             log::debug!("Merged declarations from '{}'", module_name);
         } else {

@@ -55,6 +55,7 @@ fn test_extern_function_lowers_to_hir() {
     let span = Span::new(0, 10);
     let type_registry = TypeRegistry::new();
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![TypedNode::new(
             TypedDeclaration::Function(extern_func),
             Type::Primitive(PrimitiveType::I32), // Simplified
@@ -125,6 +126,7 @@ fn test_extern_function_compiles_with_cranelift() {
     let span = Span::new(0, 10);
     let type_registry = TypeRegistry::new();
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![TypedNode::new(
             TypedDeclaration::Function(extern_func),
             Type::Primitive(PrimitiveType::I32),
@@ -203,6 +205,7 @@ fn test_calling_convention_conversion() {
         let span = Span::new(0, 10);
         let type_registry = TypeRegistry::new();
         let mut program = TypedProgram {
+            language: None,
             declarations: vec![TypedNode::new(
                 TypedDeclaration::Function(extern_func),
                 Type::Primitive(PrimitiveType::I32),
@@ -266,6 +269,7 @@ fn test_non_extern_function_without_body_fails() {
 
     let type_registry = TypeRegistry::new();
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![TypedNode::new(
             TypedDeclaration::Function(bad_func),
             Type::Primitive(PrimitiveType::I32),
@@ -308,6 +312,7 @@ fn test_multiple_extern_functions() {
 
     let type_registry = TypeRegistry::new();
     let mut program = TypedProgram {
+        language: None,
         declarations: vec![
             TypedNode::new(
                 TypedDeclaration::Function(func1),

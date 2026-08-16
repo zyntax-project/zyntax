@@ -1319,6 +1319,7 @@ impl<'g> GrammarInterpreter<'g> {
                     is_external,
                     calling_convention: CallingConvention::Default,
                     link_name: None,
+                    module: None,
                 })
             }
             "Variable" => {

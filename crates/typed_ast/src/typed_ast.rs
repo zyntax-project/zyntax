@@ -381,6 +381,13 @@ pub struct TypedFunction {
     #[serde(default)]
     pub calling_convention: CallingConvention, // Calling convention (C, Rust, System, etc.)
     pub link_name: Option<InternedString>, // Override symbol name for linking
+    /// The module this was declared in, when it came from one.
+    ///
+    /// An imported module's declarations are merged into the program
+    /// importing it, which loses where each one came from unless it is
+    /// written down. `None` means the program's own.
+    #[serde(default)]
+    pub module: Option<InternedString>,
 }
 
 /// Function parameter with mutability and advanced features
