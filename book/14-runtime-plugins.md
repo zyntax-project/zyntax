@@ -606,6 +606,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Linking Plugins Into the Host
+
+A host that knows which plugins it needs can link them in and register
+them directly, instead of opening `.zrtl` files at startup. Depend on
+the plugin crates and hand the runtime their `static_plugin()`
+accessors:
+
+```rust
+runtime.register_static_plugins([
+    zrtl_io::static_plugin(),
+    zrtl_fs::static_plugin(),
+])?;
+```
+
+This is the only way to load plugins on wasm32, where there is no
+`dlopen`. On native it removes one `dlopen` per plugin from startup,
+which is worth doing for a CLI that runs one program and exits: opening
+eight plugins costs several milliseconds warm, and considerably more
+when the files are not in the page cache.
+
+Register before installing a grammar. Builtin mappings such as `println`
+to `$IO$println_dynamic` are resolved as the language is installed, and
+the signatures a plugin carries are read while lowering, so they have to
+be present before a program is compiled rather than when it is run.
+
+`register_static_plugin` registers one plugin and rebuilds the JIT
+module. `register_static_plugins` takes a set and rebuilds once for all
+of them, so prefer it when the whole set is known up front.
+
 ### Static Linking (AOT)
 
 For standalone executables, link against static libraries:

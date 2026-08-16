@@ -34,6 +34,18 @@ serde_json = "1.0"
 log = "0.4"
 env_logger = "0.11"
 
+# The plugins ZynML's standard library calls into. Linked in rather
+# than opened at startup: a `dlopen` apiece dominates the cost of a
+# single CLI run, and the signatures they carry are needed while
+# lowering, before any of their code runs.
+zrtl_io = { path = "../../plugins/zrtl_io", optional = true }
+zrtl_fs = { path = "../../plugins/zrtl_fs", optional = true }
+zrtl_text = { path = "../../plugins/zrtl_text", optional = true }
+zrtl_vector = { path = "../../plugins/zrtl_vector", optional = true }
+zrtl_model = { path = "../../plugins/zrtl_model", optional = true }
+zrtl_tensor = { path = "../../plugins/zrtl_tensor", optional = true }
+zrtl_simd = { path = "../../plugins/zrtl_simd", optional = true }
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.16"
@@ -56,7 +68,18 @@ name = "bench_runner"
 path = "benchmarks/bench_runner.rs"
 
 [features]
-default = []
+# Link the standard library's plugins into the binary. Without it they
+# are opened from `plugins_dir` at startup, as before.
+static-plugins = [
+    "dep:zrtl_io",
+    "dep:zrtl_fs",
+    "dep:zrtl_text",
+    "dep:zrtl_vector",
+    "dep:zrtl_model",
+    "dep:zrtl_tensor",
+    "dep:zrtl_simd",
+]
+default = ["static-plugins"]
 llvm-backend = ["zyntax_embed/llvm-backend"]
 all-backends = ["llvm-backend"]
 krio-async-backend = ["zyntax_embed/krio-async-backend"]

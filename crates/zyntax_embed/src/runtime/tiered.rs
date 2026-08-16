@@ -772,6 +772,102 @@ impl TieredRuntime {
         Ok(())
     }
 
+    /// Register several statically-linked plugins, rebuilding the JIT
+    /// module once for all of them rather than once apiece. The rebuild
+    /// is the expensive half, so a host that knows its whole set up
+    /// front pays for one.
+    pub fn register_static_plugins(
+        &mut self,
+        plugins: impl IntoIterator<Item = zrtl::StaticPlugin>,
+    ) -> RuntimeResult<()> {
+        for plugin in plugins {
+            self.register_static_plugin_deferred(plugin)?;
+        }
+        self.backend.rebuild_with_accumulated_symbols()?;
+        Ok(())
+    }
+
+    /// Register a statically-linked plugin's symbols, the counterpart of
+    /// [`Self::load_plugin`] for a plugin that is part of the binary
+    /// rather than a file to open.
+    pub fn register_static_plugin(&mut self, plugin: zrtl::StaticPlugin) -> RuntimeResult<()> {
+        self.register_static_plugin_deferred(plugin)?;
+        self.backend.rebuild_with_accumulated_symbols()?;
+        Ok(())
+    }
+
+    /// Register one plugin's symbols, leaving the JIT rebuild to the
+    /// caller so a batch can share a single one.
+    fn register_static_plugin_deferred(&mut self, plugin: zrtl::StaticPlugin) -> RuntimeResult<()> {
+        use std::ffi::CStr;
+        use zyntax_compiler::zrtl::{
+            RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
+        };
+
+        // Walk the SDK-side `ZrtlSymbol` array and build compiler-side
+        // `RuntimeSymbolInfo` entries. Both sides are `#[repr(C)]` and
+        // layout-compatible by ABI, but we rebuild through the safe
+        // API rather than transmuting so the dependency boundary is
+        // explicit.
+        let mut runtime_symbols: Vec<RuntimeSymbolInfo> = Vec::new();
+        for sym in plugin.symbols {
+            // SAFETY: each `name` field in a `zrtl_plugin!`-generated
+            // table is initialised from a `concat!("...", "\0")` static
+            // literal — null-terminated and valid UTF-8. Skip on
+            // unexpected non-UTF-8 rather than panic.
+            let name: &'static str = unsafe {
+                let cstr = CStr::from_ptr(sym.name);
+                match cstr.to_str() {
+                    // The pointer came from a `'static` literal in the
+                    // plugin crate, so the returned `&str` lives for
+                    // 'static as well.
+                    Ok(s) => &*(s as *const str),
+                    Err(_) => continue,
+                }
+            };
+
+            // SAFETY: `sym.sig` is either null or points at a static
+            // `ZrtlSymbolSig` in the plugin. The SDK and compiler
+            // types are layout-compatible by `#[repr(C)]` design, so
+            // we copy the fields through their `pub` u32 wrappers.
+            let sig = if sym.sig.is_null() {
+                None
+            } else {
+                let s = unsafe { &*sym.sig };
+                let mut params = [TypeTag(0); MAX_PARAMS];
+                for (i, p) in s.params.iter().enumerate().take(MAX_PARAMS) {
+                    params[i] = TypeTag(p.0);
+                }
+                Some(ZrtlSymbolSig {
+                    param_count: s.param_count,
+                    flags: ZrtlSigFlags(s.flags.0),
+                    return_type: TypeTag(s.return_type.0),
+                    params,
+                })
+            };
+
+            runtime_symbols.push(RuntimeSymbolInfo {
+                name,
+                ptr: sym.ptr,
+                sig,
+            });
+        }
+
+        // Mirror the dlopen path: register on the backend, stash
+        // signatures, register signatures with the backend for
+        // auto-boxing, then rebuild the JIT module so compiled code
+        // can resolve the new symbols.
+        for sym in &runtime_symbols {
+            self.backend.register_runtime_symbol(sym.name, sym.ptr);
+            if let Some(sig) = sym.sig {
+                self.plugin_signatures.insert(sym.name.to_string(), sig);
+            }
+        }
+        self.backend.register_symbol_signatures(&runtime_symbols);
+
+        Ok(())
+    }
+
     /// Load all ZRTL plugins from a directory
     ///
     /// Loads all `.zrtl` files from the specified directory.

@@ -1396,8 +1396,32 @@ impl ZyntaxRuntime {
     ///
     /// This is the wasm32 plugin entry point — there is no `dlopen` in
     /// a browser-hosted wasm module, so plugins are linked at build
-    /// time and registered through this method.
+    /// time and registered through this method. Native hosts use it to
+    /// skip `dlopen` too.
     pub fn register_static_plugin(&mut self, plugin: zrtl::StaticPlugin) -> RuntimeResult<()> {
+        self.register_static_plugin_deferred(plugin)?;
+        self.backend.rebuild_with_accumulated_symbols()?;
+        Ok(())
+    }
+
+    /// Register several statically-linked plugins, rebuilding the JIT
+    /// module once for all of them rather than once apiece. The rebuild
+    /// is the expensive half, so a host that knows its whole set up
+    /// front pays for one.
+    pub fn register_static_plugins(
+        &mut self,
+        plugins: impl IntoIterator<Item = zrtl::StaticPlugin>,
+    ) -> RuntimeResult<()> {
+        for plugin in plugins {
+            self.register_static_plugin_deferred(plugin)?;
+        }
+        self.backend.rebuild_with_accumulated_symbols()?;
+        Ok(())
+    }
+
+    /// Register one plugin's symbols, leaving the JIT rebuild to the
+    /// caller so a batch can share a single one.
+    fn register_static_plugin_deferred(&mut self, plugin: zrtl::StaticPlugin) -> RuntimeResult<()> {
         use std::ffi::CStr;
         use zyntax_compiler::zrtl::{
             RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
@@ -1463,7 +1487,6 @@ impl ZyntaxRuntime {
             }
         }
         self.backend.register_symbol_signatures(&runtime_symbols);
-        self.backend.rebuild_with_accumulated_symbols()?;
 
         // Forward to the BC interpreter's FFI table so interp-mode
         // dispatch can reach these symbols as well.

@@ -113,7 +113,6 @@ fn snapshot() -> Result<Arc<zyntax_embed::Snapshot>> {
 /// Required ZRTL plugins for ZynML
 pub const REQUIRED_PLUGINS: &[&str] = &[
     "zrtl_tensor",
-    "zrtl_audio",
     "zrtl_text",
     "zrtl_vector",
     "zrtl_model",
@@ -123,7 +122,7 @@ pub const REQUIRED_PLUGINS: &[&str] = &[
 ];
 
 /// Optional ZRTL plugins that enhance functionality
-pub const OPTIONAL_PLUGINS: &[&str] = &["zrtl_image", "zrtl_json", "zrtl_http"];
+pub const OPTIONAL_PLUGINS: &[&str] = &["zrtl_image", "zrtl_json", "zrtl_http", "zrtl_audio"];
 
 /// Runtime profile used by ZynML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +221,37 @@ impl Default for ZynMLConfig {
     }
 }
 
+/// Register the standard library's plugins from the binary itself.
+///
+/// Returns whether it did. A build without `static-plugins` has nothing
+/// linked in, so the caller opens them from `plugins_dir` instead.
+#[cfg(feature = "static-plugins")]
+fn register_static_plugins(runtime: &mut RuntimeEngine) -> Result<bool> {
+    let plugins = [
+        zrtl_io::static_plugin(),
+        zrtl_fs::static_plugin(),
+        zrtl_text::static_plugin(),
+        zrtl_vector::static_plugin(),
+        zrtl_model::static_plugin(),
+        zrtl_tensor::static_plugin(),
+        zrtl_simd::static_plugin(),
+    ];
+    match runtime {
+        RuntimeEngine::Classic(rt) => rt.register_static_plugins(plugins),
+        RuntimeEngine::Tiered(rt) => rt.register_static_plugins(plugins),
+    }
+    .map_err(|e| ZynMLError::PluginError {
+        plugin: "static".to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(true)
+}
+
+#[cfg(not(feature = "static-plugins"))]
+fn register_static_plugins(_runtime: &mut RuntimeEngine) -> Result<bool> {
+    Ok(false)
+}
+
 enum RuntimeEngine {
     Classic(ZyntaxRuntime),
     Tiered(TieredRuntime),
@@ -275,30 +305,37 @@ impl ZynML {
             ),
         };
 
-        // Load required plugins BEFORE registering grammar
-        // This ensures builtin mappings (e.g., println -> $IO$println_dynamic) can find their targets
-        let plugins_path = Path::new(&config.plugins_dir);
-        for plugin_name in REQUIRED_PLUGINS {
-            let plugin_path = plugins_path.join(format!("{}.zrtl", plugin_name));
-            if plugin_path.exists() {
-                if config.verbose {
-                    log::info!("Loading plugin: {}", plugin_name);
+        // The plugins ZynML's standard library calls into. Linked into
+        // the binary when the build asked for them, and opened from
+        // `plugins_dir` when it did not. They are registered before the
+        // grammar so builtin mappings (`println` to `$IO$println_dynamic`)
+        // have something to point at.
+        if !register_static_plugins(&mut runtime)? {
+            let plugins_path = Path::new(&config.plugins_dir);
+            for plugin_name in REQUIRED_PLUGINS {
+                let plugin_path = plugins_path.join(format!("{}.zrtl", plugin_name));
+                if plugin_path.exists() {
+                    if config.verbose {
+                        log::info!("Loading plugin: {}", plugin_name);
+                    }
+                    match &mut runtime {
+                        RuntimeEngine::Classic(rt) => rt.load_plugin(&plugin_path),
+                        RuntimeEngine::Tiered(rt) => rt.load_plugin(&plugin_path),
+                    }
+                    .map_err(|e| ZynMLError::PluginError {
+                        plugin: plugin_name.to_string(),
+                        reason: e.to_string(),
+                    })?;
+                } else if config.verbose {
+                    log::warn!("Required plugin not found: {}", plugin_path.display());
                 }
-                match &mut runtime {
-                    RuntimeEngine::Classic(rt) => rt.load_plugin(&plugin_path),
-                    RuntimeEngine::Tiered(rt) => rt.load_plugin(&plugin_path),
-                }
-                .map_err(|e| ZynMLError::PluginError {
-                    plugin: plugin_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-            } else if config.verbose {
-                log::warn!("Required plugin not found: {}", plugin_path.display());
             }
         }
 
-        // Load optional plugins if requested
+        // Optional plugins are never linked in, since a build cannot
+        // know which of them a program wants.
         if config.load_optional {
+            let plugins_path = Path::new(&config.plugins_dir);
             for plugin_name in OPTIONAL_PLUGINS {
                 let plugin_path = plugins_path.join(format!("{}.zrtl", plugin_name));
                 if plugin_path.exists() {
@@ -1010,6 +1047,54 @@ mod tests {
             result.is_ok(),
             "Should parse vector search example: {:?}",
             result.err()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "static-plugins"))]
+mod static_plugin_tests {
+    use super::*;
+
+    /// The linked-in set and `REQUIRED_PLUGINS` name the same plugins.
+    ///
+    /// A build with `static-plugins` never reads `REQUIRED_PLUGINS`, so
+    /// adding a plugin to one list and not the other leaves the static
+    /// build quietly missing it while the dynamic build works.
+    #[test]
+    fn linked_plugins_match_the_required_list() {
+        let linked = [
+            zrtl_io::static_plugin(),
+            zrtl_fs::static_plugin(),
+            zrtl_text::static_plugin(),
+            zrtl_vector::static_plugin(),
+            zrtl_model::static_plugin(),
+            zrtl_tensor::static_plugin(),
+            zrtl_simd::static_plugin(),
+        ];
+        let mut linked_names: Vec<String> = linked
+            .iter()
+            .map(|p| {
+                // SAFETY: `zrtl_plugin!` builds the name from a
+                // `concat!(..., "\0")` literal, so it is a valid
+                // null-terminated string for the life of the program.
+                let name = unsafe { std::ffi::CStr::from_ptr(p.info.name) }.to_string_lossy();
+                // Plugins declare their own name and do not agree on
+                // whether it carries the `zrtl_` prefix, so compare on
+                // the part that identifies the plugin.
+                name.trim_start_matches("zrtl_").to_string()
+            })
+            .collect();
+        linked_names.sort();
+
+        let mut required: Vec<String> = REQUIRED_PLUGINS
+            .iter()
+            .map(|n| n.trim_start_matches("zrtl_").to_string())
+            .collect();
+        required.sort();
+
+        assert_eq!(
+            linked_names, required,
+            "the statically linked plugins and REQUIRED_PLUGINS have drifted apart"
         );
     }
 }
