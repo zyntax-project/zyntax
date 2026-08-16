@@ -23,8 +23,7 @@ use zrtl::zrtl_plugin;
 
 // Import SIMD functions for optimized operations
 use zrtl_simd_kernels::{
-    vec_fill_f32, vec_sum_f32, vec_max_f32, vec_min_f32,
-    vec_argmax_with_val_f32,
+    vec_argmax_with_val_f32, vec_fill_f32, vec_max_f32, vec_min_f32, vec_sum_f32,
 };
 
 // ============================================================================
@@ -256,11 +255,7 @@ pub const TENSOR_NULL: TensorPtr = std::ptr::null_mut();
 
 /// Create a new tensor with uninitialized data
 #[no_mangle]
-pub extern "C" fn tensor_new(
-    shape_ptr: *const usize,
-    ndim: u32,
-    dtype: u8,
-) -> TensorPtr {
+pub extern "C" fn tensor_new(shape_ptr: *const usize, ndim: u32, dtype: u8) -> TensorPtr {
     if shape_ptr.is_null() || ndim == 0 || ndim as usize > MAX_DIMS {
         return TENSOR_NULL;
     }
@@ -320,22 +315,14 @@ pub extern "C" fn tensor_new(
 
 /// Create a tensor filled with zeros
 #[no_mangle]
-pub extern "C" fn tensor_zeros(
-    shape_ptr: *const usize,
-    ndim: u32,
-    dtype: u8,
-) -> TensorPtr {
+pub extern "C" fn tensor_zeros(shape_ptr: *const usize, ndim: u32, dtype: u8) -> TensorPtr {
     // tensor_new already uses alloc_zeroed
     tensor_new(shape_ptr, ndim, dtype)
 }
 
 /// Create a tensor filled with ones
 #[no_mangle]
-pub extern "C" fn tensor_ones(
-    shape_ptr: *const usize,
-    ndim: u32,
-    dtype: u8,
-) -> TensorPtr {
+pub extern "C" fn tensor_ones(shape_ptr: *const usize, ndim: u32, dtype: u8) -> TensorPtr {
     let tensor = tensor_new(shape_ptr, ndim, dtype);
     if tensor.is_null() {
         return TENSOR_NULL;
@@ -394,19 +381,13 @@ pub extern "C" fn tensor_ones(
 
 /// Create a tensor filled with zeros (f32 dtype, no dtype parameter needed)
 #[no_mangle]
-pub extern "C" fn tensor_zeros_f32(
-    shape_ptr: *const usize,
-    ndim: u32,
-) -> TensorPtr {
+pub extern "C" fn tensor_zeros_f32(shape_ptr: *const usize, ndim: u32) -> TensorPtr {
     tensor_zeros(shape_ptr, ndim, DType::F32 as u8)
 }
 
 /// Create a tensor filled with ones (f32 dtype, no dtype parameter needed)
 #[no_mangle]
-pub extern "C" fn tensor_ones_f32(
-    shape_ptr: *const usize,
-    ndim: u32,
-) -> TensorPtr {
+pub extern "C" fn tensor_ones_f32(shape_ptr: *const usize, ndim: u32) -> TensorPtr {
     tensor_ones(shape_ptr, ndim, DType::F32 as u8)
 }
 
@@ -454,11 +435,7 @@ pub extern "C" fn tensor_ones_3d(d0: i64, d1: i64, d2: i64) -> TensorPtr {
 
 /// Create a tensor filled with a scalar value
 #[no_mangle]
-pub extern "C" fn tensor_full_f32(
-    shape_ptr: *const usize,
-    ndim: u32,
-    value: f32,
-) -> TensorPtr {
+pub extern "C" fn tensor_full_f32(shape_ptr: *const usize, ndim: u32, value: f32) -> TensorPtr {
     let tensor = tensor_new(shape_ptr, ndim, DType::F32 as u8);
     if tensor.is_null() {
         return TENSOR_NULL;
@@ -627,29 +604,19 @@ pub extern "C" fn tensor_eye(n: i64) -> TensorPtr {
 
 /// Create a tensor with random values from uniform distribution [0, 1) (auto-seeded)
 #[no_mangle]
-pub extern "C" fn tensor_rand_f32_auto(
-    shape_ptr: *const usize,
-    ndim: u32,
-) -> TensorPtr {
+pub extern "C" fn tensor_rand_f32_auto(shape_ptr: *const usize, ndim: u32) -> TensorPtr {
     tensor_rand_f32(shape_ptr, ndim, 0)
 }
 
 /// Create a tensor with random values from standard normal distribution (auto-seeded)
 #[no_mangle]
-pub extern "C" fn tensor_randn_f32_auto(
-    shape_ptr: *const usize,
-    ndim: u32,
-) -> TensorPtr {
+pub extern "C" fn tensor_randn_f32_auto(shape_ptr: *const usize, ndim: u32) -> TensorPtr {
     tensor_randn_f32(shape_ptr, ndim, 0)
 }
 
 /// Create a tensor with random values from uniform distribution [0, 1)
 #[no_mangle]
-pub extern "C" fn tensor_rand_f32(
-    shape_ptr: *const usize,
-    ndim: u32,
-    seed: u64,
-) -> TensorPtr {
+pub extern "C" fn tensor_rand_f32(shape_ptr: *const usize, ndim: u32, seed: u64) -> TensorPtr {
     let tensor = tensor_new(shape_ptr, ndim, DType::F32 as u8);
     if tensor.is_null() {
         return TENSOR_NULL;
@@ -678,11 +645,7 @@ pub extern "C" fn tensor_rand_f32(
 
 /// Create a tensor with random values from standard normal distribution
 #[no_mangle]
-pub extern "C" fn tensor_randn_f32(
-    shape_ptr: *const usize,
-    ndim: u32,
-    seed: u64,
-) -> TensorPtr {
+pub extern "C" fn tensor_randn_f32(shape_ptr: *const usize, ndim: u32, seed: u64) -> TensorPtr {
     let tensor = tensor_new(shape_ptr, ndim, DType::F32 as u8);
     if tensor.is_null() {
         return TENSOR_NULL;
@@ -1497,12 +1460,7 @@ pub extern "C" fn tensor_argmax_f32(tensor: TensorPtr) -> usize {
 
 /// Slice tensor along dimension
 #[no_mangle]
-pub extern "C" fn tensor_slice(
-    tensor: TensorPtr,
-    dim: u32,
-    start: usize,
-    end: usize,
-) -> TensorPtr {
+pub extern "C" fn tensor_slice(tensor: TensorPtr, dim: u32, start: usize, end: usize) -> TensorPtr {
     if tensor.is_null() {
         return TENSOR_NULL;
     }
@@ -2079,7 +2037,11 @@ unsafe fn binary_cmp_f32(a: TensorPtr, b: TensorPtr, cmp: impl Fn(f32, f32) -> b
         let ra = tr.data as *mut f32;
         let rb = tb.data as *const f32;
         for i in 0..numel {
-            *ra.add(i) = if cmp(*ra.add(i), *rb.add(i)) { 1.0 } else { 0.0 };
+            *ra.add(i) = if cmp(*ra.add(i), *rb.add(i)) {
+                1.0
+            } else {
+                0.0
+            };
         }
     }
     result
@@ -2261,16 +2223,18 @@ pub extern "C" fn tensor_ge(a: TensorPtr, b: TensorPtr) -> TensorPtr {
 
 #[no_mangle]
 pub extern "C" fn tensor_sum_axis(tensor: TensorPtr, axis: u32) -> TensorPtr {
-    unsafe {
-        axis_reduce_f32(tensor, axis, |vals| vals.iter().sum())
-    }
+    unsafe { axis_reduce_f32(tensor, axis, |vals| vals.iter().sum()) }
 }
 
 #[no_mangle]
 pub extern "C" fn tensor_mean_axis(tensor: TensorPtr, axis: u32) -> TensorPtr {
     unsafe {
         axis_reduce_f32(tensor, axis, |vals| {
-            if vals.is_empty() { 0.0 } else { vals.iter().sum::<f32>() / vals.len() as f32 }
+            if vals.is_empty() {
+                0.0
+            } else {
+                vals.iter().sum::<f32>() / vals.len() as f32
+            }
         })
     }
 }
@@ -2386,7 +2350,11 @@ pub extern "C" fn tensor_softmax(tensor: TensorPtr, axis: i64) -> TensorPtr {
     unsafe {
         let t = &*tensor;
         let ndim = t.ndim as usize;
-        let actual_axis = if axis < 0 { (ndim as i64 + axis) as usize } else { axis as usize };
+        let actual_axis = if axis < 0 {
+            (ndim as i64 + axis) as usize
+        } else {
+            axis as usize
+        };
         if actual_axis >= ndim {
             return TENSOR_NULL;
         }

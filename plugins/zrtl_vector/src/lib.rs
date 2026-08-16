@@ -30,8 +30,8 @@ use zrtl::zrtl_plugin;
 
 // Import SIMD functions for high-performance vector operations
 use zrtl_simd_kernels::{
-    vec_dot_product_f32, vec_euclidean_f32, vec_euclidean_sq_f32,
-    vec_manhattan_f32, vec_cosine_similarity_f32, vec_l2_normalize_f32,
+    vec_cosine_similarity_f32, vec_dot_product_f32, vec_euclidean_f32, vec_euclidean_sq_f32,
+    vec_l2_normalize_f32, vec_manhattan_f32,
 };
 
 // ============================================================================
@@ -41,11 +41,7 @@ use zrtl_simd_kernels::{
 /// Compute cosine similarity between two vectors using SIMD
 /// Returns value in [-1, 1], where 1 means identical direction
 #[no_mangle]
-pub extern "C" fn vector_cosine_similarity(
-    a: *const f32,
-    b: *const f32,
-    len: usize,
-) -> f32 {
+pub extern "C" fn vector_cosine_similarity(a: *const f32, b: *const f32, len: usize) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
     }
@@ -56,11 +52,7 @@ pub extern "C" fn vector_cosine_similarity(
 
 /// Compute dot product between two vectors using SIMD
 #[no_mangle]
-pub extern "C" fn vector_dot_product(
-    a: *const f32,
-    b: *const f32,
-    len: usize,
-) -> f32 {
+pub extern "C" fn vector_dot_product(a: *const f32, b: *const f32, len: usize) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
     }
@@ -71,11 +63,7 @@ pub extern "C" fn vector_dot_product(
 
 /// Compute Euclidean distance between two vectors using SIMD
 #[no_mangle]
-pub extern "C" fn vector_euclidean_distance(
-    a: *const f32,
-    b: *const f32,
-    len: usize,
-) -> f32 {
+pub extern "C" fn vector_euclidean_distance(a: *const f32, b: *const f32, len: usize) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
     }
@@ -86,11 +74,7 @@ pub extern "C" fn vector_euclidean_distance(
 
 /// Compute squared Euclidean distance (faster, avoids sqrt) using SIMD
 #[no_mangle]
-pub extern "C" fn vector_euclidean_distance_sq(
-    a: *const f32,
-    b: *const f32,
-    len: usize,
-) -> f32 {
+pub extern "C" fn vector_euclidean_distance_sq(a: *const f32, b: *const f32, len: usize) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
     }
@@ -101,11 +85,7 @@ pub extern "C" fn vector_euclidean_distance_sq(
 
 /// Compute Manhattan (L1) distance between two vectors using SIMD
 #[no_mangle]
-pub extern "C" fn vector_manhattan_distance(
-    a: *const f32,
-    b: *const f32,
-    len: usize,
-) -> f32 {
+pub extern "C" fn vector_manhattan_distance(a: *const f32, b: *const f32, len: usize) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
     }
@@ -189,11 +169,7 @@ pub extern "C" fn vector_l2_normalize(data: *mut f32, len: usize) {
 
 /// L2 normalize batch of vectors in place
 #[no_mangle]
-pub extern "C" fn vector_l2_normalize_batch(
-    data: *mut f32,
-    n_vectors: usize,
-    dim: usize,
-) {
+pub extern "C" fn vector_l2_normalize_batch(data: *mut f32, n_vectors: usize, dim: usize) {
     if data.is_null() || n_vectors == 0 || dim == 0 {
         return;
     }
@@ -260,11 +236,7 @@ pub extern "C" fn vector_mean_pooling(
 
 /// CLS token pooling (take first token embedding)
 #[no_mangle]
-pub extern "C" fn vector_cls_pooling(
-    token_embeddings: *const f32,
-    out: *mut f32,
-    dim: usize,
-) {
+pub extern "C" fn vector_cls_pooling(token_embeddings: *const f32, out: *mut f32, dim: usize) {
     if token_embeddings.is_null() || out.is_null() || dim == 0 {
         return;
     }
@@ -298,7 +270,13 @@ pub extern "C" fn vector_topk_cosine(
     dim: usize,
     k: usize,
 ) -> usize {
-    if query.is_null() || vectors.is_null() || results.is_null() || n_vectors == 0 || dim == 0 || k == 0 {
+    if query.is_null()
+        || vectors.is_null()
+        || results.is_null()
+        || n_vectors == 0
+        || dim == 0
+        || k == 0
+    {
         return 0;
     }
 
@@ -340,7 +318,10 @@ pub extern "C" fn vector_topk_cosine(
         impl Ord for HeapItem {
             fn cmp(&self, other: &Self) -> Ordering {
                 // Reverse ordering for min-heap behavior (we want to keep highest scores)
-                other.score.partial_cmp(&self.score).unwrap_or(Ordering::Equal)
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(Ordering::Equal)
             }
         }
 
@@ -407,7 +388,13 @@ pub extern "C" fn vector_topk_dot(
     dim: usize,
     k: usize,
 ) -> usize {
-    if query.is_null() || vectors.is_null() || results.is_null() || n_vectors == 0 || dim == 0 || k == 0 {
+    if query.is_null()
+        || vectors.is_null()
+        || results.is_null()
+        || n_vectors == 0
+        || dim == 0
+        || k == 0
+    {
         return 0;
     }
 
@@ -435,7 +422,10 @@ pub extern "C" fn vector_topk_dot(
 
         impl Ord for HeapItem {
             fn cmp(&self, other: &Self) -> Ordering {
-                other.score.partial_cmp(&self.score).unwrap_or(Ordering::Equal)
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(Ordering::Equal)
             }
         }
 
@@ -489,7 +479,13 @@ pub extern "C" fn vector_topk_euclidean(
     dim: usize,
     k: usize,
 ) -> usize {
-    if query.is_null() || vectors.is_null() || results.is_null() || n_vectors == 0 || dim == 0 || k == 0 {
+    if query.is_null()
+        || vectors.is_null()
+        || results.is_null()
+        || n_vectors == 0
+        || dim == 0
+        || k == 0
+    {
         return 0;
     }
 
@@ -518,7 +514,9 @@ pub extern "C" fn vector_topk_euclidean(
         impl Ord for HeapItem {
             fn cmp(&self, other: &Self) -> Ordering {
                 // Max-heap behavior (we want to keep smallest distances)
-                self.distance.partial_cmp(&other.distance).unwrap_or(Ordering::Equal)
+                self.distance
+                    .partial_cmp(&other.distance)
+                    .unwrap_or(Ordering::Equal)
             }
         }
 
@@ -550,7 +548,11 @@ pub extern "C" fn vector_topk_euclidean(
         }
 
         let mut result_vec: Vec<HeapItem> = heap.into_iter().collect();
-        result_vec.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        result_vec.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
 
         for (i, item) in result_vec.iter().enumerate() {
             *results.add(i) = SearchResult {
@@ -724,10 +726,10 @@ impl HNSWLayer {
 /// HNSW index for approximate nearest neighbor search
 struct HNSWIndex {
     dim: usize,
-    m: usize,        // Number of connections per layer
-    m_max: usize,    // Max connections at layer 0
+    m: usize,     // Number of connections per layer
+    m_max: usize, // Max connections at layer 0
     ef_construction: usize,
-    ml: f64,         // Level multiplier (1/ln(M))
+    ml: f64, // Level multiplier (1/ln(M))
 
     vectors: HashMap<u64, Vec<f32>>,
     layers: Vec<HNSWLayer>,
@@ -905,7 +907,10 @@ impl HNSWIndex {
         visited.insert(entry);
 
         while let Some(std::cmp::Reverse((FloatOrd(c_dist), c_id))) = candidates.pop() {
-            let worst_dist = results.peek().map(|(FloatOrd(d), _)| *d).unwrap_or(f32::MAX);
+            let worst_dist = results
+                .peek()
+                .map(|(FloatOrd(d), _)| *d)
+                .unwrap_or(f32::MAX);
             if c_dist > worst_dist && results.len() >= ef {
                 break;
             }
@@ -917,7 +922,10 @@ impl HNSWIndex {
                 visited.insert(neighbor);
 
                 let n_dist = self.distance(query_id, neighbor);
-                let worst_dist = results.peek().map(|(FloatOrd(d), _)| *d).unwrap_or(f32::MAX);
+                let worst_dist = results
+                    .peek()
+                    .map(|(FloatOrd(d), _)| *d)
+                    .unwrap_or(f32::MAX);
 
                 if n_dist < worst_dist || results.len() < ef {
                     candidates.push(std::cmp::Reverse((FloatOrd(n_dist), neighbor)));
@@ -929,7 +937,10 @@ impl HNSWIndex {
             }
         }
 
-        let mut result_vec: Vec<(u64, f32)> = results.into_iter().map(|(FloatOrd(d), id)| (id, d)).collect();
+        let mut result_vec: Vec<(u64, f32)> = results
+            .into_iter()
+            .map(|(FloatOrd(d), id)| (id, d))
+            .collect();
         result_vec.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         result_vec
     }
@@ -973,7 +984,10 @@ impl HNSWIndex {
         visited.insert(curr_obj);
 
         while let Some(std::cmp::Reverse((FloatOrd(c_dist), c_id))) = candidates.pop() {
-            let worst_dist = results.peek().map(|(FloatOrd(d), _)| *d).unwrap_or(f32::MAX);
+            let worst_dist = results
+                .peek()
+                .map(|(FloatOrd(d), _)| *d)
+                .unwrap_or(f32::MAX);
             if c_dist > worst_dist && results.len() >= ef_search {
                 break;
             }
@@ -985,7 +999,10 @@ impl HNSWIndex {
                 visited.insert(neighbor);
 
                 let n_dist = self.distance_to_query(neighbor, query);
-                let worst_dist = results.peek().map(|(FloatOrd(d), _)| *d).unwrap_or(f32::MAX);
+                let worst_dist = results
+                    .peek()
+                    .map(|(FloatOrd(d), _)| *d)
+                    .unwrap_or(f32::MAX);
 
                 if n_dist < worst_dist || results.len() < ef_search {
                     candidates.push(std::cmp::Reverse((FloatOrd(n_dist), neighbor)));
@@ -997,7 +1014,10 @@ impl HNSWIndex {
             }
         }
 
-        let mut result_vec: Vec<(u64, f32)> = results.into_iter().map(|(FloatOrd(d), id)| (id, d)).collect();
+        let mut result_vec: Vec<(u64, f32)> = results
+            .into_iter()
+            .map(|(FloatOrd(d), id)| (id, d))
+            .collect();
         result_vec.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         result_vec.truncate(k);
 
@@ -1029,11 +1049,7 @@ pub const HNSW_INDEX_NULL: HNSWIndexPtr = std::ptr::null_mut();
 
 /// Create a new HNSW index
 #[no_mangle]
-pub extern "C" fn hnsw_create(
-    dim: usize,
-    m: usize,
-    ef_construction: usize,
-) -> HNSWIndexPtr {
+pub extern "C" fn hnsw_create(dim: usize, m: usize, ef_construction: usize) -> HNSWIndexPtr {
     if dim == 0 || m == 0 {
         return HNSW_INDEX_NULL;
     }

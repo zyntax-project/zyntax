@@ -32,8 +32,8 @@
 //! - `$SIMD$horizontal_sum` - Sum with SIMD horizontal add
 //! - `$SIMD$count_nonzero` - Count non-zero elements
 
-use zrtl::zrtl_plugin;
 use wide::*;
+use zrtl::zrtl_plugin;
 
 pub use zrtl_simd_kernels::*;
 
@@ -83,9 +83,6 @@ pub extern "C" fn simd_capability() -> u32 {
 // Vector Operations (f32)
 // ============================================================================
 
-
-
-
 /// Element-wise addition: out[i] = a[i] + b[i]
 #[no_mangle]
 pub extern "C" fn vec_add_f32(a: *const f32, b: *const f32, out: *mut f32, len: u64) {
@@ -102,12 +99,24 @@ pub extern "C" fn vec_add_f32(a: *const f32, b: *const f32, out: *mut f32, len: 
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let result = va + vb;
             let arr = result.to_array();
@@ -139,12 +148,24 @@ pub extern "C" fn vec_mul_f32(a: *const f32, b: *const f32, out: *mut f32, len: 
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let result = va * vb;
             let arr = result.to_array();
@@ -159,8 +180,6 @@ pub extern "C" fn vec_mul_f32(a: *const f32, b: *const f32, out: *mut f32, len: 
         }
     }
 }
-
-
 
 /// Absolute value: out[i] = |data[i]|
 #[no_mangle]
@@ -178,8 +197,14 @@ pub extern "C" fn vec_abs_f32(data: *mut f32, len: u64) {
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1), *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5), *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             let result = v.abs();
             let arr = result.to_array();
@@ -211,8 +236,14 @@ pub extern "C" fn vec_sqrt_f32(data: *mut f32, len: u64) {
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1), *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5), *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             let result = v.sqrt();
             let arr = result.to_array();
@@ -472,15 +503,27 @@ pub extern "C" fn vec_sum_i32(data: *const i32, len: u64) -> i64 {
         for i in 0..chunks {
             let offset = i * 8;
             let v = i32x8::new([
-                *data.add(offset), *data.add(offset + 1), *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5), *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             sum += v;
         }
 
         let arr = sum.to_array();
-        let mut result: i64 = arr[0] as i64 + arr[1] as i64 + arr[2] as i64 + arr[3] as i64
-            + arr[4] as i64 + arr[5] as i64 + arr[6] as i64 + arr[7] as i64;
+        let mut result: i64 = arr[0] as i64
+            + arr[1] as i64
+            + arr[2] as i64
+            + arr[3] as i64
+            + arr[4] as i64
+            + arr[5] as i64
+            + arr[6] as i64
+            + arr[7] as i64;
 
         let base = chunks * 8;
         for i in 0..remainder {
@@ -520,9 +563,14 @@ pub extern "C" fn vec_count_nonzero_i32(data: *const i32, len: u64) -> u64 {
 /// A is MxK, B is KxN, C is MxN (row-major order)
 #[no_mangle]
 pub extern "C" fn gemm_f32(
-    a: *const f32, b: *const f32, c: *mut f32,
-    m: u64, n: u64, k: u64,
-    alpha: f32, beta: f32
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: u64,
+    n: u64,
+    k: u64,
+    alpha: f32,
+    beta: f32,
 ) {
     if a.is_null() || b.is_null() || c.is_null() {
         return;
@@ -600,10 +648,14 @@ pub extern "C" fn relu_f32(data: *mut f32, len: u64) {
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1),
-                *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5),
-                *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             let result = v.max(zero);
             let arr = result.to_array();
@@ -716,7 +768,7 @@ pub extern "C" fn layer_norm_f32(
     beta: *const f32,
     batch_size: u64,
     hidden_size: u64,
-    eps: f32
+    eps: f32,
 ) {
     if data.is_null() {
         return;
@@ -775,7 +827,7 @@ pub extern "C" fn batch_norm_f32(
     batch_size: u64,
     channels: u64,
     spatial_size: u64,
-    eps: f32
+    eps: f32,
 ) {
     if data.is_null() || running_mean.is_null() || running_var.is_null() {
         return;
@@ -817,7 +869,7 @@ pub extern "C" fn conv2d_f32(
     height: u64,
     width: u64,
     kernel_h: u64,
-    kernel_w: u64
+    kernel_w: u64,
 ) {
     if input.is_null() || kernel.is_null() || output.is_null() {
         return;
@@ -844,23 +896,16 @@ pub extern "C" fn conv2d_f32(
                         for ic in 0..in_c {
                             for khi in 0..kh {
                                 for kwi in 0..kw {
-                                    let in_idx = b * in_c * h * w
-                                        + ic * h * w
-                                        + (oh + khi) * w
-                                        + (ow + kwi);
-                                    let k_idx = oc * in_c * kh * kw
-                                        + ic * kh * kw
-                                        + khi * kw
-                                        + kwi;
+                                    let in_idx =
+                                        b * in_c * h * w + ic * h * w + (oh + khi) * w + (ow + kwi);
+                                    let k_idx = oc * in_c * kh * kw + ic * kh * kw + khi * kw + kwi;
                                     sum += *input.add(in_idx) * *kernel.add(k_idx);
                                 }
                             }
                         }
 
-                        let out_idx = b * out_c * out_h * out_w
-                            + oc * out_h * out_w
-                            + oh * out_w
-                            + ow;
+                        let out_idx =
+                            b * out_c * out_h * out_w + oc * out_h * out_w + oh * out_w + ow;
                         *output.add(out_idx) = sum;
                     }
                 }
@@ -879,7 +924,7 @@ pub extern "C" fn max_pool2d_f32(
     height: u64,
     width: u64,
     pool_h: u64,
-    pool_w: u64
+    pool_w: u64,
 ) {
     if input.is_null() || output.is_null() {
         return;
@@ -915,10 +960,7 @@ pub extern "C" fn max_pool2d_f32(
                             }
                         }
 
-                        let out_idx = b * c * out_h * out_w
-                            + ch * out_h * out_w
-                            + oh * out_w
-                            + ow;
+                        let out_idx = b * c * out_h * out_w + ch * out_h * out_w + oh * out_w + ow;
                         *output.add(out_idx) = max_val;
                     }
                 }
@@ -937,7 +979,7 @@ pub extern "C" fn avg_pool2d_f32(
     height: u64,
     width: u64,
     pool_h: u64,
-    pool_w: u64
+    pool_w: u64,
 ) {
     if input.is_null() || output.is_null() {
         return;
@@ -971,10 +1013,7 @@ pub extern "C" fn avg_pool2d_f32(
                             }
                         }
 
-                        let out_idx = b * c * out_h * out_w
-                            + ch * out_h * out_w
-                            + oh * out_w
-                            + ow;
+                        let out_idx = b * c * out_h * out_w + ch * out_h * out_w + oh * out_w + ow;
                         *output.add(out_idx) = sum / pool_size;
                     }
                 }
@@ -993,11 +1032,7 @@ pub extern "C" fn dropout_f32(_data: *mut f32, _len: u64, _p: f32) {
 /// Cross-entropy loss (after softmax)
 /// Returns -sum(target * log(pred))
 #[no_mangle]
-pub extern "C" fn cross_entropy_loss_f32(
-    pred: *const f32,
-    target: *const f32,
-    len: u64
-) -> f32 {
+pub extern "C" fn cross_entropy_loss_f32(pred: *const f32, target: *const f32, len: u64) -> f32 {
     if pred.is_null() || target.is_null() || len == 0 {
         return 0.0;
     }
@@ -1057,10 +1092,14 @@ pub extern "C" fn clip_f32(data: *mut f32, len: u64, min_val: f32, max_val: f32)
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1),
-                *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5),
-                *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             let result = v.max(min_vec).min(max_vec);
             let arr = result.to_array();
@@ -1079,12 +1118,7 @@ pub extern "C" fn clip_f32(data: *mut f32, len: u64, min_val: f32, max_val: f32)
 
 /// Transpose 2D matrix: out[j,i] = in[i,j]
 #[no_mangle]
-pub extern "C" fn transpose_2d_f32(
-    input: *const f32,
-    output: *mut f32,
-    rows: u64,
-    cols: u64
-) {
+pub extern "C" fn transpose_2d_f32(input: *const f32, output: *mut f32, rows: u64, cols: u64) {
     if input.is_null() || output.is_null() {
         return;
     }
@@ -1137,7 +1171,6 @@ pub extern "C" fn log_f32(data: *mut f32, len: u64) {
 // Additional Vector Operations for ML Plugins
 // ============================================================================
 
-
 /// Element-wise subtraction: out[i] = a[i] - b[i]
 #[no_mangle]
 pub extern "C" fn vec_sub_f32(a: *const f32, b: *const f32, out: *mut f32, len: u64) {
@@ -1154,12 +1187,24 @@ pub extern "C" fn vec_sub_f32(a: *const f32, b: *const f32, out: *mut f32, len: 
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let result = va - vb;
             let arr = result.to_array();
@@ -1174,9 +1219,6 @@ pub extern "C" fn vec_sub_f32(a: *const f32, b: *const f32, out: *mut f32, len: 
         }
     }
 }
-
-
-
 
 /// Sum of absolute values: sum(|data[i]|)
 #[no_mangle]
@@ -1196,8 +1238,14 @@ pub extern "C" fn vec_abs_sum_f32(data: *const f32, len: u64) -> f32 {
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1), *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5), *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             sum += v.abs();
         }
@@ -1216,7 +1264,13 @@ pub extern "C" fn vec_abs_sum_f32(data: *const f32, len: u64) -> f32 {
 
 /// Fused multiply-add: out[i] = a[i] * b[i] + c[i]
 #[no_mangle]
-pub extern "C" fn vec_fma_f32(a: *const f32, b: *const f32, c: *const f32, out: *mut f32, len: u64) {
+pub extern "C" fn vec_fma_f32(
+    a: *const f32,
+    b: *const f32,
+    c: *const f32,
+    out: *mut f32,
+    len: u64,
+) {
     if a.is_null() || b.is_null() || c.is_null() || out.is_null() || len == 0 {
         return;
     }
@@ -1230,16 +1284,34 @@ pub extern "C" fn vec_fma_f32(a: *const f32, b: *const f32, c: *const f32, out: 
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let vc = f32x8::new([
-                *c.add(offset), *c.add(offset + 1), *c.add(offset + 2), *c.add(offset + 3),
-                *c.add(offset + 4), *c.add(offset + 5), *c.add(offset + 6), *c.add(offset + 7),
+                *c.add(offset),
+                *c.add(offset + 1),
+                *c.add(offset + 2),
+                *c.add(offset + 3),
+                *c.add(offset + 4),
+                *c.add(offset + 5),
+                *c.add(offset + 6),
+                *c.add(offset + 7),
             ]);
             let result = va * vb + vc;
             let arr = result.to_array();
@@ -1257,7 +1329,13 @@ pub extern "C" fn vec_fma_f32(a: *const f32, b: *const f32, c: *const f32, out: 
 
 /// Scalar fused multiply-add: out[i] = a[i] * scalar + b[i]
 #[no_mangle]
-pub extern "C" fn vec_fma_scalar_f32(a: *const f32, scalar: f32, b: *const f32, out: *mut f32, len: u64) {
+pub extern "C" fn vec_fma_scalar_f32(
+    a: *const f32,
+    scalar: f32,
+    b: *const f32,
+    out: *mut f32,
+    len: u64,
+) {
     if a.is_null() || b.is_null() || out.is_null() || len == 0 {
         return;
     }
@@ -1272,12 +1350,24 @@ pub extern "C" fn vec_fma_scalar_f32(a: *const f32, scalar: f32, b: *const f32, 
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let result = va * scalar_vec + vb;
             let arr = result.to_array();
@@ -1293,18 +1383,24 @@ pub extern "C" fn vec_fma_scalar_f32(a: *const f32, scalar: f32, b: *const f32, 
     }
 }
 
-
-
-
 /// Find min value and its index
 #[no_mangle]
-pub extern "C" fn vec_argmin_with_val_f32(data: *const f32, len: u64, out_idx: *mut u64, out_val: *mut f32) {
+pub extern "C" fn vec_argmin_with_val_f32(
+    data: *const f32,
+    len: u64,
+    out_idx: *mut u64,
+    out_val: *mut f32,
+) {
     if data.is_null() || len == 0 {
         if !out_idx.is_null() {
-            unsafe { *out_idx = 0; }
+            unsafe {
+                *out_idx = 0;
+            }
         }
         if !out_val.is_null() {
-            unsafe { *out_val = f32::INFINITY; }
+            unsafe {
+                *out_val = f32::INFINITY;
+            }
         }
         return;
     }
@@ -1479,10 +1575,7 @@ mod tests {
     fn test_mat4_mul_identity() {
         // Identity matrix
         let identity: [f32; 16] = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let mut result = [0.0f32; 16];
 
@@ -1583,9 +1676,14 @@ mod tests {
         let mut c: Vec<f32> = vec![0.0; 4];
 
         gemm_f32(
-            a.as_ptr(), identity.as_ptr(), c.as_mut_ptr(),
-            2, 2, 2, // m, n, k
-            1.0, 0.0 // alpha, beta
+            a.as_ptr(),
+            identity.as_ptr(),
+            c.as_mut_ptr(),
+            2,
+            2,
+            2, // m, n, k
+            1.0,
+            0.0, // alpha, beta
         );
 
         assert!((c[0] - 1.0).abs() < 0.0001);

@@ -301,7 +301,8 @@ pub extern "C" fn model_free(handle: ModelHandle) {
 #[no_mangle]
 pub extern "C" fn model_format(handle: ModelHandle) -> u8 {
     get_model(handle, |m| {
-        m.map(|m| m.format as u8).unwrap_or(ModelFormat::Unknown as u8)
+        m.map(|m| m.format as u8)
+            .unwrap_or(ModelFormat::Unknown as u8)
     })
 }
 
@@ -420,11 +421,7 @@ pub extern "C" fn model_tensor_data(
 
 /// Check if model contains a tensor with given name
 #[no_mangle]
-pub extern "C" fn model_has_tensor(
-    handle: ModelHandle,
-    name: *const u8,
-    name_len: usize,
-) -> bool {
+pub extern "C" fn model_has_tensor(handle: ModelHandle, name: *const u8, name_len: usize) -> bool {
     if name.is_null() || name_len == 0 {
         return false;
     }
@@ -528,9 +525,7 @@ pub extern "C" fn model_copy_tensor_f32(
 
         match view.dtype() {
             safetensors::Dtype::F32 => {
-                let src = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const f32, numel)
-                };
+                let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, numel) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(src.as_ptr(), output, n);
                 }
@@ -554,9 +549,7 @@ pub extern "C" fn model_copy_tensor_f32(
                 }
             }
             safetensors::Dtype::F64 => {
-                let src = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const f64, numel)
-                };
+                let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, numel) };
                 for i in 0..n {
                     unsafe {
                         *output.add(i) = src[i] as f32;

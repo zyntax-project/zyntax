@@ -34,11 +34,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use zrtl::{
-    zrtl_plugin,
-    StringConstPtr, StringPtr,
-    ArrayPtr,
-    string_length, string_data, string_new,
-    array_new, array_push, array_length, array_data,
+    array_data, array_length, array_new, array_push, string_data, string_length, string_new,
+    zrtl_plugin, ArrayPtr, StringConstPtr, StringPtr,
 };
 
 // ============================================================================
@@ -208,12 +205,10 @@ pub unsafe extern "C" fn fs_append_file(path: StringConstPtr, contents: StringCo
     };
 
     match OpenOptions::new().append(true).create(true).open(path_str) {
-        Ok(mut file) => {
-            match file.write_all(bytes) {
-                Ok(()) => 0,
-                Err(_) => -1,
-            }
-        }
+        Ok(mut file) => match file.write_all(bytes) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
         Err(_) => -1,
     }
 }
@@ -231,7 +226,13 @@ pub unsafe extern "C" fn fs_append_file(path: StringConstPtr, contents: StringCo
 #[no_mangle]
 pub unsafe extern "C" fn fs_exists(path: StringConstPtr) -> i32 {
     match zrtl_string_to_str(path) {
-        Some(s) => if Path::new(s).exists() { 1 } else { 0 },
+        Some(s) => {
+            if Path::new(s).exists() {
+                1
+            } else {
+                0
+            }
+        }
         None => 0,
     }
 }
@@ -245,7 +246,13 @@ pub unsafe extern "C" fn fs_exists(path: StringConstPtr) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn fs_is_file(path: StringConstPtr) -> i32 {
     match zrtl_string_to_str(path) {
-        Some(s) => if Path::new(s).is_file() { 1 } else { 0 },
+        Some(s) => {
+            if Path::new(s).is_file() {
+                1
+            } else {
+                0
+            }
+        }
         None => 0,
     }
 }
@@ -259,7 +266,13 @@ pub unsafe extern "C" fn fs_is_file(path: StringConstPtr) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn fs_is_dir(path: StringConstPtr) -> i32 {
     match zrtl_string_to_str(path) {
-        Some(s) => if Path::new(s).is_dir() { 1 } else { 0 },
+        Some(s) => {
+            if Path::new(s).is_dir() {
+                1
+            } else {
+                0
+            }
+        }
         None => 0,
     }
 }
@@ -292,7 +305,13 @@ pub unsafe extern "C" fn fs_file_size(path: StringConstPtr) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn fs_is_symlink(path: StringConstPtr) -> i32 {
     match zrtl_string_to_str(path) {
-        Some(s) => if Path::new(s).is_symlink() { 1 } else { 0 },
+        Some(s) => {
+            if Path::new(s).is_symlink() {
+                1
+            } else {
+                0
+            }
+        }
         None => 0,
     }
 }
@@ -453,12 +472,10 @@ pub unsafe extern "C" fn fs_copy(from: StringConstPtr, to: StringConstPtr) -> i6
 #[no_mangle]
 pub extern "C" fn fs_current_dir() -> StringPtr {
     match std::env::current_dir() {
-        Ok(path) => {
-            match path.to_str() {
-                Some(s) => string_new(s),
-                None => std::ptr::null_mut(),
-            }
-        }
+        Ok(path) => match path.to_str() {
+            Some(s) => string_new(s),
+            None => std::ptr::null_mut(),
+        },
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -497,12 +514,10 @@ pub unsafe extern "C" fn fs_canonicalize(path: StringConstPtr) -> StringPtr {
     };
 
     match fs::canonicalize(path_str) {
-        Ok(abs_path) => {
-            match abs_path.to_str() {
-                Some(s) => string_new(s),
-                None => std::ptr::null_mut(),
-            }
-        }
+        Ok(abs_path) => match abs_path.to_str() {
+            Some(s) => string_new(s),
+            None => std::ptr::null_mut(),
+        },
         Err(_) => std::ptr::null_mut(),
     }
 }

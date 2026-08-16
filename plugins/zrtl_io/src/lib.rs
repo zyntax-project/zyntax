@@ -27,9 +27,7 @@
 
 use std::io::{self, BufRead, Write};
 use zrtl::{
-    zrtl_plugin,
-    StringConstPtr, StringPtr,
-    string_length, string_data, string_new, string_free,
+    string_data, string_free, string_length, string_new, zrtl_plugin, StringConstPtr, StringPtr,
 };
 
 // ============================================================================
@@ -44,7 +42,6 @@ extern "C" fn drop_zrtl_string(ptr: *mut u8) {
     }
     unsafe { string_free(ptr as StringPtr) }
 }
-
 
 // ============================================================================
 // String I/O Functions (using ZRTL string format)
@@ -415,35 +412,83 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
             }
         }
 
-        TypeCategory::Int => {
-            match value.size {
-                1 => { if let Some(v) = value.as_ref::<i8>() { let _ = write!(output, "{}", v); } }
-                2 => { if let Some(v) = value.as_ref::<i16>() { let _ = write!(output, "{}", v); } }
-                4 => { if let Some(v) = value.as_ref::<i32>() { let _ = write!(output, "{}", v); } }
-                8 => { if let Some(v) = value.as_ref::<i64>() { let _ = write!(output, "{}", v); } }
-                16 => { if let Some(v) = value.as_ref::<i128>() { let _ = write!(output, "{}", v); } }
-                _ => { let _ = write!(output, "<int{}>", value.size * 8); }
+        TypeCategory::Int => match value.size {
+            1 => {
+                if let Some(v) = value.as_ref::<i8>() {
+                    let _ = write!(output, "{}", v);
+                }
             }
-        }
+            2 => {
+                if let Some(v) = value.as_ref::<i16>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            4 => {
+                if let Some(v) = value.as_ref::<i32>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            8 => {
+                if let Some(v) = value.as_ref::<i64>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            16 => {
+                if let Some(v) = value.as_ref::<i128>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            _ => {
+                let _ = write!(output, "<int{}>", value.size * 8);
+            }
+        },
 
-        TypeCategory::UInt => {
-            match value.size {
-                1 => { if let Some(v) = value.as_ref::<u8>() { let _ = write!(output, "{}", v); } }
-                2 => { if let Some(v) = value.as_ref::<u16>() { let _ = write!(output, "{}", v); } }
-                4 => { if let Some(v) = value.as_ref::<u32>() { let _ = write!(output, "{}", v); } }
-                8 => { if let Some(v) = value.as_ref::<u64>() { let _ = write!(output, "{}", v); } }
-                16 => { if let Some(v) = value.as_ref::<u128>() { let _ = write!(output, "{}", v); } }
-                _ => { let _ = write!(output, "<uint{}>", value.size * 8); }
+        TypeCategory::UInt => match value.size {
+            1 => {
+                if let Some(v) = value.as_ref::<u8>() {
+                    let _ = write!(output, "{}", v);
+                }
             }
-        }
+            2 => {
+                if let Some(v) = value.as_ref::<u16>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            4 => {
+                if let Some(v) = value.as_ref::<u32>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            8 => {
+                if let Some(v) = value.as_ref::<u64>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            16 => {
+                if let Some(v) = value.as_ref::<u128>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            _ => {
+                let _ = write!(output, "<uint{}>", value.size * 8);
+            }
+        },
 
-        TypeCategory::Float => {
-            match value.size {
-                4 => { if let Some(v) = value.as_ref::<f32>() { let _ = write!(output, "{}", v); } }
-                8 => { if let Some(v) = value.as_ref::<f64>() { let _ = write!(output, "{}", v); } }
-                _ => { let _ = write!(output, "<float{}>", value.size * 8); }
+        TypeCategory::Float => match value.size {
+            4 => {
+                if let Some(v) = value.as_ref::<f32>() {
+                    let _ = write!(output, "{}", v);
+                }
             }
-        }
+            8 => {
+                if let Some(v) = value.as_ref::<f64>() {
+                    let _ = write!(output, "{}", v);
+                }
+            }
+            _ => {
+                let _ = write!(output, "<float{}>", value.size * 8);
+            }
+        },
 
         TypeCategory::String => {
             // ZRTL string format: [i32 length][utf8 bytes]
@@ -499,7 +544,9 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
 
             let display_len = len.min(10);
             for i in 0..display_len {
-                if i > 0 { output.push_str(", "); }
+                if i > 0 {
+                    output.push_str(", ");
+                }
 
                 match elem_size {
                     4 => {
@@ -562,7 +609,9 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
             }
             let display_count = num_elements.min(10);
             for i in 0..display_count {
-                if i > 0 { output.push_str(", "); }
+                if i > 0 {
+                    output.push_str(", ");
+                }
                 let elem = &*elements.add(i);
                 format_dynamic_box(elem, output);
             }
@@ -766,10 +815,14 @@ pub unsafe extern "C" fn io_print_array_f32(arr: zrtl::ArrayConstPtr) {
 
     print!("[");
     for i in 0..len.min(10) {
-        if i > 0 { print!(", "); }
+        if i > 0 {
+            print!(", ");
+        }
         print!("{}", *data.add(i));
     }
-    if len > 10 { print!(", ... ({} more)", len - 10); }
+    if len > 10 {
+        print!(", ... ({} more)", len - 10);
+    }
     print!("]");
 }
 
@@ -786,10 +839,14 @@ pub unsafe extern "C" fn io_print_array_i32(arr: zrtl::ArrayConstPtr) {
 
     print!("[");
     for i in 0..len.min(10) {
-        if i > 0 { print!(", "); }
+        if i > 0 {
+            print!(", ");
+        }
         print!("{}", *data.add(i));
     }
-    if len > 10 { print!(", ... ({} more)", len - 10); }
+    if len > 10 {
+        print!(", ... ({} more)", len - 10);
+    }
     print!("]");
 }
 
@@ -806,10 +863,14 @@ pub unsafe extern "C" fn io_print_array_i64(arr: zrtl::ArrayConstPtr) {
 
     print!("[");
     for i in 0..len.min(10) {
-        if i > 0 { print!(", "); }
+        if i > 0 {
+            print!(", ");
+        }
         print!("{}", *data.add(i));
     }
-    if len > 10 { print!(", ... ({} more)", len - 10); }
+    if len > 10 {
+        print!(", ... ({} more)", len - 10);
+    }
     print!("]");
 }
 
@@ -826,10 +887,14 @@ pub unsafe extern "C" fn io_print_array_f64(arr: zrtl::ArrayConstPtr) {
 
     print!("[");
     for i in 0..len.min(10) {
-        if i > 0 { print!(", "); }
+        if i > 0 {
+            print!(", ");
+        }
         print!("{}", *data.add(i));
     }
-    if len > 10 { print!(", ... ({} more)", len - 10); }
+    if len > 10 {
+        print!(", ... ({} more)", len - 10);
+    }
     print!("]");
 }
 
@@ -926,8 +991,11 @@ pub unsafe extern "C" fn io_string_concat(a: StringConstPtr, b: StringConstPtr) 
 /// Concatenate two values (DynamicBox) and return a DynamicBox containing the resulting string
 /// Used by f-string desugaring so the result works with println_dynamic
 #[no_mangle]
-pub unsafe extern "C" fn io_concat_dynamic(a: *const zrtl::DynamicBox, b: *const zrtl::DynamicBox) -> *mut zrtl::DynamicBox {
-    use zrtl::{DynamicBox, TypeTag, TypeCategory};
+pub unsafe extern "C" fn io_concat_dynamic(
+    a: *const zrtl::DynamicBox,
+    b: *const zrtl::DynamicBox,
+) -> *mut zrtl::DynamicBox {
+    use zrtl::{DynamicBox, TypeCategory, TypeTag};
 
     let mut result = String::new();
 
@@ -1061,7 +1129,7 @@ zrtl_plugin! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zrtl::{TypeCategory, TypeFlags, TypeTag, string_as_str};
+    use zrtl::{string_as_str, TypeCategory, TypeFlags, TypeTag};
 
     #[test]
     fn test_format_i64() {
@@ -1200,7 +1268,10 @@ mod tests {
             let boxed_ptr = io_string_to_dynamic(std::ptr::null());
             assert!(!boxed_ptr.is_null());
             let boxed = &*boxed_ptr;
-            assert!(boxed.data.is_null(), "null input should produce null DynamicBox");
+            assert!(
+                boxed.data.is_null(),
+                "null input should produce null DynamicBox"
+            );
             let _ = Box::from_raw(boxed_ptr);
         }
     }
@@ -1220,7 +1291,10 @@ mod tests {
 
             let result_box = &*result;
             assert_eq!(result_box.tag.category(), TypeCategory::String);
-            assert!(result_box.dropper.is_some(), "concat result should have a string dropper");
+            assert!(
+                result_box.dropper.is_some(),
+                "concat result should have a string dropper"
+            );
 
             // Verify content
             let str_ptr = result_box.data as StringConstPtr;
@@ -1234,10 +1308,14 @@ mod tests {
 
             // Clean up inputs
             let b1 = &*box1;
-            if let Some(dropper) = b1.dropper { dropper(b1.data); }
+            if let Some(dropper) = b1.dropper {
+                dropper(b1.data);
+            }
             let _ = Box::from_raw(box1);
             let b2 = &*box2;
-            if let Some(dropper) = b2.dropper { dropper(b2.data); }
+            if let Some(dropper) = b2.dropper {
+                dropper(b2.data);
+            }
             let _ = Box::from_raw(box2);
 
             string_free(s1);

@@ -165,15 +165,27 @@ pub extern "C" fn vec_min_f32(data: *const f32, len: u64) -> f32 {
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1), *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5), *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             min_vec = min_vec.min(v);
         }
 
         let arr = min_vec.to_array();
-        let mut result = arr[0].min(arr[1]).min(arr[2]).min(arr[3])
-            .min(arr[4]).min(arr[5]).min(arr[6]).min(arr[7]);
+        let mut result = arr[0]
+            .min(arr[1])
+            .min(arr[2])
+            .min(arr[3])
+            .min(arr[4])
+            .min(arr[5])
+            .min(arr[6])
+            .min(arr[7]);
 
         let base = chunks * 8;
         for i in 0..remainder {
@@ -202,15 +214,27 @@ pub extern "C" fn vec_max_f32(data: *const f32, len: u64) -> f32 {
         for i in 0..chunks {
             let offset = i * 8;
             let v = f32x8::new([
-                *data.add(offset), *data.add(offset + 1), *data.add(offset + 2), *data.add(offset + 3),
-                *data.add(offset + 4), *data.add(offset + 5), *data.add(offset + 6), *data.add(offset + 7),
+                *data.add(offset),
+                *data.add(offset + 1),
+                *data.add(offset + 2),
+                *data.add(offset + 3),
+                *data.add(offset + 4),
+                *data.add(offset + 5),
+                *data.add(offset + 6),
+                *data.add(offset + 7),
             ]);
             max_vec = max_vec.max(v);
         }
 
         let arr = max_vec.to_array();
-        let mut result = arr[0].max(arr[1]).max(arr[2]).max(arr[3])
-            .max(arr[4]).max(arr[5]).max(arr[6]).max(arr[7]);
+        let mut result = arr[0]
+            .max(arr[1])
+            .max(arr[2])
+            .max(arr[3])
+            .max(arr[4])
+            .max(arr[5])
+            .max(arr[6])
+            .max(arr[7]);
 
         let base = chunks * 8;
         for i in 0..remainder {
@@ -268,12 +292,24 @@ pub extern "C" fn vec_euclidean_f32(a: *const f32, b: *const f32, len: u64) -> f
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let diff = va - vb;
             sum += diff * diff;
@@ -310,12 +346,24 @@ pub extern "C" fn vec_euclidean_sq_f32(a: *const f32, b: *const f32, len: u64) -
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let diff = va - vb;
             sum += diff * diff;
@@ -352,12 +400,24 @@ pub extern "C" fn vec_manhattan_f32(a: *const f32, b: *const f32, len: u64) -> f
         for i in 0..chunks {
             let offset = i * 8;
             let va = f32x8::new([
-                *a.add(offset), *a.add(offset + 1), *a.add(offset + 2), *a.add(offset + 3),
-                *a.add(offset + 4), *a.add(offset + 5), *a.add(offset + 6), *a.add(offset + 7),
+                *a.add(offset),
+                *a.add(offset + 1),
+                *a.add(offset + 2),
+                *a.add(offset + 3),
+                *a.add(offset + 4),
+                *a.add(offset + 5),
+                *a.add(offset + 6),
+                *a.add(offset + 7),
             ]);
             let vb = f32x8::new([
-                *b.add(offset), *b.add(offset + 1), *b.add(offset + 2), *b.add(offset + 3),
-                *b.add(offset + 4), *b.add(offset + 5), *b.add(offset + 6), *b.add(offset + 7),
+                *b.add(offset),
+                *b.add(offset + 1),
+                *b.add(offset + 2),
+                *b.add(offset + 3),
+                *b.add(offset + 4),
+                *b.add(offset + 5),
+                *b.add(offset + 6),
+                *b.add(offset + 7),
             ]);
             let diff = va - vb;
             sum += diff.abs();
@@ -411,13 +471,22 @@ pub extern "C" fn vec_l2_normalize_f32(data: *mut f32, len: u64) {
 
 /// Find max value and its index
 #[no_mangle]
-pub extern "C" fn vec_argmax_with_val_f32(data: *const f32, len: u64, out_idx: *mut u64, out_val: *mut f32) {
+pub extern "C" fn vec_argmax_with_val_f32(
+    data: *const f32,
+    len: u64,
+    out_idx: *mut u64,
+    out_val: *mut f32,
+) {
     if data.is_null() || len == 0 {
         if !out_idx.is_null() {
-            unsafe { *out_idx = 0; }
+            unsafe {
+                *out_idx = 0;
+            }
         }
         if !out_val.is_null() {
-            unsafe { *out_val = f32::NEG_INFINITY; }
+            unsafe {
+                *out_val = f32::NEG_INFINITY;
+            }
         }
         return;
     }

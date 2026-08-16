@@ -98,13 +98,7 @@ impl BPETokenizer {
         // Convert tokens to IDs
         tokens
             .iter()
-            .map(|t| {
-                self.vocab
-                    .get(t)
-                    .copied()
-                    .or(self.unk_token)
-                    .unwrap_or(0)
-            })
+            .map(|t| self.vocab.get(t).copied().or(self.unk_token).unwrap_or(0))
             .collect()
     }
 
@@ -257,10 +251,26 @@ pub extern "C" fn tokenizer_set_special_tokens(
     let mut store = TOKENIZER_STORE.lock().unwrap();
     if let Some(ref mut map) = *store {
         if let Some(tokenizer) = map.get_mut(&handle) {
-            tokenizer.pad_token = if pad_token >= 0 { Some(pad_token as u32) } else { None };
-            tokenizer.eos_token = if eos_token >= 0 { Some(eos_token as u32) } else { None };
-            tokenizer.bos_token = if bos_token >= 0 { Some(bos_token as u32) } else { None };
-            tokenizer.unk_token = if unk_token >= 0 { Some(unk_token as u32) } else { None };
+            tokenizer.pad_token = if pad_token >= 0 {
+                Some(pad_token as u32)
+            } else {
+                None
+            };
+            tokenizer.eos_token = if eos_token >= 0 {
+                Some(eos_token as u32)
+            } else {
+                None
+            };
+            tokenizer.bos_token = if bos_token >= 0 {
+                Some(bos_token as u32)
+            } else {
+                None
+            };
+            tokenizer.unk_token = if unk_token >= 0 {
+                Some(unk_token as u32)
+            } else {
+                None
+            };
         }
     }
 }
@@ -385,9 +395,7 @@ pub extern "C" fn tokenizer_decode(
         return 0;
     }
 
-    let ids: Vec<u32> = unsafe {
-        std::slice::from_raw_parts(input, input_len).to_vec()
-    };
+    let ids: Vec<u32> = unsafe { std::slice::from_raw_parts(input, input_len).to_vec() };
 
     get_tokenizer(handle, |t| {
         if let Some(tokenizer) = t {
@@ -487,10 +495,7 @@ pub extern "C" fn text_clean_whitespace(
         }
     };
 
-    let cleaned: String = input_str
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let cleaned: String = input_str.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let bytes = cleaned.as_bytes();
     let n = bytes.len().min(output_capacity);
