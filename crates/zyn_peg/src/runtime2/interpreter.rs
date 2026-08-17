@@ -293,10 +293,16 @@ impl<'g> GrammarInterpreter<'g> {
         state.clear_bindings();
 
         // Execute pattern
+        // `@` and `$` both stop whitespace being skipped between this
+        // rule's elements; only `@` goes on to replace its value with
+        // the matched text.
         let result = self.execute_pattern(
             &rule.pattern,
             state,
-            rule.modifier == Some(RuleModifier::Atomic),
+            matches!(
+                rule.modifier,
+                Some(RuleModifier::Atomic) | Some(RuleModifier::Compound)
+            ),
         );
         trace!(
             "execute_rule: {} at pos {} -> {:?}",

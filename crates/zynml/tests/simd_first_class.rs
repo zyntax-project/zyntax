@@ -71,6 +71,37 @@ fn f32x4_dot_product() {
     assert_eq!(result.as_float(), Some(70.0), "got {:?}", result);
 }
 
+/// A whole vector out to memory and back, on `f32` lanes.
+///
+/// The typed heap and `vload`/`vstore` only named `i8x16` and `i32x4`,
+/// which is every lane width except the one a tensor is made of. A
+/// kernel written in ZynML over `f32` buffers needs this pair, so it is
+/// worth a test that the round trip keeps the values.
+#[test]
+fn f32x4_round_trips_through_a_buffer() {
+    let rt = compile_and_install(
+        r#"
+        extern def alloc_f32(n: i64): Ptr<f32>
+        extern def free<T>(p: Ptr<T>)
+        extern def vload_f32x4(p: Ptr<f32>): f32x4
+        extern def vstore_f32x4(p: Ptr<f32>, v: f32x4)
+
+        def round_trip(): f32 {
+            let buf: Ptr<f32> = alloc_f32(4)
+            vstore_f32x4(buf, f32x4::new(1.5, 2.5, 3.5, 4.5))
+            let back: f32x4 = vload_f32x4(buf)
+            free(buf)
+            return back.sum()
+        }
+        "#,
+    );
+
+    let result = rt
+        .call_function_raw("round_trip", vec![])
+        .expect("call should succeed");
+    assert_eq!(result.as_float(), Some(12.0), "got {:?}", result);
+}
+
 /// Broadcast a scalar across all lanes, then read one lane back.
 #[test]
 fn f32x4_splat_then_lane() {

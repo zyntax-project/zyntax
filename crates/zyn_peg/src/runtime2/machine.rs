@@ -203,7 +203,13 @@ pub fn compile(grammar: &GrammarIR, memo_ids: &HashMap<String, usize>) -> Progra
 
     let mut bodies: Vec<Option<Vec<Instr>>> = Vec::with_capacity(rule_index.len());
     for (_, rule) in &rule_index {
-        let atomic = rule.modifier == Some(RuleModifier::Atomic);
+        // Both modifiers stop whitespace being skipped between the
+        // elements of this rule. They part company over the value: see
+        // `RuleSlot::atomic`.
+        let atomic = matches!(
+            rule.modifier,
+            Some(RuleModifier::Atomic) | Some(RuleModifier::Compound)
+        );
         let mut out = Vec::new();
         let mut ctx = Ctx {
             index_of: &program.index_of,
@@ -235,6 +241,10 @@ pub fn compile(grammar: &GrammarIR, memo_ids: &HashMap<String, usize>) -> Progra
         program.rules.push(RuleSlot {
             entry,
             memo_id: memo_ids.get(*name).copied().unwrap_or(usize::MAX),
+            // Only `@` replaces the rule's value with the text it
+            // matched. `$` keeps the structured value, which is what
+            // lets a rule hold its parts together and still refuse to
+            // skip whitespace between them.
             atomic: rule.modifier == Some(RuleModifier::Atomic),
             name: (*name).clone(),
         });

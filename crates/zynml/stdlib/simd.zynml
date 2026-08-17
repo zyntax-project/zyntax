@@ -33,5 +33,7 @@ extern def free<T>(p: Ptr<T>)
 // pointer between iterations to sweep a buffer.
 extern def vload_i8x16(p: Ptr<i8>): i8x16
 extern def vload_i32x4(p: Ptr<i32>): i32x4
+extern def vload_f32x4(p: Ptr<f32>): f32x4
 extern def vstore_i8x16(p: Ptr<i8>, v: i8x16)
 extern def vstore_i32x4(p: Ptr<i32>, v: i32x4)
+extern def vstore_f32x4(p: Ptr<f32>, v: f32x4)

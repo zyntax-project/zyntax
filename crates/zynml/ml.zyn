@@ -3182,18 +3182,18 @@ duration_unit = { "ms" | "s" | "m" | "h" | "d" }
 f_string_literal = { f_string_triple | f_string_regular }
 
 // f"""multiline {expr} string"""
-f_string_triple = { "f\"\"\"" ~ parts:f_string_part* ~ "\"\"\"" }
+f_string_triple = ${ "f\"\"\"" ~ parts:f_string_part* ~ "\"\"\"" }
   -> fold_concat(parts)
 
 // f"single line {expr} string"
-f_string_regular = { "f\"" ~ parts:f_string_part* ~ "\"" }
+f_string_regular = ${ "f\"" ~ parts:f_string_part* ~ "\"" }
   -> fold_concat(parts)
 
 // Parts of an f-string: either text or interpolated expression
 f_string_part = { f_string_interp | f_string_text }
 
 // {expr} or {expr:format_spec} - wrap in __fstring_format__ call (internal, doesn't conflict with traits)
-f_string_interp = { "{" ~ e:expr ~ format_spec? ~ "}" }
+f_string_interp = !{ "{" ~ e:expr ~ format_spec? ~ "}" }
   -> TypedExpression::Call {
       callee: TypedExpression::Variable { name: intern("__fstring_format__") },
       args: [e],
