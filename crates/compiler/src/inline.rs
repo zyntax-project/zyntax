@@ -1153,6 +1153,45 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
                 .first()
                 .cloned()
                 .unwrap_or(crate::hir::HirType::I64);
+
+            // A return value is not obliged to already have the width
+            // the signature declares: `def f(): i64 { return 1 }` hands
+            // back an i32 literal, and a lone `Return` gets widened
+            // where the call's result type is applied. Reaching the
+            // join through a phi is the one path with no such step, so
+            // a value narrower than the phi lands as a branch argument
+            // whose type contradicts the block parameter. Widen in the
+            // returning block, which is where the value already is.
+            for (value, block) in return_incoming.iter_mut() {
+                let actual = match caller.values.get(value) {
+                    Some(v) => v.ty.clone(),
+                    None => continue,
+                };
+                let Some(op) = numeric_cast_op(&actual, &ret_ty) else {
+                    continue;
+                };
+                let widened = HirId::new();
+                caller.values.insert(
+                    widened,
+                    HirValue {
+                        id: widened,
+                        ty: ret_ty.clone(),
+                        kind: HirValueKind::Instruction,
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
+                if let Some(blk) = caller.blocks.get_mut(block) {
+                    blk.instructions.push(HirInstruction::Cast {
+                        op,
+                        result: widened,
+                        ty: ret_ty.clone(),
+                        operand: *value,
+                    });
+                    *value = widened;
+                }
+            }
+
             caller.values.insert(
                 phi_result,
                 HirValue {
@@ -2055,5 +2094,60 @@ mod tests {
         let stats = run_module_recursive(&mut module);
         assert_eq!(stats.skipped_too_large, 1, "{stats:?}");
         assert_eq!(stats.self_calls_inlined, 0);
+    }
+}
+
+/// The cast that carries a scalar of type `from` into type `to`, when
+/// one is both needed and expressible.
+///
+/// `None` where the two already agree, or where the pair is not a plain
+/// numeric widening or narrowing. Anything it declines is left alone
+/// rather than guessed at.
+fn numeric_cast_op(from: &HirType, to: &HirType) -> Option<crate::hir::CastOp> {
+    use crate::hir::CastOp;
+
+    if from == to {
+        return None;
+    }
+    // (bits, signed) for the integer types a return value can hold.
+    let int_of = |t: &HirType| -> Option<(u32, bool)> {
+        Some(match t {
+            HirType::I8 => (8, true),
+            HirType::I16 => (16, true),
+            HirType::I32 => (32, true),
+            HirType::I64 => (64, true),
+            HirType::I128 => (128, true),
+            HirType::U8 => (8, false),
+            HirType::U16 => (16, false),
+            HirType::U32 => (32, false),
+            HirType::U64 => (64, false),
+            HirType::U128 => (128, false),
+            _ => return None,
+        })
+    };
+    let float_bits = |t: &HirType| -> Option<u32> {
+        Some(match t {
+            HirType::F32 => 32,
+            HirType::F64 => 64,
+            _ => return None,
+        })
+    };
+
+    match (int_of(from), int_of(to)) {
+        (Some((fb, _)), Some((tb, signed))) => {
+            return Some(match fb.cmp(&tb) {
+                std::cmp::Ordering::Greater => CastOp::Trunc,
+                std::cmp::Ordering::Less if signed => CastOp::SExt,
+                std::cmp::Ordering::Less => CastOp::ZExt,
+                // Same width, different signedness: no bits move.
+                std::cmp::Ordering::Equal => return None,
+            });
+        }
+        _ => {}
+    }
+    match (float_bits(from), float_bits(to)) {
+        (Some(fb), Some(tb)) if fb > tb => Some(CastOp::FpTrunc),
+        (Some(fb), Some(tb)) if fb < tb => Some(CastOp::FpExt),
+        _ => None,
     }
 }

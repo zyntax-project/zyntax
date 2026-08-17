@@ -5591,8 +5591,30 @@ impl CraneliftBackend {
                                         .iter()
                                         .find(|(_, pred_block)| *pred_block == *hir_block_id)
                                     {
-                                        if let Some(cranelift_val) = self.value_map.get(value) {
-                                            args_vec.push(*cranelift_val);
+                                        if let Some(&cranelift_val) = self.value_map.get(value) {
+                                            // A block parameter has the
+                                            // phi's declared type, and
+                                            // an incoming value is not
+                                            // obliged to already carry
+                                            // it: an `i64` counter
+                                            // starting at a literal `0`
+                                            // arrives as an i32. The
+                                            // return path coerces for
+                                            // the same reason; a branch
+                                            // argument that disagrees
+                                            // with its parameter is
+                                            // rejected by the verifier.
+                                            let want =
+                                                type_cache.get(&phi.ty).copied().unwrap_or_else(
+                                                    || builder.func.dfg.value_type(cranelift_val),
+                                                );
+                                            let actual = builder.func.dfg.value_type(cranelift_val);
+                                            args_vec.push(Self::coerce_value(
+                                                &mut builder,
+                                                cranelift_val,
+                                                actual,
+                                                want,
+                                            ));
                                         }
                                         // Note: Values should now all be in value_map after pure IDF fix
                                     }

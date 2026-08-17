@@ -1,21 +1,14 @@
 //! Operator syntax for a tensor written in ZynML.
 //!
 //! `tensor_add(a, b)` is a kernel; `a + b` is a tensor library. The
-//! operators want to be ordinary trait impls whose bodies are the same
-//! SIMD loops the free functions in `tensor_in_zynml.rs` already run, so
-//! the arithmetic stays inline HIR while the surface reads the way a
+//! operators are ordinary trait impls whose bodies are the same SIMD
+//! loops the free functions in `tensor_in_zynml.rs` run, so the
+//! arithmetic stays inline HIR while the surface reads the way a
 //! numerical API should.
 //!
-//! It does not work yet, and the reason is narrower than it looks. A
-//! SIMD loop is fine in a free function: every case in
-//! `tensor_in_zynml.rs` sweeps a buffer with `vload_f32x4` and
-//! `vstore_f32x4` and passes on both the interpreter and the JIT. Move
-//! the identical loop inside an `impl` and it breaks, whether the method
-//! is an operator or inherent, while an `impl` method with a loop-free
-//! body is fine. So it is the combination of a method body and a vector
-//! loop, not the operator machinery and not the pointer field.
-//!
-//! Ignored because they fail. Remove the attributes with the fix.
+//! These go through the ZynML front door rather than `ZyntaxRuntime`
+//! directly, because that is the path supplying entry names, and
+//! lowering seeds what it emits from those.
 
 use std::path::Path;
 use zynml::{ZynML, ZynMLConfig};
@@ -81,12 +74,7 @@ fn run(kernel: &str) -> f64 {
 }
 
 /// A reduction written as a method rather than a free function.
-///
-/// The loop is the one `tensor_sum` runs today. Inside an `impl` the
-/// enclosing function never reaches the module, and the call reports
-/// `main` as missing.
 #[test]
-#[ignore = "a vector loop inside an impl method stops the caller lowering"]
 fn a_method_can_reduce_a_buffer() {
     assert_eq!(
         run(r#"
@@ -100,11 +88,7 @@ fn a_method_can_reduce_a_buffer() {
 }
 
 /// `a + b` dispatching to a ZynML `Add` impl: (1.5 + 3.0) * 8 = 36.
-///
-/// Same loop again, this time in an operator. Segfaults rather than
-/// failing to lower, so the two are not one symptom.
 #[test]
-#[ignore = "a vector loop inside an operator impl segfaults"]
 fn addition_reads_as_addition() {
     assert_eq!(
         run(r#"
