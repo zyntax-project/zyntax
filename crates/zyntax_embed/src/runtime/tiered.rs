@@ -80,6 +80,9 @@ pub struct TieredRuntime {
     /// platform where that actually unmaps the image every registered
     /// pointer is left dangling.
     loaded_plugins: Vec<zyntax_compiler::zrtl::ZrtlPlugin>,
+    /// Whether to run the interp-safe HIR optimisations before a module
+    /// reaches a backend. See `ZyntaxRuntime::set_run_interp_opts`.
+    run_interp_opts: bool,
     /// Import resolver callbacks. Same role as `ZyntaxRuntime.import_resolvers`
     /// — consulted during `lower_typed_program` to pull in stdlib source
     /// (`prelude`, `tensor`, …) and any user-supplied module sources.
@@ -403,6 +406,7 @@ impl TieredRuntime {
             extension_map: HashMap::new(),
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
+            run_interp_opts: true,
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
@@ -496,7 +500,7 @@ impl TieredRuntime {
         // `run_interp_safe_opts` entry was the only place these fired,
         // leaving production code unoptimised. (Skippable via
         // `ZYNTAX_DISABLE_INTERP_OPTS=1`.)
-        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+        if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut module);
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&module, "post-opt-tiered-compile_module");
@@ -877,6 +881,12 @@ impl TieredRuntime {
             .collect()
     }
 
+    /// Whether to run the interp-safe HIR optimisations before a module
+    /// reaches a backend. On unless a caller says otherwise.
+    pub fn set_run_interp_opts(&mut self, run: bool) {
+        self.run_interp_opts = run;
+    }
+
     /// Load all ZRTL plugins from a directory
     ///
     /// Loads all `.zrtl` files from the specified directory.
@@ -1168,7 +1178,7 @@ impl TieredRuntime {
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
-        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+        if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&hir_module, "post-opt-typed-program");
@@ -2137,7 +2147,7 @@ impl TieredRuntime {
         // on load; diffing an optimized function against an unoptimized
         // lowering of identical source would report every function
         // changed.
-        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+        if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
         }
 

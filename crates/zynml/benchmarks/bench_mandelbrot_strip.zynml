@@ -1,0 +1,55 @@
+import prelude
+
+// The same recurrence as `bench_mandelbrot` over a five-row strip, so
+// the bytecode interpreter can finish it. Its reason to exist is
+// agreement: every tier has to produce one number, because a tier can
+// change under a running loop and a result that depends on which tier
+// evaluated it would change with it.
+
+def palette_sum(iteration: i64, max_iter: i64): i64 {
+    let fraction: f64 = (iteration as f64) / (max_iter as f64)
+    let r: i64 = (fraction * 255.0) as i64
+    let g: i64 = ((1.0 - fraction) * 255.0) as i64
+    let b: i64 = ((0.5 - abs(fraction - 0.5)) * 2.0 * 255.0) as i64
+    return r + g + b
+}
+
+def main(): i64 {
+    let size: i64 = 25
+    let max_iter: i64 = 1000
+    let max_rad: f64 = 65536.0
+    let width: i64 = 35 * size
+    let height: i64 = 96
+    let scale: f64 = 0.004
+
+    let mut checksum: i64 = 0
+    let mut y: i64 = 92
+    while y < height {
+        let mut x: i64 = 0
+        while x < width {
+            let cx: f64 = (x as f64) * scale - 2.5
+            let cy: f64 = (y as f64) * scale - 1.0
+            let mut zx: f64 = 0.0
+            let mut zy: f64 = 0.0
+            let mut zx2: f64 = 0.0
+            let mut zy2: f64 = 0.0
+            let mut iter: i64 = 0
+            while iter < max_iter {
+                if zx2 + zy2 >= max_rad {
+                    break
+                }
+                let new_zx: f64 = zx2 - zy2 + cx
+                let new_zy: f64 = 2.0 * zx * zy + cy
+                zx = new_zx
+                zy = new_zy
+                zx2 = zx * zx
+                zy2 = zy * zy
+                iter = iter + 1
+            }
+            checksum = checksum + palette_sum(iter, max_iter)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return checksum
+}

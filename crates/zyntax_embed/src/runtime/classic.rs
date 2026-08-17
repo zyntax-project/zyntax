@@ -65,6 +65,13 @@ pub struct ZyntaxRuntime {
     extension_map: HashMap<String, String>,
     /// Names of async functions (original name, not _new suffix)
     async_functions: std::collections::HashSet<String>,
+    /// Whether to run the interp-safe HIR optimisations before a
+    /// module reaches a backend.
+    ///
+    /// On by default. A caller measuring what those passes are worth
+    /// needs to turn them off for one run and leave the rest of the
+    /// process alone, which the environment variable cannot do.
+    run_interp_opts: bool,
     /// Plugin signatures (symbol name -> ZRTL signature)
     /// Collected from loaded plugins for proper extern function type checking
     plugin_signatures: HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
@@ -149,6 +156,7 @@ impl ZyntaxRuntime {
             async_functions: std::collections::HashSet::new(),
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
+            run_interp_opts: true,
             runtime_events: Vec::new(),
             event_sink: None,
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
@@ -202,6 +210,7 @@ impl ZyntaxRuntime {
             async_functions: std::collections::HashSet::new(),
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
+            run_interp_opts: true,
             runtime_events: Vec::new(),
             event_sink: None,
             interp: std::sync::Mutex::new(crate::interp_runtime::InterpRuntime::new()),
@@ -226,6 +235,12 @@ impl ZyntaxRuntime {
     ///
     /// If the module has extern declarations that match previously compiled functions,
     /// the backend will be rebuilt to include those symbols before compilation.
+    /// Whether to run the interp-safe HIR optimisations before a module
+    /// reaches a backend. On unless a caller says otherwise.
+    pub fn set_run_interp_opts(&mut self, run: bool) {
+        self.run_interp_opts = run;
+    }
+
     pub fn compile_module(&mut self, module: &zyntax_compiler::HirModule) -> RuntimeResult<()> {
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `compile_module` never get CSE / LICM /
@@ -235,7 +250,7 @@ impl ZyntaxRuntime {
         // `ZYNTAX_DISABLE_INTERP_OPTS=1` for the rare case where we want
         // to bisect against the raw lowered HIR.)
         let mut owned = module.clone();
-        if std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
+        if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut owned);
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&owned, "post-opt-compile_module");

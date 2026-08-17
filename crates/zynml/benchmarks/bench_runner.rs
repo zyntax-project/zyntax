@@ -200,7 +200,14 @@ struct Meta {
 /// CI workflow because the bench harness records the value but
 /// never validates it.
 const KERNELS: &[Kernel] = &[
-    Kernel::new("bench_mandelbrot", "Int(112789639)"),
+    Kernel::new("bench_mandelbrot", "Int(112789639)").expecting_without_opts("Int(112790102)"),
+    // Four rows of the same fractal, chosen because they straddle the
+    // escape boundary where fusing `2*zx*zy + cy` changes the answer:
+    // strict evaluation gives 908586 and the fused one 908666. Small
+    // enough for the bytecode interpreter to finish, so every tier can
+    // be asked the same question. A tier can be swapped under a running
+    // loop, so they have to agree.
+    Kernel::new("bench_mandelbrot_strip", "Int(908666)").expecting_without_opts("Int(908586)"),
     Kernel::new("bench_nbody", "Int(-169077)"),
     Kernel::new("bench_nbody_ref", "Int(-169077)"),
     Kernel::new("bench_fib", "Int(102334155)"),
@@ -255,16 +262,35 @@ struct Kernel {
     published_as: Option<&'static str>,
     /// The value `main` must return on every tier.
     expected: &'static str,
+    /// The value to expect from a row that runs without the HIR
+    /// passes, where those passes change it.
+    ///
+    /// Contracting a multiply and an add rounds once where the pair
+    /// rounds twice, so a kernel near a decision boundary answers
+    /// differently depending on whether contraction ran. That is a
+    /// different arithmetic, not a wrong one, and a single expected
+    /// value would report it as a miscompile. `None` means the passes
+    /// do not change this kernel's result, which is true of every
+    /// kernel that computes in integers.
+    expected_without_opts: Option<&'static str>,
     /// Whether cross-branch pure-call PRE runs for this row.
     pure_call_pre: bool,
 }
 
 impl Kernel {
+    /// The value this kernel returns when the HIR passes are off, for a
+    /// kernel whose arithmetic they change.
+    const fn expecting_without_opts(mut self, expected: &'static str) -> Self {
+        self.expected_without_opts = Some(expected);
+        self
+    }
+
     const fn new(source: &'static str, expected: &'static str) -> Self {
         Self {
             source,
             published_as: None,
             expected,
+            expected_without_opts: None,
             pure_call_pre: true,
         }
     }
@@ -590,7 +616,11 @@ fn main() {
                 // tier failing doesn't suppress visibility into
                 // other tiers; we surface them all + exit non-zero
                 // at the end.
-                if r.result != *expected {
+                let expected = match kernel_spec.expected_without_opts {
+                    Some(without) if !target.run_with_opts => without,
+                    _ => kernel_spec.expected,
+                };
+                if r.result != expected {
                     eprintln!(
                         "    {:<22} VALUE MISMATCH — got {}, expected {}",
                         target.key, r.result, expected
@@ -852,6 +882,12 @@ fn one_iteration(
         };
 
     let t0 = Instant::now();
+    // The row that exists to show what the HIR passes are worth has to
+    // actually run without them. They moved inside `compile_module`, so
+    // asking the runtime is the only way to say so.
+    zynml
+        .runtime_mut()
+        .set_run_interp_opts(target.run_with_opts);
     zynml
         .runtime_mut()
         .compile_module(&module)
