@@ -23,7 +23,7 @@
 //! winning on the common kernels-of-known-callees case.
 
 use crate::hir::{HirCallable, HirConstant, HirId, HirInstruction, HirModule};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Compute the set of function [`HirId`]s reachable from the given entry-point
 /// names. Always includes extern function declarations (those have
@@ -299,6 +299,84 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
     }
 
     reachable
+}
+
+/// Functions whose address is observable somewhere in `module`.
+///
+/// A backend may only give a function a calling convention of its own
+/// choosing when every call site agrees with the definition. A direct
+/// call site names its callee and can read the callee's signature, so it
+/// agrees by construction. Once the address is loose in a value, the
+/// site knows a pointer and nothing else, so the convention has to be
+/// the one the pointer's type implies. Everything reported here is in
+/// that second group.
+///
+/// Reports the sources of a function address rather than the places one
+/// is called through: an `IndirectCall` can only reach a function whose
+/// address was taken by one of these, so covering the sources covers the
+/// calls.
+pub fn address_taken_functions(module: &HirModule) -> HashSet<HirId> {
+    let mut taken: HashSet<HirId> = HashSet::new();
+
+    // Names resolve to ids once rather than once per lookup. A backend
+    // runs this again for every function it compiles on its own, so a
+    // scan that walked the function table per call site would cost the
+    // square of the module's size on the tiered path.
+    let mut by_name: HashMap<String, Vec<HirId>> = HashMap::new();
+    for (fid, f) in &module.functions {
+        if f.is_external {
+            continue;
+        }
+        if let Some(name) = f.name.resolve_global() {
+            by_name.entry(name).or_default().push(*fid);
+        }
+    }
+
+    for function in module.functions.values() {
+        for block in function.blocks.values() {
+            for inst in &block.instructions {
+                match inst {
+                    HirInstruction::Call {
+                        callee: HirCallable::FuncRef(target),
+                        ..
+                    } => {
+                        taken.insert(*target);
+                    }
+                    // A call by name builds its signature from the call
+                    // site, so a module function reached this way is in
+                    // the same position as one reached through a pointer.
+                    HirInstruction::Call {
+                        callee: HirCallable::Symbol(name),
+                        ..
+                    } => {
+                        taken.extend(by_name.get(name.as_str()).into_iter().flatten());
+                    }
+                    HirInstruction::CreateClosure { function, .. } => {
+                        taken.insert(*function);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Dispatch tables hold addresses directly.
+    for global in module.globals.values() {
+        if let Some(init) = &global.initializer {
+            collect_vtable_funcs(init, &mut taken);
+        }
+    }
+
+    // A handler's operations are reached through an effect's op table,
+    // which is a table of addresses like any other.
+    for handler in module.handlers.values() {
+        for imp in &handler.implementations {
+            let mangled = crate::effect_codegen::mangle_handler_op_name(handler.name, imp.op_name);
+            taken.extend(by_name.get(&mangled).into_iter().flatten());
+        }
+    }
+
+    taken
 }
 
 /// Walk a HirConstant looking for VTable entries whose `function_id` fields

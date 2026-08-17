@@ -103,6 +103,65 @@ fn emit_inline_aggregate_copy(
     }
 }
 
+/// The field a single-field struct is carried as, when it is carried as
+/// its field rather than by address.
+///
+/// A struct wrapping one scalar has the same shape as that scalar, so it
+/// travels in a register. Anything else needs memory, and the rest of
+/// this backend represents it as a pointer to that memory.
+fn struct_carried_as_its_field(struct_ty: &crate::hir::HirStructType) -> Option<&HirType> {
+    if struct_ty.fields.len() != 1 {
+        return None;
+    }
+    let field = struct_ty.fields.first()?;
+    matches!(
+        field,
+        HirType::I8
+            | HirType::I16
+            | HirType::I32
+            | HirType::I64
+            | HirType::I128
+            | HirType::U8
+            | HirType::U16
+            | HirType::U32
+            | HirType::U64
+            | HirType::U128
+            | HirType::F32
+            | HirType::F64
+            | HirType::Bool
+    )
+    .then_some(field)
+}
+
+/// The struct a function hands back through a destination its caller
+/// provides, if it hands one back that way.
+///
+/// This backend represents a struct SSA value as the address of the
+/// bytes, and the only memory a function can put those bytes in on its
+/// own is its frame, which its caller outlives. So the caller supplies
+/// the memory instead and the function writes through it. Anything with
+/// a shape that fits in a register is returned in one and is not covered
+/// here.
+///
+/// Only structs. `Array` and `Union` translate to a pointer too, but an
+/// array-typed value is not reliably the frame memory a struct's is:
+/// copying one that already points at a buffer would hand back a copy
+/// where the buffer itself was meant. A list literal builds a struct
+/// holding a separate data pointer, so the shape that actually reaches
+/// here is the one covered.
+fn destination_return_type(function: &HirFunction) -> Option<&HirType> {
+    if function.is_external {
+        return None;
+    }
+    if function.signature.returns.len() != 1 {
+        return None;
+    }
+    match function.signature.returns.first()? {
+        ret @ HirType::Struct(s) if struct_carried_as_its_field(s).is_none() => Some(ret),
+        _ => None,
+    }
+}
+
 /// Number of function bodies skipped by Cranelift due to recoverable codegen errors.
 pub fn cranelift_skipped_function_count() -> usize {
     CRANELIFT_SKIPPED_FUNCTIONS.load(Ordering::Relaxed)
@@ -200,6 +259,20 @@ pub struct CraneliftBackend {
     symbol_signatures: HashMap<String, crate::zrtl::ZrtlSymbolSig>,
     /// External function link names (HirId → symbol name) for boxing support
     external_link_names: HashMap<HirId, String>,
+    /// Functions that take the address of their result as a leading
+    /// argument and write the returned aggregate through it, valued by
+    /// how many bytes that destination holds.
+    ///
+    /// Recorded when a function is declared, and read at each call site,
+    /// so a caller compiled from a different view of the program than
+    /// its callee still agrees with how the callee was defined. Deriving
+    /// it independently at both ends would let the two disagree exactly
+    /// when the module is compiled a function at a time.
+    destination_returns: HashMap<HirId, u32>,
+    /// Functions kept off that convention because their address is
+    /// observable, so a call to them can arrive through a pointer that
+    /// says nothing about it. See [`crate::dce::address_taken_functions`].
+    address_taken: HashSet<HirId>,
     /// Pre-scanned call-site inferred signatures for extern functions with 0-param placeholders
     /// Maps HirId → (param_types, return_type) inferred from first call site
     inferred_extern_sigs: HashMap<HirId, (Vec<HirType>, Option<HirType>)>,
@@ -431,6 +504,8 @@ impl CraneliftBackend {
             runtime_symbols,
             symbol_signatures: HashMap::new(),
             external_link_names: HashMap::new(),
+            destination_returns: HashMap::new(),
+            address_taken: HashSet::new(),
             inferred_extern_sigs: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
             compile_tier: 0,
@@ -638,6 +713,11 @@ impl CraneliftBackend {
         // the first Cranelift declaration is already correct.
         self.prescan_extern_call_sites(module);
 
+        // Before anything is declared: which functions may be reached
+        // through a pointer, and so must keep the convention their
+        // pointer type implies.
+        self.note_address_taken(module);
+
         for (id, function) in &module.functions {
             self.declare_function(*id, function, module)?;
         }
@@ -818,6 +898,18 @@ impl CraneliftBackend {
         self.exported_symbols.get(name).copied()
     }
 
+    /// Record which of `module`'s functions have an observable address.
+    ///
+    /// Accumulates rather than replaces. A function compiled one at a
+    /// time is seen through whichever module view the caller had, and a
+    /// later view that happens not to mention an address already taken
+    /// must not un-take it: the convention was already fixed when the
+    /// function was declared.
+    fn note_address_taken(&mut self, module: &HirModule) {
+        self.address_taken
+            .extend(crate::dce::address_taken_functions(module));
+    }
+
     /// Declare a function signature without compiling its body
     fn declare_function(
         &mut self,
@@ -825,7 +917,17 @@ impl CraneliftBackend {
         function: &HirFunction,
         module: &HirModule,
     ) -> CompilerResult<()> {
-        let mut sig = self.translate_signature(function)?;
+        let mut sig = self.translate_signature_for(id, function)?;
+        // Record what that signature committed to, so call sites and the
+        // body agree with it rather than each deriving it again.
+        if let Some(bytes) = self
+            .destination_returns
+            .get(&id)
+            .copied()
+            .or_else(|| self.returns_through_destination(id, function))
+        {
+            self.destination_returns.insert(id, bytes);
+        }
 
         if function.is_external {
             // External functions use Import linkage
@@ -1070,6 +1172,7 @@ impl CraneliftBackend {
         module: &HirModule,
     ) -> CompilerResult<()> {
         log::trace!("[Backend] compile_function called for {:?}", id);
+        self.note_address_taken(module);
         self.declare_function(id, function, module)?;
         log::trace!(
             "[Backend] After declare_function, IR:\n{}",
@@ -1281,7 +1384,19 @@ impl CraneliftBackend {
             }
             s
         } else {
-            self.translate_signature(function)?
+            self.translate_signature_for(id, function)?
+        };
+
+        // Whether this body writes its result through a destination its
+        // caller passed. An OSR helper takes only the frame pointer and
+        // is never on that convention, which is also why a function that
+        // is gets no probes (see `osr_layouts` below). Read from what was
+        // recorded at declaration rather than derived again, so the body
+        // cannot disagree with the signature callers were emitted against.
+        let destination_return = if osr_helper.is_some() {
+            None
+        } else {
+            self.destination_returns.get(&id).copied()
         };
 
         // Pre-calculate parameter types before creating builder
@@ -1294,7 +1409,13 @@ impl CraneliftBackend {
                 .iter()
                 .map(|param| self.translate_type(&param.ty))
                 .collect();
-            pt?
+            let mut pt = pt?;
+            // Matches the leading destination `translate_signature_for`
+            // put on the signature.
+            if destination_return.is_some() {
+                pt.insert(0, self.module.target_config().pointer_type());
+            }
+            pt
         };
 
         // Pre-translate ALL types used in the function to avoid borrow checker issues
@@ -1547,8 +1668,16 @@ impl CraneliftBackend {
             // Pre-resolve per-header layouts and the function's return
             // Cranelift type. Doing this before the FunctionBuilder is
             // created avoids re-borrowing `self` during emission.
+            //
+            // A function that returns through a caller-provided
+            // destination is left without probes. A probe finishes the
+            // frame inside the helper and returns whatever the helper
+            // returned, and the helper has no destination to write
+            // through — it would hand back its own frame, which is the
+            // thing the destination exists to avoid. Losing the transfer
+            // costs speed on one shape; returning a dead frame is wrong.
             let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
-                if self.compile_tier == 0 && self.emit_osr_probes {
+                if self.compile_tier == 0 && self.emit_osr_probes && destination_return.is_none() {
                     osr_loop_headers
                         .iter()
                         .filter_map(|h| crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l)))
@@ -1741,6 +1870,9 @@ impl CraneliftBackend {
             // pass them as block-params on the prologue → header jump
             // emitted at the end of Phase 3.
             let mut osr_phi_jump_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
+            // Where a returned aggregate is written, when the caller
+            // provided the memory for it.
+            let mut destination_ptr: Option<cranelift_codegen::ir::Value> = None;
             if let Some(layout) = &osr_helper {
                 // The sole argument is the frame's address. Recover each
                 // live-in from its offset: a value held by reference is
@@ -1770,6 +1902,15 @@ impl CraneliftBackend {
             } else {
                 let entry_params = builder.block_params(entry_block);
                 let function_params = &entry_params[entry_param_start..];
+
+                // The destination leads the declared parameters, so it
+                // is taken off before the rest are matched up by index.
+                let function_params = if destination_return.is_some() {
+                    destination_ptr = function_params.first().copied();
+                    function_params.get(1..).unwrap_or(&[])
+                } else {
+                    function_params
+                };
 
                 // Get HIR parameter value IDs sorted by parameter index
                 let mut param_value_ids = Vec::new();
@@ -2879,6 +3020,26 @@ impl CraneliftBackend {
                                                 .map(|p| p.value_type)
                                                 .collect();
                                             let mut coerced = arg_values.clone();
+
+                                            // A callee that returns an aggregate needs
+                                            // somewhere to put it that outlives its own
+                                            // frame, so the memory comes from here. One
+                                            // slot per call site, which is what keeps two
+                                            // calls from landing on top of each other.
+                                            if let Some(&bytes) =
+                                                self.destination_returns.get(func_id)
+                                            {
+                                                let slot = builder.create_sized_stack_slot(
+                                                    cranelift_codegen::ir::StackSlotData::new(
+                                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                                        bytes,
+                                                        0,
+                                                    ),
+                                                );
+                                                let dest =
+                                                    builder.ins().stack_addr(pointer_type, slot, 0);
+                                                coerced.insert(0, dest);
+                                            }
                                             for (i, &expected) in expected_types.iter().enumerate()
                                             {
                                                 if i < coerced.len() {
@@ -5359,37 +5520,61 @@ impl CraneliftBackend {
                 match &hir_block.terminator {
                     HirTerminator::Return { values } => {
                         log::debug!("[Cranelift] Return terminator with values: {:?}", values);
-                        let expected_returns = builder.func.signature.returns.clone();
-                        let mut cranelift_vals = Vec::new();
-                        for (i, v) in values.iter().enumerate() {
-                            if let Some(&val) = self.value_map.get(v) {
-                                let coerced = if let Some(expected_abi) = expected_returns.get(i) {
-                                    let actual_ty = builder.func.dfg.value_type(val);
-                                    Self::coerce_value(
-                                        &mut builder,
-                                        val,
-                                        actual_ty,
-                                        expected_abi.value_type,
-                                    )
+
+                        // An aggregate built here lives in this frame,
+                        // which the caller outlives. Copy it into the
+                        // destination the caller passed and hand that
+                        // back, so the value survives the return and two
+                        // calls do not share one buffer.
+                        if let (Some(dest), Some(bytes)) = (destination_ptr, destination_return) {
+                            if let Some(&src) = values.first().and_then(|v| self.value_map.get(v)) {
+                                if bytes <= INLINE_COPY_MAX_BYTES {
+                                    emit_inline_aggregate_copy(&mut builder, dest, src, bytes);
                                 } else {
-                                    val
-                                };
-                                cranelift_vals.push(coerced);
-                            } else {
-                                log::trace!(
-                                    "[Cranelift ERROR] Return value {:?} not in value_map",
-                                    v
-                                );
+                                    let size_val = builder.ins().iconst(types::I64, bytes as i64);
+                                    builder.call_memcpy(
+                                        self.module.target_config(),
+                                        dest,
+                                        src,
+                                        size_val,
+                                    );
+                                }
                             }
+                            builder.ins().return_(&[dest]);
+                        } else {
+                            let expected_returns = builder.func.signature.returns.clone();
+                            let mut cranelift_vals = Vec::new();
+                            for (i, v) in values.iter().enumerate() {
+                                if let Some(&val) = self.value_map.get(v) {
+                                    let coerced =
+                                        if let Some(expected_abi) = expected_returns.get(i) {
+                                            let actual_ty = builder.func.dfg.value_type(val);
+                                            Self::coerce_value(
+                                                &mut builder,
+                                                val,
+                                                actual_ty,
+                                                expected_abi.value_type,
+                                            )
+                                        } else {
+                                            val
+                                        };
+                                    cranelift_vals.push(coerced);
+                                } else {
+                                    log::trace!(
+                                        "[Cranelift ERROR] Return value {:?} not in value_map",
+                                        v
+                                    );
+                                }
+                            }
+                            // Bare return: pad with zero values if signature expects more
+                            while cranelift_vals.len() < expected_returns.len() {
+                                let ty = expected_returns[cranelift_vals.len()].value_type;
+                                let zero = Self::emit_zero_value(&mut builder, ty);
+                                cranelift_vals.push(zero);
+                            }
+                            log::debug!("[Cranelift] Returning {} values", cranelift_vals.len());
+                            builder.ins().return_(&cranelift_vals);
                         }
-                        // Bare return: pad with zero values if signature expects more
-                        while cranelift_vals.len() < expected_returns.len() {
-                            let ty = expected_returns[cranelift_vals.len()].value_type;
-                            let zero = Self::emit_zero_value(&mut builder, ty);
-                            cranelift_vals.push(zero);
-                        }
-                        log::debug!("[Cranelift] Returning {} values", cranelift_vals.len());
-                        builder.ins().return_(&cranelift_vals);
                     }
 
                     HirTerminator::Branch { target } => {
@@ -5958,6 +6143,19 @@ impl CraneliftBackend {
 
     /// Translate function signature
     pub fn translate_signature(&self, function: &HirFunction) -> CompilerResult<Signature> {
+        self.translate_signature_for(function.id, function)
+    }
+
+    /// [`Self::translate_signature`] for a function known by `id`.
+    ///
+    /// A body can be registered under an id other than its own — hot
+    /// reload swaps one in under the id its callers already name — and
+    /// the convention belongs to the id those callers use.
+    fn translate_signature_for(
+        &self,
+        id: HirId,
+        function: &HirFunction,
+    ) -> CompilerResult<Signature> {
         log::debug!(
             "[Cranelift] translate_signature for function {:?}",
             function.name
@@ -5969,6 +6167,15 @@ impl CraneliftBackend {
         log::debug!("[Cranelift]   returns: {:?}", function.signature.returns);
 
         let mut cranelift_sig = self.module.make_signature();
+        // What was decided when this function was first declared, if it
+        // was. The convention is fixed at that point: callers have been
+        // emitted against it, and a second declaration under the same
+        // name with a signature that moved is one Cranelift rejects.
+        let destination_return = self
+            .destination_returns
+            .get(&id)
+            .copied()
+            .or_else(|| self.returns_through_destination(id, function));
 
         // Set calling convention. `module.make_signature()` starts with the
         // ISA default, which is the native ABI for host externs: SystemV on
@@ -5981,6 +6188,15 @@ impl CraneliftBackend {
             crate::hir::CallingConvention::System => cranelift_sig.call_conv,
             crate::hir::CallingConvention::WebKit => CallConv::Fast,
         };
+
+        // The destination for a returned aggregate leads the declared
+        // parameters, so a caller can pass it without knowing anything
+        // about the rest of them.
+        if destination_return.is_some() {
+            cranelift_sig
+                .params
+                .push(AbiParam::new(self.module.target_config().pointer_type()));
+        }
 
         // Add parameters
         for param in &function.signature.params {
@@ -5997,6 +6213,22 @@ impl CraneliftBackend {
         }
 
         Ok(cranelift_sig)
+    }
+
+    /// How many bytes `function` writes through a caller-provided
+    /// destination, when that is how it returns.
+    ///
+    /// See [`destination_return_type`] for which shapes qualify. A
+    /// function whose address is observable is excluded: its callers may
+    /// hold only a pointer, which carries no room for the extra
+    /// argument.
+    fn returns_through_destination(&self, id: HirId, function: &HirFunction) -> Option<u32> {
+        if self.address_taken.contains(&id) || self.address_taken.contains(&function.id) {
+            return None;
+        }
+        let ty = destination_return_type(function)?;
+        let size = self.type_size(ty).unwrap_or(0);
+        (size > 0).then_some(size as u32)
     }
 
     /// Convert `val` to `expected`, preserving its numeric value.
@@ -6199,30 +6431,9 @@ impl CraneliftBackend {
                 Ok(self.module.target_config().pointer_type())
             }
             HirType::Struct(struct_ty) => {
-                // Small structs with a single scalar field are passed by value (flattened)
-                if struct_ty.fields.len() == 1 {
-                    if let Some(field_ty) = struct_ty.fields.first() {
-                        // Check if it's a scalar type
-                        match field_ty {
-                            HirType::I8
-                            | HirType::I16
-                            | HirType::I32
-                            | HirType::I64
-                            | HirType::I128
-                            | HirType::U8
-                            | HirType::U16
-                            | HirType::U32
-                            | HirType::U64
-                            | HirType::U128
-                            | HirType::F32
-                            | HirType::F64
-                            | HirType::Bool => {
-                                // Pass single-scalar-field structs by value
-                                return self.translate_type(field_ty);
-                            }
-                            _ => {}
-                        }
-                    }
+                // A struct wrapping one scalar travels as that scalar.
+                if let Some(field_ty) = struct_carried_as_its_field(struct_ty) {
+                    return self.translate_type(field_ty);
                 }
                 // Multi-field or complex structs are passed by reference
                 Ok(self.module.target_config().pointer_type())
