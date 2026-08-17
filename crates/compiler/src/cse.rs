@@ -568,6 +568,32 @@ fn rewrite_inst_operands(inst: &mut HirInstruction, map: &impl Fn(&mut HirId) ->
         HirInstruction::Unary { operand, .. } => m!(operand),
         HirInstruction::Cast { operand, .. } => m!(operand),
         HirInstruction::Load { ptr, .. } => m!(ptr),
+        // The vector family. Leaving these out let this pass delete an
+        // instruction and rewrite every use of it except the ones a
+        // vector op held, so a `vload` kept pointing at an id nothing
+        // defined any more.
+        HirInstruction::VectorSplat { scalar, .. } => m!(scalar),
+        HirInstruction::VectorExtractLane { vector, .. } => m!(vector),
+        HirInstruction::VectorInsertLane { vector, scalar, .. } => {
+            m!(vector);
+            m!(scalar);
+        }
+        HirInstruction::VectorHorizontalReduce { vector, .. } => m!(vector),
+        HirInstruction::VectorLoad { ptr, .. } => m!(ptr),
+        HirInstruction::VectorStore { value, ptr, .. } => {
+            m!(value);
+            m!(ptr);
+        }
+        HirInstruction::VectorUnaryOp { operand, .. } => m!(operand),
+        HirInstruction::VectorMinMax { left, right, .. } => {
+            m!(left);
+            m!(right);
+        }
+        HirInstruction::VectorDot { acc, a, b, .. } => {
+            m!(acc);
+            m!(a);
+            m!(b);
+        }
         HirInstruction::Store { value, ptr, .. } => {
             m!(value);
             m!(ptr);

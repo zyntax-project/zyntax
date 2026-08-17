@@ -1341,7 +1341,19 @@ fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) 
         | HirInstruction::InsertValue { result, .. }
         | HirInstruction::Alloca { result, .. }
         | HirInstruction::Select { result, .. }
-        | HirInstruction::Atomic { result, .. } => map_result(result),
+        | HirInstruction::Atomic { result, .. }
+        // Every vector instruction that defines a value. Leaving these
+        // out let the definition keep the id it had in the callee while
+        // its uses moved to the fresh one, so an inlined
+        // `vstore v, p` wrote a value nothing had computed.
+        | HirInstruction::VectorSplat { result, .. }
+        | HirInstruction::VectorExtractLane { result, .. }
+        | HirInstruction::VectorInsertLane { result, .. }
+        | HirInstruction::VectorHorizontalReduce { result, .. }
+        | HirInstruction::VectorLoad { result, .. }
+        | HirInstruction::VectorUnaryOp { result, .. }
+        | HirInstruction::VectorMinMax { result, .. }
+        | HirInstruction::VectorDot { result, .. } => map_result(result),
         HirInstruction::Call { result, .. } | HirInstruction::IndirectCall { result, .. } => {
             if let Some(r) = result {
                 map_result(r);
