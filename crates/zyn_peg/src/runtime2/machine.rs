@@ -58,7 +58,14 @@ pub enum Instr {
     /// alternative. Placed before the alternative's choice point, so
     /// an alternative ruled out this way costs one test rather than
     /// everything it would have run before failing.
-    Guard { set: usize, alt: usize },
+    Guard {
+        set: usize,
+        alt: usize,
+        /// What the alternative behind this guard would have reported
+        /// had it been tried and failed, or `usize::MAX` for one
+        /// nothing can be said about.
+        expect: usize,
+    },
     /// Push a backtrack entry that resumes at `alt` on failure.
     Choice { alt: usize },
     /// Push the backtrack entry a repetition leaves through. It
@@ -130,6 +137,9 @@ pub struct Program {
     /// running on the tree-walking interpreter, so a grammar using a
     /// form the machine does not cover still parses.
     pub unsupported: Vec<String>,
+    /// What a guarded alternative expects, named so a guard that skips
+    /// one can still say what it was.
+    pub expectations: Vec<String>,
     /// The byte sets [`Instr::Guard`] tests against.
     pub sets: Vec<ByteSet>,
 }
@@ -193,12 +203,20 @@ pub fn compile(grammar: &GrammarIR, memo_ids: &HashMap<String, usize>) -> Progra
 
     let firsts = rule_firsts(&rule_index, &index_of);
 
+    // Bodies by name, so a guard can follow a reference to what the
+    // rule it names expects.
+    let rule_patterns: HashMap<String, &PatternIR> = rule_index
+        .iter()
+        .map(|(name, rule)| ((*name).clone(), &rule.pattern))
+        .collect();
+
     let mut program = Program {
         code: Vec::new(),
         rules: Vec::with_capacity(rule_index.len()),
         index_of,
         unsupported: Vec::new(),
         sets: Vec::new(),
+        expectations: Vec::new(),
     };
 
     let mut bodies: Vec<Option<Vec<Instr>>> = Vec::with_capacity(rule_index.len());
@@ -215,6 +233,8 @@ pub fn compile(grammar: &GrammarIR, memo_ids: &HashMap<String, usize>) -> Progra
             index_of: &program.index_of,
             firsts: &firsts,
             sets: &mut program.sets,
+            expectations: &mut program.expectations,
+            rules: &rule_patterns,
         };
         match emit(&rule.pattern, atomic, &mut ctx, &mut out) {
             Ok(()) => {
@@ -375,6 +395,56 @@ fn class_first(class: &CharClass) -> ByteSet {
 /// The bytes a pattern can begin with, given what is known of the
 /// rules it calls.
 ///
+
+/// What an alternative would have reported had it been tried and
+/// failed.
+///
+/// A guard decides an alternative on the byte ahead of it and skips the
+/// ones that byte rules out, which is the whole point, but a skipped
+/// alternative never reaches the code that records what it wanted. The
+/// reader is then told only about the alternatives that did run: where
+/// a grammar offered a list of types, the message named whichever one
+/// happened to be last. Naming it here keeps the saving and the message
+/// both.
+fn pattern_expectation(
+    pattern: &PatternIR,
+    rules: &HashMap<String, &PatternIR>,
+    depth: usize,
+) -> Option<String> {
+    // A rule that calls itself, directly or round a cycle, would
+    // otherwise be followed forever.
+    const DEEPEST: usize = 4;
+    if depth > DEEPEST {
+        return None;
+    }
+    match pattern {
+        // Follow the reference: what the rule itself expects is what
+        // the reader would have been told had it been tried, and
+        // matching that is the point.
+        PatternIR::RuleRef { rule_name, .. } => rules
+            .get(rule_name.as_str())
+            .and_then(|inner| pattern_expectation(inner, rules, depth + 1))
+            .or_else(|| Some(rule_name.clone())),
+        PatternIR::Literal(text) => Some(format!("'{text}'")),
+        // What a sequence begins with is what decides whether it is
+        // worth trying, so that is what it expects.
+        PatternIR::Sequence(items) => items
+            .iter()
+            .find_map(|p| pattern_expectation(p, rules, depth)),
+        PatternIR::Choice(alts) => {
+            let named: Vec<String> = alts
+                .iter()
+                .filter_map(|p| pattern_expectation(p, rules, depth))
+                .collect();
+            (!named.is_empty()).then(|| named.join(" | "))
+        }
+        PatternIR::Optional(inner)
+        | PatternIR::PositiveLookahead(inner)
+        | PatternIR::Repeat { pattern: inner, .. } => pattern_expectation(inner, rules, depth),
+        _ => None,
+    }
+}
+
 /// Anything uncertain answers `any`, so a guard built from this never
 /// skips an alternative that could have matched.
 fn pattern_first(
@@ -503,6 +573,10 @@ struct Ctx<'a> {
     firsts: &'a [ByteSet],
     /// Sets the guards test against, collected as they are emitted.
     sets: &'a mut Vec<ByteSet>,
+    /// What each guarded alternative expects, collected alongside.
+    expectations: &'a mut Vec<String>,
+    /// Rule bodies, so a reference can be followed to what it expects.
+    rules: &'a HashMap<String, &'a PatternIR>,
 }
 
 fn emit(
@@ -597,9 +671,17 @@ fn emit(
                         None
                     } else {
                         ctx.sets.push(set);
+                        let expect = match pattern_expectation(alt, ctx.rules, 0) {
+                            Some(named) => {
+                                ctx.expectations.push(named);
+                                ctx.expectations.len() - 1
+                            }
+                            None => usize::MAX,
+                        };
                         out.push(Instr::Guard {
                             set: ctx.sets.len() - 1,
                             alt: usize::MAX,
+                            expect,
                         });
                         Some(out.len() - 1)
                     }
@@ -1062,7 +1144,7 @@ fn run_counted(
 
             Instr::Fail => failed = true,
 
-            Instr::Guard { set, alt } => {
+            Instr::Guard { set, alt, expect } => {
                 // No byte ahead means nothing this guard protects can
                 // match, since a set that admits the empty string is
                 // never given one.
@@ -1072,6 +1154,13 @@ fn run_counted(
                 if admits {
                     pc += 1;
                 } else {
+                    // Skipped, but not silently: what it would have
+                    // reported still belongs at this position, or the
+                    // reader is told about the alternatives that ran
+                    // and not the one they meant.
+                    if let Some(named) = program.expectations.get(*expect) {
+                        state.note_expected(named);
+                    }
                     pc = *alt;
                     if counting {
                         stats.guarded += 1;

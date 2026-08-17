@@ -391,6 +391,26 @@ impl<'a> ParserState<'a> {
     // Error Handling
     // =========================================================================
 
+    /// Record what was expected here without failing.
+    ///
+    /// An alternative decided against on the byte ahead of it never
+    /// runs, so it never reports what it wanted, and the reader is left
+    /// with whichever alternatives did run. This puts it back where a
+    /// failure would have.
+    pub fn note_expected(&mut self, expected: &str) {
+        const MOST_EXPECTED: usize = 8;
+        if self.pos > self.furthest_pos {
+            self.furthest_pos = self.pos;
+            self.furthest_expected.clear();
+            self.furthest_expected.push(expected.to_string());
+        } else if self.pos == self.furthest_pos
+            && self.furthest_expected.len() < MOST_EXPECTED
+            && !self.furthest_expected.iter().any(|e| e == expected)
+        {
+            self.furthest_expected.push(expected.to_string());
+        }
+    }
+
     /// Create a failure result
     pub fn fail<T>(&mut self, expected: &str) -> ParseResult<T> {
         // Track furthest failure for error reporting.
