@@ -539,6 +539,19 @@ fn main() {
             // Opt-outs are keyed by the source, since what makes a
             // kernel too slow for a tier is what it computes, not which
             // pipeline row is measuring it.
+            // A build without `llvm-backend` still has this target,
+            // but nothing escalates past Cranelift in it, so it would
+            // report Cranelift's numbers under LLVM's name. Say so
+            // instead of publishing a figure for a tier that was never
+            // in the binary.
+            if target.install_llvm && !cfg!(feature = "llvm-backend") {
+                eprintln!(
+                    "    {:<22} SKIPPED (built without the llvm-backend feature)",
+                    target.key
+                );
+                per_kernel.insert(target.key.to_string(), skipped_result());
+                continue;
+            }
             if target.skip_kernels.contains(&kernel_spec.source_name()) {
                 eprintln!("    {:<22} SKIPPED (per-target opt-out)", target.key);
                 per_kernel.insert(target.key.to_string(), skipped_result());
