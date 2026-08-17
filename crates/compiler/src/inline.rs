@@ -908,12 +908,54 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
 
     // Determine the Return value (if any) so we can map the
     // call's result to it.
-    let return_value: Option<HirId> = match &entry.terminator {
+    let mut return_value: Option<HirId> = match &entry.terminator {
         HirTerminator::Return { values } if !values.is_empty() => {
             Some(*subs.get(&values[0]).unwrap_or(&values[0]))
         }
         _ => None,
     };
+
+    // A return value need not already carry the type the signature
+    // declares: `def f(): f32 { return 2.5 }` hands back an f64 literal.
+    // The return path applies the declared type on the way out, and
+    // inlining removes that step, so without this the caller sees the
+    // value at its original type and every later decision about it, a
+    // following `as` conversion included, is made against the wrong one.
+    if job.call_result.is_some() {
+        if let Some(ret) = return_value {
+            let ret_ty = callee
+                .signature
+                .returns
+                .first()
+                .cloned()
+                .unwrap_or(crate::hir::HirType::I64);
+            let actual = caller
+                .values
+                .get(&ret)
+                .map(|v| v.ty.clone())
+                .or_else(|| callee.values.get(&ret).map(|v| v.ty.clone()));
+            if let Some(op) = actual.as_ref().and_then(|a| numeric_cast_op(a, &ret_ty)) {
+                let converted = HirId::new();
+                caller.values.insert(
+                    converted,
+                    HirValue {
+                        id: converted,
+                        ty: ret_ty.clone(),
+                        kind: HirValueKind::Instruction,
+                        uses: HashSet::new(),
+                        span: None,
+                    },
+                );
+                cloned.push(HirInstruction::Cast {
+                    op,
+                    result: converted,
+                    ty: ret_ty,
+                    operand: ret,
+                });
+                return_value = Some(converted);
+            }
+        }
+    }
 
     // Splice into the caller's block.
     let block = match caller.blocks.get_mut(&job.block_id) {
@@ -1137,6 +1179,52 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
     post_block.instructions = post_insts;
     post_block.terminator = post_term;
 
+    // A return value is not obliged to already carry the type the
+    // signature declares: `def f(): i64 { return 1 }` hands back an i32
+    // literal and `def f(): f32 { return 2.5 }` an f64 one. A function
+    // compiled on its own is fine, because the return path applies the
+    // declared type on the way out. Inlining removes that step, so the
+    // value reaches the caller as whatever it happened to be and every
+    // later decision about it is made against the wrong type. Convert in
+    // the returning block, which is where the value already is.
+    let ret_ty = callee
+        .signature
+        .returns
+        .first()
+        .cloned()
+        .unwrap_or(crate::hir::HirType::I64);
+    if job.call_result.is_some() {
+        for (value, block) in return_incoming.iter_mut() {
+            let actual = match caller.values.get(value) {
+                Some(v) => v.ty.clone(),
+                None => continue,
+            };
+            let Some(op) = numeric_cast_op(&actual, &ret_ty) else {
+                continue;
+            };
+            let converted = HirId::new();
+            caller.values.insert(
+                converted,
+                HirValue {
+                    id: converted,
+                    ty: ret_ty.clone(),
+                    kind: HirValueKind::Instruction,
+                    uses: HashSet::new(),
+                    span: None,
+                },
+            );
+            if let Some(blk) = caller.blocks.get_mut(block) {
+                blk.instructions.push(HirInstruction::Cast {
+                    op,
+                    result: converted,
+                    ty: ret_ty.clone(),
+                    operand: *value,
+                });
+                *value = converted;
+            }
+        }
+    }
+
     let final_call_substitution = if let Some(call_result) = job.call_result {
         if return_incoming.len() == 1 {
             // Single return — just substitute the call_result with
@@ -1147,51 +1235,6 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
             // Multiple Returns — synthesise a phi at the head of
             // post_block joining each return value.
             let phi_result = HirId::new();
-            let ret_ty = callee
-                .signature
-                .returns
-                .first()
-                .cloned()
-                .unwrap_or(crate::hir::HirType::I64);
-
-            // A return value is not obliged to already have the width
-            // the signature declares: `def f(): i64 { return 1 }` hands
-            // back an i32 literal, and a lone `Return` gets widened
-            // where the call's result type is applied. Reaching the
-            // join through a phi is the one path with no such step, so
-            // a value narrower than the phi lands as a branch argument
-            // whose type contradicts the block parameter. Widen in the
-            // returning block, which is where the value already is.
-            for (value, block) in return_incoming.iter_mut() {
-                let actual = match caller.values.get(value) {
-                    Some(v) => v.ty.clone(),
-                    None => continue,
-                };
-                let Some(op) = numeric_cast_op(&actual, &ret_ty) else {
-                    continue;
-                };
-                let widened = HirId::new();
-                caller.values.insert(
-                    widened,
-                    HirValue {
-                        id: widened,
-                        ty: ret_ty.clone(),
-                        kind: HirValueKind::Instruction,
-                        uses: HashSet::new(),
-                        span: None,
-                    },
-                );
-                if let Some(blk) = caller.blocks.get_mut(block) {
-                    blk.instructions.push(HirInstruction::Cast {
-                        op,
-                        result: widened,
-                        ty: ret_ty.clone(),
-                        operand: *value,
-                    });
-                    *value = widened;
-                }
-            }
-
             caller.values.insert(
                 phi_result,
                 HirValue {
