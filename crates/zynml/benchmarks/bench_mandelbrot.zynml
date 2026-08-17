@@ -14,15 +14,33 @@ import prelude
 //
 // Reference checksum (rayzor + HashLink): **112_798_515**.
 //
-// Expected checksum (Cranelift / Apple aarch64 / FMA on): 112789639
-// Reference (rayzor + HashLink + rayzor Cranelift):       112798515
-// The 8413-count delta is IEEE-754 rounding drift on the
-// fractal boundary from Cranelift's FMA contraction of
-// (2*zx*zy + cy) and friends. Algebraic equivalence with
-// rayzor's complexSquare/complexAdd port is verified.
-// Set ZYNTAX_DISABLE_FMA=1 for a different (still non-matching)
-// checksum closer to rayzor's. The port is faithful; the drift
-// is codegen-level, not source-level.
+// Checksums, all measured:
+//   ZYNTAX_DISABLE_FMA=1        112790102
+//   C, -ffp-contract=off        112790102   <- the same, to the digit
+//   FMA on (what this expects)  112789639
+//   C, -ffp-contract=fast       112798802
+//   rayzor + HashLink           112798515
+//
+// With contraction off this computes exactly what a C compiler
+// computes for the same source under strict IEEE, so the float
+// path is right and the remaining 8413 between it and rayzor is
+// not rounding introduced here. Whatever it is lives in the port
+// against rayzor's complexSquare/complexAdd formulation, or in
+// rayzor's own arithmetic, and it is unexplained.
+//
+// Contraction is the only thing in the pipeline that moves this
+// number: disabling it alone reproduces the fully unoptimised
+// checksum, while LICM, CSE, inlining and vectorisation are all
+// bit-exact on this kernel.
+//
+// What gets fused is exactly one product, `2*zx*zy + cy`. Fusing
+// only that in C reproduces 112789639 to the digit. Fusing across
+// the assignments of zx2 and zy2 as well, which would un-round a
+// value that was already stored, gives 112790103 / 112790126 /
+// 112790252 and matches nothing here. So the contraction stays
+// inside a single expression, which is the rule a C compiler
+// follows. C at -ffp-contract=fast reaches further and lands on
+// 112798802.
 
 def palette_sum(iteration: i64, max_iter: i64): i64 {
     let fraction: f64 = (iteration as f64) / (max_iter as f64)
