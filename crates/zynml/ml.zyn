@@ -1269,9 +1269,25 @@ impl_items = { item:impl_item* }
   -> item
 
 // Impl items: associated types and methods (expression-bodied, indent-bodied, and brace-bodied)
-// NOTE: indent-bodied must come after expression-bodied to prefer single-expression form when applicable
+// A method may carry the same leading `@annotations` a free function
+// does, so `@effect(E)` binds to a method as well.
 impl_item = {
     decl:impl_assoc_type |
+    decl:decorated_impl_method |
+    decl:impl_method
+}
+  -> decl
+
+// @effect(Log)
+// def bump(self): i64 { ... }
+decorated_impl_method = { ann:annotation+ ~ func:impl_method }
+  -> TypedDeclaration::AnnotatedFunction {
+      annotations: ann,
+      function: func,
+  }
+
+// NOTE: indent-bodied must come after expression-bodied to prefer single-expression form when applicable
+impl_method = {
     // New def-style methods (preferred)
     decl:impl_method_def_return | decl:impl_method_def_params | decl:impl_method_def_simple |
     // Legacy fn-style methods

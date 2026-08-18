@@ -45,30 +45,9 @@ pub fn extract_effect_annotations() -> DeclRewrite {
         |matched, _bindings, _builder| {
             if let TypedDeclaration::Function(func) = &matched.node {
                 let mut new_func = func.clone();
-                for ann in &func.annotations {
-                    let ann_name = ann.name.resolve_global();
-                    let target: Option<&mut Vec<_>> = match ann_name.as_deref() {
-                        Some("effect") => Some(&mut new_func.effects),
-                        Some("with") => Some(&mut new_func.with_handlers),
-                        _ => None,
-                    };
-                    let target = match target {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    for arg in &ann.args {
-                        if let TypedAnnotationArg::Positional(TypedAnnotationValue::Identifier(
-                            name,
-                        )) = arg
-                        {
-                            target.push(*name);
-                        }
-                        // Other arg shapes (Call exprs like `MCMC(warmup=500)`)
-                        // are out of scope for M1 — the simple identifier form
-                        // is what the grammar's annotation_ident_value produces
-                        // for the bare-handler-name case.
-                    }
-                }
+                let (effects, with_handlers) = effect_annotation_lists(&func.annotations);
+                new_func.effects = effects;
+                new_func.with_handlers = with_handlers;
                 RewriteOutput::ReplaceDecl(TypedNode::new(
                     TypedDeclaration::Function(new_func),
                     matched.ty.clone(),

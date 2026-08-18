@@ -30,6 +30,7 @@ fn test_class_declaration() {
             span: Span::new(20, 35),
         }],
         methods: vec![TypedMethod {
+            annotations: vec![],
             name: method_name,
             type_params: vec![],
             params: vec![TypedMethodParam {

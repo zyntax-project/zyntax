@@ -1813,6 +1813,7 @@ impl AstHostFunctions for TypedAstBuilder {
 
                         let method = TypedMethod {
                             name: func.name,
+                            annotations: func.annotations.clone(),
                             type_params: func.type_params.clone(),
                             params: method_params,
                             return_type: func.return_type.clone(),
@@ -1900,6 +1901,7 @@ impl AstHostFunctions for TypedAstBuilder {
 
                         let method = TypedMethod {
                             name: func.name,
+                            annotations: func.annotations.clone(),
                             type_params: func.type_params.clone(),
                             params: method_params,
                             return_type: func.return_type.clone(),
@@ -3291,6 +3293,7 @@ impl AstHostFunctions for TypedAstBuilder {
                         .collect();
                     let method = TypedMethod {
                         name: func.name.clone(),
+                        annotations: func.annotations.clone(),
                         type_params: Vec::new(),
                         params: method_params,
                         return_type: func.return_type.clone(),
@@ -3396,6 +3399,7 @@ impl AstHostFunctions for TypedAstBuilder {
 
         let method = TypedMethod {
             name: InternedString::new_global(name),
+            annotations: Vec::new(),
             type_params: Vec::new(),
             params,
             return_type,

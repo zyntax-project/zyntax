@@ -2333,6 +2333,25 @@ impl LoweringContext {
             }
 
             TypedDeclaration::Impl(impl_block) => {
+                // A handler-scoping annotation never applied any scoping,
+                // and the catch below would turn that rejection into a
+                // method that merely went missing. Reject it here, where
+                // the error still reaches the caller.
+                for method in &impl_block.methods {
+                    if method
+                        .annotations
+                        .iter()
+                        .any(|a| a.name.resolve_global().as_deref() == Some("with"))
+                    {
+                        return Err(crate::CompilerError::Lowering(format!(
+                            "a handler-scoping annotation on `{}` is no longer supported (it \
+                             never applied handler scoping — silently a no-op). Scope the \
+                             handler over the code that performs the effect with a \
+                             handler-scoping region instead.",
+                            method.name.resolve_global().unwrap_or_default()
+                        )));
+                    }
+                }
                 // Catch and warn about impl block failures - complex generics may fail
                 // but we shouldn't fail the entire compilation for unused code
                 if let Err(e) = self.lower_impl_block(impl_block) {
@@ -5058,11 +5077,13 @@ impl LoweringContext {
                         params.len()
                     );
 
+                    let (effects, with_handlers) =
+                        zyntax_typed_ast::effect_annotation_lists(&method.annotations);
                     let func = TypedFunction {
                         name: mangled_name,
-                        annotations: vec![],
-                        effects: vec![],
-                        with_handlers: vec![],
+                        annotations: method.annotations.clone(),
+                        effects,
+                        with_handlers,
                         type_params: vec![],
                         params,
                         return_type: resolved_return_type,
@@ -5096,11 +5117,13 @@ impl LoweringContext {
             }
 
             // Create a function from the method (regular, non-extern struct)
+            let (effects, with_handlers) =
+                zyntax_typed_ast::effect_annotation_lists(&method.annotations);
             let func = TypedFunction {
                 name: mangled_name, // Use mangled name for trait method
-                annotations: vec![],
-                effects: vec![],
-                with_handlers: vec![],
+                annotations: method.annotations.clone(),
+                effects,
+                with_handlers,
                 type_params: vec![],
                 params,
                 return_type: resolved_return_type,

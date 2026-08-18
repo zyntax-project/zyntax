@@ -794,6 +794,7 @@ fn generate_binary_trait_impl(
 
     let method = TypedMethod {
         name: method_name_interned,
+        annotations: vec![],
         type_params: vec![],
         params: vec![
             TypedMethodParam {
@@ -1081,6 +1082,7 @@ fn generate_comparison_trait_impl(
         // Generate TypedMethod for impl block
         typed_methods.push(TypedMethod {
             name: method_name_interned,
+            annotations: vec![],
             type_params: vec![],
             params: vec![
                 TypedMethodParam {
@@ -1316,6 +1318,7 @@ fn generate_unary_trait_impl(
     // Create method: fn {method_name}(self) -> Self { TypeName { value: {op}self.value } }
     let method = TypedMethod {
         name: method_name_interned,
+        annotations: vec![],
         type_params: vec![],
         params: vec![TypedMethodParam {
             name: self_param,

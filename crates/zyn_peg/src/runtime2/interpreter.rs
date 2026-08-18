@@ -1490,6 +1490,7 @@ impl<'g> GrammarInterpreter<'g> {
 
                             methods.push(zyntax_typed_ast::TypedMethod {
                                 name: func.name,
+                                annotations: func.annotations,
                                 type_params: func.type_params,
                                 params: method_params,
                                 return_type: func.return_type,

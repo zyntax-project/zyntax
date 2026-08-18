@@ -144,6 +144,7 @@ pub use type_registry::{
 pub use type_registry::BuiltinTraitIds;
 
 pub use typed_ast::{
+    effect_annotation_lists,
     typed_node,
     BinaryOp,
     ParameterKind,

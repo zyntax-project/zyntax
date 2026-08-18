@@ -213,6 +213,34 @@ pub struct TypedAnnotation {
     pub span: Span,
 }
 
+/// Split `@effect(E, ...)` and `@with(H, ...)` annotations into the two
+/// structured name lists they stand for, in declaration order.
+///
+/// Both the normalization rewrite that runs over free functions and the
+/// impl-block lowering that turns a method into a function read the same
+/// annotations, so they read them the same way.
+pub fn effect_annotation_lists(
+    annotations: &[TypedAnnotation],
+) -> (Vec<InternedString>, Vec<InternedString>) {
+    let mut effects = Vec::new();
+    let mut with_handlers = Vec::new();
+    for ann in annotations {
+        let target = match ann.name.resolve_global().as_deref() {
+            Some("effect") => &mut effects,
+            Some("with") => &mut with_handlers,
+            _ => continue,
+        };
+        for arg in &ann.args {
+            // Only the bare-identifier form is structured. Richer shapes
+            // such as `MCMC(warmup=500)` stay on `annotations`.
+            if let TypedAnnotationArg::Positional(TypedAnnotationValue::Identifier(name)) = arg {
+                target.push(*name);
+            }
+        }
+    }
+    (effects, with_handlers)
+}
+
 /// Annotation argument - can be positional or named
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypedAnnotationArg {
@@ -1695,6 +1723,10 @@ pub struct TypedField {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypedMethod {
     pub name: InternedString,
+    /// Leading `@annotations`, carried the way a free function carries
+    /// them so `@effect(E)` reaches lowering from a method too.
+    #[serde(default)]
+    pub annotations: Vec<TypedAnnotation>,
     pub type_params: Vec<TypedTypeParam>,
     pub params: Vec<TypedMethodParam>,
     pub return_type: Type,
