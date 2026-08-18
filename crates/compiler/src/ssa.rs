@@ -5342,9 +5342,18 @@ impl SsaBuilder {
                 // becomes, the load reads eight bytes of an `f32` buffer
                 // and everything after it works on the wrong bits.
                 if !is_list_shape_hir && !is_list_shape_named {
-                    if let Some(HirType::Ptr(pointee)) = &object_hir_ty {
-                        if !matches!(pointee.as_ref(), HirType::Void) {
-                            elem_hir_ty = pointee.as_ref().clone();
+                    // `Ptr<T>` reaches here as either shape depending on
+                    // where it came from: a local keeps `Ptr`, while a
+                    // parameter or a struct field arrives as a reference.
+                    // Both are the address of a `T`.
+                    let pointee = match &object_hir_ty {
+                        Some(HirType::Ptr(inner)) => Some(inner.as_ref()),
+                        Some(HirType::Ref { pointee, .. }) => Some(pointee.as_ref()),
+                        _ => None,
+                    };
+                    if let Some(pointee) = pointee {
+                        if !matches!(pointee, HirType::Void) {
+                            elem_hir_ty = pointee.clone();
                         }
                     }
                 }
@@ -11723,7 +11732,10 @@ impl SsaBuilder {
                     // pointer is a named type rather than a shape the
                     // match above can see through.
                     _ => match self.function.values.get(&array_val).map(|v| v.ty.clone()) {
-                        Some(HirType::Ptr(pointee))
+                        // Either spelling of "the address of a `T`": a
+                        // local keeps `Ptr`, a parameter or field arrives
+                        // as a reference.
+                        Some(HirType::Ptr(pointee)) | Some(HirType::Ref { pointee, .. })
                             if !matches!(pointee.as_ref(), HirType::Void) =>
                         {
                             (pointee.as_ref().clone(), None)

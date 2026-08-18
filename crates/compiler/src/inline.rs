@@ -836,6 +836,51 @@ fn classify(callee: &HirFunction) -> CalleeClass {
 /// `job.block_id` immediately before instruction index
 /// `job.inst_idx` (the Call). Then rewire `job.call_result` to point
 /// at the remapped return value if any.
+/// Convert each argument to the type its parameter declares, returning
+/// the ids to substitute and the casts that produce them.
+///
+/// An argument is not obliged to arrive at that type: `f(2.5)` passes an
+/// f64 literal to an `f32` parameter, and `f(1)` an i32 to an `i64` one.
+/// A real call applies the declared type on the way in. Inlining removes
+/// that step, so the body would work on a value of the wrong width and
+/// everything reading it afterwards would agree with the wrong one.
+fn convert_args_to_params(
+    caller: &mut HirFunction,
+    callee: &HirFunction,
+    args: &[HirId],
+) -> (Vec<HirId>, Vec<HirInstruction>) {
+    let mut converted_args = args.to_vec();
+    let mut casts = Vec::new();
+    for (i, param) in callee.signature.params.iter().enumerate() {
+        let Some(&arg) = args.get(i) else { continue };
+        let Some(actual) = caller.values.get(&arg).map(|v| v.ty.clone()) else {
+            continue;
+        };
+        let Some(op) = numeric_cast_op(&actual, &param.ty) else {
+            continue;
+        };
+        let converted = HirId::new();
+        caller.values.insert(
+            converted,
+            HirValue {
+                id: converted,
+                ty: param.ty.clone(),
+                kind: HirValueKind::Instruction,
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        casts.push(HirInstruction::Cast {
+            op,
+            result: converted,
+            ty: param.ty.clone(),
+            operand: arg,
+        });
+        converted_args[i] = converted;
+    }
+    (converted_args, casts)
+}
+
 fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction) {
     let entry = match callee.blocks.get(&callee.entry_block) {
         Some(b) => b,
@@ -848,10 +893,11 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
     // fresh caller-side ids.
     let mut subs: HashMap<HirId, HirId> = HashMap::new();
     let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
+    let (call_args, arg_casts) = convert_args_to_params(caller, callee, &job.args);
 
     // Map parameters → caller arguments by ordinal.
     for (i, param) in callee.signature.params.iter().enumerate() {
-        if let Some(&arg) = job.args.get(i) {
+        if let Some(&arg) = call_args.get(i) {
             subs.insert(param.id, arg);
         }
     }
@@ -859,7 +905,7 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
     // different id than `param.id`; map those too.
     for (id, val) in &callee.values {
         if let HirValueKind::Parameter(idx) = val.kind {
-            if let Some(&arg) = job.args.get(idx as usize) {
+            if let Some(&arg) = call_args.get(idx as usize) {
                 subs.insert(*id, arg);
             }
         }
@@ -904,6 +950,13 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
         let mut new_inst = inst.clone();
         substitute_operands(&mut new_inst, &subs);
         cloned.push(new_inst);
+    }
+
+    // The conversions run before the body that reads them.
+    if !arg_casts.is_empty() {
+        let mut with_casts = arg_casts;
+        with_casts.extend(cloned);
+        cloned = with_casts;
     }
 
     // Determine the Return value (if any) so we can map the
@@ -1023,16 +1076,17 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
     // ─── 2. Build value substitutions (params → args, locals → fresh).
     let mut subs: HashMap<HirId, HirId> = HashMap::new();
     let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
+    let (call_args, arg_casts) = convert_args_to_params(caller, callee, &job.args);
 
     // Params → caller args, by ordinal.
     for (i, param) in callee.signature.params.iter().enumerate() {
-        if let Some(&arg) = job.args.get(i) {
+        if let Some(&arg) = call_args.get(i) {
             subs.insert(param.id, arg);
         }
     }
     for (id, val) in &callee.values {
         if let HirValueKind::Parameter(idx) = val.kind {
-            if let Some(&arg) = job.args.get(idx as usize) {
+            if let Some(&arg) = call_args.get(idx as usize) {
                 subs.insert(*id, arg);
             }
             continue;
@@ -1079,7 +1133,10 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
     //         cloned callee entry.
     let cloned_entry = block_id_map[&callee.entry_block];
     if let Some(blk) = caller.blocks.get_mut(&job.block_id) {
+        // The conversions sit at the end of the pre-call block, after
+        // the arguments are computed and before the body reads them.
         blk.instructions = pre_insts;
+        blk.instructions.extend(arg_casts);
         blk.terminator = HirTerminator::Branch {
             target: cloned_entry,
         };
