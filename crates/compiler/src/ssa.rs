@@ -3961,18 +3961,39 @@ impl SsaBuilder {
                 // definition, and the next thing to consult the record
                 // acts on a width the value never had. The operands are
                 // the ones that decide.
+                let float_operands = (
+                    Self::float_scalar(self.function.values.get(&left_val).map(|v| &v.ty)).cloned(),
+                    Self::float_scalar(self.function.values.get(&right_val).map(|v| &v.ty))
+                        .cloned(),
+                );
+                // Two floats of different widths are brought to the wider
+                // one first. `t.at(i, j) * 10.0` is an f32 against a
+                // literal that defaults to f64, and an operation cannot
+                // be performed at two widths at once: left alone, the
+                // operands disagree with each other and with whatever
+                // reads the result.
+                let (left_val, right_val) = match &float_operands {
+                    (Some(l), Some(r)) if l != r => {
+                        let wider = if matches!(l, HirType::F64) { l } else { r };
+                        let wider = wider.clone();
+                        let left_val = self.coerce_scalar_to(block_id, left_val, &wider);
+                        let right_val = self.coerce_scalar_to(block_id, right_val, &wider);
+                        (left_val, right_val)
+                    }
+                    _ => (left_val, right_val),
+                };
                 let (result_type, inst_type) = match (
                     Self::float_scalar(self.function.values.get(&left_val).map(|v| &v.ty)),
                     Self::float_scalar(self.function.values.get(&right_val).map(|v| &v.ty)),
                 ) {
                     (Some(l), Some(r)) if l == r && result_type != *l => {
-                        let narrowed = l.clone();
+                        let settled = l.clone();
                         // Comparisons keep their boolean result and only
                         // move the type the operation is performed at.
                         if matches!(result_type, HirType::F32 | HirType::F64) {
-                            (narrowed.clone(), narrowed)
+                            (settled.clone(), settled)
                         } else {
-                            (result_type, narrowed)
+                            (result_type, settled)
                         }
                     }
                     _ => (result_type, inst_type),

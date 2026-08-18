@@ -2272,11 +2272,14 @@ field_assign_stmt = { obj:identifier ~ path:suffix_field+ ~ "=" ~ value:expr }
       value: value,
   }
 
-// arr[idx] = expr
-index_assign_stmt = { obj:identifier ~ "[" ~ idx:expr ~ "]" ~ "=" ~ value:expr }
+// arr[idx] = expr, and buf.field[idx] = expr.
+// The indexed thing is a chain of field accesses like the write target
+// above, folded with the same helper, so a tensor can write through the
+// buffer it holds rather than only through a name bound to one.
+index_assign_stmt = { obj:identifier ~ path:suffix_field* ~ "[" ~ idx:expr ~ "]" ~ "=" ~ value:expr }
   -> TypedStatement::Assignment {
       target: TypedExpression::Index {
-          object: Box::new(TypedExpression::Variable { name: intern(obj) }),
+          object: Box::new(fold_postfix(TypedExpression::Variable { name: intern(obj) }, path)),
           index: Box::new(idx),
       },
       value: value,
