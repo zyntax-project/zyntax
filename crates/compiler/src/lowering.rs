@@ -1677,6 +1677,62 @@ impl LoweringContext {
             TypedExpression::Variable(_var_name) => {
                 // Variable types are looked up from var_types when needed (see MethodCall case above)
             }
+            // Everything below carries an expression without deciding
+            // anything about it, and a call nested in one still has to
+            // be visited.
+            TypedExpression::Cast(cast) => {
+                self.resolve_method_calls_in_expression(
+                    &mut cast.expr,
+                    var_types,
+                    function_param_specs,
+                )?;
+            }
+            TypedExpression::Index(index) => {
+                self.resolve_method_calls_in_expression(
+                    &mut index.object,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_expression(
+                    &mut index.index,
+                    var_types,
+                    function_param_specs,
+                )?;
+            }
+            TypedExpression::Tuple(elems) | TypedExpression::Array(elems) => {
+                for e in elems {
+                    self.resolve_method_calls_in_expression(e, var_types, function_param_specs)?;
+                }
+            }
+            TypedExpression::Reference(reference) => {
+                self.resolve_method_calls_in_expression(
+                    &mut reference.expr,
+                    var_types,
+                    function_param_specs,
+                )?;
+            }
+            TypedExpression::Dereference(inner)
+            | TypedExpression::Await(inner)
+            | TypedExpression::Try(inner) => {
+                self.resolve_method_calls_in_expression(inner, var_types, function_param_specs)?;
+            }
+            TypedExpression::If(if_expr) => {
+                self.resolve_method_calls_in_expression(
+                    &mut if_expr.condition,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_expression(
+                    &mut if_expr.then_branch,
+                    var_types,
+                    function_param_specs,
+                )?;
+                self.resolve_method_calls_in_expression(
+                    &mut if_expr.else_branch,
+                    var_types,
+                    function_param_specs,
+                )?;
+            }
             _ => {}
         }
 

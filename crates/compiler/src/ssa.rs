@@ -4058,6 +4058,44 @@ impl SsaBuilder {
                             return Ok(result);
                         }
                     }
+
+                    // `Type::member(..)` still spelled as a path. The
+                    // earlier resolve pass rewrites these to the mangled
+                    // name, but it consults the declarations before they
+                    // are collected, so a member declared in the program
+                    // being lowered is not there to be found and the path
+                    // survives to here. Translated as a value a path is
+                    // nothing, and the call becomes an indirect one
+                    // through an undef.
+                    //
+                    // Only a name that is actually a function is taken.
+                    // Members that reach a target another way, extern
+                    // struct methods among them, resolve no differently
+                    // than before because none of them land here.
+                    if matches!(callee.node, TypedExpression::Path(_)) {
+                        let mangled = [
+                            format!("{type_name}${member}"),
+                            format!("_zyntax_ext_{type_name}_{member}"),
+                            format!("${type_name}${member}"),
+                        ]
+                        .into_iter()
+                        .map(|n| InternedString::new_global(&n))
+                        .find(|n| {
+                            self.function_symbols.contains_key(n)
+                                || self.extern_link_names.contains_key(n)
+                        });
+                        if let Some(name) = mangled {
+                            let mut direct = call.clone();
+                            direct.callee = Box::new(zyntax_typed_ast::TypedNode {
+                                node: TypedExpression::Variable(name),
+                                ty: callee.ty.clone(),
+                                span: callee.span,
+                            });
+                            let mut node = expr.clone();
+                            node.node = TypedExpression::Call(direct);
+                            return self.translate_expression(block_id, &node);
+                        }
+                    }
                 }
 
                 // F-string closure inlining: println(f"text {expr}") desugars to
