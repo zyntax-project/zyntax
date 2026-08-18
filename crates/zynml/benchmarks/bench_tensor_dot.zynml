@@ -1,0 +1,42 @@
+// Dot product: sum over a[i] * b[i], the BLAS-1 reduction.
+//
+// An accumulator carried across the loop rather than a store, which is
+// the shape the reduction vectorizer looks at rather than the loop one.
+import prelude
+import simd
+
+def dot(a: Ptr<f32>, b: Ptr<f32>, n: i64): f32 {
+    let mut acc: f32 = 0.0
+    let mut i: i64 = 0
+    while i < n {
+        acc = acc + a[i] * b[i]
+        i = i + 1
+    }
+    return acc
+}
+
+def fill(p: Ptr<f32>, v: f32, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        p[i] = v
+        i = i + 1
+    }
+    return n
+}
+
+def main(): i64 {
+    let n: i64 = 1024
+    let a: Ptr<f32> = alloc_f32(n)
+    let b: Ptr<f32> = alloc_f32(n)
+    let f1: i64 = fill(a, 1.0, n)
+    let f2: i64 = fill(b, 2.0, n)
+    let mut r: i64 = 0
+    let mut total: f32 = 0.0
+    while r < 8000 {
+        total = total + dot(a, b, n)
+        r = r + 1
+    }
+    free(a)
+    free(b)
+    return (total as i64)
+}

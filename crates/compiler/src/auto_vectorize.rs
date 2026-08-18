@@ -907,10 +907,29 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
                 });
             }
             HirInstruction::Store { value, ptr, .. } => {
-                // Vector store. The value should already have been
-                // mapped to a vector value by an earlier translation
-                // step.
-                let vec_val = subbed(&sub, *value);
+                // Vector store. Most stored values were mapped to a
+                // vector by an earlier translation step, but one that
+                // does not change across the loop was never translated:
+                // `p[i] = v` for a `v` from outside stores the same
+                // scalar to every element. Storing it as though it were
+                // already a vector writes a lane's worth of value over a
+                // vector's worth of memory. Broadcast it instead, which
+                // is what setting every element to it means.
+                let mut vec_val = subbed(&sub, *value);
+                let is_vector = matches!(
+                    func.values.get(&vec_val).map(|v| &v.ty),
+                    Some(HirType::Vector(_, _))
+                );
+                if !is_vector {
+                    let vec_ty = HirType::Vector(Box::new(lane_ty.clone()), lanes);
+                    let splatted = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+                    new_insts.push(HirInstruction::VectorSplat {
+                        result: splatted,
+                        ty: vec_ty,
+                        scalar: vec_val,
+                    });
+                    vec_val = splatted;
+                }
                 new_insts.push(HirInstruction::VectorStore {
                     value: vec_val,
                     ptr: subbed(&sub, *ptr),

@@ -1,0 +1,82 @@
+// Matrix multiply on a shaped tensor, the BLAS-3 kernel.
+//
+// Written the way an ML library would: a struct carrying its shape, an
+// accessor that turns (row, column) into an offset, and three loops. The
+// inner loop reads one matrix along a row and the other down a column,
+// so it is the row that says what a strided access costs.
+import prelude
+import simd
+
+struct Tensor {
+    data: Ptr<f32>,
+    rows: i64,
+    cols: i64
+}
+
+impl Tensor {
+    def zeros(rows: i64, cols: i64): Tensor {
+        let n: i64 = rows * cols
+        let buf: Ptr<f32> = alloc_f32(n)
+        let mut i: i64 = 0
+        while i < n {
+            buf[i] = 0.0
+            i = i + 1
+        }
+        return Tensor { data: buf, rows: rows, cols: cols }
+    }
+
+    def at(self, r: i64, c: i64): f32 {
+        return self.data[r * self.cols + c]
+    }
+
+    def put(self, r: i64, c: i64, v: f32): i64 {
+        self.data[r * self.cols + c] = v
+        return 0
+    }
+
+    def fill(self, v: f32): i64 {
+        let n: i64 = self.rows * self.cols
+        let mut i: i64 = 0
+        while i < n {
+            self.data[i] = v
+            i = i + 1
+        }
+        return n
+    }
+}
+
+def matmul(a: Tensor, b: Tensor, out: Tensor): i64 {
+    let mut i: i64 = 0
+    while i < a.rows {
+        let mut j: i64 = 0
+        while j < b.cols {
+            let mut acc: f32 = 0.0
+            let mut k: i64 = 0
+            while k < a.cols {
+                acc = acc + a.at(i, k) * b.at(k, j)
+                k = k + 1
+            }
+            let w: i64 = out.put(i, j, acc)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+def main(): i64 {
+    let n: i64 = 48
+    let a: Tensor = Tensor::zeros(n, n)
+    let b: Tensor = Tensor::zeros(n, n)
+    let c: Tensor = Tensor::zeros(n, n)
+    let f1: i64 = a.fill(1.0)
+    let f2: i64 = b.fill(2.0)
+    let mut r: i64 = 0
+    let mut total: f32 = 0.0
+    while r < 60 {
+        let w: i64 = matmul(a, b, c)
+        total = total + c.at(0, 0)
+        r = r + 1
+    }
+    return (total as i64)
+}

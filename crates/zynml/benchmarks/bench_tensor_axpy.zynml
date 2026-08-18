@@ -1,0 +1,43 @@
+// saxpy: y[i] = alpha * x[i] + y[i], the BLAS-1 kernel.
+//
+// A multiply feeding an add with a loop-invariant scalar. The
+// vectorizer matches one binary op over two loads, so this shape does
+// not vectorize today and the row is what that costs against the
+// element-wise add beside it.
+import prelude
+import simd
+
+def axpy(y: Ptr<f32>, x: Ptr<f32>, alpha: f32, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        y[i] = alpha * x[i] + y[i]
+        i = i + 1
+    }
+    return n
+}
+
+def fill(p: Ptr<f32>, v: f32, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        p[i] = v
+        i = i + 1
+    }
+    return n
+}
+
+def main(): i64 {
+    let n: i64 = 1024
+    let x: Ptr<f32> = alloc_f32(n)
+    let y: Ptr<f32> = alloc_f32(n)
+    let f1: i64 = fill(x, 1.0, n)
+    let mut r: i64 = 0
+    while r < 8000 {
+        let f2: i64 = fill(y, 0.0, n)
+        let w: i64 = axpy(y, x, 2.0, n)
+        r = r + 1
+    }
+    let out: f32 = y[0]
+    free(x)
+    free(y)
+    return (out as i64)
+}
