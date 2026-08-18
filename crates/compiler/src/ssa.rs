@@ -8703,8 +8703,39 @@ impl SsaBuilder {
             },
             // A binding carries the type its declaration stated.
             TypedExpression::Variable(name) => declared(self.var_typed_ast_types.get(name)),
+            // A field carries the type its struct declared for it. The
+            // access itself is untyped, so without this a field declared
+            // dynamic reads back as the address of its box.
+            TypedExpression::Field(access) => {
+                let object_ty = self.resolve_expr_type(&access.object);
+                declared(self.declared_field_type(&object_ty, access.field).as_ref())
+            }
             _ => false,
         }
+    }
+
+    /// The type a struct declared for one of its fields, by name.
+    ///
+    /// [`Self::get_field_typed_types`] answers the same question by
+    /// index, which suits a lowered field read; a typed-AST access
+    /// names the field instead.
+    fn declared_field_type(
+        &self,
+        object_ty: &Type,
+        field: zyntax_typed_ast::InternedString,
+    ) -> Option<Type> {
+        let type_def = match object_ty {
+            Type::Named { id, .. } => self
+                .type_registry
+                .get_type_by_id(self.declaring_type_id(*id)),
+            Type::Unresolved(name) => self.type_registry.get_type_by_name(*name),
+            _ => None,
+        }?;
+        type_def
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.ty.clone())
     }
 
     /// The registry entry that actually declares `id`'s layout.
@@ -11057,17 +11088,13 @@ impl SsaBuilder {
                 .cloned()
                 .unwrap_or_else(|| node.ty.clone()),
             TypedExpression::Field(field_access) => {
+                // A binding with no annotation carries the type its
+                // initializer resolved to, which for a struct literal is
+                // the name rather than the registry entry. Both spellings
+                // reach the same declaration.
                 let object_ty = self.resolve_expr_type(&field_access.object);
-                if let Type::Named { id, .. } = &object_ty {
-                    if let Some(type_def) = self.type_registry.get_type_by_id(*id) {
-                        for f in &type_def.fields {
-                            if f.name == field_access.field {
-                                return f.ty.clone();
-                            }
-                        }
-                    }
-                }
-                node.ty.clone()
+                self.declared_field_type(&object_ty, field_access.field)
+                    .unwrap_or_else(|| node.ty.clone())
             }
             TypedExpression::Index(index_expr) => {
                 // `xs[i]` produces an element of `xs`. The typed-AST
