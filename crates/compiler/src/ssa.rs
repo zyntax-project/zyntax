@@ -5270,6 +5270,21 @@ impl SsaBuilder {
                         .unwrap_or(false),
                     _ => false,
                 };
+                // A plain `Ptr<T>` says what its elements are, and says
+                // it more reliably than the index expression does: the
+                // grammar types every Index as `Type::Unknown`, and the
+                // fallback above only recovers what `resolve_expr_type`
+                // can see. Left at the `I64` that `Type::Unknown`
+                // becomes, the load reads eight bytes of an `f32` buffer
+                // and everything after it works on the wrong bits.
+                if !is_list_shape_hir && !is_list_shape_named {
+                    if let Some(HirType::Ptr(pointee)) = &object_hir_ty {
+                        if !matches!(pointee.as_ref(), HirType::Void) {
+                            elem_hir_ty = pointee.as_ref().clone();
+                        }
+                    }
+                }
+
                 let gep_base = if is_list_shape_hir || is_list_shape_named {
                     // Load the data pointer directly as `Ptr(elem)` — see
                     // `emit_list_data_ptr` for the AA rationale (the previous
@@ -11626,12 +11641,25 @@ impl SsaBuilder {
                     {
                         (self.convert_type(&type_args[0]), None)
                     }
-                    _ => {
-                        return Err(crate::CompilerError::Analysis(format!(
-                            "Cannot index into non-array type: {:?}",
-                            resolved_array_ty
-                        )))
-                    }
+                    // A typed buffer indexes like an array and is not
+                    // one: `Ptr<T>` has no length, so it carries no
+                    // size to bounds-check against, and the element
+                    // type is read off the HIR value because the
+                    // pointer is a named type rather than a shape the
+                    // match above can see through.
+                    _ => match self.function.values.get(&array_val).map(|v| v.ty.clone()) {
+                        Some(HirType::Ptr(pointee))
+                            if !matches!(pointee.as_ref(), HirType::Void) =>
+                        {
+                            (pointee.as_ref().clone(), None)
+                        }
+                        _ => {
+                            return Err(crate::CompilerError::Analysis(format!(
+                                "Cannot index into non-array type: {:?}",
+                                resolved_array_ty
+                            )))
+                        }
+                    },
                 };
 
                 // BOUNDS CHECKING: Emit runtime bounds check if array has known size
@@ -11741,7 +11769,13 @@ impl SsaBuilder {
                 self.add_use(gep_base, ptr);
                 self.add_use(index_val, ptr);
 
-                // Store the value at the computed address
+                // Store the value at the computed address, at the width
+                // the element has rather than the one the value arrived
+                // with. `p[i] = 7.0` offers an f64 literal to an f32
+                // buffer, and storing it whole writes over the element
+                // beside it and leaves bits the next read cannot make
+                // sense of.
+                let value = self.coerce_scalar_to(block_id, value, &element_type);
                 let store_inst = HirInstruction::Store {
                     value,
                     ptr,
