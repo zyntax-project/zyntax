@@ -4340,6 +4340,25 @@ impl CraneliftBackend {
                             // Extract value from aggregate (struct/array)
                             // Strategy: Use GEP-like logic to calculate pointer, then Load the value
 
+                            // A struct carried as its single field is that
+                            // field: there is no memory to address and the
+                            // value is already in hand. Reading it as a
+                            // pointer would dereference whatever the scalar
+                            // happens to be.
+                            let flattened = value_type_cache
+                                .get(aggregate)
+                                .and_then(|t| match t {
+                                    HirType::Struct(st) => struct_carried_as_its_field(st),
+                                    _ => None,
+                                })
+                                .is_some();
+                            if flattened {
+                                if let Some(&agg) = self.value_map.get(aggregate) {
+                                    self.value_map.insert(*result, agg);
+                                }
+                                continue;
+                            }
+
                             // aggregate is a POINTER to the struct/array
                             let mut current_ptr = self.value_map[aggregate];
 
@@ -4542,6 +4561,23 @@ impl CraneliftBackend {
                             indices,
                         } => {
                             // Insert value into aggregate (struct/array)
+
+                            // The same struct as above: setting its only
+                            // field produces the field, with nothing to
+                            // store into.
+                            let flattened = value_type_cache
+                                .get(aggregate)
+                                .and_then(|t| match t {
+                                    HirType::Struct(st) => struct_carried_as_its_field(st),
+                                    _ => None,
+                                })
+                                .is_some();
+                            if flattened {
+                                if let Some(&val) = self.value_map.get(value) {
+                                    self.value_map.insert(*result, val);
+                                }
+                                continue;
+                            }
 
                             // Get the type of the aggregate from our cache
                             let mut current_type = value_type_cache
