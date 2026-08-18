@@ -356,6 +356,17 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
                 &identity_subst,
                 &addr_index,
             )),
+            // A vectorized store writes memory exactly as the scalar one
+            // it replaced. Counting only the scalar spelling makes a
+            // store invisible to the check the moment it is vectorized,
+            // and a load of what it wrote is then free to leave the loop
+            // and be read before the loop fills it.
+            HirInstruction::VectorStore { ptr, value, .. } => Some(extract_mem_loc(
+                *ptr,
+                value_byte_size(func, *value),
+                &identity_subst,
+                &addr_index,
+            )),
             _ => None,
         })
         .collect();
@@ -576,6 +587,8 @@ enum AddrLink {
         base: HirId,
         const_offset: Option<u64>,
     },
+    /// A pointer read out of a struct field — chase to the aggregate.
+    Field { aggregate: HirId, index: u32 },
 }
 
 /// Build a `HirId → AddrLink` lookup over every `Cast` / `GEP`
@@ -593,6 +606,27 @@ fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
                     result, operand, ..
                 } => {
                     idx.insert(*result, AddrLink::Cast(*operand));
+                }
+                // Reading a pointer out of a struct is another way to
+                // name it. A tensor reaches its buffer this way, so a
+                // load and a store of the same element arrive holding
+                // two ids for one pointer; compared as roots they look
+                // unrelated, and a load nothing may write to is a load
+                // free to leave the loop. Chasing to the aggregate and
+                // the field makes both sides say the same thing.
+                HirInstruction::ExtractValue {
+                    result,
+                    aggregate,
+                    indices,
+                    ..
+                } if indices.len() == 1 => {
+                    idx.insert(
+                        *result,
+                        AddrLink::Field {
+                            aggregate: *aggregate,
+                            index: indices[0],
+                        },
+                    );
                 }
                 HirInstruction::GetElementPtr {
                     result,
@@ -643,6 +677,18 @@ fn extract_mem_loc(
         match addr_index.get(&current) {
             Some(AddrLink::Cast(operand)) => {
                 current = identity_subst.get(operand).copied().unwrap_or(*operand);
+            }
+            Some(AddrLink::Field { aggregate, index }) => {
+                // Two pointers read out of one struct resolve to that
+                // struct, and the offset stops being known: whatever
+                // they address is not laid out inside it. Two different
+                // fields therefore read as may-alias, which is the safe
+                // answer and the one that keeps a load next to the store
+                // that fills it.
+                let _ = index;
+                offset_known = false;
+                current = *aggregate;
+                continue;
             }
             Some(AddrLink::Gep { base, const_offset }) => {
                 match const_offset {

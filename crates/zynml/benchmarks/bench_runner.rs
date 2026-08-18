@@ -241,6 +241,15 @@ const KERNELS: &[Kernel] = &[
     // that the HIR passes reshape before Cranelift sees them, which hides
     // what Cranelift's own optimizer contributes; these two do not give
     // LICM, auto-vectorization or SROA anything to work with.
+    // Tensor kernels at real shapes. Each isolates a different
+    // property: the element-wise add is the shape the vectorizer
+    // matches, axpy is a multiply feeding an add with a loop-invariant
+    // scalar and is the shape it does not, dot carries an accumulator
+    // rather than storing, and matmul is strided and shaped.
+    Kernel::new("bench_tensor_add", "Int(24000)"),
+    Kernel::new("bench_tensor_axpy", "Int(2)"),
+    Kernel::new("bench_tensor_dot", "Int(16384000)"),
+    Kernel::new("bench_tensor_matmul", "Int(5760)"),
     Kernel::new("bench_collatz", "Int(35669673)"),
     Kernel::new("bench_branchy", "Int(140)"),
 ];
