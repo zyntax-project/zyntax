@@ -1830,6 +1830,15 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         let sra = scalar_replace_alloc::run_module(module);
         let il = inline::run_module(module);
         let lc = licm::run_module(module);
+        // Before the loops are matched against a shape. A variable live
+        // across a loop but never reassigned in it still carries a phi,
+        // which reads as a definition in the header and makes a buffer
+        // the function allocated itself look like it changes every
+        // iteration. Collapsing those first is what lets such a loop be
+        // recognised at all.
+        let ppf = phi_prune::run_module(module);
+        stats.phi_prune.removed += ppf.removed;
+        stats.phi_prune.rounds = stats.phi_prune.rounds.max(ppf.rounds);
         let lv = loop_vectorize::run_module(module);
         // Reduction vectorization runs alongside loop_vectorize; the
         // two recognise disjoint patterns (store-to-array vs.

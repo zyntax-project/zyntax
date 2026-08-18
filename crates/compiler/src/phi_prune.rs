@@ -20,7 +20,7 @@
 //!
 //! Turned off with `ZYNTAX_DISABLE_PHI_PRUNE=1`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::hir::{HirFunction, HirId, HirInstruction, HirModule, HirTerminator};
 
@@ -65,12 +65,87 @@ pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
             block.phis.retain(|p| used.contains(&p.result));
             removed_this_round += before - block.phis.len();
         }
+        removed_this_round += collapse_trivial_phis(func);
         stats.removed += removed_this_round;
         if removed_this_round == 0 {
             break;
         }
     }
     stats
+}
+
+/// Replace a phi that can only ever be one value with that value.
+///
+/// A variable that is live across a loop but never reassigned in it still
+/// gets a phi, and that phi's only incomings are its own result and the
+/// value it started as. It is not dead, so the removal above leaves it,
+/// and it reads as a definition in the loop header. Anything asking where
+/// a value comes from is told the header, which is how a buffer that a
+/// function allocated itself stops looking loop-invariant and a loop over
+/// it stops being recognised as one shape.
+fn collapse_trivial_phis(func: &mut HirFunction) -> usize {
+    let mut replacements: HashMap<HirId, HirId> = HashMap::new();
+    for block in func.blocks.values() {
+        for phi in &block.phis {
+            // A phi with one incoming is left alone. The shape this is
+            // for is the loop-carried one, which has an edge from
+            // outside the loop and one from within, and a single-entry
+            // phi is a different construct that the removal above
+            // already decides on.
+            if phi.incoming.len() < 2 {
+                continue;
+            }
+            let mut distinct = phi
+                .incoming
+                .iter()
+                .map(|(v, _)| *v)
+                .filter(|v| *v != phi.result);
+            let Some(first) = distinct.next() else {
+                continue;
+            };
+            if distinct.all(|v| v == first) {
+                replacements.insert(phi.result, first);
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return 0;
+    }
+    // A phi may name another phi being collapsed in the same round, so
+    // follow each chain to what it finally resolves to.
+    let resolve = |mut v: HirId| -> HirId {
+        for _ in 0..16 {
+            match replacements.get(&v) {
+                Some(&next) if next != v => v = next,
+                _ => break,
+            }
+        }
+        v
+    };
+    let final_map: indexmap::IndexMap<HirId, HirId> = replacements
+        .keys()
+        .map(|&k| (k, resolve(k)))
+        .filter(|(k, v)| k != v)
+        .collect();
+    if final_map.is_empty() {
+        return 0;
+    }
+    let removed = final_map.len();
+    for block in func.blocks.values_mut() {
+        block.phis.retain(|p| !final_map.contains_key(&p.result));
+        for phi in &mut block.phis {
+            for (value, _) in &mut phi.incoming {
+                if let Some(&to) = final_map.get(value) {
+                    *value = to;
+                }
+            }
+        }
+        for inst in &mut block.instructions {
+            inst.replace_uses(&final_map);
+        }
+        block.terminator.replace_uses(&final_map);
+    }
+    removed
 }
 
 /// Every value id read anywhere in the function: instruction operands,
