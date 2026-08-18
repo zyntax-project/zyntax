@@ -3952,6 +3952,32 @@ impl SsaBuilder {
                 let (left_val, right_val) =
                     self.normalize_int_binary_operands(block_id, left_val, right_val);
 
+                // A float op is as wide as the operands it is given, and
+                // the typed AST does not always agree: adding two `f32`
+                // elements read out of a buffer is inferred `f64`,
+                // because that is what a float literal defaults to. Every
+                // backend takes the width from the operands, so a value
+                // recorded at the other one contradicts its own
+                // definition, and the next thing to consult the record
+                // acts on a width the value never had. The operands are
+                // the ones that decide.
+                let (result_type, inst_type) = match (
+                    Self::float_scalar(self.function.values.get(&left_val).map(|v| &v.ty)),
+                    Self::float_scalar(self.function.values.get(&right_val).map(|v| &v.ty)),
+                ) {
+                    (Some(l), Some(r)) if l == r && result_type != *l => {
+                        let narrowed = l.clone();
+                        // Comparisons keep their boolean result and only
+                        // move the type the operation is performed at.
+                        if matches!(result_type, HirType::F32 | HirType::F64) {
+                            (narrowed.clone(), narrowed)
+                        } else {
+                            (result_type, narrowed)
+                        }
+                    }
+                    _ => (result_type, inst_type),
+                };
+
                 let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let inst = HirInstruction::Binary {
@@ -9325,6 +9351,17 @@ impl SsaBuilder {
 
     /// Classify a scalar HIR type as `(is_float, bit_width, is_signed)`,
     /// or `None` for non-numeric types.
+    /// `ty` when it names a float scalar, so a binary op can take its
+    /// width from the operands rather than from what the typed AST
+    /// inferred. Vectors are excluded: their width is the lane shape,
+    /// which the op already carries.
+    fn float_scalar(ty: Option<&HirType>) -> Option<&HirType> {
+        match ty? {
+            t @ (HirType::F32 | HirType::F64) => Some(t),
+            _ => None,
+        }
+    }
+
     fn scalar_class(ty: &HirType) -> Option<(bool, u32, bool)> {
         Some(match ty {
             HirType::I8 => (false, 8, true),

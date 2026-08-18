@@ -112,17 +112,7 @@ fn an_exact_multiple_still_works() {
 
 /// Element-wise add across a ragged length: (1.5 + 3.0) * 5 = 22.5.
 ///
-/// Ignored because it faults, on something narrower than the tail.
-/// Storing a sum of two indexed reads is enough: `p[1] = q[1] + q[2]`
-/// fails while `p[1] = q[1]` and a bare `q[1] + q[2]` both work.
-///
-/// The sum arrives as an HIR value declared `f64` holding an `f32`
-/// constant, so carrying it to the element type emits an `fptrunc` on a
-/// value already that width and the verifier rejects the `fdemote`. The
-/// store coercion is what surfaces it; the contradiction between a
-/// value's recorded type and its own constant is upstream of that.
 #[test]
-#[ignore = "storing a sum of two indexed reads hits a value whose type contradicts its constant"]
 fn elementwise_add_over_a_ragged_length() {
     assert_eq!(
         run(r#"
