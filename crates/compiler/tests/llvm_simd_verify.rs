@@ -157,6 +157,7 @@ fn llvm_vector_dot_emits_vpdpbusd_on_vnni() {
         name: InternedString::new_global(n),
         ty: t.clone(),
         attributes: ParamAttributes::default(),
+        ownership: Default::default(),
     };
     let sig = HirFunctionSignature {
         params: vec![mk("acc", &i32x4), mk("a", &i8x16), mk("b", &i8x16)],
@@ -250,6 +251,7 @@ fn llvm_vector_dot_portable_when_target_lacks_vnni() {
         name: InternedString::new_global(n),
         ty: t.clone(),
         attributes: ParamAttributes::default(),
+        ownership: Default::default(),
     };
     let sig = HirFunctionSignature {
         params: vec![mk("acc", &i32x4), mk("a", &i8x16), mk("b", &i8x16)],
@@ -307,6 +309,7 @@ fn llvm_vector_fma_emits_fma_intrinsic() {
         name: InternedString::new_global(n),
         ty: f32x4.clone(),
         attributes: ParamAttributes::default(),
+        ownership: Default::default(),
     };
     let sig = HirFunctionSignature {
         params: vec![mk_param("a"), mk_param("b"), mk_param("c")],

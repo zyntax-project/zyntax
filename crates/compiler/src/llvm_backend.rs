@@ -686,9 +686,36 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
-        // Phase 2: Compile all blocks in insertion order (IndexMap preserves this)
-        // This ensures all values are defined before they're used in phi nodes
+        // Phase 2: Compile blocks in reverse post-order, so every
+        // definition is built before anything that reads it.
+        //
+        // Insertion order was used here and held only by accident: a
+        // block's definitions happened to be written before its readers
+        // because of the order passes created blocks. It is not a
+        // property of the IR. A value defined in a preheader that was
+        // inserted after the loop body, which is what hoisting a
+        // loop-invariant broadcast out of a vectorized loop produces,
+        // was read before it existed and silently became a zero vector.
+        // Reverse post-order is the order that actually guarantees what
+        // the old comment claimed.
+        let rpo = crate::analysis::DominatorTree::new(func);
+        let mut emitted: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+        for block_id in rpo.rpo() {
+            if let (Some(llvm_block), Some(hir_block)) =
+                (self.block_map.get(block_id), func.blocks.get(block_id))
+            {
+                self.builder.position_at_end(*llvm_block);
+                self.compile_block_with_terminator(block_id, hir_block, func)?;
+                emitted.insert(*block_id);
+            }
+        }
+        // A block the entry cannot reach is absent from the traversal.
+        // It still needs a body, since it was declared above and LLVM
+        // rejects a block without a terminator.
         for (block_id, hir_block) in func.blocks.iter() {
+            if emitted.contains(block_id) {
+                continue;
+            }
             if let Some(llvm_block) = self.block_map.get(block_id) {
                 self.builder.position_at_end(*llvm_block);
                 self.compile_block_with_terminator(block_id, hir_block, func)?;

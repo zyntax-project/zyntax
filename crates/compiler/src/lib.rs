@@ -1755,6 +1755,18 @@ pub struct InterpOptStats {
 ///
 /// Returns per-pass counters so callers can log / assert what work
 /// was done.
+/// Compile a module to LLVM IR text, owning the context for the call.
+///
+/// The backend borrows a context the caller has to create, which means
+/// naming `inkwell` to inspect what was generated. This exists so a
+/// caller that only wants to read the IR does not take that dependency.
+#[cfg(feature = "llvm-backend")]
+pub fn compile_module_to_llvm_ir(module: &HirModule, name: &str) -> CompilerResult<String> {
+    let context = inkwell::context::Context::create();
+    let mut backend = llvm_backend::LLVMBackend::new(&context, name);
+    backend.compile_module(module)
+}
+
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
 

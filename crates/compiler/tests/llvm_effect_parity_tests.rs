@@ -40,6 +40,7 @@ fn make_sig(params: Vec<HirType>, returns: Vec<HirType>) -> HirFunctionSignature
                 name: create_name(&format!("p{}", i)),
                 ty,
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             })
             .collect(),
         returns,
@@ -123,6 +124,7 @@ fn llvm_backend_compiles_perform_effect_with_resumable_handler() {
                 name: create_name("k"),
                 ty: HirType::I64,
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             }],
             return_type: HirType::I64,
             entry_block: HirId::new(),

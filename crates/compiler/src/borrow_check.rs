@@ -139,7 +139,7 @@ impl<'a> HirBorrowChecker<'a> {
 
     /// Run borrow checking on the entire module
     pub fn check_module(&mut self) -> CompilerResult<BorrowCheckResult> {
-        eprintln!("[BORROW_CHECK] Starting HIR borrow checking...");
+        log::debug!("[BORROW_CHECK] Starting HIR borrow checking...");
 
         for (func_id, func) in &self.module.functions {
             self.check_function(*func_id, func)?;
@@ -152,12 +152,12 @@ impl<'a> HirBorrowChecker<'a> {
         };
 
         if result.errors.is_empty() {
-            eprintln!(
+            log::debug!(
                 "[BORROW_CHECK] Borrow checking passed ({} warnings)",
                 result.warnings.len()
             );
         } else {
-            eprintln!(
+            log::debug!(
                 "[BORROW_CHECK] Borrow checking found {} errors, {} warnings",
                 result.errors.len(),
                 result.warnings.len()
