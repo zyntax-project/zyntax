@@ -18,12 +18,6 @@
 //!
 //! * A loop the analysis would only offer against an obligation. What a
 //!   caller has to establish is not something this can establish for it.
-//! * A loop with no loop inside it. Measured on this machine at ten
-//!   cores, spreading an elementwise pass over a large buffer returns
-//!   1.1x to 2.4x because it is waiting on memory rather than on
-//!   arithmetic, while a matrix multiply returns 4.3x at 512 and 6.0x at
-//!   1024. Nested work is the cheap way to tell those apart, and paying
-//!   a dispatch for the first kind would spend the win on overhead.
 //! * A counter that does not step by one, or a loop whose shape is not
 //!   a single entry, a single exit and a test at the top.
 //! * A value the loop defines and something after it reads. The bands
@@ -32,9 +26,25 @@
 //! * A captured value wider than a machine word, which the buffer this
 //!   packs into has no slot for.
 //!
-//! The runtime declines a range too small to be worth splitting, so the
-//! trip count is its decision rather than one made here, where it is
-//! usually not known.
+//! ## Why a loop with no loop inside it is left alone
+//!
+//! The first reason was that spreading an elementwise pass returns 1.1x
+//! to 2.4x against a matrix multiply's 4.3x to 6.0x. That reads a
+//! number in isolation, and the objection to it is sound: work left
+//! serial does not merely fail to speed up, it bounds what the rest can
+//! reach, so 2.4x on the last few per cent should still be worth
+//! taking.
+//!
+//! It is not, and the reason is worth writing down because the argument
+//! for it is convincing. Handing them to the runtime as well, with a
+//! grain matched to what an iteration costs, was measured on the
+//! prefill kernel by alternating two prebuilt binaries: 20.27 ms
+//! against 20.31 ms, which is nothing, while compile time went from
+//! 59.6 ms to 90.9 ms for the extra functions. What the spreading wins
+//! on those loops, outlining them and handing them over gives back.
+//!
+//! So they are refused, and the trip count is not the reason. A
+//! measurement that says nothing changed is the reason.
 //!
 //! Off unless `ZYNTAX_PARALLEL_LOOPS=1`.
 
@@ -51,10 +61,9 @@ use zyntax_typed_ast::InternedString;
 /// The runtime entry that hands bands of a range to worker threads.
 const DISPATCH_SYMBOL: &str = "zyntax_parallel_for";
 
-/// The smallest run of iterations worth handing to a worker, for the
-/// only loops this dispatches: ones with a loop inside them. A row of a
-/// matrix multiply is thousands of operations, so a few rows is already
-/// more than the handover costs.
+/// The smallest run of iterations worth handing to a worker, when one
+/// iteration is itself a loop. A row of a matrix multiply is thousands
+/// of operations, so a few rows already cost more than the handover.
 const NESTED_GRAIN: i64 = 4;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +97,9 @@ pub fn enabled() -> bool {
 
 /// Everything one rewrite needs, gathered before anything is changed.
 struct Plan {
+    /// The smallest run of iterations worth handing to a worker, from
+    /// what one iteration of this loop costs.
+    grain: i64,
     /// Blocks that move, header first in `header`.
     header: HirId,
     body: HashSet<HirId>,
@@ -162,12 +174,15 @@ fn plan_function(func: &HirFunction) -> (Vec<Plan>, DispatchStats) {
             stats.shape += 1;
             continue;
         };
-        // Nested work is what makes the dispatch worth its cost.
+        // What one iteration costs is what decides the grain, and a
+        // loop with no loop inside it is not offered at all: see above
+        // for the measurement that settled it.
         if !contains_inner_loop(&forest, lp) {
             stats.flat += 1;
             continue;
         }
-        match plan_loop(func, lp, found.induction) {
+        let grain = NESTED_GRAIN;
+        match plan_loop(func, lp, found.induction, grain) {
             Some(p) => plans.push(p),
             None => stats.shape += 1,
         }
@@ -195,7 +210,7 @@ fn contains_inner_loop(forest: &LoopForest, lp: &NaturalLoop) -> bool {
 }
 
 /// Read one loop into a plan, or refuse it.
-fn plan_loop(func: &HirFunction, lp: &NaturalLoop, counter: HirId) -> Option<Plan> {
+fn plan_loop(func: &HirFunction, lp: &NaturalLoop, counter: HirId, grain: i64) -> Option<Plan> {
     let header = func.blocks.get(&lp.header)?;
 
     // A test at the top, leaving the loop on the false edge.
@@ -316,6 +331,7 @@ fn plan_loop(func: &HirFunction, lp: &NaturalLoop, counter: HirId) -> Option<Pla
     }
 
     Some(Plan {
+        grain,
         header: lp.header,
         body: lp.body.clone(),
         preheader,
@@ -755,13 +771,10 @@ fn install_dispatch(func: &mut HirFunction, plan: &Plan, band_id: HirId) {
         const_args: vec![],
         is_tail: false,
     });
-    // One iteration of a loop with a loop inside it is already a
-    // substantial amount of work, so a handful of them is worth a
-    // worker. A range shorter than twice this runs where it is.
     let grain = new_value(
         func,
         HirType::I64,
-        HirValueKind::Constant(HirConstant::I64(NESTED_GRAIN)),
+        HirValueKind::Constant(HirConstant::I64(plan.grain)),
     );
     writes.push(HirInstruction::Call {
         result: None,
