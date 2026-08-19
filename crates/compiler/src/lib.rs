@@ -1791,26 +1791,6 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         let round_start = web_time::Instant::now();
         let cf = const_fold::fold_module(module);
         let cs = cse::eliminate_module(module);
-        // FMA contraction runs after const_fold + cse so we don't
-        // contract a pattern that CSE could have eliminated to a
-        // single value, and so const_fold has already collapsed any
-        // FMul-of-constants into a Constant (which then wouldn't
-        // match the FMul pattern). Sits before load_cse / aggregate_split
-        // because those are memory-oriented and operate on different
-        // instruction shapes — order between them is independent.
-        //
-        // Temporary investigation gate: `ZYNTAX_DISABLE_FMA=1` skips
-        // the pass entirely so before/after HIR can be diffed and
-        // exec-time effect measured on Apple-Silicon. Remove once the
-        // hot-loop FMA-helps/hurts question is closed.
-        let fma_disabled = std::env::var("ZYNTAX_DISABLE_FMA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let fma = if fma_disabled {
-            fma_contract::FmaStats::default()
-        } else {
-            fma_contract::run_module(module)
-        };
         // load_cse runs after value-cse so canonical pointer ids are
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
@@ -1847,6 +1827,33 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         // two recognise disjoint patterns (store-to-array vs.
         // accumulator) so they can't double-fire on the same loop.
         let rv = reduction_vectorize::run_module(module);
+        // FMA contraction runs after the vectorizers, not before them.
+        // A multiply feeding an add is the shape both the loop matcher
+        // and this pass want, and whichever runs first takes it: fusing
+        // to a single call leaves the matcher a call it cannot lower to
+        // lanes, and a scaled kernel such as `y[i] = a * x[i] + y[i]`
+        // stays scalar. Fusing afterwards costs nothing, because the
+        // pass contracts a vector-typed multiply and add just as
+        // readily as a scalar pair, so the loop ends up both widened
+        // and fused.
+        //
+        // It still runs after const_fold + cse, which is why it sits
+        // inside the round rather than after it: a multiply of
+        // constants has already collapsed, and a pattern CSE could
+        // eliminate outright is not contracted first.
+        //
+        // Temporary investigation gate: `ZYNTAX_DISABLE_FMA=1` skips
+        // the pass entirely so before/after HIR can be diffed and
+        // exec-time effect measured on Apple-Silicon. Remove once the
+        // hot-loop FMA-helps/hurts question is closed.
+        let fma_disabled = std::env::var("ZYNTAX_DISABLE_FMA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let fma = if fma_disabled {
+            fma_contract::FmaStats::default()
+        } else {
+            fma_contract::run_module(module)
+        };
         // cfg_simplify runs last in the round — `const_fold`'s
         // CondBranch-on-known-Bool collapse routinely turns
         // conditional branches into unconditional ones, which makes

@@ -162,20 +162,151 @@ struct SaxpyPattern {
     i_next: HirId,
     /// Loop bound (the `n` in `i < n`).
     n: HirId,
-    /// Result of the elementwise op (the value stored to c[i]).
-    binary_op: BinaryOp,
-    /// Element type — vectorize at lanes=4.
+    /// The elementwise expression whose value is stored to `c[i]`.
+    expr: VecExpr,
+    /// Element type, vectorized at lanes=4.
     elem_ty: HirType,
-    /// Pointer to the LHS array (`a` in `c[i] = a[i] + b[i]`).
-    ptr_a: HirId,
-    /// Pointer to the RHS array.
-    ptr_b: HirId,
     /// Pointer to the output array.
     ptr_c: HirId,
     /// GEP, Load, Binary, GEP, Store instructions in the body — we
     /// snapshot them so the rewriter can copy them into the scalar
     /// epilogue verbatim.
     body_insts: Vec<HirInstruction>,
+}
+
+/// One node of the elementwise expression a vectorized body computes.
+///
+/// A leaf is either an element read at the induction variable, which
+/// becomes a vector load, or a value the loop does not change, which
+/// becomes one broadcast hoisted out of the loop. That second leaf is
+/// what lets a scaled kernel such as `y[i] = alpha * x[i] + y[i]` match:
+/// `alpha` is the same in every lane and on every iteration.
+#[derive(Debug, Clone)]
+enum VecExpr {
+    /// An element read through `GEP(ptr, [i])`.
+    Load(HirId),
+    /// A loop-invariant scalar, broadcast to every lane.
+    Splat(HirId),
+    /// An elementwise operation over two sub-expressions.
+    Binary(BinaryOp, Box<VecExpr>, Box<VecExpr>),
+}
+
+impl VecExpr {
+    /// Whether anything in the tree is read from memory. An expression
+    /// of nothing but invariants is the same on every iteration and
+    /// wants hoisting, not vectorizing.
+    fn reads_memory(&self) -> bool {
+        match self {
+            VecExpr::Load(_) => true,
+            VecExpr::Splat(_) => false,
+            VecExpr::Binary(_, l, r) => l.reads_memory() || r.reads_memory(),
+        }
+    }
+}
+
+/// Depth of expression tree worth matching. Elementwise kernels are
+/// shallow, and the cap keeps a pathological body from costing compile
+/// time.
+const MAX_EXPR_DEPTH: usize = 8;
+
+/// Why an expression could not be matched. The two are reported
+/// separately: a shape nothing can be done about, against an operation
+/// that would vectorize if it were supported.
+enum VecReject {
+    Shape,
+    Op,
+}
+
+/// Build the expression the store's value computes.
+///
+/// Every instruction the tree consumes is pushed to `accounted`, so the
+/// caller can confirm the body holds nothing else before replacing it.
+#[allow(clippy::too_many_arguments)]
+fn build_vec_expr(
+    func: &HirFunction,
+    body: &HirBlock,
+    body_id: HirId,
+    header_id: HirId,
+    value: HirId,
+    i: HirId,
+    elem_ty: &HirType,
+    depth: usize,
+    accounted: &mut Vec<HirId>,
+) -> Result<VecExpr, VecReject> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(VecReject::Shape);
+    }
+
+    // An element read at the induction variable.
+    if let Some(ptr) = resolve_load_through_gep(body, value, i) {
+        // The base has to name the same array on every iteration.
+        if defined_in_block(func, ptr, body_id) || defined_in_block(func, ptr, header_id) {
+            return Err(VecReject::Shape);
+        }
+        if value_type(func, value).as_ref() != Some(elem_ty) {
+            return Err(VecReject::Shape);
+        }
+        accounted.push(value);
+        if let Some(HirInstruction::Load { ptr: gep, .. }) = find_inst_by_result_in(body, value) {
+            accounted.push(*gep);
+        }
+        return Ok(VecExpr::Load(ptr));
+    }
+
+    match find_inst_by_result_in(body, value) {
+        Some(HirInstruction::Binary {
+            op,
+            left,
+            right,
+            ty,
+            ..
+        }) => {
+            if ty != elem_ty {
+                return Err(VecReject::Shape);
+            }
+            if !is_vectorizable_op(*op) {
+                return Err(VecReject::Op);
+            }
+            let (op, left, right) = (*op, *left, *right);
+            accounted.push(value);
+            let l = build_vec_expr(
+                func,
+                body,
+                body_id,
+                header_id,
+                left,
+                i,
+                elem_ty,
+                depth + 1,
+                accounted,
+            )?;
+            let r = build_vec_expr(
+                func,
+                body,
+                body_id,
+                header_id,
+                right,
+                i,
+                elem_ty,
+                depth + 1,
+                accounted,
+            )?;
+            Ok(VecExpr::Binary(op, Box::new(l), Box::new(r)))
+        }
+        // Defined by no instruction in the body. If the loop does not
+        // define it at all then it holds the same value throughout, and
+        // every lane wants that value.
+        None => {
+            if defined_in_block(func, value, body_id) || defined_in_block(func, value, header_id) {
+                return Err(VecReject::Shape);
+            }
+            if value_type(func, value).as_ref() != Some(elem_ty) {
+                return Err(VecReject::Shape);
+            }
+            Ok(VecExpr::Splat(value))
+        }
+        _ => Err(VecReject::Shape),
+    }
 }
 
 fn recognise_saxpy(func: &HirFunction, lp: &NaturalLoop) -> Recognition {
@@ -337,40 +468,54 @@ fn recognise_saxpy(func: &HirFunction, lp: &NaturalLoop) -> Recognition {
         _ => return Recognition::SkipShape,
     };
 
-    // store_value should be Binary(op, va, vb) where va, vb are
-    // Loads of GEPs over phi.result.
-    let (binary_op, va, vb, elem_ty) = match find_inst_by_result_in(body, store_value) {
-        Some(HirInstruction::Binary {
-            op,
-            left,
-            right,
-            ty,
-            ..
-        }) => (*op, *left, *right, ty.clone()),
-        _ => return Recognition::SkipShape,
+    // The stored value is an elementwise expression over element reads
+    // at `i` and values the loop does not change.
+    let elem_ty = match value_type(func, store_value) {
+        Some(t) => t,
+        None => return Recognition::SkipShape,
     };
-
-    if !is_vectorizable_op(binary_op) {
-        return Recognition::SkipOp;
-    }
     if !is_vector_elem_type(&elem_ty) {
         return Recognition::SkipOp;
     }
 
-    let ptr_a = match resolve_load_through_gep(body, va, phi.result) {
-        Some(p) => p,
-        None => return Recognition::SkipShape,
-    };
-    let ptr_b = match resolve_load_through_gep(body, vb, phi.result) {
-        Some(p) => p,
-        None => return Recognition::SkipShape,
+    let mut accounted: Vec<HirId> = vec![store_ptr];
+    let expr = match build_vec_expr(
+        func,
+        body,
+        body_id,
+        header_id,
+        store_value,
+        phi.result,
+        &elem_ty,
+        0,
+        &mut accounted,
+    ) {
+        Ok(e) => e,
+        Err(VecReject::Op) => return Recognition::SkipOp,
+        Err(VecReject::Shape) => return Recognition::SkipShape,
     };
 
-    // 7. ptr_a / ptr_b / ptr_c must be loop-invariant — none of
-    //    them defined inside the loop body.
-    for p in [ptr_a, ptr_b, ptr_c] {
-        if defined_in_block(func, p, body_id) || defined_in_block(func, p, header_id) {
-            return Recognition::SkipShape;
+    // An expression of nothing but invariants belongs outside the loop.
+    if !expr.reads_memory() {
+        return Recognition::SkipShape;
+    }
+
+    // 7. The output base must name the same array on every iteration.
+    if defined_in_block(func, ptr_c, body_id) || defined_in_block(func, ptr_c, header_id) {
+        return Recognition::SkipShape;
+    }
+
+    // 8. The body is about to be replaced wholesale, so everything in
+    //    it has to be part of what the vector form recomputes. Anything
+    //    else, a second store or a call, would simply be dropped.
+    accounted.push(i_next);
+    for inst in &body.instructions {
+        if matches!(inst, HirInstruction::Store { .. }) {
+            continue;
+        }
+        match instruction_result(inst) {
+            Some(r) if accounted.contains(&r) => {}
+            _ => return Recognition::SkipShape,
         }
     }
 
@@ -382,10 +527,8 @@ fn recognise_saxpy(func: &HirFunction, lp: &NaturalLoop) -> Recognition {
         i_phi: phi.result,
         i_next,
         n,
-        binary_op,
+        expr,
         elem_ty,
-        ptr_a,
-        ptr_b,
         ptr_c,
         body_insts: body.instructions.clone(),
     })
@@ -557,19 +700,29 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
     //       vector equivalents, and bump i by 4 instead of 1.
     let elem_ty = pat.elem_ty.clone();
     let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), 4);
-    let va_vec_id = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
-    let vb_vec_id = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
-    let vc_vec_id = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
-    let addr_a_vec = create_value(
+
+    // Build the vector body ahead of installing it, so the broadcasts
+    // the expression needs can be collected for the preheader on the
+    // same walk.
+    let mut vec_body: Vec<HirInstruction> = Vec::new();
+    let mut vec_pre: Vec<HirInstruction> = Vec::new();
+    let vc_vec_id = emit_vec_expr(
         func,
-        HirType::Ptr(Box::new(elem_ty.clone())),
-        HirValueKind::Instruction,
+        &pat.expr,
+        &elem_ty,
+        &vec_ty,
+        pat.i_phi,
+        &mut vec_body,
+        &mut vec_pre,
     );
-    let addr_b_vec = create_value(
-        func,
-        HirType::Ptr(Box::new(elem_ty.clone())),
-        HirValueKind::Instruction,
-    );
+
+    // The broadcasts go ahead of the loop, after the vector bound the
+    // preheader already computes.
+    if !vec_pre.is_empty() {
+        let pre_blk = func.blocks.get_mut(&pat.preheader).unwrap();
+        pre_blk.instructions.append(&mut vec_pre);
+    }
+
     let addr_c_vec = create_value(
         func,
         HirType::Ptr(Box::new(elem_ty.clone())),
@@ -589,37 +742,7 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
     {
         let body_blk = func.blocks.get_mut(&pat.body).unwrap();
         body_blk.instructions.clear();
-        body_blk.instructions.push(HirInstruction::GetElementPtr {
-            result: addr_a_vec,
-            ty: HirType::Ptr(Box::new(elem_ty.clone())),
-            ptr: pat.ptr_a,
-            indices: vec![pat.i_phi],
-        });
-        body_blk.instructions.push(HirInstruction::VectorLoad {
-            result: va_vec_id,
-            ty: vec_ty.clone(),
-            ptr: addr_a_vec,
-            align: elem_size,
-        });
-        body_blk.instructions.push(HirInstruction::GetElementPtr {
-            result: addr_b_vec,
-            ty: HirType::Ptr(Box::new(elem_ty.clone())),
-            ptr: pat.ptr_b,
-            indices: vec![pat.i_phi],
-        });
-        body_blk.instructions.push(HirInstruction::VectorLoad {
-            result: vb_vec_id,
-            ty: vec_ty.clone(),
-            ptr: addr_b_vec,
-            align: elem_size,
-        });
-        body_blk.instructions.push(HirInstruction::Binary {
-            op: pat.binary_op,
-            result: vc_vec_id,
-            ty: vec_ty.clone(),
-            left: va_vec_id,
-            right: vb_vec_id,
-        });
+        body_blk.instructions.append(&mut vec_body);
         body_blk.instructions.push(HirInstruction::GetElementPtr {
             result: addr_c_vec,
             ty: HirType::Ptr(Box::new(elem_ty.clone())),
@@ -750,6 +873,67 @@ fn elem_size_bytes(ty: &HirType) -> u64 {
         HirType::I32 | HirType::U32 | HirType::F32 => 4,
         HirType::I64 | HirType::U64 | HirType::F64 => 8,
         _ => 4,
+    }
+}
+
+/// Emit the vector form of `expr`, and return the value holding it.
+///
+/// Element reads and arithmetic append to `body`. A broadcast appends to
+/// `pre` instead: the value it splats is the same on every iteration, so
+/// repeating it per iteration would be waste the loop cannot remove.
+fn emit_vec_expr(
+    func: &mut HirFunction,
+    expr: &VecExpr,
+    elem_ty: &HirType,
+    vec_ty: &HirType,
+    i_phi: HirId,
+    body: &mut Vec<HirInstruction>,
+    pre: &mut Vec<HirInstruction>,
+) -> HirId {
+    match expr {
+        VecExpr::Load(ptr) => {
+            let addr = create_value(
+                func,
+                HirType::Ptr(Box::new(elem_ty.clone())),
+                HirValueKind::Instruction,
+            );
+            let out = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+            body.push(HirInstruction::GetElementPtr {
+                result: addr,
+                ty: HirType::Ptr(Box::new(elem_ty.clone())),
+                ptr: *ptr,
+                indices: vec![i_phi],
+            });
+            body.push(HirInstruction::VectorLoad {
+                result: out,
+                ty: vec_ty.clone(),
+                ptr: addr,
+                align: elem_size_bytes(elem_ty) as u32,
+            });
+            out
+        }
+        VecExpr::Splat(scalar) => {
+            let out = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+            pre.push(HirInstruction::VectorSplat {
+                result: out,
+                ty: vec_ty.clone(),
+                scalar: *scalar,
+            });
+            out
+        }
+        VecExpr::Binary(op, l, r) => {
+            let lv = emit_vec_expr(func, l, elem_ty, vec_ty, i_phi, body, pre);
+            let rv = emit_vec_expr(func, r, elem_ty, vec_ty, i_phi, body, pre);
+            let out = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+            body.push(HirInstruction::Binary {
+                op: *op,
+                result: out,
+                ty: vec_ty.clone(),
+                left: lv,
+                right: rv,
+            });
+            out
+        }
     }
 }
 

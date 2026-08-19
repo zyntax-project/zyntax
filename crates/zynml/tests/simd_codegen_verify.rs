@@ -118,6 +118,16 @@ def isum(a: Ptr<i32>): i32 {
 }
 "#;
 
+const SCALED_UPDATE: &str = r#"
+import prelude
+import simd
+def axpy(y: Ptr<f32>, x: Ptr<f32>, alpha: f32, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n { y[i] = alpha * x[i] + y[i] i = i + 1 }
+    return n
+}
+"#;
+
 /// A scalar loop the vectorizer rewrote must add four lanes at a time,
 /// not one.
 #[test]
@@ -145,4 +155,18 @@ fn a_multiply_and_add_fuse() {
 #[test]
 fn an_integer_reduction_uses_the_horizontal_add() {
     assert_folds(INT_REDUCE, "isum", "addv", "vphaddd");
+}
+
+/// A scaled update carries a loop-invariant scalar, so the widened loop
+/// has to broadcast it and then fuse the multiply and add into one
+/// vector instruction. Reaching the fused mnemonic proves both halves:
+/// the loop widened, and the contraction still applied afterwards.
+///
+/// On AArch64 the broadcast disappears into the instruction rather than
+/// preceding it: the emitted form is the by-element
+/// `fmla v2.4s, v2.4s, v1.4s, v0.s[0]`, which takes the multiplier from
+/// one lane of a register, so no separate `dup` is issued at all.
+#[test]
+fn a_scaled_update_fuses_across_four_lanes() {
+    assert_folds(SCALED_UPDATE, "axpy", "fmla", "vfmadd");
 }
