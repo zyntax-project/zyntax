@@ -51,6 +51,8 @@
 
 use std::ffi::{CStr, OsStr};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::hir::HirType;
 
@@ -2187,5 +2189,159 @@ mod tests {
             std::mem::size_of::<ZrtlInfo>(),
             std::mem::size_of::<u32>() + std::mem::size_of::<*const u8>() + 4 // padding
         );
+    }
+}
+
+// ── Data-parallel band dispatch ───────────────────────────────────
+//
+// Spreading a counted loop across cores is worth doing only where the
+// iterations do not interfere, which the compiler decides
+// (`parallel_safe`). This is the other half: given a range and a
+// function that computes one band of it, run the bands on several
+// threads and return when all have finished.
+//
+// The pool is created once and its workers live for the process. A
+// dispatch hands each worker a band and waits. Work is claimed from a
+// shared cursor rather than split into equal shares, because a machine
+// with both fast and slow cores finishes an equal split at the pace of
+// its slowest.
+//
+// **The blocking is load-bearing, not a simplification.** A captured
+// environment is a stack slot: `CreateClosure` allocates one in the
+// caller's frame and does not check whether it escapes. So an `env`
+// handed to a worker is only valid while the caller is still in the
+// frame that built it. Blocking is what makes that true. A dispatch
+// that returned before its bands finished, or handed work to something
+// detached, would give a worker a pointer into a frame that had gone.
+// Anything of that shape has to wait for captured environments to be
+// heap-allocated when they escape.
+
+/// A band of a counted loop: `[lo, hi)`, plus whatever the body needs.
+///
+/// The pointer is opaque here. It addresses the caller's own storage,
+/// which outlives the dispatch because the dispatch blocks.
+pub type BandFn = unsafe extern "C" fn(lo: i64, hi: i64, env: *mut u8);
+
+struct Job {
+    band: BandFn,
+    env: usize,
+    cursor: AtomicI64,
+    hi: i64,
+    chunk: i64,
+    remaining: AtomicUsize,
+}
+
+// The env pointer is the caller's, and the caller is blocked for the
+// whole dispatch, so every worker sees storage that cannot move.
+unsafe impl Send for Job {}
+unsafe impl Sync for Job {}
+
+struct Pool {
+    tx: Vec<std::sync::mpsc::Sender<Arc<Job>>>,
+    done: Arc<(Mutex<()>, Condvar)>,
+}
+
+static POOL: OnceLock<Pool> = OnceLock::new();
+
+/// How many workers to run. One per core the machine reports, capped so
+/// a very large machine does not pay more in dispatch than it saves.
+fn worker_count() -> usize {
+    std::env::var("ZYNTAX_PARALLEL_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(4)
+        .clamp(1, 32)
+}
+
+fn pool() -> &'static Pool {
+    POOL.get_or_init(|| {
+        let n = worker_count();
+        let done = Arc::new((Mutex::new(()), Condvar::new()));
+        let mut tx = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (s, r) = std::sync::mpsc::channel::<Arc<Job>>();
+            tx.push(s);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while let Ok(job) = r.recv() {
+                    run_bands(&job);
+                    // The last worker out wakes the caller.
+                    if job.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        let (lock, cv) = &*done;
+                        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        cv.notify_all();
+                    }
+                }
+            });
+        }
+        Pool { tx, done }
+    })
+}
+
+/// Claim bands from the shared cursor until the range is exhausted.
+fn run_bands(job: &Job) {
+    loop {
+        let lo = job.cursor.fetch_add(job.chunk, Ordering::Relaxed);
+        if lo >= job.hi {
+            return;
+        }
+        let hi = (lo + job.chunk).min(job.hi);
+        // Safety: the caller is blocked for the whole dispatch, so `env`
+        // addresses storage that is still alive, and the compiler only
+        // emits this for loops whose iterations touch disjoint memory.
+        unsafe { (job.band)(lo, hi, job.env as *mut u8) };
+    }
+}
+
+/// Run `band` over `[lo, hi)` across the pool, returning once every part
+/// of the range has been computed exactly once.
+///
+/// Falls back to running the whole range on this thread where there is
+/// too little work to be worth handing out, so a short loop does not pay
+/// for threads it cannot use.
+///
+/// # Safety
+/// `band` must be a valid function pointer and `env` must remain valid
+/// for the call, which it does because this blocks.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_parallel_for(lo: i64, hi: i64, band: BandFn, env: *mut u8) {
+    let total = hi - lo;
+    if total <= 0 {
+        return;
+    }
+    let workers = worker_count();
+    // Below this there is nothing to gain: the dispatch costs more than
+    // the iterations do.
+    const MIN_PER_WORKER: i64 = 1024;
+    if workers < 2 || total < MIN_PER_WORKER * 2 {
+        band(lo, hi, env);
+        return;
+    }
+
+    // Bands smaller than the even split, so a worker that finishes early
+    // takes more instead of idling.
+    let chunk = ((total / (workers as i64 * 4)).max(MIN_PER_WORKER)).min(total);
+    let p = pool();
+    let job = Arc::new(Job {
+        band,
+        env: env as usize,
+        cursor: AtomicI64::new(lo),
+        hi,
+        chunk,
+        remaining: AtomicUsize::new(p.tx.len()),
+    });
+    for s in &p.tx {
+        // A worker that has gone away leaves its share on the cursor for
+        // the others, so a send failure is not fatal.
+        let _ = s.send(Arc::clone(&job));
+    }
+    // The calling thread takes bands too rather than waiting idle.
+    run_bands(&job);
+
+    let (lock, cv) = &*p.done;
+    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while job.remaining.load(Ordering::Acquire) > 0 {
+        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
     }
 }
