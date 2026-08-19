@@ -34,6 +34,70 @@ fn kernels() -> Vec<PathBuf> {
     v
 }
 
+/// A second pass over the same kernels must not cost what the first
+/// did. Whatever the first pass paid for compilation and allocator
+/// arenas is already paid, so growth on the second is storage a program
+/// actually kept.
+///
+/// Before the drop-site work, one pass grew 219 MB, nearly all of it
+/// programs that allocated per iteration and released nothing. The
+/// bound here is generous: it is not measuring the residue, it is there
+/// to fail loudly if a per-iteration leak comes back.
+#[test]
+fn a_second_pass_does_not_cost_what_the_first_did() {
+    let files = kernels();
+    for f in &files {
+        if let Ok(src) = std::fs::read_to_string(f) {
+            if let Ok(mut rt) = ZynML::new() {
+                if rt.load_source(&src).is_ok() {
+                    let _ = rt.call_with_result::<i64>("main");
+                }
+            }
+        }
+    }
+    let after_first = rss_mb();
+    for f in &files {
+        if let Ok(src) = std::fs::read_to_string(f) {
+            if let Ok(mut rt) = ZynML::new() {
+                if rt.load_source(&src).is_ok() {
+                    let _ = rt.call_with_result::<i64>("main");
+                }
+            }
+        }
+    }
+    let after_second = rss_mb();
+    println!("\n  after pass 1: {after_first} MB");
+    println!("  after pass 2: {after_second} MB");
+    let growth = after_second as i64 - after_first as i64;
+    println!("  second-pass growth: {growth} MB");
+
+    assert!(
+        growth < 60,
+        "a second pass grew {growth} MB, which is the shape of a program \
+         allocating per iteration and releasing nothing"
+    );
+
+    // Attribute what is left, now that first-time costs are paid.
+    println!("\n  third pass, per kernel:");
+    let mut prev = rss_mb();
+    for f in &files {
+        let name = f.file_stem().unwrap().to_string_lossy().to_string();
+        if let Ok(src) = std::fs::read_to_string(f) {
+            if let Ok(mut rt) = ZynML::new() {
+                if rt.load_source(&src).is_ok() {
+                    let _ = rt.call_with_result::<i64>("main");
+                }
+            }
+        }
+        let now = rss_mb();
+        let d = now as i64 - prev as i64;
+        if d != 0 {
+            println!("    {name:<34}{d:>6} MB");
+        }
+        prev = now;
+    }
+}
+
 #[test]
 fn report_memory_per_kernel() {
     let base = rss_mb();
