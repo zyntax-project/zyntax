@@ -1,0 +1,285 @@
+// One transformer layer's prefill: the compute-bound phase of serving a
+// prompt.
+//
+// Prefill runs every token of the prompt through the layer at once, so
+// the work is dense matrix multiply with high arithmetic intensity. That
+// is what makes it the honest place to measure a parallel dispatch: the
+// decode steps that follow move one token at a time and are bound by
+// weight bandwidth, where spreading work across cores buys almost
+// nothing.
+//
+// Everything here is written in the language, including the exponential
+// the attention softmax needs. That is not only a rule about where FFI
+// belongs; it also makes the answer identical on every backend, because
+// no tier gets to substitute its own libm.
+//
+// Shapes are a small model at a short prompt: 128 tokens, 256 channels,
+// 4 heads of 64, and a 1024-wide feed-forward block. Roughly 218 MFLOP
+// per pass, dominated by the six matrix multiplies.
+import prelude
+import simd
+
+// out[m, n] = a[m, k] . b[k, n]
+def gemm(out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < m {
+        let mut j: i64 = 0
+        while j < n {
+            let mut acc: f32 = 0.0
+            let mut p: i64 = 0
+            while p < k {
+                acc = acc + a[i * k + p] * b[p * n + j]
+                p = p + 1
+            }
+            out[i * n + j] = acc
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// out[m, n] = a[m, k] . b[n, k]^T, which is how attention scores are
+// formed: both operands are laid out by row, so the second is read
+// along its rows rather than down its columns.
+def gemm_nt(out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64, scale: f32): i64 {
+    let mut i: i64 = 0
+    while i < m {
+        let mut j: i64 = 0
+        while j < n {
+            let mut acc: f32 = 0.0
+            let mut p: i64 = 0
+            while p < k {
+                acc = acc + a[i * k + p] * b[j * k + p]
+                p = p + 1
+            }
+            out[i * n + j] = acc * scale
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// exp by repeated squaring of (1 + x/1024), which is the limit form
+// carried far enough to be worth its cost.
+//
+// Softmax subtracts the row maximum first, so the argument is never
+// positive, and anything below -30 contributes nothing a f32 sum can
+// see. Clamping there keeps the base positive, which is what makes the
+// squarings monotone. Ten of them is 1024, giving about four correct
+// digits over the whole range: more than a probability weight needs,
+// and the same arithmetic on every tier.
+def fast_exp(x: f32): f32 {
+    let mut t: f32 = x
+    if t < -30.0 { t = -30.0 }
+    let mut r: f32 = 1.0 + t * 0.0009765625
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    return r
+}
+
+// Softmax along each row, in place. The maximum is taken out first so
+// the exponential never overflows, which is what every attention
+// implementation does and is also what bounds the argument for the
+// approximation above.
+def softmax_rows(x: Ptr<f32>, rows: i64, cols: i64): i64 {
+    let mut i: i64 = 0
+    while i < rows {
+        let mut top: f32 = -1000000.0
+        let mut j: i64 = 0
+        while j < cols {
+            let v: f32 = x[i * cols + j]
+            if v > top { top = v }
+            j = j + 1
+        }
+        let mut total: f32 = 0.0
+        let mut e: i64 = 0
+        while e < cols {
+            let w: f32 = fast_exp(x[i * cols + e] - top)
+            x[i * cols + e] = w
+            total = total + w
+            e = e + 1
+        }
+        let inv: f32 = 1.0 / total
+        let mut s: i64 = 0
+        while s < cols {
+            x[i * cols + s] = x[i * cols + s] * inv
+            s = s + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Copy one head's slice out of the packed [tokens, channels] layout so
+// the attention matmuls see a contiguous [tokens, head_dim] block.
+def take_head(dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i64, dim: i64): i64 {
+    let base: i64 = head * dim
+    let mut i: i64 = 0
+    while i < tokens {
+        let mut j: i64 = 0
+        while j < dim {
+            dst[i * dim + j] = src[i * channels + base + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// And put it back, once that head has been attended.
+def put_head(dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i64, dim: i64): i64 {
+    let base: i64 = head * dim
+    let mut i: i64 = 0
+    while i < tokens {
+        let mut j: i64 = 0
+        while j < dim {
+            dst[i * channels + base + j] = src[i * dim + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+def relu(x: Ptr<f32>, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        if x[i] < 0.0 { x[i] = 0.0 }
+        i = i + 1
+    }
+    return n
+}
+
+def add_into(dst: Ptr<f32>, src: Ptr<f32>, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        dst[i] = dst[i] + src[i]
+        i = i + 1
+    }
+    return n
+}
+
+// A deterministic spread of small values, scaled by a power of two so
+// nothing here introduces rounding of its own. Weights are scaled the
+// way an initialiser would scale them, small enough that six matrix
+// multiplies in sequence leave the activations near one instead of
+// growing by the fan-in each time.
+def fill_pattern(p: Ptr<f32>, n: i64, seed: i64, scale: f32): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        let m: i64 = (i * 7 + seed * 13) % 8
+        p[i] = ((m as f32) - 4.0) * scale
+        i = i + 1
+    }
+    return n
+}
+
+def main(): i64 {
+    let tokens: i64 = 128
+    let channels: i64 = 256
+    let heads: i64 = 4
+    let dim: i64 = 64
+    let ff: i64 = 1024
+
+    let x: Ptr<f32> = alloc_f32(tokens * channels)
+    let wq: Ptr<f32> = alloc_f32(channels * channels)
+    let wk: Ptr<f32> = alloc_f32(channels * channels)
+    let wv: Ptr<f32> = alloc_f32(channels * channels)
+    let wo: Ptr<f32> = alloc_f32(channels * channels)
+    let w1: Ptr<f32> = alloc_f32(channels * ff)
+    let w2: Ptr<f32> = alloc_f32(ff * channels)
+
+    let q: Ptr<f32> = alloc_f32(tokens * channels)
+    let k: Ptr<f32> = alloc_f32(tokens * channels)
+    let v: Ptr<f32> = alloc_f32(tokens * channels)
+    let ctx: Ptr<f32> = alloc_f32(tokens * channels)
+    let proj: Ptr<f32> = alloc_f32(tokens * channels)
+    let hidden: Ptr<f32> = alloc_f32(tokens * ff)
+    let out: Ptr<f32> = alloc_f32(tokens * channels)
+
+    let qh: Ptr<f32> = alloc_f32(tokens * dim)
+    let kh: Ptr<f32> = alloc_f32(tokens * dim)
+    let vh: Ptr<f32> = alloc_f32(tokens * dim)
+    let oh: Ptr<f32> = alloc_f32(tokens * dim)
+    let scores: Ptr<f32> = alloc_f32(tokens * tokens)
+
+    let f0: i64 = fill_pattern(x, tokens * channels, 1, 0.125)
+    let f1: i64 = fill_pattern(wq, channels * channels, 2, 0.015625)
+    let f2: i64 = fill_pattern(wk, channels * channels, 3, 0.015625)
+    let f3: i64 = fill_pattern(wv, channels * channels, 4, 0.015625)
+    let f4: i64 = fill_pattern(wo, channels * channels, 5, 0.015625)
+    let f5: i64 = fill_pattern(w1, channels * ff, 6, 0.015625)
+    let f6: i64 = fill_pattern(w2, ff * channels, 7, 0.0078125)
+
+    // Every token projected to queries, keys and values at once. This is
+    // the part decode cannot do: one token at a time, these are
+    // matrix-vector products and the weights dominate the traffic.
+    let g0: i64 = gemm(q, x, wq, tokens, channels, channels)
+    let g1: i64 = gemm(k, x, wk, tokens, channels, channels)
+    let g2: i64 = gemm(v, x, wv, tokens, channels, channels)
+
+    let scale: f32 = 0.125
+    let mut h: i64 = 0
+    while h < heads {
+        let t0: i64 = take_head(qh, q, tokens, channels, h, dim)
+        let t1: i64 = take_head(kh, k, tokens, channels, h, dim)
+        let t2: i64 = take_head(vh, v, tokens, channels, h, dim)
+        let s0: i64 = gemm_nt(scores, qh, kh, tokens, dim, tokens, scale)
+        let s1: i64 = softmax_rows(scores, tokens, tokens)
+        let s2: i64 = gemm(oh, scores, vh, tokens, tokens, dim)
+        let t3: i64 = put_head(ctx, oh, tokens, channels, h, dim)
+        h = h + 1
+    }
+
+    let g3: i64 = gemm(proj, ctx, wo, tokens, channels, channels)
+    let r0: i64 = add_into(proj, x, tokens * channels)
+
+    let g4: i64 = gemm(hidden, proj, w1, tokens, channels, ff)
+    let r1: i64 = relu(hidden, tokens * ff)
+    let g5: i64 = gemm(out, hidden, w2, tokens, ff, channels)
+    let r2: i64 = add_into(out, proj, tokens * channels)
+
+    // A checksum over the layer's output, summed as magnitudes so the
+    // signs do not cancel it away, and divided down so that the answer
+    // is coarse against the last-bit differences two tiers can have.
+    // The kernel is not exact arithmetic and does not pretend to be:
+    // the softmax divides, so no choice of inputs makes every
+    // intermediate representable.
+    let mut total: f32 = 0.0
+    let mut i: i64 = 0
+    while i < tokens * channels {
+        let e: f32 = out[i]
+        if e < 0.0 { total = total - e } else { total = total + e }
+        i = i + 1
+    }
+    free(x)
+    free(wq)
+    free(wk)
+    free(wv)
+    free(wo)
+    free(w1)
+    free(w2)
+    free(q)
+    free(k)
+    free(v)
+    free(ctx)
+    free(proj)
+    free(hidden)
+    free(out)
+    free(qh)
+    free(kh)
+    free(vh)
+    free(oh)
+    free(scores)
+    return ((total * 0.0009765625) as i64)
+}

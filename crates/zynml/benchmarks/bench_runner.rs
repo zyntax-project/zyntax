@@ -250,6 +250,11 @@ const KERNELS: &[Kernel] = &[
     Kernel::new("bench_tensor_axpy", "Int(2)"),
     Kernel::new("bench_tensor_dot", "Int(8388608)"),
     Kernel::new("bench_tensor_matmul", "Int(2048)"),
+    // One transformer layer's prefill. The tensor kernels above each
+    // isolate one shape; this is what a real workload looks like once
+    // they are composed, and the phase of serving a prompt where the
+    // work is dense enough for spreading it across cores to pay.
+    Kernel::new("bench_llm_prefill", "Int(806)"),
     Kernel::new("bench_collatz", "Int(35669673)"),
     Kernel::new("bench_branchy", "Int(140)"),
 ];
@@ -354,6 +359,7 @@ const TARGETS: &[Target] = &[
             "collatz",
             "branchy",
             "tensor_matmul",
+            "llm_prefill",
         ],
     },
     Target {
@@ -372,6 +378,7 @@ const TARGETS: &[Target] = &[
             "collatz",
             "branchy",
             "tensor_matmul",
+            "llm_prefill",
         ],
     },
     Target {
