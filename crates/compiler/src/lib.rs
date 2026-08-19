@@ -58,6 +58,7 @@ pub mod memory_pass;
 pub mod monomorphize;
 pub mod move_insert; // Owning parameters become `Move` the borrow check can see
 pub mod optimization;
+pub mod parallel_safe; // Which counted loops have independent iterations
 pub mod pattern_matching;
 pub mod phi_prune;
 pub mod pure_call_pre;
