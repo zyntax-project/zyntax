@@ -53,16 +53,16 @@ pub fn run_module(module: &mut HirModule) -> PhiPruneStats {
 /// Run the pass over a single function.
 pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
     let mut stats = PhiPruneStats::default();
-    // One removal can orphan another phi (a dead phi may have been the
-    // only reader of a second one), so iterate. The bound is generous;
-    // convergence is typically one or two rounds.
+    // Removing a phi can make a trivial phi collapsible and vice versa,
+    // so iterate. The bound is generous; convergence is typically one or
+    // two rounds.
     for _ in 0..16 {
         stats.rounds += 1;
-        let used = collect_used_values(func);
+        let live = live_phis(func);
         let mut removed_this_round = 0;
         for block in func.blocks.values_mut() {
             let before = block.phis.len();
-            block.phis.retain(|p| used.contains(&p.result));
+            block.phis.retain(|p| live.contains(&p.result));
             removed_this_round += before - block.phis.len();
         }
         removed_this_round += collapse_trivial_phis(func);
@@ -148,23 +148,63 @@ fn collapse_trivial_phis(func: &mut HirFunction) -> usize {
     removed
 }
 
-/// Every value id read anywhere in the function: instruction operands,
-/// terminator operands, and phi incoming values. A phi result absent from
-/// this set is written but never observed.
-fn collect_used_values(func: &HirFunction) -> HashSet<HirId> {
-    let mut used = HashSet::new();
+/// Which phi results a real instruction can observe.
+///
+/// Asking "is this phi's result mentioned anywhere" is the wrong
+/// question, because phis can hold each other up. Nested loops leave
+/// exactly that: SSA construction gives the outer header a phi for every
+/// variable the inner loop writes, the inner header takes it as its
+/// incoming from outside, and the inner one reinitialises before reading,
+/// so the two name each other and nothing else names either. Both look
+/// used, so neither is ever dropped, and a three-deep loop nest keeps a
+/// register per level for values no instruction reads.
+///
+/// So it is answered the other way round. Nothing is live until an
+/// instruction or a terminator reads it; a phi reached only through other
+/// phis becomes live only once one of those is. A cycle no real reader
+/// enters is never marked, and the whole cycle is dropped together. That
+/// is also why the set is computed in full before anything is removed:
+/// taking one member out first would leave the rest naming a value that
+/// no longer exists.
+fn live_phis(func: &HirFunction) -> HashSet<HirId> {
+    // Where each phi result is defined, and what it names as incomings.
+    let mut incomings: HashMap<HirId, Vec<HirId>> = HashMap::new();
     for block in func.blocks.values() {
         for phi in &block.phis {
-            for (value, _) in &phi.incoming {
-                used.insert(*value);
+            incomings.insert(phi.result, phi.incoming.iter().map(|(v, _)| *v).collect());
+        }
+    }
+
+    // Seed with the phis an instruction or terminator reads directly.
+    let mut read = HashSet::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            collect_inst_operands(inst, &mut read);
+        }
+        collect_terminator_operands(&block.terminator, &mut read);
+    }
+
+    let mut live: HashSet<HirId> = HashSet::new();
+    let mut work: Vec<HirId> = read
+        .iter()
+        .filter(|v| incomings.contains_key(v))
+        .copied()
+        .collect();
+    live.extend(work.iter().copied());
+
+    // A live phi's incomings are observable through it, so any phi among
+    // them is live too.
+    while let Some(v) = work.pop() {
+        let Some(sources) = incomings.get(&v) else {
+            continue;
+        };
+        for &src in sources {
+            if incomings.contains_key(&src) && live.insert(src) {
+                work.push(src);
             }
         }
-        for inst in &block.instructions {
-            collect_inst_operands(inst, &mut used);
-        }
-        collect_terminator_operands(&block.terminator, &mut used);
     }
-    used
+    live
 }
 
 fn collect_inst_operands(inst: &HirInstruction, used: &mut HashSet<HirId>) {
@@ -347,10 +387,11 @@ mod tests {
         assert_eq!(f.blocks[&entry].phis.len(), 1);
     }
 
-    /// A phi read only by another (dead) phi goes too — this is why the
-    /// pass iterates rather than making a single sweep.
+    /// A phi read only by another dead phi goes too, and the whole
+    /// chain goes at once. Liveness is decided before anything is
+    /// removed, so the length of the chain costs no extra rounds.
     #[test]
-    fn phi_chain_collapses_to_fixed_point() {
+    fn a_chain_of_unread_phis_goes_in_one_sweep() {
         let (mut f, entry) = mk();
         let seed = val(&mut f);
         let first = val(&mut f);
@@ -372,7 +413,6 @@ mod tests {
         let stats = run_function(&mut f);
         assert_eq!(stats.removed, 2, "both phis should go");
         assert!(f.blocks[&entry].phis.is_empty());
-        assert!(stats.rounds >= 2, "removal should need more than one round");
     }
 
     /// A phi feeding a real instruction is never dropped.
