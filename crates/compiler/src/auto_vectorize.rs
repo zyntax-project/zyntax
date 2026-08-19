@@ -328,6 +328,24 @@ impl AutoVectorizePass {
         let mut elem_ty_hint: Option<HirType> = None;
 
         for inst in &body.instructions {
+            // Widening something computed from the counter would need
+            // the counter itself as a vector, holding `i, i+1, i+2,
+            // i+3`. This pass never builds one: it widens an
+            // instruction by retyping its result and leaving its
+            // operands alone, which for a read of the counter leaves a
+            // scalar feeding a vector and writes one lane's answer into
+            // four.
+            //
+            // Indexing is the exception, because a GEP at the counter
+            // is precisely what the address of a vector load or store
+            // means, and so is the counter's own increment, which is
+            // rewritten to step by the lane count further down.
+            if !matches!(inst, HirInstruction::GetElementPtr { .. })
+                && instruction_result(inst) != Some(iv.next)
+                && mentions(inst, iv.phi)
+            {
+                return LoopOutcome::RejectShape("value computed from the counter");
+            }
             match inst {
                 HirInstruction::Binary { op, ty, result, .. } => {
                     // Skip the IV increment itself + reduction
@@ -1194,7 +1212,57 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         exit_blk.predecessors.push(scalar_check);
     }
 
-    // Suppress unused warnings on vec_ty / lane helper.
+    // Move the accumulator's outside-the-loop uses onto the tail.
+    //
+    // Widening the accumulator retyped its header phi to a vector, and
+    // that phi holds partial sums, one per lane. Whatever read the
+    // accumulator after the loop wants the whole sum, which is what the
+    // horizontal reduce feeds into the tail: the tail's phi is the only
+    // value that is both scalar and final. Leaving those reads on the
+    // vector phi is not a slower answer, it is a differently typed one,
+    // and it reaches the backend as a vector where a float was asked
+    // for.
+    //
+    // The edge has to move with the value. The exit used to arrive from
+    // the vector header and now arrives from the tail's test, so a phi
+    // there naming the old block would be naming an edge that no longer
+    // exists.
+    if !plan.reductions.is_empty() {
+        let mut onto_tail: IndexMap<HirId, HirId> = IndexMap::new();
+        for (idx, red) in plan.reductions.iter().enumerate() {
+            onto_tail.insert(red.phi, scalar_reduction_phi[idx]);
+        }
+        let epilogue = [Some(plan.header), Some(plan.body), post_vec_id];
+        let elsewhere: Vec<HirId> = func
+            .blocks
+            .keys()
+            .copied()
+            .filter(|b| {
+                *b != scalar_check && *b != scalar_body && !epilogue.iter().any(|x| *x == Some(*b))
+            })
+            .collect();
+        for b in elsewhere {
+            let Some(blk) = func.blocks.get_mut(&b) else {
+                continue;
+            };
+            for phi in &mut blk.phis {
+                for (value, from) in &mut phi.incoming {
+                    if *from == plan.header {
+                        *from = scalar_check;
+                    }
+                    if let Some(&tail) = onto_tail.get(value) {
+                        *value = tail;
+                    }
+                }
+            }
+            for inst in &mut blk.instructions {
+                inst.replace_uses(&onto_tail);
+            }
+            blk.terminator.replace_uses(&onto_tail);
+        }
+    }
+
+    // Suppress unused warnings on the lane helper.
     let _ = vec_ty;
     let _ = reduction_phi_subs;
 }
@@ -1226,6 +1294,25 @@ fn create_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirI
         },
     );
     id
+}
+
+/// Whether `inst` reads `value`.
+///
+/// Read off the debug rendering, which names every `HirId` the
+/// instruction holds. Enumerating operands by hand would mean a new
+/// instruction shape silently reading the counter until someone
+/// remembered to add it, and the cost of that is a miscompile rather
+/// than a missed loop. A result id can appear here too, which only ever
+/// makes the answer more cautious: the caller asks about a phi result,
+/// and no instruction defines one.
+fn mentions(inst: &HirInstruction, value: HirId) -> bool {
+    let needle = format!("{value:?}");
+    let text = format!("{inst:?}");
+    let bytes = text.as_bytes();
+    let n = needle.as_bytes();
+    // A whole-id match, so `HirId(1)` does not answer for `HirId(12)`.
+    text.match_indices(&needle)
+        .any(|(at, _)| bytes.get(at + n.len()).is_none_or(|c| !c.is_ascii_digit()))
 }
 
 fn instruction_result(inst: &HirInstruction) -> Option<HirId> {
