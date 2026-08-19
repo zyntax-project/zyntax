@@ -1085,6 +1085,22 @@ const fn params4(a: TypeTag, b: TypeTag, c: TypeTag, d: TypeTag) -> [TypeTag; MA
     p
 }
 
+const fn params5(
+    a: TypeTag,
+    b: TypeTag,
+    c: TypeTag,
+    d: TypeTag,
+    e: TypeTag,
+) -> [TypeTag; MAX_PARAMS] {
+    let mut p = empty_params();
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+    p[4] = e;
+    p
+}
+
 #[allow(clippy::too_many_arguments)]
 const fn params6(
     a: TypeTag,
@@ -1400,6 +1416,16 @@ pub fn box_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolInf
     let no_flags = ZrtlSigFlags::NONE;
     let entries: &[(&'static str, *const u8, ZrtlSymbolSig)] = &[
         (
+            "zyntax_parallel_for",
+            zyntax_compiler::zrtl::zyntax_parallel_for as *const u8,
+            ZrtlSymbolSig {
+                param_count: 5,
+                flags: no_flags,
+                return_type: i64_tag(),
+                params: params5(i64_tag(), i64_tag(), i64_tag(), ptr_tag(), ptr_tag()),
+            },
+        ),
+        (
             "zyntax_box_i32",
             zyntax_compiler::zrtl::zyntax_box_i32 as *const u8,
             ZrtlSymbolSig {
@@ -1554,6 +1580,16 @@ pub fn register_box_runtime_symbols(runtime: &mut crate::runtime::ZyntaxRuntime)
 
     // Box constructors: take a primitive, return a *mut DynamicBox
     // (pointer-sized — `ptr_tag()` in the runtime FFI surface).
+    runtime.register_function_typed(
+        "zyntax_parallel_for",
+        zyntax_compiler::zrtl::zyntax_parallel_for as *const u8,
+        ZrtlSymbolSig {
+            param_count: 5,
+            flags: no_flags,
+            return_type: i64_tag(),
+            params: params5(i64_tag(), i64_tag(), i64_tag(), ptr_tag(), ptr_tag()),
+        },
+    );
     runtime.register_function_typed(
         "zyntax_box_i32",
         zyntax_compiler::zrtl::zyntax_box_i32 as *const u8,

@@ -59,6 +59,7 @@ pub mod memory_pass;
 pub mod monomorphize;
 pub mod move_insert; // Owning parameters become `Move` the borrow check can see
 pub mod optimization;
+pub mod parallel_dispatch; // A loop with independent iterations becomes a band dispatch
 pub mod parallel_safe; // Which counted loops have independent iterations
 pub mod pattern_matching;
 pub mod phi_prune;
@@ -1808,6 +1809,20 @@ pub fn compile_module_to_llvm_ir(module: &HirModule, name: &str) -> CompilerResu
     let context = inkwell::context::Context::create();
     let mut backend = llvm_backend::LLVMBackend::new(&context, name);
     backend.compile_module(module)
+}
+
+/// Passes that only make sense for code a backend will compile.
+///
+/// The dispatch a spread loop becomes hands a function pointer to the
+/// runtime, and a bytecode interpreter has no address to hand over. So
+/// this is separate from [`run_interp_safe_opts`] by necessity rather
+/// than by taste: run it where the module is on its way to machine
+/// code, and nowhere else.
+///
+/// Runs after the interp-safe pipeline, because moving a loop into a
+/// function of its own is the last thing that should happen to it.
+pub fn run_native_only_opts(module: &mut HirModule) -> parallel_dispatch::DispatchStats {
+    parallel_dispatch::run_module(module)
 }
 
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {

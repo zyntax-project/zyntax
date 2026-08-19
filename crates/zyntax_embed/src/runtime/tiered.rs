@@ -502,6 +502,7 @@ impl TieredRuntime {
         // `ZYNTAX_DISABLE_INTERP_OPTS=1`.)
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut module);
+            zyntax_compiler::run_native_only_opts(&mut module);
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&module, "post-opt-tiered-compile_module");
 
@@ -1180,6 +1181,7 @@ impl TieredRuntime {
         apply_krio_fiber_lowering(&mut hir_module);
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
+            zyntax_compiler::run_native_only_opts(&mut hir_module);
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&hir_module, "post-opt-typed-program");
         let report = self
@@ -2149,6 +2151,7 @@ impl TieredRuntime {
         // changed.
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut hir_module);
+            zyntax_compiler::run_native_only_opts(&mut hir_module);
         }
 
         let report = self

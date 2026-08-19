@@ -10,6 +10,12 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use zyntax_compiler::zrtl::zyntax_parallel_for;
 
+/// Split whenever there is more than a couple of iterations, so these
+/// exercise the threaded path rather than the fall-back. What the grain
+/// should be for a real loop is the compiler's decision, made from what
+/// one iteration costs.
+const GRAIN: i64 = 2;
+
 /// Mark every index in the band, so gaps and overlaps both show up.
 unsafe extern "C" fn mark(lo: i64, hi: i64, env: *mut u8) {
     let marks = &*(env as *const Vec<AtomicI64>);
@@ -25,7 +31,7 @@ fn every_index_is_computed_exactly_once() {
     for n in [1i64, 7, 1023, 100_000] {
         let marks: Vec<AtomicI64> = (0..n).map(|_| AtomicI64::new(0)).collect();
         unsafe {
-            zyntax_parallel_for(0, n, mark, &marks as *const _ as *mut u8);
+            zyntax_parallel_for(0, n, GRAIN, mark, &marks as *const _ as *mut u8);
         }
         let wrong: Vec<(usize, i64)> = marks
             .iter()
@@ -47,7 +53,7 @@ fn the_call_returns_only_once_the_work_is_done() {
     const N: i64 = 200_000;
     let marks: Vec<AtomicI64> = (0..N).map(|_| AtomicI64::new(0)).collect();
     unsafe {
-        zyntax_parallel_for(0, N, mark, &marks as *const _ as *mut u8);
+        zyntax_parallel_for(0, N, GRAIN, mark, &marks as *const _ as *mut u8);
     }
     // Read immediately, with no synchronisation of our own.
     let total: i64 = marks.iter().map(|m| m.load(Ordering::Relaxed)).sum();
@@ -60,7 +66,7 @@ fn a_range_that_does_not_start_at_zero_is_covered() {
     const N: usize = 50_000;
     let marks: Vec<AtomicI64> = (0..N).map(|_| AtomicI64::new(0)).collect();
     unsafe {
-        zyntax_parallel_for(10_000, 40_000, mark, &marks as *const _ as *mut u8);
+        zyntax_parallel_for(10_000, 40_000, GRAIN, mark, &marks as *const _ as *mut u8);
     }
     assert_eq!(marks[9_999].load(Ordering::Relaxed), 0, "before the range");
     assert_eq!(marks[10_000].load(Ordering::Relaxed), 1, "first in range");
@@ -73,8 +79,8 @@ fn a_range_that_does_not_start_at_zero_is_covered() {
 fn an_empty_range_does_nothing() {
     let marks: Vec<AtomicI64> = (0..8).map(|_| AtomicI64::new(0)).collect();
     unsafe {
-        zyntax_parallel_for(5, 5, mark, &marks as *const _ as *mut u8);
-        zyntax_parallel_for(6, 2, mark, &marks as *const _ as *mut u8);
+        zyntax_parallel_for(5, 5, GRAIN, mark, &marks as *const _ as *mut u8);
+        zyntax_parallel_for(6, 2, GRAIN, mark, &marks as *const _ as *mut u8);
     }
     assert!(marks.iter().all(|m| m.load(Ordering::Relaxed) == 0));
 }

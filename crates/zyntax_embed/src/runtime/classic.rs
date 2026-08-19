@@ -252,6 +252,7 @@ impl ZyntaxRuntime {
         let mut owned = module.clone();
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut owned);
+            zyntax_compiler::run_native_only_opts(&mut owned);
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&owned, "post-opt-compile_module");
 

@@ -38,12 +38,13 @@
 //! that needs nothing. Nothing here decides that a loop is safe on an
 //! assumption its caller never agreed to.
 //!
-//! The agreement the language does offer is a parameter declared `mut`
-//! or `own`: nothing else names it, and every caller was held to that
-//! by `exclusive_args` before this runs. Two parameters where one is
-//! exclusive are therefore two buffers, and the obligation is settled
-//! rather than reported. Writing a kernel that way is what turns it
-//! from conditionally independent into independent.
+//! Two facts settle it rather than report it. A parameter declared
+//! `mut` or `own` is one nothing else names, and every caller was held
+//! to that by `exclusive_args` before this runs, so two parameters where
+//! one is exclusive are two buffers. And two allocations are two
+//! allocations, which needs nobody's agreement at all. The second is
+//! what survives inlining: a kernel's parameters become its caller's
+//! locals, and the locals are where the allocator's answer still shows.
 //!
 //! What disqualifies a loop outright:
 //!
@@ -1032,12 +1033,39 @@ fn bands_are_disjoint(
 /// same buffer is exactly what cannot be ruled out from here.
 fn held_apart(func: &HirFunction, a: HirId, b: HirId) -> bool {
     use crate::exclusive_args::{is_parameter, parameter_is_exclusive};
+    // Two allocations are two allocations. Nothing has to be declared
+    // for this one: an allocator that returned storage already in use
+    // would be a broken allocator, and the two values are distinct call
+    // sites by construction. Inlining turns a kernel's parameters into
+    // its caller's locals, so this is what carries the reasoning across
+    // that boundary.
+    if allocates(func, a) && allocates(func, b) {
+        return true;
+    }
     if !is_parameter(func, a) || !is_parameter(func, b) {
         return false;
     }
     // One of them being exclusive is enough: nothing else may name it,
     // and the other is something else.
     parameter_is_exclusive(func, a) || parameter_is_exclusive(func, b)
+}
+
+/// Whether the value is storage this function asked for and got.
+fn allocates(func: &HirFunction, value: HirId) -> bool {
+    func.blocks.values().any(|blk| {
+        blk.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                HirInstruction::Call {
+                    result: Some(r),
+                    callee: crate::hir::HirCallable::Intrinsic(
+                        Intrinsic::Malloc | Intrinsic::Realloc
+                    ),
+                    ..
+                } if *r == value
+            )
+        })
+    })
 }
 
 /// Every unordered pair of distinct bases.

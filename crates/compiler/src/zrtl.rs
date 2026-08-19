@@ -2297,31 +2297,39 @@ fn run_bands(job: &Job) {
 /// Run `band` over `[lo, hi)` across the pool, returning once every part
 /// of the range has been computed exactly once.
 ///
-/// Falls back to running the whole range on this thread where there is
-/// too little work to be worth handing out, so a short loop does not pay
-/// for threads it cannot use.
+/// `grain` is the smallest run of iterations worth handing to a worker,
+/// and it is the caller's to decide because only the caller knows what
+/// one iteration costs. A thousand iterations of an elementwise pass are
+/// worth less than ten rows of a matrix multiply, and a threshold picked
+/// here would have to be wrong for one of them. Below twice the grain
+/// the whole range runs on this thread, so a loop too short to spread
+/// does not pay for threads it cannot use.
 ///
 /// # Safety
 /// `band` must be a valid function pointer and `env` must remain valid
 /// for the call, which it does because this blocks.
 #[no_mangle]
-pub unsafe extern "C" fn zyntax_parallel_for(lo: i64, hi: i64, band: BandFn, env: *mut u8) {
+pub unsafe extern "C" fn zyntax_parallel_for(
+    lo: i64,
+    hi: i64,
+    grain: i64,
+    band: BandFn,
+    env: *mut u8,
+) {
     let total = hi - lo;
     if total <= 0 {
         return;
     }
+    let grain = grain.max(1);
     let workers = worker_count();
-    // Below this there is nothing to gain: the dispatch costs more than
-    // the iterations do.
-    const MIN_PER_WORKER: i64 = 1024;
-    if workers < 2 || total < MIN_PER_WORKER * 2 {
+    if workers < 2 || total < grain * 2 {
         band(lo, hi, env);
         return;
     }
 
     // Bands smaller than the even split, so a worker that finishes early
     // takes more instead of idling.
-    let chunk = ((total / (workers as i64 * 4)).max(MIN_PER_WORKER)).min(total);
+    let chunk = ((total / (workers as i64 * 4)).max(grain)).min(total);
     let p = pool();
     let job = Arc::new(Job {
         band,
