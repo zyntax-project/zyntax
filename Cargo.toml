@@ -47,3 +47,15 @@ warnings = "allow"
 
 [workspace.lints.clippy]
 all = "allow"
+
+# Debug builds keep line tables and drop the rest of the DWARF.
+#
+# Backtraces still name a file and a line, which is what they are read
+# for; stepping in a debugger and inspecting locals is what goes. On
+# macOS the default `split-debuginfo = "unpacked"` leaves one object file
+# per codegen unit beside each binary, and the executable's debug map
+# points into them, so cargo cannot remove them when a crate is rebuilt
+# under a new hash. Every rebuild leaves a full set behind, and the
+# volume of each set is set here.
+[profile.dev]
+debug = "line-tables-only"
