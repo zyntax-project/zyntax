@@ -162,6 +162,33 @@ fn destination_return_type(function: &HirFunction) -> Option<&HirType> {
     }
 }
 
+/// Function bodies this backend had no encoding for, across the process.
+///
+/// Separate from the skip count: a decline is a routing fact, and a skip
+/// is a defect that degraded to interpreter speed.
+static CRANELIFT_DECLINED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many function bodies Cranelift declined for want of an encoding.
+pub fn cranelift_declined_function_count() -> usize {
+    CRANELIFT_DECLINED_FUNCTIONS.load(Ordering::Relaxed)
+}
+
+/// Reset the decline count.
+pub fn reset_cranelift_declined_function_count() {
+    CRANELIFT_DECLINED_FUNCTIONS.store(0, Ordering::Relaxed);
+}
+
+impl CraneliftBackend {
+    /// Functions this backend had no encoding for, in this instance.
+    ///
+    /// A caller running a tier ladder can compile exactly these with a
+    /// backend that has the encoding, rather than re-compiling the
+    /// module or leaving them to run interpreted.
+    pub fn declined_functions(&self) -> &std::collections::HashSet<HirId> {
+        &self.declined_functions
+    }
+}
+
 /// Number of function bodies skipped by Cranelift due to recoverable codegen errors.
 pub fn cranelift_skipped_function_count() -> usize {
     CRANELIFT_SKIPPED_FUNCTIONS.load(Ordering::Relaxed)
@@ -224,6 +251,10 @@ fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
 
 /// Cranelift backend for JIT compilation
 pub struct CraneliftBackend {
+    /// Functions this backend had no encoding for. A caller with a
+    /// backend that does can compile exactly these and leave the rest
+    /// alone.
+    declined_functions: std::collections::HashSet<HirId>,
     /// JIT module for code generation
     module: JITModule,
     /// Current function builder
@@ -484,6 +515,7 @@ impl CraneliftBackend {
             .unwrap_or_default();
 
         Ok(Self {
+            declined_functions: std::collections::HashSet::new(),
             module,
             builder_context: FunctionBuilderContext::new(),
             codegen_context: codegen::Context::new(),
@@ -758,11 +790,25 @@ impl CraneliftBackend {
                     eprintln!("[pass2] {:?} result_err={}", id, body_result.is_err());
                 }
                 if let Err(e) = body_result {
-                    CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
                     let name = function.name.resolve_global().unwrap_or_default();
-                    log::debug!("[CRANELIFT] Skipping function '{}': {:?}", function.name, e);
-                    if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
-                        eprintln!("[CRANELIFT-SKIP] '{name}': {e:?}");
+                    // A function this backend has no encoding for is
+                    // declined, not failed: it is recorded so a caller
+                    // can hand it to a backend that does, and it is kept
+                    // out of the defect count so a real defect is not
+                    // buried among capability differences.
+                    if e.is_unsupported_by_backend() {
+                        CRANELIFT_DECLINED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+                        self.declined_functions.insert(*id);
+                        log::debug!("[CRANELIFT] Declining function '{}': {}", name, e);
+                        if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                            eprintln!("[CRANELIFT-DECLINE] '{name}': {e}");
+                        }
+                    } else {
+                        CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+                        log::debug!("[CRANELIFT] Skipping function '{}': {:?}", function.name, e);
+                        if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                            eprintln!("[CRANELIFT-SKIP] '{name}': {e:?}");
+                        }
                     }
                     // Remove from function_map to prevent later lookup failures
                     self.function_map.remove(id);
@@ -5250,16 +5296,17 @@ impl CraneliftBackend {
                                     let value = builder.ins().splat(vec_clif_ty, scalar_val);
                                     self.value_map.insert(*result, value);
                                 } else {
-                                    // Skipping leaves the result
-                                    // undefined and whatever reads it
-                                    // silently wrong, so refuse instead.
-                                    return Err(CompilerError::Backend(format!(
-                                        "this backend holds 128-bit vectors only, and cannot \
-                                         broadcast to {:?}. A wider vector reached it, which \
-                                         means the width it was vectorized at is not one this \
-                                         target accepts.",
-                                        ty
-                                    )));
+                                    // Declining hands the function to a
+                                    // backend that has the encoding.
+                                    // Skipping silently would leave the
+                                    // result undefined and whatever
+                                    // reads it wrong.
+                                    return Err(CompilerError::UnsupportedByBackend {
+                                        backend: "cranelift",
+                                        construct: format!("a {:?} broadcast", ty),
+                                        detail: "this backend holds 128-bit vectors only"
+                                            .to_string(),
+                                    });
                                 }
                             }
                         }
@@ -5379,13 +5426,12 @@ impl CraneliftBackend {
                                     let value = builder.ins().load(vec_clif_ty, flags, ptr_val, 0);
                                     self.value_map.insert(*result, value);
                                 } else {
-                                    return Err(CompilerError::Backend(format!(
-                                        "this backend holds 128-bit vectors only, and cannot \
-                                         load {:?}. A wider vector reached it, which means the \
-                                         width it was vectorized at is not one this target \
-                                         accepts.",
-                                        ty
-                                    )));
+                                    return Err(CompilerError::UnsupportedByBackend {
+                                        backend: "cranelift",
+                                        construct: format!("a {:?} load", ty),
+                                        detail: "this backend holds 128-bit vectors only"
+                                            .to_string(),
+                                    });
                                 }
                             }
                         }

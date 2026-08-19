@@ -116,7 +116,8 @@ pub use cfg::{BasicBlock, CfgEdge, ControlFlowGraph};
 pub use const_eval::{ConstEvalContext, ConstEvaluator};
 #[cfg(feature = "cranelift-backend")]
 pub use cranelift_backend::{
-    cranelift_skipped_function_count, reset_cranelift_skipped_function_count,
+    cranelift_declined_function_count, cranelift_skipped_function_count,
+    reset_cranelift_declined_function_count, reset_cranelift_skipped_function_count,
 };
 pub use dce::reachable_function_ids;
 pub use effect_analysis::{
@@ -205,6 +206,31 @@ pub enum CompilerError {
 
     #[error("Backend error: {0}")]
     Backend(String),
+
+    /// This backend has no encoding for a construct the IR is entitled
+    /// to contain. The module is not wrong and nothing needs fixing in
+    /// it; a backend with the encoding can compile the same function.
+    ///
+    /// Kept apart from `Backend` because the two want opposite
+    /// handling. A backend error is a defect and should be seen. This
+    /// is a routing fact: the function belongs on a tier that can take
+    /// it, and treating it as a failure would either abort a build over
+    /// a capability difference or, worse, hide a real defect among the
+    /// differences.
+    #[error("{backend} has no encoding for {construct}: {detail}")]
+    UnsupportedByBackend {
+        backend: &'static str,
+        construct: String,
+        detail: String,
+    },
+}
+
+impl CompilerError {
+    /// Whether this says the backend lacks an encoding, rather than
+    /// that something went wrong.
+    pub fn is_unsupported_by_backend(&self) -> bool {
+        matches!(self, CompilerError::UnsupportedByBackend { .. })
+    }
 }
 
 // Implement From for inkwell BuilderError (only when llvm-backend feature is enabled)
