@@ -1,10 +1,29 @@
 //! Is MCJIT usable on this host?
 //!
 //! `llvm_jit_backend` emits an object file, shells out to the linker and
-//! dlopens the result — ~370 ms of fixed cost per install — because MCJIT
-//! was reported to hit MAP_JIT cross-thread invalidation on Apple Silicon.
-//! Per-function lazy promotion is only viable if an in-process engine
-//! works, so check the claim directly against the current inkwell/LLVM.
+//! dlopens the result, around 370 ms of fixed cost per install, because
+//! MCJIT was reported to hit MAP_JIT cross-thread invalidation on Apple
+//! Silicon. These check that claim directly against the current
+//! inkwell/LLVM rather than carrying it forward untested.
+//!
+//! **The claim no longer holds, and the backend stays as it is anyway.**
+//! All three cross-thread cases pass and an install measures about
+//! 1.6 ms, so the original obstacle is gone. Speed is not why the object
+//! path was kept: it uses LLVM only to emit an object file, which is the
+//! most stable interface LLVM offers, and everything after that is the
+//! platform linker and `dlopen`. No LLVM JIT API can break it.
+//!
+//! MCJIT would be the opposite trade. LLVM 21 carries 52 C declarations
+//! for it against 358 for ORC, and inkwell wraps only MCJIT, so adopting
+//! it would take a dependency on the one engine that is not being
+//! developed, through a binding that would go with it.
+//!
+//! The case for moving is unloading and per-function laziness, which
+//! only ORC offers: its resource trackers can remove a module, which is
+//! what the object path structurally cannot do, since unmapping dangles
+//! every pointer already resolved through it. No released inkwell wraps
+//! ORC, so that means owning the C API by hand. Worth it when one of
+//! those two capabilities blocks something, not before.
 
 #![cfg(feature = "llvm-backend")]
 
