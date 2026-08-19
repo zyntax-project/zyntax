@@ -768,6 +768,15 @@ impl AstLowering for LoweringContext {
             self.module.increment_version();
         }
 
+        // What a `mut` or `own` parameter claims is a claim about the
+        // caller, so it is checked here, where every call in the module
+        // is present. An analysis deciding what may run at once reads
+        // those parameters as naming different buffers, and is only
+        // entitled to once this has passed.
+        if let Some(first) = crate::exclusive_args::check_module(&self.module).first() {
+            return Err(crate::CompilerError::Analysis(first.message()));
+        }
+
         Ok(self.module.clone())
     }
 }

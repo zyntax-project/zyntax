@@ -35,9 +35,15 @@
 //! passed one buffer twice. Rather than assume otherwise, a loop that
 //! is independent *provided* certain things hold is reported with those
 //! things named, as [`Obligation`]s, and counted separately from one
-//! that needs nothing. A dispatch site takes on discharging them, by
-//! runtime check or by declaration. Nothing here decides that a loop is
-//! safe on an assumption its caller never agreed to.
+//! that needs nothing. Nothing here decides that a loop is safe on an
+//! assumption its caller never agreed to.
+//!
+//! The agreement the language does offer is a parameter declared `mut`
+//! or `own`: nothing else names it, and every caller was held to that
+//! by `exclusive_args` before this runs. Two parameters where one is
+//! exclusive are therefore two buffers, and the obligation is settled
+//! rather than reported. Writing a kernel that way is what turns it
+//! from conditionally independent into independent.
 //!
 //! What disqualifies a loop outright:
 //!
@@ -897,7 +903,7 @@ fn examine(
         }
     }
 
-    if !bands_are_disjoint(&accesses, &mut obligations) {
+    if !bands_are_disjoint(func, &accesses, &mut obligations) {
         stats.opaque_body += 1;
         return None;
     }
@@ -939,7 +945,11 @@ fn examine(
 /// Whether no iteration's writes can reach another's accesses, adding
 /// what the caller must establish where the answer depends on storage
 /// this function cannot tell apart.
-fn bands_are_disjoint(accesses: &[Access], obligations: &mut Vec<Obligation>) -> bool {
+fn bands_are_disjoint(
+    func: &HirFunction,
+    accesses: &[Access],
+    obligations: &mut Vec<Obligation>,
+) -> bool {
     let mut bases: Vec<HirId> = accesses.iter().map(|a| a.base).collect();
     bases.sort();
     bases.dedup();
@@ -998,12 +1008,36 @@ fn bands_are_disjoint(accesses: &[Access], obligations: &mut Vec<Obligation>) ->
         if !touched_by_write {
             continue;
         }
-        match (band_of.get(&a), band_of.get(&b)) {
-            (Some(x), Some(y)) if x.same(*y) => {}
-            _ => obligations.push(Obligation::Disjoint(a, b)),
+        if let (Some(x), Some(y)) = (band_of.get(&a), band_of.get(&b)) {
+            if x.same(*y) {
+                continue;
+            }
         }
+        // A parameter declared exclusive is one nothing else names, and
+        // every caller was held to that before this ran. Two parameters
+        // are then two buffers, which is the fact the obligation was
+        // asking for, so it does not need asking again.
+        if held_apart(func, a, b) {
+            continue;
+        }
+        obligations.push(Obligation::Disjoint(a, b));
     }
     true
+}
+
+/// Whether the language already says these two name different storage.
+///
+/// Only parameters carry the claim. Anything else reached this loop
+/// through the body, where two ids saying different things about the
+/// same buffer is exactly what cannot be ruled out from here.
+fn held_apart(func: &HirFunction, a: HirId, b: HirId) -> bool {
+    use crate::exclusive_args::{is_parameter, parameter_is_exclusive};
+    if !is_parameter(func, a) || !is_parameter(func, b) {
+        return false;
+    }
+    // One of them being exclusive is enough: nothing else may name it,
+    // and the other is something else.
+    parameter_is_exclusive(func, a) || parameter_is_exclusive(func, b)
 }
 
 /// Every unordered pair of distinct bases.

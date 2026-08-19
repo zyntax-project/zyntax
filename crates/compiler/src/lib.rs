@@ -40,6 +40,7 @@ pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-es
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
 pub mod effect_handler_resolution; // Handler resolution for effect dispatch
+pub mod exclusive_args; // An exclusive argument may not be a second name for another
 pub mod fiber_backend; // `FiberCfg` trait + global install slot for fiber primitives
 pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
 pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
@@ -1666,6 +1667,21 @@ pub fn compile_to_hir(
     // Step 3: Analysis passes
     let mut analysis_runner = analysis::AnalysisRunner::new(hir_module.clone());
     let analysis = analysis_runner.run_all()?;
+
+    // Step 3a: exclusive arguments. Not behind a flag, because what a
+    // `mut` parameter claims is only true if every caller was held to
+    // it, and an analysis deciding what may run concurrently is
+    // entitled to rely on that claim.
+    {
+        let conflicts = exclusive_args::check_module(&hir_module);
+        if !conflicts.is_empty() {
+            let messages: Vec<String> = conflicts.iter().map(|c| c.message()).collect();
+            return Err(CompilerError::Analysis(format!(
+                "exclusive arguments:\n  - {}",
+                messages.join("\n  - ")
+            )));
+        }
+    }
 
     // Step 3b: HIR borrow checking (if enabled)
     if config.enable_borrow_check {

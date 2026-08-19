@@ -20,7 +20,12 @@ import prelude
 import simd
 
 // out[m, n] = a[m, k] . b[k, n]
-def gemm(out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64): i64 {
+//
+// The destination is declared exclusive, which is both true of every
+// call here and the reason the row loop needs nothing established
+// before it can be spread: nothing else names `out`, so it is not `a`
+// and it is not `b`.
+def gemm(mut out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64): i64 {
     let mut i: i64 = 0
     while i < m {
         let mut j: i64 = 0
@@ -42,7 +47,7 @@ def gemm(out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64): i64 {
 // out[m, n] = a[m, k] . b[n, k]^T, which is how attention scores are
 // formed: both operands are laid out by row, so the second is read
 // along its rows rather than down its columns.
-def gemm_nt(out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64, scale: f32): i64 {
+def gemm_nt(mut out: Ptr<f32>, a: Ptr<f32>, b: Ptr<f32>, m: i64, k: i64, n: i64, scale: f32): i64 {
     let mut i: i64 = 0
     while i < m {
         let mut j: i64 = 0
@@ -122,7 +127,7 @@ def softmax_rows(x: Ptr<f32>, rows: i64, cols: i64): i64 {
 
 // Copy one head's slice out of the packed [tokens, channels] layout so
 // the attention matmuls see a contiguous [tokens, head_dim] block.
-def take_head(dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i64, dim: i64): i64 {
+def take_head(mut dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i64, dim: i64): i64 {
     let base: i64 = head * dim
     let mut i: i64 = 0
     while i < tokens {
@@ -137,7 +142,7 @@ def take_head(dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i6
 }
 
 // And put it back, once that head has been attended.
-def put_head(dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i64, dim: i64): i64 {
+def put_head(mut dst: Ptr<f32>, src: Ptr<f32>, tokens: i64, channels: i64, head: i64, dim: i64): i64 {
     let base: i64 = head * dim
     let mut i: i64 = 0
     while i < tokens {
@@ -160,7 +165,7 @@ def relu(x: Ptr<f32>, n: i64): i64 {
     return n
 }
 
-def add_into(dst: Ptr<f32>, src: Ptr<f32>, n: i64): i64 {
+def add_into(mut dst: Ptr<f32>, src: Ptr<f32>, n: i64): i64 {
     let mut i: i64 = 0
     while i < n {
         dst[i] = dst[i] + src[i]
