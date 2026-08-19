@@ -100,21 +100,159 @@ impl DropStats {
 /// Run the drop-site pass over every function in `module`.
 pub fn run_module(module: &mut HirModule) -> DropStats {
     let mut total = DropStats::default();
+    let facts = ModuleFacts::build(module);
     for func in module.functions.values_mut() {
         if func.is_external {
             continue;
         }
-        total.combine(run_function(func));
+        total.combine(run_function(func, &facts));
     }
     total
 }
 
-fn run_function(func: &mut HirFunction) -> DropStats {
+/// What this pass knows about the other functions in the module.
+#[derive(Default)]
+struct ModuleFacts {
+    returns_owned: std::collections::HashSet<HirId>,
+    /// Per callee, which parameters are only borrowed. Keyed on the
+    /// module's own key for the function, which is what a call names and
+    /// is not always the function's `id` field.
+    borrowed_params: std::collections::HashMap<HirId, Vec<bool>>,
+}
+
+impl ModuleFacts {
+    fn build(module: &HirModule) -> Self {
+        let mut borrowed_params = std::collections::HashMap::new();
+        for (key, func) in module.functions.iter() {
+            borrowed_params.insert(
+                *key,
+                func.signature
+                    .params
+                    .iter()
+                    .map(|p| {
+                        matches!(
+                            p.ownership,
+                            crate::hir::ParamOwnership::Borrowed
+                                | crate::hir::ParamOwnership::BorrowedMut
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        // Borrow facts first: deciding whether an allocation leaves a
+        // function needs to know what its calls do with a pointer.
+        let mut facts = Self {
+            returns_owned: std::collections::HashSet::new(),
+            borrowed_params,
+        };
+        facts.returns_owned = functions_returning_owned_storage(module, &facts);
+        facts
+    }
+
+    /// Whether passing `target` here leaves the caller holding it.
+    fn call_only_borrows(&self, callee: &HirCallable, args: &[HirId], target: HirId) -> bool {
+        let HirCallable::Function(id) = callee else {
+            return false;
+        };
+        let Some(borrows) = self.borrowed_params.get(id) else {
+            return false;
+        };
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| **a == target)
+            .all(|(i, _)| borrows.get(i).copied().unwrap_or(false))
+    }
+}
+
+/// Functions whose result is storage the caller owns.
+///
+/// Deliberately strict, because being wrong here releases something the
+/// callee still refers to. A function qualifies only when it holds
+/// exactly one allocation, that allocation leaves solely by being
+/// returned, and every return hands it back. A function that sometimes
+/// returns a fresh object and sometimes one it was given fails the last
+/// condition and is left alone.
+fn functions_returning_owned_storage(
+    module: &HirModule,
+    facts: &ModuleFacts,
+) -> std::collections::HashSet<HirId> {
+    let mut owned = std::collections::HashSet::new();
+    for (key, func) in module.functions.iter() {
+        if func.is_external {
+            continue;
+        }
+        let sites = collect_malloc_sites(func);
+        if sites.len() != 1 || sites[0].release != Release::Intrinsic {
+            continue;
+        }
+        let site = sites[0];
+        let derived = derived_values(func, site.result);
+        if !escapes_only_by_return(func, &derived, &site, facts) {
+            continue;
+        }
+        let mut returns = 0usize;
+        let mut all_return_it = true;
+        for block in func.blocks.values() {
+            if let HirTerminator::Return { values } = &block.terminator {
+                returns += 1;
+                if !values.iter().any(|v| derived.contains(v)) {
+                    all_return_it = false;
+                }
+            }
+        }
+        if returns > 0 && all_return_it {
+            owned.insert(*key);
+        }
+    }
+    owned
+}
+
+/// Whether the allocation leaves this function only by being returned.
+fn escapes_only_by_return(
+    func: &HirFunction,
+    derived: &std::collections::HashSet<HirId>,
+    site: &MallocSite,
+    facts: &ModuleFacts,
+) -> bool {
+    for (block_id, block) in &func.blocks {
+        for phi in &block.phis {
+            if phi.incoming.iter().any(|(v, _)| derived.contains(v)) {
+                return false;
+            }
+        }
+        for (idx, inst) in block.instructions.iter().enumerate() {
+            if *block_id == site.block && idx == site.inst_idx {
+                continue;
+            }
+            if matches!(classify_derived_use(inst, derived, facts), UseKind::Escape) {
+                return false;
+            }
+        }
+        // Returning the allocation is the transfer itself; any other
+        // escaping terminator is not.
+        if let HirTerminator::Return { values } = &block.terminator {
+            if values.iter().any(|v| derived.contains(v)) {
+                continue;
+            }
+        }
+        for d in derived {
+            if matches!(
+                classify_terminator_use(&block.terminator, *d),
+                UseKind::Escape
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
     let mut stats = DropStats::default();
-    let mallocs: Vec<MallocSite> = collect_malloc_sites(func);
+    let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
     for site in mallocs {
         stats.mallocs_scanned += 1;
-        match analyze_site(func, &site) {
+        match analyze_site(func, &site, facts) {
             SiteOutcome::SingleBlockDrop { block, after_idx } => {
                 insert_free_after(func, block, after_idx, site.result, site.release);
                 stats.frees_inserted += 1;
@@ -190,6 +328,33 @@ enum SiteOutcome {
     NoUse,
 }
 
+/// Allocation sites, counting a call whose callee hands back owned
+/// storage: the caller owns that result and is the only one able to
+/// release it.
+fn collect_owned_sites(func: &HirFunction, facts: &ModuleFacts) -> Vec<MallocSite> {
+    let mut sites = collect_malloc_sites(func);
+    for (block_id, block) in &func.blocks {
+        for (idx, inst) in block.instructions.iter().enumerate() {
+            if let HirInstruction::Call {
+                result: Some(result),
+                callee: HirCallable::Function(callee_id),
+                ..
+            } = inst
+            {
+                if facts.returns_owned.contains(callee_id) {
+                    sites.push(MallocSite {
+                        result: *result,
+                        block: *block_id,
+                        inst_idx: idx,
+                        release: Release::Intrinsic,
+                    });
+                }
+            }
+        }
+    }
+    sites
+}
+
 fn collect_malloc_sites(func: &HirFunction) -> Vec<MallocSite> {
     let mut sites = Vec::new();
     for (block_id, block) in &func.blocks {
@@ -221,7 +386,7 @@ fn collect_malloc_sites(func: &HirFunction) -> Vec<MallocSite> {
     sites
 }
 
-fn analyze_site(func: &HirFunction, site: &MallocSite) -> SiteOutcome {
+fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> SiteOutcome {
     // Walk every block, every instruction, every terminator, and
     // for each use of `site.result`:
     //   - record the (block, idx) location and the use *kind*
@@ -261,7 +426,7 @@ fn analyze_site(func: &HirFunction, site: &MallocSite) -> SiteOutcome {
             if *block_id == site.block && idx == site.inst_idx {
                 continue;
             }
-            match classify_derived_use(inst, &derived) {
+            match classify_derived_use(inst, &derived, facts) {
                 UseKind::None => {}
                 UseKind::Use => {
                     had_any_use = true;
@@ -381,6 +546,7 @@ fn strongest(a: UseKind, b: UseKind) -> UseKind {
 fn classify_derived_use(
     inst: &HirInstruction,
     derived: &std::collections::HashSet<HirId>,
+    facts: &ModuleFacts,
 ) -> UseKind {
     match inst {
         HirInstruction::InsertValue {
@@ -407,7 +573,7 @@ fn classify_derived_use(
     }
     derived
         .iter()
-        .map(|d| classify_inst_use(inst, *d))
+        .map(|d| classify_inst_use(inst, *d, facts))
         .fold(UseKind::None, strongest)
 }
 
@@ -420,7 +586,7 @@ enum UseKind {
     Escape,
 }
 
-fn classify_inst_use(inst: &HirInstruction, target: HirId) -> UseKind {
+fn classify_inst_use(inst: &HirInstruction, target: HirId, facts: &ModuleFacts) -> UseKind {
     match inst {
         HirInstruction::Binary { left, right, .. } => {
             if *left == target || *right == target {
@@ -503,6 +669,12 @@ fn classify_inst_use(inst: &HirInstruction, target: HirId) -> UseKind {
                 HirCallable::Symbol(name) if symbol_role(name) == Some(SymbolRole::Borrows) => {
                     UseKind::Use
                 }
+                // A parameter the callee only borrows leaves the caller
+                // holding the storage. Handing a pointer to one extends
+                // the live range rather than forfeiting it, which is
+                // what lets a temporary passed straight into the next
+                // call still be released afterwards.
+                _ if facts.call_only_borrows(callee, args, target) => UseKind::Use,
                 _ => UseKind::Escape,
             }
         }
@@ -723,7 +895,7 @@ mod tests {
     #[test]
     fn inserts_free_after_last_use_in_single_block() {
         let (mut f, ptr) = build_alloc_store_load_return();
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 1);
         assert_eq!(stats.escapes_skipped, 0);
@@ -763,7 +935,7 @@ mod tests {
         });
         block.terminator = HirTerminator::Return { values: vec![ptr] };
 
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 0);
         assert_eq!(stats.escapes_skipped, 1);
@@ -808,7 +980,7 @@ mod tests {
         });
         block.terminator = HirTerminator::Return { values: vec![] };
 
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 0);
         assert_eq!(stats.escapes_skipped, 1);
@@ -847,7 +1019,7 @@ mod tests {
         });
         block.terminator = HirTerminator::Return { values: vec![] };
 
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 0);
         assert_eq!(stats.escapes_skipped, 1);
@@ -878,10 +1050,165 @@ mod tests {
         });
         block.terminator = HirTerminator::Return { values: vec![] };
 
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 0);
         assert_eq!(stats.no_use_skipped, 1);
+    }
+
+    /// `fn make() -> *i64 { let p = malloc(8); return p }` — a
+    /// constructor, which hands its allocation to whoever called it.
+    fn build_constructor() -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("make"),
+            empty_sig(HirType::Ptr(Box::new(HirType::I64))),
+        );
+        let entry = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let block = f.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(ptr),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![size],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.terminator = HirTerminator::Return { values: vec![ptr] };
+        f
+    }
+
+    /// `fn use_it() -> i64 { let p = make(); return load(p) }`
+    fn build_caller(callee_key: HirId) -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("use_it"),
+            empty_sig(HirType::I64),
+        );
+        let entry = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        let got = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let loaded = add_inst_val(&mut f, HirType::I64);
+        let block = f.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(got),
+            callee: HirCallable::Function(callee_key),
+            args: vec![],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.instructions.push(HirInstruction::Load {
+            result: loaded,
+            ty: HirType::I64,
+            ptr: got,
+            align: 8,
+            volatile: false,
+        });
+        block.terminator = HirTerminator::Return {
+            values: vec![loaded],
+        };
+        f
+    }
+
+    /// A constructor's result belongs to the caller, so the caller is
+    /// where it gets released. Nothing inside the constructor can do
+    /// it: the allocation leaves by being returned.
+    #[test]
+    fn a_caller_releases_what_a_constructor_returned() {
+        let ctor = build_constructor();
+        let ctor_key = HirId::new();
+        let caller = build_caller(ctor_key);
+        let caller_key = HirId::new();
+
+        let mut m = HirModule::new(InternedString::new_global("m"));
+        m.functions.insert(ctor_key, ctor);
+        m.functions.insert(caller_key, caller);
+
+        let stats = run_module(&mut m);
+        assert!(stats.frees_inserted >= 1, "the caller should release it");
+
+        let caller = m.functions.get(&caller_key).unwrap();
+        let block = caller.blocks.values().next().unwrap();
+        let freed = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Free),
+                    ..
+                }
+            )
+        });
+        assert!(
+            freed,
+            "expected a release in the caller, got {:?}",
+            block.instructions
+        );
+    }
+
+    /// A function handing back something it was given owns nothing, so
+    /// its caller must not release the result.
+    #[test]
+    fn a_caller_does_not_release_what_was_merely_passed_through() {
+        let mut passthrough = HirFunction::new(
+            InternedString::new_global("passthrough"),
+            HirFunctionSignature {
+                params: vec![crate::hir::HirParam {
+                    id: HirId::new(),
+                    name: InternedString::new_global("p"),
+                    ty: HirType::Ptr(Box::new(HirType::I64)),
+                    attributes: Default::default(),
+                    ownership: crate::hir::ParamOwnership::Borrowed,
+                }],
+                returns: vec![HirType::Ptr(Box::new(HirType::I64))],
+                type_params: vec![],
+                const_params: vec![],
+                lifetime_params: vec![],
+                is_variadic: false,
+                is_async: false,
+                is_fiber: false,
+                effects: vec![],
+                is_pure: false,
+            },
+        );
+        let entry = HirId::new();
+        passthrough.entry_block = entry;
+        passthrough.blocks.clear();
+        passthrough.blocks.insert(entry, HirBlock::new(entry));
+        let param_id = passthrough.signature.params[0].id;
+        passthrough.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return {
+            values: vec![param_id],
+        };
+
+        let key = HirId::new();
+        let caller = build_caller(key);
+        let caller_key = HirId::new();
+        let mut m = HirModule::new(InternedString::new_global("m2"));
+        m.functions.insert(key, passthrough);
+        m.functions.insert(caller_key, caller);
+
+        run_module(&mut m);
+        let caller = m.functions.get(&caller_key).unwrap();
+        let block = caller.blocks.values().next().unwrap();
+        let freed = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Free),
+                    ..
+                }
+            )
+        });
+        assert!(
+            !freed,
+            "a pass-through returns storage it does not own; releasing it would \
+             free the caller's own pointer"
+        );
     }
 
     /// The shape a boxed value takes: a runtime call hands back
@@ -948,7 +1275,7 @@ mod tests {
     #[test]
     fn a_boxed_value_is_released() {
         let (mut f, boxed) = build_box_into_struct_and_read();
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1, "the box call is an allocation");
         assert_eq!(stats.frees_inserted, 1, "and it should be released");
 
@@ -967,7 +1294,7 @@ mod tests {
     #[test]
     fn a_boxed_value_is_released_after_its_last_read() {
         let (mut f, _) = build_box_into_struct_and_read();
-        run_function(&mut f);
+        run_function(&mut f, &ModuleFacts::default());
         let block = f.blocks.values().next().unwrap();
         let idx = |name: &str| {
             block.instructions.iter().position(|i| match i {
@@ -1011,7 +1338,7 @@ mod tests {
             values: vec![boxed],
         };
 
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(
             stats.frees_inserted, 0,
             "a returned box belongs to the caller"
@@ -1054,7 +1381,7 @@ mod tests {
         });
         block.terminator = HirTerminator::Return { values: vec![] };
 
-        let stats = run_function(&mut f);
+        let stats = run_function(&mut f, &ModuleFacts::default());
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 0);
         // Either Escape or NoUse outcome — Escape because the Free
