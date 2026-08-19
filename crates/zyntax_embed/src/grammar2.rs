@@ -488,6 +488,7 @@ impl Grammar2 {
                             default_value: None,
                             attributes: vec![],
                             span,
+                            ownership: Default::default(),
                         }
                     })
                     .collect()

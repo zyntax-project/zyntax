@@ -89,6 +89,7 @@ fn create_continue_function() -> HirFunction {
             name: create_test_string("n"),
             ty: HirType::I32,
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         }],
         returns: vec![HirType::I32],
         type_params: vec![],

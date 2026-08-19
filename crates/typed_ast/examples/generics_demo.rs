@@ -26,6 +26,7 @@ fn rust_style_generics() {
             kind: ParameterKind::Regular,
             default_value: None,
             attributes: vec![],
+            ownership: Default::default(),
         }],
         return_type: Type::TypeVar(TypeVar::unbound(t_param)),
         body: Some(TypedBlock {
@@ -194,6 +195,7 @@ fn typescript_style_generics() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             },
             TypedParameter {
                 name: arena.intern_string("keys"),
@@ -207,6 +209,7 @@ fn typescript_style_generics() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             },
         ],
         return_type: Type::Index {

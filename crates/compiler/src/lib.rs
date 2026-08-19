@@ -933,6 +933,7 @@ fn generate_binary_trait_impl(
                 default_value: None,
                 attributes: vec![],
                 span: Span::default(),
+                ownership: Default::default(),
             },
             TypedParameter {
                 name: rhs_param,
@@ -942,6 +943,7 @@ fn generate_binary_trait_impl(
                 default_value: None,
                 attributes: vec![],
                 span: Span::default(),
+                ownership: Default::default(),
             },
         ],
         return_type: abstract_type.clone(),
@@ -1173,6 +1175,7 @@ fn generate_comparison_trait_impl(
                     default_value: None,
                     attributes: vec![],
                     span: Span::default(),
+                    ownership: Default::default(),
                 },
                 TypedParameter {
                     name: rhs_param,
@@ -1182,6 +1185,7 @@ fn generate_comparison_trait_impl(
                     default_value: None,
                     attributes: vec![],
                     span: Span::default(),
+                    ownership: Default::default(),
                 },
             ],
             return_type: zyntax_typed_ast::Type::Primitive(PrimitiveType::Bool),
@@ -1417,6 +1421,7 @@ fn generate_unary_trait_impl(
             default_value: None,
             attributes: vec![],
             span: Span::default(),
+            ownership: Default::default(),
         }],
         return_type: abstract_type.clone(),
         body: Some(TypedBlock {

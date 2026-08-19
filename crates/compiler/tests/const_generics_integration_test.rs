@@ -29,6 +29,7 @@ fn test_monomorphized_function_compilation() {
             name: intern_str(&mut arena, "value"),
             ty: HirType::Opaque(t_param),
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         }],
         returns: vec![HirType::Opaque(t_param)],
         type_params: vec![HirTypeParam {
@@ -82,6 +83,7 @@ fn test_const_generic_array_compilation() {
             name: intern_str(&mut arena, "arr"),
             ty: HirType::Array(Box::new(HirType::I32), 0), // Size will be substituted
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         }],
         returns: vec![HirType::I32],
         type_params: vec![],
@@ -184,6 +186,7 @@ fn test_nested_const_generics() {
                 // [[f32; N]; M] - will be substituted
                 ty: HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
             HirParam {
                 id: HirId::new(),
@@ -191,6 +194,7 @@ fn test_nested_const_generics() {
                 // [[f32; P]; N] - will be substituted
                 ty: HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
         ],
         returns: vec![

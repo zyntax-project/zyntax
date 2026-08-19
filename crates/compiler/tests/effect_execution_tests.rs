@@ -437,6 +437,7 @@ fn i64_param(param_name: &str) -> HirParam {
         name: name(param_name),
         ty: HirType::I64,
         attributes: ParamAttributes::default(),
+        ownership: Default::default(),
     }
 }
 

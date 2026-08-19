@@ -1540,6 +1540,7 @@ mod tests {
                     name: InternedString::new_global(&format!("p{i}")),
                     ty,
                     attributes: ParamAttributes::default(),
+                    ownership: Default::default(),
                 })
                 .collect(),
             returns: vec![ret],

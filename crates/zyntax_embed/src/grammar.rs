@@ -749,6 +749,7 @@ impl LanguageGrammar {
                             default_value: None,
                             attributes: vec![],
                             span,
+                            ownership: Default::default(),
                         }
                     })
                     .collect()

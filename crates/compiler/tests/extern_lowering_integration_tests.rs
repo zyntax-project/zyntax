@@ -29,6 +29,7 @@ fn create_extern_function(
             default_value: None,
             attributes: vec![],
             span,
+            ownership: Default::default(),
         }],
         type_params: vec![],
         return_type: Type::Primitive(PrimitiveType::I32),

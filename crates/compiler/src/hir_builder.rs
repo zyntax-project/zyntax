@@ -1173,6 +1173,7 @@ impl<'b, 'arena> FunctionBuilder<'b, 'arena> {
             name: name_id,
             ty,
             attributes: ParamAttributes::default(),
+            ownership: crate::hir::ParamOwnership::default(),
         });
 
         self

@@ -75,6 +75,7 @@ pub fn aggregate_carrying_loop() -> (HirFunction, HirId) {
         name: InternedString::new_global("body"),
         ty: producer_ty,
         attributes: Default::default(),
+        ownership: Default::default(),
     });
 
     (function, header_id)
@@ -240,6 +241,7 @@ pub fn counted_loop() -> (HirFunction, HirId) {
             name: InternedString::new_global("n"),
             ty: i32_ty.clone(),
             attributes: Default::default(),
+            ownership: Default::default(),
         }],
         returns: vec![i32_ty],
         type_params: vec![],

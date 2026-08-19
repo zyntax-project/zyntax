@@ -1472,6 +1472,7 @@ impl AsyncCompiler {
                     name: arena.intern_string("state_machine"),
                     ty: HirType::Ptr(Box::new(HirType::U8)), // Generic byte pointer
                     attributes: ParamAttributes::default(),
+                    ownership: crate::hir::ParamOwnership::default(),
                 },
             ],
             // Use i64 for poll result: 0 = Pending, non-zero = Ready(value)
@@ -3128,6 +3129,7 @@ impl AsyncCompiler {
             name: arena.intern_string("__sret"),
             ty: out_ptr_ty,
             attributes: ParamAttributes::default(),
+            ownership: crate::hir::ParamOwnership::default(),
         }];
         params.extend(original_func.signature.params.clone());
 
@@ -3375,6 +3377,7 @@ mod tests {
             name: intern_str(&mut arena, "x"),
             ty: HirType::I32,
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         };
 
         let sig = HirFunctionSignature {
@@ -3501,18 +3504,21 @@ mod tests {
                 name: intern_str(&mut arena, "x"),
                 ty: HirType::I32,
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
             HirParam {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "y"),
                 ty: HirType::I64,
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
             HirParam {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "msg"),
                 ty: HirType::Ptr(Box::new(HirType::I8)),
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
         ];
 

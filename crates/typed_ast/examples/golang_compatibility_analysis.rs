@@ -37,6 +37,7 @@ fn golang_features_analysis() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             },
             TypedParameter {
                 name: arena.intern_string("b"),
@@ -46,6 +47,7 @@ fn golang_features_analysis() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             },
         ],
         return_type: Type::Primitive(PrimitiveType::I32),
@@ -304,6 +306,7 @@ fn go_code_examples() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             },
             TypedParameter {
                 name: arena.intern_string("b"),
@@ -313,6 +316,7 @@ fn go_code_examples() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             },
         ],
         return_type: Type::Primitive(PrimitiveType::I32),
@@ -636,6 +640,7 @@ fn go_code_examples() {
             kind: ParameterKind::Regular,
             default_value: None,
             attributes: vec![],
+            ownership: Default::default(),
         }],
         return_type: Type::Primitive(PrimitiveType::Unit),
         body: Some(TypedBlock {
@@ -1120,6 +1125,7 @@ mod tests {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             }],
             return_type: Type::Primitive(PrimitiveType::I32),
             body: Some(TypedBlock {

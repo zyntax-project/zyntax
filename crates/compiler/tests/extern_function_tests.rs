@@ -28,6 +28,7 @@ fn create_extern_function(
             default_value: None,
             attributes: vec![],
             span: Span::new(0, 10),
+            ownership: Default::default(),
         })
         .collect();
 

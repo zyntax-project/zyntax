@@ -572,6 +572,7 @@ mod tests {
                 name: x_param,
                 ty: HirType::Opaque(t_param),
                 attributes: crate::hir::ParamAttributes::default(),
+                ownership: Default::default(),
             }],
             returns: vec![HirType::Opaque(t_param)],
             type_params: vec![HirTypeParam {
@@ -885,6 +886,7 @@ mod tests {
                 name: x_param,
                 ty: HirType::Opaque(t_param),
                 attributes: crate::hir::ParamAttributes::default(),
+                ownership: Default::default(),
             }],
             returns: vec![
                 // Return *[T; 10]
@@ -988,6 +990,7 @@ mod tests {
                 name: arena.intern_string("x"),
                 ty: HirType::Opaque(t_param),
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             }],
             returns: vec![HirType::Opaque(t_param)],
             type_params: vec![HirTypeParam {

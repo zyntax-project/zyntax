@@ -2129,7 +2129,34 @@ fn_param_comma = { "," ~ param:fn_param }
 // Examples:
 //   def search(query: str, top_k: int = 10, threshold: float = 0.5): List<Result> { }
 //
-fn_param = { param_typed_default | param_default | param_typed | param_simple }
+// An ownership modifier comes before the name. `own` is the only one
+// that ends the caller's claim on what it passes; `mut` states that the
+// callee writes through the parameter while the caller keeps it.
+//
+//   def free(own p: Ptr<f32>)      the caller may not use `p` again
+//   def fill(mut p: Ptr<f32>)      written through, still the caller's
+//
+// Stating neither leaves the type to decide: a pointer is borrowed, and
+// anything held by value is copied.
+fn_param = {
+    param_owned | param_mut |
+    param_typed_default | param_default | param_typed | param_simple
+}
+
+param_owned = { "own" ~ name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedParameter {
+      name: intern(name),
+      ty: ty,
+      ownership: ParamOwnership::Owned,
+  }
+
+param_mut = { "mut" ~ name:identifier ~ ":" ~ ty:type_expr }
+  -> TypedParameter {
+      name: intern(name),
+      ty: ty,
+      ownership: ParamOwnership::BorrowedMut,
+  }
+
 
 // x: Type = default_value
 param_typed_default = { name:identifier ~ ":" ~ ty:type_expr ~ "=" ~ default:expr }

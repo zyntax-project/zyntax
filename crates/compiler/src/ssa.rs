@@ -13587,6 +13587,7 @@ impl SsaBuilder {
                     name: param_name,
                     ty: ty.clone(),
                     attributes: crate::hir::ParamAttributes::default(),
+                    ownership: crate::hir::ParamOwnership::default(),
                 }
             })
             .collect();

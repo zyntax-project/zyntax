@@ -29,6 +29,7 @@ fn test_const_generic_array_type() {
             name: intern_str(&mut arena, "arr"),
             ty: HirType::Array(Box::new(HirType::Opaque(t_param)), 10), // Fixed size for now
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         }],
         returns: vec![HirType::Void],
         type_params: vec![HirTypeParam {
@@ -386,6 +387,7 @@ fn test_module_monomorphization() {
             name: intern_str(&mut arena, "value"),
             ty: HirType::Opaque(t_param),
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         }],
         returns: vec![HirType::Opaque(t_param)],
         type_params: vec![HirTypeParam {

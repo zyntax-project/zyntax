@@ -45,6 +45,7 @@ fn sig(params: Vec<HirType>, returns: Vec<HirType>) -> HirFunctionSignature {
                 name: InternedString::new_global(&format!("p{}", i)),
                 ty,
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             })
             .collect(),
         returns,

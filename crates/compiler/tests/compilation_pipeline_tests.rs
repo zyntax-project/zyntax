@@ -226,6 +226,7 @@ fn test_monomorphization_context_basic() {
             name: arena.intern_string("x"),
             ty: HirType::Opaque(t_param),
             attributes: ParamAttributes::default(),
+            ownership: Default::default(),
         }],
         returns: vec![HirType::Opaque(t_param)],
         type_params: vec![HirTypeParam {
@@ -286,12 +287,14 @@ fn test_monomorphization_module_integration() {
                 name: arena.intern_string("a"),
                 ty: HirType::Opaque(t_param),
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
             HirParam {
                 id: HirId::new(),
                 name: arena.intern_string("b"),
                 ty: HirType::Opaque(t_param),
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             },
         ],
         returns: vec![HirType::Opaque(t_param)],

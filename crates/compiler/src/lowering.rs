@@ -2571,6 +2571,29 @@ impl LoweringContext {
         owed
     }
 
+    /// What passing an argument to this parameter does to the caller's
+    /// claim on it.
+    ///
+    /// A parameter says so itself where the source states it. Where it
+    /// does not, the type decides: anything held behind a pointer is
+    /// borrowed, because the caller still has it afterwards and is still
+    /// the one that has to release it, and anything held by value is
+    /// copied. Only an explicit statement produces `Owned`, so adding
+    /// this changes the meaning of no existing program.
+    fn param_ownership(
+        param: &zyntax_typed_ast::TypedParameter,
+        hir_type: &HirType,
+    ) -> crate::hir::ParamOwnership {
+        use crate::hir::ParamOwnership;
+        if param.ownership != ParamOwnership::Copied {
+            return param.ownership;
+        }
+        match hir_type {
+            HirType::Ptr(_) | HirType::Ref { .. } => ParamOwnership::Borrowed,
+            _ => ParamOwnership::Copied,
+        }
+    }
+
     /// Lower a function
     fn lower_function(&mut self, func: &TypedFunction) -> CompilerResult<()> {
         if !self.should_lower(func) {
@@ -3299,12 +3322,14 @@ impl LoweringContext {
 
             let hir_type = self.convert_type(&param.ty);
             let attributes = self.compute_param_attributes(&param.ty, param.mutability);
+            let ownership = Self::param_ownership(param, &hir_type);
 
             params.push(HirParam {
                 id: crate::hir::HirId::new(),
                 name: param.name,
                 ty: hir_type,
                 attributes,
+                ownership,
             });
         }
 
@@ -4321,6 +4346,7 @@ impl LoweringContext {
                         name: p.name,
                         ty: self.convert_type(&p.ty),
                         attributes: ParamAttributes::default(),
+                        ownership: crate::hir::ParamOwnership::default(),
                     })
                     .collect();
 
@@ -4416,6 +4442,7 @@ impl LoweringContext {
                         name: p.name,
                         ty: self.convert_type(&p.ty),
                         attributes: ParamAttributes::default(),
+                        ownership: crate::hir::ParamOwnership::default(),
                     })
                     .collect();
 
@@ -4961,6 +4988,7 @@ impl LoweringContext {
                         default_value: p.default_value.clone(),
                         attributes: p.attributes.clone(),
                         span: p.span,
+                        ownership: Default::default(),
                     }
                 })
                 .collect();
@@ -5502,6 +5530,7 @@ impl LoweringContext {
                             name: param_name,
                             ty: hir_type,
                             attributes: Default::default(),
+                            ownership: crate::hir::ParamOwnership::default(),
                         }
                     })
                     .collect();
@@ -5852,6 +5881,7 @@ impl LoweringContext {
                 default_value: None,
                 attributes: vec![],
                 span: method.span,
+                ownership: Default::default(),
             };
             params.push(self_param);
         }
@@ -5866,6 +5896,7 @@ impl LoweringContext {
                 default_value: method_param.default_value.clone(),
                 attributes: vec![],
                 span: method_param.span,
+                ownership: Default::default(),
             };
             params.push(param);
         }
@@ -5931,6 +5962,7 @@ impl LoweringContext {
                 default_value: p.default_value.clone(),
                 attributes: vec![],
                 span: p.span,
+                ownership: Default::default(),
             })
             .collect();
 

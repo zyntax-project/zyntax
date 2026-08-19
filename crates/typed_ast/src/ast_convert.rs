@@ -309,6 +309,7 @@ impl<'a> TypedAstBuilder<'a> {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: Default::default(),
             })
             .collect();
 

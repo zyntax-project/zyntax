@@ -147,6 +147,7 @@ pub use typed_ast::{
     effect_annotation_lists,
     typed_node,
     BinaryOp,
+    ParamOwnership,
     ParameterKind,
     // Annotation types
     TypedAnnotation,

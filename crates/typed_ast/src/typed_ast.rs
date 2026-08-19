@@ -432,6 +432,9 @@ pub struct TypedParameter {
     pub default_value: Option<Box<TypedNode<TypedExpression>>>,
     #[serde(default)]
     pub attributes: Vec<ParameterAttribute>,
+    /// What passing an argument here does to the caller's claim on it.
+    #[serde(default)]
+    pub ownership: ParamOwnership,
     #[serde(default)]
     pub span: Span,
 }
@@ -456,6 +459,34 @@ pub enum ParameterKind {
     KeywordOnly,
     /// Positional-only parameter (Python): func(x: int, /)
     PositionalOnly,
+}
+
+/// What a function does to an argument's ownership.
+///
+/// `Owned` is the only mode that ends the caller's claim, so it is the
+/// one the borrow check runs on: an argument passed to an owned
+/// parameter is moved, and using it afterwards is an error. Every other
+/// mode leaves the caller holding the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ParamOwnership {
+    /// The callee gets its own copy and the caller is unaffected. The
+    /// default, and what every value type gets.
+    #[default]
+    Copied,
+    /// The callee reads through it; the caller keeps ownership.
+    Borrowed,
+    /// The callee may write through it; the caller keeps ownership.
+    BorrowedMut,
+    /// The callee takes ownership. The caller may not use the value
+    /// again, and is no longer responsible for releasing it.
+    Owned,
+}
+
+impl ParamOwnership {
+    /// Whether passing an argument here ends the caller's claim on it.
+    pub fn consumes(&self) -> bool {
+        matches!(self, ParamOwnership::Owned)
+    }
 }
 
 /// Parameter attributes for validation and metadata
@@ -747,6 +778,7 @@ impl TypedParameter {
             kind: ParameterKind::Regular,
             default_value: None,
             attributes: vec![],
+            ownership: ParamOwnership::Copied,
             span,
         }
     }
@@ -766,6 +798,7 @@ impl TypedParameter {
             kind: ParameterKind::Optional,
             default_value: Some(Box::new(default)),
             attributes: vec![],
+            ownership: ParamOwnership::Copied,
             span,
         }
     }
@@ -779,6 +812,7 @@ impl TypedParameter {
             kind: ParameterKind::Rest,
             default_value: None,
             attributes: vec![],
+            ownership: ParamOwnership::Copied,
             span,
         }
     }
@@ -792,6 +826,7 @@ impl TypedParameter {
             kind: ParameterKind::Out,
             default_value: None,
             attributes: vec![],
+            ownership: ParamOwnership::Copied,
             span,
         }
     }
@@ -805,6 +840,7 @@ impl TypedParameter {
             kind: ParameterKind::Ref,
             default_value: None,
             attributes: vec![],
+            ownership: ParamOwnership::Copied,
             span,
         }
     }
@@ -818,6 +854,7 @@ impl TypedParameter {
             kind: ParameterKind::InOut,
             default_value: None,
             attributes: vec![],
+            ownership: ParamOwnership::Copied,
             span,
         }
     }

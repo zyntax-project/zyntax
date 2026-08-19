@@ -1322,6 +1322,7 @@ mod tests {
             name: InternedString::new_global("p"),
             ty,
             attributes: crate::hir::ParamAttributes::default(),
+            ownership: Default::default(),
         };
         f.signature.params = vec![
             mk_param(ptr_a, ptr_ty.clone()),

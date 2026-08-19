@@ -512,6 +512,11 @@ impl<'g> GrammarInterpreter<'g> {
             ["With"] => self.construct_with(fields, state, span),
             // Lambda parameter
             ["TypedLambdaParam"] => self.construct_lambda_param(fields, state, span),
+            // A parameter's ownership modifier. Carried as text and read
+            // back by `construct_parameter`, the way parameter kinds are.
+            ["ParamOwnership", variant] => {
+                Ok(ParsedValue::Text(format!("ParamOwnership::{}", variant)))
+            }
             _ => Err(format!("unknown type path: {}", type_path)),
         }
     }
@@ -2411,14 +2416,41 @@ impl<'g> GrammarInterpreter<'g> {
             ParameterKind::Regular
         };
 
+        // An ownership modifier the grammar stated. Absent, the lowering
+        // decides from the type.
+        let ownership = match self.get_field("ownership", fields) {
+            Some(expr) => match self.eval_expr(expr, state)? {
+                ParsedValue::Text(s) if s.contains("BorrowedMut") => {
+                    zyntax_typed_ast::ParamOwnership::BorrowedMut
+                }
+                ParsedValue::Text(s) if s.contains("Owned") => {
+                    zyntax_typed_ast::ParamOwnership::Owned
+                }
+                ParsedValue::Text(s) if s.contains("Borrowed") => {
+                    zyntax_typed_ast::ParamOwnership::Borrowed
+                }
+                _ => zyntax_typed_ast::ParamOwnership::Copied,
+            },
+            None => zyntax_typed_ast::ParamOwnership::Copied,
+        };
+
+        // A parameter written through is mutable to the callee even where
+        // the caller keeps it.
+        let mutability = if ownership == zyntax_typed_ast::ParamOwnership::BorrowedMut {
+            Mutability::Mutable
+        } else {
+            Mutability::Immutable
+        };
+
         Ok(ParsedValue::Parameter(TypedParameter {
             name,
             ty,
-            mutability: Mutability::Immutable,
+            mutability,
             kind,
             default_value,
             attributes: vec![],
             span,
+            ownership,
         }))
     }
 
@@ -4138,6 +4170,7 @@ impl<'g> GrammarInterpreter<'g> {
                     default_value: None,
                     attributes: vec![],
                     span: Span::new(0, 0),
+                    ownership: Default::default(),
                 })
             }
             ParsedValue::Interned(name) => {
@@ -4150,6 +4183,7 @@ impl<'g> GrammarInterpreter<'g> {
                     default_value: None,
                     attributes: vec![],
                     span: Span::new(0, 0),
+                    ownership: Default::default(),
                 })
             }
             ParsedValue::Text(name) => {
@@ -4162,6 +4196,7 @@ impl<'g> GrammarInterpreter<'g> {
                     default_value: None,
                     attributes: vec![],
                     span: Span::new(0, 0),
+                    ownership: Default::default(),
                 })
             }
             _ => Err("cannot convert value to parameter".to_string()),

@@ -9932,6 +9932,7 @@ mod tests {
                 name: InternedString::new_global("n"),
                 ty: i32_ty.clone(),
                 attributes: crate::hir::ParamAttributes::default(),
+                ownership: Default::default(),
             }],
             returns: vec![i32_ty.clone()],
             type_params: vec![],

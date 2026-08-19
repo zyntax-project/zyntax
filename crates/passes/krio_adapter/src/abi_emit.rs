@@ -2175,6 +2175,7 @@ pub fn reshape_to_poll_abi(
         name: InternedString::new_global("state_machine"),
         ty: HirType::Ptr(Box::new(HirType::U8)),
         attributes: ParamAttributes::default(),
+        ownership: Default::default(),
     };
     function.signature.params = vec![sm_param];
     function.signature.returns = vec![HirType::I64];
@@ -2888,6 +2889,7 @@ mod calling_convention_tests {
                 name: InternedString::new_global("x"),
                 ty: HirType::I32,
                 attributes: ParamAttributes::default(),
+                ownership: Default::default(),
             }],
             returns: vec![HirType::I32],
             type_params: vec![],

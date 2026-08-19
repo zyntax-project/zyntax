@@ -1110,6 +1110,7 @@ impl TypeChecker {
                         default_value: p.default_value.clone(),
                         attributes: p.attributes.clone(),
                         span: p.span,
+                        ownership: Default::default(),
                     }
                 })
                 .collect();

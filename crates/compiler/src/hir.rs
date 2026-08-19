@@ -320,7 +320,12 @@ pub struct HirParam {
     pub name: InternedString,
     pub ty: HirType,
     pub attributes: ParamAttributes,
+    /// What passing an argument here does to the caller's claim on it.
+    #[serde(default)]
+    pub ownership: ParamOwnership,
 }
+
+pub use zyntax_typed_ast::ParamOwnership;
 
 /// Parameter attributes for ABI compatibility
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
