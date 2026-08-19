@@ -3,19 +3,33 @@
 //! A dispatch is worth only what it can be applied to, so this reports
 //! coverage over the real kernels rather than invented ones.
 //!
-//! **What it showed, and why the dispatch is not built yet.** The gate
-//! accepts elementwise compute loops (`axpy`, `vadd`) and setup fills.
-//! It does NOT accept the matrix multiply, whose three accepted loops
-//! are all fills: `Tensor$zeros`, `Tensor$fill`, and one in `main`. Its
-//! compute loop addresses memory as `row * cols + col`, and the gate
-//! only accepts a subscript that is the induction variable itself.
+//! Two columns, not one. A loop can be independent as written, or
+//! independent provided something the function cannot see for itself
+//! holds, and the second is only worth as much as the dispatch site's
+//! willingness to establish what it names. Reporting them together
+//! would make the gate look wider than it is.
 //!
-//! That is the wrong half of the coverage. Measured on this machine at
-//! ten cores, spreading an elementwise kernel buys 1.1x to 2.4x because
-//! it is bandwidth-bound, while the matrix multiply buys 4.3x at 512
-//! and 6.0x at 1024. So the gate covers the loops where threading does
-//! not pay and misses the one where it does. Accepting affine
-//! subscripts is what makes a dispatch worth building.
+//! **What it shows.** Elementwise kernels and setup fills are
+//! independent outright. The matrix multiplies are independent against
+//! named obligations: a row loop writing `i * cols + j` is a band per
+//! row, but nothing inside the function says the output's column count
+//! and the counter's limit are the same number, nor that the operands
+//! are different storage.
+//!
+//! The prefill kernel is the one to read. It is a whole transformer
+//! layer rather than one shape in isolation, and its two matrix
+//! multiplies qualify at both levels, which is where spreading work
+//! actually pays: measured on this machine at ten cores, an elementwise
+//! kernel buys 1.1x to 2.4x because it is bandwidth-bound, while a
+//! matrix multiply buys 4.3x at 512 and 6.0x at 1024.
+//!
+//! Note what `gemm` asks for against what the tensor matmul asks for.
+//! Written with its dimensions as parameters, one value serves as both
+//! the output row's width and the inner counter's limit, so there is
+//! nothing to establish; written against a struct carrying its own
+//! shape, the two arrive as separate fields and have to be matched at
+//! the dispatch. Passing dimensions is the more analysable program, and
+//! the difference is visible in the columns rather than in an opinion.
 
 use std::path::Path;
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD};
@@ -35,10 +49,10 @@ fn report_parallel_coverage() {
     files.sort();
 
     println!(
-        "\n  {:<30}{:>12}{:>12}{:>10}",
-        "kernel", "independent", "carried", "opaque"
+        "\n  {:<28}{:>12}{:>12}{:>10}{:>8}",
+        "kernel", "independent", "conditional", "carried", "opaque"
     );
-    println!("  {}", "-".repeat(64));
+    println!("  {}", "-".repeat(70));
     for f in &files {
         let Ok(src) = std::fs::read_to_string(f) else {
             continue;
@@ -69,23 +83,37 @@ fn report_parallel_coverage() {
         zyntax_compiler::run_interp_safe_opts(&mut module);
         let s = parallel_safe::analyze_module(&module);
         println!(
-            "  {:<30}{:>12}{:>12}{:>10}",
+            "  {:<28}{:>12}{:>12}{:>10}{:>8}",
             f.file_stem().unwrap().to_string_lossy(),
             s.independent,
+            s.conditional,
             s.carried_dependency,
             s.opaque_body
         );
-        // Which function each independent loop is in, since a setup
-        // fill running once is not worth spreading and a compute loop
-        // is.
+        // Which function each loop is in, since a setup fill running
+        // once is not worth spreading and a compute loop is, and what
+        // each conditional one is waiting on.
         for func in module.functions.values() {
             let (found, _) = parallel_safe::analyze(func);
             for p in &found {
+                let name = func.name.resolve_global().unwrap_or_default();
+                let asks = if p.is_unconditional() {
+                    String::new()
+                } else {
+                    let disjoint = p
+                        .obligations
+                        .iter()
+                        .filter(|o| matches!(o, parallel_safe::Obligation::Disjoint(_, _)))
+                        .count();
+                    let counts = p.obligations.len() - disjoint;
+                    format!("  needs {disjoint} apart, {counts} equal")
+                };
                 println!(
-                    "        in {}: reads {} writes {}",
-                    func.name.resolve_global().unwrap_or_default(),
+                    "        in {}: reads {} writes {}{}",
+                    name,
                     p.reads.len(),
-                    p.writes.len()
+                    p.writes.len(),
+                    asks
                 );
             }
         }
