@@ -25,14 +25,14 @@ def fill(p: Ptr<f32>, v: f32, n: i64): i64 {
 }
 
 def main(): i64 {
-    let n: i64 = 1024
+    let n: i64 = 1048576
     let a: Ptr<f32> = alloc_f32(n)
     let b: Ptr<f32> = alloc_f32(n)
     let f1: i64 = fill(a, 1.0, n)
     let f2: i64 = fill(b, 2.0, n)
     let mut r: i64 = 0
     let mut total: f32 = 0.0
-    while r < 8000 {
+    while r < 4 {
         total = total + dot(a, b, n)
         r = r + 1
     }

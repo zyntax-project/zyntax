@@ -246,10 +246,10 @@ const KERNELS: &[Kernel] = &[
     // matches, axpy is a multiply feeding an add with a loop-invariant
     // scalar and is the shape it does not, dot carries an accumulator
     // rather than storing, and matmul is strided and shaped.
-    Kernel::new("bench_tensor_add", "Int(24000)"),
+    Kernel::new("bench_tensor_add", "Int(12)"),
     Kernel::new("bench_tensor_axpy", "Int(2)"),
-    Kernel::new("bench_tensor_dot", "Int(16384000)"),
-    Kernel::new("bench_tensor_matmul", "Int(5760)"),
+    Kernel::new("bench_tensor_dot", "Int(8388608)"),
+    Kernel::new("bench_tensor_matmul", "Int(2048)"),
     Kernel::new("bench_collatz", "Int(35669673)"),
     Kernel::new("bench_branchy", "Int(140)"),
 ];
@@ -353,6 +353,7 @@ const TARGETS: &[Target] = &[
             "free_function_call",
             "collatz",
             "branchy",
+            "tensor_matmul",
         ],
     },
     Target {
@@ -370,6 +371,7 @@ const TARGETS: &[Target] = &[
             "free_function_call",
             "collatz",
             "branchy",
+            "tensor_matmul",
         ],
     },
     Target {

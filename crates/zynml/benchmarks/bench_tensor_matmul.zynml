@@ -65,7 +65,7 @@ def matmul(a: Tensor, b: Tensor, out: Tensor): i64 {
 }
 
 def main(): i64 {
-    let n: i64 = 48
+    let n: i64 = 512
     let a: Tensor = Tensor::zeros(n, n)
     let b: Tensor = Tensor::zeros(n, n)
     let c: Tensor = Tensor::zeros(n, n)
@@ -73,7 +73,7 @@ def main(): i64 {
     let f2: i64 = b.fill(2.0)
     let mut r: i64 = 0
     let mut total: f32 = 0.0
-    while r < 60 {
+    while r < 2 {
         let w: i64 = matmul(a, b, c)
         total = total + c.at(0, 0)
         r = r + 1
