@@ -69,6 +69,7 @@ pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
+pub mod target_vector; // How wide a vector the target accepts, and lanes per element
 pub mod tco; // Tail-call optimisation marker
 pub mod trait_lowering; // Trait/interface lowering to HIR
 pub mod typed_cfg; // New: TypedAST-aware CFG builder

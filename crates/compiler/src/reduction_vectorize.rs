@@ -541,10 +541,20 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
         .get(&pat.n)
         .map(|v| v.ty.clone())
         .unwrap_or(HirType::I64);
-    // Stride + vector types. The widening dot consumes 16 i8 lanes per
-    // iteration into an i32x4 accumulator via a single `VectorDot`; the
-    // same-width path consumes 4 elements (elementwise op + reduce).
-    let stride: i64 = if pat.widening_dot { 16 } else { 4 };
+    // Stride + vector types. The widening dot is an instruction shape,
+    // not a width choice: it consumes 16 i8 lanes into an i32x4
+    // accumulator through a single `VectorDot`, so it stays as it is.
+    // The same-width path takes as many lanes of the element as the
+    // target holds.
+    let acc_lanes = match crate::target_vector::lanes_for(&pat.elem_ty) {
+        Some(l) => l,
+        None => return,
+    };
+    let stride: i64 = if pat.widening_dot {
+        16
+    } else {
+        acc_lanes as i64
+    };
     let mask_const = match n_ty {
         HirType::I32 | HirType::U32 => HirConstant::I32(!((stride as i32) - 1)),
         _ => HirConstant::I64(!(stride - 1)),
@@ -555,7 +565,14 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
     // Accumulator element/vector type (`i32`/i32x4 for the dot). Synthesise the
     // vector-zero init via `VectorSplat` of a scalar zero (no `HirConstant::Vector`).
     let elem_ty = pat.elem_ty.clone();
-    let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), 4);
+    let vec_ty = HirType::Vector(
+        Box::new(elem_ty.clone()),
+        if pat.widening_dot {
+            4
+        } else {
+            acc_lanes as u32
+        },
+    );
     // Load element/vector type: i8/i8x16 for the dot, else == accumulator.
     let load_elem_ty = pat.load_elem_ty.clone();
     let load_vec_ty = if pat.widening_dot {

@@ -5250,7 +5250,16 @@ impl CraneliftBackend {
                                     let value = builder.ins().splat(vec_clif_ty, scalar_val);
                                     self.value_map.insert(*result, value);
                                 } else {
-                                    warn!("[Cranelift] VectorSplat: unsupported type {:?}", ty);
+                                    // Skipping leaves the result
+                                    // undefined and whatever reads it
+                                    // silently wrong, so refuse instead.
+                                    return Err(CompilerError::Backend(format!(
+                                        "this backend holds 128-bit vectors only, and cannot \
+                                         broadcast to {:?}. A wider vector reached it, which \
+                                         means the width it was vectorized at is not one this \
+                                         target accepts.",
+                                        ty
+                                    )));
                                 }
                             }
                         }
@@ -5370,7 +5379,13 @@ impl CraneliftBackend {
                                     let value = builder.ins().load(vec_clif_ty, flags, ptr_val, 0);
                                     self.value_map.insert(*result, value);
                                 } else {
-                                    warn!("[Cranelift] VectorLoad: unsupported type {:?}", ty);
+                                    return Err(CompilerError::Backend(format!(
+                                        "this backend holds 128-bit vectors only, and cannot \
+                                         load {:?}. A wider vector reached it, which means the \
+                                         width it was vectorized at is not one this target \
+                                         accepts.",
+                                        ty
+                                    )));
                                 }
                             }
                         }

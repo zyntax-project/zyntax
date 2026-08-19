@@ -637,19 +637,24 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
     let scalar_check = HirId::new();
     let scalar_body = HirId::new();
 
-    // ── 1. Compute vec_n = (n & ~3) in the preheader, before its
-    //       terminator. We use bitwise-and with `~3` (which is
-    //       `0xfffffffc` for i32 / `0xffff...c` for i64) — that's
-    //       the standard "round down to multiple of 4" trick.
+    // ── 1. Compute vec_n = (n & ~(lanes-1)) in the preheader, before
+    //       its terminator: round the trip count down to a whole number
+    //       of vectors. Lanes come from the element and the target
+    //       width, so the mask and the step below follow from them
+    //       rather than assuming four.
+    let lanes = match crate::target_vector::lanes_for(&pat.elem_ty) {
+        Some(l) => l,
+        None => return,
+    };
     let n_ty = func
         .values
         .get(&pat.n)
         .map(|v| v.ty.clone())
         .unwrap_or(HirType::I64);
+    let lane_mask = !(lanes as i64 - 1);
     let mask_const = match n_ty {
-        HirType::I32 | HirType::U32 => HirConstant::I32(!3i32),
-        HirType::I64 | HirType::U64 => HirConstant::I64(!3i64),
-        _ => HirConstant::I64(!3i64),
+        HirType::I32 | HirType::U32 => HirConstant::I32(lane_mask as i32),
+        _ => HirConstant::I64(lane_mask),
     };
     let mask_id = create_value(func, n_ty.clone(), HirValueKind::Constant(mask_const));
     let vec_n_id = create_value(func, n_ty.clone(), HirValueKind::Instruction);
@@ -699,7 +704,7 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
     // ── 3. Replace the body's scalar Load/Binary/Store with the
     //       vector equivalents, and bump i by 4 instead of 1.
     let elem_ty = pat.elem_ty.clone();
-    let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), 4);
+    let vec_ty = HirType::Vector(Box::new(elem_ty.clone()), lanes as u32);
 
     // Build the vector body ahead of installing it, so the broadcasts
     // the expression needs can be collected for the preheader on the
@@ -728,12 +733,12 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
         HirType::Ptr(Box::new(elem_ty.clone())),
         HirValueKind::Instruction,
     );
-    let four = create_value(
+    let step = create_value(
         func,
         n_ty.clone(),
         HirValueKind::Constant(match n_ty {
-            HirType::I32 | HirType::U32 => HirConstant::I32(4),
-            _ => HirConstant::I64(4),
+            HirType::I32 | HirType::U32 => HirConstant::I32(lanes as i32),
+            _ => HirConstant::I64(lanes as i64),
         }),
     );
     let new_i_next = create_value(func, n_ty.clone(), HirValueKind::Instruction);
@@ -760,7 +765,7 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
             result: new_i_next,
             ty: n_ty.clone(),
             left: pat.i_phi,
-            right: four,
+            right: step,
         });
         body_blk.terminator = HirTerminator::Branch { target: pat.header };
     }
