@@ -805,6 +805,17 @@ impl ZyntaxRuntime {
             );
         }
 
+        // Ownership, where the embedding language asked for it. A
+        // language that states which parameters consume their argument
+        // gets the misuse reported here; one that does not leaves the
+        // flag off and is unaffected.
+        if self.config.enable_borrow_check {
+            let result = zyntax_compiler::borrow_check::check_ownership(&hir_module)
+                .map_err(|e| RuntimeError::Execution(format!("{e:?}")))?;
+            zyntax_compiler::borrow_check::validate_borrow_check(&result)
+                .map_err(|e| RuntimeError::Execution(format!("{e:?}")))?;
+        }
+
         Ok(hir_module)
     }
 

@@ -26,7 +26,7 @@
 extern def alloc_i8(n: i64): Ptr<i8>
 extern def alloc_i32(n: i64): Ptr<i32>
 extern def alloc_f32(n: i64): Ptr<f32>
-extern def free<T>(p: Ptr<T>)
+extern def free<T>(own p: Ptr<T>)
 
 // Load / store a whole SIMD vector at a pointer. `vload_*` reads the
 // vector named by its suffix; `vstore_*` writes one. Callers advance the

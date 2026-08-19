@@ -56,6 +56,7 @@ pub mod memory_management;
 pub mod memory_optimization; // Memory-aware optimizations
 pub mod memory_pass;
 pub mod monomorphize;
+pub mod move_insert; // Owning parameters become `Move` the borrow check can see
 pub mod optimization;
 pub mod pattern_matching;
 pub mod phi_prune;
@@ -1640,7 +1641,11 @@ pub fn compile_to_hir(
 
     // Step 3b: HIR borrow checking (if enabled)
     if config.enable_borrow_check {
-        let borrow_result = borrow_check::run_borrow_check(&hir_module, Some(&analysis))?;
+        // Through `check_ownership`, not the raw check: the moves an
+        // owning parameter implies have to exist before anything can be
+        // found, and they are made on a copy so what gets compiled is
+        // unchanged.
+        let borrow_result = borrow_check::check_ownership(&hir_module)?;
         borrow_check::validate_borrow_check(&borrow_result)?;
     }
 

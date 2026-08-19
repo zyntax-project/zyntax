@@ -269,6 +269,18 @@ impl<'a> HirBorrowChecker<'a> {
                 }
             }
 
+            HirInstruction::GetElementPtr { ptr, indices, .. } => {
+                // Computing an address from a pointer is a use of that
+                // pointer. Without this, reading or writing through an
+                // index never counts as touching what it was computed
+                // from, and a release followed by an indexed access
+                // reads as untouched.
+                self.check_value_use(func, *ptr, None)?;
+                for idx in indices {
+                    self.check_value_use(func, *idx, None)?;
+                }
+            }
+
             HirInstruction::Load {
                 result: _,
                 ty: _,
@@ -531,6 +543,21 @@ impl<'a> HirBorrowChecker<'a> {
 }
 
 /// Run borrow checking on a module
+/// Check ownership over a copy of the module, and return what it found.
+///
+/// The move insertion this depends on rewrites call arguments, and no
+/// backend lowers `HirInstruction::Move`, so the checked module must
+/// never be the compiled one. Taking the copy here rather than asking
+/// callers to remember it is what keeps an analysis from changing what
+/// runs.
+pub fn check_ownership(module: &HirModule) -> CompilerResult<BorrowCheckResult> {
+    let mut checked = module.clone();
+    crate::move_insert::run_module(&mut checked);
+    let mut runner = crate::analysis::AnalysisRunner::new(checked.clone());
+    let analysis = runner.run_all()?;
+    run_borrow_check(&checked, Some(&analysis))
+}
+
 pub fn run_borrow_check(
     module: &HirModule,
     analysis: Option<&ModuleAnalysis>,

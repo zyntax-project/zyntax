@@ -287,9 +287,16 @@ impl ZynML {
             cfg
         };
         let mut runtime = match config.runtime_profile {
-            ZynMLRuntimeProfile::Classic => RuntimeEngine::Classic(
-                ZyntaxRuntime::new().context("Failed to create Zyntax runtime")?,
-            ),
+            ZynMLRuntimeProfile::Classic => RuntimeEngine::Classic({
+                let mut rt = ZyntaxRuntime::new().context("Failed to create Zyntax runtime")?;
+                // Ownership is part of the language here rather than a
+                // setting, so it is on and stays on. A parameter states
+                // whether it consumes its argument, and releasing the
+                // same buffer twice or reading one after releasing it is
+                // rejected rather than left to run.
+                rt.config_mut().enable_borrow_check = true;
+                rt
+            }),
             ZynMLRuntimeProfile::TieredDevelopment => RuntimeEngine::Tiered(
                 TieredRuntime::new(tier_config(zyntax_embed::TieredConfig::development()))
                     .context("Failed to create tiered runtime")?,
