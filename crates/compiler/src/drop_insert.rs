@@ -164,6 +164,166 @@ impl ModuleFacts {
     }
 }
 
+/// Release storage an accumulator replaces each time round a loop.
+///
+/// `sum = sum + a + b` keeps one object per iteration. The header phi
+/// holds the previous one, the body builds a new one, and the previous
+/// is unreachable the moment the body has read it. Nothing released it,
+/// because a phi is exactly what the per-site analysis turns down.
+///
+/// The release goes after the phi's last use in the body, so it frees
+/// only what the body actually consumed. What leaves through the exit is
+/// the value the last body execution produced, which no body execution
+/// ever read, so code after the loop still holds live storage. That last
+/// object is not released here: one outlives the loop, rather than one
+/// per iteration.
+///
+/// The conditions are narrow deliberately. Releasing the wrong incoming
+/// is a use after free, not a slow program.
+fn release_loop_carried(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
+    use crate::analysis::{DominatorTree, LoopForest};
+
+    let owned: std::collections::HashSet<HirId> = collect_owned_sites(func, facts)
+        .iter()
+        .map(|s| s.result)
+        .collect();
+    if owned.is_empty() {
+        return 0;
+    }
+
+    let dt = DominatorTree::new(func);
+    let forest = LoopForest::detect(func, &dt);
+    let mut plan: Vec<(HirId, usize, HirId)> = Vec::new();
+
+    for lp in forest.loops() {
+        // One body block, so "the last use in the body" is unambiguous
+        // and every way round the loop passes through it.
+        if lp.body.len() != 2 {
+            continue;
+        }
+        let Some(&body_id) = lp.body.iter().find(|&&b| b != lp.header) else {
+            continue;
+        };
+        let (Some(header), Some(body)) = (func.blocks.get(&lp.header), func.blocks.get(&body_id))
+        else {
+            continue;
+        };
+        // The body must close the loop itself, or what reaches the phi
+        // next is not what this body produced.
+        if !matches!(body.terminator, HirTerminator::Branch { target } if target == lp.header) {
+            continue;
+        }
+
+        for phi in &header.phis {
+            if phi.incoming.len() != 2 {
+                continue;
+            }
+            // Every incoming must be storage this function owns, and the
+            // one arriving round the back edge must be built by the
+            // body. Otherwise the phi can carry one object twice and the
+            // release would run on it after it was already gone.
+            let mut all_owned = true;
+            let mut back_edge_fresh = false;
+            for (val, pred) in &phi.incoming {
+                if !owned.contains(val) {
+                    all_owned = false;
+                    break;
+                }
+                if *pred == body_id {
+                    back_edge_fresh = defines_value(body, *val);
+                }
+            }
+            if !all_owned || !back_edge_fresh {
+                continue;
+            }
+
+            // Nothing anywhere may keep the value, or releasing it here
+            // pulls the storage out from under whatever kept it.
+            let derived = derived_values(func, phi.result);
+            if !uses_are_all_borrows(func, &derived, facts) {
+                continue;
+            }
+
+            let Some(last) = last_use_index(body, &derived, facts) else {
+                continue;
+            };
+            plan.push((body_id, last, phi.result));
+        }
+    }
+
+    let inserted = plan.len();
+    // Back to front, so earlier indices stay valid.
+    plan.sort_by_key(|(_, idx, _)| std::cmp::Reverse(*idx));
+    for (block_id, idx, value) in plan {
+        insert_free_after(func, block_id, idx, value, Release::Intrinsic);
+    }
+    inserted
+}
+
+/// Whether this block defines `value`.
+fn defines_value(block: &crate::hir::HirBlock, value: HirId) -> bool {
+    block
+        .instructions
+        .iter()
+        .any(|i| instruction_defines(i, value))
+}
+
+fn instruction_defines(inst: &HirInstruction, value: HirId) -> bool {
+    match inst {
+        HirInstruction::Binary { result, .. }
+        | HirInstruction::Unary { result, .. }
+        | HirInstruction::Cast { result, .. }
+        | HirInstruction::GetElementPtr { result, .. }
+        | HirInstruction::Load { result, .. }
+        | HirInstruction::ExtractValue { result, .. }
+        | HirInstruction::InsertValue { result, .. }
+        | HirInstruction::Select { result, .. }
+        | HirInstruction::Alloca { result, .. } => *result == value,
+        HirInstruction::Call { result, .. } => *result == Some(value),
+        _ => false,
+    }
+}
+
+/// Whether every use of the set, anywhere in the function, leaves the
+/// storage to us.
+fn uses_are_all_borrows(
+    func: &HirFunction,
+    derived: &std::collections::HashSet<HirId>,
+    facts: &ModuleFacts,
+) -> bool {
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if matches!(classify_derived_use(inst, derived, facts), UseKind::Escape) {
+                return false;
+            }
+        }
+        for d in derived {
+            if matches!(
+                classify_terminator_use(&block.terminator, *d),
+                UseKind::Escape
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Index of the last instruction in `block` that reads the set.
+fn last_use_index(
+    block: &crate::hir::HirBlock,
+    derived: &std::collections::HashSet<HirId>,
+    facts: &ModuleFacts,
+) -> Option<usize> {
+    let mut last = None;
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        if matches!(classify_derived_use(inst, derived, facts), UseKind::Use) {
+            last = Some(idx);
+        }
+    }
+    last
+}
+
 /// Functions whose result is storage the caller owns.
 ///
 /// Deliberately strict, because being wrong here releases something the
@@ -262,6 +422,7 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
             SiteOutcome::NoUse => stats.no_use_skipped += 1,
         }
     }
+    stats.frees_inserted += release_loop_carried(func, facts);
     stats
 }
 
@@ -1208,6 +1369,154 @@ mod tests {
             !freed,
             "a pass-through returns storage it does not own; releasing it would \
              free the caller's own pointer"
+        );
+    }
+
+    /// A loop whose header phi carries an allocation replaced each
+    /// iteration, which is what an accumulator is:
+    ///
+    /// ```text
+    /// entry:  p0 = malloc; -> header
+    /// header: phi = [p0 from entry, p1 from body]; -> body | exit
+    /// body:   load phi; p1 = malloc; -> header
+    /// exit:   load phi; return
+    /// ```
+    fn build_accumulator_loop(escaping: bool) -> (HirFunction, HirId) {
+        let mut f = HirFunction::new(
+            InternedString::new_global("accumulate"),
+            empty_sig(HirType::I64),
+        );
+        let entry = f.entry_block;
+        let header = HirId::new();
+        let body = HirId::new();
+        let exit = HirId::new();
+        f.blocks.insert(header, HirBlock::new(header));
+        f.blocks.insert(body, HirBlock::new(body));
+        f.blocks.insert(exit, HirBlock::new(exit));
+
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
+        let cond = add_const(&mut f, HirType::Bool, HirConstant::Bool(true));
+        let p0 = add_inst_val(&mut f, ptr_ty.clone());
+        let p1 = add_inst_val(&mut f, ptr_ty.clone());
+        let acc = add_inst_val(&mut f, ptr_ty.clone());
+        let l_body = add_inst_val(&mut f, HirType::I64);
+        let l_exit = add_inst_val(&mut f, HirType::I64);
+
+        let alloc = |r: HirId, sz: HirId| HirInstruction::Call {
+            result: Some(r),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![sz],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        };
+
+        let b = f.blocks.get_mut(&entry).unwrap();
+        b.instructions.push(alloc(p0, size));
+        b.terminator = HirTerminator::Branch { target: header };
+
+        let h = f.blocks.get_mut(&header).unwrap();
+        h.phis.push(crate::hir::HirPhi {
+            result: acc,
+            ty: ptr_ty.clone(),
+            incoming: vec![(p0, entry), (p1, body)],
+        });
+        h.terminator = HirTerminator::CondBranch {
+            condition: cond,
+            true_target: body,
+            false_target: exit,
+        };
+
+        let bd = f.blocks.get_mut(&body).unwrap();
+        bd.instructions.push(HirInstruction::Load {
+            result: l_body,
+            ty: HirType::I64,
+            ptr: acc,
+            align: 8,
+            volatile: false,
+        });
+        if escaping {
+            // Hand the accumulator to something that might keep it.
+            bd.instructions.push(HirInstruction::Call {
+                result: None,
+                callee: HirCallable::Symbol("keeps_it".to_string()),
+                args: vec![acc],
+                type_args: Vec::new(),
+                const_args: Vec::new(),
+                is_tail: false,
+            });
+        }
+        bd.instructions.push(alloc(p1, size));
+        bd.terminator = HirTerminator::Branch { target: header };
+
+        // Loop detection reads the edge lists rather than deriving
+        // them from terminators, so a hand-built function fills them in.
+        f.blocks.get_mut(&entry).unwrap().successors = vec![header];
+        f.blocks.get_mut(&header).unwrap().successors = vec![body, exit];
+        f.blocks.get_mut(&body).unwrap().successors = vec![header];
+        f.blocks.get_mut(&header).unwrap().predecessors = vec![entry, body];
+        f.blocks.get_mut(&body).unwrap().predecessors = vec![header];
+        f.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
+
+        let ex = f.blocks.get_mut(&exit).unwrap();
+        ex.instructions.push(HirInstruction::Load {
+            result: l_exit,
+            ty: HirType::I64,
+            ptr: acc,
+            align: 8,
+            volatile: false,
+        });
+        ex.terminator = HirTerminator::Return {
+            values: vec![l_exit],
+        };
+        (f, acc)
+    }
+
+    /// The object the accumulator replaces is released in the body,
+    /// after the body has read it. What leaves through the exit is the
+    /// one the last iteration built, which the body never read.
+    #[test]
+    fn an_accumulator_releases_what_it_replaces() {
+        let (mut f, acc) = build_accumulator_loop(false);
+        let body_id = f
+            .blocks
+            .iter()
+            .find(|(_, blk)| {
+                blk.instructions
+                    .iter()
+                    .any(|i| matches!(i, HirInstruction::Load { .. }))
+                    && matches!(blk.terminator, HirTerminator::Branch { .. })
+            })
+            .map(|(id, _)| *id)
+            .expect("the body");
+
+        assert_eq!(release_loop_carried(&mut f, &ModuleFacts::default()), 1);
+
+        let body = &f.blocks[&body_id];
+        let free_at = body.instructions.iter().position(|i| {
+            matches!(i, HirInstruction::Call { callee: HirCallable::Intrinsic(Intrinsic::Free), args, .. } if args == &vec![acc])
+        });
+        let read_at = body
+            .instructions
+            .iter()
+            .position(|i| matches!(i, HirInstruction::Load { .. }));
+        let free_at = free_at.expect("the accumulator should be released in the body");
+        assert!(
+            free_at > read_at.expect("the read"),
+            "releasing before the body reads it would be a use after free"
+        );
+    }
+
+    /// If anything might keep the accumulator, it is not ours to
+    /// release.
+    #[test]
+    fn an_accumulator_that_might_be_kept_is_left_alone() {
+        let (mut f, _) = build_accumulator_loop(true);
+        assert_eq!(
+            release_loop_carried(&mut f, &ModuleFacts::default()),
+            0,
+            "a call that might keep the pointer forfeits the release"
         );
     }
 
