@@ -926,18 +926,20 @@ impl InterpRuntime {
                             }
                         }
                         Err(e) => {
-                            // Soft failure: LLVM backend doesn't translate
-                            // every HIR type yet (Opaque from @reference-class
-                            // lowering, extern types like Tensor return
-                            // "Type translation not yet implemented"); or the
-                            // AOT-via-object path may have hit `NoLinker`
-                            // (no `cc`/`clang`/`gcc` in PATH) or a link/dlopen
-                            // failure. The runtime still runs; the LLVM tier
-                            // just never engages because `llvm_ready` stays
-                            // false. Surface the cause loudly: the bench
+                            // Soft failure: most often IR generation, which
+                            // both installers share -- a HIR type the LLVM
+                            // backend does not translate yet (Opaque from
+                            // @reference-class lowering, extern types like
+                            // Tensor), or a module the verifier rejects. Only
+                            // if the object-file installer was selected can it
+                            // additionally be `NoLinker` or a link/dlopen
+                            // failure; the default MCJIT path needs no
+                            // toolchain. The runtime still runs, and the LLVM
+                            // tier just never engages because `llvm_ready`
+                            // stays false. Surface the cause loudly: the bench
                             // harness captures stderr but doesn't init
                             // `env_logger`.
-                            eprintln!("[LLVM-AOT-DISABLED] {e}");
+                            eprintln!("[LLVM-TIER-DISABLED] {e}");
                             log::warn!(
                                 "LLVM tier-up disabled for this module: eager compile_module failed ({e}). \
                                  Cranelift tier-up will still drive the JIT path."
@@ -1202,7 +1204,7 @@ mod tests {
     use std::collections::HashSet;
     use zyntax_compiler::hir::{
         BinaryOp, HirBlock, HirFunction, HirFunctionSignature, HirInstruction, HirParam,
-        HirTerminator, HirType, HirValue, HirValueKind, ParamAttributes,
+        HirTerminator, HirType, HirValue, HirValueKind, ParamAttributes, ParamOwnership,
     };
     use zyntax_typed_ast::InternedString;
 
@@ -1231,12 +1233,14 @@ mod tests {
                     name: InternedString::new_global("a"),
                     ty: HirType::I64,
                     attributes: ParamAttributes::default(),
+                    ownership: ParamOwnership::default(),
                 },
                 HirParam {
                     id: HirId::new(),
                     name: InternedString::new_global("b"),
                     ty: HirType::I64,
                     attributes: ParamAttributes::default(),
+                    ownership: ParamOwnership::default(),
                 },
             ],
             returns: vec![HirType::I64],

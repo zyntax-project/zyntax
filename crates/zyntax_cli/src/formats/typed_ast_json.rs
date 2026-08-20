@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use zyntax_compiler::hir::{CallingConvention, HirId, HirModule, HirType};
 use zyntax_compiler::hir_builder::HirBuilder;
 use zyntax_typed_ast::{
-    typed_ast::TypedBlock, AstArena, BinaryOp, PrimitiveType, Type, TypedDeclaration,
-    TypedExpression, TypedFunction, TypedLiteral, TypedNode, TypedProgram, TypedStatement, ParamOwnership};
+    typed_ast::TypedBlock, AstArena, BinaryOp, ParamOwnership, PrimitiveType, Type,
+    TypedDeclaration, TypedExpression, TypedFunction, TypedLiteral, TypedNode, TypedProgram,
+    TypedStatement,
+};
 
 /// Load TypedAST from JSON file(s) and convert to HIR
 pub fn load(inputs: &[PathBuf], verbose: bool) -> Result<HirModule, Box<dyn std::error::Error>> {

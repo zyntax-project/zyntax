@@ -1147,7 +1147,9 @@ impl HirLiveness {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use zyntax_compiler::hir::{HirFunction, HirFunctionSignature, ParamAttributes};
+    use zyntax_compiler::hir::{
+        HirFunction, HirFunctionSignature, ParamAttributes, ParamOwnership,
+    };
     use zyntax_typed_ast::InternedString;
 
     fn empty_function(name: &str) -> HirFunction {
@@ -1418,6 +1420,7 @@ mod tests {
             name: InternedString::new_global("live"),
             ty: HirType::I32,
             attributes: ParamAttributes::default(),
+            ownership: ParamOwnership::default(),
         });
         let entry_block = f.blocks.get_mut(&entry).unwrap();
         // Plant an await call followed by a Return — krio splits at the await.
@@ -1523,6 +1526,7 @@ mod tests {
                 name: InternedString::new_global(name),
                 ty: HirType::I32,
                 attributes: ParamAttributes::default(),
+                ownership: ParamOwnership::default(),
             });
         }
         // Plant two Intrinsic::Await calls and one regular Call between them.
@@ -1737,6 +1741,7 @@ mod tests {
             name: InternedString::new_global("live"),
             ty: HirType::I32,
             attributes: ParamAttributes::default(),
+            ownership: ParamOwnership::default(),
         });
         let entry_block = f.blocks.get_mut(&entry).unwrap();
         entry_block

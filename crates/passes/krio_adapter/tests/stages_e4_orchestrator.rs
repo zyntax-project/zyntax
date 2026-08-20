@@ -242,7 +242,7 @@ fn e4_orchestrator_no_op_for_non_async_function() {
 fn generate_sync_entry_produces_poll_loop_with_original_signature() {
     use indexmap::IndexMap;
     use krio_adapter::abi_emit::generate_sync_entry;
-    use zyntax_compiler::hir::{HirFunctionSignature, HirParam, ParamAttributes};
+    use zyntax_compiler::hir::{HirFunctionSignature, HirParam, ParamAttributes, ParamOwnership};
     use zyntax_typed_ast::InternedString;
 
     let sig = HirFunctionSignature {
@@ -251,6 +251,7 @@ fn generate_sync_entry_produces_poll_loop_with_original_signature() {
             name: InternedString::new_global("p0"),
             ty: HirType::I32,
             attributes: ParamAttributes::default(),
+            ownership: ParamOwnership::default(),
         }],
         returns: vec![HirType::I64],
         type_params: vec![],
