@@ -51,7 +51,7 @@
 
 use std::ffi::{CStr, OsStr};
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::hir::HirType;
@@ -2236,14 +2236,74 @@ struct Job {
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
-struct Pool {
-    tx: Vec<std::sync::mpsc::Sender<Arc<Job>>>,
-    done: Arc<(Mutex<()>, Condvar)>,
+/// How long the dispatching thread watches for the last band before it
+/// sleeps on it.
+const STRAGGLER_SPINS: u32 = 20_000;
+
+/// One turn of a wait loop.
+///
+/// The pause hint is issued only where it pays. On x86 a bare spin runs
+/// the core at full power and machine-clears on the shared cell, so the
+/// hint is worth its cost; on aarch64 the hint costs more in the hot
+/// join than the spinning it moderates, and there is no thermal
+/// pressure to trade against.
+#[inline(always)]
+fn relax() {
+    #[cfg(target_arch = "x86_64")]
+    std::hint::spin_loop();
 }
 
-static POOL: OnceLock<Pool> = OnceLock::new();
+/// Whether this thread is already inside a band.
+///
+/// A band that dispatches again would be asking the pool for threads
+/// that are, in part, itself: it would wait for a job that only it can
+/// take, and the dispatch would never complete. Nested work runs where
+/// it is instead, which is the answer a pool with no idle thread would
+/// give anyway.
+thread_local! {
+    static IN_BAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// How many workers to run. One per core the machine reports, capped so
+/// A pool of threads that stay warm between dispatches.
+///
+/// Threads are created once and live for the process. A dispatch posts
+/// one job to each and every thread claims bands from a shared cursor
+/// until the range is gone, rather than each taking an equal share,
+/// because a machine with fast and slow cores finishes an equal split
+/// at the pace of its slowest.
+///
+/// Each thread has its own queue rather than all of them watching one
+/// slot, and each sleeps on it rather than watching for work. Both of
+/// those were tried the other way and measured, because a pool exists
+/// to make handing work over cheap and there is no reading the answer
+/// off the source.
+///
+/// One shared slot the threads raced for cost 123 microseconds a
+/// dispatch against 48 for a queue each: nine threads waking to queue
+/// behind one lock is worse than nine independent handoffs. Keeping
+/// them awake instead, watching a cell of their own and yielding before
+/// sleeping, was worse again and much less predictable: alternating
+/// prebuilt binaries eight times gave a best of 92 against 34 here and
+/// a worst of 1.7 milliseconds, because threads held awake for work
+/// that has not arrived are threads competing with the one still doing
+/// the work. A queued job also cannot be missed by a thread that had
+/// not started yet, which a cell can.
+///
+/// **The blocking is load-bearing, not a simplification.** A captured
+/// environment is a stack slot, so an `env` handed to a thread is only
+/// valid while the caller is still in the frame that built it. Blocking
+/// is what makes that true. A dispatch that returned before its bands
+/// finished, or handed work to something detached, would give a thread
+/// a pointer into a frame that had gone. Anything of that shape has to
+/// wait for captured environments to be heap-allocated when they
+/// escape.
+pub struct BandPool {
+    queues: Vec<std::sync::mpsc::Sender<Arc<Job>>>,
+    done: Arc<(Mutex<()>, Condvar)>,
+    workers: usize,
+}
+
+/// How many threads to run. One per core the machine reports, capped so
 /// a very large machine does not pay more in dispatch than it saves.
 fn worker_count() -> usize {
     std::env::var("ZYNTAX_PARALLEL_THREADS")
@@ -2254,19 +2314,26 @@ fn worker_count() -> usize {
         .clamp(1, 32)
 }
 
-fn pool() -> &'static Pool {
-    POOL.get_or_init(|| {
-        let n = worker_count();
+static POOL: OnceLock<BandPool> = OnceLock::new();
+
+impl BandPool {
+    /// The pool every dispatch uses. Built on first use.
+    pub fn shared() -> &'static BandPool {
+        POOL.get_or_init(BandPool::new)
+    }
+
+    fn new() -> BandPool {
+        let workers = worker_count();
         let done = Arc::new((Mutex::new(()), Condvar::new()));
-        let mut tx = Vec::with_capacity(n);
-        for _ in 0..n {
-            let (s, r) = std::sync::mpsc::channel::<Arc<Job>>();
-            tx.push(s);
+        let mut queues = Vec::with_capacity(workers.saturating_sub(1));
+        for _ in 0..workers.saturating_sub(1) {
+            let (send, recv) = std::sync::mpsc::channel::<Arc<Job>>();
+            queues.push(send);
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
-                while let Ok(job) = r.recv() {
+                while let Ok(job) = recv.recv() {
                     run_bands(&job);
-                    // The last worker out wakes the caller.
+                    // The last thread out wakes whoever is waiting.
                     if job.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                         let (lock, cv) = &*done;
                         let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2275,8 +2342,107 @@ fn pool() -> &'static Pool {
                 }
             });
         }
-        Pool { tx, done }
-    })
+        BandPool {
+            queues,
+            done,
+            workers,
+        }
+    }
+
+    /// How many threads take part, counting the one that dispatches.
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Run `band` over `[lo, hi)` across the pool, returning once every
+    /// part of the range has been computed exactly once.
+    ///
+    /// `grain` is the smallest run of iterations worth handing to
+    /// another thread, and it is the caller's to state because only the
+    /// caller knows what one iteration costs. A thousand iterations of
+    /// an elementwise pass are worth less than ten rows of a matrix
+    /// multiply, and a number picked here would have to be wrong for
+    /// one of them. Below twice the grain the whole range runs on this
+    /// thread, so a loop too short to spread does not pay for threads
+    /// it cannot use.
+    ///
+    /// # Safety
+    /// `band` must be a valid function pointer, and `env` must stay
+    /// valid for the call, which it does because this blocks.
+    pub unsafe fn parallel_for(&self, lo: i64, hi: i64, grain: i64, band: BandFn, env: *mut u8) {
+        let total = hi - lo;
+        if total <= 0 {
+            return;
+        }
+        let grain = grain.max(1);
+        // Running where we are is right for three separate reasons: too
+        // little work to share, nobody to share it with, or already
+        // inside a band and so unable to wait on a thread that is
+        // partly this one.
+        if self.workers < 2 || total < grain * 2 || IN_BAND.with(|f| f.get()) {
+            run_one(band, lo, hi, env);
+            return;
+        }
+
+        // Bands smaller than the even split, so a thread that finishes
+        // early takes more instead of idling. Below four iterations a
+        // thread the range is in the regime where one iteration is
+        // itself large: claim them singly so every thread gets one,
+        // because the cursor traffic is nothing against the work and an
+        // even split would hand the whole range to the first claimant.
+        let claimants = self.workers as i64;
+        let chunk = if total < claimants * 4 {
+            1
+        } else {
+            (total / (claimants * 8)).max(8).min(total)
+        };
+        let job = Arc::new(Job {
+            band,
+            env: env as usize,
+            cursor: AtomicI64::new(lo),
+            hi,
+            chunk,
+            remaining: AtomicUsize::new(self.queues.len()),
+        });
+        for q in &self.queues {
+            // A thread that has gone away leaves its share on the
+            // cursor for the others, so a send failure is not fatal.
+            let _ = q.send(Arc::clone(&job));
+        }
+
+        // The dispatching thread takes bands too rather than waiting
+        // idle for threads it just woke.
+        run_bands(&job);
+
+        // By the time this thread runs out of bands to claim, what is
+        // left is one straggler finishing the band it already has. That
+        // is a short wait, and sleeping through it costs a pair of
+        // context switches to save nothing, so look first.
+        for _ in 0..STRAGGLER_SPINS {
+            if job.remaining.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            relax();
+        }
+        // Past that the wait is no longer short, and holding a core to
+        // watch for it would take one away from whoever is still
+        // working.
+        let (lock, cv) = &*self.done;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while job.remaining.load(Ordering::Acquire) > 0 {
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// One band, with the flag that stops it dispatching again set for as
+/// long as it runs.
+fn run_one(band: BandFn, lo: i64, hi: i64, env: *mut u8) {
+    let outer = IN_BAND.with(|f| f.replace(true));
+    // Safety: the caller established that `band` and `env` are valid,
+    // and the dispatch blocks for as long as any band can run.
+    unsafe { band(lo, hi, env) };
+    IN_BAND.with(|f| f.set(outer));
 }
 
 /// Claim bands from the shared cursor until the range is exhausted.
@@ -2287,23 +2453,11 @@ fn run_bands(job: &Job) {
             return;
         }
         let hi = (lo + job.chunk).min(job.hi);
-        // Safety: the caller is blocked for the whole dispatch, so `env`
-        // addresses storage that is still alive, and the compiler only
-        // emits this for loops whose iterations touch disjoint memory.
-        unsafe { (job.band)(lo, hi, job.env as *mut u8) };
+        run_one(job.band, lo, hi, job.env as *mut u8);
     }
 }
 
-/// Run `band` over `[lo, hi)` across the pool, returning once every part
-/// of the range has been computed exactly once.
-///
-/// `grain` is the smallest run of iterations worth handing to a worker,
-/// and it is the caller's to decide because only the caller knows what
-/// one iteration costs. A thousand iterations of an elementwise pass are
-/// worth less than ten rows of a matrix multiply, and a threshold picked
-/// here would have to be wrong for one of them. Below twice the grain
-/// the whole range runs on this thread, so a loop too short to spread
-/// does not pay for threads it cannot use.
+/// The dispatch a compiled loop calls.
 ///
 /// # Safety
 /// `band` must be a valid function pointer and `env` must remain valid
@@ -2316,40 +2470,5 @@ pub unsafe extern "C" fn zyntax_parallel_for(
     band: BandFn,
     env: *mut u8,
 ) {
-    let total = hi - lo;
-    if total <= 0 {
-        return;
-    }
-    let grain = grain.max(1);
-    let workers = worker_count();
-    if workers < 2 || total < grain * 2 {
-        band(lo, hi, env);
-        return;
-    }
-
-    // Bands smaller than the even split, so a worker that finishes early
-    // takes more instead of idling.
-    let chunk = ((total / (workers as i64 * 4)).max(grain)).min(total);
-    let p = pool();
-    let job = Arc::new(Job {
-        band,
-        env: env as usize,
-        cursor: AtomicI64::new(lo),
-        hi,
-        chunk,
-        remaining: AtomicUsize::new(p.tx.len()),
-    });
-    for s in &p.tx {
-        // A worker that has gone away leaves its share on the cursor for
-        // the others, so a send failure is not fatal.
-        let _ = s.send(Arc::clone(&job));
-    }
-    // The calling thread takes bands too rather than waiting idle.
-    run_bands(&job);
-
-    let (lock, cv) = &*p.done;
-    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while job.remaining.load(Ordering::Acquire) > 0 {
-        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-    }
+    BandPool::shared().parallel_for(lo, hi, grain, band, env)
 }
