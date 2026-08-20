@@ -1,4 +1,0 @@
-# String test build configuration
--lib reflaxe.zyntax
--main StringTest
--D zyntax-output=output

@@ -1,5 +1,0 @@
--cp test
--lib reflaxe.zyntax
--main StringConcatTrace
--D zyntax-output=output
---macro exclude('haxe.Log')

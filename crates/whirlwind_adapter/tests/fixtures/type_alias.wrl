@@ -1,4 +1,0 @@
-module Test;
-
-type UserId = int
-type UserName = string

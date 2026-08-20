@@ -1,6 +1,0 @@
-module Test;
-
-enum Status {
-    Active,
-    Inactive
-}

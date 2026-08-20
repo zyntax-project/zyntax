@@ -1,4 +1,0 @@
-# Test build configuration for Zyntax backend
--lib reflaxe.zyntax
--main HelloWorld
--D zyntax-output=output

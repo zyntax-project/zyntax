@@ -1,5 +1,0 @@
--lib reflaxe.zyntax
--cp test
--main SimpleArithmetic
--D zyntax-output=output
---macro exclude('haxe.Log')

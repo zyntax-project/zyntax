@@ -1,4 +1,0 @@
--lib reflaxe.zyntax
--main ImportTest
--D zyntax-output=output
---macro exclude('haxe.Log')

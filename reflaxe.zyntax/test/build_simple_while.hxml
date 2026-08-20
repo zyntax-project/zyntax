@@ -1,4 +1,0 @@
--lib reflaxe.zyntax
--main SimpleWhileTest
--D zyntax-output=output
---macro exclude('haxe.Log')

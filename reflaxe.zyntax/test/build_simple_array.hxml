@@ -1,4 +1,0 @@
-# Simple Array test
--lib reflaxe.zyntax
--main SimpleArrayTest
--D zyntax-output=output

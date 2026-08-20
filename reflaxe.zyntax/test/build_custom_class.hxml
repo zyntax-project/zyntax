@@ -1,5 +1,0 @@
--lib reflaxe.zyntax
--main CustomClassTest
--D zyntax-output=output
---macro exclude('haxe.Log')
---macro exclude('haxe.exceptions')

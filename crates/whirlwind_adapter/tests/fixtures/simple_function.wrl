@@ -1,6 +1,0 @@
-module Test;
-
-// Simple function with basic types
-function add(a: int, b: int)-> int {
-    return a + b
-}

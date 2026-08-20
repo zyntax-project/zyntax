@@ -526,8 +526,7 @@ zyntax/
 │   │       └── python_tests.rs
 │   │
 │   ├── typed_ast/               # EXISTING
-│   ├── compiler/                # EXISTING
-│   └── whirlwind_adapter/       # EXISTING
+│   └── compiler/                # EXISTING
 │
 └── docs/
     ├── ZYN_PARSER_IMPLEMENTATION.md  # This file

@@ -84,8 +84,7 @@ Zyntax is a multi-layer compiler infrastructure designed to support multiple pro
 zyntax/
 ├── crates/
 │   ├── typed_ast/          # Multi-language typed AST + type system
-│   ├── compiler/           # HIR, backends, tiered JIT, async runtime
-│   └── whirlwind_adapter/  # Whirlwind language integration
+│   └── compiler/           # HIR, backends, tiered JIT, async runtime
 └── docs/                   # Architecture documentation
 ```
 

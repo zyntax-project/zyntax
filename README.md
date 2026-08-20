@@ -418,7 +418,6 @@ See [Embedding SDK Documentation](./book/12-embedding-sdk.md) for complete guide
 
 ### 🔜 Other Integrations
 
-- **Whirlwind** - Direct AST adapter (in progress)
 - **Custom JSON** - Generate TypedAST JSON directly from any toolchain
 
 ---
@@ -489,7 +488,6 @@ cargo test --test end_to_end_simple
 **📦 Crates:**
 - `typed_ast/` - Multi-language typed AST with rich type system
 - `compiler/` - HIR generation, lowering, backend code generation, and async runtime
-- `whirlwind_adapter/` - Whirlwind language integration
 
 **🎨 Key Features:**
 - **Tiered Compilation**: Hot code recompiles with better optimizations

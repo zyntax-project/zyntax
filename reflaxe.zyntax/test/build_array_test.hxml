@@ -1,4 +1,0 @@
-# Array test build configuration
--lib reflaxe.zyntax
--main ArrayTest
--D zyntax-output=output

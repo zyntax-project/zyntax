@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/typed_ast",
     "crates/compiler",
-    "crates/whirlwind_adapter",
     "crates/zyntax_cli",
     "crates/runtime",
     "crates/zyntax_plugin_macros",

@@ -1,6 +1,0 @@
-// Union types test
-type Result = Success | Error | Pending
-
-function handleResult(r: Result) -> i32 {
-    return 0
-}
