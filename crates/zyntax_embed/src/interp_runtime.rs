@@ -120,6 +120,27 @@ pub struct InterpRuntime {
     /// threshold instead of clobbering it with `TieredConfig::default`.
     #[cfg(feature = "native")]
     tier_config: TieredConfig,
+    /// Handles for in-flight eager LLVM tier-up compiles.
+    ///
+    /// The thread runs MCJIT codegen, which reads LLVM's process-global
+    /// registries. Those are C++ statics destroyed by the exit handlers,
+    /// so a thread still inside codegen when the process tears down
+    /// faults on freed state. Keeping the handle makes that lifetime
+    /// something an owner controls rather than a race against `exit`.
+    #[cfg(all(feature = "native", feature = "llvm-backend"))]
+    llvm_tierup: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "native", feature = "llvm-backend"))]
+impl Drop for InterpRuntime {
+    fn drop(&mut self) {
+        // Wait out any in-flight MCJIT codegen. Not interruptible once
+        // entered, so this waits rather than cancels; it is tens to a
+        // few hundred milliseconds and only on the last runtime to go.
+        for h in self.llvm_tierup.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 impl Default for InterpRuntime {
@@ -182,6 +203,8 @@ impl InterpRuntime {
             entry_names: Vec::new(),
             module: None,
             interp: HirInterpreter::new(),
+            #[cfg(all(feature = "native", feature = "llvm-backend"))]
+            llvm_tierup: Vec::new(),
             #[cfg(feature = "native")]
             tiered: Arc::new(TieredAdapter::new(default_tier_policies())),
             #[cfg(feature = "native")]
@@ -216,6 +239,8 @@ impl InterpRuntime {
                 entry_names: Vec::new(),
                 module: None,
                 interp: HirInterpreter::new(),
+                #[cfg(all(feature = "native", feature = "llvm-backend"))]
+                llvm_tierup: Vec::new(),
                 tiered: Arc::new(TieredAdapter::new(policies)),
                 bounds: HashMap::new(),
                 bead_ids: HashMap::new(),
@@ -814,8 +839,12 @@ impl InterpRuntime {
         // the whole install — the runtime still runs, the LLVM tier
         // just doesn't engage. Cached function pointers from a partial
         // earlier compile are cleared by the next compile_module call.
+        // Only when the LLVM tier can actually fire. A caller that sets
+        // `hot_threshold` beyond reach wants a Cranelift-only ladder, and
+        // eagerly compiling a module nothing will ever install is work the
+        // process then has to wait out on the way down.
         #[cfg(feature = "llvm-backend")]
-        {
+        if hot != u32::MAX {
             // Feed every runtime FFI symbol from the BC interpreter
             // into the LLVM backend before compile_module fires. The
             // AOT-via-object path links a closed-world shared library
@@ -883,7 +912,7 @@ impl InterpRuntime {
             let bead_ids_for_bg = self.bead_ids.clone();
             let module_for_bg = module.clone();
             let trace = std::env::var("ZYNTAX_TRACE_TIER_UP").is_ok();
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name("zyntax-llvm-tierup".to_string())
                 // LLVM's pass pipeline recurses deeply — SimplifyCFG and the
                 // inliner in particular — and a spawned thread gets 2 MB by
@@ -948,6 +977,7 @@ impl InterpRuntime {
                     }
                 })
                 .expect("spawn zyntax-llvm-tierup thread");
+            self.llvm_tierup.push(handle);
         }
 
         // JIT-prime the entry function so the first call dispatches

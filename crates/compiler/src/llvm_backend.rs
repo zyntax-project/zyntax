@@ -3231,6 +3231,11 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// declared type on the phi, but an incoming reaching it unnarrowed (an
     /// f64 literal feeding an f32 phi) keeps its own. Mismatches other than
     /// scalar float/int width pass through for the verifier to report.
+    ///
+    /// Uses its own builder rather than moving `self.builder`: the caller may
+    /// be parked mid-block, as `compile_osr_helper` is when it sits before the
+    /// prologue's terminator to wire phis, and an insert point restored only
+    /// to the block would land after that terminator.
     fn coerce_incoming_for_phi(
         &self,
         v: BasicValueEnum<'ctx>,
@@ -3240,30 +3245,39 @@ impl<'ctx> LLVMBackend<'ctx> {
         if v.get_type() == want {
             return Ok(v);
         }
-        let restore = self.builder.get_insert_block();
+        let b = self.context.create_builder();
         match pred.get_terminator() {
-            Some(t) => self.builder.position_before(&t),
-            None => self.builder.position_at_end(pred),
+            Some(t) => b.position_before(&t),
+            None => b.position_at_end(pred),
         }
-        let out = if want.is_float_type() && (v.is_float_value() || v.is_int_value()) {
-            self.coerce_to_float(v, want.into_float_type())?
+        let out = if want.is_float_type() {
+            let target = want.into_float_type();
+            if v.is_int_value() {
+                b.build_signed_int_to_float(v.into_int_value(), target, "phi.sitofp")?
+                    .into()
+            } else if v.is_float_value() {
+                if target == self.context.f64_type() {
+                    b.build_float_ext(v.into_float_value(), target, "phi.fpext")?
+                        .into()
+                } else {
+                    b.build_float_trunc(v.into_float_value(), target, "phi.fptrunc")?
+                        .into()
+                }
+            } else {
+                v
+            }
         } else if want.is_int_type() && v.is_int_value() {
             let (from, to) = (v.into_int_value().get_type(), want.into_int_type());
             if from.get_bit_width() > to.get_bit_width() {
-                self.builder
-                    .build_int_truncate(v.into_int_value(), to, "phi.trunc")?
+                b.build_int_truncate(v.into_int_value(), to, "phi.trunc")?
                     .into()
             } else {
-                self.builder
-                    .build_int_s_extend(v.into_int_value(), to, "phi.sext")?
+                b.build_int_s_extend(v.into_int_value(), to, "phi.sext")?
                     .into()
             }
         } else {
             v
         };
-        if let Some(b) = restore {
-            self.builder.position_at_end(b);
-        }
         Ok(out)
     }
 
