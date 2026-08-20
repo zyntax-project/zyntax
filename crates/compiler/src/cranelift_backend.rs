@@ -103,6 +103,20 @@ fn emit_inline_aggregate_copy(
     }
 }
 
+/// Cranelift's width-changing casts (`fpromote`, `fdemote`, `ireduce`) carry the
+/// `Wider` constraint, which resolves over scalars only. A vector on either side
+/// has no encoding here, so the cast must decline rather than be built.
+fn cast_needs_scalar_lanes(
+    op: &crate::hir::CastOp,
+    operand_ty: types::Type,
+    target_ty: types::Type,
+) -> bool {
+    matches!(
+        op,
+        crate::hir::CastOp::FpExt | crate::hir::CastOp::FpTrunc | crate::hir::CastOp::Trunc
+    ) && (operand_ty.is_vector() || target_ty.is_vector())
+}
+
 /// The field a single-field struct is carried as, when it is carried as
 /// its field rather than by address.
 ///
@@ -4782,8 +4796,35 @@ impl CraneliftBackend {
                             let val = self.value_map.get(operand).copied().unwrap_or_else(|| {
                                 panic!("Cast operand {:?} not in value_map", operand)
                             });
-                            // Use type_cache directly - types should be pre-cached
-                            let target_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
+                            // The cache holds every type this
+                            // backend could translate, so a miss means
+                            // the type has no Cranelift encoding.
+                            // Substituting I64 builds the cast at the
+                            // wrong width and everything downstream
+                            // reads garbage; decline instead and let a
+                            // backend that has the encoding take it.
+                            let target_ty = match type_cache.get(ty).copied() {
+                                Some(t) => t,
+                                None => {
+                                    return Err(CompilerError::UnsupportedByBackend {
+                                        backend: "cranelift",
+                                        construct: format!("a cast to {:?}", ty),
+                                        detail: "this backend has no encoding for that type"
+                                            .to_string(),
+                                    });
+                                }
+                            };
+                            let operand_clif_ty = builder.func.dfg.value_type(val);
+                            if cast_needs_scalar_lanes(op, operand_clif_ty, target_ty) {
+                                return Err(CompilerError::UnsupportedByBackend {
+                                    backend: "cranelift",
+                                    construct: format!("a vector {:?} cast", op),
+                                    detail: format!(
+                                        "no lane-width conversion from {:?} to {:?}",
+                                        operand_clif_ty, target_ty
+                                    ),
+                                });
+                            }
 
                             let cast_val = match op {
                                 crate::hir::CastOp::Bitcast => val,
@@ -8243,6 +8284,17 @@ impl CraneliftBackend {
                     .unwrap_or_else(|| panic!("Cast operand {:?} not in value_map", operand));
                 let target_ty = self.translate_type(ty)?;
                 log::trace!("[Cranelift Cast] val={:?}, target_ty={:?}", val, target_ty);
+                let operand_clif_ty = builder.func.dfg.value_type(val);
+                if cast_needs_scalar_lanes(op, operand_clif_ty, target_ty) {
+                    return Err(CompilerError::UnsupportedByBackend {
+                        backend: "cranelift",
+                        construct: format!("a vector {:?} cast", op),
+                        detail: format!(
+                            "no lane-width conversion from {:?} to {:?}",
+                            operand_clif_ty, target_ty
+                        ),
+                    });
+                }
 
                 let cast_val = match op {
                     crate::hir::CastOp::Bitcast => {
