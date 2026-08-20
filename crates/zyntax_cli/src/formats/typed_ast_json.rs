@@ -11,8 +11,7 @@ use zyntax_compiler::hir::{CallingConvention, HirId, HirModule, HirType};
 use zyntax_compiler::hir_builder::HirBuilder;
 use zyntax_typed_ast::{
     typed_ast::TypedBlock, AstArena, BinaryOp, PrimitiveType, Type, TypedDeclaration,
-    TypedExpression, TypedFunction, TypedLiteral, TypedNode, TypedProgram, TypedStatement,
-};
+    TypedExpression, TypedFunction, TypedLiteral, TypedNode, TypedProgram, TypedStatement, ParamOwnership};
 
 /// Load TypedAST from JSON file(s) and convert to HIR
 pub fn load(inputs: &[PathBuf], verbose: bool) -> Result<HirModule, Box<dyn std::error::Error>> {
@@ -125,6 +124,10 @@ fn add_runtime_function_declarations(program: &mut TypedProgram, arena: &mut Ast
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                // An extern declaration says nothing about what
+                // passing an argument does to the caller's claim on
+                // it, which is what the default means.
+                ownership: ParamOwnership::default(),
                 span: zero_span,
             })
             .collect();
