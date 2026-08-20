@@ -635,6 +635,13 @@ pub struct CompiledFunction {
     /// Number of parameters in the original signature; arg-binding
     /// fills regs[0..n_params].
     pub n_params: u16,
+    /// Which function each `FuncRef` result names.
+    ///
+    /// There is no address to put in a register here, and nothing asks
+    /// for one: a function pointer taken in this interpreter is only
+    /// ever handed straight to a call. Remembering the name at compile
+    /// time is enough to turn that call back into a direct one.
+    pub func_refs: HashMap<HirId, HirId>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1191,6 +1198,28 @@ fn lower_inst(
                     fn_id: *fn_id,
                     args: args_idx,
                 }),
+                // Handing a range to a thread pool is one way of
+                // running it, and running it here is another. The
+                // interpreter has no address to give the pool, so it
+                // calls the band over the whole range instead, which
+                // computes the same thing in the same order the loop
+                // would have.
+                HirCallable::Symbol(name) if name == "zyntax_parallel_for" && args.len() == 5 => {
+                    let band = cf.func_refs.get(&args[3]).copied().ok_or_else(|| {
+                        InterpError::UnsupportedInstruction(
+                            "a spread loop whose band is not a known function".to_string(),
+                        )
+                    })?;
+                    let whole = vec![reg(args[0])?, reg(args[1])?, reg(args[4])?];
+                    let band_args = cf.args_pool.len() as u32;
+                    cf.args_pool.push(whole);
+                    cf.code.push(Op::CallFn {
+                        dst: 0,
+                        has_dst: false,
+                        fn_id: band,
+                        args: band_args,
+                    });
+                }
                 HirCallable::Symbol(name) => {
                     let sym_idx = cf.symbol_pool.len() as u32;
                     cf.symbol_pool.push(name.clone());
@@ -1295,10 +1324,16 @@ fn lower_inst(
                         "intrinsic call".to_string(),
                     ))
                 }
-                HirCallable::FuncRef(_) => {
-                    return Err(InterpError::UnsupportedInstruction(
-                        "FuncRef in call position".to_string(),
-                    ))
+                HirCallable::FuncRef(fn_id) => {
+                    // Taking a function's address. The register holds
+                    // nothing meaningful; what matters is the note, and
+                    // the call that reads it is rewritten below.
+                    if let Some(r) = result {
+                        cf.func_refs.insert(*r, *fn_id);
+                    }
+                    let idx = cf.const_pool.len() as u32;
+                    cf.const_pool.push(ZyntaxValue::Int(0));
+                    cf.code.push(Op::LoadConst { dst, c: idx });
                 }
             }
         }
