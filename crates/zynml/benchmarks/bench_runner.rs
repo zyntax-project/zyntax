@@ -146,6 +146,28 @@ struct Suite {
     /// Run metadata: when, where, with what commit. The page reads
     /// these into the "updated · commit · arch" line.
     meta: Meta,
+    /// How the page should section the rows, in order.
+    ///
+    /// Carried in the results rather than in the page, so a kernel
+    /// added to the table above appears under the right heading
+    /// without the page being touched. A results file without it
+    /// renders as one flat list, which is what older ones do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<GroupSection>,
+}
+
+/// One published section: a heading, what it measures, and the rows
+/// under it in the order they should appear.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupSection {
+    title: String,
+    blurb: String,
+    /// Shown apart from the blurb, because what a reader must know
+    /// before comparing a number is not the same kind of statement as
+    /// what the number is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caveat: Option<String>,
+    kernels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,20 +268,20 @@ const KERNELS: &[Kernel] = &[
     // matches, axpy is a multiply feeding an add with a loop-invariant
     // scalar and is the shape it does not, dot carries an accumulator
     // rather than storing, and matmul is strided and shaped.
-    Kernel::new("bench_tensor_add", "Int(12)"),
-    Kernel::new("bench_tensor_axpy", "Int(2)"),
-    Kernel::new("bench_tensor_dot", "Int(8388608)"),
-    Kernel::new("bench_tensor_matmul", "Int(2048)"),
+    Kernel::new("bench_tensor_add", "Int(12)").ml(),
+    Kernel::new("bench_tensor_axpy", "Int(2)").ml(),
+    Kernel::new("bench_tensor_dot", "Int(8388608)").ml(),
+    Kernel::new("bench_tensor_matmul", "Int(2048)").ml(),
     // One transformer layer's prefill. The tensor kernels above each
     // isolate one shape; this is what a real workload looks like once
     // they are composed, and the phase of serving a prompt where the
     // work is dense enough for spreading it across cores to pay.
-    Kernel::new("bench_llm_prefill", "Int(806)"),
+    Kernel::new("bench_llm_prefill", "Int(806)").ml(),
     // The other half of serving: one token at a time, where every
     // matrix multiply is a matrix-vector product and the cost is in
     // reading the weights rather than multiplying by them. It is also
     // where a dispatch is paid a thousand times rather than a dozen.
-    Kernel::new("bench_llm_decode", "Int(55842)"),
+    Kernel::new("bench_llm_decode", "Int(55842)").ml(),
     Kernel::new("bench_collatz", "Int(35669673)"),
     Kernel::new("bench_branchy", "Int(140)"),
 ];
@@ -294,6 +316,75 @@ struct Kernel {
     expected_without_opts: Option<&'static str>,
     /// Whether cross-branch pure-call PRE runs for this row.
     pure_call_pre: bool,
+    /// Which section of the published page this row belongs under.
+    ///
+    /// The page reads the grouping from the results rather than
+    /// carrying its own list, so a kernel added here appears in the
+    /// right place without the page being edited.
+    group: Group,
+}
+
+/// The sections the published benchmark page is divided into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// Language and compiler shapes: control flow, calls, arithmetic.
+    Core,
+    /// Tensor and model kernels, where the question is throughput on
+    /// real numeric work rather than what the compiler does with a
+    /// language construct.
+    Ml,
+}
+
+impl Group {
+    /// The heading this section is published under.
+    fn title(self) -> &'static str {
+        match self {
+            Group::Core => "Language and compiler kernels",
+            Group::Ml => "ML kernels",
+        }
+    }
+
+    /// What the section is measuring, in one sentence, for the page.
+    fn blurb(self) -> &'static str {
+        match self {
+            Group::Core => {
+                "Classic shapes, each chosen for what it makes the compiler do: \
+                 recursion and call dispatch, branch-heavy control flow, \
+                 floating-point loops. Two rows may share a source and differ \
+                 only in which pass ran, which is what turns that pass's \
+                 contribution into a number."
+            }
+            Group::Ml => {
+                "Numeric kernels at shapes a real workload uses. The tensor rows \
+                 isolate one shape each: the elementwise add is what the \
+                 vectorizer matches, axpy is a multiply feeding an add that it \
+                 does not, dot carries an accumulator, and matmul is strided. \
+                 The two model rows are the halves of serving one: prefill \
+                 pushes every token through at once and is bound by arithmetic, \
+                 decode moves one token at a time and is bound by how fast the \
+                 weights arrive."
+            }
+        }
+    }
+
+    /// What a reader has to know before comparing these against
+    /// anything else.
+    fn caveat(self) -> Option<&'static str> {
+        match self {
+            Group::Core => None,
+            Group::Ml => Some(
+                "No hardware acceleration. These do not call Accelerate, a \
+                 vendor BLAS, cuBLAS, or any neural engine, and the two model \
+                 kernels reach no library at all: the matrix multiplies, the \
+                 softmax and its exponential, and the normalisation and its \
+                 reciprocal square root are written in the language and \
+                 compiled here. Read against a hardware-accelerated stack these \
+                 would lose, and the comparison would be measuring something \
+                 else. What they measure is what the compiler does with the \
+                 arithmetic it is given.",
+            ),
+        }
+    }
 }
 
 impl Kernel {
@@ -311,7 +402,14 @@ impl Kernel {
             expected,
             expected_without_opts: None,
             pure_call_pre: true,
+            group: Group::Core,
         }
+    }
+
+    /// Publish this row under the ML section.
+    const fn ml(mut self) -> Self {
+        self.group = Group::Ml;
+        self
     }
 
     /// Publish under a different name, for a second pipeline over the
@@ -538,6 +636,7 @@ fn main() {
 
     let mut suite = Suite {
         kernels: BTreeMap::new(),
+        groups: Vec::new(),
         meta: Meta {
             date: rfc3339_now(),
             commit: git_short_sha(),
@@ -668,6 +767,26 @@ fn main() {
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir {parent:?}: {e}"));
     }
+    // Section the rows the page will show. Only sections with a row
+    // in this run are carried, so a filtered run does not publish an
+    // empty heading.
+    for group in [Group::Core, Group::Ml] {
+        let kernels: Vec<String> = KERNELS
+            .iter()
+            .filter(|k| k.group == group)
+            .map(|k| k.name().to_string())
+            .filter(|name| suite.kernels.contains_key(name))
+            .collect();
+        if !kernels.is_empty() {
+            suite.groups.push(GroupSection {
+                title: group.title().to_string(),
+                blurb: group.blurb().to_string(),
+                caveat: group.caveat().map(|c| c.to_string()),
+                kernels,
+            });
+        }
+    }
+
     let json = serde_json::to_string_pretty(&suite).expect("serialize results");
     fs::write(&out_path, json).unwrap_or_else(|e| panic!("write {out_path:?}: {e}"));
     eprintln!("\nwrote {}", out_path.display());

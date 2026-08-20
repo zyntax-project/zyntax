@@ -112,6 +112,74 @@
     /* ── Page layout ── */
     .container { max-width: 920px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 2rem); }
 
+    /* A group of kernels that answer the same kind of question. The
+       heading and its blurb come from the results file, so adding a
+       kernel to the runner puts it under the right one without this
+       page being edited. */
+    .group-head { margin: 3rem 0 1.25rem; }
+    .group-head:first-child { margin-top: 1rem; }
+    .group-head h2 {
+      font-size: 1.05rem;
+      font-weight: 650;
+      letter-spacing: 0.01em;
+      margin: 0 0 0.45rem;
+      color: var(--text-primary);
+    }
+    .group-head p {
+      margin: 0;
+      max-width: 62ch;
+      font-size: 0.9rem;
+      line-height: 1.6;
+      color: var(--text-secondary);
+    }
+    .group-rule {
+      height: 1px;
+      background: linear-gradient(to right, var(--border), transparent);
+      margin-top: 0.9rem;
+    }
+    /* What a reader has to know before comparing a number against
+       anything else. Set apart from the description because it is a
+       different kind of statement. */
+    .group-caveat {
+      margin: 0.85rem 0 0;
+      padding: 0.7rem 0.9rem;
+      max-width: 62ch;
+      border-left: 2px solid var(--accent, #7c5cff);
+      border-radius: 0 0.35rem 0.35rem 0;
+      background: rgba(124, 92, 255, 0.06);
+      font-size: 0.855rem;
+      line-height: 1.6;
+      color: var(--text-secondary);
+    }
+    .group-caveat b { color: var(--text-primary); font-weight: 650; }
+
+    /* Architecture switch. Shown only when more than one was
+       published, so a single-architecture run looks as it always did. */
+    .arch-switch {
+      display: flex;
+      gap: 0.35rem;
+      margin: 0 0 0.5rem;
+      flex-wrap: wrap;
+    }
+    .arch-switch button {
+      font: inherit;
+      font-size: 0.83rem;
+      padding: 0.4rem 0.85rem;
+      border-radius: 0.45rem;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .arch-switch button:hover { color: var(--text-primary); }
+    .arch-switch button[aria-pressed="true"] {
+      background: rgba(124, 92, 255, 0.12);
+      border-color: var(--accent, #7c5cff);
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+
     header.page-head {
       padding-top: clamp(3rem, 8vh, 5rem);
       padding-bottom: clamp(1.5rem, 4vh, 2rem);
@@ -520,6 +588,12 @@
       free_function_call: 'Free Function Call',
       method_call: 'Method Call',
       binary_trees: 'Binary Trees',
+      tensor_add: 'Elementwise add · the shape the vectorizer matches',
+      tensor_axpy: 'AXPY · a multiply feeding an add',
+      tensor_dot: 'Dot product · a carried accumulator',
+      tensor_matmul: 'Matrix multiply · strided and shaped',
+      llm_prefill: 'Transformer prefill · every token at once',
+      llm_decode: 'Transformer decode · one token at a time',
     };
     const KERNEL_ORDER = [
       'mandelbrot',
@@ -622,29 +696,93 @@
       const metaEl = document.getElementById('meta-row');
 
       let data = null;
-      try {
-        const resp = await fetch('results.json');
-        if (resp.ok) data = await resp.json();
-      } catch (_) {
+      // Each architecture is published separately: the Apple rows are
+      // not a second sample of the same machine, they are the ones that
+      // can reach Accelerate. A run that produced only one still
+      // renders; the switch simply does not appear.
+      const load = async (file) => {
+        try {
+          const resp = await fetch(file);
+          return resp.ok ? await resp.json() : null;
+        } catch (_) {
+          return null;
+        }
+      };
+      const [linux, mac] = await Promise.all([
+        load('results.json'),
+        load('results-macos.json'),
+      ]);
+      const datasets = [
+        { file: 'results.json', data: linux },
+        { file: 'results-macos.json', data: mac },
+      ].filter((d) => d.data);
+
+      if (!datasets.length) {
         container.innerHTML = `<p class="loading">Could not load results.json — run the benchmark workflow first.</p>`;
         return;
       }
-      if (!data) {
-        container.innerHTML = `<p class="loading">No results available yet.</p>`;
-        return;
+      data = datasets[0].data;
+
+      const escape = (t) => String(t).replace(/[&<>]/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+      const sectionHead = (title, blurb, caveat) => {
+        // The caveat's first sentence is its point; lead with it.
+        let note = '';
+        if (caveat) {
+          const cut = caveat.indexOf('. ');
+          const lead = cut > 0 ? caveat.slice(0, cut + 1) : caveat;
+          const rest = cut > 0 ? caveat.slice(cut + 2) : '';
+          note = `<p class="group-caveat"><b>${escape(lead)}</b>${
+            rest ? ' ' + escape(rest) : ''
+          }</p>`;
+        }
+        return `
+        <div class="group-head">
+          <h2>${escape(title)}</h2>
+          ${blurb ? `<p>${escape(blurb)}</p>` : ''}
+          ${note}
+          <div class="group-rule"></div>
+        </div>`;
+      };
+
+      // One architecture's worth of page. Called again when the
+      // reader switches, so nothing below may depend on which one ran
+      // first.
+      const render = (data) => {
+      let html = '';
+      const shown = new Set();
+
+      // The results say how to section themselves. Older files do not
+      // carry that, and fall through to one flat list below.
+      if (Array.isArray(data.groups) && data.groups.length) {
+        for (const group of data.groups) {
+          const rows = (group.kernels || []).filter((n) => data[n]);
+          if (!rows.length) continue;
+          html += sectionHead(group.title, group.blurb, group.caveat);
+          for (const name of rows) {
+            html += buildKernel(name, data[name]);
+            shown.add(name);
+          }
+        }
+      } else {
+        for (const name of KERNEL_ORDER) {
+          if (!data[name]) continue;
+          html += buildKernel(name, data[name]);
+          shown.add(name);
+        }
       }
 
-      let html = '';
-      for (const name of KERNEL_ORDER) {
-        if (data[name]) html += buildKernel(name, data[name]);
+      // Anything the sections did not claim still appears, so a kernel
+      // added to the runner is never silently missing from the page.
+      const rest = Object.keys(data).filter(
+        (n) => n !== 'meta' && n !== 'groups' && !shown.has(n)
+      );
+      if (rest.length) {
+        if (html) html += sectionHead('Other kernels', '', null);
+        for (const name of rest) html += buildKernel(name, data[name]);
       }
-      // Surface any unknown-named kernels too, so adding a new one
-      // works without page edits.
-      for (const name of Object.keys(data)) {
-        if (name === 'meta') continue;
-        if (KERNEL_ORDER.includes(name)) continue;
-        html += buildKernel(name, data[name]);
-      }
+
       container.innerHTML = html || `<p class="loading">No kernels matched expected names.</p>`;
 
       if (data.meta) {
@@ -670,6 +808,37 @@
             <span>median of ${m.runs || 9} runs</span>
           </div>${sysRow}`;
       }
+      };
+
+      // Label each architecture from its own metadata, so the switch
+      // says what the machine was rather than what the file is called.
+      const archLabel = (d) => {
+        const m = d.data.meta || {};
+        if (m.cpu) return m.cpu;
+        if (m.arch && m.os) return `${m.arch} · ${m.os}`;
+        return m.arch || d.file;
+      };
+
+      if (datasets.length > 1) {
+        const bar = document.createElement('div');
+        bar.className = 'arch-switch';
+        datasets.forEach((d, i) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = archLabel(d);
+          b.setAttribute('aria-pressed', String(i === 0));
+          b.addEventListener('click', () => {
+            for (const other of bar.children) {
+              other.setAttribute('aria-pressed', String(other === b));
+            }
+            render(d.data);
+          });
+          bar.appendChild(b);
+        });
+        container.parentNode.insertBefore(bar, container);
+      }
+
+      render(datasets[0].data);
     }
 
     main();
