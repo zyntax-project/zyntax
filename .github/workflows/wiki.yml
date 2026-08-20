@@ -78,8 +78,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   benchmark:
-    name: bench (${{ matrix.kernel }})
-    runs-on: ubuntu-latest
+    name: bench (${{ matrix.kernel }} · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     # Matrix-per-kernel mirrors rayzor's CI shape: each kernel gets a
     # fresh GHA runner so cumulative thermal/cache throttling from
     # heavy earlier kernels (mandelbrot, nbody) doesn't bleed into the
@@ -88,6 +88,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Both architectures are published. The x86_64 runner is the
+        # baseline; the Apple one is not a duplicate of it, because
+        # Accelerate reaches the AMX coprocessor that no instruction
+        # the compiler emits can address, and the ML rows are the ones
+        # that shows in. Publishing both is what lets a reader see the
+        # size of that gap rather than take a claim about it.
+        os:
+          - ubuntu-latest
+          - macos-latest
         kernel:
           - mandelbrot
           - nbody
@@ -99,6 +108,18 @@ jobs:
           - fib_no_pure_call_pre
           - inlined_call
           - free_function_call
+          # Tensor kernels at real shapes: each isolates one shape the
+          # vectorizer either matches or declines.
+          - tensor_add
+          - tensor_axpy
+          - tensor_dot
+          - tensor_matmul
+          # The two halves of serving a model. Prefill is dense matrix
+          # multiply and compute bound; decode is one token at a time
+          # and bound by weight bandwidth. Publishing both is what makes
+          # the difference between them a number rather than a claim.
+          - llm_prefill
+          - llm_decode
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -109,14 +130,31 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: bench-runner
+          key: bench-runner-${{ matrix.os }}
 
-      - name: Install LLVM 21
+      - name: Install LLVM 21 (Linux)
+        if: runner.os == 'Linux'
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 21 all
           echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 21 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21
+          echo "LLVM_SYS_211_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+
+      # Accelerate ships with macOS, so there is nothing to install for
+      # it; this records that it is present and reachable, because a
+      # published row that claims to use it should fail loudly rather
+      # than quietly fall back to the portable path.
+      - name: Confirm Accelerate is present (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          test -d /System/Library/Frameworks/Accelerate.framework
+          echo "Accelerate.framework found"
 
       - name: Run benchmark (${{ matrix.kernel }})
         env:
@@ -148,7 +186,9 @@ jobs:
       - name: Upload partial benchmark result
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.kernel }}
+          # The architecture is in the name because both are published
+          # and a shared name would let one quietly replace the other.
+          name: bench-${{ matrix.os }}-${{ matrix.kernel }}
           path: bench-out/results-${{ matrix.kernel }}.json
           retention-days: 90
 
@@ -157,11 +197,18 @@ jobs:
     needs: benchmark
     runs-on: ubuntu-latest
     steps:
-      - name: Download all per-kernel results
+      - name: Download x86_64 per-kernel results
         uses: actions/download-artifact@v4
         with:
-          pattern: bench-*
+          pattern: bench-ubuntu-latest-*
           path: bench-parts
+          merge-multiple: true
+
+      - name: Download Apple per-kernel results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-macos-latest-*
+          path: bench-parts-macos
           merge-multiple: true
 
       - name: Merge into single results.json
@@ -180,7 +227,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: bench-out/results.json
+          path: bench-out/
           retention-days: 90
 
   deploy-site:
@@ -225,6 +272,9 @@ jobs:
           mkdir -p site/benchmark
           cp website/benchmark/index.html site/benchmark/index.html
           cp bench-out/results.json site/benchmark/results.json
+          if [ -f bench-out/results-macos.json ]; then
+            cp bench-out/results-macos.json site/benchmark/results-macos.json
+          fi
 
           # Verify book output exists
           ls -la site/book/
