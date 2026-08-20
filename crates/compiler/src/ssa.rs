@@ -2147,7 +2147,9 @@ impl SsaBuilder {
                     let value_id = if matches!(let_stmt.ty, Type::Any | Type::Unknown) {
                         value_id
                     } else {
-                        self.coerce_for_transfer(write_block, value_id, value, &let_stmt.ty)
+                        let coerced =
+                            self.coerce_for_transfer(write_block, value_id, value, &let_stmt.ty);
+                        self.narrow_float_to_declared(write_block, coerced, &let_stmt.ty)
                     };
 
                     // Record variable type (both HIR and TypedAST versions).
@@ -8682,6 +8684,47 @@ impl SsaBuilder {
             return value;
         }
         self.emit_coercion(block_id, value, &source, target_ty)
+    }
+
+    /// Bind a float initializer at the width its annotation declares.
+    ///
+    /// `let x: f32 = 1.0 / y` computes in f64, because the literal is
+    /// f64 and the divide widens to meet it, but the binding's type is
+    /// recorded from the annotation. Nothing downstream reconciles the
+    /// two, so the variable claims F32 while holding an F64 value and
+    /// every later use disagrees with its own type. The declared type
+    /// wins here, the same way it does for a parameter or a return.
+    ///
+    /// Floats only: an integer annotation narrower than its
+    /// initializer is a separate question, and truncating one here
+    /// would change values that pass through today.
+    fn narrow_float_to_declared(
+        &mut self,
+        block_id: HirId,
+        value: HirId,
+        target_ty: &Type,
+    ) -> HirId {
+        let declared = self.convert_type(target_ty);
+        let Some(actual) = self.function.values.get(&value).map(|v| v.ty.clone()) else {
+            return value;
+        };
+        let op = match (&actual, &declared) {
+            (HirType::F64, HirType::F32) => CastOp::FpTrunc,
+            (HirType::F32, HirType::F64) => CastOp::FpExt,
+            _ => return value,
+        };
+        let result = self.create_value(declared.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Cast {
+                op,
+                result,
+                ty: declared,
+                operand: value,
+            },
+        );
+        self.add_use(value, result);
+        result
     }
 
     /// Whether something in the program declares this expression's
