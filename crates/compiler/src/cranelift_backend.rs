@@ -2455,6 +2455,25 @@ impl CraneliftBackend {
                                 }
                             };
 
+                            // The op's width comes from its operands, so a
+                            // float expression with one f64 operand produces
+                            // an f64 even where the HIR result is f32. A
+                            // Store takes its width from the stored value,
+                            // so leaving it wide writes eight bytes into a
+                            // four-byte element. Bring the result back to
+                            // the type the HIR declared for it.
+                            let value = match type_cache.get(ty).copied() {
+                                Some(want) if want.is_float() && !want.is_vector() => {
+                                    let got = builder.func.dfg.value_type(value);
+                                    if got != want && got.is_float() && !got.is_vector() {
+                                        Self::coerce_value(&mut builder, value, got, want)
+                                    } else {
+                                        value
+                                    }
+                                }
+                                _ => value,
+                            };
+
                             self.value_map.insert(*result, value);
                         }
 
