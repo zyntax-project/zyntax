@@ -1,29 +1,28 @@
 //! Is MCJIT usable on this host?
 //!
-//! `llvm_jit_backend` emits an object file, shells out to the linker and
-//! dlopens the result, around 370 ms of fixed cost per install, because
-//! MCJIT was reported to hit MAP_JIT cross-thread invalidation on Apple
-//! Silicon. These check that claim directly against the current
-//! inkwell/LLVM rather than carrying it forward untested.
+//! `llvm_jit_backend` once emitted an object file, shelled out to the
+//! linker and dlopened the result, around 370 ms of fixed cost per
+//! install, because MCJIT was reported to hit MAP_JIT cross-thread
+//! invalidation on Apple Silicon. These check that claim directly against
+//! the current inkwell/LLVM rather than carrying it forward untested.
 //!
-//! **The claim no longer holds, and the backend stays as it is anyway.**
-//! All three cross-thread cases pass and an install measures about
-//! 1.6 ms, so the original obstacle is gone. Speed is not why the object
-//! path was kept: it uses LLVM only to emit an object file, which is the
-//! most stable interface LLVM offers, and everything after that is the
-//! platform linker and `dlopen`. No LLVM JIT API can break it.
+//! **The claim no longer holds.** All three cross-thread cases pass and
+//! an install measures about 1.6 ms, so the original obstacle is gone.
+//! MCJIT is now the default installer on every platform: a deployed
+//! runtime cannot assume a C toolchain or a writable temp directory on
+//! the machine running the code, and MCJIT needs neither. The object
+//! path remains behind `ZYNTAX_LLVM_MCJIT=0` for producing an artefact.
 //!
-//! MCJIT would be the opposite trade. LLVM 21 carries 52 C declarations
-//! for it against 358 for ORC, and inkwell wraps only MCJIT, so adopting
-//! it would take a dependency on the one engine that is not being
-//! developed, through a binding that would go with it.
+//! The cost of that default is a dependency on the one LLVM engine that
+//! is not being developed: LLVM 21 carries 52 C declarations for MCJIT
+//! against 358 for ORC, and inkwell wraps only MCJIT.
 //!
-//! The case for moving is unloading and per-function laziness, which
-//! only ORC offers: its resource trackers can remove a module, which is
-//! what the object path structurally cannot do, since unmapping dangles
-//! every pointer already resolved through it. No released inkwell wraps
-//! ORC, so that means owning the C API by hand. Worth it when one of
-//! those two capabilities blocks something, not before.
+//! The case for moving to ORC is unloading and per-function laziness,
+//! which only it offers: its resource trackers can remove a module,
+//! which neither current path can do, since unmapping dangles every
+//! pointer already resolved through it. No released inkwell wraps ORC,
+//! so that means owning the C API by hand. Worth it when one of those
+//! two capabilities blocks something, or when MCJIT is removed upstream.
 
 #![cfg(feature = "llvm-backend")]
 
