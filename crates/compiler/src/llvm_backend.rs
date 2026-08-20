@@ -755,6 +755,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                                     pred_block_id
                                 ))
                             })?;
+                        let incoming_value = self.coerce_incoming_for_phi(
+                            incoming_value,
+                            phi_value.as_basic_value().get_type(),
+                            *incoming_block,
+                        )?;
                         phi_value.add_incoming(&[(&incoming_value, *incoming_block)]);
                     }
                 }
@@ -984,6 +989,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                             "Phi node references unknown block: {pred_block_id:?}"
                         ))
                     })?;
+                    let incoming_value = self.coerce_incoming_for_phi(
+                        incoming_value,
+                        phi_value.as_basic_value().get_type(),
+                        *incoming_block,
+                    )?;
                     phi_value.add_incoming(&[(&incoming_value, *incoming_block)]);
                 }
                 if is_header {
@@ -3212,6 +3222,49 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         };
         Ok(out.into())
+    }
+
+    /// Coerce a phi incoming to the phi's own type, emitting the cast in the
+    /// predecessor so it dominates the edge.
+    ///
+    /// A phi whose incomings disagree in width is invalid IR. HIR carries the
+    /// declared type on the phi, but an incoming reaching it unnarrowed (an
+    /// f64 literal feeding an f32 phi) keeps its own. Mismatches other than
+    /// scalar float/int width pass through for the verifier to report.
+    fn coerce_incoming_for_phi(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        want: BasicTypeEnum<'ctx>,
+        pred: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        if v.get_type() == want {
+            return Ok(v);
+        }
+        let restore = self.builder.get_insert_block();
+        match pred.get_terminator() {
+            Some(t) => self.builder.position_before(&t),
+            None => self.builder.position_at_end(pred),
+        }
+        let out = if want.is_float_type() && (v.is_float_value() || v.is_int_value()) {
+            self.coerce_to_float(v, want.into_float_type())?
+        } else if want.is_int_type() && v.is_int_value() {
+            let (from, to) = (v.into_int_value().get_type(), want.into_int_type());
+            if from.get_bit_width() > to.get_bit_width() {
+                self.builder
+                    .build_int_truncate(v.into_int_value(), to, "phi.trunc")?
+                    .into()
+            } else {
+                self.builder
+                    .build_int_s_extend(v.into_int_value(), to, "phi.sext")?
+                    .into()
+            }
+        } else {
+            v
+        };
+        if let Some(b) = restore {
+            self.builder.position_at_end(b);
+        }
+        Ok(out)
     }
 
     /// Coerce a scalar operand to `target` float (int -> sitofp, f32<->f64 via

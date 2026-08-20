@@ -98,3 +98,53 @@ fn tier_up_to_llvm_dispatches_correctly() {
         r
     );
 }
+
+/// A variable assigned a wider literal than it was declared still
+/// reaches the LLVM tier.
+///
+/// `t` is declared `f32` and the clamp assigns `-30.0`, an `f64`
+/// literal. An annotated binding narrows its initializer, but an
+/// assignment is the same declared boundary and did not, so the join
+/// after the `if` carried one incoming of each width. LLVM rejects a
+/// phi whose incomings disagree with its result type, and the whole
+/// module failed verification: not a wrong answer, a tier that stopped
+/// installing and silently left every function on Cranelift.
+///
+/// Cranelift coerces branch arguments on the way into a phi and is
+/// unaffected, which is why this only ever showed on the LLVM lane.
+#[test]
+fn a_clamp_assigning_a_wide_literal_reaches_llvm() {
+    let rt = compile_with_jit(
+        r#"
+        def clamped(x: f32): i64 {
+            let mut t: f32 = x
+            if t < -30.0 { t = -30.0 }
+            return (t * 100.0) as i64
+        }
+        def main(): i64 { return clamped(-40.0) }
+        "#,
+        1,
+        1,
+    );
+
+    for _ in 0..30 {
+        let r = rt.call_function_raw("main", vec![]).unwrap();
+        assert_eq!(r.as_i64(), Some(-3000), "value broken: {:?}", r);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let func_ids = rt.interp_registered_function_ids();
+    assert!(!func_ids.is_empty());
+    let reached_llvm = poll_until(Duration::from_millis(3000), || {
+        func_ids
+            .iter()
+            .any(|fid| rt.interp_function_generation(*fid) >= 1)
+    });
+    assert!(
+        reached_llvm,
+        "LLVM tier never fired: the module failed verification"
+    );
+
+    let r = rt.call_function_raw("main", vec![]).unwrap();
+    assert_eq!(r.as_i64(), Some(-3000), "LLVM-tier dispatch broke value");
+}

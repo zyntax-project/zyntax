@@ -11545,7 +11545,11 @@ impl SsaBuilder {
         let value = if matches!(target_ty, Type::Any | Type::Unknown) {
             value
         } else {
-            self.coerce_for_transfer(block_id, value, value_expr, &target_ty)
+            let coerced = self.coerce_for_transfer(block_id, value, value_expr, &target_ty);
+            // An assignment is the same declared boundary a binding is:
+            // `t = -30.0` into an `f32` slot must narrow here, or the
+            // join phi downstream sees two widths for one variable.
+            self.narrow_float_to_declared(block_id, coerced, &target_ty)
         };
 
         // Now handle different assignment targets
