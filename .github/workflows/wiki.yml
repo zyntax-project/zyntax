@@ -195,6 +195,12 @@ jobs:
   benchmark-aggregate:
     name: Aggregate benchmark results
     needs: benchmark
+    # `needs` alone would skip this whenever any matrix leg failed, and a
+    # skipped aggregate skips the deploy, so one crashing kernel takes the
+    # whole published page down with it rather than just its own row. Run
+    # on the legs that did produce results; a kernel that failed simply has
+    # no partial to merge and does not appear.
+    if: ${{ always() && needs.benchmark.result != 'cancelled' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download x86_64 per-kernel results
@@ -224,10 +230,15 @@ jobs:
         # report both. The page loads each file and labels the switch
         # from its own `meta.cpu`.
         run: |
-          ls -la bench-parts/
           mkdir -p bench-out
-          jq -s 'reduce .[] as $x ({}; . * $x)' bench-parts/*.json > bench-out/results.json
-          cat bench-out/results.json | jq 'keys'
+          ls -la bench-parts/ || true
+          if compgen -G 'bench-parts/*.json' > /dev/null; then
+            jq -s 'reduce .[] as $x ({}; . * $x)' bench-parts/*.json > bench-out/results.json
+            cat bench-out/results.json | jq 'keys'
+          else
+            echo "::error::no x86_64 partials produced; nothing to publish"
+            exit 1
+          fi
           # macOS runners are best-effort: a failed or skipped leg leaves
           # no partials, and the page renders the x86_64 set alone.
           if compgen -G 'bench-parts-macos/*.json' > /dev/null; then
@@ -246,6 +257,7 @@ jobs:
 
   deploy-site:
     needs: benchmark-aggregate
+    if: ${{ always() && needs.benchmark-aggregate.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
