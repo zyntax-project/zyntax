@@ -595,17 +595,39 @@
       llm_prefill: 'Transformer prefill · every token at once',
       llm_decode: 'Transformer decode · one token at a time',
     };
+    // Order and sectioning for results files that predate the `groups`
+    // field. A current file carries its own sections and this is unused;
+    // it exists so a stale file still puts the ML rows in the ML section
+    // rather than in the unclaimed-kernels bucket at the bottom.
     const KERNEL_ORDER = [
       'mandelbrot',
+      'mandelbrot_strip',
       'nbody',
       'nbody_ref',
       'fib',
       'fib_no_pure_call_pre',
       'inlined_call',
       'free_function_call',
-      'method_call',
-      'binary_trees',
+      'op_overload',
+      'op_overload_ref',
+      'any_field',
+      'any_cast',
+      'collatz',
+      'branchy',
     ];
+    const ML_KERNEL_ORDER = [
+      'tensor_add',
+      'tensor_axpy',
+      'tensor_dot',
+      'tensor_matmul',
+      'llm_prefill',
+      'llm_decode',
+    ];
+    const FALLBACK_ML_CAVEAT =
+      'No hardware acceleration. These do not call Accelerate, a vendor ' +
+      'BLAS, cuBLAS, or any neural engine, and the two model kernels reach ' +
+      'no library at all: every matrix multiply, softmax, exponential and ' +
+      'normalisation is compiled from ZynML source.';
 
     const TARGET_LABELS = {
       'zyntax-interp': 'interp · no opts',
@@ -766,10 +788,31 @@
           }
         }
       } else {
-        for (const name of KERNEL_ORDER) {
-          if (!data[name]) continue;
-          html += buildKernel(name, data[name]);
-          shown.add(name);
+        // Core rows first, then ML, matching what the runner emits.
+        // Any kernel this list does not know is treated as core, so a
+        // newly added core row lands above the ML section rather than
+        // after it.
+        const known = new Set([...KERNEL_ORDER, ...ML_KERNEL_ORDER]);
+        const core = [
+          ...KERNEL_ORDER.filter((n) => data[n]),
+          ...Object.keys(data).filter(
+            (n) => n !== 'meta' && n !== 'groups' && !known.has(n)
+          ),
+        ];
+        const ml = ML_KERNEL_ORDER.filter((n) => data[n]);
+        if (core.length) {
+          html += sectionHead('Language and compiler kernels', '', null);
+          for (const name of core) {
+            html += buildKernel(name, data[name]);
+            shown.add(name);
+          }
+        }
+        if (ml.length) {
+          html += sectionHead('ML kernels', '', FALLBACK_ML_CAVEAT);
+          for (const name of ml) {
+            html += buildKernel(name, data[name]);
+            shown.add(name);
+          }
         }
       }
 

@@ -211,17 +211,31 @@ jobs:
           path: bench-parts-macos
           merge-multiple: true
 
-      - name: Merge into single results.json
+      - name: Merge per-architecture results
         # jq deep-merge across all per-kernel partials. Each partial
         # already carries the same `meta` block (same commit/date/os/
         # arch), so the merge keeps whichever lands last — harmless.
         # Per-kernel objects accumulate under their kernel name; the
         # final results.json has the shape the static page expects.
+        #
+        # The two architectures stay in separate files. Every kernel key
+        # is the same on both, so merging them into one table would let
+        # whichever ran last overwrite the other's numbers rather than
+        # report both. The page loads each file and labels the switch
+        # from its own `meta.cpu`.
         run: |
           ls -la bench-parts/
           mkdir -p bench-out
           jq -s 'reduce .[] as $x ({}; . * $x)' bench-parts/*.json > bench-out/results.json
           cat bench-out/results.json | jq 'keys'
+          # macOS runners are best-effort: a failed or skipped leg leaves
+          # no partials, and the page renders the x86_64 set alone.
+          if compgen -G 'bench-parts-macos/*.json' > /dev/null; then
+            jq -s 'reduce .[] as $x ({}; . * $x)' bench-parts-macos/*.json > bench-out/results-macos.json
+            cat bench-out/results-macos.json | jq 'keys'
+          else
+            echo "no macOS partials; publishing x86_64 only"
+          fi
 
       - name: Upload merged benchmark results
         uses: actions/upload-artifact@v4
