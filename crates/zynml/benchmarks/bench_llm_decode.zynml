@@ -1,0 +1,293 @@
+// Autoregressive decode: the phase after the prompt, one token at a time.
+//
+// Prefill runs every token through the layer at once and the work is
+// dense matrix multiply. Decode cannot: token `t + 1` depends on token
+// `t`, so each step has a single row to push through, and every matrix
+// multiply collapses into a matrix-vector product. The arithmetic per
+// step is a hundredth of a prefill pass while the weights read are the
+// same, so decode is bound by how fast the weights arrive rather than
+// by how fast they are multiplied.
+//
+// That makes it the other half of the question prefill answers. Prefill
+// asks what spreading a large amount of dense work across cores is
+// worth. Decode asks what it costs to spread a small amount many times:
+// a step here dispatches around fourteen loops, and sixty-four steps
+// dispatch nearly a thousand, so anything a handover costs is paid a
+// thousand times over.
+//
+// Same shapes and same weights as the prefill kernel, so the two are
+// reading the same model: 256 channels, 4 heads of 64, a 1024-wide
+// feed-forward block, and a context that starts where the prompt left
+// off and grows by one per step.
+import prelude
+import simd
+
+// y[n] = x[k] . w[k, n], the shape every projection collapses to when
+// there is one token to push through.
+def matvec(mut y: Ptr<f32>, x: Ptr<f32>, w: Ptr<f32>, k: i64, n: i64): i64 {
+    let mut j: i64 = 0
+    while j < n {
+        let mut acc: f32 = 0.0
+        let mut i: i64 = 0
+        while i < k {
+            acc = acc + x[i] * w[i * n + j]
+            i = i + 1
+        }
+        y[j] = acc
+        j = j + 1
+    }
+    return 0
+}
+
+// exp by repeated squaring of the limit form, as in the prefill kernel:
+// the same arithmetic on every backend rather than whichever libm the
+// host links.
+def fast_exp(x: f32): f32 {
+    let mut t: f32 = x
+    if t < -30.0 { t = -30.0 }
+    let mut r: f32 = 1.0 + t * 0.0009765625
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    r = r * r
+    return r
+}
+
+// One head attending over the whole context it has so far.
+//
+// The query is this step's alone; the keys and values are every step's,
+// which is what the cache holds. Scores are formed against each cached
+// key, normalised, and used to weight the cached values.
+def attend(
+    mut ctx: Ptr<f32>,
+    mut scores: Ptr<f32>,
+    q: Ptr<f32>,
+    kcache: Ptr<f32>,
+    vcache: Ptr<f32>,
+    used: i64,
+    dim: i64,
+    channels: i64,
+    base: i64
+): i64 {
+    let mut top: f32 = -1000000.0
+    let mut t: i64 = 0
+    while t < used {
+        let mut acc: f32 = 0.0
+        let mut d: i64 = 0
+        while d < dim {
+            acc = acc + q[d] * kcache[t * channels + base + d]
+            d = d + 1
+        }
+        let s: f32 = acc * 0.125
+        scores[t] = s
+        if s > top { top = s }
+        t = t + 1
+    }
+
+    let mut total: f32 = 0.0
+    let mut e: i64 = 0
+    while e < used {
+        let w: f32 = fast_exp(scores[e] - top)
+        scores[e] = w
+        total = total + w
+        e = e + 1
+    }
+    let inv: f32 = 1.0 / total
+
+    let mut d2: i64 = 0
+    while d2 < dim {
+        let mut acc2: f32 = 0.0
+        let mut t2: i64 = 0
+        while t2 < used {
+            acc2 = acc2 + scores[t2] * vcache[t2 * channels + base + d2]
+            t2 = t2 + 1
+        }
+        ctx[base + d2] = acc2 * inv
+        d2 = d2 + 1
+    }
+    return 0
+}
+
+// The reciprocal root-mean-square of a vector, by Newton's method.
+//
+// Decode feeds each step's output back in as the next step's input, so
+// without normalisation the residual stream compounds: sixty-four steps
+// of unnormalised addition reach infinity, and the first thing that
+// notices is the conversion at the end trapping. Prefill runs one pass
+// and never sees this, which is why it can leave normalisation out and
+// this cannot.
+//
+// The square root is iterated rather than called for the same reason
+// the exponential is: `s = (s + m/s) / 2` converges to the root from
+// any positive start, and doing it here rather than through the host's
+// libm keeps the answer the same on every backend. It runs once per
+// vector rather than once per element, so two dozen turns of it cost
+// nothing against the projections around it.
+def inv_rms(v: Ptr<f32>, n: i64): f32 {
+    let mut ss: f32 = 0.0
+    let mut i: i64 = 0
+    while i < n {
+        let e: f32 = v[i]
+        ss = ss + e * e
+        i = i + 1
+    }
+    let m: f32 = ss / (n as f32) + 0.00001
+    let mut s: f32 = m
+    if s < 1.0 { s = 1.0 }
+    let mut k: i64 = 0
+    while k < 24 {
+        s = 0.5 * (s + m / s)
+        k = k + 1
+    }
+    return 1.0 / s
+}
+
+def scale_by(mut v: Ptr<f32>, f: f32, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        v[i] = v[i] * f
+        i = i + 1
+    }
+    return n
+}
+
+def relu(mut x: Ptr<f32>, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        if x[i] < 0.0 { x[i] = 0.0 }
+        i = i + 1
+    }
+    return n
+}
+
+def add_into(mut dst: Ptr<f32>, src: Ptr<f32>, n: i64): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        dst[i] = dst[i] + src[i]
+        i = i + 1
+    }
+    return n
+}
+
+def fill_pattern(mut p: Ptr<f32>, n: i64, seed: i64, scale: f32): i64 {
+    let mut i: i64 = 0
+    while i < n {
+        let m: i64 = (i * 7 + seed * 13) % 8
+        p[i] = ((m as f32) - 4.0) * scale
+        i = i + 1
+    }
+    return n
+}
+
+def main(): i64 {
+    let channels: i64 = 256
+    let heads: i64 = 4
+    let dim: i64 = 64
+    let ff: i64 = 1024
+    let prompt: i64 = 128
+    let steps: i64 = 64
+    let capacity: i64 = prompt + steps
+
+    let wq: Ptr<f32> = alloc_f32(channels * channels)
+    let wk: Ptr<f32> = alloc_f32(channels * channels)
+    let wv: Ptr<f32> = alloc_f32(channels * channels)
+    let wo: Ptr<f32> = alloc_f32(channels * channels)
+    let w1: Ptr<f32> = alloc_f32(channels * ff)
+    let w2: Ptr<f32> = alloc_f32(ff * channels)
+
+    let kcache: Ptr<f32> = alloc_f32(capacity * channels)
+    let vcache: Ptr<f32> = alloc_f32(capacity * channels)
+
+    let x: Ptr<f32> = alloc_f32(channels)
+    let q: Ptr<f32> = alloc_f32(channels)
+    let krow: Ptr<f32> = alloc_f32(channels)
+    let vrow: Ptr<f32> = alloc_f32(channels)
+    let ctx: Ptr<f32> = alloc_f32(channels)
+    let proj: Ptr<f32> = alloc_f32(channels)
+    let hidden: Ptr<f32> = alloc_f32(ff)
+    let out: Ptr<f32> = alloc_f32(channels)
+    let qh: Ptr<f32> = alloc_f32(dim)
+    let scores: Ptr<f32> = alloc_f32(capacity)
+
+    let f1: i64 = fill_pattern(wq, channels * channels, 2, 0.015625)
+    let f2: i64 = fill_pattern(wk, channels * channels, 3, 0.015625)
+    let f3: i64 = fill_pattern(wv, channels * channels, 4, 0.015625)
+    let f4: i64 = fill_pattern(wo, channels * channels, 5, 0.015625)
+    let f5: i64 = fill_pattern(w1, channels * ff, 6, 0.015625)
+    let f6: i64 = fill_pattern(w2, ff * channels, 7, 0.0078125)
+    let f7: i64 = fill_pattern(x, channels, 1, 0.125)
+
+    // The prompt's keys and values are already in the cache when decode
+    // starts. Filling them with the same pattern stands in for having
+    // run the prefill, which is measured separately.
+    let f8: i64 = fill_pattern(kcache, capacity * channels, 11, 0.03125)
+    let f9: i64 = fill_pattern(vcache, capacity * channels, 12, 0.03125)
+
+    let mut total: f32 = 0.0
+    let mut step: i64 = 0
+    while step < steps {
+        let pos: i64 = prompt + step
+        let used: i64 = pos + 1
+
+        // Everything below is a matrix-vector product. One token gives
+        // the weights nothing to be reused across.
+        let p0: i64 = matvec(q, x, wq, channels, channels)
+        let p1: i64 = matvec(krow, x, wk, channels, channels)
+        let p2: i64 = matvec(vrow, x, wv, channels, channels)
+
+        // This step's key and value join the cache the next steps read.
+        let mut c: i64 = 0
+        while c < channels {
+            kcache[pos * channels + c] = krow[c]
+            vcache[pos * channels + c] = vrow[c]
+            c = c + 1
+        }
+
+        let mut h: i64 = 0
+        while h < heads {
+            let base: i64 = h * dim
+            let mut d: i64 = 0
+            while d < dim {
+                qh[d] = q[base + d]
+                d = d + 1
+            }
+            let a: i64 = attend(ctx, scores, qh, kcache, vcache, used, dim, channels, base)
+            h = h + 1
+        }
+
+        let p3: i64 = matvec(proj, ctx, wo, channels, channels)
+        let r0: i64 = add_into(proj, x, channels)
+        let n0: f32 = inv_rms(proj, channels)
+        let s0: i64 = scale_by(proj, n0, channels)
+
+        let p4: i64 = matvec(hidden, proj, w1, channels, ff)
+        let r1: i64 = relu(hidden, ff)
+        let p5: i64 = matvec(out, hidden, w2, ff, channels)
+        let r2: i64 = add_into(out, proj, channels)
+        let n1: f32 = inv_rms(out, channels)
+        let s1: i64 = scale_by(out, n1, channels)
+
+        // The step's output is the next step's input, which is what
+        // makes this sequential and prefill parallel.
+        let mut m: i64 = 0
+        while m < channels {
+            let e: f32 = out[m]
+            x[m] = e
+            if e < 0.0 { total = total - e } else { total = total + e }
+            m = m + 1
+        }
+        step = step + 1
+    }
+
+    free(wq) free(wk) free(wv) free(wo) free(w1) free(w2)
+    free(kcache) free(vcache)
+    free(x) free(q) free(krow) free(vrow) free(ctx) free(proj)
+    free(hidden) free(out) free(qh) free(scores)
+    return ((total * 4.0) as i64)
+}

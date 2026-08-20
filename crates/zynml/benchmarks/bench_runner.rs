@@ -255,6 +255,11 @@ const KERNELS: &[Kernel] = &[
     // they are composed, and the phase of serving a prompt where the
     // work is dense enough for spreading it across cores to pay.
     Kernel::new("bench_llm_prefill", "Int(806)"),
+    // The other half of serving: one token at a time, where every
+    // matrix multiply is a matrix-vector product and the cost is in
+    // reading the weights rather than multiplying by them. It is also
+    // where a dispatch is paid a thousand times rather than a dozen.
+    Kernel::new("bench_llm_decode", "Int(55842)"),
     Kernel::new("bench_collatz", "Int(35669673)"),
     Kernel::new("bench_branchy", "Int(140)"),
 ];
@@ -360,6 +365,7 @@ const TARGETS: &[Target] = &[
             "branchy",
             "tensor_matmul",
             "llm_prefill",
+            "llm_decode",
         ],
     },
     Target {
@@ -379,6 +385,7 @@ const TARGETS: &[Target] = &[
             "branchy",
             "tensor_matmul",
             "llm_prefill",
+            "llm_decode",
         ],
     },
     Target {
