@@ -29,14 +29,15 @@ static DUMPING: Mutex<()> = Mutex::new(());
 /// success even when the kernel under test stayed scalar.
 fn build(src: &str, dump: &str, func: &str) -> (f64, usize, String) {
     let _serialised = DUMPING.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = format!(
-        "{}/target/hirdump_{dump}",
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap()
-            .display()
-    );
+    // Built by joining rather than formatting: `canonicalize` returns a
+    // verbatim `\\?\C:\...` path on Windows, which takes no forward
+    // slash as a separator, so pasting one in makes the name invalid.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+        .join("target")
+        .join(format!("hirdump_{dump}"));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("ZYNTAX_DUMP_HIR_DIR", &dir);
@@ -59,7 +60,8 @@ fn build(src: &str, dump: &str, func: &str) -> (f64, usize, String) {
         .collect();
     assert!(
         !hir.is_empty(),
-        "no HIR dump at {dir}; a count here would be meaningless"
+        "no HIR dump at {}; a count here would be meaningless",
+        dir.display()
     );
 
     let marker = format!("function @{func}");
