@@ -43,8 +43,12 @@
 //! 59.6 ms to 90.9 ms for the extra functions. What the spreading wins
 //! on those loops, outlining them and handing them over gives back.
 //!
-//! So they are refused, and the trip count is not the reason. A
-//! measurement that says nothing changed is the reason.
+//! So they are left alone by default, and the trip count is not the
+//! reason. A measurement that says nothing changed is the reason, and
+//! it is a measurement about compile time: the exec time was identical.
+//! Where the compile is paid once rather than every run, that trade
+//! comes out differently, so `ZYNTAX_PARALLEL_FLAT_LOOPS=1` turns them
+//! on for a build that is bundled ahead of time or cached.
 //!
 //! Off unless `ZYNTAX_PARALLEL_LOOPS=1`.
 
@@ -65,6 +69,12 @@ const DISPATCH_SYMBOL: &str = "zyntax_parallel_for";
 /// iteration is itself a loop. A row of a matrix multiply is thousands
 /// of operations, so a few rows already cost more than the handover.
 const NESTED_GRAIN: i64 = 4;
+
+/// And when one iteration is a handful of instructions. Handing a band
+/// over costs tens of microseconds and an iteration costs a nanosecond
+/// or two, so a band has to be tens of thousands of iterations long
+/// before it is worth the handover.
+const FLAT_GRAIN: i64 = 32_768;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchStats {
@@ -90,7 +100,23 @@ impl DispatchStats {
 
 /// Whether the pass is switched on.
 pub fn enabled() -> bool {
-    std::env::var("ZYNTAX_PARALLEL_LOOPS")
+    switched_on("ZYNTAX_PARALLEL_LOOPS")
+}
+
+/// Whether a loop with no loop inside it is a candidate too.
+///
+/// Off by default because the compile time is paid every run and the
+/// exec time it buys is nothing (see above). Where the compile is paid
+/// once, ahead of time or into a cache, that trade is different: the
+/// extra functions cost nothing at run time, and a workload whose
+/// elementwise passes are a larger share of it than this one's may get
+/// something back. So it is a switch rather than a rule.
+pub fn flat_loops_enabled() -> bool {
+    switched_on("ZYNTAX_PARALLEL_FLAT_LOOPS")
+}
+
+fn switched_on(name: &str) -> bool {
+    std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -174,14 +200,16 @@ fn plan_function(func: &HirFunction) -> (Vec<Plan>, DispatchStats) {
             stats.shape += 1;
             continue;
         };
-        // What one iteration costs is what decides the grain, and a
-        // loop with no loop inside it is not offered at all: see above
-        // for the measurement that settled it.
-        if !contains_inner_loop(&forest, lp) {
+        // What one iteration costs is what decides the grain.
+        let grain = if contains_inner_loop(&forest, lp) {
+            NESTED_GRAIN
+        } else {
             stats.flat += 1;
-            continue;
-        }
-        let grain = NESTED_GRAIN;
+            if !flat_loops_enabled() {
+                continue;
+            }
+            FLAT_GRAIN
+        };
         match plan_loop(func, lp, found.induction, grain) {
             Some(p) => plans.push(p),
             None => stats.shape += 1,
@@ -502,10 +530,74 @@ fn result_of(inst: &HirInstruction) -> Option<HirId> {
 }
 
 /// Move the loop out and leave a dispatch behind.
+///
+/// The rewrite is checked before it is kept. Two functions are being
+/// rebuilt at once and a value left behind in either of them is not a
+/// slower program, it is one the backend cannot compile at all, so the
+/// pair is dropped rather than handed on if anything reads a value
+/// nothing defines.
 fn rewrite(func: &mut HirFunction, plan: &Plan) -> Option<HirFunction> {
+    let before = func.clone();
     let band = build_band(func, plan)?;
     install_dispatch(func, plan, band.id);
+    if let Some(loose) = undefined_operand(&band).or_else(|| undefined_operand(func)) {
+        log::debug!(
+            "parallel_dispatch: declining {:?}, {loose:?} is read but not defined",
+            plan.header
+        );
+        *func = before;
+        return None;
+    }
     Some(band)
+}
+
+/// A value some instruction reads that nothing in the function defines,
+/// if there is one.
+fn undefined_operand(func: &HirFunction) -> Option<HirId> {
+    let mut defined: HashSet<HirId> = HashSet::new();
+    for (id, blk) in &func.blocks {
+        defined.insert(*id);
+        for phi in &blk.phis {
+            defined.insert(phi.result);
+        }
+        for inst in &blk.instructions {
+            if let Some(r) = result_of(inst) {
+                defined.insert(r);
+            }
+        }
+    }
+    // Parameters and anything self-defining are available everywhere.
+    for (id, value) in &func.values {
+        if !matches!(value.kind, HirValueKind::Instruction) {
+            defined.insert(*id);
+        }
+    }
+    for blk in func.blocks.values() {
+        for phi in &blk.phis {
+            for (v, _) in &phi.incoming {
+                if !defined.contains(v) {
+                    return Some(*v);
+                }
+            }
+        }
+        for inst in &blk.instructions {
+            for v in operands(inst) {
+                // An id an instruction mentions is not always a value:
+                // a call names the function it calls. Only something
+                // the function has a value for is something the
+                // function has to define.
+                if func.values.contains_key(&v) && !defined.contains(&v) {
+                    return Some(v);
+                }
+            }
+        }
+        for v in terminator_operands(&blk.terminator) {
+            if func.values.contains_key(&v) && !defined.contains(&v) {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 fn new_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
@@ -554,8 +646,19 @@ fn build_band(func: &HirFunction, plan: &Plan) -> Option<HirFunction> {
 
     // The body keeps every id it had, so the values it reads come across
     // whole. Ids belong to a function, so nothing can collide.
+    //
+    // Except in one way: what was a parameter of the caller is not a
+    // parameter here. This function's parameters are the band's range
+    // and its buffer, and a value still claiming to be the caller's
+    // second parameter would be bound to the wrong one. Everything
+    // arriving from outside arrives through the buffer instead, so none
+    // of them keep the claim.
     for (id, value) in &func.values {
-        band.values.insert(*id, value.clone());
+        let mut value = value.clone();
+        if matches!(value.kind, HirValueKind::Parameter(_)) {
+            value.kind = HirValueKind::Instruction;
+        }
+        band.values.insert(*id, value);
     }
 
     let lo = new_value(&mut band, HirType::I64, HirValueKind::Parameter(0));
@@ -568,14 +671,6 @@ fn build_band(func: &HirFunction, plan: &Plan) -> Option<HirFunction> {
     band.signature.params[0].id = lo;
     band.signature.params[1].id = hi;
     band.signature.params[2].id = env;
-
-    // Whatever the caller passed in arrives from the buffer instead, so
-    // a value that was a parameter there is an instruction result here.
-    for v in &plan.captured {
-        if let Some(slot) = band.values.get_mut(v) {
-            slot.kind = HirValueKind::Instruction;
-        }
-    }
 
     // Entry: read the captured values back, then fall into the loop.
     let entry = band.entry_block;

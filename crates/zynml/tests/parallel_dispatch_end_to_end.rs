@@ -160,8 +160,18 @@ def run(mut out: Ptr<f32>, src: Ptr<f32>, mut scratch: Ptr<f32>, rounds: i64, n:
     // being dispatched is therefore a statement about the outer one.
     let _guard = serialised();
     std::env::set_var("ZYNTAX_PARALLEL_LOOPS", "1");
+    // The inner copy is a candidate when flat loops are switched on,
+    // and it is genuinely independent, so it would mask what this is
+    // asking about. Off, nothing dispatched is a statement about the
+    // rounds loop alone.
+    let flat = std::env::var("ZYNTAX_PARALLEL_FLAT_LOOPS").ok();
+    std::env::set_var("ZYNTAX_PARALLEL_FLAT_LOOPS", "0");
     let stats = zyntax_compiler::parallel_dispatch::run_module(&mut module);
     std::env::set_var("ZYNTAX_PARALLEL_LOOPS", "0");
+    match flat {
+        Some(v) => std::env::set_var("ZYNTAX_PARALLEL_FLAT_LOOPS", v),
+        None => std::env::remove_var("ZYNTAX_PARALLEL_FLAT_LOOPS"),
+    }
     assert_eq!(
         stats.dispatched, 0,
         "iterations that all write the same scratch must not be spread"
