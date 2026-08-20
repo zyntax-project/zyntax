@@ -775,13 +775,26 @@
       let html = '';
       const shown = new Set();
 
-      // The results say how to section themselves. Older files do not
-      // carry that, and fall through to one flat list below.
-      if (Array.isArray(data.groups) && data.groups.length) {
-        for (const group of data.groups) {
-          const rows = (group.kernels || []).filter((n) => data[n]);
+      // The results say how to section themselves: `sections` describes
+      // each heading and `kernel_meta` says which one every row belongs
+      // under. Both are maps, so the per-kernel partials CI merges keep
+      // all of it. Files predating that fall through to the list below.
+      //
+      // An earlier shape carried a `groups` array instead. It is ignored
+      // on purpose: a deep merge replaces arrays, so in a merged file it
+      // only ever described whichever kernel was merged last.
+      const sections = data.sections;
+      const kmeta = data.kernel_meta;
+      if (sections && kmeta && Object.keys(sections).length) {
+        const ordered = Object.entries(sections).sort(
+          (a, b) => (a[1].rank ?? 0) - (b[1].rank ?? 0)
+        );
+        for (const [key, sec] of ordered) {
+          const rows = Object.keys(kmeta)
+            .filter((n) => data[n] && kmeta[n].group === key)
+            .sort((a, b) => (kmeta[a].order ?? 0) - (kmeta[b].order ?? 0));
           if (!rows.length) continue;
-          html += sectionHead(group.title, group.blurb, group.caveat);
+          html += sectionHead(sec.title, sec.blurb, sec.caveat);
           for (const name of rows) {
             html += buildKernel(name, data[name]);
             shown.add(name);
@@ -796,7 +809,9 @@
         const core = [
           ...KERNEL_ORDER.filter((n) => data[n]),
           ...Object.keys(data).filter(
-            (n) => n !== 'meta' && n !== 'groups' && !known.has(n)
+            (n) =>
+              !['meta', 'groups', 'sections', 'kernel_meta'].includes(n) &&
+              !known.has(n)
           ),
         ];
         const ml = ML_KERNEL_ORDER.filter((n) => data[n]);
@@ -818,8 +833,9 @@
 
       // Anything the sections did not claim still appears, so a kernel
       // added to the runner is never silently missing from the page.
+      const META_KEYS = new Set(['meta', 'groups', 'sections', 'kernel_meta']);
       const rest = Object.keys(data).filter(
-        (n) => n !== 'meta' && n !== 'groups' && !shown.has(n)
+        (n) => !META_KEYS.has(n) && !shown.has(n)
       );
       if (rest.length) {
         if (html) html += sectionHead('Other kernels', '', null);

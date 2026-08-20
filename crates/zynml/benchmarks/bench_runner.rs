@@ -146,20 +146,24 @@ struct Suite {
     /// Run metadata: when, where, with what commit. The page reads
     /// these into the "updated · commit · arch" line.
     meta: Meta,
-    /// How the page should section the rows, in order.
+    /// Section metadata, keyed by section id.
     ///
-    /// Carried in the results rather than in the page, so a kernel
-    /// added to the table above appears under the right heading
-    /// without the page being touched. A results file without it
-    /// renders as one flat list, which is what older ones do.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    groups: Vec<GroupSection>,
+    /// A map rather than a list, and membership lives on the kernels
+    /// rather than here, because the published file is merged from one
+    /// partial per kernel: a deep merge unions maps but replaces
+    /// arrays, so a list of sections would survive only as whichever
+    /// partial merged last.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sections: BTreeMap<String, SectionMeta>,
+    /// Which section each kernel belongs under, and where it sits in
+    /// it. Keyed by kernel name, so it merges the same way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    kernel_meta: BTreeMap<String, KernelMeta>,
 }
 
-/// One published section: a heading, what it measures, and the rows
-/// under it in the order they should appear.
+/// One published section: a heading and what it measures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct GroupSection {
+struct SectionMeta {
     title: String,
     blurb: String,
     /// Shown apart from the blurb, because what a reader must know
@@ -167,7 +171,18 @@ struct GroupSection {
     /// what the number is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caveat: Option<String>,
-    kernels: Vec<String>,
+    /// Section order on the page.
+    rank: u32,
+}
+
+/// Where one kernel is published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KernelMeta {
+    /// Section id, matching a key in `sections`.
+    group: String,
+    /// Position within the section, from the runner's own table, so
+    /// the published order does not depend on merge order.
+    order: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +351,25 @@ enum Group {
 }
 
 impl Group {
+    /// Stable identifier, used as the section's key in the results and
+    /// as the value each kernel records for itself.
+    fn key(self) -> &'static str {
+        match self {
+            Group::Core => "core",
+            Group::Ml => "ml",
+        }
+    }
+
+    /// Where the section sits on the page. Language shapes come first:
+    /// they are what the compiler is, and the ML rows are what it is
+    /// then asked to do.
+    fn rank(self) -> u32 {
+        match self {
+            Group::Core => 0,
+            Group::Ml => 1,
+        }
+    }
+
     /// The heading this section is published under.
     fn title(self) -> &'static str {
         match self {
@@ -636,7 +670,8 @@ fn main() {
 
     let mut suite = Suite {
         kernels: BTreeMap::new(),
-        groups: Vec::new(),
+        sections: BTreeMap::new(),
+        kernel_meta: BTreeMap::new(),
         meta: Meta {
             date: rfc3339_now(),
             commit: git_short_sha(),
@@ -767,24 +802,34 @@ fn main() {
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir {parent:?}: {e}"));
     }
-    // Section the rows the page will show. Only sections with a row
-    // in this run are carried, so a filtered run does not publish an
-    // empty heading.
-    for group in [Group::Core, Group::Ml] {
-        let kernels: Vec<String> = KERNELS
-            .iter()
-            .filter(|k| k.group == group)
-            .map(|k| k.name().to_string())
-            .filter(|name| suite.kernels.contains_key(name))
-            .collect();
-        if !kernels.is_empty() {
-            suite.groups.push(GroupSection {
-                title: group.title().to_string(),
-                blurb: group.blurb().to_string(),
-                caveat: group.caveat().map(|c| c.to_string()),
-                kernels,
-            });
+    // Section the rows the page will show. Each kernel records its own
+    // section and its position in the runner's table, and only the
+    // sections a row landed in are described, so a filtered run does
+    // not publish an empty heading. Both are maps: this file is merged
+    // from one partial per kernel, and a deep merge unions maps while
+    // it replaces arrays.
+    for (order, kernel) in KERNELS.iter().enumerate() {
+        let name = kernel.name().to_string();
+        if !suite.kernels.contains_key(&name) {
+            continue;
         }
+        suite.kernel_meta.insert(
+            name,
+            KernelMeta {
+                group: kernel.group.key().to_string(),
+                order: order as u32,
+            },
+        );
+        let g = kernel.group;
+        suite
+            .sections
+            .entry(g.key().to_string())
+            .or_insert_with(|| SectionMeta {
+                title: g.title().to_string(),
+                blurb: g.blurb().to_string(),
+                caveat: g.caveat().map(|c| c.to_string()),
+                rank: g.rank(),
+            });
     }
 
     let json = serde_json::to_string_pretty(&suite).expect("serialize results");
