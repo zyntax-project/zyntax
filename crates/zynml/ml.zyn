@@ -2684,13 +2684,39 @@ or_rest = { op:or_op ~ operand:and_expr }
 or_op = @{ "||" }
 
 // Logical AND (left-associative)
-and_expr = { first:comparison_expr ~ rest:and_rest* }
+and_expr = { first:bitor_expr ~ rest:and_rest* }
   -> fold_left_ops(first, rest)
 
-and_rest = { op:and_op ~ operand:comparison_expr }
+and_rest = { op:and_op ~ operand:bitor_expr }
   -> make_pair(op, operand)
 
 and_op = @{ "&&" }
+
+// Bitwise or / xor / and, between `&&` and comparison as in C.
+// The `!` guards keep `|` and `&` from eating `||` and `&&`.
+bitor_expr = { first:bitxor_expr ~ rest:bitor_rest* }
+  -> fold_left_ops(first, rest)
+
+bitor_rest = { op:bitor_op ~ operand:bitxor_expr }
+  -> make_pair(op, operand)
+
+bitor_op = @{ "|" ~ !"|" }
+
+bitxor_expr = { first:bitand_expr ~ rest:bitxor_rest* }
+  -> fold_left_ops(first, rest)
+
+bitxor_rest = { op:bitxor_op ~ operand:bitand_expr }
+  -> make_pair(op, operand)
+
+bitxor_op = @{ "^" }
+
+bitand_expr = { first:comparison_expr ~ rest:bitand_rest* }
+  -> fold_left_ops(first, rest)
+
+bitand_rest = { op:bitand_op ~ operand:comparison_expr }
+  -> make_pair(op, operand)
+
+bitand_op = @{ "&" ~ !"&" }
 
 // Comparison expressions - properly build Binary expressions
 // comparison_with_op handles: a < b, a == b, etc.
@@ -2710,21 +2736,30 @@ comparison_no_op = { inner:range_expr }
 comparison_op = @{ "==" | "!=" | "<=" | ">=" | "<" | ">" }
 
 // Range: 0..10 (exclusive), 0..=10 (inclusive)
-range_expr = { range_inclusive | range_exclusive | additive_expr }
+range_expr = { range_inclusive | range_exclusive | shift_expr }
 
-range_exclusive = { start:additive_expr ~ ".." ~ end:additive_expr }
+range_exclusive = { start:shift_expr ~ ".." ~ end:shift_expr }
   -> TypedExpression::Range {
       start: Box::new(start),
       end: Box::new(end),
       inclusive: false,
   }
 
-range_inclusive = { start:additive_expr ~ "..=" ~ end:additive_expr }
+range_inclusive = { start:shift_expr ~ "..=" ~ end:shift_expr }
   -> TypedExpression::Range {
       start: Box::new(start),
       end: Box::new(end),
       inclusive: true,
   }
+
+// Shifts, tighter than a comparison and looser than `+`, as in C.
+shift_expr = { first:additive_expr ~ rest:shift_rest* }
+  -> fold_left_ops(first, rest)
+
+shift_rest = { op:shift_op ~ operand:additive_expr }
+  -> make_pair(op, operand)
+
+shift_op = @{ "<<" | ">>" }
 
 // Addition and subtraction - binary left-associative using fold_left_ops
 // e.g., a + b - c becomes Binary(Binary(a, +, b), -, c)
