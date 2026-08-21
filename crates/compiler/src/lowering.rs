@@ -322,6 +322,12 @@ pub struct SymbolTable {
     /// should construct a paused fiber (`FiberNew`) rather than
     /// running the body synchronously.
     pub fiber_fn_names: std::collections::HashSet<InternedString>,
+    /// Names this program declares with a body of its own
+    /// (`is_external == false` and `body.is_some()`). A name here is a
+    /// real definition, so nothing keyed on the bare name — an
+    /// intrinsic alias, a later `extern def` — may take the call site
+    /// away from it.
+    pub body_fn_names: std::collections::HashSet<InternedString>,
 }
 
 /// Import metadata for debugging and error messages
@@ -1894,7 +1900,22 @@ impl LoweringContext {
                     // nothing else. Saying so is not a fix, but it is
                     // the difference between a wrong call and an
                     // invisible one.
-                    if self.symbols.functions.insert(func.name, func_id).is_some() {
+                    let has_body = !func.is_external && func.body.is_some();
+                    // An `extern def` sharing a name with something this
+                    // program defines is a declaration of a different thing
+                    // that happens to be spelled the same. It must not take
+                    // the name away from the body already collected, or the
+                    // call reaches a stub instead of the definition.
+                    let keeps_body = !has_body && self.symbols.body_fn_names.contains(&func.name);
+                    if has_body {
+                        self.symbols.body_fn_names.insert(func.name);
+                    }
+                    let displaced = if keeps_body {
+                        self.symbols.functions.get(&func.name).copied()
+                    } else {
+                        self.symbols.functions.insert(func.name, func_id)
+                    };
+                    if displaced.is_some() {
                         let where_from = |module: Option<zyntax_typed_ast::InternedString>| {
                             module
                                 .and_then(|m| m.resolve_global())
@@ -1928,18 +1949,24 @@ impl LoweringContext {
                     } else {
                         effective_return_type
                     };
-                    self.symbols
-                        .function_return_types
-                        .insert(func.name, publicly_visible_return);
-                    self.symbols.function_param_types.insert(
-                        func.name,
-                        func.params.iter().map(|p| p.ty.clone()).collect(),
-                    );
-                    // Record default parameter info for functions with optional params
-                    if func.params.iter().any(|p| p.default_value.is_some()) {
+                    // Same rule as the symbol itself: an extern sharing
+                    // the name does not get to describe the signature the
+                    // call site coerces its arguments to.
+                    if !keeps_body {
                         self.symbols
-                            .function_default_params
-                            .insert(func.name, func.params.clone());
+                            .function_return_types
+                            .insert(func.name, publicly_visible_return);
+                        self.symbols.function_param_types.insert(
+                            func.name,
+                            func.params.iter().map(|p| p.ty.clone()).collect(),
+                        );
+                        // Record default parameter info for functions with
+                        // optional params
+                        if func.params.iter().any(|p| p.default_value.is_some()) {
+                            self.symbols
+                                .function_default_params
+                                .insert(func.name, func.params.clone());
+                        }
                     }
                 }
 
@@ -2870,7 +2897,8 @@ impl LoweringContext {
         .with_effect_op_map(effect_op_map)
         .with_resume_param_names(resume_param_names)
         .with_param_typed_ast_types(param_typed_ast_types)
-        .with_fiber_fn_names(self.symbols.fiber_fn_names.clone());
+        .with_fiber_fn_names(self.symbols.fiber_fn_names.clone())
+        .with_body_fn_names(self.symbols.body_fn_names.clone());
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
         // Debug: check SSA result

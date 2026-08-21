@@ -341,6 +341,11 @@ pub struct SsaBuilder {
     /// Populated by lowering before any body is processed (fiber
     /// defs can be called from anywhere).
     fiber_fn_names: HashSet<InternedString>,
+    /// Names this program declares with a body of its own. The Call
+    /// handler consults it before the intrinsic alias map: a name the
+    /// program defines is that definition, not a built-in that happens
+    /// to share the spelling.
+    body_fn_names: HashSet<InternedString>,
 }
 
 /// Context for pattern matching
@@ -661,6 +666,7 @@ impl SsaBuilder {
             array_pool_placement: None,
             builtin_registry,
             fiber_fn_names: HashSet::new(),
+            body_fn_names: HashSet::new(),
         }
     }
 
@@ -708,6 +714,7 @@ impl SsaBuilder {
             array_pool_placement: None,
             builtin_registry: Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
             fiber_fn_names: HashSet::new(),
+            body_fn_names: HashSet::new(),
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -764,6 +771,25 @@ impl SsaBuilder {
     pub fn with_fiber_fn_names(mut self, names: HashSet<InternedString>) -> Self {
         self.fiber_fn_names = names;
         self
+    }
+
+    /// Set the set of function names this program declares with a body
+    /// of its own. The Call handler will not rewrite a call to one of
+    /// them into a same-named built-in intrinsic.
+    pub fn with_body_fn_names(mut self, names: HashSet<InternedString>) -> Self {
+        self.body_fn_names = names;
+        self
+    }
+
+    /// Whether this program declares `name` with a body of its own,
+    /// matching on the resolved string as well as on identity so a
+    /// callee interned through another arena still matches.
+    fn defines_own_body(&self, name: &InternedString, name_str: &str) -> bool {
+        self.body_fn_names.contains(name)
+            || self
+                .body_fn_names
+                .iter()
+                .any(|n| n.resolve_global().as_deref() == Some(name_str))
     }
 
     /// Set default parameter info for functions with optional parameters
@@ -4464,8 +4490,10 @@ impl SsaBuilder {
                                 None,
                                 Some(*func_name),
                             )
-                        } else if let Some(&intrinsic) =
-                            self.intrinsic_alias_map.get(func_name).or_else(|| {
+                        } else if let Some(intrinsic) = self
+                            .intrinsic_alias_map
+                            .get(func_name)
+                            .or_else(|| {
                                 // The callee may have been interned through
                                 // an arena distinct from the global interner
                                 // used at alias-map construction. Re-key the
@@ -4474,6 +4502,13 @@ impl SsaBuilder {
                                 self.intrinsic_alias_map
                                     .get(&InternedString::new_global(&name_str))
                             })
+                            .copied()
+                            // The alias stands in for a stdlib `extern def`.
+                            // A name this program defines with a body of its
+                            // own is that definition, and the call has to
+                            // reach it. Checked through the resolved string
+                            // as well, for the same interning reason.
+                            .filter(|_| !self.defines_own_body(func_name, &name_str))
                         {
                             // Route stdlib intrinsic-aliased fn (e.g. `sqrt`)
                             // to a direct Cranelift intrinsic. The body in
