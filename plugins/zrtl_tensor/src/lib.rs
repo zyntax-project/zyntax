@@ -2586,10 +2586,14 @@ zrtl_plugin! {
         ("$Tensor$ones_3d", tensor_ones_3d, (i64, i64, i64) -> opaque),  // d0, d1, d2
         ("$Tensor$full_f32", tensor_full_f32, (i64, u32, f32) -> opaque),  // shape_ptr, ndim, value
         ("$Tensor$from_array_f32", tensor_from_array_f32, (i64) -> opaque),  // array ptr
+        // An `extern def` in `impl Tensor` mangles to the bare method
+        // name, so the element-typed entry above needs one to reach.
+        ("$Tensor$from_array", tensor_from_array_f32, (i64) -> opaque),
         ("$Tensor$from_raw_f32", tensor_from_raw_f32, (i64, u64) -> opaque),  // ptr + count (usize)
         ("$Tensor$arange_f32", tensor_arange_f32, (f32, f32, f32) -> opaque),
         ("$Tensor$arange", tensor_arange, (f64, f64, f64) -> opaque),  // f64 wrapper for convenience
         ("$Tensor$linspace_f32", tensor_linspace_f32, (f32, f32, u64) -> opaque),  // start, end, n (usize)
+        ("$Tensor$linspace", tensor_linspace_f32, (f32, f32, u64) -> opaque),
         ("$Tensor$eye", tensor_eye, (i64) -> opaque),  // n (creates n×n identity matrix)
         ("$Tensor$rand_f32", tensor_rand_f32_auto, (i64, u32) -> opaque),  // shape_ptr, ndim (auto-seeded)
         ("$Tensor$randn_f32", tensor_randn_f32_auto, (i64, u32) -> opaque),  // shape_ptr, ndim (auto-seeded)
@@ -2648,8 +2652,9 @@ zrtl_plugin! {
         ("$Tensor$div", tensor_div, (i64, i64) -> opaque),
         ("$Tensor$mod", tensor_mod, (i64, i64) -> opaque),
         ("$Tensor$neg", tensor_neg, (i64) -> opaque),
-        ("$Tensor$matmul", tensor_dot, (i64, i64) -> f32),  // @ operator returns f32, not tensor
-        // A real matrix multiply, distinct from the `@` mapping above.
+        // `@`. Bound to the scalar dot until 161e52e gave the plugin a
+        // real matrix multiply; `$Tensor$dot` below is the dot product.
+        ("$Tensor$matmul", tensor_matmul_2d, (i64, i64) -> opaque),
         ("$Tensor$matmul_2d", tensor_matmul_2d, (i64, i64) -> opaque),
         ("$Tensor$dot", tensor_dot, (i64, i64) -> f32),
 

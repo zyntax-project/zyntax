@@ -86,7 +86,7 @@
     tensor_set: "$Tensor$set_f32",
     tensor_set_f32: "$Tensor$set_f32",
     tensor_dot: "$Tensor$dot",
-    // tensor_matmul disabled - ZRTL has wrong signature (maps to dot product, not matmul)
+    tensor_matmul: "$Tensor$matmul",
     // Additional tensor methods used in stdlib
     tensor_std: "$Tensor$std_f32",
     tensor_var: "$Tensor$var_f32",

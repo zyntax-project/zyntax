@@ -60,11 +60,11 @@ impl Div<Tensor> for Tensor {
     extern def div(self, rhs: Tensor): Tensor
 }
 
-// Tensor @ Tensor (matrix multiplication) - DISABLED until ZRTL supports proper matmul
-// impl MatMul<Tensor> for Tensor {
-//     type Output = Tensor
-//     extern def matmul(self, rhs: Tensor): Tensor
-// }
+// Tensor @ Tensor (matrix multiplication)
+impl MatMul<Tensor> for Tensor {
+    type Output = Tensor
+    extern def matmul(self, rhs: Tensor): Tensor
+}
 
 // Tensor negation (-x)
 impl Neg for Tensor {
@@ -290,10 +290,10 @@ def dot(a: Tensor, b: Tensor): f64 {
     extern tensor_dot(a, b)
 }
 
-// Matrix multiplication - DISABLED until ZRTL supports proper matmul
-// def matmul(a: Tensor, b: Tensor): Tensor {
-//     extern tensor_matmul(a, b)
-// }
+// Matrix multiplication
+def matmul(a: Tensor, b: Tensor): Tensor {
+    extern tensor_matmul(a, b)
+}
 
 // Concatenate tensors along axis
 def concat(tensors: List<Tensor>, axis: i64 = 0): Tensor {
