@@ -34,7 +34,8 @@
 //!   tracked pointer — otherwise the allocation escapes through
 //!   another slot), the `arg` of `Call(Intrinsic::Free)`, the `ptr`
 //!   of a `GetElementPtr`, or the operand of a pointer-typed `Cast`.
-//! * GEP indices are constant integers (resolved from `HirConstant`).
+//! * GEP indices are constant integers (resolved from `HirConstant`),
+//!   scaled to bytes by the GEP's `ty` the way the backends scale them.
 //! * Every Load's pointer resolves to a known field offset for which
 //!   we know the stored type.
 //! * No instruction outside the home block references any tracked id
@@ -275,25 +276,44 @@ fn build_candidate(func: &HirFunction, bid: HirId, malloc_result: HirId) -> Opti
             match inst {
                 HirInstruction::GetElementPtr {
                     result,
+                    ty,
                     ptr,
                     indices,
-                    ..
                 } if tracked.contains(ptr) => {
                     if tracked.contains(result) {
                         continue;
                     }
-                    // Resolve indices to a constant byte offset. We
-                    // sum, treating each as a byte offset (matching
-                    // aggregate_split's `ty: HirType::U8` GEPs).
+                    // Resolve indices to a constant byte offset using the
+                    // same stride rule the backends apply: a GEP's `ty`
+                    // names what one index step covers. `U8`/`I8` is the
+                    // byte-offset form aggregate_split emits; a pointer or
+                    // an array steps by its element's size.
                     let mut offset: i64 = 0;
+                    let mut cur_ty = ty.clone();
                     let mut all_const = true;
                     for idx_id in indices {
-                        match const_map.get(idx_id) {
-                            Some(v) => offset += *v,
+                        let v = match const_map.get(idx_id) {
+                            Some(v) => *v,
                             None => {
                                 all_const = false;
                                 break;
                             }
+                        };
+                        match &cur_ty {
+                            HirType::U8 | HirType::I8 => offset += v,
+                            HirType::Ptr(inner) => {
+                                offset += v.saturating_mul(size_of_hir_ty(inner) as i64);
+                                cur_ty = (**inner).clone();
+                            }
+                            HirType::Array(elem, _) => {
+                                offset += v.saturating_mul(size_of_hir_ty(elem) as i64);
+                                cur_ty = (**elem).clone();
+                            }
+                            // A struct-typed GEP steps to a field offset the
+                            // backend reads from its own layout cache. This
+                            // pass has no layout of its own, so it declines
+                            // the candidate rather than guess one.
+                            _ => return None,
                         }
                     }
                     if !all_const || offset < 0 {
@@ -1018,5 +1038,19 @@ mod tests {
         assert_eq!(stats.mallocs_eliminated, 0);
         assert_eq!(stats.escapes_skipped, 1);
         assert_eq!(count_malloc(&module, func_id, entry), 1);
+    }
+}
+
+/// Byte size of an HIR type, matching `aggregate_split`'s layout.
+fn size_of_hir_ty(ty: &HirType) -> usize {
+    match ty {
+        HirType::Bool | HirType::I8 | HirType::U8 => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Struct(s) => s.fields.iter().map(size_of_hir_ty).sum::<usize>().max(1),
+        HirType::Array(elem, n) => size_of_hir_ty(elem).saturating_mul(*n as usize),
+        _ => 8,
     }
 }
