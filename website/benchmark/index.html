@@ -155,10 +155,13 @@
 
     /* Architecture switch. Shown only when more than one was
        published, so a single-architecture run looks as it always did. */
+    /* Carries `.container` too, so it lines up with the column rather
+       than the viewport. `.container` is declared above, so this margin
+       wins at equal specificity and has to keep the auto sides itself. */
     .arch-switch {
       display: flex;
       gap: 0.35rem;
-      margin: 0 0 0.5rem;
+      margin: 0 auto 0.5rem;
       flex-wrap: wrap;
     }
     .arch-switch button {
@@ -880,7 +883,7 @@
 
       if (datasets.length > 1) {
         const bar = document.createElement('div');
-        bar.className = 'arch-switch';
+        bar.className = 'arch-switch container';
         datasets.forEach((d, i) => {
           const b = document.createElement('button');
           b.type = 'button';
