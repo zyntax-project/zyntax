@@ -4740,7 +4740,19 @@ impl SsaBuilder {
                         .and_then(|key| self.function_param_types.get(&key).cloned())
                         .filter(|params| params.len() == args.len());
                     for (i, arg) in args.iter().enumerate() {
-                        let value = self.translate_expression(block_id, arg)?;
+                        // A list literal is laid out as it is translated, so
+                        // what it is being passed into has to be known
+                        // first: `[2, 3]` is a list of i32 on its own and a
+                        // `List<i64>` parameter needs it strided eight bytes
+                        // apart, which no coercion afterwards can undo.
+                        // Same reasoning as the annotated binding.
+                        let saved_expected = self.expected_elem_ty.take();
+                        if let Some(params) = &declared_params {
+                            self.expected_elem_ty = self.declared_element_type(&params[i]);
+                        }
+                        let value = self.translate_expression(block_id, arg);
+                        self.expected_elem_ty = saved_expected;
+                        let value = value?;
                         let value = match &declared_params {
                             Some(params) => {
                                 let target = params[i].clone();
@@ -6370,9 +6382,22 @@ impl SsaBuilder {
                 } else {
                     vec![self.translate_expression(block_id, &method_call.receiver)?]
                 };
-                for arg in &method_call.positional_args {
-                    let arg_val = self.translate_expression(block_id, arg)?;
-                    arg_vals.push(arg_val);
+                // As at a free call: a list literal is laid out as it is
+                // translated, so the parameter it is going into has to be
+                // known first. An instance method's parameters begin with
+                // `self`, which the positional arguments do not.
+                let declared_method_params = self.function_param_types.get(&mangled_name).cloned();
+                let self_offset = usize::from(!is_static);
+                for (i, arg) in method_call.positional_args.iter().enumerate() {
+                    let saved_expected = self.expected_elem_ty.take();
+                    if let Some(params) = &declared_method_params {
+                        if let Some(param_ty) = params.get(i + self_offset) {
+                            self.expected_elem_ty = self.declared_element_type(param_ty);
+                        }
+                    }
+                    let arg_val = self.translate_expression(block_id, arg);
+                    self.expected_elem_ty = saved_expected;
+                    arg_vals.push(arg_val?);
                 }
 
                 // Look up the function by mangled name - first in function_symbols, then extern_link_names

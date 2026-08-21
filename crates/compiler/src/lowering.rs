@@ -2085,6 +2085,16 @@ impl LoweringContext {
                         };
 
                         self.symbols.functions.insert(mangled_name, method_id);
+                        // The declared parameter types, so a call site can
+                        // know what it is passing into before it lowers the
+                        // argument. Only free functions were recorded, which
+                        // left a list literal at a method call laid out by
+                        // what it infers about itself rather than by the
+                        // parameter it is going into.
+                        self.symbols.function_param_types.insert(
+                            mangled_name,
+                            method.params.iter().map(|p| p.ty.clone()).collect(),
+                        );
                     }
                 }
 
