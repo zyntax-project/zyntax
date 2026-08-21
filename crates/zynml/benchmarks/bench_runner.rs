@@ -246,6 +246,10 @@ const KERNELS: &[Kernel] = &[
     // loop, so they have to agree.
     Kernel::new("bench_mandelbrot_strip", "Int(908666)").expecting_without_opts("Int(908586)"),
     Kernel::new("bench_nbody", "Int(-169077)"),
+    // The allocator row. Millions of short-lived trees against one that
+    // outlives them all; nothing else in the suite allocates per
+    // iteration. See the kernel's own header for the shape.
+    Kernel::new("bench_binary_trees", "Int(-104864)"),
     Kernel::new("bench_nbody_ref", "Int(-169077)"),
     Kernel::new("bench_fib", "Int(102334155)"),
     // Same source as `bench_fib`, compiled with pure-call PRE off.
@@ -490,6 +494,7 @@ const TARGETS: &[Target] = &[
             "mandelbrot",
             "nbody",
             "nbody_ref",
+            "binary_trees",
             "fib",
             "inlined_call",
             "free_function_call",
@@ -510,6 +515,7 @@ const TARGETS: &[Target] = &[
             "mandelbrot",
             "nbody",
             "nbody_ref",
+            "binary_trees",
             "fib",
             "inlined_call",
             "free_function_call",

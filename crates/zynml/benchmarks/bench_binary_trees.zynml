@@ -1,0 +1,111 @@
+import prelude
+import simd
+
+// Binary trees — a port of rayzor's
+// `compiler/benchmarks/haxe/BMBinaryTreesCode.hx`, which is HashLink's
+// own port of the Benchmarks Game kernel.
+//
+// The suite had a hole here. Mandelbrot and n-body are floating point,
+// fib and the call rows are call latency, and the tensor rows work out
+// of buffers allocated once, so nothing measured what the allocator
+// does under pressure. This kernel does almost nothing else: millions
+// of short-lived perfect trees are built and released while one long
+// lived tree stays reachable across the whole run, which is the young
+// garbage plus tenured survivor shape a real frame produces.
+//
+// `item_check`'s recursive walk keeps them honest. A tree that was
+// corrupted changes the checksum rather than merely crashing.
+//
+// n = 16 rather than the Benchmarks Game's 14, matching rayzor, so the
+// compiled tiers spend seconds here the way they do on the other heavy
+// rows. The n = 14 checksum 26208 was reproduced first to validate the
+// port, and n = 16 answers -104864.
+//
+// A node is three words — left, right, item — allocated one at a time
+// so the row measures allocation rather than a bump through a slab. A
+// child link is the node's own address and 0 is the absent child: the
+// language spells a null reference as an `Option` today, and comparing
+// one against `null` asks about a variant rather than an address, so a
+// tree written that way would measure the union and not the heap.
+// Nothing else about the kernel changes; the trees, their shapes and
+// the checksum are the reference's.
+//
+// Unlike the reference, which leaves the collector to it, the trees are
+// released explicitly. That is what there is to measure here: the
+// reference's cost is a collector's, and this one's is malloc and free.
+
+def new_node(left: i64, right: i64, item: i64): i64 {
+    let raw: Ptr<i8> = alloc_i8(24)
+    let n: Ptr<i64> = raw as Ptr<i64>
+    n[0] = left
+    n[1] = right
+    n[2] = item
+    return n as i64
+}
+
+def bottom_up_tree(item: i64, depth: i64): i64 {
+    if depth > 0 {
+        let l: i64 = bottom_up_tree(2 * item - 1, depth - 1)
+        let r: i64 = bottom_up_tree(2 * item, depth - 1)
+        return new_node(l, r, item)
+    }
+    return new_node(0, 0, item)
+}
+
+def item_check(node: i64): i64 {
+    let n: Ptr<i64> = node as Ptr<i64>
+    let l: i64 = n[0]
+    if l == 0 { return n[2] }
+    return n[2] + item_check(l) - item_check(n[1])
+}
+
+def free_tree(node: i64) {
+    let n: Ptr<i64> = node as Ptr<i64>
+    let l: i64 = n[0]
+    if l != 0 {
+        free_tree(l)
+        free_tree(n[1])
+    }
+    free(node as Ptr<i8>)
+}
+
+def main(): i64 {
+    let min_depth: i64 = 4
+    let n: i64 = 16
+    let mut max_depth: i64 = n
+    if min_depth + 2 > max_depth { max_depth = min_depth + 2 }
+    let stretch_depth: i64 = max_depth + 1
+
+    // One tree deeper than any other, built and released before the
+    // long lived one is allocated, so the heap has been stretched once
+    // before anything is meant to survive.
+    let stretch: i64 = bottom_up_tree(0, stretch_depth)
+    let mut result: i64 = item_check(stretch)
+    free_tree(stretch)
+
+    // Held to the end, so every round below runs against something the
+    // allocator cannot reclaim.
+    let long_lived: i64 = bottom_up_tree(0, max_depth)
+
+    let mut depth: i64 = min_depth
+    while depth <= max_depth {
+        let iterations: i64 = 1 << (max_depth - depth + min_depth)
+        let mut check: i64 = 0
+        let mut i: i64 = 0
+        while i < iterations {
+            let t1: i64 = bottom_up_tree(i, depth)
+            check = check + item_check(t1)
+            free_tree(t1)
+            let t2: i64 = bottom_up_tree(0 - i, depth)
+            check = check + item_check(t2)
+            free_tree(t2)
+            i = i + 1
+        }
+        result = result ^ check
+        depth = depth + 2
+    }
+
+    result = result ^ item_check(long_lived)
+    free_tree(long_lived)
+    return result
+}
