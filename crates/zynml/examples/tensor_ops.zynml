@@ -78,7 +78,7 @@ def test_matrix_ops() {
     println(result2)
 
     // Transpose
-    let m1_t = m1.transpose()
+    let m1_t = m1.transpose(0, 1)
     println("m1.transpose() (3x2):")
     println(m1_t)
 }
@@ -88,25 +88,25 @@ def test_shapes() {
     println("\n=== Shape Manipulation ===")
 
     let t = Tensor::arange(0.0, 24.0, 1.0)
-    println(f"Original shape: {t.shape()}")
+    println(f"Original length: {t.shape(0)}")
     println(f"ndim: {t.ndim()}")
     println(f"numel: {t.numel()}")
 
     // Reshape to 2x3x4
     let reshaped = t.reshape([2, 3, 4])
-    println(f"Reshaped to: {reshaped.shape()}")
+    println(f"Reshaped to: {reshaped.shape(0)} x {reshaped.shape(1)} x {reshaped.shape(2)}")
 
     // Flatten back to 1D
     let flat = reshaped.flatten()
-    println(f"Flattened: {flat.shape()}")
+    println(f"Flattened: {flat.shape(0)}")
 
     // Add dimension
     let expanded = t.unsqueeze(0)
-    println(f"Unsqueezed at 0: {expanded.shape()}")
+    println(f"Unsqueezed at 0: {expanded.shape(0)} x {expanded.shape(1)}")
 
     // Remove singleton dimensions
     let squeezed = expanded.squeeze()
-    println(f"Squeezed: {squeezed.shape()}")
+    println(f"Squeezed: {squeezed.shape(0)}")
 }
 
 // Test reduction operations

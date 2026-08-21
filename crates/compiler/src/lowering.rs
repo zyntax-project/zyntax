@@ -236,6 +236,13 @@ pub struct LoweringContext {
     /// name. Nothing can say what such a call reaches, so skipping
     /// stops being safe once one appears.
     saw_indirect_call: bool,
+    /// Functions dropped because their body failed analysis, keyed by
+    /// the id a call site still carries, with the name and what the
+    /// analysis said. A drop is only tolerable while nothing calls the
+    /// function; when something does, this is the explanation the
+    /// caller is owed. Keyed by id because the name is what the drop
+    /// removes.
+    dropped_for: std::collections::HashMap<crate::hir::HirId, (InternedString, String)>,
     /// Type registry for type conversions
     pub type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
     /// String arena for creating mangled names
@@ -505,6 +512,7 @@ impl LoweringContext {
             skipped_at: std::collections::HashMap::new(),
             current_decl: 0,
             saw_indirect_call: false,
+            dropped_for: std::collections::HashMap::new(),
             type_registry,
             arena,
             symbols,
@@ -776,6 +784,10 @@ impl AstLowering for LoweringContext {
         if let Some(first) = crate::exclusive_args::check_module(&self.module).first() {
             return Err(crate::CompilerError::Analysis(first.message()));
         }
+
+        // Checked here because only now is every call in the module
+        // present, and because every backend is downstream of it.
+        self.report_calls_with_wrong_arity()?;
 
         Ok(self.module.clone())
     }
@@ -2318,6 +2330,9 @@ impl LoweringContext {
                         if std::env::var("ZYNTAX_TRACE_LOWERING_DROP").is_ok() {
                             eprintln!("[LOWERING-DROP] '{func_name}': {e}");
                         }
+                        if let Some(id) = self.symbols.functions.get(&func.name).copied() {
+                            self.dropped_for.insert(id, (func.name, e.to_string()));
+                        }
                         self.symbols.functions.remove(&func.name);
                     } else {
                         return Err(e);
@@ -2527,8 +2542,77 @@ impl LoweringContext {
                 self.current_decl = index;
                 self.lower_declaration(&program.declarations[index])?;
             }
+            // Everything that could be built has been. A call still
+            // landing nowhere reaches a function with no body, which
+            // runs as a silent no-op and returns whatever the ABI
+            // leaves behind, so the program does nothing and says it
+            // succeeded. Report it instead, with the analysis error
+            // that dropped the body where there is one.
             return Ok(());
         }
+    }
+
+    /// Fail on a call whose argument count its callee cannot accept.
+    ///
+    /// Cranelift's verifier already catches this, but the response
+    /// there is to skip the function: a body that fails to compile is
+    /// dropped and calling it becomes a no-op, so a program with a
+    /// mistyped call runs, does nothing, and reports success. The
+    /// mismatch is a fact about the module, so it is decided here,
+    /// where every call is present and every backend is downstream.
+    ///
+    /// Defaults are filled before this point, so the counts are exact.
+    /// A variadic takes its declared parameters and any number after.
+    fn report_calls_with_wrong_arity(&mut self) -> CompilerResult<()> {
+        use crate::hir::{HirCallable, HirInstruction};
+
+        let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
+            std::collections::HashMap::new();
+        for (name, id) in &self.symbols.functions {
+            name_of.insert(*id, *name);
+        }
+
+        for function in self.module.functions.values() {
+            for block in function.blocks.values() {
+                for inst in &block.instructions {
+                    let HirInstruction::Call { callee, args, .. } = inst else {
+                        continue;
+                    };
+                    let target = match callee {
+                        HirCallable::Function(t) | HirCallable::FuncRef(t) => *t,
+                        _ => continue,
+                    };
+                    let Some(target_fn) = self.module.functions.get(&target) else {
+                        continue;
+                    };
+                    let want = target_fn.signature.params.len();
+                    let got = args.len();
+                    let ok = if target_fn.signature.is_variadic {
+                        got >= want
+                    } else {
+                        got == want
+                    };
+                    if ok {
+                        continue;
+                    }
+                    let callee_name = name_of
+                        .get(&target)
+                        .and_then(|n| n.resolve_global())
+                        .or_else(|| target_fn.name.resolve_global())
+                        .unwrap_or_else(|| format!("{target:?}"));
+                    let caller = function
+                        .name
+                        .resolve_global()
+                        .unwrap_or_else(|| format!("{:?}", function.name));
+                    let plural = if want == 1 { "" } else { "s" };
+                    return Err(crate::CompilerError::Analysis(format!(
+                        "'{callee_name}' takes {want} argument{plural} but is called with \
+                         {got} in '{caller}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Names of functions that lowered code calls but which have no
@@ -2541,6 +2625,11 @@ impl LoweringContext {
         let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
             std::collections::HashMap::new();
         for (name, id) in &self.symbols.functions {
+            name_of.insert(*id, *name);
+        }
+        // A dropped function is no longer in the table, and without
+        // this its call site looks like a call through a value.
+        for (id, (name, _)) in &self.dropped_for {
             name_of.insert(*id, *name);
         }
 
