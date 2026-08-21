@@ -3626,6 +3626,14 @@ impl SsaBuilder {
                     return self.translate_assignment(block_id, left, right);
                 }
 
+                // `x == null` asks whether a reference is absent, which is
+                // a question about which variant it holds.
+                if matches!(op, FrontendOp::Eq | FrontendOp::Ne) {
+                    if let Some(v) = self.translate_null_comparison(block_id, op, left, right)? {
+                        return Ok(v);
+                    }
+                }
+
                 // Logical AND/OR operators require short-circuit control flow.
                 if matches!(op, FrontendOp::And | FrontendOp::Or) {
                     let left_val = self.translate_expression(block_id, left)?;
@@ -8785,6 +8793,132 @@ impl SsaBuilder {
         );
         self.add_use(value, result);
         result
+    }
+
+    /// Compare against a `null` literal by variant rather than by value.
+    ///
+    /// `null` lowers to `Option`'s `None`, so the ordinary path compares
+    /// two whole unions: a union carrying no payload against another
+    /// carrying no payload, byte for byte, which answers false for two
+    /// nulls that are the same absence. What the source asked is which
+    /// variant the operand holds, so that is what is compared. A
+    /// pointer-typed operand is compared against the zero address
+    /// instead, which is the same question for a raw reference.
+    ///
+    /// Returns `None` unless one side is the literal, so no other
+    /// comparison changes meaning. In particular `Some(1) == Some(2)`
+    /// still takes the ordinary path rather than becoming a variant
+    /// test that would call them equal.
+    fn translate_null_comparison(
+        &mut self,
+        block_id: HirId,
+        op: &zyntax_typed_ast::typed_ast::BinaryOp,
+        left: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        right: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<Option<HirId>> {
+        use zyntax_typed_ast::typed_ast::{BinaryOp as FrontendOp, TypedExpression, TypedLiteral};
+
+        // `null_literal` is an atomic rule with no action of its own, so
+        // the word arrives here as a name rather than a literal. It is
+        // reserved by the grammar, so nothing else can be called it.
+        let is_null = |e: &zyntax_typed_ast::TypedNode<TypedExpression>| match &e.node {
+            TypedExpression::Literal(TypedLiteral::Null) => true,
+            // The resolver rewrites the word to the variant it names
+            // before this point, so that is what actually arrives.
+            TypedExpression::Variable(name) => name
+                .resolve_global()
+                .is_some_and(|n| n == "null" || n == "None"),
+            _ => false,
+        };
+        let operand = if is_null(right) {
+            left
+        } else if is_null(left) {
+            right
+        } else {
+            return Ok(None);
+        };
+        // `null == null` has no operand to interrogate; the ordinary
+        // path answers it and is not wrong about two identical literals.
+        if is_null(operand) {
+            return Ok(None);
+        }
+
+        let value = self.translate_expression(block_id, operand)?;
+        let value_ty = self
+            .function
+            .values
+            .get(&value)
+            .map(|v| v.ty.clone())
+            .unwrap_or(HirType::I64);
+
+        // What is compared, and what it is compared against: a union
+        // yields its discriminant against `None`'s, anything else is an
+        // address against zero.
+        let (subject, absent) = match &value_ty {
+            HirType::Union(union_ty) => {
+                let none = union_ty.variants.iter().find(|v| {
+                    v.name
+                        .resolve_global()
+                        .is_some_and(|n| n == "None" || n == "Null")
+                });
+                // A union with no absent variant is not an optional, so
+                // the question does not apply to it.
+                let Some(none) = none else {
+                    return Ok(None);
+                };
+                let disc_ty = (*union_ty.discriminant_type).clone();
+                let extracted = self.create_value(disc_ty.clone(), HirValueKind::Instruction);
+                self.add_instruction(
+                    block_id,
+                    HirInstruction::GetUnionDiscriminant {
+                        result: extracted,
+                        union_val: value,
+                    },
+                );
+                self.add_use(value, extracted);
+                let d = none.discriminant;
+                let tag_const = match &disc_ty {
+                    HirType::I8 => HirConstant::I8(d as i8),
+                    HirType::I16 => HirConstant::I16(d as i16),
+                    HirType::I32 => HirConstant::I32(d as i32),
+                    HirType::I64 => HirConstant::I64(d as i64),
+                    HirType::U8 => HirConstant::U8(d as u8),
+                    HirType::U16 => HirConstant::U16(d as u16),
+                    HirType::U32 => HirConstant::U32(d as u32),
+                    HirType::U64 => HirConstant::U64(d),
+                    _ => HirConstant::I32(d as i32),
+                };
+                let tag = self.create_value(disc_ty, HirValueKind::Constant(tag_const));
+                (extracted, tag)
+            }
+            HirType::Ptr(_) => {
+                let zero = self.create_value(
+                    value_ty.clone(),
+                    HirValueKind::Constant(HirConstant::I64(0)),
+                );
+                (value, zero)
+            }
+            _ => return Ok(None),
+        };
+
+        let result = self.create_value(HirType::Bool, HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Binary {
+                op: if matches!(op, FrontendOp::Eq) {
+                    crate::hir::BinaryOp::Eq
+                } else {
+                    crate::hir::BinaryOp::Ne
+                },
+                result,
+                ty: HirType::Bool,
+                left: subject,
+                right: absent,
+            },
+        );
+        self.add_use(subject, result);
+        self.add_use(absent, result);
+        Ok(Some(result))
     }
 
     /// Whether something in the program declares this expression's
