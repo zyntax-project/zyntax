@@ -43,6 +43,8 @@
 
 use std::alloc::{alloc as sys_alloc, dealloc as sys_dealloc, Layout};
 use std::cell::Cell;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Largest request served from a pool. Above this, libc.
 const MAX_POOLED: usize = 1024;
@@ -108,6 +110,22 @@ thread_local! {
     static SLAB_USED: Cell<usize> = const { Cell::new(SLAB) };
 }
 
+/// Requests the pools have served, across every thread.
+///
+/// The behaviour tests below prove what a pool does with a block. They
+/// cannot prove a compiled program's allocations arrive here at all,
+/// and a pool nothing reaches would pass every one of them. This is
+/// what an end-to-end test reads to assert the path rather than the
+/// behaviour.
+#[cfg(debug_assertions)]
+static SERVED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many requests the pools have served. Debug builds only.
+#[cfg(debug_assertions)]
+pub fn pooled_allocation_count() -> usize {
+    SERVED.load(Ordering::Relaxed)
+}
+
 /// Size class for a payload, or `None` when libc should take it.
 #[inline]
 fn class_of(size: usize) -> Option<usize> {
@@ -134,6 +152,8 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
     let Some(class) = class_of(size) else {
         return large_alloc(size);
     };
+    #[cfg(debug_assertions)]
+    SERVED.fetch_add(1, Ordering::Relaxed);
 
     // A block already on this pool's list.
     let reused = FREE.with(|lists| {
@@ -355,25 +375,54 @@ mod tests {
     /// Reads past the header deliberately: the first word of a freed
     /// block is the free-list link, which follows the address and so
     /// differs every run.
+    ///
+    /// Every size here is checked to be one a pool actually serves,
+    /// including the last one it takes. An instrument that tests a
+    /// size the allocator hands to libc reports on the path it did not
+    /// change, and passes while seeing none of the memory this owns.
     #[cfg(debug_assertions)]
     #[test]
     fn a_freed_payload_is_poisoned() {
         unsafe {
-            let p = zyntax_alloc(64);
-            std::ptr::write_bytes(p, 0x11, 64);
-            assert_eq!(*p, 0x11);
-            zyntax_free(p);
-
-            // Every byte of the payload, not just the first: a partial
-            // overwrite would still leave stale data to read.
-            for i in 0..64 {
-                assert_eq!(
-                    *p.add(i),
-                    POISON,
-                    "byte {i} of a freed payload still holds what it held before"
+            for size in [16usize, 24, 64, 512, MAX_POOLED] {
+                assert!(
+                    class_of(size).is_some(),
+                    "size {size} is not pooled, so poisoning it proves nothing"
                 );
+                let p = zyntax_alloc(size);
+                std::ptr::write_bytes(p, 0x11, size);
+                assert_eq!(*p, 0x11, "size {size} was not writable before free");
+                zyntax_free(p);
+
+                // Every byte, not just the first: a partial overwrite
+                // would still leave stale data to read.
+                for i in 0..size {
+                    assert_eq!(
+                        *p.add(i),
+                        POISON,
+                        "byte {i} of a freed {size}-byte payload still holds \
+                         what it held before"
+                    );
+                }
             }
         }
+    }
+
+    /// And the first size past the cap is not pooled, which is what
+    /// makes the sizes above meaningful.
+    ///
+    /// A block libc owns is released rather than kept, so there is
+    /// nothing to poison and no stale read to guard. This pins the
+    /// boundary so that raising `MAX_POOLED` cannot quietly move the
+    /// test above it.
+    #[test]
+    fn the_cap_is_where_the_pool_stops() {
+        assert!(class_of(MAX_POOLED).is_some(), "the cap itself is pooled");
+        assert!(
+            class_of(MAX_POOLED + 1).is_none(),
+            "one byte past the cap must go to libc, or the poison tests \
+             above are exercising a path the pool does not own"
+        );
     }
 
     /// A large block released on a different thread than took it is
