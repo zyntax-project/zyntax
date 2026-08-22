@@ -16,6 +16,11 @@
 //! Anything larger than [`MAX_POOLED`] goes to libc, since a pool that
 //! keeps every size forever is a leak wearing a hat.
 //!
+//! Under `debug_assertions` a freed payload is overwritten with
+//! [`POISON`]. A pool hands the same bytes back rather than unmapping
+//! them, so without it a read through a stale pointer returns the old
+//! contents and looks like a correct answer.
+//!
 //! ## The contract
 //!
 //! [`zyntax_free`] must only ever be handed a pointer from
@@ -57,6 +62,13 @@ const HEADER: usize = 16;
 /// Marks a block as this allocator's. Chosen to be implausible as a
 /// length, a pointer, or ASCII.
 const MAGIC: u64 = 0x5A79_6E50_6F6F_6C01;
+
+/// Written over a freed payload under `debug_assertions`, so a read
+/// through a stale pointer is recognisable rather than plausible.
+/// `0x55` repeats to `0x5555555555555555`, which is not a small
+/// integer, not a mappable address on any target here, and not ASCII.
+#[cfg(debug_assertions)]
+const POISON: u8 = 0x55;
 
 /// Bytes carved per slab. Large enough that carving is rare and small
 /// enough that a program allocating once does not take a megabyte.
@@ -209,19 +221,39 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
         sys_dealloc(block, Layout::from_size_align_unchecked(total, HEADER));
         return;
     }
+    // A freed block keeps its bytes, so a read through a stale pointer
+    // returns the old contents: plausible, wrong, and silent. Overwrite
+    // the payload with a byte that is none of a small integer, a valid
+    // pointer, or ASCII, so such a read is recognisable instead. Debug
+    // only — the whole point of the pool is that freeing is a push.
+    #[cfg(debug_assertions)]
+    std::ptr::write_bytes(block.add(HEADER), POISON, (class + 1) * STEP);
+
     FREE.with(|lists| {
-        // Thread the block onto the list through its own payload.
+        // Threaded through the header, not the payload: the first word
+        // of the block is the magic, which a freed block no longer
+        // needs, and leaving the payload alone is what lets it carry
+        // the poison above.
         *(block as *mut *mut u8) = lists[class].get();
         lists[class].set(block);
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 unsafe fn libc_free(ptr: *mut u8) {
     extern "C" {
         fn free(p: *mut core::ffi::c_void);
     }
     free(ptr as *mut core::ffi::c_void);
 }
+
+/// wasm32 links no libc, so there is nothing to hand a foreign block
+/// back to. This path is only reached by a pointer that did not come
+/// from here, which is a mistake somewhere else; leaking it is what
+/// there is to do, and it beats guessing a layout for
+/// `dealloc` and corrupting the allocator that does own it.
+#[cfg(target_arch = "wasm32")]
+unsafe fn libc_free(_ptr: *mut u8) {}
 
 /// The symbols JIT'd code calls, for registration alongside the other
 /// runtime groups.
@@ -305,6 +337,41 @@ mod tests {
             }
             for (p, _) in live {
                 zyntax_free(p);
+            }
+        }
+    }
+
+    /// A read through a pointer that was already freed is
+    /// recognisable rather than plausible.
+    ///
+    /// The pool hands the same bytes back instead of unmapping them,
+    /// so before the poison a stale read returned whatever the block
+    /// last held — a correct-looking answer with nothing to notice.
+    ///
+    /// This reads freed memory on purpose. It is safe here because a
+    /// slab is never returned, so the page is still mapped; that is
+    /// exactly why the bug it guards is invisible without help.
+    ///
+    /// Reads past the header deliberately: the first word of a freed
+    /// block is the free-list link, which follows the address and so
+    /// differs every run.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_freed_payload_is_poisoned() {
+        unsafe {
+            let p = zyntax_alloc(64);
+            std::ptr::write_bytes(p, 0x11, 64);
+            assert_eq!(*p, 0x11);
+            zyntax_free(p);
+
+            // Every byte of the payload, not just the first: a partial
+            // overwrite would still leave stale data to read.
+            for i in 0..64 {
+                assert_eq!(
+                    *p.add(i),
+                    POISON,
+                    "byte {i} of a freed payload still holds what it held before"
+                );
             }
         }
     }
