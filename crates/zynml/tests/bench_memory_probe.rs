@@ -41,11 +41,22 @@ fn kernels() -> Vec<PathBuf> {
 ///
 /// Before the drop-site work, one pass grew 219 MB, nearly all of it
 /// programs that allocated per iteration and released nothing. The
-/// bound here is generous: it is not measuring the residue, it is there
-/// to fail loudly if a per-iteration leak comes back.
+/// bound is not measuring the residue, it is there to fail loudly if a
+/// per-iteration leak comes back.
+///
+/// Stated as a fraction of what the first pass cost rather than as a
+/// number of megabytes. A leak makes the second pass cost what the
+/// first did, so the quantity being watched is a ratio; an absolute
+/// bound measures instead how much this particular set of kernels
+/// allocates, and moves whenever one is added.
+///
+/// The ratio also has to survive the difference between machines: the
+/// same tree grows 2% here and 34% on the Linux runner, so the bound is
+/// half rather than something tighter.
 #[test]
 fn a_second_pass_does_not_cost_what_the_first_did() {
     let files = kernels();
+    let before_first = rss_mb();
     for f in &files {
         if let Ok(src) = std::fs::read_to_string(f) {
             if let Ok(mut rt) = ZynML::new() {
@@ -71,10 +82,27 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
     let growth = after_second as i64 - after_first as i64;
     println!("  second-pass growth: {growth} MB");
 
+    // Judged against what the first pass cost, not against a fixed
+    // number of megabytes. A leak that returns makes the second pass
+    // cost what the first did, which is the thing being watched for and
+    // is a ratio; an absolute bound instead tracks how much the suite
+    // happens to allocate, so adding a kernel moves it. `binary_trees`
+    // allocates thirty million nodes on purpose and moved it enough to
+    // fail on CI at 60 MB against a 60 MB bound while passing locally
+    // at -7 MB.
+    // Half, not a smaller fraction: a returning leak makes the second
+    // pass cost essentially what the first did, so anything well under
+    // that catches it, and the headroom is what stops an environment
+    // difference from reading as one. This machine sees 2% and the
+    // Linux runner 34%, for the same tree.
+    let first_growth = (after_first as i64 - before_first as i64).max(1);
+    println!("  first-pass growth: {first_growth} MB");
     assert!(
-        growth < 60,
-        "a second pass grew {growth} MB, which is the shape of a program \
-         allocating per iteration and releasing nothing"
+        growth * 2 < first_growth,
+        "a second pass grew {growth} MB against the first pass's \
+         {first_growth} MB. A pass that costs anything like the one \
+         before it is the shape of a program allocating per iteration \
+         and releasing nothing."
     );
 
     // Attribute what is left, now that first-time costs are paid.
