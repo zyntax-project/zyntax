@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use zynml::{ZynML, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR};
@@ -1179,7 +1179,54 @@ fn one_iteration(
     .map_err(|e| format!("call: {e:?}"))?;
     let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
+    // A tier that did not install is not a slow tier. When the LLVM
+    // install fails the runtime says so and carries on, every function
+    // stays on Cranelift, and this row would report Cranelift's time
+    // under LLVM's name — a plausible number, a correct answer, and a
+    // measurement of the wrong thing. It has happened twice: once when
+    // a void call was refused, once when the pool's symbols were not
+    // handed to the JIT. Both times the tell was the two rows agreeing
+    // to within a millisecond, which reads as convergence rather than
+    // as breakage.
+    //
+    // Asked of the runtime rather than grepped out of its log: a
+    // generation of 0 is Cranelift and 1 is the LLVM pointer swapped
+    // in, and a counter cannot be reworded the way a message can.
+    if target.install_llvm && !llvm_tier_engaged(&zynml) {
+        return Err(
+            "the LLVM tier never installed, so this would be Cranelift's              number under LLVM's name; run with RUST_LOG=warn to see why"
+                .to_string(),
+        );
+    }
+
     Ok((runtime_setup_ms, compile_ms, exec_ms, result))
+}
+
+/// Whether any function actually reached the LLVM tier.
+///
+/// Generation 0 is the Cranelift pointer and 1 is the LLVM one, swapped
+/// in by the promotion broker. The install is synchronous on this path,
+/// so the warm-up calls above should already have driven it; the short
+/// wait is there so a slow swap reads as slow rather than as absent,
+/// since refusing a row that would have been fine is its own way of
+/// reporting the wrong thing.
+fn llvm_tier_engaged(zynml: &ZynML) -> bool {
+    let ids = zynml.runtime().interp_registered_function_ids();
+    if ids.is_empty() {
+        return false;
+    }
+    let reached = || {
+        ids.iter()
+            .any(|id| zynml.runtime().interp_function_generation(*id) >= 1)
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(500) {
+        if reached() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reached()
 }
 
 fn median(samples: &mut [f64]) -> f64 {
