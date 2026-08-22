@@ -63,6 +63,7 @@ pub mod parallel_dispatch; // A loop with independent iterations becomes a band 
 pub mod parallel_safe; // Which counted loops have independent iterations
 pub mod pattern_matching;
 pub mod phi_prune;
+pub mod pool_alloc; // Size-class pools behind the allocation intrinsics
 pub mod pure_call_pre;
 pub mod purity;
 pub mod reduction_vectorize;

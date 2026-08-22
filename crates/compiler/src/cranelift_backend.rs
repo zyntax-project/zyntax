@@ -507,6 +507,12 @@ impl CraneliftBackend {
         for (name, ptr) in crate::osr::osr_runtime_symbols() {
             builder.symbol(name, ptr);
         }
+        // The allocation intrinsics call into the runtime's size-class
+        // pools rather than libc, so the JIT has to resolve them.
+        for (name, ptr) in crate::pool_alloc::alloc_runtime_symbols() {
+            builder.symbol(name, ptr);
+        }
+
         // String-op runtime intrinsics — referenced unconditionally
         // by `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
         for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
@@ -2624,11 +2630,11 @@ impl CraneliftBackend {
                                                 let malloc_func = self
                                                     .module
                                                     .declare_function(
-                                                        "malloc",
+                                                        "zyntax_alloc",
                                                         Linkage::Import,
                                                         &malloc_sig,
                                                     )
-                                                    .expect("Failed to declare malloc");
+                                                    .expect("Failed to declare zyntax_alloc");
 
                                                 let local_malloc =
                                                     self.module.declare_func_in_func(
@@ -2660,11 +2666,11 @@ impl CraneliftBackend {
                                                 let free_func = self
                                                     .module
                                                     .declare_function(
-                                                        "free",
+                                                        "zyntax_free",
                                                         Linkage::Import,
                                                         &free_sig,
                                                     )
-                                                    .expect("Failed to declare free");
+                                                    .expect("Failed to declare zyntax_free");
 
                                                 let local_free = self
                                                     .module
@@ -6767,7 +6773,7 @@ impl CraneliftBackend {
         // Declare malloc as an external function
         let malloc_id = self
             .module
-            .declare_function("malloc", Linkage::Import, &sig)
+            .declare_function("zyntax_alloc", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare malloc: {}", e)))?;
 
         // Import the function into the current function
@@ -6793,7 +6799,7 @@ impl CraneliftBackend {
         // Declare free as an external function
         let free_id = self
             .module
-            .declare_function("free", Linkage::Import, &sig)
+            .declare_function("zyntax_free", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare free: {}", e)))?;
 
         // Import the function into the current function
@@ -9304,6 +9310,12 @@ impl CraneliftBackend {
         for (name, ptr) in crate::osr::osr_runtime_symbols() {
             builder.symbol(name, ptr);
         }
+        // The allocation intrinsics call into the runtime's size-class
+        // pools rather than libc, so the JIT has to resolve them.
+        for (name, ptr) in crate::pool_alloc::alloc_runtime_symbols() {
+            builder.symbol(name, ptr);
+        }
+
         // String-op runtime intrinsics — referenced unconditionally
         // by `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
         for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {

@@ -4350,11 +4350,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let size = self.get_value(args[0])?;
 
                 // Declare or get malloc function: declare ptr @malloc(i64)
-                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+                let malloc_fn = self.module.get_function("zyntax_alloc").unwrap_or_else(|| {
                     let i64_type = self.context.i64_type();
                     let ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
                     let fn_type = ptr_type.fn_type(&[i64_type.into()], false);
-                    self.module.add_function("malloc", fn_type, None)
+                    self.module.add_function("zyntax_alloc", fn_type, None)
                 });
 
                 let call_site = self.builder.build_call(
@@ -4382,10 +4382,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let ptr = self.get_value(args[0])?;
 
                 // Declare or get free function: declare void @free(ptr)
-                let free_fn = self.module.get_function("free").unwrap_or_else(|| {
+                let free_fn = self.module.get_function("zyntax_free").unwrap_or_else(|| {
                     let ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
                     let fn_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
-                    self.module.add_function("free", fn_type, None)
+                    self.module.add_function("zyntax_free", fn_type, None)
                 });
 
                 self.builder.build_call(

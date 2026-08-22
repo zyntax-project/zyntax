@@ -59,10 +59,13 @@ use zyntax_compiler::zrtl::{
 // either (debt #2 in the wasm work) so the SM-release path is never
 // invoked there. A no-op stub keeps the link clean until wasm32 grows
 // its own allocator pair.
+// Whatever `Intrinsic::Malloc` lowers to has to be what releases this,
+// and that is the runtime's size-class pool rather than libc. The pool
+// hands a block it did not allocate to libc itself, so this stays right
+// for anything that reached here from somewhere else.
 #[cfg(not(target_arch = "wasm32"))]
-extern "C" {
-    #[link_name = "free"]
-    fn c_free(ptr: *mut core::ffi::c_void);
+unsafe fn c_free(ptr: *mut core::ffi::c_void) {
+    unsafe { zyntax_compiler::pool_alloc::zyntax_free(ptr as *mut u8) }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -473,11 +476,10 @@ pub(crate) fn migrate_handler_states(
 /// `state` must have come from a handler constructor and must not be
 /// installed in any live frame.
 pub(crate) unsafe fn free_handler_state(state: *mut u8) {
-    unsafe extern "C" {
-        fn free(p: *mut core::ffi::c_void);
-    }
+    // Allocated by the constructor the compiler synthesises, which
+    // goes through `Intrinsic::Malloc`, so it comes back to the pool.
     if !state.is_null() {
-        unsafe { free(state as *mut core::ffi::c_void) };
+        unsafe { c_free(state as *mut core::ffi::c_void) };
     }
 }
 
@@ -908,9 +910,8 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm(resume_struct: *mut u8) {
     let prev = (*refcount_ptr).fetch_sub(1, Ordering::AcqRel);
     if prev == 1 {
         // Last reference — free the SM. The allocator is whatever
-        // `Intrinsic::Malloc` lowers to in the Cranelift backend.
-        // Today that's the platform `libc::malloc`; the matching free
-        // is `libc::free`.
+        // `Intrinsic::Malloc` lowers to in the backends, which is the
+        // runtime's size-class pool.
         c_free(r.state_machine_ptr as *mut core::ffi::c_void);
     }
 }
