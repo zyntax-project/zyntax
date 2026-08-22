@@ -169,7 +169,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             CompilerError::Backend(format!("Failed to initialise LLVM target: {}", e))
         })?;
 
-        Ok(Self {
+        let mut backend = Self {
             context,
             module_context: None,
             loaded_lib: None,
@@ -184,7 +184,17 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             engines: Vec::new(),
             compile_tier: 0,
             pending_osr_helpers: Vec::new(),
-        })
+        };
+
+        // The allocation intrinsics call into the runtime's pools. Both
+        // installers resolve anything they were not handed with
+        // `dlsym(RTLD_DEFAULT)`, which finds libc's `malloc` but not a
+        // `#[no_mangle]` symbol living in an rlib: that never reaches
+        // the executable's dynamic symbol table. Handing over the
+        // addresses is what makes them findable.
+        backend.register_symbols(&crate::pool_alloc::alloc_runtime_symbols());
+
+        Ok(backend)
     }
 
     /// Set a content-hash cache key for subsequent `compile_module`
