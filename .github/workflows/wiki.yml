@@ -108,6 +108,10 @@ jobs:
           - fib_no_pure_call_pre
           - inlined_call
           - free_function_call
+          # The allocator row. Nothing else in the suite allocates per
+          # iteration, so without it no published number covers what
+          # malloc and free cost.
+          - binary_trees
           # Tensor kernels at real shapes: each isolates one shape the
           # vectorizer either matches or declines.
           - tensor_add
