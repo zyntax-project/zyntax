@@ -4041,16 +4041,22 @@ impl<'ctx> LLVMBackend<'ctx> {
                     call_site.set_tail_call(true);
                 }
 
-                // Return value (or void)
+                // Return value (or void).
+                //
+                // A bound result on a void callee is not a disagreement
+                // worth refusing. A function written without a return
+                // type lowers its definition to `-> void`, while its
+                // call sites take the `HirType::I64` that `ssa.rs`
+                // assumes for an unannotated callee, so the two differ
+                // by construction rather than by mistake. Nothing can
+                // read the value either, because the callee returns
+                // none. Cranelift has always answered this with a
+                // stand-in; refusing it here disabled the whole LLVM
+                // tier for any program with a void function, silently,
+                // and published Cranelift's numbers under LLVM's name.
                 match call_site.try_as_basic_value() {
                     ValueKind::Basic(val) => Ok(val),
-                    ValueKind::Instruction(_) if !expects_value => {
-                        Ok(self.context.i32_type().get_undef().into())
-                    }
-                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen(format!(
-                        "call to {} returns void but its result is bound",
-                        function.get_name().to_string_lossy()
-                    ))),
+                    ValueKind::Instruction(_) => Ok(self.context.i32_type().get_undef().into()),
                 }
             }
             HirCallable::Indirect(func_ptr_id) => {
@@ -4157,12 +4163,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Return value (or void)
                 match call_site.try_as_basic_value() {
                     ValueKind::Basic(val) => Ok(val),
-                    ValueKind::Instruction(_) if !expects_value => {
-                        Ok(self.context.i32_type().get_undef().into())
-                    }
-                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen(
-                        "indirect call returns void but its result is bound".to_string(),
-                    )),
+                    // Same reasoning as the direct call above.
+                    ValueKind::Instruction(_) => Ok(self.context.i32_type().get_undef().into()),
                 }
             }
             HirCallable::Intrinsic(intrinsic) => self.compile_intrinsic(*intrinsic, args),
