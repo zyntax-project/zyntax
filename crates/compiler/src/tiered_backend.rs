@@ -285,6 +285,17 @@ pub struct TieredBackend {
     /// The module the compiled code came from. A reload diffs the
     /// edited module against this and replaces it piecewise.
     current_module: Option<HirModule>,
+    /// Every module loaded so far, in the order they arrived.
+    ///
+    /// A rebuild throws the JIT module away and with it the address of
+    /// every global, and only the modules recompiled afterwards get
+    /// theirs back. Restoring the newest alone leaves each earlier one
+    /// holding compiled code whose globals cannot be found, so a
+    /// handler declared in the first file of a program stops being
+    /// installable as soon as the second file loads. A module stays
+    /// usable for as long as it is loaded, whatever loads after it, and
+    /// that needs all of them kept and all of them restored.
+    loaded: Vec<HirModule>,
     /// Undo record for the most recent applied reload, consumed by
     /// [`Self::rollback_last_reload`].
     last_undo: Option<ReloadUndo>,
@@ -373,6 +384,7 @@ impl TieredBackend {
             _llvm_context,
             functions: HashMap::new(),
             current_module: None,
+            loaded: Vec::new(),
             last_undo: None,
             state_migration: crate::reload::StateMigration::default(),
             profile_data: ProfileData::new(config.profile_config.clone()),
@@ -410,9 +422,14 @@ impl TieredBackend {
             }
         })?;
         if rebuilt {
-            if let Some(previous) = self.current_module.clone() {
-                self.cranelift
-                    .with_lock(|be| be.compile_module(&previous))?;
+            // All of them, in the order they were loaded, because the
+            // rebuild cleared the addresses of all of them. Restoring
+            // only the newest satisfies the requirement stated above
+            // for one module and leaves every other one with code it
+            // cannot resolve its own globals from.
+            let previously: Vec<HirModule> = self.loaded.clone();
+            for earlier in &previously {
+                self.cranelift.with_lock(|be| be.compile_module(earlier))?;
             }
         }
 
@@ -430,6 +447,14 @@ impl TieredBackend {
             .with_lock(|be| be.set_bead_ids(bead_ids.clone()));
 
         self.cranelift.with_lock(|be| be.compile_module(&module))?;
+
+        // Recorded before it becomes `current_module`, so a later
+        // rebuild can put every one of them back. Kept by identity
+        // rather than by name: a host loading several files gives them
+        // all the same module name, so matching on that discarded every
+        // earlier file and restored only the newest, which is the
+        // behaviour this list exists to fix.
+        self.loaded.push(module.clone());
 
         self.current_module = Some(module.clone());
 
@@ -1297,6 +1322,27 @@ impl TieredBackend {
     /// `(effect_id, effect_name)`.
     ///
 
+    /// Rebuild the JIT with everything registered so far, and put every
+    /// loaded module back.
+    ///
+    /// A rebuild replaces the module object, so the address of every
+    /// function and every global goes with it. Whatever is not
+    /// recompiled afterwards keeps code that cannot resolve its own
+    /// globals, which for a handler means its op table has no address
+    /// and it can no longer be installed. Restoring them all is what
+    /// makes a rebuild something a host can do between files rather
+    /// than something that quietly unloads everything it already
+    /// loaded.
+    pub fn rebuild_and_restore(&mut self) -> CompilerResult<()> {
+        self.cranelift
+            .with_lock(|be| be.rebuild_with_accumulated_symbols())?;
+        let previously: Vec<HirModule> = self.loaded.clone();
+        for earlier in &previously {
+            self.cranelift.with_lock(|be| be.compile_module(earlier))?;
+        }
+        Ok(())
+    }
+
     /// Every module whose functions are still installed, the most
     /// recently loaded first.
     ///
@@ -1309,6 +1355,13 @@ impl TieredBackend {
         if let Some(m) = self.current_module.as_ref() {
             out.push(m);
         }
+        for m in &self.loaded {
+            if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
+                out.push(m);
+            }
+        }
+        // A function entry's own module, for anything compiled through
+        // a path that did not record one.
         for entry in self.functions.values() {
             let m = entry.module.as_ref();
             if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
@@ -1450,7 +1503,17 @@ impl TieredBackend {
             if !seen.insert((id, handled.clone())) {
                 continue;
             }
-            let Some(func) = module.functions.get(&id) else {
+            // Looked for in every loaded module, not in the one the
+            // walk started from. A call into another module is where a
+            // program of more than one file spends most of its edges,
+            // and resolving it against a single module ended the walk
+            // there without saying so: the answer came back empty and
+            // read as nothing to report.
+            let Some(func) = self
+                .loaded_modules()
+                .into_iter()
+                .find_map(|m| m.functions.get(&id))
+            else {
                 continue;
             };
             let name = func.name.resolve_global().unwrap_or_default();

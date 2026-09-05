@@ -1156,8 +1156,14 @@ impl TieredRuntime {
     /// that declares those externs. This mirrors
     /// [`ZyntaxRuntime::finalize_runtime_symbols`].
     pub fn finalize_runtime_symbols(&mut self) -> RuntimeResult<()> {
+        // Rebuilding is only half of it. The rebuild throws the JIT
+        // module away, and every module already loaded keeps its
+        // compiled code while losing the address of every global it
+        // has. A handler's op table is one of those, so a host calling
+        // this between files unloaded the handlers of every file before
+        // the last without being told.
         self.backend
-            .rebuild_with_accumulated_symbols()
+            .rebuild_and_restore()
             .map_err(|error| RuntimeError::Execution(error.to_string()))
     }
 
@@ -1709,12 +1715,20 @@ impl TieredRuntime {
         instance: HandlerInstance,
     ) -> RuntimeResult<HandlerFrame> {
         let e = self.handler_instance_entry(instance)?;
-        let (effect_id, state, table, async_mask) = (
+        let (handler, effect_id, state, async_mask) = (
+            e.handler.clone(),
             e.effect_id,
             e.state as *mut u8,
-            e.table as *mut u8,
             e.async_mask,
         );
+        // Resolved here rather than read from the instance. An address
+        // recorded when the instance was created stops being the table
+        // as soon as a rebuild moves it, and a rebuild is what loading
+        // the next file of a program does, so a cached one made
+        // instance creation legal at one moment rather than independent
+        // of load order. The state is the caller's own region and does
+        // not move.
+        let table = self.handler_shape(&handler)?.2;
         let frame = crate::effect_runtime::__zyntax_effect_push_handler(
             effect_id, state, table, async_mask,
         );
@@ -1740,12 +1754,20 @@ impl TieredRuntime {
             hf.ptr as *mut u8
         };
         let e = self.handler_instance_entry(instance)?;
-        let (effect_id, state, table, async_mask) = (
+        let (handler, effect_id, state, async_mask) = (
+            e.handler.clone(),
             e.effect_id,
             e.state as *mut u8,
-            e.table as *mut u8,
             e.async_mask,
         );
+        // Resolved here rather than read from the instance. An address
+        // recorded when the instance was created stops being the table
+        // as soon as a rebuild moves it, and a rebuild is what loading
+        // the next file of a program does, so a cached one made
+        // instance creation legal at one moment rather than independent
+        // of load order. The state is the caller's own region and does
+        // not move.
+        let table = self.handler_shape(&handler)?.2;
         crate::effect_runtime::fiber_bind_handler(ptr, effect_id, state, table, async_mask);
         if let Some(e) = self.handler_instances.get_mut(&instance.0) {
             e.installs += 1;
