@@ -5034,14 +5034,29 @@ impl CraneliftBackend {
                                     // op_index = position of this op in the
                                     // effect's operation list (stable order,
                                     // shared with op-table construction).
-                                    let op_index = hir_module
+                                    //
+                                    // Refused rather than defaulted. Answering
+                                    // zero for an operation that could not be
+                                    // found sends the perform to the effect's
+                                    // first operation, which has its own
+                                    // signature and its own meaning, and
+                                    // nothing downstream can tell that it was
+                                    // not the one written.
+                                    let Some(op_index) = hir_module
                                         .effects
                                         .get(effect_id)
                                         .and_then(|e| {
                                             e.operations.iter().position(|o| o.name == *op_name)
                                         })
-                                        .unwrap_or(0)
-                                        as i64;
+                                        .map(|i| i as i64)
+                                    else {
+                                        return Err(CompilerError::CodeGen(format!(
+                                            "effect operation `{}` is performed here but is not \
+                                             one of the operations its effect declares, so there \
+                                             is no handler slot to dispatch to",
+                                            op_name.resolve_global().unwrap_or_default()
+                                        )));
+                                    };
                                     let effect_u64 =
                                         builder.ins().iconst(types::I64, effect_id.as_u32() as i64);
                                     let op_index_val = builder.ins().iconst(types::I64, op_index);

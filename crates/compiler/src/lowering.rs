@@ -740,7 +740,25 @@ impl AstLowering for LoweringContext {
         // and nothing reaches is never built.
         phase.mark();
         self.wanted = self.initial_wanted(program);
+
+        // Effects first, whatever order the declarations arrive in. A
+        // function that declares one resolves the operations it may
+        // perform against the effects lowered so far, so an effect
+        // lowered after it leaves those calls looking like calls to
+        // functions that do not exist. An import appends what it
+        // brought to the end of the program, which puts every imported
+        // effect after every function that could name it, so a perform
+        // of an imported effect never resolved.
         for (index, decl) in program.declarations.iter().enumerate() {
+            if matches!(decl.node, TypedDeclaration::Effect(_)) {
+                self.current_decl = index;
+                self.lower_declaration(decl)?;
+            }
+        }
+        for (index, decl) in program.declarations.iter().enumerate() {
+            if matches!(decl.node, TypedDeclaration::Effect(_)) {
+                continue;
+            }
             self.current_decl = index;
             self.lower_declaration(decl)?;
         }
@@ -3109,10 +3127,36 @@ impl LoweringContext {
                 .map(|(id, _)| *id);
             let Some(func_id) = func_id else {
                 log::warn!(
-                    "[with] handler {} has no implementation fn for op {} — op-table entry left null",
+                    "[with] handler {} has no implementation fn for op {}, so its \
+                     op-table slot is left empty",
                     handler_name.resolve_global().unwrap_or_default(),
                     op.name.resolve_global().unwrap_or_default(),
                 );
+                // The slot is kept and left empty rather than dropped.
+                // A perform names its operation by position, counted in
+                // the effect's declaration order, and reads that slot of
+                // this table. Dropping one moves every operation after
+                // it a slot early, so the last operation of the effect
+                // reads past the end of the table and calls whatever
+                // follows it in memory. That arrives as a jump to an
+                // address that is not code, with nothing to say which
+                // operation was meant.
+                //
+                // A fresh id names no function, so the backend finds
+                // nothing to relocate and the slot keeps the zero it was
+                // defined with. A perform of a missing operation then
+                // reads null, which the perform site can see.
+                methods.push(HirVTableEntry {
+                    method_name: op.name,
+                    function_id: crate::hir::HirId::new(),
+                    signature: HirMethodSignature {
+                        name: op.name,
+                        params: op.params.iter().map(|p| p.ty.clone()).collect(),
+                        return_type: op.return_type.clone(),
+                        is_static: false,
+                        is_async: false,
+                    },
+                });
                 continue;
             };
             methods.push(HirVTableEntry {
