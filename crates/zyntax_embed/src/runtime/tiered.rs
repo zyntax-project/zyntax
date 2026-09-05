@@ -541,6 +541,33 @@ impl TieredRuntime {
         T::from_zyntax(result).map_err(RuntimeError::from)
     }
 
+    /// The stateful effect a call to `name` would perform with no frame
+    /// to supply it, or `None` when nothing is missing.
+    ///
+    /// [`TieredRuntime::call_raw`] runs this check itself and refuses
+    /// the call. A host that takes a function pointer and jumps to it
+    /// cannot be refused, because nothing is asked: the runtime lock
+    /// cannot be held across compiled code that re-enters the host, so
+    /// calling by pointer is the only route for a render path, and the
+    /// check has to be callable on its own for that route to have one.
+    ///
+    /// Reachability is followed through direct calls, so an entry point
+    /// that declares no effects is still reported when something it
+    /// calls performs one. An indirect call is not followed, and a
+    /// handler op reached by dispatch is not either, so `None` means
+    /// nothing reachable this way needs a frame rather than that the
+    /// call is safe.
+    ///
+    /// Returns the effect's id and name, which is what
+    /// [`crate::effect_runtime::has_handler_for`] wants and what an
+    /// error message needs.
+    pub fn missing_stateful_handler(&self, name: &str) -> Option<(u64, String)> {
+        self.backend
+            .stateful_effects_reached_by(name)
+            .into_iter()
+            .find(|(effect_id, _)| !crate::effect_runtime::has_handler_for(*effect_id))
+    }
+
     /// Call a function and get the raw ZyntaxValue result
     pub fn call_raw(&self, name: &str, args: &[ZyntaxValue]) -> RuntimeResult<ZyntaxValue> {
         let func_id = self
@@ -553,14 +580,16 @@ impl TieredRuntime {
         // implicit `self` that nothing supplied. Refusing the call is
         // the difference between an error the host can report and a
         // null dereference inside compiled code.
-        for (effect_id, effect_name) in self.backend.stateful_effects_of(name) {
-            if !crate::effect_runtime::has_handler_for(effect_id) {
-                return Err(RuntimeError::Execution(format!(
-                    "cannot call `{name}`: it uses effect `{effect_name}`, and no handler for \
-                     `{effect_name}` is active on this thread. Handlers for `{effect_name}` keep \
-                     their own state, so one has to be active around the call"
-                )));
-            }
+        // Reached rather than declared. The entry point declaring
+        // nothing is exactly the case that used to get through: the
+        // perform that had no frame was two frames further down, in a
+        // function this check never looked at.
+        if let Some((_, effect_name)) = self.missing_stateful_handler(name) {
+            return Err(RuntimeError::Execution(format!(
+                "cannot call `{name}`: it reaches a perform of effect `{effect_name}`, and no \
+                 handler for `{effect_name}` is active on this thread. Handlers for \
+                 `{effect_name}` keep their own state, so one has to be active around the call"
+            )));
         }
 
         // Record the call for profiling

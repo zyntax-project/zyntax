@@ -301,6 +301,25 @@ pub struct TieredBackend {
     config: TieredConfig,
 }
 
+/// An integer constant's value, whatever width it was written at.
+///
+/// The effect an effect-push names is a constant argument, and which
+/// integer variant carries it depends on how the site was lowered.
+fn constant_as_u64(k: &crate::hir::HirConstant) -> Option<u64> {
+    use crate::hir::HirConstant as C;
+    match k {
+        C::I8(v) => Some(*v as u64),
+        C::I16(v) => Some(*v as u64),
+        C::I32(v) => Some(*v as u64),
+        C::I64(v) => Some(*v as u64),
+        C::U8(v) => Some(*v as u64),
+        C::U16(v) => Some(*v as u64),
+        C::U32(v) => Some(*v as u64),
+        C::U64(v) => Some(*v),
+        _ => None,
+    }
+}
+
 impl TieredBackend {
     /// Build the tiered backend.
     pub fn new(config: TieredConfig) -> CompilerResult<Self> {
@@ -1289,6 +1308,8 @@ impl TieredBackend {
     /// handler for them itself before calling. Walking into callees
     /// would refuse a function whose body opens a handler scope around
     /// the performs it makes, which is the ordinary way to use one.
+    /// [`TieredBackend::stateful_effects_reached_by`] answers the other
+    /// question, for a caller that wants it.
     ///
     /// Empty for a function that declares no effects, or whose effects
     /// are all handled by handlers that keep no state, both of which
@@ -1327,6 +1348,130 @@ impl TieredBackend {
             let id = eid.as_u32() as u64;
             if stateful && !out.iter().any(|(existing, _)| *existing == id) {
                 out.push((id, name));
+            }
+        }
+        out
+    }
+
+    /// Stateful effects reached from `function`, its callees included.
+    ///
+    /// [`TieredBackend::stateful_effects_of`] reports the contract a
+    /// function states. This reports what a call to it can end up
+    /// performing, which is a different question and the one a host has
+    /// when it is about to jump into compiled code: an entry point that
+    /// declares nothing may still call something that performs, two or
+    /// more frames down, and refusing that call is the difference
+    /// between a message and a jump into whatever the handler stack had
+    /// no frame to supply.
+    ///
+    /// A function that establishes a handler for an effect answers for
+    /// it, so the walk stops carrying that effect past it. Without
+    /// that, the ordinary shape of opening a scope around a perform
+    /// would be reported as unhandled.
+    ///
+    /// Reachability is followed through direct calls only. An indirect
+    /// call, and a handler op reached by dispatch, are not followed:
+    /// what they land on is a runtime question. So an empty answer is
+    /// "nothing reachable this way needs a frame" rather than a promise
+    /// that the call is safe.
+    pub fn stateful_effects_reached_by(&self, function: &str) -> Vec<(u64, String)> {
+        let Some(module) = self.current_module.as_ref() else {
+            return Vec::new();
+        };
+        let by_name = |n: &str| {
+            module
+                .functions
+                .iter()
+                .find(|(_, f)| f.name.resolve_global().as_deref() == Some(n))
+                .map(|(id, f)| (*id, f))
+        };
+        let Some((start, _)) = by_name(function) else {
+            return Vec::new();
+        };
+
+        let mut out: Vec<(u64, String)> = Vec::new();
+        // Visited with the set of effects an ancestor had already
+        // established, because reaching the same function under a
+        // handler and without one are different questions.
+        let mut seen: std::collections::HashSet<(HirId, Vec<u64>)> =
+            std::collections::HashSet::new();
+        let mut queue: Vec<(HirId, Vec<u64>)> = vec![(start, Vec::new())];
+        while let Some((id, handled)) = queue.pop() {
+            if !seen.insert((id, handled.clone())) {
+                continue;
+            }
+            let Some(func) = module.functions.get(&id) else {
+                continue;
+            };
+            let name = func.name.resolve_global().unwrap_or_default();
+
+            // A handler this function opens covers what it calls. The
+            // scope is regional and this is not, so a perform outside
+            // the scope in the same function is missed. That is the
+            // direction to be wrong in: the alternative reports the
+            // ordinary shape, a scope opened around the performs it is
+            // there for, as an error.
+            let mut handled = handled;
+            for eid in self.effects_handled_by(func) {
+                if !handled.contains(&eid) {
+                    handled.push(eid);
+                }
+            }
+            handled.sort_unstable();
+
+            for (eid, ename) in self.stateful_effects_of(&name) {
+                if handled.contains(&eid) {
+                    continue;
+                }
+                if !out.iter().any(|(existing, _)| *existing == eid) {
+                    out.push((eid, ename));
+                }
+            }
+            for block in func.blocks.values() {
+                for inst in &block.instructions {
+                    if let crate::hir::HirInstruction::Call {
+                        callee: crate::hir::HirCallable::Function(callee),
+                        ..
+                    } = inst
+                    {
+                        queue.push((*callee, handled.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The effects `func` pushes a handler frame for.
+    ///
+    /// A `with` scope lowers to a push of the handler's op table, so a
+    /// function that opens one has supplied a frame its callees can
+    /// find and does not need one from its own caller.
+    fn effects_handled_by(&self, func: &crate::hir::HirFunction) -> Vec<u64> {
+        let mut out = Vec::new();
+        for block in func.blocks.values() {
+            for inst in &block.instructions {
+                let crate::hir::HirInstruction::Call { callee, args, .. } = inst else {
+                    continue;
+                };
+                let crate::hir::HirCallable::Symbol(sym) = callee else {
+                    continue;
+                };
+                if sym != "__zyntax_effect_push_handler" {
+                    continue;
+                }
+                // The pushed effect is the first argument, a constant
+                // the `with` lowering wrote.
+                let Some(first) = args.first() else { continue };
+                if let Some(crate::hir::HirValueKind::Constant(k)) =
+                    func.values.get(first).map(|v| &v.kind)
+                {
+                    if let Some(eid) = constant_as_u64(k) {
+                        if !out.contains(&eid) {
+                            out.push(eid);
+                        }
+                    }
+                }
             }
         }
         out
