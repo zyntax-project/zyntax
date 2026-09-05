@@ -1296,6 +1296,56 @@ impl TieredBackend {
     /// The effects `function` declares whose handlers carry state, as
     /// `(effect_id, effect_name)`.
     ///
+
+    /// Every module whose functions are still installed, the most
+    /// recently loaded first.
+    ///
+    /// `current_module` is the last one, and a host that loads several
+    /// keeps calling into all of them. Anything asked by name has to be
+    /// looked for in all of them or it is missing for every module but
+    /// the newest.
+    fn loaded_modules(&self) -> Vec<&HirModule> {
+        let mut out: Vec<&HirModule> = Vec::new();
+        if let Some(m) = self.current_module.as_ref() {
+            out.push(m);
+        }
+        for entry in self.functions.values() {
+            let m = entry.module.as_ref();
+            if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// The module a function was compiled as part of.
+    ///
+    /// `current_module` is the last one loaded, not the only one. A host
+    /// that loads several modules leaves every function from the earlier
+    /// ones outside it, and a question asked about such a function
+    /// against `current_module` alone finds no function rather than
+    /// finding no effects. The two answers are the same shape and mean
+    /// opposite things, so a check reading the first as the second
+    /// reports that nothing is needed for exactly the functions it
+    /// cannot see.
+    ///
+    /// Each compiled function keeps the module it came from, so the
+    /// function's own context is the one to ask.
+    fn module_holding(&self, function: &str) -> Option<&HirModule> {
+        if let Some(m) = self.current_module.as_ref() {
+            if m.functions
+                .values()
+                .any(|f| f.name.resolve_global().as_deref() == Some(function))
+            {
+                return Some(m);
+            }
+        }
+        self.functions
+            .values()
+            .find(|e| e.function.name.resolve_global().as_deref() == Some(function))
+            .map(|e| e.module.as_ref())
+    }
+
     /// A perform resolves its handler op statically when nothing is in
     /// scope, and for a handler that keeps state that op reads an
     /// implicit `self` the handler stack has no frame to supply. A
@@ -1315,7 +1365,7 @@ impl TieredBackend {
     /// are all handled by handlers that keep no state, both of which
     /// are fine to call with nothing in scope.
     pub fn stateful_effects_of(&self, function: &str) -> Vec<(u64, String)> {
-        let Some(module) = self.current_module.as_ref() else {
+        let Some(module) = self.module_holding(function) else {
             return Vec::new();
         };
         let Some(func) = module
@@ -1375,7 +1425,7 @@ impl TieredBackend {
     /// "nothing reachable this way needs a frame" rather than a promise
     /// that the call is safe.
     pub fn stateful_effects_reached_by(&self, function: &str) -> Vec<(u64, String)> {
-        let Some(module) = self.current_module.as_ref() else {
+        let Some(module) = self.module_holding(function) else {
             return Vec::new();
         };
         let by_name = |n: &str| {
@@ -1481,30 +1531,41 @@ impl TieredBackend {
         &self,
         handler: &str,
     ) -> Result<(String, u64, usize, u64, bool), String> {
-        let module = self
-            .current_module
-            .as_ref()
-            .ok_or_else(|| "no module has been compiled yet".to_string())?;
+        let modules = self.loaded_modules();
+        if modules.is_empty() {
+            return Err("no module has been compiled yet".to_string());
+        }
         let suffix = format!("::{handler}");
-        let mut matched: Option<(&crate::hir::HirEffectHandler, String)> = None;
-        for h in module.handlers.values() {
-            let Some(name) = h.name.resolve_global() else {
-                continue;
-            };
-            if name == handler {
-                matched = Some((h, name));
-                break;
-            }
-            if name.ends_with(&suffix) {
-                if let Some((_, first)) = &matched {
-                    return Err(format!(
-                        "`{handler}` is ambiguous: `{first}` and `{name}` both match; qualify it"
-                    ));
+        // The module it was found in comes with it: the effect it names
+        // and its op-table global are that module's, not the newest
+        // one's.
+        let mut matched: Option<(&crate::hir::HirEffectHandler, String, &HirModule)> = None;
+        // Across every loaded module, not just the newest. A handler
+        // declared in one module and pushed after another has loaded
+        // was reported as absent from the program that declares it.
+        'search: for module in &modules {
+            for h in module.handlers.values() {
+                let Some(name) = h.name.resolve_global() else {
+                    continue;
+                };
+                if name == handler {
+                    matched = Some((h, name, module));
+                    break 'search;
                 }
-                matched = Some((h, name));
+                if name.ends_with(&suffix) {
+                    if let Some((_, first, _)) = &matched {
+                        if first != &name {
+                            return Err(format!(
+                                "`{handler}` is ambiguous: `{first}` and `{name}` both match; \
+                                 qualify it"
+                            ));
+                        }
+                    }
+                    matched = Some((h, name, module));
+                }
             }
         }
-        let (h, resolved) =
+        let (h, resolved, module) =
             matched.ok_or_else(|| format!("no handler named `{handler}` in the loaded program"))?;
         let effect = module.effects.get(&h.effect_id).ok_or_else(|| {
             format!(
