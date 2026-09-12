@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789250150,"nonce":"5JTZMY1ZiJiqh5chN5aQi3W9hjw=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789250168,"nonce":"Z0txfteSOr96hEer3unNeCYi1MQ=","message":"Types and frontend landed in 08aaa4d and 90144c8; the host-based pointer_size in lowering.rs and the list header's i64 data field remain.","files":null}]}
