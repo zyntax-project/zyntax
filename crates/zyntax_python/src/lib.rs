@@ -23,6 +23,7 @@ use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction};
 use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedNode, TypedProgram, Visibility};
 
+mod format;
 mod lower;
 mod types;
 

@@ -20,5 +20,3 @@ scope/closures.py                            e9d2d8b
 scope/global_statement.py                    e9d2d8b
 scope/nonlocal.py                            e9d2d8b
 set/basics.py                                4ec2c7a
-string/formatting.py                         74c2742
-tuple/basics.py                              be231dc

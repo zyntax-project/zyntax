@@ -12,6 +12,7 @@
 
 pub mod build;
 mod dynamic;
+mod format;
 mod io;
 mod lists;
 mod strings;
@@ -109,6 +110,7 @@ pub fn library(policy: &Policy) -> Library {
     let mut declarations = Vec::new();
     declarations.extend(io::declarations());
     declarations.extend(strings::declarations(policy));
+    declarations.extend(format::declarations());
     declarations.extend(dynamic::declarations(policy, list_type));
     declarations.extend(lists::declarations(policy, list_type));
     Library {

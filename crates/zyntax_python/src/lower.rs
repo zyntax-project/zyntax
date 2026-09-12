@@ -23,7 +23,7 @@ use zyntax_typed_ast::{
     TypedNode, UnaryOp, Visibility,
 };
 
-type Node = TypedNode<TypedExpression>;
+pub(crate) type Node = TypedNode<TypedExpression>;
 type Stmt = TypedNode<TypedStatement>;
 
 thread_local! {
@@ -88,15 +88,15 @@ pub(crate) struct Val {
     pub(crate) ty: Ty,
 }
 
-fn node(x: TypedExpression, ty: Ty, span: Span) -> Node {
+pub(crate) fn node(x: TypedExpression, ty: Ty, span: Span) -> Node {
     TypedNode::new(x, ir(ty), span)
 }
 
-fn var(name: InternedString, ty: Ty, span: Span) -> Node {
+pub(crate) fn var(name: InternedString, ty: Ty, span: Span) -> Node {
     node(TypedExpression::Variable(name), ty, span)
 }
 
-fn int_lit(v: i64, span: Span) -> Node {
+pub(crate) fn int_lit(v: i64, span: Span) -> Node {
     node(
         TypedExpression::Literal(TypedLiteral::Integer(v as i128)),
         Ty::Int,
@@ -104,7 +104,7 @@ fn int_lit(v: i64, span: Span) -> Node {
     )
 }
 
-fn str_lit(s: &str, span: Span) -> Node {
+pub(crate) fn str_lit(s: &str, span: Span) -> Node {
     node(
         TypedExpression::Literal(TypedLiteral::String(intern(s))),
         Ty::Str,
@@ -112,7 +112,7 @@ fn str_lit(s: &str, span: Span) -> Node {
     )
 }
 
-fn binary(op: BinaryOp, left: Node, right: Node, ty: Ty, span: Span) -> Node {
+pub(crate) fn binary(op: BinaryOp, left: Node, right: Node, ty: Ty, span: Span) -> Node {
     node(
         TypedExpression::Binary(TypedBinary {
             op,
@@ -124,7 +124,7 @@ fn binary(op: BinaryOp, left: Node, right: Node, ty: Ty, span: Span) -> Node {
     )
 }
 
-fn call(name: &str, args: Vec<Node>, ty: Ty, span: Span) -> Node {
+pub(crate) fn call(name: &str, args: Vec<Node>, ty: Ty, span: Span) -> Node {
     node(
         TypedExpression::Call(TypedCall {
             callee: Box::new(node(
@@ -384,7 +384,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// `str(v)`.
-    fn str_of(&mut self, v: Val) -> Node {
+    pub(crate) fn str_of(&mut self, v: Val) -> Node {
         let span = v.node.span;
         match v.ty {
             Ty::Int => call("zb_str_of_int", vec![v.node], Ty::Str, span),
@@ -399,7 +399,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// `repr(v)`.
-    fn repr_of(&mut self, v: Val) -> Node {
+    pub(crate) fn repr_of(&mut self, v: Val) -> Node {
         let span = v.node.span;
         match v.ty {
             Ty::Str => call("zb_str_repr", vec![v.node], Ty::Str, span),
@@ -1003,6 +1003,7 @@ impl<'m> Lowerer<'m> {
             }
             py::Expr::Subscript(sub) => self.subscript(sub, ty, span)?,
             py::Expr::ListComp(c) => self.list_comp(c, ty, span)?,
+            py::Expr::FString(f) => self.fstring(f, span)?,
             other => return unsupported(types::expr_kind(other), other),
         })
     }
@@ -1102,6 +1103,45 @@ impl<'m> Lowerer<'m> {
                 }
                 _ => {}
             }
+        }
+        // Sequences concatenate and repeat.
+        match (op, left.ty, right.ty) {
+            (py::Operator::Add, Ty::List(e), Ty::List(_)) if ty == left.ty => {
+                return Ok(Val {
+                    node: call(&list_fn("concat", e), vec![left.node, right.node], ty, span),
+                    ty,
+                });
+            }
+            (py::Operator::Add, Ty::Tuple, Ty::Tuple) => {
+                return Ok(Val {
+                    node: call(
+                        "zb_list_concat_any",
+                        vec![left.node, right.node],
+                        Ty::Tuple,
+                        span,
+                    ),
+                    ty: Ty::Tuple,
+                });
+            }
+            (py::Operator::Mult, Ty::List(_) | Ty::Tuple, Ty::Int | Ty::Bool)
+            | (py::Operator::Mult, Ty::Int | Ty::Bool, Ty::List(_) | Ty::Tuple) => {
+                let (seq, times) = if matches!(left.ty, Ty::List(_) | Ty::Tuple) {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let elem = match seq.ty {
+                    Ty::List(e) => e,
+                    _ => Elem::Object,
+                };
+                let n = self.coerce(times, Ty::Int);
+                let seq_ty = seq.ty;
+                return Ok(Val {
+                    node: call(&list_fn("repeat", elem), vec![seq.node, n], seq_ty, span),
+                    ty: seq_ty,
+                });
+            }
+            _ => {}
         }
         if ty == Ty::Object {
             // At least one side is dynamic: the runtime picks the
