@@ -128,12 +128,23 @@ impl ModuleFacts {
     fn build(module: &HirModule) -> Self {
         let mut borrowed_params = std::collections::HashMap::new();
         for (key, func) in module.functions.iter() {
+            // What a host does with a pointer is unknown here, so an
+            // extern borrows only when its symbol is one the pass knows
+            // reads without keeping; any other extern is an escape.
+            let extern_borrows = func.is_external
+                && func
+                    .link_name
+                    .as_deref()
+                    .is_some_and(|name| symbol_role(name) == Some(SymbolRole::Borrows));
             borrowed_params.insert(
                 *key,
                 func.signature
                     .params
                     .iter()
                     .map(|p| {
+                        if func.is_external {
+                            return extern_borrows;
+                        }
                         matches!(
                             p.ownership,
                             crate::hir::ParamOwnership::Borrowed
@@ -500,7 +511,9 @@ pub(crate) enum SymbolRole {
 pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
     match name {
         "zyntax_box_bool" | "zyntax_box_f32" | "zyntax_box_f64" | "zyntax_box_i32"
-        | "zyntax_box_i64" | "zyntax_box_opaque" => Some(SymbolRole::Allocates("zyntax_box_free")),
+        | "zyntax_box_i64" | "zyntax_box_str" | "zyntax_box_opaque" => {
+            Some(SymbolRole::Allocates("zyntax_box_free"))
+        }
         "zyntax_box_get_bool"
         | "zyntax_box_get_f32"
         | "zyntax_box_get_f64"
@@ -508,6 +521,14 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         | "zyntax_box_get_i64"
         | "zyntax_box_get_opaque"
         | "zyntax_box_get_tag" => Some(SymbolRole::Borrows),
+        // The IO, string and math plugins read their arguments and hand
+        // back fresh storage; none keeps a pointer it was given.
+        _ if name.starts_with("$IO$")
+            || name.starts_with("$String$")
+            || name.starts_with("$Math$") =>
+        {
+            Some(SymbolRole::Borrows)
+        }
         _ => None,
     }
 }
