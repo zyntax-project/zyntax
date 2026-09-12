@@ -75,11 +75,13 @@ const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
 };
 
 /// Give a runtime what a compiled Python program links against: the IO
-/// and string plugins the library's primitives come from. A host calls
-/// this once before compiling a program.
+/// and string plugins the library's primitives come from, and the name
+/// a program is entered through, so only the library the program
+/// reaches is built. A host calls this once before compiling a program.
 pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {
+    runtime.declare_entry_points([ENTRY]);
     runtime.register_static_plugins([zrtl_io::static_plugin(), zrtl_string::static_plugin()])
 }
 

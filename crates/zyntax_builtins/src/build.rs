@@ -23,6 +23,12 @@ pub type Decl = TypedNode<TypedDeclaration>;
 
 pub const SPAN: Span = Span { start: 0, end: 0 };
 
+/// The module every declaration here is attributed to. A frontend's own
+/// declarations carry none, which is how lowering and codegen tell what
+/// a program wrote from what the library brought and build the latter
+/// only where the former reaches it.
+pub const MODULE: &str = "builtins";
+
 pub fn i64() -> Type {
     Type::Primitive(PrimitiveType::I64)
 }
@@ -499,7 +505,7 @@ pub fn define(name: &str, params: &[&Local], ret_ty: Type, body: Vec<Stmt>) -> D
             is_external: false,
             calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
             link_name: None,
-            module: None,
+            module: Some(intern(MODULE)),
         }),
         ret_ty,
         SPAN,
@@ -531,7 +537,7 @@ pub fn extern_fn(name: &str, params: &[(&str, Type)], ret_ty: Type, symbol: Opti
             is_external: true,
             calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
             link_name: symbol.map(intern),
-            module: None,
+            module: Some(intern(MODULE)),
         }),
         ret_ty,
         SPAN,
