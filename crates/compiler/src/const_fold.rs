@@ -166,7 +166,14 @@ fn try_fold_inst(
             let l = constant_of(*left, values)?;
             let r = constant_of(*right, values)?;
             let folded = fold_binary(*op, l, r, ty)?;
-            Some((*result, folded, ty.clone()))
+            // `ty` is the type the operation is performed at, which for a
+            // comparison is the operand type; the value's own type is the
+            // result's.
+            let result_ty = match folded {
+                HirConstant::Bool(_) => HirType::Bool,
+                _ => ty.clone(),
+            };
+            Some((*result, folded, result_ty))
         }
         HirInstruction::Unary {
             op,
