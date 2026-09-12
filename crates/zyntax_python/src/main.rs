@@ -38,18 +38,8 @@ fn main() -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    // The IO plugin, for `print`. Looked for beside the workspace's
-    // plugin build, or where ZYPY_PLUGINS says.
-    let plugins = std::env::var("ZYPY_PLUGINS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/target/zrtl")
-        });
-    if let Err(e) = rt.load_plugin(plugins.join("zrtl_io.zrtl")) {
-        eprintln!(
-            "zypy: cannot load the IO plugin from {}: {e}",
-            plugins.display()
-        );
+    if let Err(e) = zyntax_python::register_runtime(&mut rt) {
+        eprintln!("zypy: runtime: {e}");
         return ExitCode::from(4);
     }
     if let Err(e) = rt.compile_typed_program(program) {

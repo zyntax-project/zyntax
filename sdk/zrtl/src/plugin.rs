@@ -255,6 +255,46 @@ macro_rules! zrtl_symbol_sig {
             &SIG as *const $crate::ZrtlSymbolSig,
         )
     }};
+    // All-dynamic parameters with a scalar return
+    ($name:expr, $func:ident, dynamic($count:expr) -> i64) => {{
+        static SIG: $crate::ZrtlSymbolSig = $crate::ZrtlSymbolSig {
+            param_count: $count,
+            flags: $crate::ZrtlSigFlags::ALL_DYNAMIC,
+            return_type: $crate::TypeTag::I64,
+            params: [$crate::TypeTag::DYNAMIC_BOX; $crate::MAX_PARAMS],
+        };
+        $crate::ZrtlSymbol::with_sig(
+            concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char,
+            $func as *const u8,
+            &SIG as *const $crate::ZrtlSymbolSig,
+        )
+    }};
+    ($name:expr, $func:ident, dynamic($count:expr) -> f64) => {{
+        static SIG: $crate::ZrtlSymbolSig = $crate::ZrtlSymbolSig {
+            param_count: $count,
+            flags: $crate::ZrtlSigFlags::ALL_DYNAMIC,
+            return_type: $crate::TypeTag::F64,
+            params: [$crate::TypeTag::DYNAMIC_BOX; $crate::MAX_PARAMS],
+        };
+        $crate::ZrtlSymbol::with_sig(
+            concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char,
+            $func as *const u8,
+            &SIG as *const $crate::ZrtlSymbolSig,
+        )
+    }};
+    ($name:expr, $func:ident, dynamic($count:expr) -> bool) => {{
+        static SIG: $crate::ZrtlSymbolSig = $crate::ZrtlSymbolSig {
+            param_count: $count,
+            flags: $crate::ZrtlSigFlags::ALL_DYNAMIC,
+            return_type: $crate::TypeTag::BOOL,
+            params: [$crate::TypeTag::DYNAMIC_BOX; $crate::MAX_PARAMS],
+        };
+        $crate::ZrtlSymbol::with_sig(
+            concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char,
+            $func as *const u8,
+            &SIG as *const $crate::ZrtlSymbolSig,
+        )
+    }};
     // Function that returns opaque pointer (raw pointer to opaque type, no params)
     ($name:expr, $func:ident, () -> opaque) => {{
         static SIG: $crate::ZrtlSymbolSig = $crate::ZrtlSymbolSig {
@@ -458,6 +498,16 @@ macro_rules! __zrtl_symbol_entry {
     // All-dynamic signature with dynamic return
     ($sym_name:expr, $func:ident, dynamic($count:expr) -> dynamic) => {
         $crate::zrtl_symbol_sig!($sym_name, $func, dynamic($count) -> dynamic)
+    };
+    // All-dynamic parameters with a scalar return
+    ($sym_name:expr, $func:ident, dynamic($count:expr) -> i64) => {
+        $crate::zrtl_symbol_sig!($sym_name, $func, dynamic($count) -> i64)
+    };
+    ($sym_name:expr, $func:ident, dynamic($count:expr) -> f64) => {
+        $crate::zrtl_symbol_sig!($sym_name, $func, dynamic($count) -> f64)
+    };
+    ($sym_name:expr, $func:ident, dynamic($count:expr) -> bool) => {
+        $crate::zrtl_symbol_sig!($sym_name, $func, dynamic($count) -> bool)
     };
     // Opaque return type (no params)
     ($sym_name:expr, $func:ident, () -> opaque) => {

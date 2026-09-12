@@ -25,14 +25,16 @@ use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
-    TypedBinary, TypedBlock, TypedCall, TypedDeclaration, TypedExpression, TypedFor, TypedFunction,
-    TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedParameter, TypedPattern, TypedRange,
-    TypedStatement, TypedUnary, TypedWhile,
+    TypedBinary, TypedBlock, TypedCall, TypedCast, TypedDeclaration, TypedExpression, TypedFor,
+    TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedParameter, TypedPattern,
+    TypedRange, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
     TypedNode, TypedProgram, UnaryOp, Visibility,
 };
+
+mod runtime;
 
 /// Why a program could not be turned into a `TypedProgram`.
 #[derive(Debug, thiserror::Error)]
@@ -52,13 +54,29 @@ type Result<T> = std::result::Result<T, Error>;
 /// Python program by calling this.
 pub const ENTRY: &str = "__main__";
 
-/// Runtime symbols the frontend's builtins link to. `print` here is the
-/// no-newline half; the frontend spells Python's `print(...)` in terms
-/// of both.
-const BUILTINS: &[(&str, &str)] = &[
-    ("println", "$IO$println_dynamic"),
-    ("print", "$IO$print_dynamic"),
+/// Python's builtins: the name a program calls, the runtime symbol it
+/// links to, and what it returns. Each takes one value of any type; the
+/// runtime reads the type from the box it arrives in. `print` here is
+/// the no-newline half; the frontend spells Python's `print(...)` in
+/// terms of both.
+const BUILTINS: &[(&str, &str, PrimitiveType)] = &[
+    ("println", "$Py$println", PrimitiveType::Unit),
+    ("print", "$Py$print", PrimitiveType::Unit),
+    ("str", "$Py$str", PrimitiveType::String),
+    ("int", "$Py$int", PrimitiveType::I64),
+    ("float", "$Py$float", PrimitiveType::F64),
+    ("bool", "$Py$bool", PrimitiveType::Bool),
+    ("len", "$Py$len", PrimitiveType::I64),
 ];
+
+/// Give a runtime what a compiled Python program links against: the IO
+/// plugin for string operations and the natives behind [`BUILTINS`]. A
+/// host calls this once before compiling a program.
+pub fn register_runtime(
+    runtime: &mut zyntax_embed::TieredRuntime,
+) -> std::result::Result<(), zyntax_embed::RuntimeError> {
+    runtime.register_static_plugins([zrtl_io::static_plugin(), runtime::plugin()])
+}
 
 /// Parse Python source and rewrite it into a `TypedProgram`.
 pub fn parse_program(source: &str) -> Result<TypedProgram> {
@@ -138,9 +156,8 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
     }
 
     // Python's builtins, declared here rather than borrowed from another
-    // language's prelude: `print` is the IO plugin's dynamic print, which
-    // formats any value.
-    for (name, symbol) in BUILTINS {
+    // language's prelude.
+    for (name, symbol, returns) in BUILTINS {
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(TypedFunction {
                 name: intern(name),
@@ -158,7 +175,7 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
                     ownership: ParamOwnership::Copied,
                     span: Span::new(0, 0),
                 }],
-                return_type: prim(PrimitiveType::Unit),
+                return_type: prim(*returns),
                 body: None,
                 visibility: Visibility::Public,
                 is_async: false,
@@ -169,7 +186,7 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
                 link_name: Some(intern(symbol)),
                 module: None,
             }),
-            prim(PrimitiveType::Unit),
+            prim(*returns),
             Span::new(0, 0),
         ));
     }
@@ -205,11 +222,23 @@ fn prim(p: PrimitiveType) -> Type {
 /// a `let mut` and every later one an `Assign`.
 struct Lowerer {
     bound: Vec<InternedString>,
+    /// Hidden locals introduced so far, for naming the next one.
+    temps: usize,
 }
 
 impl Lowerer {
     fn new() -> Self {
-        Self { bound: Vec::new() }
+        Self {
+            bound: Vec::new(),
+            temps: 0,
+        }
+    }
+
+    /// A local no Python program can spell, for a value that must be
+    /// evaluated once and read more than once.
+    fn temp(&mut self) -> InternedString {
+        self.temps += 1;
+        intern(&format!("__tmp{}", self.temps))
     }
 
     fn function(&mut self, f: &py::StmtFunctionDef) -> Result<TypedFunction> {
@@ -354,22 +383,22 @@ impl Lowerer {
                     });
                 };
                 let value = self.expr(v)?;
-                self.bind(&a.target, Some(ty), value, span, out)?;
+                // An annotation is a hint, not a conversion: `x: float = 3`
+                // binds the int 3. A declared binding type would convert,
+                // so a primitive annotation is not passed on; a class name
+                // is, since it only helps resolution.
+                let ty = match ty {
+                    Type::Primitive(_) => None,
+                    other => Some(other),
+                };
+                self.bind(&a.target, ty, value, span, out)?;
             }
             py::Stmt::AugAssign(a) => {
                 // `x += e` is `x = x + e`. Read the target once as the
                 // left operand and once as the destination.
                 let target = self.expr(&a.target)?;
                 let rhs = self.expr(&a.value)?;
-                let combined = TypedNode::new(
-                    TypedExpression::Binary(TypedBinary {
-                        op: operator(a.op),
-                        left: Box::new(target.clone()),
-                        right: Box::new(rhs),
-                    }),
-                    Type::Unknown,
-                    span,
-                );
+                let combined = arithmetic(a.op, target.clone(), rhs);
                 let assign = TypedNode::new(
                     TypedExpression::Binary(TypedBinary {
                         op: BinaryOp::Assign,
@@ -532,19 +561,20 @@ impl Lowerer {
                 at: f.iter.range().start().to_usize(),
             });
         }
-        let (start, end) = match call.arguments.args.as_ref() {
-            [end] => (
-                TypedNode::new(
-                    TypedExpression::Literal(TypedLiteral::Integer(0)),
-                    prim(PrimitiveType::I64),
-                    span,
-                ),
-                self.expr(end)?,
-            ),
-            [start, end] => (self.expr(start)?, self.expr(end)?),
+        let zero = || {
+            TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::Integer(0)),
+                prim(PrimitiveType::I64),
+                span,
+            )
+        };
+        let (start, end, step) = match call.arguments.args.as_ref() {
+            [end] => (zero(), self.expr(end)?, None),
+            [start, end] => (self.expr(start)?, self.expr(end)?, None),
+            [start, end, step] => (self.expr(start)?, self.expr(end)?, Some(self.expr(step)?)),
             _ => {
                 return Err(Error::Unsupported {
-                    what: "range() with a step".into(),
+                    what: "range() with more than three arguments".into(),
                     at: f.iter.range().start().to_usize(),
                 })
             }
@@ -561,12 +591,26 @@ impl Lowerer {
                 prim(PrimitiveType::I64),
                 span_of(target),
             )),
+            // The IR's range has no step; a stepped `range(...)` is kept
+            // as the call, which the counted-loop lowering reads as well.
             iterator: Box::new(TypedNode::new(
-                TypedExpression::Range(TypedRange {
-                    start: Some(Box::new(start)),
-                    end: Some(Box::new(end)),
-                    inclusive: false,
-                }),
+                match step {
+                    None => TypedExpression::Range(TypedRange {
+                        start: Some(Box::new(start)),
+                        end: Some(Box::new(end)),
+                        inclusive: false,
+                    }),
+                    Some(step) => TypedExpression::Call(TypedCall {
+                        callee: Box::new(TypedNode::new(
+                            TypedExpression::Variable(intern("range")),
+                            Type::Unknown,
+                            span_of(&*call.func),
+                        )),
+                        positional_args: vec![start, end, step],
+                        named_args: Vec::new(),
+                        type_args: Vec::new(),
+                    }),
+                },
                 Type::Unknown,
                 span_of(&*f.iter),
             )),
@@ -680,14 +724,7 @@ impl Lowerer {
                 TypedExpression::Variable(intern(n.id.as_str())),
                 Type::Unknown,
             ),
-            py::Expr::BinOp(b) => node(
-                TypedExpression::Binary(TypedBinary {
-                    op: operator(b.op),
-                    left: Box::new(self.expr(&b.left)?),
-                    right: Box::new(self.expr(&b.right)?),
-                }),
-                Type::Unknown,
-            ),
+            py::Expr::BinOp(b) => arithmetic(b.op, self.expr(&b.left)?, self.expr(&b.right)?),
             py::Expr::UnaryOp(u) => node(
                 TypedExpression::Unary(TypedUnary {
                     op: match u.op {
@@ -700,13 +737,41 @@ impl Lowerer {
                 }),
                 Type::Unknown,
             ),
-            // `a < b < c` is `a < b and b < c`. Each operand is lowered
-            // once and the middle ones are reused on both sides, which
-            // is only right because this subset's expressions are pure.
+            // `a < b < c` is `a < b and b < c` with `b` evaluated once.
+            // A middle operand that is not a name or a literal is bound
+            // to a hidden local first, and the whole comparison becomes
+            // a block whose value is the chain.
             py::Expr::Compare(c) => {
+                let span = span_of(c);
                 let mut operands = vec![self.expr(&c.left)?];
                 for x in c.comparators.iter() {
                     operands.push(self.expr(x)?);
+                }
+                let mut bindings = Vec::new();
+                for operand in operands.iter_mut().take(c.ops.len()).skip(1) {
+                    if matches!(
+                        operand.node,
+                        TypedExpression::Variable(_) | TypedExpression::Literal(_)
+                    ) {
+                        continue;
+                    }
+                    let name = self.temp();
+                    let value = std::mem::replace(
+                        operand,
+                        TypedNode::new(TypedExpression::Variable(name), Type::Unknown, span),
+                    );
+                    operand.ty = value.ty.clone();
+                    bindings.push(TypedNode::new(
+                        TypedStatement::Let(TypedLet {
+                            name,
+                            ty: value.ty.clone(),
+                            mutability: Mutability::Immutable,
+                            initializer: Some(Box::new(value)),
+                            span,
+                        }),
+                        Type::Unknown,
+                        span,
+                    ));
                 }
                 let mut acc: Option<TypedNode<TypedExpression>> = None;
                 for (i, op) in c.ops.iter().enumerate() {
@@ -730,7 +795,21 @@ impl Lowerer {
                         ),
                     });
                 }
-                acc.expect("a comparison has at least one operator")
+                let chain = acc.expect("a comparison has at least one operator");
+                if bindings.is_empty() {
+                    chain
+                } else {
+                    let mut statements = bindings;
+                    statements.push(TypedNode::new(
+                        TypedStatement::Expression(Box::new(chain)),
+                        Type::Unknown,
+                        span,
+                    ));
+                    node(
+                        TypedExpression::Block(TypedBlock { statements, span }),
+                        prim(PrimitiveType::Bool),
+                    )
+                }
             }
             py::Expr::BoolOp(b) => {
                 let op = match b.op {
@@ -799,19 +878,50 @@ impl Lowerer {
     }
 }
 
+/// `left op right`. Python's `/` always divides as floats, so both
+/// sides are converted first; a float operand converts to itself.
+fn arithmetic(
+    op: py::Operator,
+    left: TypedNode<TypedExpression>,
+    right: TypedNode<TypedExpression>,
+) -> TypedNode<TypedExpression> {
+    let to_float = |e: TypedNode<TypedExpression>| {
+        let span = e.span;
+        TypedNode::new(
+            TypedExpression::Cast(TypedCast {
+                expr: Box::new(e),
+                target_type: prim(PrimitiveType::F64),
+            }),
+            prim(PrimitiveType::F64),
+            span,
+        )
+    };
+    let (left, right, ty) = match op {
+        py::Operator::Div => (to_float(left), to_float(right), prim(PrimitiveType::F64)),
+        _ => (left, right, Type::Unknown),
+    };
+    let span = Span::new(left.span.start, right.span.end);
+    TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: operator(op),
+            left: Box::new(left),
+            right: Box::new(right),
+        }),
+        ty,
+        span,
+    )
+}
+
 fn operator(op: py::Operator) -> BinaryOp {
     match op {
         py::Operator::Add => BinaryOp::Add,
         py::Operator::Sub => BinaryOp::Sub,
         py::Operator::Mult => BinaryOp::Mul,
         py::Operator::MatMult => BinaryOp::MatMul,
-        // Python's `/` is float division and `//` is floor division;
-        // both land on the one division the IR has, whose result type
-        // decides which it is. The distinction is owed a proper home
-        // once `int / int -> float` is enforced.
-        py::Operator::Div | py::Operator::FloorDiv => BinaryOp::Div,
-        py::Operator::Mod => BinaryOp::Rem,
-        py::Operator::Pow => BinaryOp::Mul, // placeholder until pow lands
+        py::Operator::Div => BinaryOp::Div,
+        py::Operator::FloorDiv => BinaryOp::FloorDiv,
+        py::Operator::Mod => BinaryOp::FloorRem,
+        py::Operator::Pow => BinaryOp::Pow,
         py::Operator::LShift => BinaryOp::Shl,
         py::Operator::RShift => BinaryOp::Shr,
         py::Operator::BitOr => BinaryOp::BitOr,

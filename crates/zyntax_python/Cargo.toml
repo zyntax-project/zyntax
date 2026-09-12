@@ -12,6 +12,10 @@ path = "src/main.rs"
 zyntax_typed_ast = { path = "../typed_ast" }
 zyntax_embed = { path = "../zyntax_embed" }
 zyntax_compiler = { path = "../compiler" }
+# The runtime a Python program links: the IO plugin for strings, and
+# the SDK types the natives in `runtime.rs` are written against.
+zrtl_io = { path = "../../plugins/zrtl_io", features = ["linked-into-host"] }
+zrtl = { path = "../../sdk/zrtl" }
 # Pinned exactly: the crate publishes 0.0.x and makes no semver promise.
 ruff_python_parser = "=0.0.12"
 ruff_python_ast = "=0.0.12"

@@ -12,6 +12,7 @@ use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
 fn run(source: &str, entry: &str) -> ZyntaxValue {
     let program = zyntax_python::parse_program(source).expect("should lower");
     let mut rt = TieredRuntime::new(TieredConfig::default()).expect("runtime");
+    zyntax_python::register_runtime(&mut rt).expect("runtime plugins");
     rt.compile_typed_program(program).expect("should compile");
     rt.call_raw(entry, &[]).expect("should run")
 }
