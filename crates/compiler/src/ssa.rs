@@ -12906,7 +12906,11 @@ impl SsaBuilder {
             TypedLiteral::Char(c) => HirConstant::I32(*c as i32),
             TypedLiteral::Unit => HirConstant::Struct(vec![]),
             // Null is represented as a None variant in Optional type (discriminant 1)
-            TypedLiteral::Null => HirConstant::I32(0), // null pointer / None discriminant
+            // A null of a pointer type is a pointer-wide zero.
+            TypedLiteral::Null => match target_ty {
+                HirType::Ptr(_) | HirType::I64 | HirType::U64 => HirConstant::I64(0),
+                _ => HirConstant::I32(0),
+            },
             // Undefined is used for uninitialized memory - use 0 as placeholder
             TypedLiteral::Undefined => HirConstant::I32(0), // Undefined/uninitialized
         }

@@ -482,21 +482,32 @@ fn fold_terminators(func: &mut HirFunction) -> usize {
                     true_target,
                     false_target,
                 } => match constant_of(*condition, &func.values) {
-                    Some(HirConstant::Bool(true)) => Some(HirTerminator::Branch {
-                        target: *true_target,
-                    }),
-                    Some(HirConstant::Bool(false)) => Some(HirTerminator::Branch {
-                        target: *false_target,
-                    }),
+                    Some(HirConstant::Bool(true)) => Some((*true_target, *false_target)),
+                    Some(HirConstant::Bool(false)) => Some((*false_target, *true_target)),
                     _ => None,
                 },
                 _ => None,
             }
         };
-        if let Some(t) = new_term {
+        if let Some((kept, dropped)) = new_term {
             if let Some(b) = func.blocks.get_mut(&id) {
-                b.terminator = t;
+                b.terminator = HirTerminator::Branch { target: kept };
+                if dropped != kept {
+                    b.successors.retain(|s| *s != dropped);
+                }
                 folded += 1;
+            }
+            // The edge to the other target is gone: its phis no longer
+            // receive anything from this block, and it no longer counts
+            // this block among its predecessors. Left in place, a later
+            // block merge can give the phi two values from one block.
+            if dropped != kept {
+                if let Some(target) = func.blocks.get_mut(&dropped) {
+                    for phi in &mut target.phis {
+                        phi.incoming.retain(|(_, from)| *from != id);
+                    }
+                    target.predecessors.retain(|p| *p != id);
+                }
             }
         }
     }
