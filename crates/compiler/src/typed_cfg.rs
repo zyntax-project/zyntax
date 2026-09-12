@@ -773,39 +773,20 @@ impl TypedCfgBuilder {
                         _ => None,
                     };
 
-                    // Detect `range(start, end)` or `range(start, end, step)` call patterns.
-                    let range_args = match &for_stmt.iterator.node {
-                        TypedExpression::Call(call) => {
-                            let is_range = match &call.callee.node {
-                                TypedExpression::Variable(name) => {
-                                    let mut arena = zyntax_typed_ast::arena::AstArena::new();
-                                    let range_sym = arena.intern_string("range");
-                                    *name == range_sym
-                                }
-                                _ => false,
-                            };
-                            if is_range
-                                && (call.positional_args.len() == 2
-                                    || call.positional_args.len() == 3)
-                            {
-                                Some(call.positional_args.clone())
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-
-                    if let (Some(var_name), Some(args)) = (loop_var, range_args) {
-                        // Desugar: for i in range(start, end) => C-style for loop
+                    // A counted loop, spelled either way a frontend spells
+                    // one: `range(end)`, `range(start, end)`,
+                    // `range(start, end, step)`, or the language's own
+                    // `start..end` / `start..=end`. Anything else is not
+                    // one and is refused below rather than guessed at.
+                    let counted = counted_loop_bounds(&for_stmt.iterator);
+                    if let (Some(var_name), Some(bounds)) = (loop_var, counted) {
                         let span = for_stmt.iterator.span;
-                        let start_expr = args[0].clone();
-                        let end_expr = args[1].clone();
-                        let step_expr = if args.len() == 3 {
-                            Some(args[2].clone())
-                        } else {
-                            None
-                        };
+                        let CountedLoop {
+                            start: start_expr,
+                            end: end_expr,
+                            step: step_expr,
+                            inclusive,
+                        } = bounds;
 
                         // Init: let mut i = start
                         let init_stmt = typed_node(
@@ -821,10 +802,14 @@ impl TypedCfgBuilder {
                         );
                         current_statements.push(init_stmt);
 
-                        // Condition: i < end
+                        // Condition: i < end, or i <= end for an inclusive range
                         let cond_expr = typed_node(
                             TypedExpression::Binary(zyntax_typed_ast::typed_ast::TypedBinary {
-                                op: zyntax_typed_ast::typed_ast::BinaryOp::Lt,
+                                op: if inclusive {
+                                    zyntax_typed_ast::typed_ast::BinaryOp::Le
+                                } else {
+                                    zyntax_typed_ast::typed_ast::BinaryOp::Lt
+                                },
                                 left: Box::new(typed_node(
                                     TypedExpression::Variable(var_name),
                                     start_expr.ty.clone(),
@@ -935,46 +920,19 @@ impl TypedCfgBuilder {
                         current_block_id = after_id;
                         exit_id = after_id;
                     } else {
-                        // General for-each loop (iterator protocol)
-                        // TODO: Implement general iterator desugaring
-                        // For now, emit unconditional loop (matches previous behavior)
-                        let header_id = self.new_block_id();
-                        let body_id = self.new_block_id();
-                        let after_id = self.new_block_id();
-
-                        all_blocks.push(TypedBasicBlock {
-                            id: current_block_id,
-                            label: None,
-                            statements: current_statements.clone(),
-                            terminator: TypedTerminator::Jump(header_id),
-                            pattern_check: None,
-                        });
-
-                        all_blocks.push(TypedBasicBlock {
-                            id: header_id,
-                            label: None,
-                            statements: vec![],
-                            terminator: TypedTerminator::Jump(body_id),
-                            pattern_check: None,
-                        });
-
-                        self.loop_stack.push((header_id, after_id));
-                        let (body_blocks, _, body_exit) =
-                            self.split_at_control_flow(&for_stmt.body, body_id, false)?;
-                        all_blocks.extend(body_blocks);
-                        self.loop_stack.pop();
-
-                        if let Some(last_block) =
-                            all_blocks.iter_mut().rev().find(|b| b.id == body_exit)
-                        {
-                            if matches!(last_block.terminator, TypedTerminator::Unreachable) {
-                                last_block.terminator = TypedTerminator::Jump(header_id);
-                            }
-                        }
-
-                        current_statements = Vec::new();
-                        current_block_id = after_id;
-                        exit_id = after_id;
+                        // Not a counted loop. There is no iterator protocol
+                        // to fall back on, and the fallback that stood here
+                        // built a loop with no exit: a `for` over anything
+                        // unrecognised compiled to code that never returned,
+                        // with nothing said. Refusing it is the difference
+                        // between a message naming the iterator and a
+                        // program that hangs.
+                        return Err(crate::CompilerError::Lowering(format!(
+                            "`for` over this iterator is not supported: only a counted range \
+                             (`range(end)`, `range(start, end)`, `start..end`) can be iterated, \
+                             and the loop variable must be a plain name (at {:?})",
+                            for_stmt.iterator.span
+                        )));
                     }
                 }
 
@@ -1784,6 +1742,59 @@ impl TypedCfgBuilder {
                 }
             }
         }
+    }
+}
+
+/// The bounds of a counted loop, however the frontend wrote it.
+struct CountedLoop {
+    start: TypedNode<TypedExpression>,
+    end: TypedNode<TypedExpression>,
+    step: Option<TypedNode<TypedExpression>>,
+    inclusive: bool,
+}
+
+/// `range(...)` with one to three arguments, or a range expression.
+/// `None` for anything else, which the caller refuses.
+fn counted_loop_bounds(iter: &TypedNode<TypedExpression>) -> Option<CountedLoop> {
+    let zero = |span: Span| {
+        typed_node(
+            TypedExpression::Literal(zyntax_typed_ast::typed_ast::TypedLiteral::Integer(0)),
+            Type::Primitive(zyntax_typed_ast::PrimitiveType::I64),
+            span,
+        )
+    };
+    match &iter.node {
+        TypedExpression::Range(r) => Some(CountedLoop {
+            start: r
+                .start
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| zero(iter.span)),
+            end: r.end.as_deref()?.clone(),
+            step: None,
+            inclusive: r.inclusive,
+        }),
+        TypedExpression::Call(call) => {
+            let TypedExpression::Variable(name) = &call.callee.node else {
+                return None;
+            };
+            if name.resolve_global().as_deref() != Some("range") {
+                return None;
+            }
+            let (start, end, step) = match call.positional_args.as_slice() {
+                [end] => (zero(iter.span), end.clone(), None),
+                [start, end] => (start.clone(), end.clone(), None),
+                [start, end, step] => (start.clone(), end.clone(), Some(step.clone())),
+                _ => return None,
+            };
+            Some(CountedLoop {
+                start,
+                end,
+                step,
+                inclusive: false,
+            })
+        }
+        _ => None,
     }
 }
 
