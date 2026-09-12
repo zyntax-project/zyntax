@@ -2957,6 +2957,31 @@ impl CraneliftBackend {
                                             );
                                             arg_values[0]
                                         }
+                                        Intrinsic::IncRef | Intrinsic::DecRef => {
+                                            let Some(&ptr) = arg_values.first() else {
+                                                return Err(CompilerError::Backend(format!(
+                                                    "{intrinsic:?} requires a pointer argument"
+                                                )));
+                                            };
+                                            let delta = if matches!(intrinsic, Intrinsic::IncRef) {
+                                                1
+                                            } else {
+                                                -1
+                                            };
+                                            Self::adjust_refcount(
+                                                &mut self.module,
+                                                &mut builder,
+                                                ptr,
+                                                delta,
+                                            )?;
+                                            ptr
+                                        }
+                                        // Destructor dispatch needs a type behind the
+                                        // pointer; until then dropping is releasing.
+                                        Intrinsic::Drop => match arg_values.first() {
+                                            Some(&ptr) => ptr,
+                                            None => continue,
+                                        },
                                         other => {
                                             return Err(CompilerError::Backend(format!(
                                                 "intrinsic {other:?} has no lowering in this backend"
@@ -6954,6 +6979,46 @@ impl CraneliftBackend {
         // Call free
         builder.ins().call(free_func, &[ptr]);
 
+        Ok(())
+    }
+
+    /// Add `delta` to the reference count an object keeps in its first
+    /// word, freeing the object when the count reaches zero. Leaves the
+    /// builder in the block that follows. Takes the module rather than
+    /// `self` because the builder holds the codegen context borrowed.
+    fn adjust_refcount(
+        module: &mut JITModule,
+        builder: &mut FunctionBuilder,
+        ptr: Value,
+        delta: i64,
+    ) -> CompilerResult<()> {
+        let count = builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
+        let step = builder.ins().iconst(types::I32, delta);
+        let count = builder.ins().iadd(count, step);
+        builder.ins().store(MemFlags::new(), count, ptr, 0);
+        if delta >= 0 {
+            return Ok(());
+        }
+        let zero = builder.ins().iconst(types::I32, 0);
+        let is_zero = builder.ins().icmp(IntCC::Equal, count, zero);
+        let free_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_zero, free_block, &[], continue_block, &[]);
+        builder.seal_block(free_block);
+        builder.switch_to_block(free_block);
+        let mut sig = module.make_signature();
+        sig.params
+            .push(AbiParam::new(module.target_config().pointer_type()));
+        let free_id = module
+            .declare_function("zyntax_free", Linkage::Import, &sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare free: {}", e)))?;
+        let free_func = module.declare_func_in_func(free_id, builder.func);
+        builder.ins().call(free_func, &[ptr]);
+        builder.ins().jump(continue_block, &[]);
+        builder.seal_block(continue_block);
+        builder.switch_to_block(continue_block);
         Ok(())
     }
 
