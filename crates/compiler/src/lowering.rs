@@ -1959,6 +1959,19 @@ impl LoweringContext {
                     if func.is_fiber {
                         self.symbols.fiber_fn_names.insert(func.name);
                     }
+                    // An extern's link name is known before any body is
+                    // lowered, so a call site earlier in the program than
+                    // the declaration still knows it is calling a symbol.
+                    if func.is_external && !keeps_body {
+                        if let Some(link_name) = func.link_name {
+                            self.symbols.extern_link_names.insert(
+                                func.name,
+                                link_name
+                                    .resolve_global()
+                                    .unwrap_or_else(|| link_name.to_string()),
+                            );
+                        }
+                    }
                     // Record return type for call-site type resolution. A
                     // declaration with no stated return type gets one from
                     // its body — the same type the signature is built from,
@@ -3472,10 +3485,13 @@ impl LoweringContext {
         for param in &func.params {
             // Warn about untyped parameters — they will be treated as Dynamic.
             // Skip warnings for: main(), internal runtime functions ($-prefixed),
-            // and stdlib IO functions that intentionally accept DynamicBox.
+            // externs bound to a runtime symbol (the symbol's registered
+            // signature types them), and stdlib IO functions that
+            // intentionally accept DynamicBox.
             if matches!(param.ty, Type::Any | Type::Unknown | Type::Dynamic) {
                 let param_name = param.name.resolve_global().unwrap_or_default();
                 let is_internal = func_name == "main"
+                    || (func.is_external && func.link_name.is_some())
                     || func_name.starts_with('$')
                     || func_name.starts_with("__")
                     || matches!(
@@ -3932,8 +3948,8 @@ impl LoweringContext {
                 PrimitiveType::F64 => HirType::F64,
                 PrimitiveType::Unit => HirType::Void,
                 PrimitiveType::Char => HirType::U32, // Unicode scalar
-                PrimitiveType::String => HirType::Ptr(Box::new(HirType::U8)), // String as u8 pointer
-                _ => HirType::I64,                                            // Default
+                PrimitiveType::String => HirType::Ptr(Box::new(HirType::I8)),
+                _ => HirType::I64, // Default
             },
 
             Type::Tuple(types) if types.is_empty() => HirType::Void,
