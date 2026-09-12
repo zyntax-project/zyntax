@@ -1,0 +1,547 @@
+// The Python prelude: what Python defines above the IR, written in
+// ZynML and compiled with every Python program so it inlines like the
+// program's own code. The frontend calls these by name; nothing here is
+// reachable from Python source directly.
+//
+// Names beginning with `__py_` are the frontend's. The `zrtl_*` externs
+// are the string plugin's primitives, bound to their symbols when this
+// file is loaded.
+
+extern def zrtl_string_length(s: String): i64
+extern def zrtl_string_char_count(s: String): i64
+extern def zrtl_string_index_of(haystack: String, needle: String): i64
+extern def zrtl_string_substring(s: String, start: i64, end: i64): String
+extern def zrtl_string_char_at(s: String, index: i64): String
+extern def zrtl_string_repeat(s: String, count: i64): String
+extern def zrtl_string_from_int(n: i64): String
+extern def zrtl_string_from_float(n: f64): String
+extern def zrtl_string_equals(a: String, b: String): bool
+extern def zrtl_string_compare(a: String, b: String): i64
+extern def zrtl_string_contains(haystack: String, needle: String): bool
+extern def zrtl_string_to_upper(s: String): String
+extern def zrtl_string_to_lower(s: String): String
+extern def zrtl_string_trim(s: String): String
+extern def zrtl_string_trim_start(s: String): String
+extern def zrtl_string_trim_end(s: String): String
+extern def zrtl_string_starts_with(s: String, prefix: String): bool
+extern def zrtl_string_ends_with(s: String, suffix: String): bool
+extern def zrtl_string_replace_all(s: String, from: String, to: String): String
+extern def zrtl_string_count(s: String, needle: String): i64
+extern def zrtl_string_parse_int(s: String): i64
+extern def zrtl_string_parse_float(s: String): f64
+
+// ---- str() of each primitive ----
+
+def __py_str_int(x: i64): String {
+    return zrtl_string_from_int(x)
+}
+
+def __py_str_bool(b: bool): String {
+    if b {
+        return "True"
+    }
+    return "False"
+}
+
+def __py_str_none(): String {
+    return "None"
+}
+
+def __py_str_str(s: String): String {
+    return s
+}
+
+// repr(float): the shortest digits that round-trip, positional when the
+// decimal exponent is in -4..16 and scientific otherwise, and always with
+// a fractional part or an exponent so it reads as a float. The digits
+// come from the runtime's shortest formatting, which never uses an
+// exponent; the placement is decided here.
+def __py_str_float(x: f64): String {
+    if x != x {
+        return "nan"
+    }
+    let digits = zrtl_string_from_float(x)
+    if zrtl_string_equals(digits, "inf") {
+        return "inf"
+    }
+    if zrtl_string_equals(digits, "-inf") {
+        return "-inf"
+    }
+    mut sign = ""
+    mut body = digits
+    if zrtl_string_starts_with(body, "-") {
+        sign = "-"
+        body = zrtl_string_substring(body, 1, zrtl_string_char_count(body))
+    }
+    let dot = zrtl_string_index_of(body, ".")
+    mut int_part = body
+    mut frac_part = ""
+    if dot >= 0 {
+        int_part = zrtl_string_substring(body, 0, dot)
+        frac_part = zrtl_string_substring(body, dot + 1, zrtl_string_char_count(body))
+    }
+    // The significant digits and the decimal exponent of the first one.
+    mut mantissa = ""
+    mut exponent = 0
+    if zrtl_string_equals(int_part, "0") {
+        // 0.000ddd: the exponent counts the zeros after the point.
+        mut zeros = 0
+        while zeros < zrtl_string_char_count(frac_part) && zrtl_string_equals(zrtl_string_char_at(frac_part, zeros), "0") {
+            zeros = zeros + 1
+        }
+        if zeros == zrtl_string_char_count(frac_part) {
+            return sign + "0.0"
+        }
+        mantissa = zrtl_string_substring(frac_part, zeros, zrtl_string_char_count(frac_part))
+        exponent = 0 - (zeros + 1)
+    } else {
+        mantissa = int_part + frac_part
+        exponent = zrtl_string_char_count(int_part) - 1
+    }
+    // Trailing zeros carry no information.
+    mut end = zrtl_string_char_count(mantissa)
+    while end > 1 && zrtl_string_equals(zrtl_string_char_at(mantissa, end - 1), "0") {
+        end = end - 1
+    }
+    mantissa = zrtl_string_substring(mantissa, 0, end)
+
+    if exponent >= -4 && exponent < 16 {
+        if exponent >= 0 {
+            let point = exponent + 1
+            if zrtl_string_char_count(mantissa) <= point {
+                return sign + mantissa + zrtl_string_repeat("0", point - zrtl_string_char_count(mantissa)) + ".0"
+            }
+            return sign + zrtl_string_substring(mantissa, 0, point) + "." + zrtl_string_substring(mantissa, point, zrtl_string_char_count(mantissa))
+        }
+        return sign + "0." + zrtl_string_repeat("0", 0 - exponent - 1) + mantissa
+    }
+    mut out = sign + zrtl_string_char_at(mantissa, 0)
+    if zrtl_string_char_count(mantissa) > 1 {
+        out = out + "." + zrtl_string_substring(mantissa, 1, zrtl_string_char_count(mantissa))
+    }
+    mut exp_sign = "+"
+    mut exp_abs = exponent
+    if exponent < 0 {
+        exp_sign = "-"
+        exp_abs = 0 - exponent
+    }
+    mut exp_digits = zrtl_string_from_int(exp_abs)
+    if exp_abs < 10 {
+        exp_digits = "0" + exp_digits
+    }
+    return out + "e" + exp_sign + exp_digits
+}
+
+// repr(str): single quotes unless the text has a single quote and no
+// double quote, with the escapes Python uses.
+def __py_repr_str(s: String): String {
+    mut quote = "'"
+    if zrtl_string_contains(s, "'") && !zrtl_string_contains(s, "\"") {
+        quote = "\""
+    }
+    mut out = quote
+    mut i = 0
+    let n = zrtl_string_char_count(s)
+    while i < n {
+        let c = zrtl_string_char_at(s, i)
+        if zrtl_string_equals(c, "\\") {
+            out = out + "\\\\"
+        } else if zrtl_string_equals(c, "\n") {
+            out = out + "\\n"
+        } else if zrtl_string_equals(c, "\t") {
+            out = out + "\\t"
+        } else if zrtl_string_equals(c, quote) {
+            out = out + "\\" + c
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out + quote
+}
+
+// ---- truth ----
+
+def __py_truthy_str(s: String): bool {
+    return zrtl_string_length(s) != 0
+}
+
+// ---- str operators ----
+
+def __py_str_mul(s: String, n: i64): String {
+    if n <= 0 {
+        return ""
+    }
+    return zrtl_string_repeat(s, n)
+}
+
+def __py_str_eq(a: String, b: String): bool {
+    return zrtl_string_equals(a, b)
+}
+
+def __py_str_lt(a: String, b: String): bool {
+    return zrtl_string_compare(a, b) < 0
+}
+
+def __py_str_contains(haystack: String, needle: String): bool {
+    return zrtl_string_contains(haystack, needle)
+}
+
+def __py_str_len(s: String): i64 {
+    return zrtl_string_char_count(s)
+}
+
+// ---- output ----
+
+def __py_print_line(s: String) {
+    println(s)
+}
+
+// ---- dynamic values ----
+//
+// An `Any` is a box with a type tag. Its low byte is the category: 0 is
+// None, 1 bool, 2 signed int, 3 unsigned int, 4 float, 5 string. The
+// accessors below read the payload; each operation switches on the
+// category and then does what the typed code does.
+
+extern def zrtl_box_tag(x: Any): i32
+extern def zrtl_box_i64(x: Any): i64
+extern def zrtl_box_f64(x: Any): f64
+extern def zrtl_box_bool(x: Any): i32
+extern def zrtl_box_str(x: Any): String
+
+def __py_category(x: Any): i64 {
+    let tag: i64 = zrtl_box_tag(x)
+    return tag & 255
+}
+
+def __py_is_number(cat: i64): bool {
+    return cat >= 1 && cat <= 4
+}
+
+def __py_number_f64(x: Any, cat: i64): f64 {
+    if cat == 4 {
+        return zrtl_box_f64(x)
+    }
+    if cat == 1 {
+        if zrtl_box_bool(x) != 0 {
+            return 1.0
+        }
+        return 0.0
+    }
+    let i = zrtl_box_i64(x)
+    let f: f64 = i
+    return f
+}
+
+def __py_number_i64(x: Any, cat: i64): i64 {
+    if cat == 1 {
+        if zrtl_box_bool(x) != 0 {
+            return 1
+        }
+        return 0
+    }
+    return zrtl_box_i64(x)
+}
+
+def __py_truthy_any(x: Any): bool {
+    let cat = __py_category(x)
+    if cat == 0 {
+        return false
+    }
+    if cat == 1 {
+        return zrtl_box_bool(x) != 0
+    }
+    if cat == 2 || cat == 3 {
+        return zrtl_box_i64(x) != 0
+    }
+    if cat == 4 {
+        return zrtl_box_f64(x) != 0.0
+    }
+    if cat == 5 {
+        return zrtl_string_length(zrtl_box_str(x)) != 0
+    }
+    return true
+}
+
+def __py_str_any(x: Any): String {
+    let cat = __py_category(x)
+    if cat == 0 {
+        return "None"
+    }
+    if cat == 1 {
+        return __py_str_bool(zrtl_box_bool(x) != 0)
+    }
+    if cat == 2 || cat == 3 {
+        return __py_str_int(zrtl_box_i64(x))
+    }
+    if cat == 4 {
+        return __py_str_float(zrtl_box_f64(x))
+    }
+    if cat == 5 {
+        return zrtl_box_str(x)
+    }
+    return format_dynamic(x)
+}
+
+def __py_repr_any(x: Any): String {
+    if __py_category(x) == 5 {
+        return __py_repr_str(zrtl_box_str(x))
+    }
+    return __py_str_any(x)
+}
+
+def __py_eq_any(a: Any, b: Any): bool {
+    let ca = __py_category(a)
+    let cb = __py_category(b)
+    if ca == 0 || cb == 0 {
+        return ca == cb
+    }
+    if ca == 5 || cb == 5 {
+        if ca == 5 && cb == 5 {
+            return zrtl_string_equals(zrtl_box_str(a), zrtl_box_str(b))
+        }
+        return false
+    }
+    if __py_is_number(ca) && __py_is_number(cb) {
+        if ca == 4 || cb == 4 {
+            return __py_number_f64(a, ca) == __py_number_f64(b, cb)
+        }
+        return __py_number_i64(a, ca) == __py_number_i64(b, cb)
+    }
+    return false
+}
+
+def __py_lt_any(a: Any, b: Any): bool {
+    let ca = __py_category(a)
+    let cb = __py_category(b)
+    if ca == 5 && cb == 5 {
+        return zrtl_string_compare(zrtl_box_str(a), zrtl_box_str(b)) < 0
+    }
+    if __py_is_number(ca) && __py_is_number(cb) {
+        if ca == 4 || cb == 4 {
+            return __py_number_f64(a, ca) < __py_number_f64(b, cb)
+        }
+        return __py_number_i64(a, ca) < __py_number_i64(b, cb)
+    }
+    return false
+}
+
+def __py_is_any(a: Any, b: Any): bool {
+    let ca = __py_category(a)
+    let cb = __py_category(b)
+    if ca == 0 || cb == 0 {
+        return ca == cb
+    }
+    if ca == 1 && cb == 1 {
+        return (zrtl_box_bool(a) != 0) == (zrtl_box_bool(b) != 0)
+    }
+    return __py_eq_any(a, b)
+}
+
+def __py_contains_any(container: Any, item: Any): bool {
+    if __py_category(container) == 5 && __py_category(item) == 5 {
+        return zrtl_string_contains(zrtl_box_str(container), zrtl_box_str(item))
+    }
+    return false
+}
+
+def __py_len_any(x: Any): i64 {
+    if __py_category(x) == 5 {
+        return zrtl_string_char_count(zrtl_box_str(x))
+    }
+    return 0
+}
+
+def __py_int_any(x: Any): i64 {
+    let cat = __py_category(x)
+    if cat == 4 {
+        let f = zrtl_box_f64(x)
+        let i: i64 = f
+        return i
+    }
+    if cat == 5 {
+        return zrtl_string_parse_int(zrtl_box_str(x))
+    }
+    return __py_number_i64(x, cat)
+}
+
+def __py_float_any(x: Any): f64 {
+    let cat = __py_category(x)
+    if cat == 5 {
+        return zrtl_string_parse_float(zrtl_box_str(x))
+    }
+    return __py_number_f64(x, cat)
+}
+
+def __py_neg_any(x: Any): Any {
+    let cat = __py_category(x)
+    if cat == 4 {
+        let f: Any = 0.0 - zrtl_box_f64(x)
+        return f
+    }
+    let i: Any = 0 - __py_number_i64(x, cat)
+    return i
+}
+
+def __py_pos_any(x: Any): Any {
+    return x
+}
+
+def __py_invert_any(x: Any): Any {
+    let i: Any = 0 - 1 - __py_number_i64(x, __py_category(x))
+    return i
+}
+
+extern def zrtl_math_pow(a: f64, b: f64): f64
+extern def zrtl_math_floor(a: f64): f64
+
+// Floor division and remainder: the quotient rounds toward negative
+// infinity and the remainder takes the divisor's sign.
+def __py_floordiv_i64(a: i64, b: i64): i64 {
+    let q = a / b
+    let r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) {
+        return q - 1
+    }
+    return q
+}
+
+def __py_mod_i64(a: i64, b: i64): i64 {
+    let r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) {
+        return r + b
+    }
+    return r
+}
+
+def __py_mod_f64(a: f64, b: f64): f64 {
+    let r = a % b
+    if r != 0.0 && ((r < 0.0) != (b < 0.0)) {
+        return r + b
+    }
+    return r
+}
+
+def __py_pow_i64(a: i64, b: i64): i64 {
+    mut result = 1
+    mut base = a
+    mut exp = b
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result * base
+        }
+        base = base * base
+        exp = exp >> 1
+    }
+    return result
+}
+
+// Operator codes: 0 +, 1 -, 2 *, 3 /, 4 //, 5 %, 6 **, 7 &, 8 |, 9 ^,
+// 10 <<, 11 >>.
+def __py_arith_i64(code: i64, a: i64, b: i64): Any {
+    if code == 0 {
+        let r: Any = a + b
+        return r
+    }
+    if code == 1 {
+        let r: Any = a - b
+        return r
+    }
+    if code == 2 {
+        let r: Any = a * b
+        return r
+    }
+    if code == 3 {
+        let fa: f64 = a
+        let fb: f64 = b
+        let r: Any = fa / fb
+        return r
+    }
+    if code == 4 {
+        let r: Any = __py_floordiv_i64(a, b)
+        return r
+    }
+    if code == 5 {
+        let r: Any = __py_mod_i64(a, b)
+        return r
+    }
+    if code == 6 {
+        if b < 0 {
+            let fa: f64 = a
+            let fb: f64 = b
+            let r: Any = zrtl_math_pow(fa, fb)
+            return r
+        }
+        let r: Any = __py_pow_i64(a, b)
+        return r
+    }
+    if code == 7 {
+        let r: Any = a & b
+        return r
+    }
+    if code == 8 {
+        let r: Any = a | b
+        return r
+    }
+    if code == 9 {
+        let r: Any = a ^ b
+        return r
+    }
+    if code == 10 {
+        let r: Any = a << b
+        return r
+    }
+    let r: Any = a >> b
+    return r
+}
+
+def __py_arith_f64(code: i64, a: f64, b: f64): Any {
+    if code == 0 {
+        let r: Any = a + b
+        return r
+    }
+    if code == 1 {
+        let r: Any = a - b
+        return r
+    }
+    if code == 2 {
+        let r: Any = a * b
+        return r
+    }
+    if code == 3 {
+        let r: Any = a / b
+        return r
+    }
+    if code == 4 {
+        let r: Any = zrtl_math_floor(a / b)
+        return r
+    }
+    if code == 5 {
+        let r: Any = __py_mod_f64(a, b)
+        return r
+    }
+    let r: Any = zrtl_math_pow(a, b)
+    return r
+}
+
+def __py_arith_any(code: i64, a: Any, b: Any): Any {
+    let ca = __py_category(a)
+    let cb = __py_category(b)
+    if ca == 5 && cb == 5 && code == 0 {
+        let r: Any = zrtl_box_str(a) + zrtl_box_str(b)
+        return r
+    }
+    if ca == 5 && code == 2 && (cb == 1 || cb == 2 || cb == 3) {
+        let r: Any = __py_str_mul(zrtl_box_str(a), __py_number_i64(b, cb))
+        return r
+    }
+    if cb == 5 && code == 2 && (ca == 1 || ca == 2 || ca == 3) {
+        let r: Any = __py_str_mul(zrtl_box_str(b), __py_number_i64(a, ca))
+        return r
+    }
+    if ca == 4 || cb == 4 {
+        return __py_arith_f64(code, __py_number_f64(a, ca), __py_number_f64(b, cb))
+    }
+    return __py_arith_i64(code, __py_number_i64(a, ca), __py_number_i64(b, cb))
+}

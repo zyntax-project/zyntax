@@ -4,7 +4,6 @@
 # and its issue is closed; an unlisted case that fails is a regression.
 
 binop/floor_and_modulo_signs.py              a735972
-bool/logic.py                                decf8ef
 builtin/conversions.py                       4ed0759
 builtin/numeric.py                           4ed0759
 class/basic.py                               cd13255
@@ -31,4 +30,3 @@ set/basics.py                                4ec2c7a
 string/basics.py                             74c2742
 string/formatting.py                         74c2742
 tuple/basics.py                              be231dc
-unary/operators.py                           b74f44c
