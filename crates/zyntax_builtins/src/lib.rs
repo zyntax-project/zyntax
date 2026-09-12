@@ -42,6 +42,12 @@ pub struct Policy {
     /// instances of its own classes (kinds from [`INSTANCE_KIND_BASE`]).
     /// When it does not, the library's defaults stand in.
     pub instance_hooks: bool,
+    /// Whether the frontend defines `zb_hook_raise(kind, message)` and
+    /// turns a library error into an exception it can catch. When it
+    /// does, every library function that can fail returns a placeholder
+    /// after the hook, and the frontend checks for the pending exception
+    /// after calling one; see [`Library::fallible`].
+    pub exceptions: bool,
 }
 
 /// The names of the dynamic value kinds, as a language spells them.
@@ -128,6 +134,9 @@ pub struct Library {
     pub type_registry: TypeRegistry,
     /// `List<T>`, for spelling list types as the library does.
     pub list_type: TypeId,
+    /// The functions that can report an error: those calling `zb_fatal`,
+    /// and those calling one of them, and so on.
+    pub fallible: std::collections::BTreeSet<String>,
 }
 
 /// The library for one language's spellings.
@@ -135,7 +144,7 @@ pub fn library(policy: &Policy) -> Library {
     let mut b = TypedASTBuilder::new();
     let list_type = lists::declare_list_type(&mut b);
     let mut declarations = Vec::new();
-    declarations.extend(io::declarations());
+    declarations.extend(io::declarations(policy));
     declarations.extend(strings::declarations(policy));
     declarations.extend(format::declarations());
     declarations.extend(dynamic::declarations(policy, list_type));
@@ -145,11 +154,44 @@ pub fn library(policy: &Policy) -> Library {
     if !policy.instance_hooks {
         declarations.extend(dynamic::default_instance_hooks(policy));
     }
+    let fallible = fallible_functions(&declarations);
     Library {
         declarations,
         type_registry: b.registry,
         list_type,
+        fallible,
     }
+}
+
+/// Every function that reaches `zb_fatal`, through any number of calls.
+fn fallible_functions(declarations: &[Decl]) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use zyntax_typed_ast::typed_ast::TypedDeclaration;
+    let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for d in declarations {
+        if let TypedDeclaration::Function(f) = &d.node {
+            if let (Some(name), Some(body)) = (f.name.resolve_global(), &f.body) {
+                let mut callees = BTreeSet::new();
+                for s in &body.statements {
+                    build::callees_of_stmt(s, &mut callees);
+                }
+                calls.insert(name, callees);
+            }
+        }
+    }
+    let mut fallible: BTreeSet<String> = ["zb_fatal".to_string()].into_iter().collect();
+    loop {
+        let before = fallible.len();
+        for (name, callees) in &calls {
+            if callees.iter().any(|c| fallible.contains(c)) {
+                fallible.insert(name.clone());
+            }
+        }
+        if fallible.len() == before {
+            break;
+        }
+    }
+    fallible
 }
 
 /// `List<elem>` as the library declares it.
@@ -176,6 +218,7 @@ mod tests {
             single_quotes: true,
             float_fraction: true,
             instance_hooks: false,
+            exceptions: false,
             type_names: TypeNames {
                 none: "NoneType",
                 bool: "bool",

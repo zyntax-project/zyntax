@@ -402,15 +402,82 @@ pub fn for_range(i: &Local, from: Expr, to: Expr, mut body: Vec<Stmt>) -> Vec<St
     vec![i.decl(from), while_(lt(i.e(), to), body)]
 }
 
-/// `fatal(kind, message)`.
+/// `fatal(kind, message)`: report the error, and leave the function
+/// with a placeholder result once [`define`] has seen the return type.
+/// A frontend that turns errors into exceptions gets control back
+/// from `zb_fatal`, so nothing after it may run.
 pub fn fatal(kind: &str, message: Expr) -> Stmt {
     expr(call("zb_fatal", vec![text(kind), message], unit()))
+}
+
+fn is_fatal(stmt: &Stmt) -> bool {
+    match &stmt.node {
+        TypedStatement::Expression(e) => match &e.node {
+            TypedExpression::Call(c) => matches!(
+                &c.callee.node,
+                TypedExpression::Variable(n) if n.resolve_global().as_deref() == Some("zb_fatal")
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The value a function hands back when it has reported an error.
+fn placeholder(ret_ty: &Type) -> Option<Expr> {
+    Some(match ret_ty {
+        Type::Primitive(PrimitiveType::Unit) => return None,
+        Type::Primitive(PrimitiveType::Bool) => bool(false),
+        Type::Primitive(PrimitiveType::I32) => int32(0),
+        Type::Primitive(PrimitiveType::F64) => float(0.0),
+        Type::Primitive(PrimitiveType::String) => text(""),
+        Type::Primitive(_) => int(0),
+        // Boxes, lists and code addresses: a null of the type.
+        other => node(TypedExpression::Literal(TypedLiteral::Null), other.clone()),
+    })
+}
+
+fn leave_after_fatal(stmts: Vec<Stmt>, ret_ty: &Type) -> Vec<Stmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    let mut iter = stmts.into_iter().peekable();
+    while let Some(mut stmt) = iter.next() {
+        match &mut stmt.node {
+            TypedStatement::If(i) => {
+                let then = std::mem::take(&mut i.then_block.statements);
+                i.then_block.statements = leave_after_fatal(then, ret_ty);
+                if let Some(els) = &mut i.else_block {
+                    let e = std::mem::take(&mut els.statements);
+                    els.statements = leave_after_fatal(e, ret_ty);
+                }
+            }
+            TypedStatement::While(w) => {
+                let body = std::mem::take(&mut w.body.statements);
+                w.body.statements = leave_after_fatal(body, ret_ty);
+            }
+            _ => {}
+        }
+        let fatal_here = is_fatal(&stmt);
+        out.push(stmt);
+        if fatal_here
+            && !matches!(
+                iter.peek().map(|s| &s.node),
+                Some(TypedStatement::Return(_))
+            )
+        {
+            out.push(match placeholder(ret_ty) {
+                Some(value) => ret(value),
+                None => ret_void(),
+            });
+        }
+    }
+    out
 }
 
 // ─── declarations ───────────────────────────────────────────────────
 
 /// A function with a body.
 pub fn define(name: &str, params: &[&Local], ret_ty: Type, body: Vec<Stmt>) -> Decl {
+    let body = leave_after_fatal(body, &ret_ty);
     typed_node(
         TypedDeclaration::Function(TypedFunction {
             name: intern(name),
@@ -465,4 +532,77 @@ pub fn extern_fn(name: &str, params: &[(&str, Type)], ret_ty: Type, symbol: Opti
         ret_ty,
         SPAN,
     )
+}
+
+/// The names called anywhere in a statement.
+pub fn callees_of_stmt(stmt: &Stmt, out: &mut std::collections::BTreeSet<String>) {
+    match &stmt.node {
+        TypedStatement::Expression(e) => callees_of_expr(e, out),
+        TypedStatement::Let(l) => {
+            if let Some(init) = &l.initializer {
+                callees_of_expr(init, out);
+            }
+        }
+        TypedStatement::Return(Some(e)) => callees_of_expr(e, out),
+        TypedStatement::If(i) => {
+            callees_of_expr(&i.condition, out);
+            for s in &i.then_block.statements {
+                callees_of_stmt(s, out);
+            }
+            if let Some(e) = &i.else_block {
+                for s in &e.statements {
+                    callees_of_stmt(s, out);
+                }
+            }
+        }
+        TypedStatement::While(w) => {
+            callees_of_expr(&w.condition, out);
+            for s in &w.body.statements {
+                callees_of_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn callees_of_expr(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
+    match &e.node {
+        TypedExpression::Call(c) => {
+            if let TypedExpression::Variable(n) = &c.callee.node {
+                if let Some(name) = n.resolve_global() {
+                    out.insert(name);
+                }
+            }
+            for a in &c.positional_args {
+                callees_of_expr(a, out);
+            }
+        }
+        TypedExpression::MethodCall(m) => {
+            callees_of_expr(&m.receiver, out);
+            for a in &m.positional_args {
+                callees_of_expr(a, out);
+            }
+        }
+        TypedExpression::Binary(b) => {
+            callees_of_expr(&b.left, out);
+            callees_of_expr(&b.right, out);
+        }
+        TypedExpression::Unary(u) => callees_of_expr(&u.operand, out),
+        TypedExpression::Index(i) => {
+            callees_of_expr(&i.object, out);
+            callees_of_expr(&i.index, out);
+        }
+        TypedExpression::Cast(c) => callees_of_expr(&c.expr, out),
+        TypedExpression::If(i) => {
+            callees_of_expr(&i.condition, out);
+            callees_of_expr(&i.then_branch, out);
+            callees_of_expr(&i.else_branch, out);
+        }
+        TypedExpression::Array(items) => {
+            for a in items {
+                callees_of_expr(a, out);
+            }
+        }
+        _ => {}
+    }
 }

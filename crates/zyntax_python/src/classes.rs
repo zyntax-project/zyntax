@@ -791,3 +791,59 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
 }
 
 use zyntax_typed_ast::BinaryOp;
+
+/// `zb_hook_raise(kind, message)`: the library's error as the exception
+/// class of that name, pending.
+pub(crate) fn raise_hook(module: &Module) -> TypedFunction {
+    let span = Span::new(0, 0);
+    let mut lowerer = scratch(module);
+    let kind = var(intern("kind"), Ty::Str, span);
+    let message = var(intern("message"), Ty::Str, span);
+    let mut statements = Vec::new();
+    for name in crate::prelude::EXCEPTION_KINDS {
+        let Some(&k) = module.class_index.get(*name) else {
+            continue;
+        };
+        let instance = Val {
+            node: call(
+                &new_name(name),
+                vec![message.clone()],
+                Ty::Class(k as u16),
+                span,
+            ),
+            ty: Ty::Class(k as u16),
+        };
+        let boxed = lowerer.coerce(instance, Ty::Object);
+        let set = binary(
+            BinaryOp::Assign,
+            var(intern(lower::PENDING), Ty::Object, span),
+            boxed,
+            Ty::None,
+            span,
+        );
+        let matches = call(
+            "zb_str_eq",
+            vec![kind.clone(), str_lit(name, span)],
+            Ty::Bool,
+            span,
+        );
+        statements.push(when(
+            matches,
+            vec![
+                stmt(set, span),
+                TypedNode::new(TypedStatement::Return(None), Type::Unknown, span),
+            ],
+            span,
+        ));
+    }
+    function(
+        "zb_hook_raise",
+        vec![
+            param("kind", Ty::Str, span),
+            param("message", Ty::Str, span),
+        ],
+        Ty::None,
+        statements,
+        span,
+    )
+}

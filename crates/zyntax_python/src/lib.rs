@@ -28,6 +28,7 @@ use zyntax_typed_ast::{
 mod classes;
 mod format;
 mod lower;
+mod prelude;
 mod scope;
 mod types;
 
@@ -57,6 +58,7 @@ const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
     single_quotes: true,
     float_fraction: true,
     instance_hooks: true,
+    exceptions: true,
     type_names: zyntax_builtins::TypeNames {
         none: "NoneType",
         bool: "bool",
@@ -91,7 +93,14 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             first.error, first.location
         )));
     }
-    let module = parsed.into_syntax();
+    let mut module = parsed.into_syntax();
+    // The prelude's declarations come first.
+    let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
+        .expect("the prelude parses")
+        .into_syntax();
+    let mut body = prelude.body;
+    body.append(&mut module.body);
+    module.body = body;
 
     // A module's body is the program. Statements outside any `def` run
     // top to bottom when the module is executed, so they become the
@@ -151,6 +160,7 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         list_type: Some(library.list_type),
         classes: class_infos,
         class_index,
+        fallible: library.fallible.clone(),
         ..Default::default()
     };
     let global_names = module_globals(&module.body, &defs, &inferred.class_index);
@@ -193,6 +203,18 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         }
     }
     let mut declarations = classes::register(&mut inferred, &mut library.type_registry);
+    // The exception in flight.
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Variable(TypedVariable {
+            name: intern(lower::PENDING),
+            ty: Type::Any,
+            mutability: Mutability::Mutable,
+            initializer: None,
+            visibility: Visibility::Public,
+        }),
+        Type::Unknown,
+        Span::new(0, 0),
+    ));
     for (name, ty) in &inferred.globals {
         let stored = match ty {
             types::Ty::Int | types::Ty::Float | types::Ty::Bool | types::Ty::Str => *ty,
@@ -246,7 +268,7 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             Vec::new(),
             std::collections::HashMap::new(),
         )
-        .body(&top_level)?;
+        .entry_body(&top_level)?;
         let span = Span::new(
             top_level[0].range().start().to_usize(),
             top_level[top_level.len() - 1].range().end().to_usize(),
@@ -290,6 +312,11 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             Span::new(0, 0),
         ));
     }
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Function(classes::raise_hook(&inferred)),
+        Type::Unknown,
+        Span::new(0, 0),
+    ));
     for func in classes::generated(&inferred) {
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),

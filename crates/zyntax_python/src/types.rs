@@ -156,6 +156,8 @@ pub(crate) struct Module {
     pub(crate) attr_reads: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) attr_writes: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) dyn_methods: std::cell::RefCell<std::collections::BTreeSet<(String, usize)>>,
+    /// Library functions that can raise.
+    pub(crate) fallible: std::collections::BTreeSet<String>,
     pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
 }
 
@@ -663,7 +665,17 @@ impl Walker<'_> {
                 for h in &t.handlers {
                     let py::ExceptHandler::ExceptHandler(h) = h;
                     if let Some(name) = &h.name {
-                        self.assign(name.as_str(), Ty::Object);
+                        // `except E as e` binds an instance of E.
+                        let ty = match h.type_.as_deref() {
+                            Some(py::Expr::Name(n)) => self
+                                .module
+                                .class_index
+                                .get(n.id.as_str())
+                                .map(|k| Ty::Class(*k as u16))
+                                .unwrap_or(Ty::Object),
+                            _ => Ty::Object,
+                        };
+                        self.assign(name.as_str(), ty);
                     }
                     self.stmts(&h.body);
                 }

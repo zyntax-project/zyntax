@@ -229,6 +229,26 @@ pub(crate) fn without_self(sig: &Sig) -> Sig {
     }
 }
 
+/// A loop of one pass: its body leaves it with `break`.
+fn one_pass(body: Vec<Stmt>, span: Span) -> Stmt {
+    TypedNode::new(
+        TypedStatement::While(TypedWhile {
+            condition: Box::new(node(
+                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                Ty::Bool,
+                span,
+            )),
+            body: TypedBlock {
+                statements: body,
+                span,
+            },
+            span,
+        }),
+        Type::Unknown,
+        span,
+    )
+}
+
 fn op_text(op: py::Operator) -> &'static str {
     match op {
         py::Operator::Add => "+",
@@ -388,7 +408,48 @@ pub(crate) struct Lowerer<'m> {
     captured_types: HashMap<String, Ty>,
     /// The class whose method this is, for `super()`.
     pub(crate) class: Option<usize>,
+    /// How control leaves when an exception is pending: out of the
+    /// innermost loop when inside a `try`, out of the function otherwise.
+    escapes: Vec<Escape>,
+    /// Whether the statement being lowered emitted a pending check, so a
+    /// loop containing it re-checks once the loop is left.
+    raised: bool,
+    /// The variable holding the exception being handled, for a bare
+    /// `raise`.
+    caught: Option<InternedString>,
+    /// The `try` bodies being lowered, innermost last. A `return`,
+    /// `break` or `continue` inside one records what it wants in the
+    /// body's flag and leaves the body; the flag is acted on after
+    /// `finally`.
+    try_ctls: Vec<TryCtl>,
+    /// Whether the statement being lowered recorded such a flag, so a
+    /// loop containing it leaves again once the loop is left.
+    redirected: bool,
 }
+
+/// One `try` body's control flag: 0 fell through, 1 return, 2 break,
+/// 3 continue.
+struct TryCtl {
+    flag: InternedString,
+    /// Where a `return` inside the body parks its value.
+    ret: Option<InternedString>,
+    /// How many loops of the body's own the statement being lowered is
+    /// inside; a `break` at depth 0 is the body's to redirect.
+    loop_depth: usize,
+}
+
+/// Where a pending exception sends control.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Escape {
+    /// Return a placeholder from the function; the caller checks.
+    Return,
+    /// Leave the innermost loop: a `try` body's own loop, or a loop
+    /// inside it, whose following check leaves the next.
+    Break,
+}
+
+/// The module variable holding the exception in flight, `None` when none.
+pub(crate) const PENDING: &str = "py$exc";
 
 /// The function record's fixed prefix: code address and arity.
 const RECORD_CELLS_AT: usize = 2;
@@ -435,7 +496,263 @@ impl<'m> Lowerer<'m> {
             captured,
             captured_types,
             class: None,
+            escapes: vec![Escape::Return],
+            raised: false,
+            caught: None,
+            try_ctls: Vec::new(),
+            redirected: false,
         }
+    }
+
+    /// `return value`, or the `try` body's way of recording one.
+    fn emit_return(&mut self, value: Option<Node>, span: Span, out: &mut Vec<Stmt>) {
+        if let Some(ctl) = self.try_ctls.last() {
+            let flag = ctl.flag;
+            if let (Some(slot), Some(v)) = (ctl.ret, value) {
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(binary(
+                        BinaryOp::Assign,
+                        var(slot, self.sig.ret, span),
+                        v,
+                        Ty::None,
+                        span,
+                    ))),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+            self.set_flag_and_leave(flag, 1, span, out);
+            return;
+        }
+        out.push(TypedNode::new(
+            TypedStatement::Return(value.map(Box::new)),
+            Type::Unknown,
+            span,
+        ));
+    }
+
+    /// `break` or `continue` (`code` 2 or 3), or the `try` body's way of
+    /// recording one when the loop it means is outside the body.
+    fn emit_loop_exit(&mut self, code: i64, span: Span, out: &mut Vec<Stmt>) {
+        if let Some(ctl) = self.try_ctls.last() {
+            if ctl.loop_depth == 0 {
+                let flag = ctl.flag;
+                self.set_flag_and_leave(flag, code, span, out);
+                return;
+            }
+        }
+        let st = if code == 2 {
+            TypedStatement::Break(None)
+        } else {
+            TypedStatement::Continue
+        };
+        out.push(TypedNode::new(st, Type::Unknown, span));
+    }
+
+    fn set_flag_and_leave(
+        &mut self,
+        flag: InternedString,
+        code: i64,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) {
+        out.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(binary(
+                BinaryOp::Assign,
+                var(flag, Ty::Int, span),
+                int_lit(code, span),
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        out.push(TypedNode::new(
+            TypedStatement::Break(None),
+            Type::Unknown,
+            span,
+        ));
+        self.redirected = true;
+    }
+
+    /// Lower a loop body that sits inside a `try`, counting the loop so
+    /// a `break` inside it is the loop's own.
+    fn in_loop<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if let Some(ctl) = self.try_ctls.last_mut() {
+            ctl.loop_depth += 1;
+        }
+        let r = f(self);
+        if let Some(ctl) = self.try_ctls.last_mut() {
+            ctl.loop_depth -= 1;
+        }
+        r
+    }
+
+    /// Whether an exception is pending.
+    fn pending(&self, span: Span) -> Node {
+        binary(
+            BinaryOp::Ne,
+            call(
+                "zb_any_category",
+                vec![var(intern(PENDING), Ty::Object, span)],
+                Ty::Int,
+                span,
+            ),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        )
+    }
+
+    /// `py$exc = value`.
+    fn set_pending(&mut self, value: Node, span: Span) -> Stmt {
+        TypedNode::new(
+            TypedStatement::Expression(Box::new(binary(
+                BinaryOp::Assign,
+                var(intern(PENDING), Ty::Object, span),
+                value,
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        )
+    }
+
+    /// Leave, the way the current context leaves.
+    fn escape(&mut self, span: Span) -> Stmt {
+        let st = match self.escapes.last().copied().unwrap_or(Escape::Return) {
+            Escape::Break => TypedStatement::Break(None),
+            Escape::Return => TypedStatement::Return(self.placeholder(span).map(Box::new)),
+        };
+        TypedNode::new(st, Type::Unknown, span)
+    }
+
+    /// The value a function returns when it leaves with an exception
+    /// pending, which its caller never reads.
+    fn placeholder(&mut self, span: Span) -> Option<Node> {
+        Some(match self.sig.ret {
+            Ty::None => return None,
+            Ty::Int => int_lit(0, span),
+            Ty::Float => node(
+                TypedExpression::Literal(TypedLiteral::Float(0.0)),
+                Ty::Float,
+                span,
+            ),
+            Ty::Bool => node(
+                TypedExpression::Literal(TypedLiteral::Bool(false)),
+                Ty::Bool,
+                span,
+            ),
+            Ty::Str => str_lit("", span),
+            Ty::Object | Ty::Unknown => {
+                let none = Val {
+                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                    ty: Ty::None,
+                };
+                self.coerce(none, Ty::Object)
+            }
+            other => cast(int_lit(0, span), other, span),
+        })
+    }
+
+    /// `if <pending> { <escape> }`.
+    fn pending_check(&mut self, span: Span) -> Stmt {
+        self.raised = true;
+        let cond = self.pending(span);
+        let leave = self.escape(span);
+        TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(cond),
+                then_block: TypedBlock {
+                    statements: vec![leave],
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        )
+    }
+
+    /// A value from a call that may have raised: held, then checked
+    /// before anything uses it.
+    fn guard(&mut self, v: Val, span: Span) -> Val {
+        let mut pre = Vec::new();
+        let held = if v.ty == Ty::None {
+            pre.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(v.node)),
+                Type::Unknown,
+                span,
+            ));
+            Val {
+                node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                ty: Ty::None,
+            }
+        } else {
+            self.hold(v, &mut pre, span)
+        };
+        pre.push(self.pending_check(span));
+        self.hoisted.extend(pre);
+        held
+    }
+
+    /// `raise Class(message)` built here: pending set, control leaving.
+    fn raise_named(&mut self, class: &str, message: Node, span: Span, out: &mut Vec<Stmt>) {
+        let Some(&k) = self.module.class_index.get(class) else {
+            return;
+        };
+        let instance = Val {
+            node: call(&new_name(class), vec![message], Ty::Class(k as u16), span),
+            ty: Ty::Class(k as u16),
+        };
+        let boxed = self.coerce(instance, Ty::Object);
+        out.push(self.set_pending(boxed, span));
+        self.raised = true;
+        out.push(self.escape(span));
+    }
+
+    /// Integer division and remainder trap on zero, so the divisor is
+    /// checked first and a zero raises.
+    fn nonzero(&mut self, divisor: Node, span: Span) -> Node {
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: divisor,
+                ty: Ty::Int,
+            },
+            &mut pre,
+            span,
+        );
+        let mut raise = Vec::new();
+        self.raise_named(
+            "ZeroDivisionError",
+            str_lit("integer division or modulo by zero", span),
+            span,
+            &mut raise,
+        );
+        pre.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(binary(
+                    BinaryOp::Eq,
+                    held.node.clone(),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                )),
+                then_block: TypedBlock {
+                    statements: raise,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        self.hoisted.extend(pre);
+        held.node
     }
 
     fn typer(&self) -> Typer<'_> {
@@ -751,6 +1068,12 @@ impl<'m> Lowerer<'m> {
                 ty: ir(target),
                 ..v.node
             },
+            // None is the null dynamic value.
+            (Ty::None, Ty::Object) => node(
+                TypedExpression::Literal(TypedLiteral::Null),
+                Ty::Object,
+                span,
+            ),
             // Into the dynamic world: a box. Out of it: a checked read.
             (_, Ty::Object) => cast(v.node, Ty::Object, span),
             (Ty::Object, _) => cast(v.node, target, span),
@@ -919,11 +1242,54 @@ impl<'m> Lowerer<'m> {
     }
 
     fn stmt(&mut self, s: &py::Stmt, out: &mut Vec<Stmt>) -> Result<()> {
+        let raised_before = self.raised;
+        self.raised = false;
         let mut own = Vec::new();
         self.stmt_into(s, &mut own)?;
         // Whatever the statement's expressions hoisted runs first.
         out.append(&mut self.hoisted);
         out.append(&mut own);
+        // A check inside a loop left that loop; inside a `try`, the
+        // statement after the loop leaves the next.
+        if self.raised
+            && matches!(s, py::Stmt::For(_) | py::Stmt::While(_))
+            && self.escapes.last() == Some(&Escape::Break)
+        {
+            let check = self.pending_check(span_of(s));
+            out.push(check);
+        }
+        // Likewise a `return`, `break` or `continue` recorded inside a
+        // loop: leave this level too.
+        if self.redirected && matches!(s, py::Stmt::For(_) | py::Stmt::While(_)) {
+            if let Some(ctl) = self.try_ctls.last() {
+                let flag = ctl.flag;
+                let sp = span_of(s);
+                out.push(TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(binary(
+                            BinaryOp::Ne,
+                            var(flag, Ty::Int, sp),
+                            int_lit(0, sp),
+                            Ty::Bool,
+                            sp,
+                        )),
+                        then_block: TypedBlock {
+                            statements: vec![TypedNode::new(
+                                TypedStatement::Break(None),
+                                Type::Unknown,
+                                sp,
+                            )],
+                            span: sp,
+                        },
+                        else_block: None,
+                        span: sp,
+                    }),
+                    Type::Unknown,
+                    sp,
+                ));
+            }
+        }
+        self.raised |= raised_before;
         Ok(())
     }
 
@@ -954,7 +1320,7 @@ impl<'m> Lowerer<'m> {
                         Some(Box::new(self.coerce(none, ret)))
                     }
                 };
-                push(out, TypedStatement::Return(value));
+                self.emit_return(value.map(|b| *b), span, out);
             }
             py::Stmt::Expr(e) => {
                 let v = self.expr(&e.value)?;
@@ -983,24 +1349,68 @@ impl<'m> Lowerer<'m> {
                 self.bind(&a.target, combined, span, out)?;
             }
             py::Stmt::If(i) => {
-                let st = self.if_chain(&i.test, &i.body, &i.elif_else_clauses, span)?;
-                push(out, st);
+                self.if_chain(&i.test, &i.body, &i.elif_else_clauses, span, out)?;
             }
             py::Stmt::While(w) => {
                 if !w.orelse.is_empty() {
                     return unsupported("while/else", w);
                 }
                 let cond = self.expr(&w.test)?;
-                let condition = Box::new(self.truthy(cond));
-                let body = self.block(&w.body, span)?;
-                push(
-                    out,
-                    TypedStatement::While(TypedWhile {
-                        condition,
-                        body,
+                let condition = self.truthy(cond);
+                // A test that hoists work re-does it every pass: the loop
+                // becomes `while true { work; if not test: break; body }`.
+                let pre = std::mem::take(&mut self.hoisted);
+                let body = self.in_loop(|this| this.block(&w.body, span))?;
+                if pre.is_empty() {
+                    push(
+                        out,
+                        TypedStatement::While(TypedWhile {
+                            condition: Box::new(condition),
+                            body,
+                            span,
+                        }),
+                    );
+                } else {
+                    let mut statements = pre;
+                    let stop = node(
+                        TypedExpression::Unary(TypedUnary {
+                            op: UnaryOp::Not,
+                            operand: Box::new(condition),
+                        }),
+                        Ty::Bool,
                         span,
-                    }),
-                );
+                    );
+                    statements.push(TypedNode::new(
+                        TypedStatement::If(TypedIf {
+                            condition: Box::new(stop),
+                            then_block: TypedBlock {
+                                statements: vec![TypedNode::new(
+                                    TypedStatement::Break(None),
+                                    Type::Unknown,
+                                    span,
+                                )],
+                                span,
+                            },
+                            else_block: None,
+                            span,
+                        }),
+                        Type::Unknown,
+                        span,
+                    ));
+                    statements.extend(body.statements);
+                    push(
+                        out,
+                        TypedStatement::While(TypedWhile {
+                            condition: Box::new(node(
+                                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                                Ty::Bool,
+                                span,
+                            )),
+                            body: TypedBlock { statements, span },
+                            span,
+                        }),
+                    );
+                }
             }
             py::Stmt::For(f) => {
                 let st = self.for_loop(f, span)?;
@@ -1027,11 +1437,83 @@ impl<'m> Lowerer<'m> {
                             call("zb_any_delitem", vec![seq, key], Ty::None, span)
                         }
                     };
+                    let fallible = match &stmt.node {
+                        TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
+                        _ => false,
+                    };
                     push(out, TypedStatement::Expression(Box::new(stmt)));
+                    if fallible {
+                        let check = self.pending_check(span);
+                        out.push(check);
+                    }
                 }
             }
-            py::Stmt::Break(_) => push(out, TypedStatement::Break(None)),
-            py::Stmt::Continue(_) => push(out, TypedStatement::Continue),
+            py::Stmt::Break(_) => self.emit_loop_exit(2, span, out),
+            py::Stmt::Continue(_) => self.emit_loop_exit(3, span, out),
+            py::Stmt::Raise(r) => {
+                if r.cause.is_some() {
+                    return unsupported("raise ... from ...", r);
+                }
+                match &r.exc {
+                    None => {
+                        let Some(caught) = self.caught else {
+                            return unsupported("a bare `raise` outside an except clause", r);
+                        };
+                        let again = var(caught, Ty::Object, span);
+                        out.push(self.set_pending(again, span));
+                    }
+                    Some(e) => {
+                        // `raise E` with a bare class is `raise E()`.
+                        let value = match &**e {
+                            py::Expr::Name(n)
+                                if self.module.class_index.contains_key(n.id.as_str()) =>
+                            {
+                                let k = self.module.class_index[n.id.as_str()];
+                                self.construct(k, &[], &[], &**e, span)?
+                            }
+                            _ => self.expr(e)?,
+                        };
+                        let boxed = self.coerce(value, Ty::Object);
+                        out.push(self.set_pending(boxed, span));
+                    }
+                }
+                self.raised = true;
+                out.push(self.escape(span));
+            }
+            py::Stmt::Assert(a) => {
+                let test = self.expr(&a.test)?;
+                let cond = self.truthy(test);
+                let message = match &a.msg {
+                    Some(m) => {
+                        let v = self.expr(m)?;
+                        self.str_of(v)
+                    }
+                    None => str_lit("", span),
+                };
+                let mut raise = Vec::new();
+                self.raise_named("AssertionError", message, span, &mut raise);
+                let failed = node(
+                    TypedExpression::Unary(TypedUnary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(cond),
+                    }),
+                    Ty::Bool,
+                    span,
+                );
+                push(
+                    out,
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(failed),
+                        then_block: TypedBlock {
+                            statements: raise,
+                            span,
+                        },
+                        else_block: None,
+                        span,
+                    }),
+                );
+            }
+            py::Stmt::Try(t) => self.try_stmt(t, span, out)?,
             // Scope analysis already made the names module variables.
             py::Stmt::Global(_) => {}
             // The cells this body shares are already set up.
@@ -1103,11 +1585,19 @@ impl<'m> Lowerer<'m> {
                         )
                     }
                 };
+                let fallible = match &stmt.node {
+                    TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
+                    _ => false,
+                };
                 out.push(TypedNode::new(
                     TypedStatement::Expression(Box::new(stmt)),
                     Type::Unknown,
                     span,
                 ));
+                if fallible {
+                    let check = self.pending_check(span);
+                    out.push(check);
+                }
                 return Ok(());
             }
             // `a, b = value`: the value once, then each name an element.
@@ -1220,15 +1710,19 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
+    /// An `if` with its `elif`/`else` tail. What the test hoists runs
+    /// before the statement, in `out`, not inside a branch.
     fn if_chain(
         &mut self,
         test: &py::Expr,
         body: &[py::Stmt],
         rest: &[py::ElifElseClause],
         span: Span,
-    ) -> Result<TypedStatement> {
+        out: &mut Vec<Stmt>,
+    ) -> Result<()> {
         let cond = self.expr(test)?;
         let condition = Box::new(self.truthy(cond));
+        out.append(&mut self.hoisted);
         let then_block = self.block(body, span)?;
         let else_block = match rest.split_first() {
             None => None,
@@ -1236,9 +1730,10 @@ impl<'m> Lowerer<'m> {
                 let clause_span = span_of(clause);
                 match &clause.test {
                     Some(t) => {
-                        let inner = self.if_chain(t, &clause.body, tail, clause_span)?;
+                        let mut statements = Vec::new();
+                        self.if_chain(t, &clause.body, tail, clause_span, &mut statements)?;
                         Some(TypedBlock {
-                            statements: vec![TypedNode::new(inner, Type::Unknown, clause_span)],
+                            statements,
                             span: clause_span,
                         })
                     }
@@ -1246,12 +1741,17 @@ impl<'m> Lowerer<'m> {
                 }
             }
         };
-        Ok(TypedStatement::If(TypedIf {
-            condition,
-            then_block,
-            else_block,
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition,
+                then_block,
+                else_block,
+                span,
+            }),
+            Type::Unknown,
             span,
-        }))
+        ));
+        Ok(())
     }
 
     /// `seq[i]` for a sequence value and an int index already lowered.
@@ -1284,7 +1784,8 @@ impl<'m> Lowerer<'m> {
     ) -> Result<TypedStatement> {
         let seq = self.expr(&f.iter)?;
         let elem_ty = seq.ty.element().unwrap_or(Ty::Object);
-        let mut prologue = Vec::new();
+        // The iterator is evaluated once, before the loop.
+        let mut prologue = std::mem::take(&mut self.hoisted);
         let seq = match seq.ty {
             // A dynamic iterable is snapshotted into a list of objects,
             // and a dict iterates over a snapshot of its keys.
@@ -1320,9 +1821,12 @@ impl<'m> Lowerer<'m> {
         );
         let mut body = Vec::new();
         self.bind(&f.target, item, span, &mut body)?;
-        for s in &f.body {
-            self.stmt(s, &mut body)?;
-        }
+        self.in_loop(|this| -> Result<()> {
+            for s in &f.body {
+                this.stmt(s, &mut body)?;
+            }
+            Ok(())
+        })?;
         body.extend(extra);
         let loop_stmt = TypedStatement::For(TypedFor {
             pattern: Box::new(TypedNode::new(
@@ -1394,6 +1898,8 @@ impl<'m> Lowerer<'m> {
             ),
             _ => return unsupported("range() with more than three arguments", &*f.iter),
         };
+        // The bounds are evaluated once, before the loop.
+        let pre = std::mem::take(&mut self.hoisted);
         // The loop counts in the target itself when the target is a
         // plain int local; a shared, global or object-typed target is
         // assigned from a hidden counter each time round.
@@ -1417,12 +1923,15 @@ impl<'m> Lowerer<'m> {
             };
             self.bind(&f.target, counter, span, &mut statements)?;
         }
-        for s in &f.body {
-            self.stmt(s, &mut statements)?;
-        }
+        self.in_loop(|this| -> Result<()> {
+            for s in &f.body {
+                this.stmt(s, &mut statements)?;
+            }
+            Ok(())
+        })?;
         statements.extend(extra);
         let body = TypedBlock { statements, span };
-        Ok(TypedStatement::For(TypedFor {
+        let loop_stmt = TypedStatement::For(TypedFor {
             pattern: Box::new(TypedNode::new(
                 TypedPattern::Identifier {
                     name,
@@ -1451,12 +1960,46 @@ impl<'m> Lowerer<'m> {
                 span_of(&*f.iter),
             )),
             body,
-        }))
+        });
+        if pre.is_empty() {
+            return Ok(loop_stmt);
+        }
+        let mut statements = pre;
+        statements.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+        Ok(TypedStatement::Block(TypedBlock { statements, span }))
     }
 
     // ─── Expressions ────────────────────────────────────────────────
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
+        let v = self.expr_unchecked(e)?;
+        // A library call that can raise is checked before its value is
+        // used, wherever the lowering above produced it.
+        let fallible = match &v.node.node {
+            TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
+            TypedExpression::Cast(c) => match &c.expr.node {
+                TypedExpression::Call(inner) => self.is_fallible_callee(&inner.callee),
+                _ => false,
+            },
+            _ => false,
+        };
+        if fallible {
+            let span = v.node.span;
+            return Ok(self.guard(v, span));
+        }
+        Ok(v)
+    }
+
+    fn is_fallible_callee(&self, callee: &Node) -> bool {
+        match &callee.node {
+            TypedExpression::Variable(n) => n
+                .resolve_global()
+                .is_some_and(|name| self.module.fallible.contains(&name)),
+            _ => false,
+        }
+    }
+
+    fn expr_unchecked(&mut self, e: &py::Expr) -> Result<Val> {
         let span = span_of(e);
         let ty = self.ty_of(e);
         let lit = |x: TypedExpression, ty: Ty| Val {
@@ -1533,8 +2076,22 @@ impl<'m> Lowerer<'m> {
             py::Expr::If(i) => {
                 let cond = self.expr(&i.test)?;
                 let condition = self.truthy(cond);
-                let then_branch = self.expr_as(&i.body, ty)?;
-                let else_branch = self.expr_as(&i.orelse, ty)?;
+                // What a branch hoists runs only when that branch does.
+                let outer = std::mem::take(&mut self.hoisted);
+                let then_value = self.expr_as(&i.body, ty)?;
+                let then_pre = std::mem::take(&mut self.hoisted);
+                let else_value = self.expr_as(&i.orelse, ty)?;
+                let else_pre = std::mem::replace(&mut self.hoisted, outer);
+                let then_branch = if then_pre.is_empty() {
+                    then_value
+                } else {
+                    Self::block_value(then_pre, then_value, ty, span)
+                };
+                let else_branch = if else_pre.is_empty() {
+                    else_value
+                } else {
+                    Self::block_value(else_pre, else_value, ty, span)
+                };
                 Val {
                     node: node(
                         TypedExpression::If(TypedIfExpr {
@@ -1819,6 +2376,12 @@ impl<'m> Lowerer<'m> {
         };
         let l = self.coerce(left, operand_ty);
         let r = self.coerce(right, operand_ty);
+        let r = if operand_ty == Ty::Int && matches!(op, py::Operator::FloorDiv | py::Operator::Mod)
+        {
+            self.nonzero(r, span)
+        } else {
+            r
+        };
         let bin = match op {
             py::Operator::Add => BinaryOp::Add,
             py::Operator::Sub => BinaryOp::Sub,
@@ -2179,8 +2742,22 @@ impl<'m> Lowerer<'m> {
     fn bool_op(&mut self, b: &py::ExprBoolOp, ty: Ty, span: Span) -> Result<Val> {
         let is_and = b.op == py::BoolOp::And;
         let mut vals = Vec::with_capacity(b.values.len());
-        for v in &b.values {
-            vals.push(self.expr(v)?);
+        for (i, v) in b.values.iter().enumerate() {
+            // What a later operand hoists must run only if it is reached,
+            // so it stays inside the operand as a block.
+            let outer = std::mem::take(&mut self.hoisted);
+            let val = self.expr(v)?;
+            let mine = std::mem::replace(&mut self.hoisted, outer);
+            if i == 0 || mine.is_empty() {
+                self.hoisted.extend(mine);
+                vals.push(val);
+            } else {
+                let ty = val.ty;
+                vals.push(Val {
+                    node: Self::block_value(mine, val.node, ty, span),
+                    ty,
+                });
+            }
         }
         if ty == Ty::Bool {
             let op = if is_and { BinaryOp::And } else { BinaryOp::Or };
@@ -2703,10 +3280,11 @@ impl<'m> Lowerer<'m> {
             }
             if let Some(sig) = self.module.funcs.get(name).cloned() {
                 let lowered = self.arguments(name, &sig, args, keywords, c)?;
-                return Ok(Val {
+                let v = Val {
                     node: call(name, lowered, sig.ret, span),
                     ty: sig.ret,
-                });
+                };
+                return Ok(self.guard(v, span));
             }
             if name == "print" {
                 return self.print(args, keywords, span);
@@ -3041,9 +3619,12 @@ impl<'m> Lowerer<'m> {
                 "divmod" if args.len() == 2 => {
                     let a = self.expr(&args[0])?;
                     let b = self.expr(&args[1])?;
+                    // Both operands are held before either operation, and
+                    // what the operations hoist follows them.
                     let mut statements = Vec::new();
                     let a = self.hold(a, &mut statements, span);
                     let b = self.hold(b, &mut statements, span);
+                    self.hoisted.extend(statements);
                     let q = self.arithmetic(
                         py::Operator::FloorDiv,
                         Val {
@@ -3059,12 +3640,11 @@ impl<'m> Lowerer<'m> {
                     )?;
                     let r = self.arithmetic(py::Operator::Mod, a, b, &args[1], span)?;
                     let pair = self.list_of(vec![q, r], Elem::Object, span);
-                    let value = Node {
-                        ty: ir(Ty::Tuple),
-                        ..pair
-                    };
                     return Ok(Val {
-                        node: Self::block_value(statements, value, Ty::Tuple, span),
+                        node: Node {
+                            ty: ir(Ty::Tuple),
+                            ..pair
+                        },
                         ty: Ty::Tuple,
                     });
                 }
@@ -3207,6 +3787,380 @@ impl<'m> Lowerer<'m> {
 
     /// `print(a, b, ...)`: each argument as `str()`, a space between,
     /// one line written.
+    /// `try` / `except` / `else` / `finally`.
+    ///
+    /// The body runs in a loop of one pass that a pending exception
+    /// breaks out of. After it, the handlers match the pending exception
+    /// in order; the first match clears it and runs. `else` runs when
+    /// nothing was raised, `finally` always, and whatever is still
+    /// pending afterwards leaves the way the enclosing context does.
+    fn try_stmt(&mut self, t: &py::StmtTry, span: Span, out: &mut Vec<Stmt>) -> Result<()> {
+        if t.is_star {
+            return unsupported("except*", t);
+        }
+        // The body's control flag and, when the function returns a
+        // value, the slot a `return` inside the body parks it in.
+        let flag = self.temp();
+        out.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: flag,
+                ty: ir(Ty::Int),
+                mutability: Mutability::Mutable,
+                initializer: Some(Box::new(int_lit(0, span))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let ret_slot = match self.placeholder(span) {
+            Some(zero) => {
+                let slot = self.temp();
+                out.push(TypedNode::new(
+                    TypedStatement::Let(TypedLet {
+                        name: slot,
+                        ty: ir(self.sig.ret),
+                        mutability: Mutability::Mutable,
+                        initializer: Some(Box::new(zero)),
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+                Some(slot)
+            }
+            None => None,
+        };
+        let redirected_before = self.redirected;
+        self.redirected = false;
+        self.try_ctls.push(TryCtl {
+            flag,
+            ret: ret_slot,
+            loop_depth: 0,
+        });
+        self.escapes.push(Escape::Break);
+        let mut body = Vec::new();
+        for s in &t.body {
+            self.stmt(s, &mut body)?;
+        }
+        self.escapes.pop();
+        self.try_ctls.pop();
+        let body_redirected = self.redirected;
+        self.redirected = redirected_before;
+        body.push(TypedNode::new(
+            TypedStatement::Break(None),
+            Type::Unknown,
+            span,
+        ));
+        out.push(one_pass(body, span));
+        // Whether anything was raised, before a handler clears it.
+        let raised = self.temp();
+        let pending_now = self.pending(span);
+        out.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: raised,
+                ty: ir(Ty::Bool),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(pending_now)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        // Handlers, first match wins. What matching hoists is computed
+        // here, after the body, not before the statement.
+        let mut chain: Option<Stmt> = None;
+        let mut before_chain = Vec::new();
+        for h in t.handlers.iter().rev() {
+            let py::ExceptHandler::ExceptHandler(h) = h;
+            let hspan = span_of(h);
+            let outer_hoisted = std::mem::take(&mut self.hoisted);
+            let matches = match h.type_.as_deref() {
+                None => node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    Ty::Bool,
+                    hspan,
+                ),
+                Some(py::Expr::Tuple(classes)) => {
+                    let mut any: Option<Node> = None;
+                    for c in &classes.elts {
+                        let this = self.exception_matches(c, hspan)?;
+                        any = Some(match any {
+                            None => this,
+                            Some(prev) => binary(BinaryOp::Or, prev, this, Ty::Bool, hspan),
+                        });
+                    }
+                    any.unwrap_or_else(|| {
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(false)),
+                            Ty::Bool,
+                            hspan,
+                        )
+                    })
+                }
+                Some(c) => self.exception_matches(c, hspan)?,
+            };
+            let mut hoisted_now = std::mem::replace(&mut self.hoisted, outer_hoisted);
+            before_chain.append(&mut hoisted_now);
+            let mut handler = Vec::new();
+            // The exception as the handler names it, then cleared.
+            let saved_caught = self.caught;
+            let caught_name = self.temp();
+            handler.push(TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: caught_name,
+                    ty: ir(Ty::Object),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(var(intern(PENDING), Ty::Object, hspan))),
+                    span: hspan,
+                }),
+                Type::Unknown,
+                hspan,
+            ));
+            self.caught = Some(caught_name);
+            if let Some(name) = &h.name {
+                let ty = self.var_ty(name.as_str());
+                let value = Val {
+                    node: var(caught_name, Ty::Object, hspan),
+                    ty: Ty::Object,
+                };
+                let target = py::Expr::Name(py::ExprName {
+                    node_index: Default::default(),
+                    range: name.range(),
+                    id: name.id.clone(),
+                    ctx: py::ExprContext::Store,
+                });
+                let value = Val {
+                    node: self.coerce(value, ty),
+                    ty,
+                };
+                self.bind(&target, value, hspan, &mut handler)?;
+            }
+            let none = Val {
+                node: node(
+                    TypedExpression::Literal(TypedLiteral::Null),
+                    Ty::None,
+                    hspan,
+                ),
+                ty: Ty::None,
+            };
+            let cleared = self.coerce(none, Ty::Object);
+            handler.push(self.set_pending(cleared, hspan));
+            for s in &h.body {
+                self.stmt(s, &mut handler)?;
+            }
+            self.caught = saved_caught;
+            chain = Some(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(matches),
+                    then_block: TypedBlock {
+                        statements: handler,
+                        span: hspan,
+                    },
+                    else_block: chain.map(|c| TypedBlock {
+                        statements: vec![c],
+                        span: hspan,
+                    }),
+                    span: hspan,
+                }),
+                Type::Unknown,
+                hspan,
+            ));
+        }
+        let mut orelse = Vec::new();
+        for s in &t.orelse {
+            self.stmt(s, &mut orelse)?;
+        }
+        if chain.is_some() || !orelse.is_empty() {
+            out.extend(before_chain);
+            out.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(var(raised, Ty::Bool, span)),
+                    then_block: TypedBlock {
+                        statements: chain.into_iter().collect(),
+                        span,
+                    },
+                    else_block: if orelse.is_empty() {
+                        None
+                    } else {
+                        Some(TypedBlock {
+                            statements: orelse,
+                            span,
+                        })
+                    },
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+        }
+        for s in &t.finalbody {
+            self.stmt(s, out)?;
+        }
+        // Whatever no handler took leaves with the enclosing context.
+        let check = self.pending_check(span);
+        out.push(check);
+        // What the body asked for before it left.
+        if body_redirected {
+            for code in 1..=3 {
+                let mut action = Vec::new();
+                match code {
+                    1 => {
+                        let value = ret_slot.map(|slot| var(slot, self.sig.ret, span));
+                        self.emit_return(value, span, &mut action);
+                    }
+                    _ => self.emit_loop_exit(code, span, &mut action),
+                }
+                out.push(TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(binary(
+                            BinaryOp::Eq,
+                            var(flag, Ty::Int, span),
+                            int_lit(code, span),
+                            Ty::Bool,
+                            span,
+                        )),
+                        then_block: TypedBlock {
+                            statements: action,
+                            span,
+                        },
+                        else_block: None,
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the pending exception is an instance of the class named.
+    fn exception_matches(&mut self, class: &py::Expr, span: Span) -> Result<Node> {
+        let py::Expr::Name(n) = class else {
+            return unsupported(
+                "an except clause naming something other than a class",
+                class,
+            );
+        };
+        if !self.module.class_index.contains_key(n.id.as_str()) {
+            return unsupported(format!("except {}, which is not a class", n.id), class);
+        }
+        let pending = Val {
+            node: var(intern(PENDING), Ty::Object, span),
+            ty: Ty::Object,
+        };
+        let v = self.isinstance(pending, class, span)?;
+        Ok(v.node)
+    }
+
+    /// The entry function's statements: the module body in a loop of one
+    /// pass, then a report of whatever exception nothing caught.
+    pub(crate) fn entry_body(&mut self, stmts: &[&py::Stmt]) -> Result<Vec<Stmt>> {
+        let span = stmts
+            .first()
+            .map(|s| span_of(*s))
+            .unwrap_or(Span::new(0, 0));
+        self.escapes.push(Escape::Break);
+        let mut body = self.body(stmts)?;
+        self.escapes.pop();
+        body.push(TypedNode::new(
+            TypedStatement::Break(None),
+            Type::Unknown,
+            span,
+        ));
+        let pending = || var(intern(PENDING), Ty::Object, span);
+        let eprint = |line: Node| {
+            TypedNode::new(
+                TypedStatement::Expression(Box::new(call(
+                    "zb_eprintln",
+                    vec![line],
+                    Ty::None,
+                    span,
+                ))),
+                Type::Unknown,
+                span,
+            )
+        };
+        // `Name: message`, or just `Name` when the message is empty.
+        let text_var = self.temp();
+        let kind = call("zb_any_type", vec![pending()], Ty::Str, span);
+        let line = binary(
+            BinaryOp::Add,
+            binary(
+                BinaryOp::Add,
+                kind.clone(),
+                str_lit(": ", span),
+                Ty::Str,
+                span,
+            ),
+            var(text_var, Ty::Str, span),
+            Ty::Str,
+            span,
+        );
+        let report = vec![
+            TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: text_var,
+                    ty: ir(Ty::Str),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(call("zb_any_str", vec![pending()], Ty::Str, span))),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ),
+            eprint(str_lit("Traceback (most recent call last):", span)),
+            TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(call(
+                        "zb_str_truthy",
+                        vec![var(text_var, Ty::Str, span)],
+                        Ty::Bool,
+                        span,
+                    )),
+                    then_block: TypedBlock {
+                        statements: vec![eprint(line)],
+                        span,
+                    },
+                    else_block: Some(TypedBlock {
+                        statements: vec![eprint(kind)],
+                        span,
+                    }),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ),
+            TypedNode::new(
+                TypedStatement::Expression(Box::new(call(
+                    "zb_exit",
+                    vec![int32_lit(1, span)],
+                    Ty::None,
+                    span,
+                ))),
+                Type::Unknown,
+                span,
+            ),
+        ];
+        let pending_now = self.pending(span);
+        Ok(vec![
+            one_pass(body, span),
+            TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(pending_now),
+                    then_block: TypedBlock {
+                        statements: report,
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ),
+        ])
+    }
+
     /// `isinstance(v, T)` for a type name or a class.
     fn isinstance(&mut self, v: Val, ty_expr: &py::Expr, span: Span) -> Result<Val> {
         let py::Expr::Name(n) = ty_expr else {
@@ -3356,10 +4310,11 @@ impl<'m> Lowerer<'m> {
             }
             Ty::Object => {
                 self.module.attr_reads.borrow_mut().insert(attr.to_string());
-                Ok(Val {
+                let v = Val {
                     node: call(&getattr_name(attr), vec![object.node], Ty::Object, span),
                     ty: Ty::Object,
-                })
+                };
+                Ok(self.guard(v, span))
             }
             other => Err(Error::Unsupported {
                 what: format!("attribute `{attr}` of a {other:?}"),
@@ -3502,9 +4457,10 @@ impl<'m> Lowerer<'m> {
         };
         let sig = without_self(sig);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
-        Ok(self
+        let v = self
             .invoke(k, method, receiver.node, lowered, span)
-            .expect("the method was just found"))
+            .expect("the method was just found");
+        Ok(self.guard(v, span))
     }
 
     /// `obj.m(args)` on a dynamic receiver: a dispatcher over every class
@@ -3524,10 +4480,11 @@ impl<'m> Lowerer<'m> {
             .dyn_methods
             .borrow_mut()
             .insert((method.to_string(), args.len()));
-        Ok(Val {
+        let v = Val {
             node: call(&callm_name(method, args.len()), lowered, Ty::Object, span),
             ty: Ty::Object,
-        })
+        };
+        Ok(self.guard(v, span))
     }
 
     /// `C(args)`: allocate, then `__init__`.
@@ -3536,24 +4493,25 @@ impl<'m> Lowerer<'m> {
         k: usize,
         args: &[py::Expr],
         keywords: &[py::Keyword],
-        c: &py::ExprCall,
+        at: &dyn Ranged,
         span: Span,
     ) -> Result<Val> {
         let name = self.module.classes[k].name.clone();
         let lowered = match self.module.method_sig(k, "__init__") {
             Some((sig, _)) => {
                 let sig = without_self(sig);
-                self.arguments(&name, &sig, args, keywords, c)?
+                self.arguments(&name, &sig, args, keywords, at)?
             }
             None if args.is_empty() && keywords.is_empty() => Vec::new(),
             None => {
-                return unsupported(format!("{name}() takes no arguments"), c);
+                return unsupported(format!("{name}() takes no arguments"), &at.range());
             }
         };
-        Ok(Val {
+        let v = Val {
             node: call(&new_name(&name), lowered, Ty::Class(k as u16), span),
             ty: Ty::Class(k as u16),
-        })
+        };
+        Ok(self.guard(v, span))
     }
 
     /// `super().m(args)`: the base class's method, on `self`.
@@ -3595,10 +4553,11 @@ impl<'m> Lowerer<'m> {
         let receiver = self.coerce(receiver, Ty::Class(owner as u16));
         let mut all = vec![receiver];
         all.extend(lowered);
-        Ok(Val {
+        let v = Val {
             node: call(&fn_name, all, ret, span),
             ty: ret,
-        })
+        };
+        Ok(self.guard(v, span))
     }
 
     /// A call through a function value: every argument boxed, the result
@@ -3627,7 +4586,7 @@ impl<'m> Lowerer<'m> {
         for a in args {
             lowered.push(self.expr_as(a, Ty::Object)?);
         }
-        Ok(Val {
+        let v = Val {
             node: call(
                 &format!("zb_call_{}", args.len()),
                 lowered,
@@ -3635,7 +4594,8 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             ty: Ty::Object,
-        })
+        };
+        Ok(self.guard(v, span))
     }
 
     /// A function record: the code address, the arity and the cells.
@@ -3861,7 +4821,7 @@ impl<'m> Lowerer<'m> {
         sig: &Sig,
         args: &[py::Expr],
         keywords: &[py::Keyword],
-        c: &py::ExprCall,
+        at: &dyn Ranged,
     ) -> Result<Vec<Node>> {
         let mut slots: Vec<Option<&py::Expr>> = vec![None; sig.params.len()];
         if args.len() > sig.params.len() {
@@ -3871,7 +4831,7 @@ impl<'m> Lowerer<'m> {
                     args.len(),
                     sig.params.len()
                 ),
-                c,
+                &at.range(),
             );
         }
         for (slot, a) in slots.iter_mut().zip(args) {
@@ -3900,7 +4860,7 @@ impl<'m> Lowerer<'m> {
                 (None, None) => {
                     return unsupported(
                         format!("calling `{name}` without its argument `{pname}`"),
-                        c,
+                        &at.range(),
                     )
                 }
             };

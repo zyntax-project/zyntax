@@ -15,6 +15,10 @@ fn any_eq(a: Expr, b: Expr) -> Expr {
 fn any_repr(x: Expr) -> Expr {
     call("zb_any_repr", vec![x], string())
 }
+/// A key as an error reports it; the frontend's KeyError quotes it.
+fn any_str(x: Expr) -> Expr {
+    call("zb_any_str", vec![x], string())
+}
 fn len(xs: Expr) -> Expr {
     mcall(xs, "len", vec![], i64())
 }
@@ -83,7 +87,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         any(),
         vec![
             i.decl(find(k.e())),
-            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_repr(k.e()))]),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(k.e()))]),
             ret(at(d.e(), add(i.e(), int(1)))),
         ],
     ));
@@ -133,7 +137,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     out_decls.push(define("zb_dict_del", &[&d, &k], unit(), {
         let mut s = vec![
             i.decl(find(k.e())),
-            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_repr(k.e()))]),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(k.e()))]),
         ];
         s.extend(remove_pair(&i));
         s.push(ret_void());
@@ -142,7 +146,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     out_decls.push(define("zb_dict_pop", &[&d, &k], any(), {
         let mut s = vec![
             i.decl(find(k.e())),
-            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_repr(k.e()))]),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(k.e()))]),
             v.decl(at(d.e(), add(i.e(), int(1)))),
         ];
         s.extend(remove_pair(&i));
@@ -370,7 +374,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         unit(),
         vec![
             i.decl(call("zb_list_index_or_neg_any", vec![s.e(), v.e()], i64())),
-            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_repr(v.e()))]),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(v.e()))]),
             expr(mcall(s.e(), "remove_at", vec![i.e()], any())),
             ret_void(),
         ],

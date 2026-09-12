@@ -1,11 +1,36 @@
 //! Printing, and ending the program on an error nothing can catch.
 
 use crate::build::*;
+use crate::Policy;
 
-pub(crate) fn declarations() -> Vec<Decl> {
+pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
     let s = local("s", string());
     let kind = local("kind", string());
     let message = local("message", string());
+    // A frontend with exceptions turns the error into one and gets
+    // control back; otherwise the program ends the way an uncaught
+    // exception ends it: the kind and message on stderr, and status 1.
+    let fatal_body = if policy.exceptions {
+        vec![
+            expr(call("zb_hook_raise", vec![kind.e(), message.e()], unit())),
+            ret_void(),
+        ]
+    } else {
+        vec![
+            expr(call(
+                "zb_eprintln",
+                vec![text("Traceback (most recent call last):")],
+                unit(),
+            )),
+            expr(call(
+                "zb_eprintln",
+                vec![add(add(kind.e(), text(": ")), message.e())],
+                unit(),
+            )),
+            expr(call("zb_exit", vec![int32(1)], unit())),
+            ret_void(),
+        ]
+    };
     vec![
         extern_fn(
             "zb_println",
@@ -45,27 +70,6 @@ pub(crate) fn declarations() -> Vec<Decl> {
             unit(),
             vec![expr(call("zb_print", vec![s.e()], unit())), ret_void()],
         ),
-        // An error with nothing to catch it ends the program the way an
-        // uncaught exception does: the kind and message on stderr, and
-        // status 1.
-        define(
-            "zb_fatal",
-            &[&kind, &message],
-            unit(),
-            vec![
-                expr(call(
-                    "zb_eprintln",
-                    vec![text("Traceback (most recent call last):")],
-                    unit(),
-                )),
-                expr(call(
-                    "zb_eprintln",
-                    vec![add(add(kind.e(), text(": ")), message.e())],
-                    unit(),
-                )),
-                expr(call("zb_exit", vec![int32(1)], unit())),
-                ret_void(),
-            ],
-        ),
+        define("zb_fatal", &[&kind, &message], unit(), fatal_body),
     ]
 }
