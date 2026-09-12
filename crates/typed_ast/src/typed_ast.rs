@@ -689,6 +689,11 @@ pub enum BinaryOp {
     MatMul,
     Div,
     Rem,
+    /// Division rounding toward negative infinity.
+    FloorDiv,
+    /// Remainder with the divisor's sign, so `a == b * (a floordiv b) + (a floorrem b)`.
+    FloorRem,
+    Pow,
     // Comparison
     Eq,
     Ne,

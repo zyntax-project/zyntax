@@ -2590,6 +2590,13 @@ impl CraneliftBackend {
                                                 continue; // Skip if no argument
                                             }
                                         }
+                                        Intrinsic::Floor => {
+                                            if let Some(&arg) = arg_values.first() {
+                                                builder.ins().floor(arg)
+                                            } else {
+                                                continue;
+                                            }
+                                        }
                                         Intrinsic::Fma => {
                                             if arg_values.len() == 3 {
                                                 builder.ins().fma(
@@ -7562,6 +7569,18 @@ impl CraneliftBackend {
                                 } else {
                                     return Err(CompilerError::Backend(
                                         "fabs requires 1 argument".into(),
+                                    ));
+                                }
+                            }
+                            crate::hir::Intrinsic::Floor => {
+                                if args.len() == 1 {
+                                    let floor_val = builder.ins().floor(arg_vals[0]);
+                                    if let Some(result_id) = result {
+                                        self.value_map.insert(*result_id, floor_val);
+                                    }
+                                } else {
+                                    return Err(CompilerError::Backend(
+                                        "floor requires 1 argument".into(),
                                     ));
                                 }
                             }

@@ -158,6 +158,7 @@ fn is_pure_intrinsic(i: &Intrinsic) -> bool {
         Intrinsic::Sqrt
             | Intrinsic::Rsqrt
             | Intrinsic::Fabs
+            | Intrinsic::Floor
             | Intrinsic::Fma
             | Intrinsic::Sin
             | Intrinsic::Cos

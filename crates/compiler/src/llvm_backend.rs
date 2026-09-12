@@ -4592,6 +4592,35 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
 
+            Floor => {
+                if args.len() != 1 {
+                    return Err(CompilerError::CodeGen(
+                        format!("floor expects 1 argument, got {}", args.len())
+                    ));
+                }
+
+                let value = self.get_value(args[0])?;
+                let intrinsic_name = if value.is_float_value() {
+                    if value.into_float_value().get_type() == self.context.f32_type() {
+                        "llvm.floor.f32"
+                    } else {
+                        "llvm.floor.f64"
+                    }
+                } else {
+                    return Err(CompilerError::CodeGen(
+                        "floor requires float argument".to_string()
+                    ));
+                };
+
+                let floor_fn = self.get_or_declare_intrinsic(intrinsic_name, value.get_type())?;
+                let call_site = self.builder.build_call(floor_fn, &[value.into()], "floor")?;
+
+                match call_site.try_as_basic_value() {
+                    ValueKind::Basic(val) => Ok(val),
+                    ValueKind::Instruction(_) => Err(CompilerError::CodeGen("floor returned void".to_string()))
+                }
+            }
+
             Fma => {
                 // Fused multiply-add: `fma(a, b, c) = a * b + c` with a
                 // single IEEE-754 round. Emitted by the `fma_contract`

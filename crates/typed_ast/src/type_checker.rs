@@ -1432,7 +1432,7 @@ impl TypeChecker {
         use BinaryOp::*;
         match bin.op {
             // Arithmetic operators
-            Add | Sub | Mul | MatMul | Div | Rem => {
+            Add | Sub | Mul | MatMul | Div | Rem | FloorDiv | FloorRem | Pow => {
                 self.inference.unify(left_ty.clone(), right_ty)?;
                 Ok(left_ty)
             }

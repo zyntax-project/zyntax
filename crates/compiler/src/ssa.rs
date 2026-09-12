@@ -3858,8 +3858,9 @@ impl SsaBuilder {
                         Type::Primitive(zyntax_typed_ast::PrimitiveType::String)
                     )
                 {
-                    let left_val = self.translate_expression(block_id, left)?;
-                    let right_val = self.translate_expression(block_id, right)?;
+                    let mut cur = block_id;
+                    let left_val = self.translate_operand(&mut cur, left)?;
+                    let right_val = self.translate_operand(&mut cur, right)?;
                     let result = self.create_value(
                         HirType::Ptr(Box::new(HirType::I8)),
                         HirValueKind::Instruction,
@@ -3872,13 +3873,16 @@ impl SsaBuilder {
                         const_args: vec![],
                         is_tail: false,
                     };
-                    self.add_instruction(block_id, call_inst);
+                    self.add_instruction(cur, call_inst);
+                    self.settle(block_id, cur);
                     return Ok(result);
                 }
 
                 // Regular binary operations for primitive types
-                let left_val = self.translate_expression(block_id, left)?;
-                let right_val = self.translate_expression(block_id, right)?;
+                let started = block_id;
+                let mut block_id = block_id;
+                let left_val = self.translate_operand(&mut block_id, left)?;
+                let right_val = self.translate_operand(&mut block_id, right)?;
 
                 // First-class SIMD: when either lowered operand is a
                 // vector register this is element-wise vector
@@ -3898,8 +3902,18 @@ impl SsaBuilder {
                     if let Some(result) =
                         self.emit_vector_binary(block_id, op, left_val, right_val)?
                     {
+                        self.settle(started, block_id);
                         return Ok(result);
                     }
+                }
+
+                if matches!(
+                    op,
+                    FrontendOp::FloorDiv | FrontendOp::FloorRem | FrontendOp::Pow
+                ) {
+                    let result = self.emit_floor_or_pow(&mut block_id, op, left_val, right_val);
+                    self.settle(started, block_id);
+                    return Ok(result);
                 }
 
                 let result_type = self.convert_type(&expr.ty);
@@ -4103,6 +4117,7 @@ impl SsaBuilder {
                 self.add_instruction(block_id, inst);
                 self.add_use(left_val, result);
                 self.add_use(right_val, result);
+                self.settle(started, block_id);
 
                 Ok(result)
             }
@@ -4128,13 +4143,63 @@ impl SsaBuilder {
                 }
 
                 // Regular unary operations for primitive types
-                let operand_val = self.translate_expression(block_id, operand)?;
-                // For unary ops, result type = operand type (e.g., -int → int)
-                // Use operand type when expression type is Unknown/Any
-                let result_type = if matches!(expr.ty, Type::Unknown | Type::Any) {
-                    self.convert_type(&operand_with_type.ty)
-                } else {
-                    self.convert_type(&expr.ty)
+                let started = block_id;
+                let mut block_id = block_id;
+                let operand_val = self.translate_operand(&mut block_id, operand)?;
+                let operand_hir_ty = self
+                    .function
+                    .values
+                    .get(&operand_val)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or_else(|| self.convert_type(&operand_with_type.ty));
+
+                // `+x` is `x`.
+                if matches!(op, zyntax_typed_ast::typed_ast::UnaryOp::Plus) {
+                    self.settle(started, block_id);
+                    return Ok(operand_val);
+                }
+
+                // Logical not is a question about the value, not its bits:
+                // a bool flips, a number asks whether it is zero. HIR `Not`
+                // is the bitwise complement and stays for `BitNot`.
+                if matches!(op, zyntax_typed_ast::typed_ast::UnaryOp::Not) {
+                    let (bin_op, zero) = match &operand_hir_ty {
+                        HirType::Bool => (crate::hir::BinaryOp::Xor, HirConstant::Bool(true)),
+                        HirType::F32 | HirType::F64 => (
+                            crate::hir::BinaryOp::FEq,
+                            default_const_for(&operand_hir_ty),
+                        ),
+                        _ => (crate::hir::BinaryOp::Eq, default_const_for(&operand_hir_ty)),
+                    };
+                    let rhs =
+                        self.create_value(operand_hir_ty.clone(), HirValueKind::Constant(zero));
+                    let result = self.create_value(HirType::Bool, HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Binary {
+                            op: bin_op,
+                            result,
+                            ty: operand_hir_ty,
+                            left: operand_val,
+                            right: rhs,
+                        },
+                    );
+                    self.add_use(operand_val, result);
+                    self.settle(started, block_id);
+                    return Ok(result);
+                }
+
+                // Negation and complement keep the operand's type; the
+                // typed AST's guess is used only when the operand has none.
+                let result_type = match &operand_hir_ty {
+                    HirType::Void | HirType::Opaque(_) => {
+                        if matches!(expr.ty, Type::Unknown | Type::Any) {
+                            self.convert_type(&operand_with_type.ty)
+                        } else {
+                            self.convert_type(&expr.ty)
+                        }
+                    }
+                    ty => ty.clone(),
                 };
 
                 let hir_op = self.convert_unary_op(op);
@@ -4149,6 +4214,7 @@ impl SsaBuilder {
 
                 self.add_instruction(block_id, inst);
                 self.add_use(operand_val, result);
+                self.settle(started, block_id);
 
                 Ok(result)
             }
@@ -4769,11 +4835,13 @@ impl SsaBuilder {
                 };
 
                 // Translate arguments — flatten array literals for arity-dispatched calls
+                let started = block_id;
+                let mut block_id = block_id;
                 let mut arg_vals = Vec::new();
                 if arity_dispatched && args.len() == 1 {
                     if let TypedExpression::Array(elements) = &args[0].node {
                         for elem in elements {
-                            arg_vals.push(self.translate_expression(block_id, elem)?);
+                            arg_vals.push(self.translate_operand(&mut block_id, elem)?);
                         }
                     }
                 } else {
@@ -4785,12 +4853,17 @@ impl SsaBuilder {
                     // parameter list lines up one-to-one with the
                     // arguments, so an implicit receiver or a
                     // defaulted tail leaves the values untouched.
-                    // The print and formatting helpers read an argument
-                    // as a raw word plus the signature they registered,
-                    // so their `Any` parameter is not a box and handing
-                    // them one prints the pointer. The `__name__`
-                    // spelling marks the ones the compiler synthesises.
+                    // An extern bound to a runtime symbol is marshalled
+                    // against the signature that symbol registered, by
+                    // the backend, so its `Any` parameter is not a box
+                    // here and handing it one would box twice. The
+                    // `__name__` spelling marks the ones the compiler
+                    // synthesises; the print names cover the aliases a
+                    // prelude declares without a link name of their own.
                     let takes_raw_dynamic = callee_func_key.is_some_and(|key| {
+                        if self.extern_link_names.contains_key(&key) {
+                            return true;
+                        }
                         let name = key.resolve_global().unwrap_or_default();
                         name.starts_with("__")
                             || matches!(
@@ -4813,7 +4886,7 @@ impl SsaBuilder {
                         if let Some(params) = &declared_params {
                             self.expected_elem_ty = self.declared_element_type(&params[i]);
                         }
-                        let value = self.translate_expression(block_id, arg);
+                        let value = self.translate_operand(&mut block_id, arg);
                         self.expected_elem_ty = saved_expected;
                         let value = value?;
                         let value = match &declared_params {
@@ -4855,7 +4928,7 @@ impl SsaBuilder {
                             let idx = arg_vals.len();
                             if let Some(default_expr) = &non_self_params[idx].default_value {
                                 let default_val =
-                                    self.translate_expression(block_id, default_expr)?;
+                                    self.translate_operand(&mut block_id, default_expr)?;
                                 arg_vals.push(default_val);
                             } else {
                                 break; // No more defaults available
@@ -4937,6 +5010,7 @@ impl SsaBuilder {
                 for arg in &arg_vals {
                     self.add_use(*arg, result_or_void);
                 }
+                self.settle(started, block_id);
 
                 Ok(result_or_void)
             }
@@ -6281,7 +6355,9 @@ impl SsaBuilder {
             }
 
             TypedExpression::Cast(cast) => {
-                let operand_val = self.translate_expression(block_id, &cast.expr)?;
+                let started = block_id;
+                let mut block_id = block_id;
+                let operand_val = self.translate_operand(&mut block_id, &cast.expr)?;
 
                 // Route the cast through the universal coercion
                 // funnel first. For Any↔T pairs the classifier picks
@@ -6296,6 +6372,7 @@ impl SsaBuilder {
                 let coerced =
                     self.emit_coercion(block_id, operand_val, &typed_source, &cast.target_type);
                 if coerced != operand_val {
+                    self.settle(started, block_id);
                     return Ok(coerced);
                 }
 
@@ -6329,6 +6406,7 @@ impl SsaBuilder {
                 );
 
                 self.add_use(operand_val, result);
+                self.settle(started, block_id);
                 Ok(result)
             }
 
@@ -6949,6 +7027,32 @@ impl SsaBuilder {
                 // Fallback for any remaining unhandled expressions
                 Ok(self.create_undef(self.convert_type(&expr.ty)))
             }
+        }
+    }
+
+    /// Translate a sub-expression and move `block` to where its
+    /// evaluation ended. An expression that creates control flow (a
+    /// conditional, a short-circuit, a match) finishes in a merge block
+    /// rather than the one it started in, and whatever its parent emits
+    /// next belongs there.
+    fn translate_operand(
+        &mut self,
+        block: &mut HirId,
+        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let value = self.translate_expression(*block, expr)?;
+        if let Some(cont) = self.continuation_block.take() {
+            *block = cont;
+        }
+        Ok(value)
+    }
+
+    /// Tell the parent where evaluation ended, when it moved. The
+    /// counterpart of `translate_operand`, for the expression that used
+    /// it.
+    fn settle(&mut self, started: HirId, ended: HirId) {
+        if ended != started {
+            self.continuation_block = Some(ended);
         }
     }
 
@@ -8873,6 +8977,11 @@ impl SsaBuilder {
         let op = match (&actual, &declared) {
             (HirType::F64, HirType::F32) => CastOp::FpTrunc,
             (HirType::F32, HirType::F64) => CastOp::FpExt,
+            // An integer initializer under a float annotation is a
+            // float from the binding on, the same as at a parameter.
+            (int, HirType::F32 | HirType::F64) if Self::int_type_width_and_sign(int).is_some() => {
+                return self.coerce_scalar_to(block_id, value, &declared);
+            }
             _ => return value,
         };
         let result = self.create_value(declared.clone(), HirValueKind::Instruction);
@@ -9980,6 +10089,294 @@ impl SsaBuilder {
     /// Scalar unary math method on a number (`x.sqrt()`, `x.abs()`) →
     /// a direct intrinsic call, so the hardware instruction is reached
     /// without a runtime call. Result keeps the receiver's type.
+    fn scalar_const(&mut self, ty: &HirType, c: HirConstant) -> HirId {
+        self.create_value(ty.clone(), HirValueKind::Constant(c))
+    }
+
+    fn scalar_one(&mut self, ty: &HirType) -> HirId {
+        let c = match ty {
+            HirType::I8 => HirConstant::I8(1),
+            HirType::I16 => HirConstant::I16(1),
+            HirType::I32 => HirConstant::I32(1),
+            HirType::U8 => HirConstant::U8(1),
+            HirType::U16 => HirConstant::U16(1),
+            HirType::U32 => HirConstant::U32(1),
+            HirType::U64 => HirConstant::U64(1),
+            HirType::F32 => HirConstant::F32(1.0),
+            HirType::F64 => HirConstant::F64(1.0),
+            _ => HirConstant::I64(1),
+        };
+        self.scalar_const(ty, c)
+    }
+
+    /// A binary instruction performed at `ty`; comparisons produce a Bool.
+    fn emit_bin(
+        &mut self,
+        block: HirId,
+        op: crate::hir::BinaryOp,
+        ty: &HirType,
+        left: HirId,
+        right: HirId,
+    ) -> HirId {
+        use crate::hir::BinaryOp as B;
+        let result_ty = match op {
+            B::Eq
+            | B::Ne
+            | B::Lt
+            | B::Le
+            | B::Gt
+            | B::Ge
+            | B::FEq
+            | B::FNe
+            | B::FLt
+            | B::FLe
+            | B::FGt
+            | B::FGe => HirType::Bool,
+            _ => ty.clone(),
+        };
+        let result = self.create_value(result_ty, HirValueKind::Instruction);
+        self.add_instruction(
+            block,
+            HirInstruction::Binary {
+                op,
+                result,
+                ty: ty.clone(),
+                left,
+                right,
+            },
+        );
+        self.add_use(left, result);
+        self.add_use(right, result);
+        result
+    }
+
+    fn emit_select(
+        &mut self,
+        block: HirId,
+        condition: HirId,
+        true_val: HirId,
+        false_val: HirId,
+        ty: &HirType,
+    ) -> HirId {
+        let result = self.create_value(ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block,
+            HirInstruction::Select {
+                result,
+                ty: ty.clone(),
+                condition,
+                true_val,
+                false_val,
+            },
+        );
+        self.add_use(condition, result);
+        self.add_use(true_val, result);
+        self.add_use(false_val, result);
+        result
+    }
+
+    fn emit_intrinsic(
+        &mut self,
+        block: HirId,
+        intrinsic: crate::hir::Intrinsic,
+        args: Vec<HirId>,
+        ty: &HirType,
+    ) -> HirId {
+        let result = self.create_value(ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block,
+            HirInstruction::Call {
+                result: Some(result),
+                callee: crate::hir::HirCallable::Intrinsic(intrinsic),
+                args: args.clone(),
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        for a in args {
+            self.add_use(a, result);
+        }
+        result
+    }
+
+    /// Whether a truncating remainder must be corrected to carry the
+    /// divisor's sign: it is nonzero and its sign differs from the
+    /// divisor's. Shared by floor division and floor remainder.
+    fn floor_correction_needed(
+        &mut self,
+        block: HirId,
+        rem: HirId,
+        divisor: HirId,
+        ty: &HirType,
+    ) -> HirId {
+        use crate::hir::BinaryOp as B;
+        let float = matches!(ty, HirType::F32 | HirType::F64);
+        let (ne, lt) = if float {
+            (B::FNe, B::FLt)
+        } else {
+            (B::Ne, B::Lt)
+        };
+        let zero = self.scalar_const(ty, default_const_for(ty));
+        let nonzero = self.emit_bin(block, ne, ty, rem, zero);
+        let rem_neg = self.emit_bin(block, lt, ty, rem, zero);
+        let div_neg = self.emit_bin(block, lt, ty, divisor, zero);
+        let differ = self.emit_bin(block, B::Xor, &HirType::Bool, rem_neg, div_neg);
+        self.emit_bin(block, B::And, &HirType::Bool, nonzero, differ)
+    }
+
+    /// `FloorDiv`, `FloorRem` and `Pow` on scalars, as the operands'
+    /// type decides. Floats go through the float ops and the `Floor`
+    /// and `Pow` intrinsics; integers through truncating division
+    /// corrected toward negative infinity, and square-and-multiply for
+    /// a power. An integer beside a float is converted to the float,
+    /// two integers of different width meet at the wider.
+    fn emit_floor_or_pow(
+        &mut self,
+        block: &mut HirId,
+        op: &zyntax_typed_ast::typed_ast::BinaryOp,
+        left: HirId,
+        right: HirId,
+    ) -> HirId {
+        use crate::hir::BinaryOp as B;
+        use zyntax_typed_ast::typed_ast::BinaryOp as FrontendOp;
+
+        let ty_of = |me: &Self, v: HirId| {
+            me.function
+                .values
+                .get(&v)
+                .map(|x| x.ty.clone())
+                .unwrap_or(HirType::I64)
+        };
+        let (lt, rt) = (ty_of(self, left), ty_of(self, right));
+        let float =
+            matches!(lt, HirType::F32 | HirType::F64) || matches!(rt, HirType::F32 | HirType::F64);
+        let (l, r, ty) = if float {
+            // The `Pow` intrinsic is a double-precision `pow`.
+            let wide = if matches!(op, FrontendOp::Pow)
+                || matches!(lt, HirType::F64)
+                || matches!(rt, HirType::F64)
+            {
+                HirType::F64
+            } else {
+                HirType::F32
+            };
+            let l = self.coerce_scalar_to(*block, left, &wide);
+            let r = self.coerce_scalar_to(*block, right, &wide);
+            (l, r, wide)
+        } else {
+            let (l, r) = self.normalize_int_binary_operands(*block, left, right);
+            let ty = ty_of(self, l);
+            (l, r, ty)
+        };
+        let b = *block;
+
+        match (op, float) {
+            (FrontendOp::FloorDiv, true) => {
+                let q = self.emit_bin(b, B::FDiv, &ty, l, r);
+                self.emit_intrinsic(b, crate::hir::Intrinsic::Floor, vec![q], &ty)
+            }
+            (FrontendOp::FloorRem, true) => {
+                let rem = self.emit_bin(b, B::FRem, &ty, l, r);
+                let fix = self.floor_correction_needed(b, rem, r, &ty);
+                let shifted = self.emit_bin(b, B::FAdd, &ty, rem, r);
+                self.emit_select(b, fix, shifted, rem, &ty)
+            }
+            (_, true) => self.emit_intrinsic(b, crate::hir::Intrinsic::Pow, vec![l, r], &ty),
+            (FrontendOp::FloorDiv, false) => {
+                let q = self.emit_bin(b, B::Div, &ty, l, r);
+                let rem = self.emit_bin(b, B::Rem, &ty, l, r);
+                let fix = self.floor_correction_needed(b, rem, r, &ty);
+                let one = self.scalar_one(&ty);
+                let q_less = self.emit_bin(b, B::Sub, &ty, q, one);
+                self.emit_select(b, fix, q_less, q, &ty)
+            }
+            (FrontendOp::FloorRem, false) => {
+                let rem = self.emit_bin(b, B::Rem, &ty, l, r);
+                let fix = self.floor_correction_needed(b, rem, r, &ty);
+                let shifted = self.emit_bin(b, B::Add, &ty, rem, r);
+                self.emit_select(b, fix, shifted, rem, &ty)
+            }
+            (_, false) => self.emit_int_pow(block, l, r, &ty),
+        }
+    }
+
+    /// `base ** exp` for integers by square-and-multiply, as a loop
+    /// carved out of the current block; `block` is left at the loop's
+    /// exit. A negative exponent yields 1: the integer result type has
+    /// no room for the fraction a language might want there.
+    fn emit_int_pow(&mut self, block: &mut HirId, base: HirId, exp: HirId, ty: &HirType) -> HirId {
+        use crate::hir::BinaryOp as B;
+
+        let pre = *block;
+        let header = HirId::new();
+        let body = HirId::new();
+        let exit = HirId::new();
+        for id in [header, body, exit] {
+            self.function.blocks.insert(id, HirBlock::new(id));
+            self.definitions.insert(id, IndexMap::new());
+        }
+
+        let one = self.scalar_one(ty);
+        let zero = self.scalar_const(ty, default_const_for(ty));
+
+        // Loop-carried values: the accumulator, the running square and
+        // what is left of the exponent.
+        let acc = self.create_value(ty.clone(), HirValueKind::Instruction);
+        let sq = self.create_value(ty.clone(), HirValueKind::Instruction);
+        let rest = self.create_value(ty.clone(), HirValueKind::Instruction);
+
+        let done = self.emit_bin(header, B::Le, ty, rest, zero);
+
+        let bit = self.emit_bin(body, B::And, ty, rest, one);
+        let odd = self.emit_bin(body, B::Ne, ty, bit, zero);
+        let times = self.emit_bin(body, B::Mul, ty, acc, sq);
+        let acc_next = self.emit_select(body, odd, times, acc, ty);
+        let sq_next = self.emit_bin(body, B::Mul, ty, sq, sq);
+        let rest_next = self.emit_bin(body, B::Shr, ty, rest, one);
+
+        {
+            let h = self.function.blocks.get_mut(&header).unwrap();
+            h.phis.push(HirPhi {
+                result: acc,
+                ty: ty.clone(),
+                incoming: vec![(one, pre), (acc_next, body)],
+            });
+            h.phis.push(HirPhi {
+                result: sq,
+                ty: ty.clone(),
+                incoming: vec![(base, pre), (sq_next, body)],
+            });
+            h.phis.push(HirPhi {
+                result: rest,
+                ty: ty.clone(),
+                incoming: vec![(exp, pre), (rest_next, body)],
+            });
+            h.predecessors = vec![pre, body];
+            h.successors = vec![exit, body];
+            h.terminator = HirTerminator::CondBranch {
+                condition: done,
+                true_target: exit,
+                false_target: body,
+            };
+        }
+        {
+            let p = self.function.blocks.get_mut(&pre).unwrap();
+            p.terminator = HirTerminator::Branch { target: header };
+            p.successors = vec![header];
+        }
+        {
+            let bd = self.function.blocks.get_mut(&body).unwrap();
+            bd.predecessors = vec![header];
+            bd.successors = vec![header];
+            bd.terminator = HirTerminator::Branch { target: header };
+        }
+        self.function.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
+
+        *block = exit;
+        acc
+    }
+
     pub(crate) fn emit_scalar_unary_intrinsic(
         &mut self,
         block_id: HirId,
@@ -11157,15 +11554,16 @@ impl SsaBuilder {
         }
     }
 
-    /// Convert unary operator
+    /// Convert a unary operator that keeps its operand's type. Logical
+    /// not and unary plus are lowered before this is asked; HIR `Not`
+    /// is the bitwise complement.
     fn convert_unary_op(&self, op: &zyntax_typed_ast::typed_ast::UnaryOp) -> crate::hir::UnaryOp {
         use crate::hir::UnaryOp as HirOp;
         use zyntax_typed_ast::typed_ast::UnaryOp as FrontendOp;
 
         match op {
-            FrontendOp::Minus => HirOp::Neg,
-            FrontendOp::Not => HirOp::Not,
-            _ => HirOp::Neg, // Default
+            FrontendOp::Minus | FrontendOp::Plus => HirOp::Neg,
+            FrontendOp::BitNot | FrontendOp::Not => HirOp::Not,
         }
     }
 

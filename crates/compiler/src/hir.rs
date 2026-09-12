@@ -2178,6 +2178,8 @@ pub enum Intrinsic {
     /// (Coulomb, gravity), and any `1/||x||` normalization.
     Rsqrt,
     Fabs,
+    /// Round toward negative infinity.
+    Floor,
     /// Fused multiply-add: `fma(a, b, c) = a * b + c` with a single
     /// IEEE-754 round at the end. Emitted by the `fma_contract` pass
     /// when it recognises an `fadd(fmul a b, c)` pattern.
