@@ -991,20 +991,33 @@ impl SsaBuilder {
         // Mark IDF placement as done - no new phis should be created after this
         self.idf_placement_done = true;
 
-        // CRITICAL: Propagate parameters to all blocks
-        // Parameters don't need phis (they're never reassigned), but they need to be
-        // available in all blocks. Copy them from entry block to all other blocks.
+        // Make each parameter visible in every block, but only one that
+        // is never written. A parameter that is assigned somewhere has
+        // its phis placed above, and a block below one of those must
+        // reach the parameter through the phi, by the ordinary
+        // predecessor walk, not through a copy of the entry value: the
+        // copy is found first and read as the current value, so a
+        // parameter decremented in a loop body reads as the original in
+        // the next iteration and the loop never ends.
+        let written: std::collections::HashSet<InternedString> = self
+            .scan_cfg_for_variable_writes(cfg)
+            .into_values()
+            .flatten()
+            .collect();
         let param_defs: Vec<_> = self
             .definitions
             .get(&entry_block)
-            .map(|defs| defs.iter().map(|(&var, &val)| (var, val)).collect())
+            .map(|defs| {
+                defs.iter()
+                    .filter(|(var, _)| !written.contains(*var))
+                    .map(|(&var, &val)| (var, val))
+                    .collect()
+            })
             .unwrap_or_default();
 
         for (block_id, _) in &self.function.blocks {
             if *block_id != entry_block {
                 for (var, val) in &param_defs {
-                    // Only copy if the block doesn't already have this variable
-                    // (it might have a phi for variables that ARE reassigned)
                     if let Some(defs) = self.definitions.get_mut(block_id) {
                         defs.entry(*var).or_insert(*val);
                     }
