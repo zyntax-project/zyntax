@@ -87,6 +87,28 @@ pub trait FiberCfg: Send + Sync {
         0
     }
 
+    /// [`Self::fiber_new`] with an environment the body reads back
+    /// through [`Self::fiber_env`] once it runs: how a fiber body that
+    /// takes no parameters is given its arguments and captures.
+    ///
+    /// # Safety
+    /// As [`Self::fiber_new`]. `env` is kept as an address only.
+    unsafe fn fiber_new_with_env(
+        &self,
+        closure: *mut u8,
+        env: *mut u8,
+        stack_size: i64,
+    ) -> *mut FiberRepr {
+        let _ = env;
+        self.fiber_new(closure, stack_size)
+    }
+
+    /// The environment of the fiber running now, null when it was made
+    /// without one or nothing is running. Valid only inside a body.
+    fn fiber_env(&self) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+
     /// Symmetric switch — abandon the caller and transfer to `target`
     /// with `value`. Returns the value the current fiber receives when
     /// somebody later transfers back to it. Packed return shape

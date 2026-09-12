@@ -64,6 +64,13 @@ thread_local! {
     /// synchronisation).
     static ERROR_MAP: RefCell<HashMap<usize, AbortInfo>> = RefCell::new(HashMap::new());
 
+    /// Each fiber's environment address, by handle; see `fiber_env`.
+    static ENV_MAP: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+
+    /// The fibers being resumed right now, innermost last, so a body
+    /// can find its own handle.
+    static RUNNING: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+
     /// Task that owns fibers created right now. The cooperative executor
     /// stamps this (via `set_fiber_task_id`) before driving a task, so a
     /// fiber the task creates can be freed if that task is later cancelled
@@ -219,7 +226,31 @@ impl FiberCfg for KrioFiberBackend {
         ptr
     }
 
+    unsafe fn fiber_new_with_env(
+        &self,
+        closure: *mut u8,
+        env: *mut u8,
+        stack_size: i64,
+    ) -> *mut FiberRepr {
+        let ptr = self.fiber_new(closure, stack_size);
+        ENV_MAP.with(|m| {
+            m.borrow_mut().insert(ptr as usize, env as usize);
+        });
+        ptr
+    }
+
+    fn fiber_env(&self) -> *mut u8 {
+        let current = RUNNING.with(|r| r.borrow().last().copied());
+        match current {
+            Some(handle) => ENV_MAP
+                .with(|m| m.borrow().get(&handle).copied())
+                .unwrap_or(0) as *mut u8,
+            None => std::ptr::null_mut(),
+        }
+    }
+
     unsafe fn fiber_resume(&self, fiber: *mut FiberRepr) -> i64 {
+        let handle = fiber as usize;
         let fiber = &mut *(fiber as *mut Fiber);
         // Honour cooperative cancel at the resume boundary: an
         // auto-generated `fiber def` body has no chance to call
@@ -240,11 +271,16 @@ impl FiberCfg for KrioFiberBackend {
         ) {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
         }
+        RUNNING.with(|r| r.borrow_mut().push(handle));
         let step = fiber.resume();
+        RUNNING.with(|r| {
+            r.borrow_mut().pop();
+        });
         encode_step(step, fiber)
     }
 
     unsafe fn fiber_resume_with(&self, fiber: *mut FiberRepr, value: i64) -> i64 {
+        let handle = fiber as usize;
         let fiber = &mut *(fiber as *mut Fiber);
         if fiber.is_cancelled() {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
@@ -255,7 +291,11 @@ impl FiberCfg for KrioFiberBackend {
         ) {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
         }
+        RUNNING.with(|r| r.borrow_mut().push(handle));
         let step = fiber.resume_with_u64(value as u64);
+        RUNNING.with(|r| {
+            r.borrow_mut().pop();
+        });
         encode_step(step, fiber)
     }
 
@@ -299,6 +339,9 @@ impl FiberCfg for KrioFiberBackend {
         // the same address could inherit a stale error.
         let key = fiber as usize;
         ERROR_MAP.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+        ENV_MAP.with(|m| {
             m.borrow_mut().remove(&key);
         });
         // Drop the fiber from its owning task's set so a later

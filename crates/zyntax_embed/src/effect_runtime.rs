@@ -1875,6 +1875,28 @@ pub fn fiber_runtime_symbol_infos() -> Vec<zyntax_compiler::zrtl::RuntimeSymbolI
                 params: params2(ptr_tag(), i64_tag()),
             },
         ),
+        // krio_fiber_new_with_env(closure: ptr, env: ptr, stack_size: i64) -> ptr
+        (
+            "krio_fiber_new_with_env",
+            zyntax_compiler::zrtl::krio_fiber_new_with_env as *const u8,
+            ZrtlSymbolSig {
+                param_count: 3,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: params3(ptr_tag(), ptr_tag(), i64_tag()),
+            },
+        ),
+        // krio_fiber_env() -> ptr
+        (
+            "krio_fiber_env",
+            zyntax_compiler::zrtl::krio_fiber_env as *const u8,
+            ZrtlSymbolSig {
+                param_count: 0,
+                flags: no_flags,
+                return_type: ptr_tag(),
+                params: [zyntax_compiler::zrtl::TypeTag::VOID; 16],
+            },
+        ),
         // krio_fiber_resume(fiber: ptr) -> i64 (FiberStep tag)
         (
             "krio_fiber_resume",

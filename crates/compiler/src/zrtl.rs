@@ -2107,6 +2107,27 @@ pub unsafe extern "C" fn krio_fiber_yield(value: i64) {
     fiber_backend().fiber_yield(value)
 }
 
+/// `krio_fiber_new_with_env` — [`krio_fiber_new`] with an environment
+/// pointer the body reads back through [`krio_fiber_env`].
+///
+/// # Safety
+/// As [`krio_fiber_new`]; `env` is stored as an address only.
+#[no_mangle]
+pub unsafe extern "C" fn krio_fiber_new_with_env(
+    closure: *mut u8,
+    env: *mut u8,
+    stack_size: i64,
+) -> *mut FiberRepr {
+    fiber_backend().fiber_new_with_env(closure, env, stack_size)
+}
+
+/// `krio_fiber_env` — the environment of the fiber running now, null
+/// outside any fiber or for one made without an environment.
+#[no_mangle]
+pub extern "C" fn krio_fiber_env() -> *mut u8 {
+    fiber_backend().fiber_env()
+}
+
 /// `krio_fiber_take_input` — read and clear the scalar delivered by the most
 /// recent bidirectional resume of the currently-running fiber.
 ///
@@ -2196,6 +2217,12 @@ pub unsafe extern "C" fn krio_fiber_take_error(fiber: *mut FiberRepr) -> i64 {
 pub fn fiber_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
     vec![
         ("krio_fiber_new", krio_fiber_new as *const u8, 2),
+        (
+            "krio_fiber_new_with_env",
+            krio_fiber_new_with_env as *const u8,
+            3,
+        ),
+        ("krio_fiber_env", krio_fiber_env as *const u8, 0),
         ("krio_fiber_resume", krio_fiber_resume as *const u8, 1),
         (
             "krio_fiber_resume_with",
