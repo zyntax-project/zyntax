@@ -124,6 +124,17 @@ impl TypedCfgBuilder {
         id
     }
 
+    /// A local the builder introduces for itself, named so no source
+    /// program can spell it and distinct per loop variable and block.
+    fn hidden_name(&mut self, role: &str, loop_var: InternedString) -> InternedString {
+        let n = self.next_block_id;
+        self.next_block_id += 1;
+        InternedString::new_global(&format!(
+            "__{role}_{}_{n}",
+            loop_var.resolve_global().unwrap_or_default()
+        ))
+    }
+
     /// Build CFG from a typed block
     /// entry_block_id should be the ID of the entry block from the HirFunction
     pub fn build_from_block(
@@ -788,75 +799,119 @@ impl TypedCfgBuilder {
                             inclusive,
                         } = bounds;
 
-                        // Init: let mut i = start
-                        let init_stmt = typed_node(
-                            TypedStatement::Let(zyntax_typed_ast::typed_ast::TypedLet {
-                                name: var_name,
-                                ty: start_expr.ty.clone(),
-                                mutability: zyntax_typed_ast::Mutability::Mutable,
-                                initializer: Some(Box::new(start_expr.clone())),
-                                span,
-                            }),
-                            Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
-                            span,
-                        );
-                        current_statements.push(init_stmt);
-
-                        // Condition: i < end, or i <= end for an inclusive range
-                        let cond_expr = typed_node(
-                            TypedExpression::Binary(zyntax_typed_ast::typed_ast::TypedBinary {
-                                op: if inclusive {
-                                    zyntax_typed_ast::typed_ast::BinaryOp::Le
-                                } else {
-                                    zyntax_typed_ast::typed_ast::BinaryOp::Lt
-                                },
-                                left: Box::new(typed_node(
-                                    TypedExpression::Variable(var_name),
-                                    start_expr.ty.clone(),
-                                    span,
-                                )),
-                                right: Box::new(end_expr),
-                            }),
-                            Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool),
-                            span,
-                        );
-
-                        // Update: i = i + step (default step = 1)
-                        let step = step_expr.unwrap_or_else(|| {
+                        let ty = start_expr.ty.clone();
+                        let var = |name: InternedString| {
+                            typed_node(TypedExpression::Variable(name), ty.clone(), span)
+                        };
+                        let int_lit = |v: i128| {
                             typed_node(
                                 TypedExpression::Literal(
-                                    zyntax_typed_ast::typed_ast::TypedLiteral::Integer(1),
+                                    zyntax_typed_ast::typed_ast::TypedLiteral::Integer(v),
                                 ),
-                                start_expr.ty.clone(),
+                                ty.clone(),
                                 span,
                             )
+                        };
+                        let bind = |name: InternedString, value: TypedNode<TypedExpression>| {
+                            typed_node(
+                                TypedStatement::Let(zyntax_typed_ast::typed_ast::TypedLet {
+                                    name,
+                                    ty: value.ty.clone(),
+                                    mutability: zyntax_typed_ast::Mutability::Mutable,
+                                    initializer: Some(Box::new(value)),
+                                    span,
+                                }),
+                                Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
+                                span,
+                            )
+                        };
+                        let binary = |op: zyntax_typed_ast::typed_ast::BinaryOp,
+                                      l: TypedNode<TypedExpression>,
+                                      r: TypedNode<TypedExpression>,
+                                      out_ty: Type| {
+                            typed_node(
+                                TypedExpression::Binary(zyntax_typed_ast::typed_ast::TypedBinary {
+                                    op,
+                                    left: Box::new(l),
+                                    right: Box::new(r),
+                                }),
+                                out_ty,
+                                span,
+                            )
+                        };
+                        use zyntax_typed_ast::typed_ast::BinaryOp as Op;
+                        let bool_ty = Type::Primitive(zyntax_typed_ast::PrimitiveType::Bool);
+
+                        // The bounds are evaluated once, before the loop,
+                        // into locals of the loop's own. Python and every
+                        // range-loop language read them once.
+                        let end_name = self.hidden_name("end", var_name);
+                        current_statements.push(bind(var_name, start_expr.clone()));
+                        current_statements.push(bind(end_name, end_expr));
+
+                        // A literal step decides the comparison here; any
+                        // other step is bound and tested for sign at run time,
+                        // since counting down to `end` means `i > end`.
+                        let literal_step = step_expr.as_ref().and_then(|s| match &s.node {
+                            TypedExpression::Literal(
+                                zyntax_typed_ast::typed_ast::TypedLiteral::Integer(v),
+                            ) => Some(*v),
+                            TypedExpression::Unary(zyntax_typed_ast::typed_ast::TypedUnary {
+                                op: zyntax_typed_ast::typed_ast::UnaryOp::Minus,
+                                operand,
+                            }) => match &operand.node {
+                                TypedExpression::Literal(
+                                    zyntax_typed_ast::typed_ast::TypedLiteral::Integer(v),
+                                ) => Some(-*v),
+                                _ => None,
+                            },
+                            _ => None,
                         });
-                        let update_expr = typed_node(
-                            TypedExpression::Binary(zyntax_typed_ast::typed_ast::TypedBinary {
-                                op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
-                                left: Box::new(typed_node(
-                                    TypedExpression::Variable(var_name),
-                                    start_expr.ty.clone(),
-                                    span,
-                                )),
-                                right: Box::new(typed_node(
-                                    TypedExpression::Binary(
-                                        zyntax_typed_ast::typed_ast::TypedBinary {
-                                            op: zyntax_typed_ast::typed_ast::BinaryOp::Add,
-                                            left: Box::new(typed_node(
-                                                TypedExpression::Variable(var_name),
-                                                start_expr.ty.clone(),
-                                                span,
-                                            )),
-                                            right: Box::new(step),
-                                        },
-                                    ),
-                                    start_expr.ty.clone(),
-                                    span,
-                                )),
-                            }),
-                            start_expr.ty.clone(),
-                            span,
+                        let up = if inclusive { Op::Le } else { Op::Lt };
+                        let down = if inclusive { Op::Ge } else { Op::Gt };
+                        let (cond_expr, step) = match (step_expr, literal_step) {
+                            (None, _) => (
+                                binary(up, var(var_name), var(end_name), bool_ty.clone()),
+                                int_lit(1),
+                            ),
+                            (Some(step), Some(v)) => (
+                                binary(
+                                    if v < 0 { down } else { up },
+                                    var(var_name),
+                                    var(end_name),
+                                    bool_ty.clone(),
+                                ),
+                                step,
+                            ),
+                            (Some(step), None) => {
+                                let step_name = self.hidden_name("step", var_name);
+                                current_statements.push(bind(step_name, step));
+                                let zero = int_lit(0);
+                                let ascending = binary(
+                                    Op::And,
+                                    binary(Op::Gt, var(step_name), zero.clone(), bool_ty.clone()),
+                                    binary(up, var(var_name), var(end_name), bool_ty.clone()),
+                                    bool_ty.clone(),
+                                );
+                                let descending = binary(
+                                    Op::And,
+                                    binary(Op::Lt, var(step_name), zero, bool_ty.clone()),
+                                    binary(down, var(var_name), var(end_name), bool_ty.clone()),
+                                    bool_ty.clone(),
+                                );
+                                (
+                                    binary(Op::Or, ascending, descending, bool_ty.clone()),
+                                    var(step_name),
+                                )
+                            }
+                        };
+
+                        // Update: i = i + step
+                        let update_expr = binary(
+                            Op::Assign,
+                            var(var_name),
+                            binary(Op::Add, var(var_name), step, ty.clone()),
+                            ty.clone(),
                         );
 
                         // Build the C-style for loop block structure
