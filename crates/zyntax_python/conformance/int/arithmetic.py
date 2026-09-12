@@ -1,0 +1,11 @@
+# test_int / test_long basics
+print(7 + 3)
+print(7 - 3)
+print(7 * 3)
+print(7 // 3)
+print(7 % 3)
+print(2 ** 10)
+print(-7 // 3)
+print(-7 % 3)
+print(7 // -3)
+print(7 % -3)

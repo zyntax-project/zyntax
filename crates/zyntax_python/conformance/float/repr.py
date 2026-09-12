@@ -1,0 +1,11 @@
+# test_float.ReprTestCase: the shortest repr that round-trips
+print(0.1)
+print(0.1 + 0.2)
+print(1.0)
+print(100.0)
+print(1e16)
+print(1e-5)
+print(123456789.0)
+print(0.5)
+print(-0.0)
+print(1.0 / 3.0)

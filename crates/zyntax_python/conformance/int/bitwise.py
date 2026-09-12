@@ -1,0 +1,10 @@
+# test_long.test_bitop_identities
+print(0b1100 & 0b1010)
+print(0b1100 | 0b1010)
+print(0b1100 ^ 0b1010)
+print(~5)
+print(1 << 10)
+print(1024 >> 3)
+print(-16 >> 2)
+print(5 & -1)
+print(0 | 0)

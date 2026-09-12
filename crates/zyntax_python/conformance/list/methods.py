@@ -1,0 +1,15 @@
+# test_list: methods
+xs = [3, 1, 2]
+xs.sort()
+print(xs)
+xs.reverse()
+print(xs)
+print(xs.index(1))
+xs.insert(0, 9)
+print(xs)
+print(xs.pop())
+print(xs)
+xs.extend([7, 8])
+print(xs)
+print(1 in xs, 100 in xs)
+print(xs.count(9))

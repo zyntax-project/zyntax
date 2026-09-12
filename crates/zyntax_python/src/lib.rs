@@ -48,6 +48,18 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// The function a module's top-level statements become. A host runs a
+/// Python program by calling this.
+pub const ENTRY: &str = "__main__";
+
+/// Runtime symbols the frontend's builtins link to. `print` here is the
+/// no-newline half; the frontend spells Python's `print(...)` in terms
+/// of both.
+const BUILTINS: &[(&str, &str)] = &[
+    ("println", "$IO$println_dynamic"),
+    ("print", "$IO$print_dynamic"),
+];
+
 /// Parse Python source and rewrite it into a `TypedProgram`.
 pub fn parse_program(source: &str) -> Result<TypedProgram> {
     let parsed = ruff_python_parser::parse_module(source)
@@ -61,9 +73,23 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
     let module = parsed.into_syntax();
 
     let mut declarations = Vec::new();
+    // A module's body is the program. Statements outside any `def` run
+    // top to bottom when the module is executed, so they become the
+    // body of the entry point, in order. A program that is nothing but
+    // `def`s has no entry point of its own and calls whichever one the
+    // host names.
+    let mut top_level: Vec<&py::Stmt> = Vec::new();
     for stmt in &module.body {
         match stmt {
             py::Stmt::FunctionDef(f) => {
+                if f.name.as_str() == ENTRY {
+                    return Err(Error::Unsupported {
+                        what: format!(
+                            "a function named `{ENTRY}`; the module body is the program's entry"
+                        ),
+                        at: f.range().start().to_usize(),
+                    });
+                }
                 let func = Lowerer::new().function(f)?;
                 declarations.push(TypedNode::new(
                     TypedDeclaration::Function(func),
@@ -71,17 +97,81 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
                     span_of(f),
                 ));
             }
-            // A module docstring or a bare `pass` at the top level
-            // declares nothing.
+            // A module docstring declares nothing and runs nothing.
             py::Stmt::Expr(e) if matches!(*e.value, py::Expr::StringLiteral(_)) => {}
             py::Stmt::Pass(_) => {}
-            other => {
-                return Err(Error::Unsupported {
-                    what: format!("top-level {}", stmt_kind(other)),
-                    at: other.range().start().to_usize(),
-                })
-            }
+            other => top_level.push(other),
         }
+    }
+    if !top_level.is_empty() {
+        let mut lowerer = Lowerer::new();
+        let mut statements = Vec::new();
+        for s in &top_level {
+            lowerer.stmt(s, &mut statements)?;
+        }
+        let span = Span::new(
+            top_level[0].range().start().to_usize(),
+            top_level[top_level.len() - 1].range().end().to_usize(),
+        );
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(TypedFunction {
+                name: intern(ENTRY),
+                annotations: Vec::new(),
+                effects: Vec::new(),
+                with_handlers: Vec::new(),
+                type_params: Vec::new(),
+                params: Vec::new(),
+                return_type: prim(PrimitiveType::Unit),
+                body: Some(TypedBlock { statements, span }),
+                visibility: Visibility::Public,
+                is_async: false,
+                is_fiber: false,
+                is_pure: false,
+                is_external: false,
+                calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+                link_name: None,
+                module: None,
+            }),
+            Type::Unknown,
+            span,
+        ));
+    }
+
+    // Python's builtins, declared here rather than borrowed from another
+    // language's prelude: `print` is the IO plugin's dynamic print, which
+    // formats any value.
+    for (name, symbol) in BUILTINS {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(TypedFunction {
+                name: intern(name),
+                annotations: Vec::new(),
+                effects: Vec::new(),
+                with_handlers: Vec::new(),
+                type_params: Vec::new(),
+                params: vec![TypedParameter {
+                    name: intern("value"),
+                    ty: Type::Any,
+                    mutability: Mutability::Immutable,
+                    kind: ParameterKind::Regular,
+                    default_value: None,
+                    attributes: Vec::new(),
+                    ownership: ParamOwnership::Copied,
+                    span: Span::new(0, 0),
+                }],
+                return_type: prim(PrimitiveType::Unit),
+                body: None,
+                visibility: Visibility::Public,
+                is_async: false,
+                is_fiber: false,
+                is_pure: false,
+                is_external: true,
+                calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+                link_name: Some(intern(symbol)),
+                module: None,
+            }),
+            prim(PrimitiveType::Unit),
+            Span::new(0, 0),
+        ));
     }
 
     Ok(TypedProgram {
@@ -484,6 +574,70 @@ impl Lowerer {
         }))
     }
 
+    /// `print(a, b, ...)`: each argument, a space between, a newline
+    /// after. `print()` alone is a bare newline.
+    fn print_call(&mut self, c: &py::ExprCall, span: Span) -> Result<TypedNode<TypedExpression>> {
+        let call = |name: &str, arg: TypedNode<TypedExpression>| {
+            TypedNode::new(
+                TypedExpression::Call(TypedCall {
+                    callee: Box::new(TypedNode::new(
+                        TypedExpression::Variable(intern(name)),
+                        Type::Unknown,
+                        span,
+                    )),
+                    positional_args: vec![arg],
+                    named_args: Vec::new(),
+                    type_args: Vec::new(),
+                }),
+                prim(PrimitiveType::Unit),
+                span,
+            )
+        };
+        let text = |s: &str| {
+            TypedNode::new(
+                TypedExpression::Literal(TypedLiteral::String(intern(s))),
+                prim(PrimitiveType::String),
+                span,
+            )
+        };
+        let args = &c.arguments.args;
+        if args.is_empty() {
+            return Ok(call("println", text("")));
+        }
+        if args.len() == 1 {
+            let a = self.expr(&args[0])?;
+            return Ok(call("println", a));
+        }
+        // Several: a block of prints, the last ending the line.
+        let mut statements = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let v = self.expr(a)?;
+            let is_last = i + 1 == args.len();
+            let stmt = if is_last {
+                call("println", v)
+            } else {
+                call("print", v)
+            };
+            statements.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(stmt)),
+                Type::Unknown,
+                span,
+            ));
+            if !is_last {
+                statements.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(call("print", text(" ")))),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+        }
+        Ok(TypedNode::new(
+            TypedExpression::Block(TypedBlock { statements, span }),
+            prim(PrimitiveType::Unit),
+            span,
+        ))
+    }
+
     fn expr(&mut self, e: &py::Expr) -> Result<TypedNode<TypedExpression>> {
         let span = span_of(e);
         let node = |x: TypedExpression, ty: Type| TypedNode::new(x, ty, span);
@@ -612,6 +766,13 @@ impl Lowerer {
                         what: "keyword arguments".into(),
                         at: c.range().start().to_usize(),
                     });
+                }
+                // `print` writes its arguments separated by spaces and
+                // ends the line. One argument is the runtime's println
+                // directly; several are printed in turn with a space
+                // between, then the line is ended.
+                if matches!(&*c.func, py::Expr::Name(n) if n.id.as_str() == "print") {
+                    return self.print_call(c, span);
                 }
                 let callee = self.expr(&c.func)?;
                 let mut positional_args = Vec::with_capacity(c.arguments.args.len());

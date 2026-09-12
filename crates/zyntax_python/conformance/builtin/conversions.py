@@ -1,0 +1,8 @@
+# test_builtin: int(), float(), str(), bool(), len(), range()
+print(int("42"), int(3.9), int(-3.9))
+print(float("2.5"), float(3))
+print(str(42), str(2.5), str(True))
+print(bool(0), bool(1), bool(""), bool("x"), bool([]))
+print(len("abc"), len([1, 2]), len({}))
+print(list(range(3)))
+print(type(1) == int)

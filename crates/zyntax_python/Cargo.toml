@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "A Python frontend for Zyntax: ruff's AST to a TypedProgram"
 
+[[bin]]
+name = "zypy"
+path = "src/main.rs"
+
 [dependencies]
 zyntax_typed_ast = { path = "../typed_ast" }
 zyntax_embed = { path = "../zyntax_embed" }

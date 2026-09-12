@@ -1,0 +1,50 @@
+# A conformance case expected to fail, and the git-bug issue tracking it.
+# One per line: <category>/<file>.py <issue id>.
+# A listed case that starts passing fails the suite until it is removed here
+# and its issue is closed; an unlisted case that fails is a regression.
+
+augassign/all_operators.py                   80bd2d2
+binop/floor_and_modulo_signs.py              a735972
+binop/precedence.py                          a735972
+bool/arithmetic.py                           decf8ef
+bool/logic.py                                decf8ef
+bool/printing.py                             decf8ef
+builtin/conversions.py                       4ed0759
+builtin/numeric.py                           4ed0759
+class/basic.py                               cd13255
+class/dunder_operators.py                    cd13255
+class/inheritance.py                         cd13255
+compare/chained.py                           96fbe23
+compare/mixed_numeric.py                     96fbe23
+dict/basics.py                               267e30f
+dict/int_keys_and_methods.py                 267e30f
+exceptions/custom_and_propagation.py         2327e7f
+exceptions/try_except_finally.py             2327e7f
+float/arithmetic.py                          053bd35
+float/mixed_with_int.py                      053bd35
+float/repr.py                                053bd35
+functions/keyword_arguments.py               f322651
+functions/lambda_and_higher_order.py         f322651
+functions/multiple_return_values.py          f322651
+generators/basic_yield.py                    804d85e
+generators/generator_expression.py           804d85e
+grammar/conditional_expression.py            147af9e
+grammar/float_literals.py                    147af9e
+grammar/for_range.py                         147af9e
+grammar/if_elif_else.py                      147af9e
+int/arithmetic.py                            dd86335
+int/big_values.py                            dd86335
+int/bitwise.py                               dd86335
+int/true_division.py                         dd86335
+list/basics.py                               143bd46
+list/comprehension.py                        143bd46
+list/methods.py                              143bd46
+list/slicing.py                              143bd46
+scope/closures.py                            e9d2d8b
+scope/global_statement.py                    e9d2d8b
+scope/nonlocal.py                            e9d2d8b
+set/basics.py                                4ec2c7a
+string/basics.py                             74c2742
+string/formatting.py                         74c2742
+tuple/basics.py                              be231dc
+unary/operators.py                           b74f44c

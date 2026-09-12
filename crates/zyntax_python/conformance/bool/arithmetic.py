@@ -1,0 +1,10 @@
+# test_bool.BoolTest.test_math: bools are ints
+print(True + True)
+print(True + False)
+print(True * 10)
+print(False * 10)
+print(True - 1)
+print(int(True))
+print(int(False))
+print(True == 1)
+print(False == 0)
