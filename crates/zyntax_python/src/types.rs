@@ -35,6 +35,8 @@ pub(crate) enum Ty {
     Dict,
     /// A set of dynamic values.
     Set,
+    /// An instance of the module's class at this index.
+    Class(u16),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -145,7 +147,87 @@ pub(crate) struct Module {
     pub(crate) adapters: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// A counter for names no Python program can spell.
     pub(crate) counter: std::cell::Cell<usize>,
+    /// The module's classes, bases before subclasses.
+    pub(crate) classes: Vec<ClassInfo>,
+    pub(crate) class_index: HashMap<String, usize>,
+    /// Attribute names read and written on dynamic receivers, and
+    /// methods called on them with an argument count: each needs a
+    /// dispatcher over the classes that have it.
+    pub(crate) attr_reads: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    pub(crate) attr_writes: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    pub(crate) dyn_methods: std::cell::RefCell<std::collections::BTreeSet<(String, usize)>>,
     pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
+}
+
+/// A class: its place in the hierarchy, its layout and its methods.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClassInfo {
+    pub(crate) name: String,
+    pub(crate) base: Option<usize>,
+    /// Every field in layout order: the class tag first, then the
+    /// base's fields, then this class's own.
+    pub(crate) fields: Vec<(String, Ty)>,
+    /// The methods this class itself defines.
+    pub(crate) methods: Vec<String>,
+    pub(crate) type_id: Option<zyntax_typed_ast::TypeId>,
+}
+
+/// The name of the function a method lowers to.
+pub(crate) fn method_fn(class: &str, method: &str) -> String {
+    format!("{class}${method}")
+}
+
+impl Module {
+    /// The index of a field on class `k`, inherited or own, and its type.
+    pub(crate) fn field(&self, k: usize, name: &str) -> Option<(usize, Ty)> {
+        self.classes[k]
+            .fields
+            .iter()
+            .position(|(f, _)| f == name)
+            .map(|i| (i, self.classes[k].fields[i].1))
+    }
+
+    /// The class in `k`'s chain that defines `method`, nearest first.
+    pub(crate) fn method_owner(&self, k: usize, method: &str) -> Option<usize> {
+        let mut at = Some(k);
+        while let Some(c) = at {
+            if self.classes[c].methods.iter().any(|m| m == method) {
+                return Some(c);
+            }
+            at = self.classes[c].base;
+        }
+        None
+    }
+
+    /// The signature and function name of `method` as `k` sees it.
+    pub(crate) fn method_sig(&self, k: usize, method: &str) -> Option<(&Sig, String)> {
+        let owner = self.method_owner(k, method)?;
+        let name = method_fn(&self.classes[owner].name, method);
+        self.funcs.get(&name).map(|sig| (sig, name))
+    }
+
+    /// Whether `k` is `base` or derives from it.
+    pub(crate) fn is_subclass(&self, k: usize, base: usize) -> bool {
+        let mut at = Some(k);
+        while let Some(c) = at {
+            if c == base {
+                return true;
+            }
+            at = self.classes[c].base;
+        }
+        false
+    }
+
+    /// The classes deriving from `owner` that define `method` themselves.
+    pub(crate) fn overriders(&self, owner: usize, method: &str) -> Vec<usize> {
+        (0..self.classes.len())
+            .filter(|&c| {
+                c != owner
+                    && self.is_subclass(c, owner)
+                    && self.classes[c].methods.iter().any(|m| m == method)
+            })
+            .collect()
+    }
 }
 
 /// One function's inferred locals.
@@ -157,9 +239,13 @@ pub(crate) struct Locals {
     pub(crate) global_writes: HashMap<String, Ty>,
     /// Names this body declares `nonlocal`, and what it assigns to them.
     pub(crate) nonlocal_writes: HashMap<String, Ty>,
+    /// Attributes assigned on the first parameter (`self.x = ...`), and
+    /// what is assigned to them.
+    pub(crate) field_writes: HashMap<String, Ty>,
 }
 
-pub(crate) fn annotation(e: &py::Expr) -> Ty {
+/// An annotation, with the module's class names known.
+pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> Ty {
     match e {
         py::Expr::Name(n) => match n.id.as_str() {
             "int" => Ty::Int,
@@ -167,9 +253,26 @@ pub(crate) fn annotation(e: &py::Expr) -> Ty {
             "bool" => Ty::Bool,
             "str" => Ty::Str,
             "None" => Ty::None,
-            _ => Ty::Object,
+            "list" => Ty::List(Elem::Object),
+            "dict" => Ty::Dict,
+            "set" => Ty::Set,
+            "tuple" => Ty::Tuple,
+            other => classes
+                .get(other)
+                .map(|k| Ty::Class(*k as u16))
+                .unwrap_or(Ty::Object),
         },
         py::Expr::NoneLiteral(_) => Ty::None,
+        // `list[int]` and friends: the outer name decides.
+        py::Expr::Subscript(sub) => match annotation_in(classes, &sub.value) {
+            Ty::List(_) => match annotation_in(classes, &sub.slice) {
+                Ty::Int => Ty::List(Elem::Int),
+                Ty::Float => Ty::List(Elem::Float),
+                Ty::Str => Ty::List(Elem::Str),
+                _ => Ty::List(Elem::Object),
+            },
+            other => other,
+        },
         _ => Ty::Object,
     }
 }
@@ -177,16 +280,26 @@ pub(crate) fn annotation(e: &py::Expr) -> Ty {
 /// Signature from the annotations alone; an unannotated return is
 /// `Unknown` until the body says.
 pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
+    declared_sig_in(&HashMap::new(), f, None)
+}
+
+/// [`declared_sig`] with class names resolved, and `self` typed as the
+/// class a method belongs to.
+pub(crate) fn declared_sig_in(
+    classes: &HashMap<String, usize>,
+    f: &py::StmtFunctionDef,
+    class: Option<usize>,
+) -> Sig {
     let params = f
         .parameters
         .iter_non_variadic_params()
-        .map(|p| {
-            let ty = p
-                .parameter
-                .annotation
-                .as_deref()
-                .map(annotation)
-                .unwrap_or(Ty::Object);
+        .enumerate()
+        .map(|(i, p)| {
+            let ty = match (i, class, &p.parameter.annotation) {
+                (0, Some(k), None) => Ty::Class(k as u16),
+                (_, _, Some(a)) => annotation_in(classes, a),
+                _ => Ty::Object,
+            };
             (p.parameter.name.to_string(), ty)
         })
         .collect();
@@ -197,38 +310,66 @@ pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
         .collect();
     Sig {
         params,
-        ret: f.returns.as_deref().map(annotation).unwrap_or(Ty::Unknown),
+        ret: f
+            .returns
+            .as_deref()
+            .map(|r| annotation_in(classes, r))
+            .unwrap_or(Ty::Unknown),
         defaults,
     }
 }
 
 /// Infer the module's signatures to a fixed point.
-pub(crate) fn infer_module(known: &Module, defs: &[&py::StmtFunctionDef]) -> HashMap<String, Sig> {
+/// A function the module defines: the name it lowers to, the class it
+/// is a method of, and its definition.
+pub(crate) struct Item<'a> {
+    pub(crate) name: String,
+    pub(crate) class: Option<usize>,
+    pub(crate) def: &'a py::StmtFunctionDef,
+}
+
+/// Infer the module's signatures to a fixed point. Class layouts are
+/// taken from `known` and refined from what methods assign to `self`.
+pub(crate) fn infer_module(
+    known: &Module,
+    items: &[Item<'_>],
+) -> (HashMap<String, Sig>, Vec<ClassInfo>) {
     let mut module = Module {
         funcs: HashMap::new(),
         globals: known.globals.clone(),
         list_type: known.list_type,
+        classes: known.classes.clone(),
+        class_index: known.class_index.clone(),
         ..Default::default()
     };
-    for f in defs {
-        module.funcs.insert(f.name.to_string(), declared_sig(f));
+    for item in items {
+        module.funcs.insert(
+            item.name.clone(),
+            declared_sig_in(&module.class_index, item.def, item.class),
+        );
     }
     for _ in 0..8 {
         let mut changed = false;
-        for f in defs {
-            if f.returns.is_some() {
-                continue;
+        for item in items {
+            let sig = module.funcs[&item.name].clone();
+            let locals = infer_locals(&module, &sig, &item.def.body);
+            if item.def.returns.is_none() {
+                let ret = if locals.ret == Ty::Unknown {
+                    Ty::None
+                } else {
+                    locals.ret
+                };
+                if ret != sig.ret {
+                    module.funcs.get_mut(&item.name).unwrap().ret = ret;
+                    changed = true;
+                }
             }
-            let sig = module.funcs[f.name.as_str()].clone();
-            let locals = infer_locals(&module, &sig, &f.body);
-            let ret = if locals.ret == Ty::Unknown {
-                Ty::None
-            } else {
-                locals.ret
-            };
-            if ret != sig.ret {
-                module.funcs.get_mut(f.name.as_str()).unwrap().ret = ret;
-                changed = true;
+            // What a method assigns to `self.x` types the field on its
+            // class, and on every class deriving from it.
+            if let Some(k) = item.class {
+                for (field, ty) in &locals.field_writes {
+                    changed |= widen_field(&mut module.classes, k, field, *ty);
+                }
             }
         }
         if !changed {
@@ -241,7 +382,68 @@ pub(crate) fn infer_module(known: &Module, defs: &[&py::StmtFunctionDef]) -> Has
             sig.ret = Ty::Object;
         }
     }
-    module.funcs
+    for class in &mut module.classes {
+        for (_, ty) in &mut class.fields {
+            if *ty == Ty::Unknown {
+                *ty = Ty::Object;
+            }
+        }
+    }
+    normalize_layouts(&mut module.classes);
+    (module.funcs, module.classes)
+}
+
+/// Lay each class out as its base's fields followed by its own, so an
+/// instance reads correctly through a base-typed reference. Bases come
+/// before their subclasses in the list.
+fn normalize_layouts(classes: &mut [ClassInfo]) {
+    for c in 0..classes.len() {
+        let Some(b) = classes[c].base else {
+            continue;
+        };
+        let mut fields = classes[b].fields.clone();
+        for (name, ty) in std::mem::take(&mut classes[c].fields) {
+            match fields.iter_mut().find(|(f, _)| *f == name) {
+                Some(slot) => slot.1 = slot.1.join(ty),
+                None => fields.push((name, ty)),
+            }
+        }
+        classes[c].fields = fields;
+    }
+}
+
+/// Join `ty` into field `name` of class `k` and of every subclass, adding
+/// the field where it is new. Returns whether anything changed.
+fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool {
+    let mut changed = false;
+    let targets: Vec<usize> = (0..classes.len())
+        .filter(|&c| {
+            let mut at = Some(c);
+            while let Some(x) = at {
+                if x == k {
+                    return true;
+                }
+                at = classes[x].base;
+            }
+            false
+        })
+        .collect();
+    for c in targets {
+        match classes[c].fields.iter().position(|(f, _)| f == name) {
+            Some(i) => {
+                let joined = classes[c].fields[i].1.join(ty);
+                if joined != classes[c].fields[i].1 {
+                    classes[c].fields[i].1 = joined;
+                    changed = true;
+                }
+            }
+            None => {
+                classes[c].fields.push((name.to_string(), ty));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Infer one body's locals: parameters as declared, every other name
@@ -373,6 +575,20 @@ impl Walker<'_> {
     fn target(&mut self, target: &py::Expr, ty: Ty) {
         match target {
             py::Expr::Name(n) => self.assign(n.id.as_str(), ty),
+            // `self.x = v` in a method declares the field.
+            py::Expr::Attribute(a)
+                if matches!(&*a.value, py::Expr::Name(n)
+                    if self.params.first().is_some_and(|(p, _)| p == n.id.as_str())) =>
+            {
+                let joined = self
+                    .locals
+                    .field_writes
+                    .get(a.attr.as_str())
+                    .copied()
+                    .unwrap_or(Ty::Unknown)
+                    .join(ty);
+                self.locals.field_writes.insert(a.attr.to_string(), joined);
+            }
             // Unpacking gives every name an element, whose type only the
             // runtime knows.
             py::Expr::Tuple(t) => {
@@ -501,6 +717,11 @@ pub(crate) fn is_name(e: &py::Expr, name: &str) -> bool {
     matches!(e, py::Expr::Name(n) if n.id.as_str() == name)
 }
 
+/// `super()` with no arguments.
+pub(crate) fn is_super_call(e: &py::Expr) -> bool {
+    matches!(e, py::Expr::Call(c) if is_name(&c.func, "super") && c.arguments.args.is_empty())
+}
+
 /// The number the library's dynamic arithmetic switches on.
 pub(crate) fn arith_code(op: py::Operator) -> i64 {
     match op {
@@ -624,6 +845,14 @@ impl Typer<'_> {
             }
             py::Expr::If(i) => self.expr(&i.body).join(self.expr(&i.orelse)),
             py::Expr::Call(c) => self.call(c),
+            py::Expr::Attribute(a) => match self.expr(&a.value) {
+                Ty::Class(k) => self
+                    .module
+                    .field(k as usize, a.attr.as_str())
+                    .map(|(_, ty)| ty)
+                    .unwrap_or(Ty::Object),
+                _ => Ty::Object,
+            },
             py::Expr::Subscript(s) => {
                 let seq = self.expr(&s.value);
                 if matches!(&*s.slice, py::Expr::Slice(_)) {
@@ -680,6 +909,9 @@ impl Typer<'_> {
         match &*c.func {
             py::Expr::Name(n) => {
                 let name = n.id.as_str();
+                if let Some(k) = self.module.class_index.get(name) {
+                    return Ty::Class(*k as u16);
+                }
                 if let Some(sig) = self.module.funcs.get(name) {
                     return sig.ret;
                 }
@@ -748,6 +980,29 @@ impl Typer<'_> {
                     "index" | "count" => Ty::Int,
                     "copy" => Ty::List(e),
                     _ => Ty::None,
+                }
+            }
+            // A method on an instance: what the defining class says.
+            py::Expr::Attribute(a) if matches!(self.expr(&a.value), Ty::Class(_)) => {
+                let Ty::Class(k) = self.expr(&a.value) else {
+                    unreachable!()
+                };
+                match self.module.method_sig(k as usize, a.attr.as_str()) {
+                    Some((sig, _)) => sig.ret,
+                    None => Ty::Object,
+                }
+            }
+            // `super().m(...)`: the base's method.
+            py::Expr::Attribute(a) if is_super_call(&a.value) => {
+                match self.vars.get("self").copied() {
+                    Some(Ty::Class(k)) => {
+                        let base = self.module.classes[k as usize].base;
+                        match base.and_then(|b| self.module.method_sig(b, a.attr.as_str())) {
+                            Some((sig, _)) => sig.ret,
+                            None => Ty::Object,
+                        }
+                    }
+                    _ => Ty::Object,
                 }
             }
             py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Dict => match a.attr.as_str() {

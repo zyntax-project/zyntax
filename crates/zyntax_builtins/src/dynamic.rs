@@ -5,7 +5,7 @@
 //! category and then does what the typed code does.
 
 use crate::build::*;
-use crate::{list_of, Kind, Policy, DICT_TAG, FUNC_TAG, SET_TAG, TUPLE_TAG};
+use crate::{list_of, Kind, Policy, DICT_TAG, FUNC_TAG, INSTANCE_KIND_BASE, SET_TAG, TUPLE_TAG};
 use zyntax_typed_ast::TypeId;
 
 const NONE: i64 = 0;
@@ -70,6 +70,39 @@ fn is_int(cat: &Local) -> Expr {
 fn is_integral(cat: &Local) -> Expr {
     or(is(cat, BOOL), is_int(cat))
 }
+/// Whether a custom-category box holds an instance of a frontend class.
+fn is_instance(x: Expr) -> Expr {
+    ge(kind(x), int(INSTANCE_KIND_BASE))
+}
+
+/// What the library says about instances when the frontend defines no
+/// hooks: nothing is equal to anything, and they print as objects.
+pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
+    let x = local("x", any());
+    let a = local("a", any());
+    let b = local("b", any());
+    vec![
+        define(
+            "zb_hook_instance_str",
+            &[&x],
+            string(),
+            vec![ret(text(&format!("<{}>", policy.type_names.object)))],
+        ),
+        define(
+            "zb_hook_instance_type",
+            &[&x],
+            string(),
+            vec![ret(text(policy.type_names.object))],
+        ),
+        define(
+            "zb_hook_instance_eq",
+            &[&a, &b],
+            boolean(),
+            vec![ret(bool(false))],
+        ),
+    ]
+}
+
 fn quoted(x: Expr) -> Expr {
     add(add(text("'"), x), text("'"))
 }
@@ -87,6 +120,19 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let cb = local("cb", i64());
     let mut d = Vec::new();
 
+    // An instance travels as its address under the class's tag.
+    d.push(extern_fn(
+        "zb_box_instance_raw",
+        &[("p", i64()), ("tag", i32())],
+        any(),
+        Some("zyntax_box_ptr"),
+    ));
+    d.push(extern_fn(
+        "zb_unbox_instance_raw",
+        &[("x", any())],
+        i64(),
+        Some("zyntax_box_get_opaque"),
+    ));
     // The box accessors.
     d.push(extern_fn(
         "zb_box_tag",
@@ -210,6 +256,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is(&cat, CUSTOM),
                 vec![
                     when(
+                        is_instance(x.e()),
+                        vec![ret(call("zb_hook_instance_type", vec![x.e()], string()))],
+                    ),
+                    when(
                         eq(kind(x.e()), int(TUPLE_TAG >> 8)),
                         vec![ret(text(names.tuple))],
                     ),
@@ -247,7 +297,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call("zb_str_truthy", vec![get_str(x.e())], boolean()))],
             ),
             when(
-                and(is(&cat, CUSTOM), ne(kind(x.e()), int(FUNC_TAG >> 8))),
+                and(
+                    is(&cat, CUSTOM),
+                    and(ne(kind(x.e()), int(FUNC_TAG >> 8)), not(is_instance(x.e()))),
+                ),
                 vec![ret(ne(call("zb_seq_len_any", vec![x.e()], i64()), int(0)))],
             ),
             ret(bool(true)),
@@ -334,6 +387,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     ),
                     ret(eq(number_i64(a.e(), ca.e()), number_i64(b.e(), cb.e()))),
                 ],
+            ),
+            when(
+                or(
+                    and(is(&ca, CUSTOM), is_instance(a.e())),
+                    and(is(&cb, CUSTOM), is_instance(b.e())),
+                ),
+                vec![ret(call(
+                    "zb_hook_instance_eq",
+                    vec![a.e(), b.e()],
+                    boolean(),
+                ))],
             ),
             when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
@@ -516,7 +580,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call("zb_str_chars_len", vec![get_str(x.e())], i64()))],
             ),
             when(
-                is(&cat, CUSTOM),
+                and(is(&cat, CUSTOM), not(is_instance(x.e()))),
                 vec![ret(call("zb_seq_len_any", vec![x.e()], i64()))],
             ),
             type_error(add(
@@ -717,7 +781,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 or(
                     ne(cat.e(), int(CUSTOM)),
-                    eq(kind(x.e()), int(FUNC_TAG >> 8)),
+                    or(eq(kind(x.e()), int(FUNC_TAG >> 8)), is_instance(x.e())),
                 ),
                 vec![type_error(add(
                     quoted(type_name(x.e())),
@@ -759,6 +823,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x],
         string(),
         vec![
+            when(
+                is_instance(x.e()),
+                vec![ret(call("zb_hook_instance_str", vec![x.e()], string()))],
+            ),
             when(
                 eq(kind(x.e()), int(FUNC_TAG >> 8)),
                 vec![ret(add(add(text("<"), text(names.function)), text(">")))],

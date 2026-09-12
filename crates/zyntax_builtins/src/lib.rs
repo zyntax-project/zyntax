@@ -37,6 +37,11 @@ pub struct Policy {
     pub float_fraction: bool,
     /// What `type(x)` calls each kind of dynamic value.
     pub type_names: TypeNames,
+    /// Whether the frontend defines `zb_hook_instance_str`,
+    /// `zb_hook_instance_type` and `zb_hook_instance_eq` for boxed
+    /// instances of its own classes (kinds from [`INSTANCE_KIND_BASE`]).
+    /// When it does not, the library's defaults stand in.
+    pub instance_hooks: bool,
 }
 
 /// The names of the dynamic value kinds, as a language spells them.
@@ -107,6 +112,14 @@ pub const SET_TAG: i64 = (7 << 8) | 255;
 pub const FUNC_TAG: i64 = (8 << 8) | 255;
 /// The box tag of a bare code address inside a function record.
 pub const CODE_TAG: i64 = (9 << 8) | 255;
+/// Kinds from here up are instances of a frontend's classes, in the
+/// order the frontend numbers them.
+pub const INSTANCE_KIND_BASE: i64 = 16;
+
+/// The box tag of an instance of the frontend's class `index`.
+pub fn instance_tag(index: usize) -> i64 {
+    ((INSTANCE_KIND_BASE + index as i64) << 8) | 255
+}
 
 /// What the library contributes to a program.
 pub struct Library {
@@ -129,6 +142,9 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(lists::declarations(policy, list_type));
     declarations.extend(functions::declarations(list_type));
     declarations.extend(dicts::declarations(list_type));
+    if !policy.instance_hooks {
+        declarations.extend(dynamic::default_instance_hooks(policy));
+    }
     Library {
         declarations,
         type_registry: b.registry,
@@ -159,6 +175,7 @@ mod tests {
             none_text: "None",
             single_quotes: true,
             float_fraction: true,
+            instance_hooks: false,
             type_names: TypeNames {
                 none: "NoneType",
                 bool: "bool",

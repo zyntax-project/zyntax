@@ -16,9 +16,9 @@ use ruff_text_size::Ranged;
 use std::collections::{BTreeSet, HashMap};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
-    TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression, TypedFor, TypedFunction,
-    TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedMethodCall, TypedParameter, TypedPattern,
-    TypedRange, TypedStatement, TypedUnary, TypedWhile,
+    TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression, TypedFieldAccess, TypedFor,
+    TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedMethodCall, TypedParameter,
+    TypedPattern, TypedRange, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
@@ -39,6 +39,38 @@ pub(crate) fn set_list_type(id: zyntax_typed_ast::TypeId) {
     LIST_TYPE.with(|c| c.set(Some(id)));
 }
 
+thread_local! {
+    /// The struct type of each class, by class index.
+    static CLASS_TYPES: std::cell::RefCell<Vec<zyntax_typed_ast::TypeId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn set_class_types(ids: Vec<zyntax_typed_ast::TypeId>) {
+    CLASS_TYPES.with(|c| *c.borrow_mut() = ids);
+}
+
+/// The struct type of class `k`.
+pub(crate) fn class_type(k: usize) -> Type {
+    let id = CLASS_TYPES.with(|c| c.borrow()[k]);
+    Type::Named {
+        id,
+        type_args: Vec::new(),
+        const_args: Vec::new(),
+        variance: Vec::new(),
+        nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+    }
+}
+
+/// A field holds its own scalar; anything on the heap is stored boxed,
+/// so a list field is one shared header and a class's layout never
+/// depends on another's.
+pub(crate) fn field_storage(ty: Ty) -> Ty {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str => ty,
+        _ => Ty::Object,
+    }
+}
+
 /// `List<elem>` as the library declares it.
 fn list_type(elem: Type) -> Type {
     let id = LIST_TYPE
@@ -57,6 +89,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::None => prim(PrimitiveType::Unit),
         Ty::List(e) => list_type(ir(e.ty())),
         Ty::Tuple | Ty::Dict | Ty::Set => list_type(Type::Any),
+        Ty::Class(k) => class_type(k as usize),
         Ty::Object | Ty::Unknown => Type::Any,
     }
 }
@@ -151,7 +184,7 @@ pub(crate) fn call(name: &str, args: Vec<Node>, ty: Ty, span: Span) -> Node {
     )
 }
 
-fn cast(value: Node, ty: Ty, span: Span) -> Node {
+pub(crate) fn cast(value: Node, ty: Ty, span: Span) -> Node {
     node(
         TypedExpression::Cast(TypedCast {
             expr: Box::new(value),
@@ -165,6 +198,61 @@ fn cast(value: Node, ty: Ty, span: Span) -> Node {
 /// The name of a module function's value adapter.
 pub(crate) fn adapter_name(name: &str) -> String {
     format!("{name}$fn")
+}
+
+pub(crate) fn new_name(class: &str) -> String {
+    format!("{class}$new")
+}
+pub(crate) fn dispatch_name(method_fn: &str) -> String {
+    format!("{method_fn}$dispatch")
+}
+pub(crate) fn getattr_name(attr: &str) -> String {
+    format!("py$getattr${attr}")
+}
+pub(crate) fn setattr_name(attr: &str) -> String {
+    format!("py$setattr${attr}")
+}
+pub(crate) fn callm_name(method: &str, arity: usize) -> String {
+    format!("py$call${method}${arity}")
+}
+
+/// A method's signature as its callers see it: without `self`.
+pub(crate) fn without_self(sig: &Sig) -> Sig {
+    Sig {
+        params: sig.params[1..].to_vec(),
+        ret: sig.ret,
+        defaults: sig
+            .defaults
+            .get(1..)
+            .map(|d| d.to_vec())
+            .unwrap_or_default(),
+    }
+}
+
+fn op_text(op: py::Operator) -> &'static str {
+    match op {
+        py::Operator::Add => "+",
+        py::Operator::Sub => "-",
+        py::Operator::Mult => "*",
+        py::Operator::MatMult => "@",
+        py::Operator::Div => "/",
+        py::Operator::Mod => "%",
+        py::Operator::Pow => "**",
+        py::Operator::LShift => "<<",
+        py::Operator::RShift => ">>",
+        py::Operator::BitOr => "|",
+        py::Operator::BitXor => "^",
+        py::Operator::BitAnd => "&",
+        py::Operator::FloorDiv => "//",
+    }
+}
+
+pub(crate) fn int32_lit(v: i32, span: Span) -> Node {
+    node(
+        TypedExpression::Literal(TypedLiteral::Integer(v as i128)),
+        Ty::Int,
+        span,
+    )
 }
 
 /// A Python function may keep anything it is handed: store it in a
@@ -298,6 +386,8 @@ pub(crate) struct Lowerer<'m> {
     captured: Vec<String>,
     /// The types of the captured variables, as the owner has them.
     captured_types: HashMap<String, Ty>,
+    /// The class whose method this is, for `super()`.
+    pub(crate) class: Option<usize>,
 }
 
 /// The function record's fixed prefix: code address and arity.
@@ -344,6 +434,7 @@ impl<'m> Lowerer<'m> {
                 .collect(),
             captured,
             captured_types,
+            class: None,
         }
     }
 
@@ -486,7 +577,13 @@ impl<'m> Lowerer<'m> {
 
     // ─── Functions ──────────────────────────────────────────────────
 
-    pub(crate) fn function(&mut self, f: &py::StmtFunctionDef) -> Result<TypedFunction> {
+    /// A `def` as a function, under `name`: its own for a module
+    /// function, `Class$m` for a method.
+    pub(crate) fn function_named(
+        &mut self,
+        f: &py::StmtFunctionDef,
+        name: &str,
+    ) -> Result<TypedFunction> {
         if !f.decorator_list.is_empty() {
             return unsupported("decorators", f);
         }
@@ -558,7 +655,7 @@ impl<'m> Lowerer<'m> {
             self.stmt(s, &mut statements)?;
         }
         Ok(TypedFunction {
-            name: intern(f.name.as_str()),
+            name: intern(name),
             annotations: Vec::new(),
             effects: Vec::new(),
             with_handlers: Vec::new(),
@@ -610,6 +707,36 @@ impl<'m> Lowerer<'m> {
             (Ty::Object, Ty::Tuple) => call("zb_unbox_tuple", vec![v.node], Ty::Tuple, span),
             (Ty::Object, Ty::Dict) => call("zb_dict_unbox", vec![v.node], Ty::Dict, span),
             (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
+            // An instance is boxed as its address under the class tag, and
+            // read back with a check; a subclass instance is its base.
+            (Ty::Class(k), Ty::Object) => {
+                let address = cast(v.node, Ty::Int, span);
+                call(
+                    "zb_box_instance_raw",
+                    vec![
+                        address,
+                        int32_lit(zyntax_builtins::instance_tag(k as usize) as i32, span),
+                    ],
+                    Ty::Object,
+                    span,
+                )
+            }
+            (Ty::Object, Ty::Class(k)) => {
+                let address = call(
+                    &format!("{}$unbox", self.module.classes[k as usize].name),
+                    vec![v.node],
+                    Ty::Int,
+                    span,
+                );
+                cast(address, target, span)
+            }
+            // Up or down one chain, the instance is the same address.
+            (Ty::Class(a), Ty::Class(b))
+                if self.module.is_subclass(a as usize, b as usize)
+                    || self.module.is_subclass(b as usize, a as usize) =>
+            {
+                cast(v.node, target, span)
+            }
             // A dict iterates as its keys; a set is its list of elements.
             (Ty::Dict, Ty::List(Elem::Object)) => call("zb_dict_keys", vec![v.node], target, span),
             (Ty::Set, Ty::List(Elem::Object)) => Node {
@@ -640,7 +767,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// `bool(v)`: the value as a condition.
-    fn truthy(&mut self, v: Val) -> Node {
+    pub(crate) fn truthy(&mut self, v: Val) -> Node {
         let span = v.node.span;
         match v.ty {
             Ty::Bool => v.node,
@@ -664,6 +791,19 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
+            Ty::Class(k) => {
+                if let Some(r) = self.dunder(k as usize, "__bool__", v.node.clone(), vec![], span) {
+                    self.truthy(r)
+                } else if let Some(r) = self.dunder(k as usize, "__len__", v.node, vec![], span) {
+                    self.truthy(r)
+                } else {
+                    node(
+                        TypedExpression::Literal(TypedLiteral::Bool(true)),
+                        Ty::Bool,
+                        span,
+                    )
+                }
+            }
             Ty::List(_) | Ty::Tuple | Ty::Set => binary(
                 BinaryOp::Ne,
                 method_call(v.node, "len", vec![], Ty::Int, span),
@@ -693,6 +833,16 @@ impl<'m> Lowerer<'m> {
             Ty::Tuple => call("zb_tuple_repr", vec![v.node], Ty::Str, span),
             Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
             Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
+            Ty::Class(k) => {
+                let k = k as usize;
+                match self
+                    .dunder(k, "__str__", v.node.clone(), vec![], span)
+                    .or_else(|| self.dunder(k, "__repr__", v.node, vec![], span))
+                {
+                    Some(r) => self.coerce(r, Ty::Str),
+                    None => str_lit(&format!("<{} object>", self.module.classes[k].name), span),
+                }
+            }
             Ty::Object | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
         }
     }
@@ -702,13 +852,18 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         match v.ty {
             Ty::Str => call("zb_str_repr", vec![v.node], Ty::Str, span),
+            Ty::Class(k) => match self.dunder(k as usize, "__repr__", v.node.clone(), vec![], span)
+            {
+                Some(r) => self.coerce(r, Ty::Str),
+                None => self.str_of(v),
+            },
             Ty::Object | Ty::Unknown => call("zb_any_repr", vec![v.node], Ty::Str, span),
             _ => self.str_of(v),
         }
     }
 
     /// A list literal of `elem` kind from already lowered elements.
-    fn list_of(&mut self, items: Vec<Val>, elem: Elem, span: Span) -> Node {
+    pub(crate) fn list_of(&mut self, items: Vec<Val>, elem: Elem, span: Span) -> Node {
         let items = items
             .into_iter()
             .map(|v| self.coerce(v, elem.ty()))
@@ -911,6 +1066,17 @@ impl<'m> Lowerer<'m> {
     ) -> Result<()> {
         let n = match target {
             py::Expr::Name(n) => n,
+            // `obj.attr = v`
+            py::Expr::Attribute(a) => {
+                let object = self.expr(&a.value)?;
+                let stmt = self.set_attribute(object, a.attr.as_str(), value, span)?;
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(stmt)),
+                    Type::Unknown,
+                    span,
+                ));
+                return Ok(());
+            }
             // `xs[i] = v`
             py::Expr::Subscript(sub) => {
                 let seq = self.expr(&sub.value)?;
@@ -1352,6 +1518,10 @@ impl<'m> Lowerer<'m> {
                 ty,
             },
             py::Expr::Lambda(l) => self.lambda(l, span)?,
+            py::Expr::Attribute(a) => {
+                let object = self.expr(&a.value)?;
+                self.attribute(object, a.attr.as_str(), span)?
+            }
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left)?;
                 let r = self.expr(&b.right)?;
@@ -1518,6 +1688,35 @@ impl<'m> Lowerer<'m> {
         right_expr: &py::Expr,
         span: Span,
     ) -> Result<Val> {
+        if let Ty::Class(k) = left.ty {
+            let name = match op {
+                py::Operator::Add => "__add__",
+                py::Operator::Sub => "__sub__",
+                py::Operator::Mult => "__mul__",
+                py::Operator::Div => "__truediv__",
+                py::Operator::FloorDiv => "__floordiv__",
+                py::Operator::Mod => "__mod__",
+                py::Operator::Pow => "__pow__",
+                py::Operator::MatMult => "__matmul__",
+                py::Operator::BitAnd => "__and__",
+                py::Operator::BitOr => "__or__",
+                py::Operator::BitXor => "__xor__",
+                py::Operator::LShift => "__lshift__",
+                py::Operator::RShift => "__rshift__",
+            };
+            let other = self.coerce(right, Ty::Object);
+            if let Some(r) = self.dunder(k as usize, name, left.node, vec![other], span) {
+                return Ok(r);
+            }
+            return Err(Error::Unsupported {
+                what: format!(
+                    "`{}` on {}, which defines no {name}",
+                    op_text(op),
+                    self.module.classes[k as usize].name
+                ),
+                at: span.start,
+            });
+        }
         let ty = types::binop(op, left.ty, right.ty, right_expr);
         // Strings have their own operators.
         if left.ty == Ty::Str || right.ty == Ty::Str {
@@ -1658,6 +1857,60 @@ impl<'m> Lowerer<'m> {
                 span,
             )
         };
+        if let Ty::Class(k) = left.ty {
+            let dunder = match op {
+                py::CmpOp::Eq => Some(("__eq__", false)),
+                py::CmpOp::NotEq => Some(("__ne__", false)),
+                py::CmpOp::Lt => Some(("__lt__", false)),
+                py::CmpOp::LtE => Some(("__le__", false)),
+                py::CmpOp::Gt => Some(("__gt__", false)),
+                py::CmpOp::GtE => Some(("__ge__", false)),
+                _ => None,
+            };
+            if let Some((name, _)) = dunder {
+                let right_ty = right.ty;
+                let right_node = right.node.clone();
+                let other = self.coerce(right, Ty::Object);
+                if let Some(r) = self.dunder(
+                    k as usize,
+                    name,
+                    left.node.clone(),
+                    vec![other.clone()],
+                    span,
+                ) {
+                    return Ok(self.truthy(r));
+                }
+                if name == "__ne__" {
+                    if let Some(r) = self.dunder(
+                        k as usize,
+                        "__eq__",
+                        left.node.clone(),
+                        vec![other.clone()],
+                        span,
+                    ) {
+                        let t = self.truthy(r);
+                        return Ok(negate(t));
+                    }
+                }
+                if matches!(op, py::CmpOp::Eq | py::CmpOp::NotEq) {
+                    // No `__eq__`: identity.
+                    let l = self.coerce(left, Ty::Object);
+                    let same = call("zb_any_same", vec![l, other], Ty::Bool, span);
+                    return Ok(if op == py::CmpOp::NotEq {
+                        negate(same)
+                    } else {
+                        same
+                    });
+                }
+                return Err(Error::Unsupported {
+                    what: format!(
+                        "ordering {} against a {right_ty:?}, which defines no {name}",
+                        self.module.classes[k as usize].name
+                    ),
+                    at: right_node.span.start,
+                });
+            }
+        }
         match op {
             py::CmpOp::In | py::CmpOp::NotIn => {
                 let n = if left.ty == Ty::Str && right.ty == Ty::Str {
@@ -2445,6 +2698,9 @@ impl<'m> Lowerer<'m> {
                 let callee = self.expr(&c.func)?;
                 return self.call_value(callee, args, keywords, c, span);
             }
+            if let Some(&k) = self.module.class_index.get(name) {
+                return self.construct(k, args, keywords, c, span);
+            }
             if let Some(sig) = self.module.funcs.get(name).cloned() {
                 let lowered = self.arguments(name, &sig, args, keywords, c)?;
                 return Ok(Val {
@@ -2454,6 +2710,29 @@ impl<'m> Lowerer<'m> {
             }
             if name == "print" {
                 return self.print(args, keywords, span);
+            }
+        }
+        if let py::Expr::Attribute(a) = &*c.func {
+            if types::is_super_call(&a.value) {
+                return self.super_call(a.attr.as_str(), args, keywords, c, span);
+            }
+            let receiver = self.expr(&a.value)?;
+            if let Ty::Class(k) = receiver.ty {
+                return self.method_on(
+                    k as usize,
+                    receiver,
+                    a.attr.as_str(),
+                    args,
+                    keywords,
+                    c,
+                    span,
+                );
+            }
+            if receiver.ty == Ty::Object && !keywords.is_empty() {
+                return unsupported("keyword arguments in a call through a value", c);
+            }
+            if receiver.ty == Ty::Object {
+                return self.dynamic_method(receiver, a.attr.as_str(), args, span);
             }
         }
         if !keywords.is_empty() {
@@ -2516,6 +2795,10 @@ impl<'m> Lowerer<'m> {
                     };
                     return Ok(Val { node, ty: Ty::Bool });
                 }
+                "isinstance" if args.len() == 2 => {
+                    let v = self.expr(&args[0])?;
+                    return self.isinstance(v, &args[1], span);
+                }
                 "len" => {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
@@ -2524,6 +2807,20 @@ impl<'m> Lowerer<'m> {
                             method_call(v.node, "len", vec![], Ty::Int, span)
                         }
                         Ty::Dict => call("zb_dict_len", vec![v.node], Ty::Int, span),
+                        Ty::Class(k) => {
+                            match self.dunder(k as usize, "__len__", v.node, vec![], span) {
+                                Some(r) => self.coerce(r, Ty::Int),
+                                None => {
+                                    return Err(Error::Unsupported {
+                                        what: format!(
+                                            "len() of {}, which defines no __len__",
+                                            self.module.classes[k as usize].name
+                                        ),
+                                        at: span.start,
+                                    })
+                                }
+                            }
+                        }
                         _ => {
                             let o = self.coerce(v, Ty::Object);
                             call("zb_any_len", vec![o], Ty::Int, span)
@@ -2831,6 +3128,7 @@ impl<'m> Lowerer<'m> {
                         Ty::Tuple => str_lit("tuple", span),
                         Ty::Dict => str_lit("dict", span),
                         Ty::Set => str_lit("set", span),
+                        Ty::Class(k) => str_lit(&self.module.classes[k as usize].name, span),
                         _ => call("zb_any_type", vec![v.node], Ty::Str, span),
                     };
                     return Ok(Val { node, ty: Ty::Str });
@@ -2909,6 +3207,400 @@ impl<'m> Lowerer<'m> {
 
     /// `print(a, b, ...)`: each argument as `str()`, a space between,
     /// one line written.
+    /// `isinstance(v, T)` for a type name or a class.
+    fn isinstance(&mut self, v: Val, ty_expr: &py::Expr, span: Span) -> Result<Val> {
+        let py::Expr::Name(n) = ty_expr else {
+            return unsupported("isinstance() with anything but a type name", ty_expr);
+        };
+        let lit = |b: bool| Val {
+            node: node(
+                TypedExpression::Literal(TypedLiteral::Bool(b)),
+                Ty::Bool,
+                span,
+            ),
+            ty: Ty::Bool,
+        };
+        if let Some(&k) = self.module.class_index.get(n.id.as_str()) {
+            // The instance's class tag against `k` and every subclass.
+            let tag = match v.ty {
+                Ty::Class(c) => {
+                    if !self.module.is_subclass(c as usize, k)
+                        && !self.module.is_subclass(k, c as usize)
+                    {
+                        return Ok(lit(false));
+                    }
+                    node(
+                        TypedExpression::Field(TypedFieldAccess {
+                            object: Box::new(v.node),
+                            field: intern("$class"),
+                        }),
+                        Ty::Int,
+                        span,
+                    )
+                }
+                Ty::Object => binary(
+                    BinaryOp::Sub,
+                    call("zb_any_kind", vec![v.node], Ty::Int, span),
+                    int_lit(zyntax_builtins::INSTANCE_KIND_BASE, span),
+                    Ty::Int,
+                    span,
+                ),
+                _ => return Ok(lit(false)),
+            };
+            let mut pre = Vec::new();
+            let held = self.hold(
+                Val {
+                    node: tag,
+                    ty: Ty::Int,
+                },
+                &mut pre,
+                span,
+            );
+            self.hoisted.extend(pre);
+            let mut test: Option<Node> = None;
+            for c in 0..self.module.classes.len() {
+                if self.module.is_subclass(c, k) {
+                    let this = binary(
+                        BinaryOp::Eq,
+                        held.node.clone(),
+                        int_lit(c as i64, span),
+                        Ty::Bool,
+                        span,
+                    );
+                    test = Some(match test {
+                        None => this,
+                        Some(prev) => binary(BinaryOp::Or, prev, this, Ty::Bool, span),
+                    });
+                }
+            }
+            return Ok(Val {
+                node: test.expect("a class is its own subclass"),
+                ty: Ty::Bool,
+            });
+        }
+        let name = n.id.as_str();
+        let statically = |ty: Ty| -> Option<bool> {
+            Some(match (name, ty) {
+                ("int", Ty::Int | Ty::Bool) => true,
+                ("bool", Ty::Bool) => true,
+                ("float", Ty::Float) => true,
+                ("str", Ty::Str) => true,
+                ("list", Ty::List(_)) => true,
+                ("tuple", Ty::Tuple) => true,
+                ("dict", Ty::Dict) => true,
+                ("set", Ty::Set) => true,
+                (_, Ty::Object | Ty::Unknown) => return None,
+                _ => false,
+            })
+        };
+        if let Some(answer) = statically(v.ty) {
+            return Ok(lit(answer));
+        }
+        let type_name = call("zb_any_type", vec![v.node], Ty::Str, span);
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: type_name,
+                ty: Ty::Str,
+            },
+            &mut pre,
+            span,
+        );
+        self.hoisted.extend(pre);
+        let same = |t: &str| {
+            call(
+                "zb_str_eq",
+                vec![held.node.clone(), str_lit(t, span)],
+                Ty::Bool,
+                span,
+            )
+        };
+        let node = match name {
+            // A bool is an int too.
+            "int" => binary(BinaryOp::Or, same("int"), same("bool"), Ty::Bool, span),
+            other => same(other),
+        };
+        Ok(Val { node, ty: Ty::Bool })
+    }
+
+    /// `obj.attr` read.
+    fn attribute(&mut self, object: Val, attr: &str, span: Span) -> Result<Val> {
+        match object.ty {
+            Ty::Class(k) => {
+                let Some((_, ty)) = self.module.field(k as usize, attr) else {
+                    return Err(Error::Unsupported {
+                        what: format!(
+                            "attribute `{attr}` of {}, which has no such field",
+                            self.module.classes[k as usize].name
+                        ),
+                        at: span.start,
+                    });
+                };
+                let stored = field_storage(ty);
+                let field = node(
+                    TypedExpression::Field(TypedFieldAccess {
+                        object: Box::new(object.node),
+                        field: intern(attr),
+                    }),
+                    stored,
+                    span,
+                );
+                let node = self.coerce(
+                    Val {
+                        node: field,
+                        ty: stored,
+                    },
+                    ty,
+                );
+                Ok(Val { node, ty })
+            }
+            Ty::Object => {
+                self.module.attr_reads.borrow_mut().insert(attr.to_string());
+                Ok(Val {
+                    node: call(&getattr_name(attr), vec![object.node], Ty::Object, span),
+                    ty: Ty::Object,
+                })
+            }
+            other => Err(Error::Unsupported {
+                what: format!("attribute `{attr}` of a {other:?}"),
+                at: span.start,
+            }),
+        }
+    }
+
+    /// `obj.attr = value` as a statement expression.
+    fn set_attribute(&mut self, object: Val, attr: &str, value: Val, span: Span) -> Result<Node> {
+        match object.ty {
+            Ty::Class(k) => {
+                let Some((_, ty)) = self.module.field(k as usize, attr) else {
+                    return Err(Error::Unsupported {
+                        what: format!(
+                            "attribute `{attr}` of {}, which has no such field",
+                            self.module.classes[k as usize].name
+                        ),
+                        at: span.start,
+                    });
+                };
+                let stored = field_storage(ty);
+                let value = self.coerce(value, ty);
+                let value = self.coerce(Val { node: value, ty }, stored);
+                let field = node(
+                    TypedExpression::Field(TypedFieldAccess {
+                        object: Box::new(object.node),
+                        field: intern(attr),
+                    }),
+                    stored,
+                    span,
+                );
+                Ok(binary(BinaryOp::Assign, field, value, Ty::None, span))
+            }
+            Ty::Object => {
+                self.module
+                    .attr_writes
+                    .borrow_mut()
+                    .insert(attr.to_string());
+                let v = self.coerce(value, Ty::Object);
+                Ok(call(
+                    &setattr_name(attr),
+                    vec![object.node, v],
+                    Ty::None,
+                    span,
+                ))
+            }
+            other => Err(Error::Unsupported {
+                what: format!("assignment to attribute `{attr}` of a {other:?}"),
+                at: span.start,
+            }),
+        }
+    }
+
+    /// The call of `method` on an instance of class `k`, through the
+    /// dispatcher when a subclass overrides it. `args` are already
+    /// coerced to the parameter types.
+    pub(crate) fn invoke(
+        &mut self,
+        k: usize,
+        method: &str,
+        receiver: Node,
+        args: Vec<Node>,
+        span: Span,
+    ) -> Option<Val> {
+        let owner = self.module.method_owner(k, method)?;
+        let (sig, fn_name) = self.module.method_sig(k, method)?;
+        let ret = sig.ret;
+        let target = if self.module.overriders(owner, method).is_empty() {
+            fn_name
+        } else {
+            dispatch_name(&fn_name)
+        };
+        let receiver = self.coerce(
+            Val {
+                node: receiver,
+                ty: Ty::Class(k as u16),
+            },
+            Ty::Class(owner as u16),
+        );
+        let mut all = vec![receiver];
+        all.extend(args);
+        Some(Val {
+            node: call(&target, all, ret, span),
+            ty: ret,
+        })
+    }
+
+    /// A dunder method call with already-boxed operands, when the class
+    /// chain defines it.
+    fn dunder(
+        &mut self,
+        k: usize,
+        method: &str,
+        receiver: Node,
+        args: Vec<Node>,
+        span: Span,
+    ) -> Option<Val> {
+        let (sig, _) = self.module.method_sig(k, method)?;
+        if sig.params.len() != args.len() + 1 {
+            return None;
+        }
+        let param_tys: Vec<Ty> = sig.params.iter().skip(1).map(|(_, t)| *t).collect();
+        let args = args
+            .into_iter()
+            .zip(param_tys)
+            .map(|(a, t)| {
+                self.coerce(
+                    Val {
+                        node: a,
+                        ty: Ty::Object,
+                    },
+                    t,
+                )
+            })
+            .collect();
+        self.invoke(k, method, receiver, args, span)
+    }
+
+    /// `obj.m(args)` on a receiver of known class.
+    #[allow(clippy::too_many_arguments)]
+    fn method_on(
+        &mut self,
+        k: usize,
+        receiver: Val,
+        method: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        let Some((sig, _)) = self.module.method_sig(k, method) else {
+            return Err(Error::Unsupported {
+                what: format!(
+                    "method `{method}` of {}, which defines none",
+                    self.module.classes[k].name
+                ),
+                at: span.start,
+            });
+        };
+        let sig = without_self(sig);
+        let lowered = self.arguments(method, &sig, args, keywords, c)?;
+        Ok(self
+            .invoke(k, method, receiver.node, lowered, span)
+            .expect("the method was just found"))
+    }
+
+    /// `obj.m(args)` on a dynamic receiver: a dispatcher over every class
+    /// with such a method, generated once per name and arity.
+    fn dynamic_method(
+        &mut self,
+        receiver: Val,
+        method: &str,
+        args: &[py::Expr],
+        span: Span,
+    ) -> Result<Val> {
+        let mut lowered = vec![receiver.node];
+        for a in args {
+            lowered.push(self.expr_as(a, Ty::Object)?);
+        }
+        self.module
+            .dyn_methods
+            .borrow_mut()
+            .insert((method.to_string(), args.len()));
+        Ok(Val {
+            node: call(&callm_name(method, args.len()), lowered, Ty::Object, span),
+            ty: Ty::Object,
+        })
+    }
+
+    /// `C(args)`: allocate, then `__init__`.
+    fn construct(
+        &mut self,
+        k: usize,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        let name = self.module.classes[k].name.clone();
+        let lowered = match self.module.method_sig(k, "__init__") {
+            Some((sig, _)) => {
+                let sig = without_self(sig);
+                self.arguments(&name, &sig, args, keywords, c)?
+            }
+            None if args.is_empty() && keywords.is_empty() => Vec::new(),
+            None => {
+                return unsupported(format!("{name}() takes no arguments"), c);
+            }
+        };
+        Ok(Val {
+            node: call(&new_name(&name), lowered, Ty::Class(k as u16), span),
+            ty: Ty::Class(k as u16),
+        })
+    }
+
+    /// `super().m(args)`: the base class's method, on `self`.
+    fn super_call(
+        &mut self,
+        method: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        let Some(k) = self.class else {
+            return unsupported("super() outside a method", c);
+        };
+        let Some(base) = self.module.classes[k].base else {
+            return unsupported(
+                format!(
+                    "super() in {}, which has no base class",
+                    self.module.classes[k].name
+                ),
+                c,
+            );
+        };
+        let Some(owner) = self.module.method_owner(base, method) else {
+            return unsupported(format!("super().{method}, which no base class defines"), c);
+        };
+        let (sig, fn_name) = self
+            .module
+            .method_sig(owner, method)
+            .expect("the owner defines it");
+        let ret = sig.ret;
+        let sig = without_self(sig);
+        let lowered = self.arguments(method, &sig, args, keywords, c)?;
+        let self_name = self.sig.params[0].0.clone();
+        let receiver = Val {
+            node: var(intern(&self_name), Ty::Class(k as u16), span),
+            ty: Ty::Class(k as u16),
+        };
+        let receiver = self.coerce(receiver, Ty::Class(owner as u16));
+        let mut all = vec![receiver];
+        all.extend(lowered);
+        Ok(Val {
+            node: call(&fn_name, all, ret, span),
+            ty: ret,
+        })
+    }
+
     /// A call through a function value: every argument boxed, the result
     /// dynamic.
     fn call_value(
@@ -3231,9 +3923,24 @@ impl<'m> Lowerer<'m> {
                 None => return unsupported("`**` argument unpacking", k),
             }
         }
-        let mut line: Option<Node> = None;
+        // Every argument is evaluated before any is converted, so a call
+        // among them sees the others' side effects the way Python's
+        // print does.
+        let mut values = Vec::with_capacity(args.len());
         for a in args {
             let v = self.expr(a)?;
+            let v = if args.len() > 1 {
+                let mut pre = Vec::new();
+                let held = self.hold(v, &mut pre, span);
+                self.hoisted.extend(pre);
+                held
+            } else {
+                v
+            };
+            values.push(v);
+        }
+        let mut line: Option<Node> = None;
+        for v in values {
             let s = self.str_of(v);
             line = Some(match line {
                 None => s,

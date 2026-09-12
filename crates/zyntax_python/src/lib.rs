@@ -25,6 +25,7 @@ use zyntax_typed_ast::{
     InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
 };
 
+mod classes;
 mod format;
 mod lower;
 mod scope;
@@ -55,6 +56,7 @@ const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
     none_text: "None",
     single_quotes: true,
     float_fraction: true,
+    instance_hooks: true,
     type_names: zyntax_builtins::TypeNames {
         none: "NoneType",
         bool: "bool",
@@ -112,11 +114,32 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             // A module docstring declares nothing and runs nothing.
             py::Stmt::Expr(e) if matches!(*e.value, py::Expr::StringLiteral(_)) => {}
             py::Stmt::Pass(_) => {}
+            // Classes are declarations; their methods are functions.
+            py::Stmt::ClassDef(_) => {}
             other => top_level.push(other),
         }
     }
+    let class_defs = classes::collect(&module.body)?;
+    let (class_infos, class_index) = classes::skeletons(&class_defs)?;
+    let mut items: Vec<types::Item<'_>> = defs
+        .iter()
+        .map(|f| types::Item {
+            name: f.name.to_string(),
+            class: None,
+            def: f,
+        })
+        .collect();
+    for (k, def) in class_defs.iter().enumerate() {
+        for m in &def.methods {
+            items.push(types::Item {
+                name: types::method_fn(&def.name, m.name.as_str()),
+                class: Some(k),
+                def: m,
+            });
+        }
+    }
 
-    let library = zyntax_builtins::library(&POLICY);
+    let mut library = zyntax_builtins::library(&POLICY);
     lower::set_list_type(library.list_type);
     let owned: Vec<py::Stmt> = top_level.iter().map(|s| (*s).clone()).collect();
     let entry_sig = types::Sig {
@@ -126,9 +149,11 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
     };
     let mut inferred = types::Module {
         list_type: Some(library.list_type),
+        classes: class_infos,
+        class_index,
         ..Default::default()
     };
-    let global_names = module_globals(&module.body, &defs);
+    let global_names = module_globals(&module.body, &defs, &inferred.class_index);
     // A global's type is the join of every assignment to it: the
     // module's own, then those under `global` in each function.
     let main_locals = types::infer_locals(&inferred, &entry_sig, &owned);
@@ -142,11 +167,12 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
     }
     for _ in 0..4 {
         let before = inferred.globals.clone();
-        let funcs = types::infer_module(&inferred, &defs);
+        let (funcs, class_infos) = types::infer_module(&inferred, &items);
         inferred.funcs = funcs;
-        for f in &defs {
-            let sig = inferred.funcs[f.name.as_str()].clone();
-            let locals = types::infer_locals(&inferred, &sig, &f.body);
+        inferred.classes = class_infos;
+        for item in &items {
+            let sig = inferred.funcs[&item.name].clone();
+            let locals = types::infer_locals(&inferred, &sig, &item.def.body);
             for (name, ty) in &locals.global_writes {
                 let joined = inferred
                     .globals
@@ -166,7 +192,7 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             *ty = types::Ty::Object;
         }
     }
-    let mut declarations = Vec::new();
+    let mut declarations = classes::register(&mut inferred, &mut library.type_registry);
     for (name, ty) in &inferred.globals {
         let stored = match ty {
             types::Ty::Int | types::Ty::Float | types::Ty::Bool | types::Ty::Str => *ty,
@@ -184,24 +210,25 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             Span::new(0, 0),
         ));
     }
-    for f in &defs {
-        let sig = inferred.funcs[f.name.as_str()].clone();
-        let locals = types::infer_locals(&inferred, &sig, &f.body);
-        let scope = scope::Scope::of_function(f);
-        let func = lower::Lowerer::new(
+    for item in &items {
+        let sig = inferred.funcs[&item.name].clone();
+        let locals = types::infer_locals(&inferred, &sig, &item.def.body);
+        let scope = scope::Scope::of_function(item.def);
+        let mut lowerer = lower::Lowerer::new(
             &inferred,
-            f.name.as_str(),
+            &item.name,
             sig,
             locals,
             &scope,
             Vec::new(),
             std::collections::HashMap::new(),
-        )
-        .function(f)?;
+        );
+        lowerer.class = item.class;
+        let func = lowerer.function_named(item.def, &item.name)?;
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),
             Type::Unknown,
-            span_of(*f),
+            span_of(item.def),
         ));
     }
     if !top_level.is_empty() {
@@ -263,6 +290,13 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             Span::new(0, 0),
         ));
     }
+    for func in classes::generated(&inferred) {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
     declarations.extend(library.declarations);
 
     Ok(TypedProgram {
@@ -276,9 +310,15 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
 
 /// The module-level names that are variables of the module rather than
 /// locals of its body: those a function reads or declares `global`.
-fn module_globals(body: &[py::Stmt], defs: &[&py::StmtFunctionDef]) -> Vec<String> {
+fn module_globals(
+    body: &[py::Stmt],
+    defs: &[&py::StmtFunctionDef],
+    classes: &std::collections::HashMap<String, usize>,
+) -> Vec<String> {
     let module = scope::Scope::of_body(Vec::new(), body);
-    let functions: std::collections::HashSet<&str> = defs.iter().map(|f| f.name.as_str()).collect();
+    let mut functions: std::collections::HashSet<&str> =
+        defs.iter().map(|f| f.name.as_str()).collect();
+    functions.extend(classes.keys().map(|k| k.as_str()));
     let mut names: std::collections::BTreeSet<String> =
         module.declared_globals().into_iter().collect();
     for (_, child) in &module.children {

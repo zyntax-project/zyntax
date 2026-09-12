@@ -3,9 +3,6 @@
 # A listed case that starts passing fails the suite until it is removed here
 # and its issue is closed; an unlisted case that fails is a regression.
 
-class/basic.py                               cd13255
-class/dunder_operators.py                    cd13255
-class/inheritance.py                         cd13255
 exceptions/custom_and_propagation.py         2327e7f
 exceptions/try_except_finally.py             2327e7f
 generators/basic_yield.py                    804d85e
