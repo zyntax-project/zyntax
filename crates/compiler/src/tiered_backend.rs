@@ -32,7 +32,7 @@
 //! Phase 2/3 will add OSR; phase 4 will add deopt-on-speculation.
 //! See `crates/compiler/BEADIE_INTEGRATION.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::{Arc, RwLock};
 
@@ -396,6 +396,18 @@ impl TieredBackend {
     /// Compile a HIR module — bulk-emits every function at tier 0 and
     /// registers each with the beadie adapter.
     pub fn compile_module(&mut self, module: HirModule) -> CompilerResult<()> {
+        self.compile_module_reaching(module, None)
+    }
+
+    /// Compile a HIR module, generating bodies only for `reachable` when
+    /// it is given. Every function is still declared and registered, so
+    /// a name resolves and a bead exists; one outside the set has no
+    /// tier-0 code and cannot be entered.
+    pub fn compile_module_reaching(
+        &mut self,
+        module: HirModule,
+        reachable: Option<HashSet<HirId>>,
+    ) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             eprintln!(
                 "[TieredBackend] Compiling {} functions at Tier 0 (Baseline)",
@@ -446,7 +458,14 @@ impl TieredBackend {
         self.cranelift
             .with_lock(|be| be.set_bead_ids(bead_ids.clone()));
 
-        self.cranelift.with_lock(|be| be.compile_module(&module))?;
+        // The filter applies to this module alone; a rebuild recompiles
+        // earlier modules whole, and their ids are not in this set.
+        self.cranelift.with_lock(|be| {
+            be.set_only_compile_reachable(reachable);
+            let compiled = be.compile_module(&module);
+            be.set_only_compile_reachable(None);
+            compiled
+        })?;
 
         // Recorded before it becomes `current_module`, so a later
         // rebuild can put every one of them back. Kept by identity

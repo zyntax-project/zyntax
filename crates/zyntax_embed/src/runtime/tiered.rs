@@ -93,6 +93,10 @@ pub struct TieredRuntime {
     /// brought them, so a name means what it means inside the language
     /// asking rather than whichever language registered first.
     snapshot_modules: crate::import_chain::SnapshotModules,
+    /// Entry points declared by frontends that hand over typed programs
+    /// rather than registering a grammar, alongside the ones grammars
+    /// state.
+    entry_points: Vec<String>,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
@@ -410,6 +414,7 @@ impl TieredRuntime {
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
+            entry_points: Vec::new(),
             runtime_events: Vec::new(),
             event_sink: None,
             builtin_aliases: indexmap::IndexMap::new(),
@@ -493,7 +498,18 @@ impl TieredRuntime {
     }
 
     /// Compile a HIR module into the tiered runtime
-    pub fn compile_module(&mut self, mut module: HirModule) -> RuntimeResult<()> {
+    pub fn compile_module(&mut self, module: HirModule) -> RuntimeResult<()> {
+        self.compile_module_entered(module, None)
+    }
+
+    /// Compile a module whose entry points are known, generating code
+    /// only for what they reach. `None` compiles everything, for a host
+    /// that may call any function by name.
+    fn compile_module_entered(
+        &mut self,
+        mut module: HirModule,
+        entered: Option<Vec<String>>,
+    ) -> RuntimeResult<()> {
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `TieredRuntime::compile_module` never get
         // CSE / LICM / inline / const_fold / aggregate_split — the bench-only
@@ -519,8 +535,16 @@ impl TieredRuntime {
 
         self.backend.set_emit_osr_probes(self.config.enable_osr);
 
+        // Reachability is read after the optimisers, since inlining
+        // removes calls and the set has to describe the module codegen
+        // sees.
+        let reachable = entered.map(|names| {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            zyntax_compiler::reachable_function_ids(&module, &names)
+        });
+
         // Compile the module (consumes it)
-        self.backend.compile_module(module)?;
+        self.backend.compile_module_reaching(module, reachable)?;
 
         Ok(())
     }
@@ -903,12 +927,31 @@ impl TieredRuntime {
     }
 
     /// The names a program can be entered through, as each registered
-    /// language declares them.
+    /// language declares them and as frontends declared them directly.
     fn entry_names(&self) -> Vec<String> {
         self.grammars
             .values()
             .filter_map(|grammar| grammar.entry_point().map(str::to_string))
+            .chain(self.entry_points.iter().cloned())
             .collect()
+    }
+
+    /// Declare the functions programs are entered through, for a
+    /// frontend that compiles typed programs without a grammar. Lowering
+    /// and codegen then build only what a program's own declarations
+    /// reach of what its imports brought in; without an entry point,
+    /// everything is built because a host may call anything.
+    pub fn declare_entry_points<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for name in names {
+            let name = name.into();
+            if !self.entry_points.contains(&name) {
+                self.entry_points.push(name);
+            }
+        }
     }
 
     /// Whether to run the interp-safe HIR optimisations before a module
@@ -1181,7 +1224,8 @@ impl TieredRuntime {
             self.event_sink.as_ref(),
         );
         let fiber_decls = collect_fiber_decls(&program);
-        let mut hir_module = self.lower_typed_program(program, self.builtin_aliases.clone())?;
+        let (mut hir_module, entered) =
+            self.lower_typed_program(program, self.builtin_aliases.clone())?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -1193,7 +1237,7 @@ impl TieredRuntime {
             .filter_map(|f| f.name.resolve_global())
             .collect();
 
-        self.compile_module(hir_module)?;
+        self.compile_module_entered(hir_module, entered)?;
         let _ = self.apply_fiber_decls(fiber_decls);
         Ok(function_names)
     }
@@ -1210,7 +1254,8 @@ impl TieredRuntime {
             self.event_sink.as_ref(),
         );
         let fiber_decls = collect_fiber_decls(&program);
-        let mut hir_module = self.lower_typed_program(program, self.builtin_aliases.clone())?;
+        let (mut hir_module, _) =
+            self.lower_typed_program(program, self.builtin_aliases.clone())?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -2191,7 +2236,7 @@ impl TieredRuntime {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let fiber_decls = collect_fiber_decls(&typed_program);
-        let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
+        let (mut hir_module, _) = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -2263,7 +2308,7 @@ impl TieredRuntime {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let fiber_decls = collect_fiber_decls(&typed_program);
-        let mut hir_module = self.lower_typed_program(typed_program, builtins)?;
+        let (mut hir_module, entered) = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -2280,7 +2325,7 @@ impl TieredRuntime {
             .collect();
 
         // Compile the module
-        self.compile_module(hir_module)?;
+        self.compile_module_entered(hir_module, entered)?;
         let _ = self.apply_fiber_decls(fiber_decls);
 
         Ok(function_names)
@@ -2311,12 +2356,16 @@ impl TieredRuntime {
         self.load_module(&language, &source)
     }
 
-    /// Lower a TypedProgram to HirModule
+    /// Lower a TypedProgram to HirModule.
+    ///
+    /// Also returns the functions the program can be entered through
+    /// (see `LoweringContext::entered_functions`), for codegen to
+    /// compile only what those reach.
     fn lower_typed_program(
         &self,
         mut program: zyntax_typed_ast::TypedProgram,
         builtins: indexmap::IndexMap<String, String>,
-    ) -> RuntimeResult<HirModule> {
+    ) -> RuntimeResult<(HirModule, Option<Vec<String>>)> {
         use zyntax_compiler::lowering::{LoweringConfig, LoweringContext};
         use zyntax_typed_ast::{
             type_registry::*, AstArena, InternedString, TypeRegistry, TypedDeclaration,
@@ -2497,7 +2546,7 @@ impl TieredRuntime {
         zyntax_compiler::monomorphize_module(&mut hir_module)
             .map_err(|e| RuntimeError::Execution(format!("Monomorphization error: {:?}", e)))?;
 
-        Ok(hir_module)
+        Ok((hir_module, lowering_ctx.entered_functions()))
     }
 
     /// List all loaded function names

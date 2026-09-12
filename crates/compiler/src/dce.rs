@@ -15,12 +15,10 @@
 //!   observable.
 //! - If any reachable function performs an indirect call
 //!   ([`HirCallable::Indirect`], [`HirInstruction::IndirectCall`],
-//!   [`HirInstruction::CallClosure`], or [`HirInstruction::TraitMethodCall`])
-//!   AND we cannot statically resolve the target, we fall back to
-//!   "compile everything" by returning the full set of function ids.
-//!
-//! This preserves correctness in all current call patterns while still
-//! winning on the common kernels-of-known-callees case.
+//!   [`HirInstruction::CallClosure`], or [`HirInstruction::TraitMethodCall`]),
+//!   every function whose address is taken anywhere in the module
+//!   ([`address_taken_functions`]) becomes a root: a pointer can only
+//!   reach a function something took the address of.
 
 use crate::hir::{HirCallable, HirConstant, HirId, HirInstruction, HirModule};
 use std::collections::{HashMap, HashSet};
@@ -119,8 +117,8 @@ fn host_reachable_roots(module: &HirModule) -> Vec<HirId> {
 /// along or the call dangles.
 pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<HirId> {
     // Walk: collect direct calls, FuncRef-style escapes, and detect any
-    // indirect-call site. On indirect-call detection, fall back to "everything
-    // reachable" (the full function-id set).
+    // indirect-call site. The first indirect call seeds every function
+    // whose address is taken anywhere in the module.
     let mut reachable: HashSet<HirId> = HashSet::new();
     let mut worklist: Vec<HirId> = roots;
     // Track every extern symbol name observed in a `HirCallable::Symbol`
@@ -139,6 +137,9 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
     // Whether we've already seeded escapes (we do this once when we first
     // detect an indirect call so we don't double-walk).
     let mut seeded_escapes = false;
+    // Whether the address-taken closure has been seeded; once is enough,
+    // since the set is a property of the module rather than of the walk.
+    let mut seeded_address_taken = false;
 
     while let Some(fid) = worklist.pop() {
         if !reachable.insert(fid) {
@@ -171,10 +172,12 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
                             }
                         }
                         HirCallable::Indirect(_) => {
-                            // Unknown target. Seed escape closure once, then
-                            // fall back to full set if escapes can't account
-                            // for it.
-                            return all_function_ids(module);
+                            // Unknown target: anything whose address is
+                            // taken may be it.
+                            if !seeded_address_taken {
+                                seeded_address_taken = true;
+                                worklist.extend(address_taken_functions(module));
+                            }
                         }
                         // Intrinsics don't reach HIR functions in this module.
                         HirCallable::Intrinsic(_) => {}
@@ -203,11 +206,12 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
                     HirInstruction::IndirectCall { .. }
                     | HirInstruction::CallClosure { .. }
                     | HirInstruction::TraitMethodCall { .. } => {
-                        // Same conservative fallback. TraitMethodCall could in
-                        // principle be resolved via vtables in globals, but
-                        // we keep it simple — these are rare in benchmark
-                        // kernels.
-                        return all_function_ids(module);
+                        // Same unknown target. Vtables are globals, so the
+                        // address-taken set covers trait dispatch too.
+                        if !seeded_address_taken {
+                            seeded_address_taken = true;
+                            worklist.extend(address_taken_functions(module));
+                        }
                     }
                     HirInstruction::CreateClosure { function, .. } => {
                         // Closure body is a real function reachable through
@@ -381,12 +385,10 @@ pub fn address_taken_functions(module: &HirModule) -> HashSet<HirId> {
 
 /// Walk a HirConstant looking for VTable entries whose `function_id` fields
 /// are addresses of HIR functions that may escape.
-fn collect_vtable_funcs(c: &HirConstant, out: &mut HashSet<HirId>) {
+pub(crate) fn collect_vtable_funcs(c: &HirConstant, out: &mut impl Extend<HirId>) {
     match c {
         HirConstant::VTable(vt) => {
-            for entry in &vt.methods {
-                out.insert(entry.function_id);
-            }
+            out.extend(vt.methods.iter().map(|entry| entry.function_id));
         }
         HirConstant::Array(items) | HirConstant::Struct(items) => {
             for item in items {

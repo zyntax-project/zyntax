@@ -232,10 +232,17 @@ pub struct LoweringContext {
     skipped_at: std::collections::HashMap<InternedString, usize>,
     /// Index of the declaration being lowered.
     current_decl: usize,
-    /// Whether a lowered body called through a value rather than a
-    /// name. Nothing can say what such a call reaches, so skipping
-    /// stops being safe once one appears.
+    /// Whether a lowered body reached a target no declaration can
+    /// build. Nothing can say what else is reached, so skipping stops
+    /// being safe once one appears.
     saw_indirect_call: bool,
+    /// Whether the program named an entry point, so that only what it
+    /// reaches had to be built. Stays set when a call through a value
+    /// later forced every body to be built anyway.
+    entered: bool,
+    /// Functions an import brought in, by name. Everything else in the
+    /// module is the program's own and a host may call it.
+    imported: std::collections::HashSet<InternedString>,
     /// Functions dropped because their body failed analysis, keyed by
     /// the id a call site still carries, with the name and what the
     /// analysis said. A drop is only tolerable while nothing calls the
@@ -525,6 +532,8 @@ impl LoweringContext {
             skipped_at: std::collections::HashMap::new(),
             current_decl: 0,
             saw_indirect_call: false,
+            entered: false,
+            imported: std::collections::HashSet::new(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
             arena,
@@ -639,6 +648,26 @@ impl LoweringContext {
         let _ = self.diagnostics.borrow_mut().add(diagnostic);
     }
 
+    /// The functions the program can be entered through, once
+    /// `lower_program` has run: everything it declared itself, since a
+    /// host may call any of those by name, but nothing an import brought
+    /// in, which only matters if one of the former reaches it. `None`
+    /// when the program named no entry point, so a host may call
+    /// anything and nothing may be left out.
+    pub fn entered_functions(&self) -> Option<Vec<String>> {
+        if !self.entered {
+            return None;
+        }
+        Some(
+            self.module
+                .functions
+                .values()
+                .filter(|f| !self.imported.contains(&f.name))
+                .filter_map(|f| f.name.resolve_global())
+                .collect(),
+        )
+    }
+
     /// Display all collected lowering diagnostics using the proper formatter.
     /// Call this after `lower_program` completes.
     pub fn display_diagnostics(&self, program: &zyntax_typed_ast::TypedProgram) {
@@ -740,6 +769,7 @@ impl AstLowering for LoweringContext {
         // and nothing reaches is never built.
         phase.mark();
         self.wanted = self.initial_wanted(program);
+        self.entered = self.wanted.is_some();
 
         // Effects first, whatever order the declarations arrive in. A
         // function that declares one resolves the operations it may
@@ -2567,11 +2597,13 @@ impl LoweringContext {
     /// handful of an import's functions would otherwise pay for all of
     /// them the moment it called one.
     ///
-    /// Two things end the scheme instead of settling it. A call through
-    /// a value says nothing about what it reaches, and a call whose
-    /// target was never skipped here cannot be answered by building
-    /// anything. Both fall back to building every skipped body, which
-    /// is the behaviour that came before any of this.
+    /// A call through a value reaches only what some built body took
+    /// the address of, or what a dispatch table holds, and those are
+    /// owed as they appear. One thing ends the scheme instead of
+    /// settling it: a call whose target was never skipped here cannot
+    /// be answered by building anything, and falls back to building
+    /// every skipped body, which is the behaviour that came before any
+    /// of this.
     fn lower_until_nothing_is_owed(&mut self, program: &TypedProgram) -> CompilerResult<()> {
         if self.wanted.is_none() {
             return Ok(());
@@ -2700,8 +2732,13 @@ impl LoweringContext {
         Ok(())
     }
 
-    /// Names of functions that lowered code calls but which have no
-    /// body to land in, either declared empty or never built at all.
+    /// Names of functions that lowered code calls, or takes the address
+    /// of, but which have no body to land in, either declared empty or
+    /// never built at all.
+    ///
+    /// A call through a value owes nothing on its own: the value holds
+    /// an address some built body took, or a dispatch table holds, and
+    /// those are owed here as they appear.
     fn calls_with_nowhere_to_land(&mut self) -> Vec<InternedString> {
         use crate::hir::{HirCallable, HirInstruction};
 
@@ -2718,37 +2755,43 @@ impl LoweringContext {
             name_of.insert(*id, *name);
         }
 
-        let mut owed: Vec<InternedString> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut targets: Vec<crate::hir::HirId> = Vec::new();
         for function in self.module.functions.values() {
             for block in function.blocks.values() {
                 for inst in &block.instructions {
-                    let HirInstruction::Call { callee, .. } = inst else {
-                        continue;
-                    };
-                    let target = match callee {
-                        HirCallable::Function(target) | HirCallable::FuncRef(target) => *target,
-                        HirCallable::Indirect(_) => {
-                            self.saw_indirect_call = true;
-                            return Vec::new();
-                        }
-                        _ => continue,
-                    };
-                    if let Some(target_fn) = self.module.functions.get(&target) {
-                        if target_fn.is_external || !target_fn.blocks.is_empty() {
-                            continue;
-                        }
-                    }
-                    let Some(name) = name_of.get(&target).copied() else {
-                        // A target with no name behind it cannot be
-                        // built by visiting a declaration.
-                        self.saw_indirect_call = true;
-                        return Vec::new();
-                    };
-                    if seen.insert(name) {
-                        owed.push(name);
+                    match inst {
+                        HirInstruction::Call {
+                            callee: HirCallable::Function(target) | HirCallable::FuncRef(target),
+                            ..
+                        } => targets.push(*target),
+                        HirInstruction::CreateClosure { function, .. } => targets.push(*function),
+                        _ => {}
                     }
                 }
+            }
+        }
+        for global in self.module.globals.values() {
+            if let Some(init) = &global.initializer {
+                crate::dce::collect_vtable_funcs(init, &mut targets);
+            }
+        }
+
+        let mut owed: Vec<InternedString> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for target in targets {
+            if let Some(target_fn) = self.module.functions.get(&target) {
+                if target_fn.is_external || !target_fn.blocks.is_empty() {
+                    continue;
+                }
+            }
+            let Some(name) = name_of.get(&target).copied() else {
+                // A target with no name behind it cannot be built by
+                // visiting a declaration.
+                self.saw_indirect_call = true;
+                return Vec::new();
+            };
+            if seen.insert(name) {
+                owed.push(name);
             }
         }
         owed
@@ -2779,6 +2822,9 @@ impl LoweringContext {
 
     /// Lower a function
     fn lower_function(&mut self, func: &TypedFunction) -> CompilerResult<()> {
+        if func.module.is_some() {
+            self.imported.insert(func.name);
+        }
         if !self.should_lower(func) {
             return Ok(());
         }
