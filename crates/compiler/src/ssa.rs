@@ -1376,6 +1376,35 @@ impl SsaBuilder {
                 false_target,
             } => {
                 let cond_val = self.translate_expression(block_id, condition)?;
+                // A short-circuit `and`/`or` in the condition builds its
+                // own blocks and leaves control in its merge block. The
+                // branch has to be made from there, as the jump above
+                // already is: made from the block this started in, it
+                // would overwrite the terminator that enters the
+                // short-circuit's blocks, orphan them, and branch on a
+                // value defined in one of them.
+                if let Some(continuation) = self.continuation_block.take() {
+                    for target in [true_target, false_target] {
+                        let target_block = self.function.blocks.get_mut(target).unwrap();
+                        if let Some(pos) = target_block
+                            .predecessors
+                            .iter()
+                            .position(|&p| p == block_id)
+                        {
+                            target_block.predecessors[pos] = continuation;
+                        } else {
+                            target_block.predecessors.push(continuation);
+                        }
+                    }
+                    let cont_block = self.function.blocks.get_mut(&continuation).unwrap();
+                    cont_block.successors = vec![*true_target, *false_target];
+                    cont_block.terminator = HirTerminator::CondBranch {
+                        condition: cond_val,
+                        true_target: *true_target,
+                        false_target: *false_target,
+                    };
+                    return Ok(());
+                }
                 HirTerminator::CondBranch {
                     condition: cond_val,
                     true_target: *true_target,
@@ -5523,6 +5552,14 @@ impl SsaBuilder {
                 let else_branch = &if_expr.else_branch;
 
                 let cond_val = self.translate_expression(block_id, condition)?;
+                // Where control is once the condition has been evaluated.
+                // A short-circuit `and`/`or` in the condition builds its
+                // own blocks and leaves control in its merge block, not
+                // in the one this expression started in. Branching from
+                // the start block would overwrite the terminator that
+                // enters the short-circuit's blocks, orphan them, and
+                // branch on a value defined in one of them.
+                let cond_block_id = self.continuation_block.take().unwrap_or(block_id);
 
                 // Create blocks for then/else/merge
                 let then_block_id = HirId::new();
@@ -5558,29 +5595,36 @@ impl SsaBuilder {
                 self.sealed_blocks.insert(then_block_id);
                 self.sealed_blocks.insert(else_block_id);
 
-                // Set conditional branch terminator for current block
-                self.function.blocks.get_mut(&block_id).unwrap().terminator =
-                    HirTerminator::CondBranch {
-                        condition: cond_val,
-                        true_target: then_block_id,
-                        false_target: else_block_id,
-                    };
+                // Set conditional branch terminator for the block the
+                // condition left control in
+                self.function
+                    .blocks
+                    .get_mut(&cond_block_id)
+                    .unwrap()
+                    .terminator = HirTerminator::CondBranch {
+                    condition: cond_val,
+                    true_target: then_block_id,
+                    false_target: else_block_id,
+                };
 
                 // Update predecessors/successors
-                self.function.blocks.get_mut(&block_id).unwrap().successors =
-                    vec![then_block_id, else_block_id];
+                self.function
+                    .blocks
+                    .get_mut(&cond_block_id)
+                    .unwrap()
+                    .successors = vec![then_block_id, else_block_id];
                 self.function
                     .blocks
                     .get_mut(&then_block_id)
                     .unwrap()
                     .predecessors
-                    .push(block_id);
+                    .push(cond_block_id);
                 self.function
                     .blocks
                     .get_mut(&else_block_id)
                     .unwrap()
                     .predecessors
-                    .push(block_id);
+                    .push(cond_block_id);
 
                 // Translate then branch. The branch's translation may run
                 // its own nested control flow (another if-expression / Block
