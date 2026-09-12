@@ -15,6 +15,7 @@
 
 use ruff_python_ast as py;
 use std::collections::HashMap;
+use zyntax_typed_ast::typed_ast::TypedFunction;
 
 /// A static type. `Unknown` is the bottom of the join and never
 /// survives inference; a name nothing assigns to is a runtime error in
@@ -132,6 +133,14 @@ pub(crate) struct Module {
     /// Module-level variables a function reads or declares `global`,
     /// with the join of everything assigned to them anywhere.
     pub(crate) globals: HashMap<String, Ty>,
+    /// Functions the lowering produced from nested defs and lambdas,
+    /// and the value adapters of module functions, to be declared with
+    /// the program.
+    pub(crate) lifted: std::cell::RefCell<Vec<TypedFunction>>,
+    /// Module functions used as values, which need an adapter.
+    pub(crate) adapters: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// A counter for names no Python program can spell.
+    pub(crate) counter: std::cell::Cell<usize>,
     pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
 }
 
@@ -142,6 +151,8 @@ pub(crate) struct Locals {
     pub(crate) ret: Ty,
     /// Names this body declares `global`, and what it assigns to them.
     pub(crate) global_writes: HashMap<String, Ty>,
+    /// Names this body declares `nonlocal`, and what it assigns to them.
+    pub(crate) nonlocal_writes: HashMap<String, Ty>,
 }
 
 pub(crate) fn annotation(e: &py::Expr) -> Ty {
@@ -193,6 +204,7 @@ pub(crate) fn infer_module(known: &Module, defs: &[&py::StmtFunctionDef]) -> Has
         funcs: HashMap::new(),
         globals: known.globals.clone(),
         list_type: known.list_type,
+        ..Default::default()
     };
     for f in defs {
         module.funcs.insert(f.name.to_string(), declared_sig(f));
@@ -231,13 +243,32 @@ pub(crate) fn infer_module(known: &Module, defs: &[&py::StmtFunctionDef]) -> Has
 /// Infer one body's locals: parameters as declared, every other name
 /// the join of what is assigned to it, iterated until stable.
 pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Locals {
+    infer_locals_seeded(module, sig, body, &HashMap::new())
+}
+
+/// [`infer_locals`] with the variables captured from an enclosing scope
+/// already typed. A captured variable a nested body assigns under
+/// `nonlocal` takes the join of both scopes' assignments.
+pub(crate) fn infer_locals_seeded(
+    module: &Module,
+    sig: &Sig,
+    body: &[py::Stmt],
+    seeds: &HashMap<String, Ty>,
+) -> Locals {
     let mut locals = Locals::default();
+    for (name, ty) in seeds {
+        locals.vars.insert(name.clone(), *ty);
+    }
     for (name, ty) in &sig.params {
         locals.vars.insert(name.clone(), *ty);
     }
-    let declared_global = crate::scope::Scope::of_body(Vec::new(), body).globals;
-    for name in &declared_global {
+    let scope = crate::scope::Scope::of_body(Vec::new(), body);
+    for name in &scope.globals {
         locals.global_writes.insert(name.clone(), Ty::Unknown);
+    }
+    for name in &scope.nonlocals {
+        locals.nonlocal_writes.insert(name.clone(), Ty::Unknown);
+        locals.vars.remove(name);
     }
     for _ in 0..8 {
         let before = locals.clone();
@@ -245,11 +276,24 @@ pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Loc
             module,
             locals: &mut locals,
             params: &sig.params,
+            seeds,
         };
         walker.stmts(body);
+        // What nested bodies assign to this body's variables.
+        for (_, child) in &scope.children {
+            if child.nonlocals.is_empty() {
+                continue;
+            }
+            for (name, ty) in child_nonlocal_writes(module, body, &locals.vars) {
+                if let Some(own) = locals.vars.get_mut(&name) {
+                    *own = own.join(ty);
+                }
+            }
+        }
         if locals.vars == before.vars
             && locals.ret == before.ret
             && locals.global_writes == before.global_writes
+            && locals.nonlocal_writes == before.nonlocal_writes
         {
             break;
         }
@@ -262,19 +306,48 @@ pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Loc
     locals
 }
 
+/// The `nonlocal` assignments of the defs directly inside `body`, typed
+/// with `vars` as their enclosing scope.
+fn child_nonlocal_writes(
+    module: &Module,
+    body: &[py::Stmt],
+    vars: &HashMap<String, Ty>,
+) -> Vec<(String, Ty)> {
+    let mut out = Vec::new();
+    for s in body {
+        let py::Stmt::FunctionDef(f) = s else {
+            continue;
+        };
+        let sig = declared_sig(f);
+        let child = infer_locals_seeded(module, &sig, &f.body, vars);
+        out.extend(child.nonlocal_writes);
+    }
+    out
+}
+
 struct Walker<'a> {
     module: &'a Module,
     locals: &'a mut Locals,
     params: &'a [(String, Ty)],
+    seeds: &'a HashMap<String, Ty>,
 }
 
 impl Walker<'_> {
     fn assign(&mut self, name: &str, ty: Ty) {
-        // A declared global is the module's variable, not a local.
+        // A declared global or nonlocal is another scope's variable.
         if let Some(written) = self.locals.global_writes.get_mut(name) {
             *written = written.join(ty);
             return;
         }
+        if let Some(written) = self.locals.nonlocal_writes.get_mut(name) {
+            *written = written.join(ty);
+            return;
+        }
+        // A captured variable is typed by the scope that owns it.
+        if self.seeds.contains_key(name) {
+            return;
+        }
+
         // A parameter keeps its declared type unless the body assigns it
         // another, in which case it lives as an object from the start.
         if let Some((_, declared)) = self.params.iter().find(|(n, _)| n == name) {
@@ -388,6 +461,7 @@ impl Walker<'_> {
         Typer {
             module: self.module,
             vars: &self.locals.vars,
+            outer: self.seeds,
         }
         .expr(e)
     }
@@ -399,6 +473,8 @@ impl Walker<'_> {
 pub(crate) struct Typer<'a> {
     pub(crate) module: &'a Module,
     pub(crate) vars: &'a HashMap<String, Ty>,
+    /// Variables of the enclosing function this body captured.
+    pub(crate) outer: &'a HashMap<String, Ty>,
 }
 
 /// Give the names in an assignment target a type, in a scratch
@@ -508,6 +584,7 @@ impl Typer<'_> {
             py::Expr::Name(n) => self
                 .vars
                 .get(n.id.as_str())
+                .or_else(|| self.outer.get(n.id.as_str()))
                 .or_else(|| self.module.globals.get(n.id.as_str()))
                 .copied()
                 .unwrap_or(Ty::Object),
@@ -562,6 +639,7 @@ impl Typer<'_> {
                 let inner = Typer {
                     module: self.module,
                     vars: &vars,
+                    outer: self.outer,
                 };
                 Ty::List(Elem::of(inner.expr(&c.elt)))
             }

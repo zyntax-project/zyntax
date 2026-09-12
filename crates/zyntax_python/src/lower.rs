@@ -8,10 +8,12 @@
 //! (how a bool prints, what `"a" * 3` is) are calls into the shared
 //! built-in library.
 
+use crate::scope::Scope;
 use crate::types::{self, Elem, Locals, Module, Sig, Ty, Typer};
 use crate::{intern, prim, span_of, Error, Result};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
+use std::collections::{BTreeSet, HashMap};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression, TypedFor, TypedFunction,
@@ -152,6 +154,112 @@ fn cast(value: Node, ty: Ty, span: Span) -> Node {
     )
 }
 
+/// The name of a module function's value adapter.
+pub(crate) fn adapter_name(name: &str) -> String {
+    format!("{name}$fn")
+}
+
+/// A Python function may keep anything it is handed: store it in a
+/// list, capture it, return it. So a caller keeps no claim on a heap
+/// value it passes.
+fn ownership_of(ty: Ty) -> ParamOwnership {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::None => ParamOwnership::Copied,
+        _ => ParamOwnership::Owned,
+    }
+}
+
+fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
+    TypedParameter {
+        name: intern(name),
+        ty: ir(ty),
+        mutability: Mutability::Mutable,
+        kind: ParameterKind::Regular,
+        default_value: None,
+        attributes: Vec::new(),
+        ownership: ownership_of(ty),
+        span,
+    }
+}
+
+/// A module function in the shape of a function value: the record is
+/// ignored, each argument is unboxed to the declared type, the result
+/// is boxed.
+pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
+    let span = Span::new(0, 0);
+    let scope = Scope::default();
+    let mut lowerer = Lowerer::new(
+        module,
+        name,
+        sig.clone(),
+        Locals::default(),
+        &scope,
+        Vec::new(),
+        HashMap::new(),
+    );
+    let mut params = vec![parameter("env", Ty::List(Elem::Object), span)];
+    let mut args = Vec::new();
+    for (i, (_, ty)) in sig.params.iter().enumerate() {
+        let arg = format!("a{i}");
+        params.push(parameter(&arg, Ty::Object, span));
+        args.push(lowerer.coerce(
+            Val {
+                node: var(intern(&arg), Ty::Object, span),
+                ty: Ty::Object,
+            },
+            *ty,
+        ));
+    }
+    let result = Val {
+        node: call(name, args, sig.ret, span),
+        ty: sig.ret,
+    };
+    let statements = if sig.ret == Ty::None {
+        let none = Val {
+            node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+            ty: Ty::None,
+        };
+        let none = lowerer.coerce(none, Ty::Object);
+        vec![
+            TypedNode::new(
+                TypedStatement::Expression(Box::new(result.node)),
+                Type::Unknown,
+                span,
+            ),
+            TypedNode::new(
+                TypedStatement::Return(Some(Box::new(none))),
+                Type::Unknown,
+                span,
+            ),
+        ]
+    } else {
+        let boxed = lowerer.coerce(result, Ty::Object);
+        vec![TypedNode::new(
+            TypedStatement::Return(Some(Box::new(boxed))),
+            Type::Unknown,
+            span,
+        )]
+    };
+    TypedFunction {
+        name: intern(&adapter_name(name)),
+        annotations: Vec::new(),
+        effects: Vec::new(),
+        with_handlers: Vec::new(),
+        type_params: Vec::new(),
+        params,
+        return_type: ir(Ty::Object),
+        body: Some(TypedBlock { statements, span }),
+        visibility: Visibility::Public,
+        is_async: false,
+        is_fiber: false,
+        is_pure: false,
+        is_external: false,
+        calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+        link_name: None,
+        module: None,
+    }
+}
+
 fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
     Err(Error::Unsupported {
         what: what.into(),
@@ -162,6 +270,8 @@ fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
 /// One function's lowering state.
 pub(crate) struct Lowerer<'m> {
     module: &'m Module,
+    /// The function's name, which nested functions prefix theirs with.
+    name: String,
     sig: Sig,
     locals: Locals,
     /// Names already bound in emission order, so the first sight of a
@@ -172,18 +282,60 @@ pub(crate) struct Lowerer<'m> {
     /// part of: a comprehension's loop, which the IR cannot hold inside
     /// an expression. Drained in front of each statement.
     hoisted: Vec<Stmt>,
+    /// Variables shared with nested functions. Each lives in a
+    /// one-element list, the cell, that every function using it holds.
+    cells: HashMap<String, InternedString>,
+    /// The enclosing function's variables this one uses, in the order
+    /// their cells sit in the function record after code and arity.
+    captured: Vec<String>,
+    /// The types of the captured variables, as the owner has them.
+    captured_types: HashMap<String, Ty>,
 }
 
+/// The function record's fixed prefix: code address and arity.
+const RECORD_CELLS_AT: usize = 2;
+
 impl<'m> Lowerer<'m> {
-    pub(crate) fn new(module: &'m Module, sig: Sig, locals: Locals) -> Self {
+    pub(crate) fn new(
+        module: &'m Module,
+        name: &str,
+        sig: Sig,
+        locals: Locals,
+        scope: &Scope,
+        captured: Vec<String>,
+        captured_types: HashMap<String, Ty>,
+    ) -> Self {
         let bound = sig.params.iter().map(|(n, _)| intern(n)).collect();
+        // A variable a nested function reads or assigns is shared
+        // through a cell, as is everything captured from further out.
+        let mut cells: BTreeSet<String> = captured.iter().cloned().collect();
+        for (_, child) in &scope.children {
+            for n in &child.free {
+                let own = scope.bound.contains(n)
+                    || sig.params.iter().any(|(p, _)| p == n)
+                    || captured.contains(n);
+                if own && !module.funcs.contains_key(n) {
+                    cells.insert(n.clone());
+                }
+            }
+        }
         Self {
             module,
+            name: name.to_string(),
             sig,
             locals,
             bound,
             temps: 0,
             hoisted: Vec::new(),
+            cells: cells
+                .into_iter()
+                .map(|n| {
+                    let cell = intern(&format!("{n}$cell"));
+                    (n, cell)
+                })
+                .collect(),
+            captured,
+            captured_types,
         }
     }
 
@@ -191,6 +343,7 @@ impl<'m> Lowerer<'m> {
         Typer {
             module: self.module,
             vars: &self.locals.vars,
+            outer: &self.captured_types,
         }
     }
 
@@ -202,6 +355,7 @@ impl<'m> Lowerer<'m> {
         self.locals
             .vars
             .get(name)
+            .or_else(|| self.captured_types.get(name))
             .or_else(|| self.module.globals.get(name))
             .copied()
             .unwrap_or(Ty::Object)
@@ -209,7 +363,88 @@ impl<'m> Lowerer<'m> {
 
     /// Whether `name` here is the module's variable rather than a local.
     fn is_global(&self, name: &str) -> bool {
-        !self.locals.vars.contains_key(name) && self.module.globals.contains_key(name)
+        !self.locals.vars.contains_key(name)
+            && !self.cells.contains_key(name)
+            && self.module.globals.contains_key(name)
+    }
+
+    /// Whether `name` is a variable of some kind here, as opposed to a
+    /// module function or a builtin.
+    fn is_variable(&self, name: &str) -> bool {
+        self.cells.contains_key(name)
+            || self.locals.vars.contains_key(name)
+            || self.module.globals.contains_key(name)
+    }
+
+    /// The statements that set up this function's cells: a captured one
+    /// comes out of the record, a parameter's starts holding the
+    /// parameter, any other starts empty.
+    fn cell_prologue(&mut self, span: Span) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        let names: Vec<String> = self.cells.keys().cloned().collect();
+        for name in names {
+            let cell = self.cells[&name];
+            let init = if let Some(i) = self.captured.iter().position(|c| *c == name) {
+                let slot = int_lit((RECORD_CELLS_AT + i) as i64, span);
+                let element = call(
+                    "zb_list_get_any",
+                    vec![var(intern("env"), Ty::List(Elem::Object), span), slot],
+                    Ty::Object,
+                    span,
+                );
+                call(
+                    "zb_list_unbox_any",
+                    vec![element],
+                    Ty::List(Elem::Object),
+                    span,
+                )
+            } else if let Some((_, ty)) = self.sig.params.iter().find(|(p, _)| *p == name) {
+                let value = Val {
+                    node: var(intern(&name), *ty, span),
+                    ty: *ty,
+                };
+                self.list_of(vec![value], Elem::Object, span)
+            } else {
+                let none = Val {
+                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                    ty: Ty::None,
+                };
+                self.list_of(vec![none], Elem::Object, span)
+            };
+            self.bound.push(cell);
+            out.push(TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: cell,
+                    ty: ir(Ty::List(Elem::Object)),
+                    mutability: Mutability::Mutable,
+                    initializer: Some(Box::new(init)),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+        }
+        out
+    }
+
+    /// Read the shared variable `name` out of its cell.
+    fn cell_read(&mut self, name: &str, span: Span) -> Val {
+        let ty = self.var_ty(name);
+        let cell = var(self.cells[name], Ty::List(Elem::Object), span);
+        let element = call(
+            "zb_list_get_any",
+            vec![cell, int_lit(0, span)],
+            Ty::Object,
+            span,
+        );
+        let node = self.coerce(
+            Val {
+                node: element,
+                ty: Ty::Object,
+            },
+            ty,
+        );
+        Val { node, ty }
     }
 
     /// A global holds its own scalar type; anything else is stored boxed,
@@ -279,7 +514,7 @@ impl<'m> Lowerer<'m> {
                 },
                 default_value,
                 attributes: Vec::new(),
-                ownership: ParamOwnership::Copied,
+                ownership: ownership_of(declared),
                 span: span_of(p),
             });
             // A parameter the body also assigns another type to lives as
@@ -310,6 +545,7 @@ impl<'m> Lowerer<'m> {
 
         let span = span_of(f);
         let mut statements = prologue;
+        statements.extend(self.cell_prologue(span));
         for s in &f.body {
             self.stmt(s, &mut statements)?;
         }
@@ -335,7 +571,10 @@ impl<'m> Lowerer<'m> {
 
     /// The module body as the entry function's statements.
     pub(crate) fn body(&mut self, stmts: &[&py::Stmt]) -> Result<Vec<Stmt>> {
-        let mut out = Vec::new();
+        let mut out = match stmts.first() {
+            Some(first) => self.cell_prologue(span_of(*first)),
+            None => Vec::new(),
+        };
         for s in stmts {
             self.stmt(s, &mut out)?;
         }
@@ -609,6 +848,21 @@ impl<'m> Lowerer<'m> {
             py::Stmt::Continue(_) => push(out, TypedStatement::Continue),
             // Scope analysis already made the names module variables.
             py::Stmt::Global(_) => {}
+            // The cells this body shares are already set up.
+            py::Stmt::Nonlocal(_) => {}
+            py::Stmt::FunctionDef(f) => {
+                if !f.decorator_list.is_empty() {
+                    return unsupported("decorators", f);
+                }
+                let value = self.nested_def(f, span)?;
+                let target = py::Expr::Name(py::ExprName {
+                    node_index: Default::default(),
+                    range: f.range(),
+                    id: f.name.id.clone(),
+                    ctx: py::ExprContext::Store,
+                });
+                self.bind(&target, value, span, out)?;
+            }
             other => return unsupported(types::stmt_kind(other), other),
         }
         Ok(())
@@ -701,6 +955,26 @@ impl<'m> Lowerer<'m> {
         };
         let ty = self.var_ty(n.id.as_str());
         let name = intern(n.id.as_str());
+        if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
+            let value = self.coerce(value, ty);
+            let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
+            let set = call(
+                "zb_list_set_any",
+                vec![
+                    var(cell, Ty::List(Elem::Object), span),
+                    int_lit(0, span),
+                    boxed,
+                ],
+                Ty::None,
+                span,
+            );
+            out.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(set)),
+                Type::Unknown,
+                span,
+            ));
+            return Ok(());
+        }
         if self.is_global(n.id.as_str()) {
             let stored = Self::storage(ty);
             let value = self.coerce(value, ty);
@@ -914,12 +1188,34 @@ impl<'m> Lowerer<'m> {
             ),
             _ => return unsupported("range() with more than three arguments", &*f.iter),
         };
-        let name = intern(target.id.as_str());
-        if !self.bound.contains(&name) {
-            self.bound.push(name);
+        // The loop counts in the target itself when the target is a
+        // plain int local; a shared, global or object-typed target is
+        // assigned from a hidden counter each time round.
+        let direct = !self.cells.contains_key(target.id.as_str())
+            && !self.is_global(target.id.as_str())
+            && self.var_ty(target.id.as_str()) == Ty::Int;
+        let name = if direct {
+            let name = intern(target.id.as_str());
+            if !self.bound.contains(&name) {
+                self.bound.push(name);
+            }
+            name
+        } else {
+            self.temp()
+        };
+        let mut statements = Vec::new();
+        if !direct {
+            let counter = Val {
+                node: var(name, Ty::Int, span),
+                ty: Ty::Int,
+            };
+            self.bind(&f.target, counter, span, &mut statements)?;
         }
-        let mut body = self.block(&f.body, span)?;
-        body.statements.extend(extra);
+        for s in &f.body {
+            self.stmt(s, &mut statements)?;
+        }
+        statements.extend(extra);
+        let body = TypedBlock { statements, span };
         Ok(TypedStatement::For(TypedFor {
             pattern: Box::new(TypedNode::new(
                 TypedPattern::Identifier {
@@ -998,13 +1294,24 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Str,
                 }
             }
+            py::Expr::Name(n) if self.cells.contains_key(n.id.as_str()) => {
+                self.cell_read(n.id.as_str(), span)
+            }
             py::Expr::Name(n) if self.is_global(n.id.as_str()) => {
                 self.global_read(n.id.as_str(), span)
+            }
+            // A module function named as a value.
+            py::Expr::Name(n)
+                if !self.is_variable(n.id.as_str())
+                    && self.module.funcs.contains_key(n.id.as_str()) =>
+            {
+                self.function_value(n.id.as_str(), span)
             }
             py::Expr::Name(n) => Val {
                 node: var(intern(n.id.as_str()), ty, span),
                 ty,
             },
+            py::Expr::Lambda(l) => self.lambda(l, span)?,
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left)?;
                 let r = self.expr(&b.right)?;
@@ -1843,14 +2150,19 @@ impl<'m> Lowerer<'m> {
         let args = &c.arguments.args;
         let keywords = &c.arguments.keywords;
         if let py::Expr::Name(n) = &*c.func {
-            if let Some(sig) = self.module.funcs.get(n.id.as_str()).cloned() {
-                let lowered = self.arguments(n.id.as_str(), &sig, args, keywords, c)?;
+            let name = n.id.as_str();
+            if self.is_variable(name) {
+                let callee = self.expr(&c.func)?;
+                return self.call_value(callee, args, keywords, c, span);
+            }
+            if let Some(sig) = self.module.funcs.get(name).cloned() {
+                let lowered = self.arguments(name, &sig, args, keywords, c)?;
                 return Ok(Val {
-                    node: call(n.id.as_str(), lowered, sig.ret, span),
+                    node: call(name, lowered, sig.ret, span),
                     ty: sig.ret,
                 });
             }
-            if n.id.as_str() == "print" {
+            if name == "print" {
                 return self.print(args, keywords, span);
             }
         }
@@ -1860,6 +2172,10 @@ impl<'m> Lowerer<'m> {
         if let py::Expr::Attribute(a) = &*c.func {
             let receiver = self.expr(&a.value)?;
             return self.method(receiver, a.attr.as_str(), args, ty, span);
+        }
+        if !matches!(&*c.func, py::Expr::Name(_)) {
+            let callee = self.expr(&c.func)?;
+            return self.call_value(callee, args, keywords, c, span);
         }
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
@@ -2264,6 +2580,258 @@ impl<'m> Lowerer<'m> {
 
     /// `print(a, b, ...)`: each argument as `str()`, a space between,
     /// one line written.
+    /// A call through a function value: every argument boxed, the result
+    /// dynamic.
+    fn call_value(
+        &mut self,
+        callee: Val,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        if !keywords.is_empty() {
+            return unsupported("keyword arguments in a call through a value", c);
+        }
+        if args.len() > zyntax_builtins::functions::MAX_CALL_ARITY {
+            return unsupported(
+                format!(
+                    "a call through a value with more than {} arguments",
+                    args.len()
+                ),
+                c,
+            );
+        }
+        let mut lowered = vec![self.coerce(callee, Ty::Object)];
+        for a in args {
+            lowered.push(self.expr_as(a, Ty::Object)?);
+        }
+        Ok(Val {
+            node: call(
+                &format!("zb_call_{}", args.len()),
+                lowered,
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        })
+    }
+
+    /// A function record: the code address, the arity and the cells.
+    fn record(&mut self, code: &str, arity: usize, cells: Vec<Val>, span: Span) -> Val {
+        let cells = self.list_of(cells, Elem::Object, span);
+        Val {
+            node: call(
+                "zb_func_new",
+                vec![
+                    var(intern(code), Ty::Int, span),
+                    int_lit(arity as i64, span),
+                    cells,
+                ],
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        }
+    }
+
+    /// A module function as a value, through an adapter that unboxes
+    /// the arguments and boxes the result.
+    fn function_value(&mut self, name: &str, span: Span) -> Val {
+        let sig = self.module.funcs[name].clone();
+        self.module.adapters.borrow_mut().insert(name.to_string());
+        self.record(&adapter_name(name), sig.params.len(), Vec::new(), span)
+    }
+
+    /// A `def` inside this function: lifted to a function of its own
+    /// that takes the record, and bound here as a value.
+    fn nested_def(&mut self, f: &py::StmtFunctionDef, span: Span) -> Result<Val> {
+        if f.parameters.vararg.is_some() || f.parameters.kwarg.is_some() {
+            return unsupported("*args / **kwargs", &*f.parameters);
+        }
+        let scope = Scope::of_function(f);
+        let sig = types::declared_sig(f);
+        let (captured, seeds) = self.captures_for(&scope);
+        let locals = types::infer_locals_seeded(self.module, &sig, &f.body, &seeds);
+        let lifted = self.lifted_name(f.name.as_str());
+        let mut child = Lowerer::new(
+            self.module,
+            &lifted,
+            sig,
+            locals,
+            &scope,
+            captured.clone(),
+            seeds,
+        );
+        let params: Vec<(String, Ty)> = child.sig.params.clone();
+        let mut body = Vec::new();
+        for s in &f.body {
+            child.stmt(s, &mut body)?;
+        }
+        let function = child.lifted_function(&lifted, &params, body, span);
+        self.module.lifted.borrow_mut().push(function);
+        let cells = self.cells_of(&captured, span);
+        Ok(self.record(&lifted, params.len(), cells, span))
+    }
+
+    /// A lambda: a lifted function returning its one expression.
+    fn lambda(&mut self, l: &py::ExprLambda, span: Span) -> Result<Val> {
+        let scope = Scope::of_lambda(l);
+        let mut params: Vec<(String, Ty)> = Vec::new();
+        if let Some(ps) = &l.parameters {
+            if ps.vararg.is_some() || ps.kwarg.is_some() {
+                return unsupported("*args / **kwargs", &**ps);
+            }
+            for p in ps.iter_non_variadic_params() {
+                if p.default.is_some() {
+                    return unsupported("a default in a lambda", p);
+                }
+                params.push((p.parameter.name.to_string(), Ty::Object));
+            }
+        }
+        let sig = Sig {
+            params: params.clone(),
+            ret: Ty::Object,
+            defaults: vec![None; params.len()],
+        };
+        let (captured, seeds) = self.captures_for(&scope);
+        let mut locals = Locals::default();
+        for (name, ty) in &params {
+            locals.vars.insert(name.clone(), *ty);
+        }
+        let lifted = self.lifted_name("lambda");
+        let mut child = Lowerer::new(
+            self.module,
+            &lifted,
+            sig,
+            locals,
+            &scope,
+            captured.clone(),
+            seeds,
+        );
+        let value = child.expr_as(&l.body, Ty::Object)?;
+        let mut body = std::mem::take(&mut child.hoisted);
+        body.push(TypedNode::new(
+            TypedStatement::Return(Some(Box::new(value))),
+            Type::Unknown,
+            span,
+        ));
+        let function = child.lifted_function(&lifted, &params, body, span);
+        self.module.lifted.borrow_mut().push(function);
+        let cells = self.cells_of(&captured, span);
+        Ok(self.record(&lifted, params.len(), cells, span))
+    }
+
+    /// Which of this function's cells a nested body uses, in record
+    /// order, with their types.
+    fn captures_for(&self, scope: &Scope) -> (Vec<String>, HashMap<String, Ty>) {
+        let captured: Vec<String> = self
+            .cells
+            .keys()
+            .filter(|n| scope.free.contains(*n))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let seeds = captured
+            .iter()
+            .map(|n| (n.clone(), self.var_ty(n)))
+            .collect();
+        (captured, seeds)
+    }
+
+    /// The cells named, boxed, for a record.
+    fn cells_of(&mut self, captured: &[String], span: Span) -> Vec<Val> {
+        captured
+            .iter()
+            .map(|n| Val {
+                node: var(self.cells[n], Ty::List(Elem::Object), span),
+                ty: Ty::List(Elem::Object),
+            })
+            .collect()
+    }
+
+    fn lifted_name(&self, inner: &str) -> String {
+        let n = self.module.counter.get();
+        self.module.counter.set(n + 1);
+        format!("{}${inner}${n}", self.name)
+    }
+
+    /// This function in the shape every function value has: the record
+    /// first, each argument a dynamic value unboxed to its declared type
+    /// in a prologue, the result boxed.
+    fn lifted_function(
+        &mut self,
+        name: &str,
+        params: &[(String, Ty)],
+        body: Vec<Stmt>,
+        span: Span,
+    ) -> TypedFunction {
+        let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
+        let mut statements = Vec::new();
+        for (i, (pname, declared)) in params.iter().enumerate() {
+            let arg = format!("a{i}");
+            typed_params.push(parameter(&arg, Ty::Object, span));
+            let local = self.var_ty(pname);
+            let value = self.coerce(
+                Val {
+                    node: var(intern(&arg), Ty::Object, span),
+                    ty: Ty::Object,
+                },
+                *declared,
+            );
+            let value = self.coerce(
+                Val {
+                    node: value,
+                    ty: *declared,
+                },
+                local,
+            );
+            statements.push(TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: intern(pname),
+                    ty: ir(local),
+                    mutability: Mutability::Mutable,
+                    initializer: Some(Box::new(value)),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+        }
+        statements.extend(self.cell_prologue(span));
+        statements.extend(body);
+        // Falling off the end returns None.
+        let none = Val {
+            node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+            ty: Ty::None,
+        };
+        let none = self.coerce(none, Ty::Object);
+        statements.push(TypedNode::new(
+            TypedStatement::Return(Some(Box::new(none))),
+            Type::Unknown,
+            span,
+        ));
+        TypedFunction {
+            name: intern(name),
+            annotations: Vec::new(),
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params: typed_params,
+            return_type: ir(Ty::Object),
+            body: Some(TypedBlock { statements, span }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: false,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: None,
+        }
+    }
+
     /// The arguments of a call to a module function, in parameter order:
     /// positionals first, then keywords by name, then defaults.
     fn arguments(

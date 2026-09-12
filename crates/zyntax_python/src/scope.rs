@@ -12,6 +12,8 @@ pub(crate) struct Scope {
     pub bound: HashSet<String>,
     /// Names declared `global`.
     pub globals: HashSet<String>,
+    /// Names declared `nonlocal`.
+    pub nonlocals: HashSet<String>,
     /// Names read here, or free in a nested body, that this body does
     /// not bind: they come from an enclosing scope or the module.
     pub free: HashSet<String>,
@@ -83,6 +85,7 @@ impl Collector {
         Scope {
             bound: self.bound,
             globals: self.globals,
+            nonlocals: self.nonlocals,
             free,
             children: self.children,
         }

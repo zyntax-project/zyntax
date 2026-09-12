@@ -63,6 +63,7 @@ const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
         str: "str",
         list: "list",
         tuple: "tuple",
+        function: "function",
         object: "object",
     },
 };
@@ -184,7 +185,17 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
     for f in &defs {
         let sig = inferred.funcs[f.name.as_str()].clone();
         let locals = types::infer_locals(&inferred, &sig, &f.body);
-        let func = lower::Lowerer::new(&inferred, sig, locals).function(f)?;
+        let scope = scope::Scope::of_function(f);
+        let func = lower::Lowerer::new(
+            &inferred,
+            f.name.as_str(),
+            sig,
+            locals,
+            &scope,
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .function(f)?;
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),
             Type::Unknown,
@@ -196,7 +207,17 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         for name in inferred.globals.keys() {
             locals.vars.remove(name);
         }
-        let statements = lower::Lowerer::new(&inferred, entry_sig, locals).body(&top_level)?;
+        let scope = scope::Scope::of_body(Vec::new(), &owned);
+        let statements = lower::Lowerer::new(
+            &inferred,
+            ENTRY,
+            entry_sig,
+            locals,
+            &scope,
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .body(&top_level)?;
         let span = Span::new(
             top_level[0].range().start().to_usize(),
             top_level[top_level.len() - 1].range().end().to_usize(),
@@ -225,6 +246,21 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         ));
     }
 
+    for name in inferred.adapters.borrow().iter() {
+        let sig = &inferred.funcs[name];
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(lower::adapter(&inferred, name, sig)),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
+    for func in inferred.lifted.take() {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
     declarations.extend(library.declarations);
 
     Ok(TypedProgram {

@@ -149,7 +149,8 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let i = local("i", i64());
     let j = local("j", i64());
     let n = local("n", i64());
-    let v = local("v", k.elem.clone());
+    // The element a list keeps.
+    let v = owned("v", k.elem.clone());
     let e = local("e", k.elem.clone());
     let what = local("what", string());
     let el = |xs: &Local, i: Expr| idx(xs.e(), i, k.elem.clone());

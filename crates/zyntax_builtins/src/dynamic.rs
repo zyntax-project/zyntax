@@ -5,7 +5,7 @@
 //! category and then does what the typed code does.
 
 use crate::build::*;
-use crate::{list_of, Kind, Policy, TUPLE_TAG};
+use crate::{list_of, Kind, Policy, FUNC_TAG, TUPLE_TAG};
 use zyntax_typed_ast::TypeId;
 
 const NONE: i64 = 0;
@@ -213,6 +213,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         eq(kind(x.e()), int(TUPLE_TAG >> 8)),
                         vec![ret(text(names.tuple))],
                     ),
+                    when(
+                        eq(kind(x.e()), int(FUNC_TAG >> 8)),
+                        vec![ret(text(names.function))],
+                    ),
                     ret(text(names.list)),
                 ],
             ),
@@ -235,7 +239,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call("zb_str_truthy", vec![get_str(x.e())], boolean()))],
             ),
             when(
-                is(&cat, CUSTOM),
+                and(is(&cat, CUSTOM), ne(kind(x.e()), int(FUNC_TAG >> 8))),
                 vec![ret(ne(call("zb_seq_len_any", vec![x.e()], i64()), int(0)))],
             ),
             ret(bool(true)),
@@ -676,6 +680,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x],
         string(),
         vec![
+            when(
+                eq(kind(x.e()), int(FUNC_TAG >> 8)),
+                vec![ret(add(add(text("<"), text(names.function)), text(">")))],
+            ),
             when(
                 kind_is(Kind::Int, x.e()),
                 vec![ret(repr_of(Kind::Int, x.e()))],

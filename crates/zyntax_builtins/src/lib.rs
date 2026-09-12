@@ -13,6 +13,7 @@
 pub mod build;
 mod dynamic;
 mod format;
+pub mod functions;
 mod io;
 mod lists;
 mod strings;
@@ -47,6 +48,7 @@ pub struct TypeNames {
     pub str: &'static str,
     pub list: &'static str,
     pub tuple: &'static str,
+    pub function: &'static str,
     pub object: &'static str,
 }
 
@@ -93,6 +95,11 @@ impl Kind {
 /// The box tag of a tuple: a list of dynamic values that prints and
 /// compares as a tuple.
 pub const TUPLE_TAG: i64 = (5 << 8) | 255;
+/// The box tag of a function value: a record of dynamic values, see
+/// [`functions`].
+pub const FUNC_TAG: i64 = (8 << 8) | 255;
+/// The box tag of a bare code address inside a function record.
+pub const CODE_TAG: i64 = (9 << 8) | 255;
 
 /// What the library contributes to a program.
 pub struct Library {
@@ -113,6 +120,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(format::declarations());
     declarations.extend(dynamic::declarations(policy, list_type));
     declarations.extend(lists::declarations(policy, list_type));
+    declarations.extend(functions::declarations(list_type));
     Library {
         declarations,
         type_registry: b.registry,
@@ -151,6 +159,7 @@ mod tests {
                 str: "str",
                 list: "list",
                 tuple: "tuple",
+                function: "function",
                 object: "object",
             },
         });

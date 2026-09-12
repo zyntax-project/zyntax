@@ -13,7 +13,8 @@ use zyntax_typed_ast::typed_ast::{
     TypedParameter, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
-    BinaryOp, InternedString, Mutability, PrimitiveType, Type, TypedNode, UnaryOp, Visibility,
+    BinaryOp, InternedString, Mutability, ParamOwnership, PrimitiveType, Type, TypedNode, UnaryOp,
+    Visibility,
 };
 
 pub type Expr = TypedNode<TypedExpression>;
@@ -86,10 +87,26 @@ pub fn bool(v: bool) -> Expr {
 pub struct Local {
     pub name: &'static str,
     pub ty: Type,
+    /// As a parameter: whether the function keeps what it is passed, so
+    /// the caller must not release it afterwards.
+    pub owned: bool,
 }
 
 pub fn local(name: &'static str, ty: Type) -> Local {
-    Local { name, ty }
+    Local {
+        name,
+        ty,
+        owned: false,
+    }
+}
+
+/// A parameter the function stores somewhere that outlives the call.
+pub fn owned(name: &'static str, ty: Type) -> Local {
+    Local {
+        name,
+        ty,
+        owned: true,
+    }
 }
 
 impl Local {
@@ -135,12 +152,16 @@ impl Local {
     }
 
     pub fn param(&self) -> TypedParameter {
-        TypedParameter::regular(
+        let mut p = TypedParameter::regular(
             intern(self.name),
             self.ty.clone(),
             Mutability::Mutable,
             SPAN,
-        )
+        );
+        if self.owned {
+            p.ownership = ParamOwnership::Owned;
+        }
+        p
     }
 }
 
