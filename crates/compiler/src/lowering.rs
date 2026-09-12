@@ -2662,8 +2662,9 @@ impl LoweringContext {
                     let HirInstruction::Call { callee, args, .. } = inst else {
                         continue;
                     };
+                    // A FuncRef takes the function's address; it is not a call.
                     let target = match callee {
-                        HirCallable::Function(t) | HirCallable::FuncRef(t) => *t,
+                        HirCallable::Function(t) => *t,
                         _ => continue,
                     };
                     let Some(target_fn) = self.module.functions.get(&target) else {
