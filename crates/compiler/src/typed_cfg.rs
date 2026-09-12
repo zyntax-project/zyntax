@@ -1111,21 +1111,36 @@ impl TypedCfgBuilder {
                 }
 
                 TypedStatement::Expression(expr) => {
-                    // Check if expression is a Block - if so, flatten it
+                    // A block used as a statement is split like a block
+                    // statement: the statements so far close into a block
+                    // that jumps into it, and what follows continues in a
+                    // fresh block after it. The recursion must not reuse
+                    // the current id, which is already claimed by the
+                    // statements before the block.
                     if let TypedExpression::Block(block) = &expr.node {
-                        log::debug!(
-                            "[CFG] Expression(Block): flattening block with {} statements",
-                            block.statements.len()
-                        );
-                        // Recursively process the block's statements
-                        let (block_blocks, _block_entry, block_exit) =
-                            self.split_at_control_flow(block, current_block_id, false)?;
+                        let block_entry_id = self.new_block_id();
+                        let after_block_id = self.new_block_id();
+                        all_blocks.push(TypedBasicBlock {
+                            id: current_block_id,
+                            label: None,
+                            statements: current_statements.clone(),
+                            terminator: TypedTerminator::Jump(block_entry_id),
+                            pattern_check: None,
+                        });
+                        let (block_blocks, _, block_exit) =
+                            self.split_at_control_flow(block, block_entry_id, false)?;
                         all_blocks.extend(block_blocks);
+                        if let Some(last_block) =
+                            all_blocks.iter_mut().rev().find(|b| b.id == block_exit)
+                        {
+                            if matches!(last_block.terminator, TypedTerminator::Unreachable) {
+                                last_block.terminator = TypedTerminator::Jump(after_block_id);
+                            }
+                        }
                         current_statements = Vec::new();
-                        current_block_id = block_exit;
-                        exit_id = block_exit;
+                        current_block_id = after_block_id;
+                        exit_id = after_block_id;
                     } else {
-                        // Regular expression - add as statement
                         current_statements.push(stmt.clone());
                     }
                 }
