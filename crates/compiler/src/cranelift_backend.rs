@@ -1573,6 +1573,13 @@ impl CraneliftBackend {
                             type_cache.insert(ty.clone(), cranelift_ty);
                         }
                     }
+                    // A frame slot is stored as i64 and narrowed back to
+                    // its own type on load; that type must be known.
+                    HirInstruction::AsyncLoadSlot { ty, .. } => {
+                        if let Ok(cranelift_ty) = self.translate_type(ty) {
+                            type_cache.insert(ty.clone(), cranelift_ty);
+                        }
+                    }
                     HirInstruction::Alloca { ty, .. } => {
                         if let Ok(cranelift_ty) = self.translate_type(ty) {
                             type_cache.insert(ty.clone(), cranelift_ty);
@@ -5529,15 +5536,15 @@ impl CraneliftBackend {
                                 };
                                 // Integer horizontal-add via a pairwise-reduction
                                 // tree instead of a serial extractlane chain: for
-                                // i32x4/i64x2 the AArch64 backend folds
+                                // i32x4 the AArch64 backend folds
                                 // `extractlane(iadd_pairwise(iadd_pairwise(x,x),
                                 // iadd_pairwise(x,x)), 0)` into a single `addv`
                                 // (a pattern the serial chain never matches). GVN
                                 // shares the repeated operand so the tree stays the
-                                // exact matched shape. Restricted to widths that
-                                // can't overflow the pairwise accumulation.
-                                let pairwise = matches!(op, BinaryOp::Add)
-                                    && matches!(vec_clif_ty, types::I32X4 | types::I64X2);
+                                // exact matched shape. `iadd_pairwise` takes lanes
+                                // of at most 32 bits, so i64x2 uses the serial chain.
+                                let pairwise =
+                                    matches!(op, BinaryOp::Add) && vec_clif_ty == types::I32X4;
                                 if pairwise {
                                     let mut v = vec_val;
                                     let mut n = lane_count;
