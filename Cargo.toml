@@ -12,6 +12,7 @@ members = [
     "crates/zyntax_wasm",
     "crates/zynml",
     "crates/pattern_engine",
+    "crates/zyntax_python",
     "crates/passes/normalization",
     "crates/passes/algebraic_effects",
     "crates/passes/krio_adapter",

@@ -1,0 +1,17 @@
+[package]
+name = "zyntax_python"
+version = "0.1.0"
+edition = "2021"
+description = "A Python frontend for Zyntax: ruff's AST to a TypedProgram"
+
+[dependencies]
+zyntax_typed_ast = { path = "../typed_ast" }
+zyntax_embed = { path = "../zyntax_embed" }
+zyntax_compiler = { path = "../compiler" }
+# Pinned exactly: the crate publishes 0.0.x and makes no semver promise.
+ruff_python_parser = "=0.0.12"
+ruff_python_ast = "=0.0.12"
+thiserror = "1"
+ruff_text_size = "=0.0.12"
+
+[dev-dependencies]
