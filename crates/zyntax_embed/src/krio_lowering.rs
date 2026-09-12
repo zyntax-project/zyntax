@@ -137,7 +137,7 @@ pub fn apply_krio_effect_lowering(
 
     let mut live_out: HashMap<HirId, HashMap<HirId, HashSet<HirId>>> = HashMap::new();
     let mut analyzer = AnalysisRunner::new(module.clone());
-    if let Ok(analysis) = analyzer.run_all() {
+    if let Ok(analysis) = analyzer.run_for(&resumable_fn_ids) {
         for (fn_id, fn_analysis) in &analysis.functions {
             live_out.insert(*fn_id, fn_analysis.liveness.live_out.clone());
         }
@@ -274,9 +274,20 @@ pub fn apply_krio_async_lowering(
 ) -> Result<(), KrioLoweringError> {
     #[cfg(feature = "krio-async-backend")]
     {
+        // Only async functions are transformed, and liveness is only
+        // read for them; a module without any is left alone.
+        let async_fn_ids: Vec<HirId> = _module
+            .functions
+            .values()
+            .filter(|f| f.signature.is_async)
+            .map(|f| f.id)
+            .collect();
+        if async_fn_ids.is_empty() {
+            return Ok(());
+        }
         let mut live_out: HashMap<HirId, HashMap<HirId, HashSet<HirId>>> = HashMap::new();
         let mut analyzer = AnalysisRunner::new(_module.clone());
-        match analyzer.run_all() {
+        match analyzer.run_for(&async_fn_ids) {
             Ok(analysis) => {
                 for (fn_id, fn_analysis) in &analysis.functions {
                     live_out.insert(*fn_id, fn_analysis.liveness.live_out.clone());
@@ -345,13 +356,6 @@ pub fn apply_krio_async_lowering(
                     .any(|h| h.implementations.iter().any(|i| i.is_resumable))
             })
             .map(|effect| effect.name)
-            .collect();
-
-        let async_fn_ids: Vec<HirId> = _module
-            .functions
-            .values()
-            .filter(|f| f.signature.is_async)
-            .map(|f| f.id)
             .collect();
 
         let mut lowered_count = 0_usize;

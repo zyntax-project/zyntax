@@ -1948,6 +1948,21 @@ pub fn type_tag_for_hir_type(ty: &crate::hir::HirType) -> TypeTag {
         HirType::U128 => TypeTag::new(TypeCategory::UInt, 0x10, TypeFlags::NONE), // 128-bit
         HirType::F32 => TypeTag::F32,
         HirType::F64 => TypeTag::F64,
+        // An address as a number marshals as the target's word.
+        HirType::USize => {
+            if crate::target_pointer_size() == 8 {
+                TypeTag::U64
+            } else {
+                TypeTag::U32
+            }
+        }
+        HirType::ISize => {
+            if crate::target_pointer_size() == 8 {
+                TypeTag::I64
+            } else {
+                TypeTag::I32
+            }
+        }
         HirType::Ptr(_) => TypeTag::new(TypeCategory::Pointer, 0, TypeFlags::NONE),
         HirType::Ref { .. } => TypeTag::new(TypeCategory::Pointer, 1, TypeFlags::NONE),
         HirType::Array(_, _) => TypeTag::new(TypeCategory::Array, 0, TypeFlags::NONE),

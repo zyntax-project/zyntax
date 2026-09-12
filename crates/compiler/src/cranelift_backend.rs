@@ -2049,6 +2049,20 @@ impl CraneliftBackend {
                         }
                         HirConstant::F32(v) => builder.ins().f32const(*v),
                         HirConstant::F64(v) => builder.ins().f64const(*v),
+                        // Pointer-width constants and nulls take the
+                        // target's pointer type.
+                        HirConstant::USize(v) => {
+                            let ptr = self.module.target_config().pointer_type();
+                            builder.ins().iconst(ptr, *v as i64)
+                        }
+                        HirConstant::ISize(v) => {
+                            let ptr = self.module.target_config().pointer_type();
+                            builder.ins().iconst(ptr, *v)
+                        }
+                        HirConstant::Null(_) => {
+                            let ptr = self.module.target_config().pointer_type();
+                            builder.ins().iconst(ptr, 0)
+                        }
                         _ => continue, // Complex constants not yet supported
                     };
                     self.value_map.insert(value.id, cranelift_val);
@@ -6737,6 +6751,7 @@ impl CraneliftBackend {
             HirType::U128 => Ok(types::I128),
             HirType::F32 => Ok(types::F32),
             HirType::F64 => Ok(types::F64),
+            HirType::USize | HirType::ISize => Ok(self.module.target_config().pointer_type()),
             HirType::Ptr(_) => Ok(self.module.target_config().pointer_type()),
             HirType::Ref { .. } => {
                 // References are treated as pointers in Cranelift
@@ -9854,6 +9869,9 @@ impl CraneliftBackend {
             HirType::I16 | HirType::U16 => Ok(2),
             HirType::I32 | HirType::U32 | HirType::F32 => Ok(4),
             HirType::I64 | HirType::U64 | HirType::F64 => Ok(8),
+            HirType::USize | HirType::ISize => {
+                Ok(self.module.target_config().pointer_bytes() as usize)
+            }
             HirType::I128 | HirType::U128 => Ok(16),
             HirType::Ptr(_) => Ok(self.module.target_config().pointer_bytes() as usize),
             HirType::Array(elem_ty, count) => {
@@ -9884,6 +9902,9 @@ impl CraneliftBackend {
             HirType::I16 | HirType::U16 => Ok(2),
             HirType::I32 | HirType::U32 | HirType::F32 => Ok(4),
             HirType::I64 | HirType::U64 | HirType::F64 => Ok(8),
+            HirType::USize | HirType::ISize => {
+                Ok(self.module.target_config().pointer_bytes() as usize)
+            }
             HirType::I128 | HirType::U128 => Ok(16),
             HirType::Ptr(_) => Ok(self.module.target_config().pointer_bytes() as usize),
             HirType::Array(elem_ty, _) => self.type_alignment(elem_ty),

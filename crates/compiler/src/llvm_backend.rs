@@ -5041,6 +5041,16 @@ impl<'ctx> LLVMBackend<'ctx> {
             I16(v) => self.context.i16_type().const_int(*v as u64, true).into(),
             I32(v) => self.context.i32_type().const_int(*v as u64, true).into(),
             I64(v) => self.context.i64_type().const_int(*v as u64, true).into(),
+            USize(v) => self
+                .translate_type(&HirType::USize)?
+                .into_int_type()
+                .const_int(*v, false)
+                .into(),
+            ISize(v) => self
+                .translate_type(&HirType::ISize)?
+                .into_int_type()
+                .const_int(*v as u64, true)
+                .into(),
             I128(v) => {
                 // Split i128 into high and low u64 parts
                 let low = (*v as u128 & 0xFFFFFFFFFFFFFFFF) as u64;
@@ -5211,6 +5221,14 @@ impl<'ctx> LLVMBackend<'ctx> {
             U128 => self.context.i128_type().into(),
             F32 => self.context.f32_type().into(),
             F64 => self.context.f64_type().into(),
+            // Pointer-width integers take the target's word.
+            USize | ISize => {
+                if crate::target_pointer_size() == 8 {
+                    self.context.i64_type().into()
+                } else {
+                    self.context.i32_type().into()
+                }
+            }
             Bool => self.context.bool_type().into(),
             Ptr(inner) => {
                 // `Ptr(Opaque(X))` and bare `Opaque(X)` both collapse to

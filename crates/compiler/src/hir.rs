@@ -1585,6 +1585,11 @@ pub enum HirType {
     F32,
     F64,
 
+    /// Pointer-width integers: an address as a number, sized by the
+    /// target rather than fixed at 64 bits.
+    USize,
+    ISize,
+
     /// Pointer type
     Ptr(Box<HirType>),
 
@@ -1861,6 +1866,9 @@ pub enum HirConstant {
     U128(u128),
     F32(f32),
     F64(f64),
+    /// A pointer-width integer constant.
+    USize(u64),
+    ISize(i64),
     Null(HirType),
     Array(Vec<HirConstant>),
     Struct(Vec<HirConstant>),
@@ -1887,6 +1895,8 @@ impl std::hash::Hash for HirConstant {
             U32(v) => v.hash(state),
             U64(v) => v.hash(state),
             U128(v) => v.hash(state),
+            USize(v) => v.hash(state),
+            ISize(v) => v.hash(state),
             // For floating point, hash the bits representation
             F32(v) => v.to_bits().hash(state),
             F64(v) => v.to_bits().hash(state),

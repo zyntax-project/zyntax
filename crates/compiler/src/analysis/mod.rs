@@ -236,10 +236,20 @@ impl AnalysisRunner {
 
     /// Run all analyses
     pub fn run_all(&mut self) -> CompilerResult<ModuleAnalysis> {
+        let ids: Vec<HirId> = self.module.functions.keys().copied().collect();
+        self.run_for(&ids)
+    }
+
+    /// [`Self::run_all`] over the functions named, for a caller that
+    /// needs per-function results for a few functions of a large module.
+    pub fn run_for(&mut self, function_ids: &[HirId]) -> CompilerResult<ModuleAnalysis> {
         let mut functions = HashMap::new();
 
         // Analyze each function
-        for (func_id, func) in &self.module.functions {
+        for func_id in function_ids {
+            let Some(func) = self.module.functions.get(func_id) else {
+                continue;
+            };
             let func_analysis = self.analyze_function(func)?;
             functions.insert(*func_id, func_analysis);
         }

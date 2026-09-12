@@ -131,7 +131,8 @@ pub(crate) fn hir_ty_size(ty: &HirType) -> usize {
         HirType::Bool | HirType::I8 | HirType::U8 => 1,
         HirType::I16 | HirType::U16 => 2,
         HirType::I32 | HirType::U32 | HirType::F32 => 4,
-        HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_) => 8,
+        HirType::I64 | HirType::U64 | HirType::F64 => 8,
+        HirType::Ptr(_) | HirType::USize | HirType::ISize => crate::target_pointer_size(),
         HirType::I128 | HirType::U128 => 16,
         HirType::Struct(s) => s.fields.iter().map(hir_ty_size).sum::<usize>().max(1),
         HirType::Array(elem, n) => hir_ty_size(elem).saturating_mul(*n as usize),
@@ -3565,6 +3566,8 @@ impl SsaBuilder {
             HirType::U32 => Some((32, false)),
             HirType::U64 => Some((64, false)),
             HirType::U128 => Some((128, false)),
+            HirType::ISize => Some((crate::target_pointer_size() as u8 * 8, true)),
+            HirType::USize => Some((crate::target_pointer_size() as u8 * 8, false)),
             _ => None,
         }
     }
@@ -3630,8 +3633,12 @@ impl SsaBuilder {
         }
 
         match (source_ty, target_ty) {
-            (HirType::Ptr(_), HirType::I64 | HirType::U64) => PtrToInt,
-            (HirType::I64 | HirType::U64, HirType::Ptr(_)) => IntToPtr,
+            (HirType::Ptr(_), HirType::I64 | HirType::U64 | HirType::USize | HirType::ISize) => {
+                PtrToInt
+            }
+            (HirType::I64 | HirType::U64 | HirType::USize | HirType::ISize, HirType::Ptr(_)) => {
+                IntToPtr
+            }
             _ => Bitcast,
         }
     }
@@ -3752,7 +3759,8 @@ impl SsaBuilder {
                                 "[SSA] Variable '{}' is a function — emitting function ref",
                                 name_str
                             );
-                            let addr = self.create_value(HirType::I64, HirValueKind::Instruction);
+                            // A code address is pointer-wide.
+                            let addr = self.create_value(HirType::USize, HirValueKind::Instruction);
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Call {
@@ -4700,14 +4708,14 @@ impl SsaBuilder {
                             })?;
 
                         // CreateClosure with no captures yields the
-                        // raw function pointer as an i64 — see the
+                        // raw function pointer, pointer-wide; see the
                         // backend's `func_addr` lowering for the op.
-                        let fn_ptr = self.create_value(HirType::I64, HirValueKind::Instruction);
+                        let fn_ptr = self.create_value(HirType::USize, HirValueKind::Instruction);
                         self.add_instruction(
                             block_id,
                             HirInstruction::CreateClosure {
                                 result: fn_ptr,
-                                closure_ty: HirType::I64,
+                                closure_ty: HirType::USize,
                                 function: fiber_fn_id,
                                 captures: vec![],
                             },
@@ -8606,21 +8614,9 @@ impl SsaBuilder {
         right: HirId,
     ) -> (HirId, HirId) {
         fn int_width(ty: &HirType) -> Option<(u8, bool)> {
-            // Returns (bit_width, is_signed) for fixed-width integer
-            // types; None for non-int / Bool / Ptr / variable-width.
-            match ty {
-                HirType::I8 => Some((8, true)),
-                HirType::I16 => Some((16, true)),
-                HirType::I32 => Some((32, true)),
-                HirType::I64 => Some((64, true)),
-                HirType::I128 => Some((128, true)),
-                HirType::U8 => Some((8, false)),
-                HirType::U16 => Some((16, false)),
-                HirType::U32 => Some((32, false)),
-                HirType::U64 => Some((64, false)),
-                HirType::U128 => Some((128, false)),
-                _ => None,
-            }
+            // Returns (bit_width, is_signed) for integer types; None for
+            // non-int / Bool / Ptr.
+            SsaBuilder::int_type_width_and_sign(ty)
         }
 
         let lhs_ty = match self.function.values.get(&left).map(|v| v.ty.clone()) {
@@ -11726,7 +11722,9 @@ impl SsaBuilder {
                 PrimitiveType::F64 => HirType::F64,
                 PrimitiveType::Unit => HirType::Void,
                 PrimitiveType::String => HirType::Ptr(Box::new(HirType::I8)), // String is Ptr<i8>
-                _ => HirType::I64,                                            // Default
+                PrimitiveType::USize => HirType::USize,
+                PrimitiveType::ISize => HirType::ISize,
+                _ => HirType::I64, // Default
             },
             Type::Tuple(types) if types.is_empty() => HirType::Void,
             Type::Reference { ty, .. } => HirType::Ptr(Box::new(self.convert_type(ty))),
@@ -12894,6 +12892,8 @@ impl SsaBuilder {
                     HirType::U16 => HirConstant::U16(*i as u16),
                     HirType::U32 => HirConstant::U32(*i as u32),
                     HirType::U64 => HirConstant::U64(*i as u64),
+                    HirType::USize => HirConstant::USize(*i as u64),
+                    HirType::ISize => HirConstant::ISize(*i as i64),
                     _ => HirConstant::I32(*i as i32), // Default to I32
                 }
             }
@@ -12906,9 +12906,12 @@ impl SsaBuilder {
             TypedLiteral::Char(c) => HirConstant::I32(*c as i32),
             TypedLiteral::Unit => HirConstant::Struct(vec![]),
             // Null is represented as a None variant in Optional type (discriminant 1)
-            // A null of a pointer type is a pointer-wide zero.
+            // A null of a pointer type is a null pointer.
             TypedLiteral::Null => match target_ty {
-                HirType::Ptr(_) | HirType::I64 | HirType::U64 => HirConstant::I64(0),
+                HirType::Ptr(_) => HirConstant::Null(target_ty.clone()),
+                HirType::USize => HirConstant::USize(0),
+                HirType::ISize => HirConstant::ISize(0),
+                HirType::I64 | HirType::U64 => HirConstant::I64(0),
                 _ => HirConstant::I32(0),
             },
             // Undefined is used for uninitialized memory - use 0 as placeholder

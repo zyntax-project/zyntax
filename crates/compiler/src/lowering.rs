@@ -3961,6 +3961,8 @@ impl LoweringContext {
                 PrimitiveType::Unit => HirType::Void,
                 PrimitiveType::Char => HirType::U32, // Unicode scalar
                 PrimitiveType::String => HirType::Ptr(Box::new(HirType::I8)),
+                PrimitiveType::USize => HirType::USize,
+                PrimitiveType::ISize => HirType::ISize,
                 _ => HirType::I64, // Default
             },
 

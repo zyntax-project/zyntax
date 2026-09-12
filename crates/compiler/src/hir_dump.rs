@@ -92,6 +92,8 @@ fn fmt_type(ty: &HirType) -> String {
         HirType::U128 => "u128".into(),
         HirType::F32 => "f32".into(),
         HirType::F64 => "f64".into(),
+        HirType::USize => "usize".into(),
+        HirType::ISize => "isize".into(),
         HirType::Ptr(inner) => format!("*{}", fmt_type(inner)),
         HirType::Ref {
             pointee, mutable, ..
@@ -229,6 +231,8 @@ fn fmt_constant(c: &HirConstant) -> String {
         HirConstant::U128(v) => format!("{}u128", v),
         HirConstant::F32(v) => format!("{}f32", v),
         HirConstant::F64(v) => format!("{}f64", v),
+        HirConstant::USize(v) => format!("{}usize", v),
+        HirConstant::ISize(v) => format!("{}isize", v),
         HirConstant::Null(ty) => format!("null:{}", fmt_type(ty)),
         HirConstant::Array(elems) => {
             let vals: Vec<String> = elems.iter().map(|e| fmt_constant(e)).collect();

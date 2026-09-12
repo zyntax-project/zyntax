@@ -2180,3 +2180,18 @@ pub fn compile_to_jit(
 
     Ok(backend)
 }
+
+/// The pointer size of the code being produced, in bytes. The JIT
+/// targets the host; a cross-compiling backend sets it for its target
+/// before lowering.
+pub fn target_pointer_size() -> usize {
+    TARGET_POINTER_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the pointer size of the target being compiled for.
+pub fn set_target_pointer_size(bytes: usize) {
+    TARGET_POINTER_SIZE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+static TARGET_POINTER_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(std::mem::size_of::<*const ()>());
