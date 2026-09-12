@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789245494,"nonce":"wwlyZ80Zs6Ts2RTy/98bc2bxOqM=","added":["bug","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789250168,"nonce":"ir3+hczgIBmzwnKg+48rLvld8r0=","message":"Root cause in 4c83241: compile time over the harness's 30 s limit under parallel load, from liveness over every function. Fixed in 08aaa4d.","files":null}]}
