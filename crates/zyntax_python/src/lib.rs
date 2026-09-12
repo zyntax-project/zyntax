@@ -20,11 +20,14 @@
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction};
-use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedNode, TypedProgram, Visibility};
+use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction, TypedVariable};
+use zyntax_typed_ast::{
+    InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
+};
 
 mod format;
 mod lower;
+mod scope;
 mod types;
 
 /// Why a program could not be turned into a `TypedProgram`.
@@ -112,9 +115,72 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
 
     let library = zyntax_builtins::library(&POLICY);
     lower::set_list_type(library.list_type);
-    let mut inferred = types::infer_module(&defs);
-    inferred.list_type = Some(library.list_type);
+    let owned: Vec<py::Stmt> = top_level.iter().map(|s| (*s).clone()).collect();
+    let entry_sig = types::Sig {
+        params: Vec::new(),
+        ret: types::Ty::None,
+        defaults: Vec::new(),
+    };
+    let mut inferred = types::Module {
+        list_type: Some(library.list_type),
+        ..Default::default()
+    };
+    let global_names = module_globals(&module.body, &defs);
+    // A global's type is the join of every assignment to it: the
+    // module's own, then those under `global` in each function.
+    let main_locals = types::infer_locals(&inferred, &entry_sig, &owned);
+    for name in &global_names {
+        let ty = main_locals
+            .vars
+            .get(name)
+            .copied()
+            .unwrap_or(types::Ty::Unknown);
+        inferred.globals.insert(name.clone(), ty);
+    }
+    for _ in 0..4 {
+        let before = inferred.globals.clone();
+        let funcs = types::infer_module(&inferred, &defs);
+        inferred.funcs = funcs;
+        for f in &defs {
+            let sig = inferred.funcs[f.name.as_str()].clone();
+            let locals = types::infer_locals(&inferred, &sig, &f.body);
+            for (name, ty) in &locals.global_writes {
+                let joined = inferred
+                    .globals
+                    .get(name)
+                    .copied()
+                    .unwrap_or(types::Ty::Unknown)
+                    .join(*ty);
+                inferred.globals.insert(name.clone(), joined);
+            }
+        }
+        if inferred.globals == before {
+            break;
+        }
+    }
+    for ty in inferred.globals.values_mut() {
+        if *ty == types::Ty::Unknown {
+            *ty = types::Ty::Object;
+        }
+    }
     let mut declarations = Vec::new();
+    for (name, ty) in &inferred.globals {
+        let stored = match ty {
+            types::Ty::Int | types::Ty::Float | types::Ty::Bool | types::Ty::Str => *ty,
+            _ => types::Ty::Object,
+        };
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Variable(TypedVariable {
+                name: intern(name),
+                ty: lower::ir(stored),
+                mutability: Mutability::Mutable,
+                initializer: None,
+                visibility: Visibility::Public,
+            }),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
     for f in &defs {
         let sig = inferred.funcs[f.name.as_str()].clone();
         let locals = types::infer_locals(&inferred, &sig, &f.body);
@@ -126,14 +192,11 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         ));
     }
     if !top_level.is_empty() {
-        let owned: Vec<py::Stmt> = top_level.iter().map(|s| (*s).clone()).collect();
-        let sig = types::Sig {
-            params: Vec::new(),
-            ret: types::Ty::None,
-            defaults: 0,
-        };
-        let locals = types::infer_locals(&inferred, &sig, &owned);
-        let statements = lower::Lowerer::new(&inferred, sig, locals).body(&top_level)?;
+        let mut locals = types::infer_locals(&inferred, &entry_sig, &owned);
+        for name in inferred.globals.keys() {
+            locals.vars.remove(name);
+        }
+        let statements = lower::Lowerer::new(&inferred, entry_sig, locals).body(&top_level)?;
         let span = Span::new(
             top_level[0].range().start().to_usize(),
             top_level[top_level.len() - 1].range().end().to_usize(),
@@ -171,6 +234,23 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         source_files: Vec::new(),
         type_registry: library.type_registry,
     })
+}
+
+/// The module-level names that are variables of the module rather than
+/// locals of its body: those a function reads or declares `global`.
+fn module_globals(body: &[py::Stmt], defs: &[&py::StmtFunctionDef]) -> Vec<String> {
+    let module = scope::Scope::of_body(Vec::new(), body);
+    let functions: std::collections::HashSet<&str> = defs.iter().map(|f| f.name.as_str()).collect();
+    let mut names: std::collections::BTreeSet<String> =
+        module.declared_globals().into_iter().collect();
+    for (_, child) in &module.children {
+        for name in &child.free {
+            if module.bound.contains(name) && !functions.contains(name.as_str()) {
+                names.insert(name.clone());
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 pub(crate) fn intern(s: &str) -> InternedString {

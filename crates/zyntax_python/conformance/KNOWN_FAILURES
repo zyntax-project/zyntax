@@ -11,12 +11,10 @@ dict/basics.py                               267e30f
 dict/int_keys_and_methods.py                 267e30f
 exceptions/custom_and_propagation.py         2327e7f
 exceptions/try_except_finally.py             2327e7f
-functions/keyword_arguments.py               f322651
 functions/lambda_and_higher_order.py         f322651
 generators/basic_yield.py                    804d85e
 generators/generator_expression.py           804d85e
 int/big_values.py                            dd86335
 scope/closures.py                            e9d2d8b
-scope/global_statement.py                    e9d2d8b
 scope/nonlocal.py                            e9d2d8b
 set/basics.py                                4ec2c7a

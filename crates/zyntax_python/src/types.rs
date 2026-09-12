@@ -118,8 +118,9 @@ impl Ty {
 pub(crate) struct Sig {
     pub(crate) params: Vec<(String, Ty)>,
     pub(crate) ret: Ty,
-    /// How many trailing parameters have defaults.
-    pub(crate) defaults: usize,
+    /// Each parameter's default, evaluated at the call site that leaves
+    /// the parameter out.
+    pub(crate) defaults: Vec<Option<py::Expr>>,
 }
 
 /// What the module declares: every `def` by name, and the library's
@@ -128,6 +129,9 @@ pub(crate) struct Sig {
 #[derive(Default, Debug)]
 pub(crate) struct Module {
     pub(crate) funcs: HashMap<String, Sig>,
+    /// Module-level variables a function reads or declares `global`,
+    /// with the join of everything assigned to them anywhere.
+    pub(crate) globals: HashMap<String, Ty>,
     pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
 }
 
@@ -136,6 +140,8 @@ pub(crate) struct Module {
 pub(crate) struct Locals {
     pub(crate) vars: HashMap<String, Ty>,
     pub(crate) ret: Ty,
+    /// Names this body declares `global`, and what it assigns to them.
+    pub(crate) global_writes: HashMap<String, Ty>,
 }
 
 pub(crate) fn annotation(e: &py::Expr) -> Ty {
@@ -172,8 +178,8 @@ pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
     let defaults = f
         .parameters
         .iter_non_variadic_params()
-        .filter(|p| p.default.is_some())
-        .count();
+        .map(|p| p.default.as_deref().cloned())
+        .collect();
     Sig {
         params,
         ret: f.returns.as_deref().map(annotation).unwrap_or(Ty::Unknown),
@@ -182,8 +188,12 @@ pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
 }
 
 /// Infer the module's signatures to a fixed point.
-pub(crate) fn infer_module(defs: &[&py::StmtFunctionDef]) -> Module {
-    let mut module = Module::default();
+pub(crate) fn infer_module(known: &Module, defs: &[&py::StmtFunctionDef]) -> HashMap<String, Sig> {
+    let mut module = Module {
+        funcs: HashMap::new(),
+        globals: known.globals.clone(),
+        list_type: known.list_type,
+    };
     for f in defs {
         module.funcs.insert(f.name.to_string(), declared_sig(f));
     }
@@ -215,7 +225,7 @@ pub(crate) fn infer_module(defs: &[&py::StmtFunctionDef]) -> Module {
             sig.ret = Ty::Object;
         }
     }
-    module
+    module.funcs
 }
 
 /// Infer one body's locals: parameters as declared, every other name
@@ -225,6 +235,10 @@ pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Loc
     for (name, ty) in &sig.params {
         locals.vars.insert(name.clone(), *ty);
     }
+    let declared_global = crate::scope::Scope::of_body(Vec::new(), body).globals;
+    for name in &declared_global {
+        locals.global_writes.insert(name.clone(), Ty::Unknown);
+    }
     for _ in 0..8 {
         let before = locals.clone();
         let mut walker = Walker {
@@ -233,7 +247,10 @@ pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Loc
             params: &sig.params,
         };
         walker.stmts(body);
-        if locals.vars == before.vars && locals.ret == before.ret {
+        if locals.vars == before.vars
+            && locals.ret == before.ret
+            && locals.global_writes == before.global_writes
+        {
             break;
         }
     }
@@ -253,6 +270,11 @@ struct Walker<'a> {
 
 impl Walker<'_> {
     fn assign(&mut self, name: &str, ty: Ty) {
+        // A declared global is the module's variable, not a local.
+        if let Some(written) = self.locals.global_writes.get_mut(name) {
+            *written = written.join(ty);
+            return;
+        }
         // A parameter keeps its declared type unless the body assigns it
         // another, in which case it lives as an object from the start.
         if let Some((_, declared)) = self.params.iter().find(|(n, _)| n == name) {
@@ -358,16 +380,6 @@ impl Walker<'_> {
             py::Stmt::With(w) => self.stmts(&w.body),
             py::Stmt::FunctionDef(f) => self.assign(f.name.as_str(), Ty::Object),
             py::Stmt::ClassDef(c) => self.assign(c.name.as_str(), Ty::Object),
-            py::Stmt::Global(g) => {
-                for n in &g.names {
-                    self.assign(n.as_str(), Ty::Object);
-                }
-            }
-            py::Stmt::Nonlocal(g) => {
-                for n in &g.names {
-                    self.assign(n.as_str(), Ty::Object);
-                }
-            }
             _ => {}
         }
     }
@@ -493,7 +505,12 @@ impl Typer<'_> {
             py::Expr::BooleanLiteral(_) => Ty::Bool,
             py::Expr::NoneLiteral(_) => Ty::None,
             py::Expr::StringLiteral(_) | py::Expr::FString(_) => Ty::Str,
-            py::Expr::Name(n) => self.vars.get(n.id.as_str()).copied().unwrap_or(Ty::Object),
+            py::Expr::Name(n) => self
+                .vars
+                .get(n.id.as_str())
+                .or_else(|| self.module.globals.get(n.id.as_str()))
+                .copied()
+                .unwrap_or(Ty::Object),
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left);
                 let r = self.expr(&b.right);

@@ -199,7 +199,40 @@ impl<'m> Lowerer<'m> {
     }
 
     fn var_ty(&self, name: &str) -> Ty {
-        self.locals.vars.get(name).copied().unwrap_or(Ty::Object)
+        self.locals
+            .vars
+            .get(name)
+            .or_else(|| self.module.globals.get(name))
+            .copied()
+            .unwrap_or(Ty::Object)
+    }
+
+    /// Whether `name` here is the module's variable rather than a local.
+    fn is_global(&self, name: &str) -> bool {
+        !self.locals.vars.contains_key(name) && self.module.globals.contains_key(name)
+    }
+
+    /// A global holds its own scalar type; anything else is stored boxed,
+    /// so a list global is one heap header shared by every reader.
+    fn storage(ty: Ty) -> Ty {
+        match ty {
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str => ty,
+            _ => Ty::Object,
+        }
+    }
+
+    /// Read the module variable `name`.
+    fn global_read(&mut self, name: &str, span: Span) -> Val {
+        let ty = self.var_ty(name);
+        let stored = Self::storage(ty);
+        let node = self.coerce(
+            Val {
+                node: var(intern(name), stored, span),
+                ty: stored,
+            },
+            ty,
+        );
+        Val { node, ty }
     }
 
     /// A local no Python program can spell.
@@ -574,6 +607,8 @@ impl<'m> Lowerer<'m> {
             }
             py::Stmt::Break(_) => push(out, TypedStatement::Break(None)),
             py::Stmt::Continue(_) => push(out, TypedStatement::Continue),
+            // Scope analysis already made the names module variables.
+            py::Stmt::Global(_) => {}
             other => return unsupported(types::stmt_kind(other), other),
         }
         Ok(())
@@ -665,8 +700,26 @@ impl<'m> Lowerer<'m> {
             }
         };
         let ty = self.var_ty(n.id.as_str());
-        let value = self.coerce(value, ty);
         let name = intern(n.id.as_str());
+        if self.is_global(n.id.as_str()) {
+            let stored = Self::storage(ty);
+            let value = self.coerce(value, ty);
+            let value = self.coerce(Val { node: value, ty }, stored);
+            let assign = binary(
+                BinaryOp::Assign,
+                var(name, stored, span),
+                value,
+                Ty::None,
+                span,
+            );
+            out.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(assign)),
+                Type::Unknown,
+                span,
+            ));
+            return Ok(());
+        }
+        let value = self.coerce(value, ty);
         if !self.bound.contains(&name) {
             self.bound.push(name);
             out.push(TypedNode::new(
@@ -944,6 +997,9 @@ impl<'m> Lowerer<'m> {
                     node: str_lit(n.id.as_str(), span),
                     ty: Ty::Str,
                 }
+            }
+            py::Expr::Name(n) if self.is_global(n.id.as_str()) => {
+                self.global_read(n.id.as_str(), span)
             }
             py::Expr::Name(n) => Val {
                 node: var(intern(n.id.as_str()), ty, span),
@@ -1784,38 +1840,30 @@ impl<'m> Lowerer<'m> {
     /// A call: `print`, a conversion builtin, or a function the module
     /// defines.
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
-        if !c.arguments.keywords.is_empty() {
+        let args = &c.arguments.args;
+        let keywords = &c.arguments.keywords;
+        if let py::Expr::Name(n) = &*c.func {
+            if let Some(sig) = self.module.funcs.get(n.id.as_str()).cloned() {
+                let lowered = self.arguments(n.id.as_str(), &sig, args, keywords, c)?;
+                return Ok(Val {
+                    node: call(n.id.as_str(), lowered, sig.ret, span),
+                    ty: sig.ret,
+                });
+            }
+            if n.id.as_str() == "print" {
+                return self.print(args, keywords, span);
+            }
+        }
+        if !keywords.is_empty() {
             return unsupported("keyword arguments", c);
         }
-        let args = &c.arguments.args;
         if let py::Expr::Attribute(a) = &*c.func {
             let receiver = self.expr(&a.value)?;
             return self.method(receiver, a.attr.as_str(), args, ty, span);
         }
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
-            if let Some(sig) = self.module.funcs.get(name).cloned() {
-                if args.len() > sig.params.len() || args.len() + sig.defaults < sig.params.len() {
-                    return unsupported(
-                        format!(
-                            "calling `{name}` with {} argument(s); it takes {}",
-                            args.len(),
-                            sig.params.len()
-                        ),
-                        c,
-                    );
-                }
-                let mut lowered = Vec::with_capacity(args.len());
-                for (a, (_, pty)) in args.iter().zip(&sig.params) {
-                    lowered.push(self.expr_as(a, *pty)?);
-                }
-                return Ok(Val {
-                    node: call(name, lowered, sig.ret, span),
-                    ty: sig.ret,
-                });
-            }
             match name {
-                "print" => return self.print(args, span),
                 "str" => {
                     let v = self.expr(&args[0])?;
                     let node = self.str_of(v);
@@ -2216,7 +2264,76 @@ impl<'m> Lowerer<'m> {
 
     /// `print(a, b, ...)`: each argument as `str()`, a space between,
     /// one line written.
-    fn print(&mut self, args: &[py::Expr], span: Span) -> Result<Val> {
+    /// The arguments of a call to a module function, in parameter order:
+    /// positionals first, then keywords by name, then defaults.
+    fn arguments(
+        &mut self,
+        name: &str,
+        sig: &Sig,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+    ) -> Result<Vec<Node>> {
+        let mut slots: Vec<Option<&py::Expr>> = vec![None; sig.params.len()];
+        if args.len() > sig.params.len() {
+            return unsupported(
+                format!(
+                    "calling `{name}` with {} positional argument(s); it takes {}",
+                    args.len(),
+                    sig.params.len()
+                ),
+                c,
+            );
+        }
+        for (slot, a) in slots.iter_mut().zip(args) {
+            *slot = Some(a);
+        }
+        for k in keywords {
+            let Some(arg) = &k.arg else {
+                return unsupported("`**` argument unpacking", k);
+            };
+            let Some(i) = sig.params.iter().position(|(p, _)| p == arg.as_str()) else {
+                return unsupported(
+                    format!("calling `{name}` with an unexpected keyword `{arg}`"),
+                    k,
+                );
+            };
+            if slots[i].is_some() {
+                return unsupported(format!("calling `{name}` with `{arg}` given twice"), k);
+            }
+            slots[i] = Some(&k.value);
+        }
+        let mut lowered = Vec::with_capacity(sig.params.len());
+        for (i, ((pname, pty), slot)) in sig.params.iter().zip(&slots).enumerate() {
+            let e = match (slot, sig.defaults.get(i).and_then(|d| d.as_ref())) {
+                (Some(e), _) => *e,
+                (None, Some(default)) => default,
+                (None, None) => {
+                    return unsupported(
+                        format!("calling `{name}` without its argument `{pname}`"),
+                        c,
+                    )
+                }
+            };
+            lowered.push(self.expr_as(e, *pty)?);
+        }
+        Ok(lowered)
+    }
+
+    /// `print(*values, sep=" ", end="\n")`.
+    fn print(&mut self, args: &[py::Expr], keywords: &[py::Keyword], span: Span) -> Result<Val> {
+        let mut sep = str_lit(" ", span);
+        let mut end: Option<Node> = None;
+        for k in keywords {
+            match k.arg.as_ref().map(|a| a.as_str()) {
+                Some("sep") => sep = self.expr_as(&k.value, Ty::Str)?,
+                Some("end") => end = Some(self.expr_as(&k.value, Ty::Str)?),
+                Some(other) => {
+                    return unsupported(format!("print(..., {other}=...)"), k);
+                }
+                None => return unsupported("`**` argument unpacking", k),
+            }
+        }
         let mut line: Option<Node> = None;
         for a in args {
             let v = self.expr(a)?;
@@ -2224,15 +2341,21 @@ impl<'m> Lowerer<'m> {
             line = Some(match line {
                 None => s,
                 Some(prev) => {
-                    let with_space = binary(BinaryOp::Add, prev, str_lit(" ", span), Ty::Str, span);
-                    binary(BinaryOp::Add, with_space, s, Ty::Str, span)
+                    let with_sep = binary(BinaryOp::Add, prev, sep.clone(), Ty::Str, span);
+                    binary(BinaryOp::Add, with_sep, s, Ty::Str, span)
                 }
             });
         }
         let line = line.unwrap_or_else(|| str_lit("", span));
-        Ok(Val {
-            node: call("zb_print_line", vec![line], Ty::None, span),
-            ty: Ty::None,
-        })
+        let node = match end {
+            None => call("zb_print_line", vec![line], Ty::None, span),
+            Some(end) => call(
+                "zb_print_text",
+                vec![binary(BinaryOp::Add, line, end, Ty::Str, span)],
+                Ty::None,
+                span,
+            ),
+        };
+        Ok(Val { node, ty: Ty::None })
     }
 }
