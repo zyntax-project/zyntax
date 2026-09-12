@@ -3483,15 +3483,17 @@ impl LoweringContext {
 
         let func_name = func.name.resolve_global().unwrap_or_default();
         for param in &func.params {
-            // Warn about untyped parameters — they will be treated as Dynamic.
+            // Warn about untyped parameters: they will be treated as Dynamic.
             // Skip warnings for: main(), internal runtime functions ($-prefixed),
             // externs bound to a runtime symbol (the symbol's registered
-            // signature types them), and stdlib IO functions that
-            // intentionally accept DynamicBox.
+            // signature types them), parameters with no source location (a
+            // frontend synthesized them and meant the type), and stdlib IO
+            // functions that intentionally accept DynamicBox.
             if matches!(param.ty, Type::Any | Type::Unknown | Type::Dynamic) {
                 let param_name = param.name.resolve_global().unwrap_or_default();
                 let is_internal = func_name == "main"
                     || (func.is_external && func.link_name.is_some())
+                    || param.span.is_empty()
                     || func_name.starts_with('$')
                     || func_name.starts_with("__")
                     || matches!(

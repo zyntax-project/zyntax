@@ -3,9 +3,7 @@
 # A listed case that starts passing fails the suite until it is removed here
 # and its issue is closed; an unlisted case that fails is a regression.
 
-binop/floor_and_modulo_signs.py              a735972
 builtin/conversions.py                       4ed0759
-builtin/numeric.py                           4ed0759
 class/basic.py                               cd13255
 class/dunder_operators.py                    cd13255
 class/inheritance.py                         cd13255
@@ -15,18 +13,12 @@ exceptions/custom_and_propagation.py         2327e7f
 exceptions/try_except_finally.py             2327e7f
 functions/keyword_arguments.py               f322651
 functions/lambda_and_higher_order.py         f322651
-functions/multiple_return_values.py          f322651
 generators/basic_yield.py                    804d85e
 generators/generator_expression.py           804d85e
 int/big_values.py                            dd86335
-list/basics.py                               143bd46
-list/comprehension.py                        143bd46
-list/methods.py                              143bd46
-list/slicing.py                              143bd46
 scope/closures.py                            e9d2d8b
 scope/global_statement.py                    e9d2d8b
 scope/nonlocal.py                            e9d2d8b
 set/basics.py                                4ec2c7a
-string/basics.py                             74c2742
 string/formatting.py                         74c2742
 tuple/basics.py                              be231dc

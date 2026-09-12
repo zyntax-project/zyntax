@@ -5,17 +5,18 @@
 //! two types gets an explicit conversion: a cast between numbers, a box
 //! into `Any`, a checked unbox out of it. Nothing is left for the
 //! compiler to guess. Python's own semantics that the IR does not have
-//! (how a bool prints, what `"a" * 3` is) are calls into the prelude.
+//! (how a bool prints, what `"a" * 3` is) are calls into the shared
+//! built-in library.
 
-use crate::types::{self, Locals, Module, Sig, Ty, Typer};
+use crate::types::{self, Elem, Locals, Module, Sig, Ty, Typer};
 use crate::{intern, prim, span_of, Error, Result};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression, TypedFor, TypedFunction,
-    TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedParameter, TypedPattern, TypedRange,
-    TypedStatement, TypedUnary, TypedWhile,
+    TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedMethodCall, TypedParameter, TypedPattern,
+    TypedRange, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
@@ -25,6 +26,25 @@ use zyntax_typed_ast::{
 type Node = TypedNode<TypedExpression>;
 type Stmt = TypedNode<TypedStatement>;
 
+thread_local! {
+    /// The built-in library's `List<T>`, for spelling list types. Set
+    /// once per program before any lowering.
+    static LIST_TYPE: std::cell::Cell<Option<zyntax_typed_ast::TypeId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn set_list_type(id: zyntax_typed_ast::TypeId) {
+    LIST_TYPE.with(|c| c.set(Some(id)));
+}
+
+/// `List<elem>` as the library declares it.
+fn list_type(elem: Type) -> Type {
+    let id = LIST_TYPE
+        .with(|c| c.get())
+        .expect("the library's List<T> is known before lowering");
+    zyntax_builtins::list_of(id, elem)
+}
+
 /// The IR type a static type is carried as.
 pub(crate) fn ir(ty: Ty) -> Type {
     match ty {
@@ -33,8 +53,33 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Bool => prim(PrimitiveType::Bool),
         Ty::Str => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
+        Ty::List(e) => list_type(ir(e.ty())),
+        Ty::Tuple => list_type(Type::Any),
         Ty::Object | Ty::Unknown => Type::Any,
     }
+}
+
+fn method_call(receiver: Node, method: &str, args: Vec<Node>, ty: Ty, span: Span) -> Node {
+    node(
+        TypedExpression::MethodCall(TypedMethodCall {
+            receiver: Box::new(receiver),
+            method: intern(method),
+            type_args: Vec::new(),
+            positional_args: args,
+            named_args: Vec::new(),
+        }),
+        ty,
+        span,
+    )
+}
+
+fn bind_names(vars: &mut std::collections::HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
+    types::bind_target(vars, target, ty)
+}
+
+/// `zb_list_<op>_<kind>`.
+fn list_fn(op: &str, elem: Elem) -> String {
+    format!("zb_list_{op}_{}", elem.suffix())
 }
 
 /// A lowered expression and the static type it has.
@@ -123,6 +168,10 @@ pub(crate) struct Lowerer<'m> {
     /// name is its `let` and later ones are assignments.
     bound: Vec<InternedString>,
     temps: usize,
+    /// Statements an expression needs run before the statement it is
+    /// part of: a comprehension's loop, which the IR cannot hold inside
+    /// an expression. Drained in front of each statement.
+    hoisted: Vec<Stmt>,
 }
 
 impl<'m> Lowerer<'m> {
@@ -134,6 +183,7 @@ impl<'m> Lowerer<'m> {
             locals,
             bound,
             temps: 0,
+            hoisted: Vec::new(),
         }
     }
 
@@ -270,6 +320,20 @@ impl<'m> Lowerer<'m> {
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
+            // A list is boxed by reference under a tag of its kind, and
+            // read back by checking that tag.
+            (Ty::List(e), Ty::Object) => call(&list_fn("box", e), vec![v.node], Ty::Object, span),
+            (Ty::Tuple, Ty::Object) => call("zb_box_tuple", vec![v.node], Ty::Object, span),
+            (Ty::Object, Ty::List(e)) => call(&list_fn("unbox", e), vec![v.node], target, span),
+            (Ty::Object, Ty::Tuple) => call("zb_unbox_tuple", vec![v.node], Ty::Tuple, span),
+            // Lists of one kind into lists of dynamic values.
+            (Ty::List(e), Ty::List(Elem::Object)) => {
+                call(&list_fn("to_any", e), vec![v.node], target, span)
+            }
+            (Ty::Tuple, Ty::List(Elem::Object)) => Node {
+                ty: ir(target),
+                ..v.node
+            },
             // Into the dynamic world: a box. Out of it: a checked read.
             (_, Ty::Object) => cast(v.node, Ty::Object, span),
             (Ty::Object, _) => cast(v.node, target, span),
@@ -302,13 +366,20 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Str => call("__py_truthy_str", vec![v.node], Ty::Bool, span),
+            Ty::Str => call("zb_str_truthy", vec![v.node], Ty::Bool, span),
+            Ty::List(_) | Ty::Tuple => binary(
+                BinaryOp::Ne,
+                method_call(v.node, "len", vec![], Ty::Int, span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            ),
             Ty::None => node(
                 TypedExpression::Literal(TypedLiteral::Bool(false)),
                 Ty::Bool,
                 span,
             ),
-            Ty::Object | Ty::Unknown => call("__py_truthy_any", vec![v.node], Ty::Bool, span),
+            Ty::Object | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
         }
     }
 
@@ -316,13 +387,71 @@ impl<'m> Lowerer<'m> {
     fn str_of(&mut self, v: Val) -> Node {
         let span = v.node.span;
         match v.ty {
-            Ty::Int => call("__py_str_int", vec![v.node], Ty::Str, span),
-            Ty::Float => call("__py_str_float", vec![v.node], Ty::Str, span),
-            Ty::Bool => call("__py_str_bool", vec![v.node], Ty::Str, span),
+            Ty::Int => call("zb_str_of_int", vec![v.node], Ty::Str, span),
+            Ty::Float => call("zb_float_repr", vec![v.node], Ty::Str, span),
+            Ty::Bool => call("zb_bool_repr", vec![v.node], Ty::Str, span),
             Ty::Str => v.node,
-            Ty::None => call("__py_str_none", vec![], Ty::Str, span),
-            Ty::Object | Ty::Unknown => call("__py_str_any", vec![v.node], Ty::Str, span),
+            Ty::None => call("zb_none_repr", vec![], Ty::Str, span),
+            Ty::List(e) => call(&list_fn("repr", e), vec![v.node], Ty::Str, span),
+            Ty::Tuple => call("zb_tuple_repr", vec![v.node], Ty::Str, span),
+            Ty::Object | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
         }
+    }
+
+    /// `repr(v)`.
+    fn repr_of(&mut self, v: Val) -> Node {
+        let span = v.node.span;
+        match v.ty {
+            Ty::Str => call("zb_str_repr", vec![v.node], Ty::Str, span),
+            Ty::Object | Ty::Unknown => call("zb_any_repr", vec![v.node], Ty::Str, span),
+            _ => self.str_of(v),
+        }
+    }
+
+    /// A list literal of `elem` kind from already lowered elements.
+    fn list_of(&mut self, items: Vec<Val>, elem: Elem, span: Span) -> Node {
+        let items = items
+            .into_iter()
+            .map(|v| self.coerce(v, elem.ty()))
+            .collect();
+        node(TypedExpression::Array(items), Ty::List(elem), span)
+    }
+
+    /// Bind a value to a hidden local and hand back the name, so it is
+    /// evaluated once.
+    fn hold(&mut self, v: Val, out: &mut Vec<Stmt>, span: Span) -> Val {
+        let name = self.temp();
+        let ty = v.ty;
+        out.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name,
+                ty: ir(ty),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(v.node)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        Val {
+            node: var(name, ty, span),
+            ty,
+        }
+    }
+
+    /// A block expression: statements, then the value.
+    fn block_value(statements: Vec<Stmt>, value: Node, ty: Ty, span: Span) -> Node {
+        let mut statements = statements;
+        statements.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(value)),
+            Type::Unknown,
+            span,
+        ));
+        node(
+            TypedExpression::Block(TypedBlock { statements, span }),
+            ty,
+            span,
+        )
     }
 
     // ─── Statements ─────────────────────────────────────────────────
@@ -336,6 +465,15 @@ impl<'m> Lowerer<'m> {
     }
 
     fn stmt(&mut self, s: &py::Stmt, out: &mut Vec<Stmt>) -> Result<()> {
+        let mut own = Vec::new();
+        self.stmt_into(s, &mut own)?;
+        // Whatever the statement's expressions hoisted runs first.
+        out.append(&mut self.hoisted);
+        out.append(&mut own);
+        Ok(())
+    }
+
+    fn stmt_into(&mut self, s: &py::Stmt, out: &mut Vec<Stmt>) -> Result<()> {
         let span = span_of(s);
         let push = |out: &mut Vec<Stmt>, st: TypedStatement| {
             out.push(TypedNode::new(st, Type::Unknown, span));
@@ -414,6 +552,26 @@ impl<'m> Lowerer<'m> {
                 let st = self.for_loop(f, span)?;
                 push(out, st);
             }
+            py::Stmt::Delete(d) => {
+                for target in &d.targets {
+                    let py::Expr::Subscript(sub) = target else {
+                        return unsupported("del of anything but an item", target);
+                    };
+                    let seq = self.expr(&sub.value)?;
+                    let stmt = match seq.ty {
+                        Ty::List(e) => {
+                            let i = self.expr_as(&sub.slice, Ty::Int)?;
+                            call(&list_fn("pop", e), vec![seq.node, i], e.ty(), span)
+                        }
+                        _ => {
+                            let key = self.expr_as(&sub.slice, Ty::Object)?;
+                            let seq = self.coerce(seq, Ty::Object);
+                            call("zb_any_delitem", vec![seq, key], Ty::None, span)
+                        }
+                    };
+                    push(out, TypedStatement::Expression(Box::new(stmt)));
+                }
+            }
             py::Stmt::Break(_) => push(out, TypedStatement::Break(None)),
             py::Stmt::Continue(_) => push(out, TypedStatement::Continue),
             other => return unsupported(types::stmt_kind(other), other),
@@ -431,11 +589,80 @@ impl<'m> Lowerer<'m> {
         span: Span,
         out: &mut Vec<Stmt>,
     ) -> Result<()> {
-        let py::Expr::Name(n) = target else {
-            return unsupported(
-                format!("assignment to {}", types::expr_kind(target)),
-                target,
-            );
+        let n = match target {
+            py::Expr::Name(n) => n,
+            // `xs[i] = v`
+            py::Expr::Subscript(sub) => {
+                let seq = self.expr(&sub.value)?;
+                let stmt = match seq.ty {
+                    Ty::List(e) => {
+                        let i = self.expr_as(&sub.slice, Ty::Int)?;
+                        let v = self.coerce(value, e.ty());
+                        call(&list_fn("set", e), vec![seq.node, i, v], Ty::None, span)
+                    }
+                    Ty::Object => {
+                        let i = self.expr_as(&sub.slice, Ty::Object)?;
+                        let v = self.coerce(value, Ty::Object);
+                        call("zb_any_setitem", vec![seq.node, i, v], Ty::None, span)
+                    }
+                    _ => {
+                        return unsupported(
+                            format!("item assignment on {}", types::expr_kind(&sub.value)),
+                            target,
+                        )
+                    }
+                };
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(stmt)),
+                    Type::Unknown,
+                    span,
+                ));
+                return Ok(());
+            }
+            // `a, b = value`: the value once, then each name an element.
+            py::Expr::Tuple(t) => {
+                let elem_ty = value.ty.element().unwrap_or(Ty::Object);
+                let seq = self.hold(value, out, span);
+                let n = t.elts.len() as i64;
+                let check = match seq.ty {
+                    Ty::List(e) => Some(call(
+                        &list_fn("expect_len", e),
+                        vec![seq.node.clone(), int_lit(n, span)],
+                        Ty::None,
+                        span,
+                    )),
+                    Ty::Tuple => Some(call(
+                        "zb_list_expect_len_any",
+                        vec![seq.node.clone(), int_lit(n, span)],
+                        Ty::None,
+                        span,
+                    )),
+                    _ => None,
+                };
+                if let Some(check) = check {
+                    out.push(TypedNode::new(
+                        TypedStatement::Expression(Box::new(check)),
+                        Type::Unknown,
+                        span,
+                    ));
+                }
+                for (i, elt) in t.elts.iter().enumerate() {
+                    let item = self.index_value(
+                        Val {
+                            node: seq.node.clone(),
+                            ty: seq.ty,
+                        },
+                        int_lit(i as i64, span),
+                        elem_ty,
+                        span,
+                    );
+                    self.bind(elt, item, span, out)?;
+                }
+                return Ok(());
+            }
+            other => {
+                return unsupported(format!("assignment to {}", types::expr_kind(other)), other)
+            }
         };
         let ty = self.var_ty(n.id.as_str());
         let value = self.coerce(value, ty);
@@ -498,20 +725,128 @@ impl<'m> Lowerer<'m> {
         }))
     }
 
-    /// `for x in range(...)`, the one iterable this subset knows so far.
+    /// `seq[i]` for a sequence value and an int index already lowered.
+    fn index_value(&mut self, seq: Val, index: Node, elem_ty: Ty, span: Span) -> Val {
+        let node = match seq.ty {
+            Ty::List(e) => call(&list_fn("get", e), vec![seq.node, index], e.ty(), span),
+            Ty::Tuple => call("zb_list_get_any", vec![seq.node, index], Ty::Object, span),
+            Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
+            _ => {
+                let i = self.coerce(
+                    Val {
+                        node: index,
+                        ty: Ty::Int,
+                    },
+                    Ty::Object,
+                );
+                call("zb_any_getitem", vec![seq.node, i], Ty::Object, span)
+            }
+        };
+        Val { node, ty: elem_ty }
+    }
+
+    /// `for x in <sequence>`: an index loop over the sequence held once,
+    /// with the element bound at the top of each iteration.
+    fn for_sequence(
+        &mut self,
+        f: &py::StmtFor,
+        extra: Vec<Stmt>,
+        span: Span,
+    ) -> Result<TypedStatement> {
+        let seq = self.expr(&f.iter)?;
+        let elem_ty = seq.ty.element().unwrap_or(Ty::Object);
+        let mut prologue = Vec::new();
+        let seq = match seq.ty {
+            // A dynamic iterable is snapshotted into a list of objects.
+            Ty::Object => {
+                let items = call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span);
+                self.hold(
+                    Val {
+                        node: items,
+                        ty: Ty::List(Elem::Object),
+                    },
+                    &mut prologue,
+                    span,
+                )
+            }
+            _ => self.hold(seq, &mut prologue, span),
+        };
+        let counter = self.temp();
+        let len = match seq.ty {
+            Ty::Str => call("zb_str_chars_len", vec![seq.node.clone()], Ty::Int, span),
+            _ => method_call(seq.node.clone(), "len", vec![], Ty::Int, span),
+        };
+        let item = self.index_value(
+            Val {
+                node: seq.node.clone(),
+                ty: seq.ty,
+            },
+            var(counter, Ty::Int, span),
+            elem_ty,
+            span,
+        );
+        let mut body = Vec::new();
+        self.bind(&f.target, item, span, &mut body)?;
+        for s in &f.body {
+            self.stmt(s, &mut body)?;
+        }
+        body.extend(extra);
+        let loop_stmt = TypedStatement::For(TypedFor {
+            pattern: Box::new(TypedNode::new(
+                TypedPattern::Identifier {
+                    name: counter,
+                    mutability: Mutability::Mutable,
+                },
+                prim(PrimitiveType::I64),
+                span,
+            )),
+            iterator: Box::new(TypedNode::new(
+                TypedExpression::Range(TypedRange {
+                    start: Some(Box::new(int_lit(0, span))),
+                    end: Some(Box::new(len)),
+                    inclusive: false,
+                }),
+                Type::Unknown,
+                span,
+            )),
+            body: TypedBlock {
+                statements: body,
+                span,
+            },
+        });
+        prologue.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+        Ok(TypedStatement::Block(TypedBlock {
+            statements: prologue,
+            span,
+        }))
+    }
+
     fn for_loop(&mut self, f: &py::StmtFor, span: Span) -> Result<TypedStatement> {
+        self.for_with_body(f, Vec::new(), span)
+    }
+
+    /// `for x in range(...)` as a counted loop; anything else iterates
+    /// by index over a sequence. `extra` statements follow the body.
+    fn for_with_body(
+        &mut self,
+        f: &py::StmtFor,
+        extra: Vec<Stmt>,
+        span: Span,
+    ) -> Result<TypedStatement> {
         if f.is_async || !f.orelse.is_empty() {
             return unsupported("async for / for-else", f);
         }
-        let py::Expr::Name(target) = &*f.target else {
-            return unsupported("destructuring for target", &*f.target);
+        let range = match &*f.iter {
+            py::Expr::Call(c)
+                if types::is_name(&c.func, "range") && c.arguments.keywords.is_empty() =>
+            {
+                Some(c)
+            }
+            _ => None,
         };
-        let py::Expr::Call(c) = &*f.iter else {
-            return unsupported("for over anything but range()", &*f.iter);
+        let (Some(c), py::Expr::Name(target)) = (range, &*f.target) else {
+            return self.for_sequence(f, extra, span);
         };
-        if !types::is_name(&c.func, "range") || !c.arguments.keywords.is_empty() {
-            return unsupported("for over anything but range()", &*f.iter);
-        }
         let (start, end, step) = match c.arguments.args.as_ref() {
             [end] => (int_lit(0, span), self.expr_as(end, Ty::Int)?, None),
             [start, end] => (
@@ -530,7 +865,8 @@ impl<'m> Lowerer<'m> {
         if !self.bound.contains(&name) {
             self.bound.push(name);
         }
-        let body = self.block(&f.body, span)?;
+        let mut body = self.block(&f.body, span)?;
+        body.statements.extend(extra);
         Ok(TypedStatement::For(TypedFor {
             pattern: Box::new(TypedNode::new(
                 TypedPattern::Identifier {
@@ -597,6 +933,18 @@ impl<'m> Lowerer<'m> {
                 TypedExpression::Literal(TypedLiteral::String(intern(s.value.to_str()))),
                 Ty::Str,
             ),
+            py::Expr::Name(n)
+                if !self.locals.vars.contains_key(n.id.as_str())
+                    && matches!(
+                        n.id.as_str(),
+                        "int" | "float" | "str" | "bool" | "list" | "tuple" | "dict" | "set"
+                    ) =>
+            {
+                Val {
+                    node: str_lit(n.id.as_str(), span),
+                    ty: Ty::Str,
+                }
+            }
             py::Expr::Name(n) => Val {
                 node: var(intern(n.id.as_str()), ty, span),
                 ty,
@@ -628,6 +976,33 @@ impl<'m> Lowerer<'m> {
                 }
             }
             py::Expr::Call(c) => self.call(c, ty, span)?,
+            py::Expr::List(l) => {
+                let Ty::List(elem) = ty else { unreachable!() };
+                let mut items = Vec::with_capacity(l.elts.len());
+                for e in &l.elts {
+                    items.push(self.expr(e)?);
+                }
+                Val {
+                    node: self.list_of(items, elem, span),
+                    ty,
+                }
+            }
+            py::Expr::Tuple(t) => {
+                let mut items = Vec::with_capacity(t.elts.len());
+                for e in &t.elts {
+                    items.push(self.expr(e)?);
+                }
+                let node = self.list_of(items, Elem::Object, span);
+                Val {
+                    node: Node {
+                        ty: ir(Ty::Tuple),
+                        ..node
+                    },
+                    ty: Ty::Tuple,
+                }
+            }
+            py::Expr::Subscript(sub) => self.subscript(sub, ty, span)?,
+            py::Expr::ListComp(c) => self.list_comp(c, ty, span)?,
             other => return unsupported(types::expr_kind(other), other),
         })
     }
@@ -658,9 +1033,9 @@ impl<'m> Lowerer<'m> {
                 match operand.ty {
                     Ty::Object | Ty::Unknown => {
                         let name = match op {
-                            UnaryOp::Minus => "__py_neg_any",
-                            UnaryOp::BitNot => "__py_invert_any",
-                            _ => "__py_pos_any",
+                            UnaryOp::Minus => "zb_any_neg",
+                            UnaryOp::BitNot => "zb_any_invert",
+                            _ => "zb_any_pos",
                         };
                         Val {
                             node: call(name, vec![operand.node], Ty::Object, span),
@@ -714,14 +1089,14 @@ impl<'m> Lowerer<'m> {
                 (py::Operator::Mult, Ty::Str, Ty::Int | Ty::Bool) => {
                     let n = self.coerce(right, Ty::Int);
                     return Ok(Val {
-                        node: call("__py_str_mul", vec![left.node, n], Ty::Str, span),
+                        node: call("zb_str_repeat", vec![left.node, n], Ty::Str, span),
                         ty: Ty::Str,
                     });
                 }
                 (py::Operator::Mult, Ty::Int | Ty::Bool, Ty::Str) => {
                     let n = self.coerce(left, Ty::Int);
                     return Ok(Val {
-                        node: call("__py_str_mul", vec![right.node, n], Ty::Str, span),
+                        node: call("zb_str_repeat", vec![right.node, n], Ty::Str, span),
                         ty: Ty::Str,
                     });
                 }
@@ -735,7 +1110,7 @@ impl<'m> Lowerer<'m> {
             let r = self.coerce(right, Ty::Object);
             let code = int_lit(types::arith_code(op), span);
             return Ok(Val {
-                node: call("__py_arith_any", vec![code, l, r], Ty::Object, span),
+                node: call("zb_any_arith", vec![code, l, r], Ty::Object, span),
                 ty: Ty::Object,
             });
         }
@@ -790,15 +1165,31 @@ impl<'m> Lowerer<'m> {
             py::CmpOp::In | py::CmpOp::NotIn => {
                 let n = if left.ty == Ty::Str && right.ty == Ty::Str {
                     call(
-                        "__py_str_contains",
+                        "zb_str_contains",
                         vec![right.node, left.node],
+                        Ty::Bool,
+                        span,
+                    )
+                } else if let Ty::List(e) = right.ty {
+                    let item = self.coerce(left, e.ty());
+                    call(
+                        &list_fn("contains", e),
+                        vec![right.node, item],
+                        Ty::Bool,
+                        span,
+                    )
+                } else if right.ty == Ty::Tuple {
+                    let item = self.coerce(left, Ty::Object);
+                    call(
+                        "zb_list_contains_any",
+                        vec![right.node, item],
                         Ty::Bool,
                         span,
                     )
                 } else {
                     let item = self.coerce(left, Ty::Object);
                     let container = self.coerce(right, Ty::Object);
-                    call("__py_contains_any", vec![container, item], Ty::Bool, span)
+                    call("zb_any_contains", vec![container, item], Ty::Bool, span)
                 };
                 return Ok(if op == py::CmpOp::NotIn { negate(n) } else { n });
             }
@@ -817,32 +1208,60 @@ impl<'m> Lowerer<'m> {
                     _ => {
                         let l = self.coerce(left, Ty::Object);
                         let r = self.coerce(right, Ty::Object);
-                        call("__py_is_any", vec![l, r], Ty::Bool, span)
+                        call("zb_any_is", vec![l, r], Ty::Bool, span)
                     }
                 };
                 return Ok(if op == py::CmpOp::IsNot { negate(n) } else { n });
             }
             _ => {}
         }
+        // Two sequences compare element by element.
+        let seq_kind = |t: Ty| match t {
+            Ty::List(e) => Some(e),
+            Ty::Tuple => Some(Elem::Object),
+            _ => None,
+        };
+        if let (Some(e), Some(f)) = (seq_kind(left.ty), seq_kind(right.ty)) {
+            let (l, r, e) = if e == f {
+                (left.node, right.node, e)
+            } else {
+                (
+                    self.coerce(left, Ty::List(Elem::Object)),
+                    self.coerce(right, Ty::List(Elem::Object)),
+                    Elem::Object,
+                )
+            };
+            let eq = |l: Node, r: Node| call(&list_fn("eq", e), vec![l, r], Ty::Bool, span);
+            let lt = |l: Node, r: Node| call(&list_fn("lt", e), vec![l, r], Ty::Bool, span);
+            return Ok(match op {
+                py::CmpOp::Eq => eq(l, r),
+                py::CmpOp::NotEq => negate(eq(l, r)),
+                py::CmpOp::Lt => lt(l, r),
+                py::CmpOp::Gt => lt(r, l),
+                py::CmpOp::LtE => negate(lt(r, l)),
+                py::CmpOp::GtE => negate(lt(l, r)),
+                _ => unreachable!(),
+            });
+        }
         if left.ty == Ty::Str && right.ty == Ty::Str {
             let n = match op {
-                py::CmpOp::Eq => call("__py_str_eq", vec![left.node, right.node], Ty::Bool, span),
+                py::CmpOp::Eq => call("zb_str_eq", vec![left.node, right.node], Ty::Bool, span),
                 py::CmpOp::NotEq => negate(call(
-                    "__py_str_eq",
+                    "zb_str_eq",
                     vec![left.node, right.node],
                     Ty::Bool,
                     span,
                 )),
-                py::CmpOp::Lt => call("__py_str_lt", vec![left.node, right.node], Ty::Bool, span),
-                py::CmpOp::Gt => call("__py_str_lt", vec![right.node, left.node], Ty::Bool, span),
+                py::CmpOp::Lt => call("zb_str_lt", vec![left.node, right.node], Ty::Bool, span),
+                py::CmpOp::Gt => call("zb_str_lt", vec![right.node, left.node], Ty::Bool, span),
                 py::CmpOp::LtE => negate(call(
-                    "__py_str_lt",
+                    "zb_str_lt",
                     vec![right.node, left.node],
                     Ty::Bool,
                     span,
                 )),
                 py::CmpOp::GtE => negate(call(
-                    "__py_str_lt",
+                    "zb_str_lt",
                     vec![left.node, right.node],
                     Ty::Bool,
                     span,
@@ -875,12 +1294,12 @@ impl<'m> Lowerer<'m> {
         let l = self.coerce(left, Ty::Object);
         let r = self.coerce(right, Ty::Object);
         Ok(match op {
-            py::CmpOp::Eq => call("__py_eq_any", vec![l, r], Ty::Bool, span),
-            py::CmpOp::NotEq => negate(call("__py_eq_any", vec![l, r], Ty::Bool, span)),
-            py::CmpOp::Lt => call("__py_lt_any", vec![l, r], Ty::Bool, span),
-            py::CmpOp::Gt => call("__py_lt_any", vec![r, l], Ty::Bool, span),
-            py::CmpOp::LtE => negate(call("__py_lt_any", vec![r, l], Ty::Bool, span)),
-            py::CmpOp::GtE => negate(call("__py_lt_any", vec![l, r], Ty::Bool, span)),
+            py::CmpOp::Eq => call("zb_any_eq", vec![l, r], Ty::Bool, span),
+            py::CmpOp::NotEq => negate(call("zb_any_eq", vec![l, r], Ty::Bool, span)),
+            py::CmpOp::Lt => call("zb_any_lt", vec![l, r], Ty::Bool, span),
+            py::CmpOp::Gt => call("zb_any_lt", vec![r, l], Ty::Bool, span),
+            py::CmpOp::LtE => negate(call("zb_any_lt", vec![r, l], Ty::Bool, span)),
+            py::CmpOp::GtE => negate(call("zb_any_lt", vec![l, r], Ty::Bool, span)),
             _ => unreachable!(),
         })
     }
@@ -1040,6 +1459,288 @@ impl<'m> Lowerer<'m> {
         Ok(Val { node: acc, ty })
     }
 
+    /// `seq[i]` and `seq[a:b:c]`.
+    fn subscript(&mut self, sub: &py::ExprSubscript, ty: Ty, span: Span) -> Result<Val> {
+        let seq = self.expr(&sub.value)?;
+        if let py::Expr::Slice(sl) = &*sub.slice {
+            let mut mask = 0;
+            let mut bound =
+                |this: &mut Self, e: &Option<Box<py::Expr>>, bit: i64| -> Result<Node> {
+                    match e {
+                        Some(e) => {
+                            mask |= bit;
+                            this.expr_as(e, Ty::Int)
+                        }
+                        None => Ok(int_lit(0, span)),
+                    }
+                };
+            let start = bound(self, &sl.lower, 1)?;
+            let stop = bound(self, &sl.upper, 2)?;
+            let step = bound(self, &sl.step, 4)?;
+            let mask = int_lit(mask, span);
+            let node = match seq.ty {
+                Ty::List(e) => call(
+                    &list_fn("slice", e),
+                    vec![seq.node, start, stop, step, mask],
+                    ty,
+                    span,
+                ),
+                Ty::Tuple => {
+                    let sliced = call(
+                        "zb_list_slice_any",
+                        vec![seq.node, start, stop, step, mask],
+                        Ty::Tuple,
+                        span,
+                    );
+                    Node {
+                        ty: ir(Ty::Tuple),
+                        ..sliced
+                    }
+                }
+                Ty::Str => call(
+                    "zb_str_slice",
+                    vec![seq.node, start, stop, step, mask],
+                    Ty::Str,
+                    span,
+                ),
+                _ => {
+                    let o = self.coerce(seq, Ty::Object);
+                    call(
+                        "zb_any_getslice",
+                        vec![o, start, stop, step, mask],
+                        Ty::Object,
+                        span,
+                    )
+                }
+            };
+            return Ok(Val { node, ty });
+        }
+        match seq.ty {
+            Ty::List(_) | Ty::Tuple | Ty::Str => {
+                let index = self.expr_as(&sub.slice, Ty::Int)?;
+                Ok(self.index_value(seq, index, ty, span))
+            }
+            _ => {
+                let key = self.expr_as(&sub.slice, Ty::Object)?;
+                let o = self.coerce(seq, Ty::Object);
+                Ok(Val {
+                    node: call("zb_any_getitem", vec![o, key], Ty::Object, span),
+                    ty: Ty::Object,
+                })
+            }
+        }
+    }
+
+    /// `[e for x in it if c]`: a fresh list, a loop appending to it, the
+    /// list as the value.
+    fn list_comp(&mut self, c: &py::ExprListComp, ty: Ty, span: Span) -> Result<Val> {
+        let Ty::List(elem) = ty else { unreachable!() };
+        let out = self.temp();
+        // Loop variables are the comprehension's own; they shadow the
+        // function's for the body and are forgotten after.
+        let saved_vars = self.locals.vars.clone();
+        let mut statements = vec![TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: out,
+                ty: ir(ty),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(self.list_of(Vec::new(), elem, span))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        )];
+        // Build innermost first: the append, wrapped in each `if`, wrapped
+        // in each `for`, from the last generator outwards.
+        for g in &c.generators {
+            let item_ty = self.ty_of(&g.iter).element().unwrap_or(match &g.iter {
+                py::Expr::Call(call) if types::is_name(&call.func, "range") => Ty::Int,
+                _ => Ty::Object,
+            });
+            bind_names(&mut self.locals.vars, &g.target, item_ty);
+        }
+        let value = self.expr(&c.elt)?;
+        let value = self.coerce(value, elem.ty());
+        let mut inner: Vec<Stmt> = vec![TypedNode::new(
+            TypedStatement::Expression(Box::new(method_call(
+                var(out, ty, span),
+                "push",
+                vec![value],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        )];
+        for g in c.generators.iter().rev() {
+            for cond in g.ifs.iter().rev() {
+                let test = self.expr(cond)?;
+                let condition = self.truthy(test);
+                inner = vec![TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(condition),
+                        then_block: TypedBlock {
+                            statements: inner,
+                            span,
+                        },
+                        else_block: None,
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                )];
+            }
+            let for_stmt = py::StmtFor {
+                node_index: Default::default(),
+                range: g.range,
+                is_async: g.is_async,
+                target: Box::new(g.target.clone()),
+                iter: Box::new(g.iter.clone()),
+                body: Default::default(),
+                orelse: Default::default(),
+            };
+            inner = vec![TypedNode::new(
+                self.for_with_body(&for_stmt, inner, span)?,
+                Type::Unknown,
+                span,
+            )];
+        }
+        self.locals.vars = saved_vars;
+        statements.extend(inner);
+        self.hoisted.extend(statements);
+        Ok(Val {
+            node: var(out, ty, span),
+            ty,
+        })
+    }
+
+    /// A method call on a value whose type is known.
+    fn method(
+        &mut self,
+        receiver: Val,
+        name: &str,
+        args: &[py::Expr],
+        ty: Ty,
+        span: Span,
+    ) -> Result<Val> {
+        let expect = |n: usize, this: &Self| -> Result<()> {
+            let _ = this;
+            if args.len() == n {
+                Ok(())
+            } else {
+                Err(Error::Unsupported {
+                    what: format!("{name}() with {} argument(s)", args.len()),
+                    at: span.start,
+                })
+            }
+        };
+        match receiver.ty {
+            Ty::List(e) => {
+                let list = receiver.node;
+                let node = match name {
+                    "append" => {
+                        expect(1, self)?;
+                        let v = self.expr_as(&args[0], e.ty())?;
+                        method_call(list, "push", vec![v], Ty::None, span)
+                    }
+                    "pop" => {
+                        let i = if args.is_empty() {
+                            int_lit(-1, span)
+                        } else {
+                            self.expr_as(&args[0], Ty::Int)?
+                        };
+                        call(&list_fn("pop", e), vec![list, i], e.ty(), span)
+                    }
+                    "insert" => {
+                        expect(2, self)?;
+                        let i = self.expr_as(&args[0], Ty::Int)?;
+                        let v = self.expr_as(&args[1], e.ty())?;
+                        call(&list_fn("insert", e), vec![list, i, v], Ty::None, span)
+                    }
+                    "remove" | "index" | "count" => {
+                        expect(1, self)?;
+                        let v = self.expr_as(&args[0], e.ty())?;
+                        call(&list_fn(name, e), vec![list, v], ty, span)
+                    }
+                    "extend" => {
+                        expect(1, self)?;
+                        let other = self.expr_as(&args[0], Ty::List(e))?;
+                        call(&list_fn("extend", e), vec![list, other], Ty::None, span)
+                    }
+                    "sort" | "reverse" | "copy" => {
+                        expect(0, self)?;
+                        call(&list_fn(name, e), vec![list], ty, span)
+                    }
+                    "clear" => {
+                        expect(0, self)?;
+                        method_call(list, "clear", vec![], Ty::None, span)
+                    }
+                    _ => {
+                        return unsupported(
+                            format!("list.{name}"),
+                            &args.first().map(|a| a.range()).unwrap_or(
+                                ruff_text_size::TextRange::empty(ruff_text_size::TextSize::from(
+                                    span.start as u32,
+                                )),
+                            ),
+                        )
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::Str => {
+                let s = receiver.node;
+                let mut lowered = Vec::with_capacity(args.len());
+                for a in args {
+                    lowered.push(self.expr(a)?);
+                }
+                let node = match (name, lowered.len()) {
+                    (
+                        "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "capitalize" | "title",
+                        0,
+                    ) => call(&format!("zb_str_{name}"), vec![s], Ty::Str, span),
+                    ("startswith" | "endswith", 1) => {
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call(&format!("zb_str_{name}"), vec![s, a], Ty::Bool, span)
+                    }
+                    ("find", 1) => {
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call("zb_str_index_of", vec![s, a], Ty::Int, span)
+                    }
+                    ("count", 1) => {
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call("zb_str_count", vec![s, a], Ty::Int, span)
+                    }
+                    ("replace", 2) => {
+                        let b = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call("zb_str_replace", vec![s, a, b], Ty::Str, span)
+                    }
+                    ("split", 0) => call("zb_str_split_ws", vec![s], Ty::List(Elem::Str), span),
+                    ("split", 1) => {
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call("zb_str_split", vec![s, a], Ty::List(Elem::Str), span)
+                    }
+                    ("join", 1) => {
+                        let items = self.coerce(lowered.pop().unwrap(), Ty::List(Elem::Str));
+                        call("zb_str_join", vec![s, items], Ty::Str, span)
+                    }
+                    _ => {
+                        return Err(Error::Unsupported {
+                            what: format!("str.{name} with {} argument(s)", args.len()),
+                            at: span.start,
+                        })
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            _ => Err(Error::Unsupported {
+                what: format!("method `{name}` on a dynamic value"),
+                at: span.start,
+            }),
+        }
+    }
+
     /// A call: `print`, a conversion builtin, or a function the module
     /// defines.
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
@@ -1047,6 +1748,10 @@ impl<'m> Lowerer<'m> {
             return unsupported("keyword arguments", c);
         }
         let args = &c.arguments.args;
+        if let py::Expr::Attribute(a) = &*c.func {
+            let receiver = self.expr(&a.value)?;
+            return self.method(receiver, a.attr.as_str(), args, ty, span);
+        }
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
             if let Some(sig) = self.module.funcs.get(name).cloned() {
@@ -1078,13 +1783,7 @@ impl<'m> Lowerer<'m> {
                 }
                 "repr" => {
                     let v = self.expr(&args[0])?;
-                    let node = match v.ty {
-                        Ty::Str => call("__py_repr_str", vec![v.node], Ty::Str, span),
-                        Ty::Object | Ty::Unknown => {
-                            call("__py_repr_any", vec![v.node], Ty::Str, span)
-                        }
-                        _ => self.str_of(v),
-                    };
+                    let node = self.repr_of(v);
                     return Ok(Val { node, ty: Ty::Str });
                 }
                 "int" => {
@@ -1092,8 +1791,8 @@ impl<'m> Lowerer<'m> {
                     let node = match v.ty {
                         Ty::Int => v.node,
                         Ty::Bool | Ty::Float => cast(v.node, Ty::Int, span),
-                        Ty::Str => call("__py_int_of_str", vec![v.node], Ty::Int, span),
-                        _ => call("__py_int_any", vec![v.node], Ty::Int, span),
+                        Ty::Str => call("zb_str_parse_int", vec![v.node], Ty::Int, span),
+                        _ => call("zb_any_int", vec![v.node], Ty::Int, span),
                     };
                     return Ok(Val { node, ty: Ty::Int });
                 }
@@ -1102,8 +1801,8 @@ impl<'m> Lowerer<'m> {
                     let node = match v.ty {
                         Ty::Float => v.node,
                         Ty::Bool | Ty::Int => cast(v.node, Ty::Float, span),
-                        Ty::Str => call("__py_float_of_str", vec![v.node], Ty::Float, span),
-                        _ => call("__py_float_any", vec![v.node], Ty::Float, span),
+                        Ty::Str => call("zb_str_parse_float", vec![v.node], Ty::Float, span),
+                        _ => call("zb_any_float", vec![v.node], Ty::Float, span),
                     };
                     return Ok(Val {
                         node,
@@ -1126,13 +1825,282 @@ impl<'m> Lowerer<'m> {
                 "len" => {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
-                        Ty::Str => call("__py_str_len", vec![v.node], Ty::Int, span),
+                        Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
+                        Ty::List(_) | Ty::Tuple => {
+                            method_call(v.node, "len", vec![], Ty::Int, span)
+                        }
                         _ => {
                             let o = self.coerce(v, Ty::Object);
-                            call("__py_len_any", vec![o], Ty::Int, span)
+                            call("zb_any_len", vec![o], Ty::Int, span)
                         }
                     };
                     return Ok(Val { node, ty: Ty::Int });
+                }
+                "sum" if args.len() == 1 => {
+                    let v = self.expr(&args[0])?;
+                    let node = match v.ty {
+                        Ty::List(e @ (Elem::Int | Elem::Float | Elem::Object)) => {
+                            call(&list_fn("sum", e), vec![v.node], e.ty(), span)
+                        }
+                        _ => {
+                            let xs = self.coerce(v, Ty::List(Elem::Object));
+                            call("zb_list_sum_any", vec![xs], Ty::Object, span)
+                        }
+                    };
+                    return Ok(Val { node, ty });
+                }
+                "min" | "max" => {
+                    // Several arguments are the one-argument form over a
+                    // list of them.
+                    let list = if args.len() == 1 {
+                        self.expr(&args[0])?
+                    } else {
+                        let mut items = Vec::with_capacity(args.len());
+                        for a in args.iter() {
+                            items.push(self.expr(a)?);
+                        }
+                        let elem = Elem::of(ty);
+                        Val {
+                            node: self.list_of(items, elem, span),
+                            ty: Ty::List(elem),
+                        }
+                    };
+                    let list = match list.ty {
+                        Ty::List(_) => list,
+                        _ => {
+                            let e = Elem::Object;
+                            Val {
+                                node: self.coerce(list, Ty::List(e)),
+                                ty: Ty::List(e),
+                            }
+                        }
+                    };
+                    let Ty::List(e) = list.ty else { unreachable!() };
+                    let node = call(&list_fn(name, e), vec![list.node], e.ty(), span);
+                    let v = Val { node, ty: e.ty() };
+                    return Ok(Val {
+                        node: self.coerce(v, ty),
+                        ty,
+                    });
+                }
+                "sorted" | "reversed" | "list" | "tuple" => {
+                    let target_elem = match ty {
+                        Ty::List(e) => e,
+                        _ => Elem::Object,
+                    };
+                    let source = match args.first() {
+                        None => {
+                            let empty = self.list_of(Vec::new(), target_elem, span);
+                            Val {
+                                node: empty,
+                                ty: Ty::List(target_elem),
+                            }
+                        }
+                        Some(py::Expr::Call(rc)) if types::is_name(&rc.func, "range") => {
+                            let (start, stop, step) = match rc.arguments.args.as_ref() {
+                                [end] => (
+                                    int_lit(0, span),
+                                    self.expr_as(end, Ty::Int)?,
+                                    int_lit(1, span),
+                                ),
+                                [a, b] => (
+                                    self.expr_as(a, Ty::Int)?,
+                                    self.expr_as(b, Ty::Int)?,
+                                    int_lit(1, span),
+                                ),
+                                [a, b, c2] => (
+                                    self.expr_as(a, Ty::Int)?,
+                                    self.expr_as(b, Ty::Int)?,
+                                    self.expr_as(c2, Ty::Int)?,
+                                ),
+                                _ => {
+                                    return unsupported(
+                                        "range() with more than three arguments",
+                                        rc,
+                                    )
+                                }
+                            };
+                            Val {
+                                node: call(
+                                    "zb_list_range",
+                                    vec![start, stop, step],
+                                    Ty::List(Elem::Int),
+                                    span,
+                                ),
+                                ty: Ty::List(Elem::Int),
+                            }
+                        }
+                        Some(a) => {
+                            let v = self.expr(a)?;
+                            match v.ty {
+                                Ty::List(_) => v,
+                                Ty::Tuple => Val {
+                                    node: Node {
+                                        ty: ir(Ty::List(Elem::Object)),
+                                        ..v.node
+                                    },
+                                    ty: Ty::List(Elem::Object),
+                                },
+                                Ty::Str => Val {
+                                    node: call(
+                                        "zb_str_chars",
+                                        vec![v.node],
+                                        Ty::List(Elem::Str),
+                                        span,
+                                    ),
+                                    ty: Ty::List(Elem::Str),
+                                },
+                                _ => {
+                                    let o = self.coerce(v, Ty::Object);
+                                    Val {
+                                        node: call(
+                                            "zb_any_iter",
+                                            vec![o],
+                                            Ty::List(Elem::Object),
+                                            span,
+                                        ),
+                                        ty: Ty::List(Elem::Object),
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    let Ty::List(e) = source.ty else {
+                        unreachable!()
+                    };
+                    // Every form returns a fresh list.
+                    let mut statements = Vec::new();
+                    let copy = call(&list_fn("copy", e), vec![source.node], Ty::List(e), span);
+                    let held = self.hold(
+                        Val {
+                            node: copy,
+                            ty: Ty::List(e),
+                        },
+                        &mut statements,
+                        span,
+                    );
+                    let op = match name {
+                        "sorted" => Some("sort"),
+                        "reversed" => Some("reverse"),
+                        _ => None,
+                    };
+                    if let Some(op) = op {
+                        statements.push(TypedNode::new(
+                            TypedStatement::Expression(Box::new(call(
+                                &list_fn(op, e),
+                                vec![held.node.clone()],
+                                Ty::None,
+                                span,
+                            ))),
+                            Type::Unknown,
+                            span,
+                        ));
+                    }
+                    let result_ty = if name == "tuple" {
+                        Ty::Tuple
+                    } else {
+                        Ty::List(e)
+                    };
+                    let value = Node {
+                        ty: ir(result_ty),
+                        ..held.node
+                    };
+                    return Ok(Val {
+                        node: Self::block_value(statements, value, result_ty, span),
+                        ty: result_ty,
+                    });
+                }
+                "divmod" if args.len() == 2 => {
+                    let a = self.expr(&args[0])?;
+                    let b = self.expr(&args[1])?;
+                    let mut statements = Vec::new();
+                    let a = self.hold(a, &mut statements, span);
+                    let b = self.hold(b, &mut statements, span);
+                    let q = self.arithmetic(
+                        py::Operator::FloorDiv,
+                        Val {
+                            node: a.node.clone(),
+                            ty: a.ty,
+                        },
+                        Val {
+                            node: b.node.clone(),
+                            ty: b.ty,
+                        },
+                        &args[1],
+                        span,
+                    )?;
+                    let r = self.arithmetic(py::Operator::Mod, a, b, &args[1], span)?;
+                    let pair = self.list_of(vec![q, r], Elem::Object, span);
+                    let value = Node {
+                        ty: ir(Ty::Tuple),
+                        ..pair
+                    };
+                    return Ok(Val {
+                        node: Self::block_value(statements, value, Ty::Tuple, span),
+                        ty: Ty::Tuple,
+                    });
+                }
+                "pow" if args.len() == 2 => {
+                    let a = self.expr(&args[0])?;
+                    let b = self.expr(&args[1])?;
+                    return self.arithmetic(py::Operator::Pow, a, b, &args[1], span);
+                }
+                "round" => {
+                    let v = self.expr(&args[0])?;
+                    let node = match (v.ty, args.len()) {
+                        (Ty::Int, 1) => v.node,
+                        (Ty::Float | Ty::Bool, 1) => {
+                            let f = self.coerce(v, Ty::Float);
+                            call("zb_round_half_even", vec![f], Ty::Int, span)
+                        }
+                        (Ty::Int | Ty::Float | Ty::Bool, 2) => {
+                            let f = self.coerce(v, Ty::Float);
+                            let n = self.expr_as(&args[1], Ty::Int)?;
+                            let r = call("zb_round_digits", vec![f, n], Ty::Float, span);
+                            return Ok(Val {
+                                node: self.coerce(
+                                    Val {
+                                        node: r,
+                                        ty: Ty::Float,
+                                    },
+                                    ty,
+                                ),
+                                ty,
+                            });
+                        }
+                        _ => {
+                            let o = self.coerce(v, Ty::Object);
+                            call("zb_any_round", vec![o], Ty::Object, span)
+                        }
+                    };
+                    return Ok(Val {
+                        node: self.coerce(
+                            Val {
+                                node,
+                                ty: if ty == Ty::Object {
+                                    Ty::Object
+                                } else {
+                                    Ty::Int
+                                },
+                            },
+                            ty,
+                        ),
+                        ty,
+                    });
+                }
+                "type" if args.len() == 1 => {
+                    let v = self.expr(&args[0])?;
+                    let node = match v.ty {
+                        Ty::Int => str_lit("int", span),
+                        Ty::Float => str_lit("float", span),
+                        Ty::Bool => str_lit("bool", span),
+                        Ty::Str => str_lit("str", span),
+                        Ty::None => str_lit("NoneType", span),
+                        Ty::List(_) => str_lit("list", span),
+                        Ty::Tuple => str_lit("tuple", span),
+                        _ => call("zb_any_type", vec![v.node], Ty::Str, span),
+                    };
+                    return Ok(Val { node, ty: Ty::Str });
                 }
                 "abs" if ty != Ty::Object => {
                     let v = self.expr(&args[0])?;
@@ -1223,7 +2191,7 @@ impl<'m> Lowerer<'m> {
         }
         let line = line.unwrap_or_else(|| str_lit("", span));
         Ok(Val {
-            node: call("__py_print_line", vec![line], Ty::None, span),
+            node: call("zb_print_line", vec![line], Ty::None, span),
             ty: Ty::None,
         })
     }

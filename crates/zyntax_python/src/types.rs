@@ -26,10 +26,55 @@ pub(crate) enum Ty {
     Bool,
     Str,
     None,
+    /// A list whose elements are all of one kind.
+    List(Elem),
+    /// A tuple: an immutable list of dynamic values.
+    Tuple,
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
     Unknown,
+}
+
+/// The element kinds a list is instantiated for. Anything else in a
+/// list is a dynamic value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Elem {
+    Int,
+    Float,
+    Str,
+    Object,
+}
+
+impl Elem {
+    /// The element kind a value of `ty` is stored as.
+    pub(crate) fn of(ty: Ty) -> Elem {
+        match ty {
+            Ty::Int => Elem::Int,
+            Ty::Float => Elem::Float,
+            Ty::Str => Elem::Str,
+            _ => Elem::Object,
+        }
+    }
+
+    pub(crate) fn ty(self) -> Ty {
+        match self {
+            Elem::Int => Ty::Int,
+            Elem::Float => Ty::Float,
+            Elem::Str => Ty::Str,
+            Elem::Object => Ty::Object,
+        }
+    }
+
+    /// The suffix of the library functions for this kind.
+    pub(crate) fn suffix(self) -> &'static str {
+        match self {
+            Elem::Int => "i64",
+            Elem::Float => "f64",
+            Elem::Str => "str",
+            Elem::Object => "any",
+        }
+    }
 }
 
 impl Ty {
@@ -44,6 +89,16 @@ impl Ty {
 
     pub(crate) fn is_numeric(self) -> bool {
         matches!(self, Ty::Int | Ty::Float | Ty::Bool)
+    }
+
+    /// The element type of a sequence, when it is one.
+    pub(crate) fn element(self) -> Option<Ty> {
+        match self {
+            Ty::List(e) => Some(e.ty()),
+            Ty::Tuple => Some(Ty::Object),
+            Ty::Str => Some(Ty::Str),
+            _ => None,
+        }
     }
 
     /// The type an arithmetic result has when both operands are known
@@ -67,10 +122,13 @@ pub(crate) struct Sig {
     pub(crate) defaults: usize,
 }
 
-/// What the module declares: every `def` by name.
+/// What the module declares: every `def` by name, and the library's
+/// `List<T>` so list types can be spelled the way the library spells
+/// them.
 #[derive(Default, Debug)]
 pub(crate) struct Module {
     pub(crate) funcs: HashMap<String, Sig>,
+    pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
 }
 
 /// One function's inferred locals.
@@ -269,8 +327,7 @@ impl Walker<'_> {
                 let iter = self.expr(&f.iter);
                 let item = match (&*f.iter, iter) {
                     (py::Expr::Call(c), _) if is_name(&c.func, "range") => Ty::Int,
-                    (_, Ty::Str) => Ty::Str,
-                    _ => Ty::Object,
+                    (_, t) => t.element().unwrap_or(Ty::Object),
                 };
                 self.target(&f.target, item);
                 self.stmts(&f.body);
@@ -332,11 +389,27 @@ pub(crate) struct Typer<'a> {
     pub(crate) vars: &'a HashMap<String, Ty>,
 }
 
+/// Give the names in an assignment target a type, in a scratch
+/// environment.
+pub(crate) fn bind_target(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
+    match target {
+        py::Expr::Name(n) => {
+            vars.insert(n.id.to_string(), ty);
+        }
+        py::Expr::Tuple(t) => {
+            for e in &t.elts {
+                bind_target(vars, e, Ty::Object);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn is_name(e: &py::Expr, name: &str) -> bool {
     matches!(e, py::Expr::Name(n) if n.id.as_str() == name)
 }
 
-/// The number the prelude's dynamic arithmetic switches on.
+/// The number the library's dynamic arithmetic switches on.
 pub(crate) fn arith_code(op: py::Operator) -> i64 {
     match op {
         py::Operator::Add => 0,
@@ -359,14 +432,33 @@ pub(crate) fn arith_code(op: py::Operator) -> i64 {
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
     match op {
         py::Operator::Div if l.is_numeric() && r.is_numeric() => Ty::Float,
+        // `int ** int` is an int only when the exponent is visibly not
+        // negative; otherwise Python's answer may be a float, and the
+        // value decides at run time.
         py::Operator::Pow if l.is_numeric() && r.is_numeric() => {
-            if negative_literal(right) || l == Ty::Float || r == Ty::Float {
+            if l == Ty::Float || r == Ty::Float {
                 Ty::Float
-            } else {
+            } else if nonnegative_literal(right) {
                 Ty::Int
+            } else if l == Ty::Unknown || r == Ty::Unknown {
+                Ty::Unknown
+            } else {
+                Ty::Object
             }
         }
         py::Operator::Add if l == Ty::Str && r == Ty::Str => Ty::Str,
+        py::Operator::Add if matches!(l, Ty::List(_)) && l == r => l,
+        py::Operator::Add if l == Ty::Tuple && r == Ty::Tuple => Ty::Tuple,
+        py::Operator::Mult
+            if matches!(l, Ty::List(_) | Ty::Tuple) && matches!(r, Ty::Int | Ty::Bool) =>
+        {
+            l
+        }
+        py::Operator::Mult
+            if matches!(r, Ty::List(_) | Ty::Tuple) && matches!(l, Ty::Int | Ty::Bool) =>
+        {
+            r
+        }
         py::Operator::Mult
             if (l == Ty::Str && matches!(r, Ty::Int | Ty::Bool))
                 || (matches!(l, Ty::Int | Ty::Bool) && r == Ty::Str) =>
@@ -384,9 +476,10 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
     }
 }
 
-fn negative_literal(e: &py::Expr) -> bool {
-    matches!(e, py::Expr::UnaryOp(u) if u.op == py::UnaryOp::USub
-        && matches!(&*u.operand, py::Expr::NumberLiteral(_)))
+fn nonnegative_literal(e: &py::Expr) -> bool {
+    matches!(e, py::Expr::NumberLiteral(n) if matches!(n.value, py::Number::Int(_)))
+        || matches!(e, py::Expr::UnaryOp(u) if u.op == py::UnaryOp::UAdd
+            && matches!(&*u.operand, py::Expr::NumberLiteral(_)))
 }
 
 impl Typer<'_> {
@@ -428,12 +521,51 @@ impl Typer<'_> {
             }
             py::Expr::If(i) => self.expr(&i.body).join(self.expr(&i.orelse)),
             py::Expr::Call(c) => self.call(c),
-            py::Expr::Subscript(s) => match self.expr(&s.value) {
-                Ty::Str => Ty::Str,
-                _ => Ty::Object,
-            },
+            py::Expr::Subscript(s) => {
+                let seq = self.expr(&s.value);
+                if matches!(&*s.slice, py::Expr::Slice(_)) {
+                    match seq {
+                        Ty::Str | Ty::List(_) | Ty::Tuple => seq,
+                        _ => Ty::Object,
+                    }
+                } else {
+                    seq.element().unwrap_or(Ty::Object)
+                }
+            }
+            py::Expr::List(l) => Ty::List(self.elem_of(l.elts.iter())),
+            py::Expr::ListComp(c) => {
+                let mut vars = self.vars.clone();
+                for g in &c.generators {
+                    bind_target(
+                        &mut vars,
+                        &g.target,
+                        self.expr(&g.iter).element().unwrap_or(Ty::Object),
+                    );
+                }
+                let inner = Typer {
+                    module: self.module,
+                    vars: &vars,
+                };
+                Ty::List(Elem::of(inner.expr(&c.elt)))
+            }
+            py::Expr::Tuple(_) => Ty::Tuple,
             _ => Ty::Object,
         }
+    }
+
+    /// The element kind of a literal: the one kind every element has,
+    /// or dynamic when they differ.
+    fn elem_of<'e>(&self, elts: impl Iterator<Item = &'e py::Expr>) -> Elem {
+        let mut kind: Option<Elem> = None;
+        for e in elts {
+            let k = Elem::of(self.expr(e));
+            kind = Some(match kind {
+                None => k,
+                Some(prev) if prev == k => k,
+                Some(_) => return Elem::Object,
+            });
+        }
+        kind.unwrap_or(Elem::Object)
     }
 
     fn call(&self, c: &py::ExprCall) -> Ty {
@@ -447,7 +579,32 @@ impl Typer<'_> {
                 }
                 match name {
                     "print" => Ty::None,
+                    // A range is iterated as ints.
+                    "range" => Ty::List(Elem::Int),
                     "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
+                    "sorted" | "reversed" | "list" => match arg(0) {
+                        Ty::List(e) => Ty::List(e),
+                        Ty::Str => Ty::List(Elem::Str),
+                        Ty::Tuple => Ty::List(Elem::Object),
+                        _ => match args.first() {
+                            Some(py::Expr::Call(c)) if is_name(&c.func, "range") => {
+                                Ty::List(Elem::Int)
+                            }
+                            _ => Ty::List(Elem::Object),
+                        },
+                    },
+                    "tuple" => Ty::Tuple,
+                    "sum" => match arg(0) {
+                        Ty::List(Elem::Int) => Ty::Int,
+                        Ty::List(Elem::Float) => Ty::Float,
+                        _ => Ty::Object,
+                    },
+                    "min" | "max" if args.len() == 1 => match arg(0) {
+                        Ty::List(e) => e.ty(),
+                        _ => Ty::Object,
+                    },
+                    "divmod" => Ty::Tuple,
+                    "type" => Ty::Str,
                     "str" | "repr" | "input" | "chr" => Ty::Str,
                     "float" => Ty::Float,
                     "bool" | "isinstance" | "callable" | "hasattr" => Ty::Bool,
@@ -473,6 +630,18 @@ impl Typer<'_> {
                     _ => Ty::Object,
                 }
             }
+            // A method on a list.
+            py::Expr::Attribute(a) if matches!(self.expr(&a.value), Ty::List(_)) => {
+                let Ty::List(e) = self.expr(&a.value) else {
+                    unreachable!()
+                };
+                match a.attr.as_str() {
+                    "pop" => e.ty(),
+                    "index" | "count" => Ty::Int,
+                    "copy" => Ty::List(e),
+                    _ => Ty::None,
+                }
+            }
             // A method on a string, when the receiver is known to be one.
             py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Str => match a.attr.as_str() {
                 "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join"
@@ -481,6 +650,7 @@ impl Typer<'_> {
                 "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
                 "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum" | "isspace"
                 | "isupper" | "islower" => Ty::Bool,
+                "split" | "rsplit" | "splitlines" => Ty::List(Elem::Str),
                 _ => Ty::Object,
             },
             _ => Ty::Object,

@@ -1,0 +1,11 @@
+[package]
+name = "zyntax_builtins"
+version = "0.1.0"
+edition = "2021"
+description = "The built-in library frontends share: lists, strings, dynamic values and printing, as typed AST"
+
+[dependencies]
+zyntax_typed_ast = { path = "../typed_ast" }
+
+[lints]
+workspace = true

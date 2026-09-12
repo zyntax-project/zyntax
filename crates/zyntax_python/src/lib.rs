@@ -12,20 +12,18 @@
 //! `float` is `f64`, `bool` is `bool`, `str` is `String`, `None` is
 //! `Unit`, and a value the pass cannot type is `Any`, the IR's boxed
 //! dynamic value. Crossings between them are explicit in what
-//! [`lower`] emits. Python's own semantics above the IR live in
-//! [`prelude`], ZynML compiled with the program.
+//! [`lower`] emits. What Python defines above the IR (how a value
+//! prints, list and string operations, dynamic dispatch) comes from the
+//! shared built-in library with Python's spellings, compiled with the
+//! program.
 
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction, TypedParameter};
-use zyntax_typed_ast::{
-    InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type, TypedNode,
-    TypedProgram, Visibility,
-};
+use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction};
+use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedNode, TypedProgram, Visibility};
 
 mod lower;
-mod prelude;
 mod types;
 
 /// Why a program could not be turned into a `TypedProgram`.
@@ -38,8 +36,6 @@ pub enum Error {
     /// guess.
     #[error("{what} is not supported yet (at byte offset {at})")]
     Unsupported { what: String, at: usize },
-    #[error("{0}")]
-    Prelude(String),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -48,35 +44,32 @@ type Result<T> = std::result::Result<T, Error>;
 /// Python program by calling this.
 pub const ENTRY: &str = "__main__";
 
-/// Runtime symbols the prelude and the lowering call by these names.
-/// Each is an extern with a link name; the backend marshals arguments
-/// against the symbol's registered signature.
-const EXTERNS: &[(&str, &str, &[Type], Type)] = &[
-    (
-        "println",
-        "$IO$println_dynamic",
-        &[Type::Any],
-        Type::Primitive(PrimitiveType::Unit),
-    ),
-    (
-        "format_dynamic",
-        "$IO$format_dynamic",
-        &[Type::Any],
-        Type::Primitive(PrimitiveType::String),
-    ),
-];
+/// Python's spellings for the built-in library.
+const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
+    true_text: "True",
+    false_text: "False",
+    none_text: "None",
+    single_quotes: true,
+    float_fraction: true,
+    type_names: zyntax_builtins::TypeNames {
+        none: "NoneType",
+        bool: "bool",
+        int: "int",
+        float: "float",
+        str: "str",
+        list: "list",
+        tuple: "tuple",
+        object: "object",
+    },
+};
 
-/// Give a runtime what a compiled Python program links against: the IO,
-/// string and math plugins the prelude's primitives come from. A host
-/// calls this once before compiling a program.
+/// Give a runtime what a compiled Python program links against: the IO
+/// and string plugins the library's primitives come from. A host calls
+/// this once before compiling a program.
 pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {
-    runtime.register_static_plugins([
-        zrtl_io::static_plugin(),
-        zrtl_string::static_plugin(),
-        zrtl_math::static_plugin(),
-    ])
+    runtime.register_static_plugins([zrtl_io::static_plugin(), zrtl_string::static_plugin()])
 }
 
 /// Parse Python source and rewrite it into a `TypedProgram`.
@@ -116,7 +109,10 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         }
     }
 
-    let inferred = types::infer_module(&defs);
+    let library = zyntax_builtins::library(&POLICY);
+    lower::set_list_type(library.list_type);
+    let mut inferred = types::infer_module(&defs);
+    inferred.list_type = Some(library.list_type);
     let mut declarations = Vec::new();
     for f in &defs {
         let sig = inferred.funcs[f.name.as_str()].clone();
@@ -165,51 +161,14 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         ));
     }
 
-    for (name, symbol, params, returns) in EXTERNS {
-        declarations.push(TypedNode::new(
-            TypedDeclaration::Function(TypedFunction {
-                name: intern(name),
-                annotations: Vec::new(),
-                effects: Vec::new(),
-                with_handlers: Vec::new(),
-                type_params: Vec::new(),
-                params: params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ty)| TypedParameter {
-                        name: intern(&format!("p{i}")),
-                        ty: ty.clone(),
-                        mutability: Mutability::Immutable,
-                        kind: ParameterKind::Regular,
-                        default_value: None,
-                        attributes: Vec::new(),
-                        ownership: ParamOwnership::Copied,
-                        span: Span::new(0, 0),
-                    })
-                    .collect(),
-                return_type: returns.clone(),
-                body: None,
-                visibility: Visibility::Public,
-                is_async: false,
-                is_fiber: false,
-                is_pure: false,
-                is_external: true,
-                calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
-                link_name: Some(intern(symbol)),
-                module: None,
-            }),
-            returns.clone(),
-            Span::new(0, 0),
-        ));
-    }
-    declarations.extend(prelude::declarations().map_err(Error::Prelude)?);
+    declarations.extend(library.declarations);
 
     Ok(TypedProgram {
         declarations,
         language: Some(intern("python")),
         span: Span::new(0, source.len()),
         source_files: Vec::new(),
-        type_registry: zyntax_typed_ast::TypeRegistry::new(),
+        type_registry: library.type_registry,
     })
 }
 

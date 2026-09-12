@@ -12,13 +12,11 @@ path = "src/main.rs"
 zyntax_typed_ast = { path = "../typed_ast" }
 zyntax_embed = { path = "../zyntax_embed" }
 zyntax_compiler = { path = "../compiler" }
-# The ZynML grammar, for the prelude written in it.
-zynml = { path = "../zynml", default-features = false }
-# The plugins a Python program links: the primitives the prelude is
-# written against.
+zyntax_builtins = { path = "../zyntax_builtins" }
+# The plugins a Python program links: the primitives the built-in
+# library is written against.
 zrtl_io = { path = "../../plugins/zrtl_io", features = ["linked-into-host"] }
 zrtl_string = { path = "../../plugins/zrtl_string", features = ["linked-into-host"] }
-zrtl_math = { path = "../../plugins/zrtl_math", features = ["linked-into-host"] }
 # Pinned exactly: the crate publishes 0.0.x and makes no semver promise.
 ruff_python_parser = "=0.0.12"
 ruff_python_ast = "=0.0.12"
