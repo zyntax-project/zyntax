@@ -37,6 +37,8 @@ pub(crate) enum Ty {
     Set,
     /// An instance of the module's class at this index.
     Class(u16),
+    /// A generator: a fiber yielding dynamic values.
+    Gen,
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -102,7 +104,7 @@ impl Ty {
     pub(crate) fn element(self) -> Option<Ty> {
         match self {
             Ty::List(e) => Some(e.ty()),
-            Ty::Tuple | Ty::Dict | Ty::Set => Some(Ty::Object),
+            Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
             _ => None,
         }
@@ -310,15 +312,46 @@ pub(crate) fn declared_sig_in(
         .iter_non_variadic_params()
         .map(|p| p.default.as_deref().cloned())
         .collect();
-    Sig {
-        params,
-        ret: f
-            .returns
+    let ret = if is_generator(&f.body) {
+        Ty::Gen
+    } else {
+        f.returns
             .as_deref()
             .map(|r| annotation_in(classes, r))
-            .unwrap_or(Ty::Unknown),
+            .unwrap_or(Ty::Unknown)
+    };
+    Sig {
+        params,
+        ret,
         defaults,
     }
+}
+
+/// Whether a body yields, making its function a generator. Nested
+/// functions yield for themselves.
+pub(crate) fn is_generator(body: &[py::Stmt]) -> bool {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    #[derive(Default)]
+    struct Finder(bool);
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            if !matches!(stmt, py::Stmt::FunctionDef(_) | py::Stmt::ClassDef(_)) {
+                walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            match expr {
+                py::Expr::Yield(_) | py::Expr::YieldFrom(_) => self.0 = true,
+                py::Expr::Lambda(_) | py::Expr::Generator(_) => {}
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut finder = Finder::default();
+    for s in body {
+        finder.visit_stmt(s);
+    }
+    finder.0
 }
 
 /// Infer the module's signatures to a fixed point.
@@ -355,7 +388,7 @@ pub(crate) fn infer_module(
         for item in items {
             let sig = module.funcs[&item.name].clone();
             let locals = infer_locals(&module, &sig, &item.def.body);
-            if item.def.returns.is_none() {
+            if item.def.returns.is_none() && sig.ret != Ty::Gen {
                 let ret = if locals.ret == Ty::Unknown {
                     Ty::None
                 } else {
@@ -896,6 +929,8 @@ impl Typer<'_> {
             py::Expr::Tuple(_) => Ty::Tuple,
             py::Expr::Dict(_) | py::Expr::DictComp(_) => Ty::Dict,
             py::Expr::Set(_) | py::Expr::SetComp(_) => Ty::Set,
+            py::Expr::Generator(_) => Ty::Gen,
+            py::Expr::Yield(_) | py::Expr::YieldFrom(_) => Ty::None,
             _ => Ty::Object,
         }
     }
@@ -932,10 +967,11 @@ impl Typer<'_> {
                     // A range is iterated as ints.
                     "range" => Ty::List(Elem::Int),
                     "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
+                    "next" => Ty::Object,
                     "sorted" | "reversed" | "list" => match arg(0) {
                         Ty::List(e) => Ty::List(e),
                         Ty::Str => Ty::List(Elem::Str),
-                        Ty::Tuple | Ty::Dict | Ty::Set => Ty::List(Elem::Object),
+                        Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Ty::List(Elem::Object),
                         _ => match args.first() {
                             Some(py::Expr::Call(c)) if is_name(&c.func, "range") => {
                                 Ty::List(Elem::Int)

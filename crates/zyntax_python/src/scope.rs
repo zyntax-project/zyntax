@@ -46,6 +46,20 @@ impl Scope {
         collector.finish(params)
     }
 
+    /// A generator expression: its loop variables are its own.
+    pub(crate) fn of_generator(g: &py::ExprGenerator) -> Scope {
+        let mut collector = Collector::default();
+        for comp in &g.generators {
+            collector.visit_expr(&comp.target);
+            collector.visit_expr(&comp.iter);
+            for cond in &comp.ifs {
+                collector.visit_expr(cond);
+            }
+        }
+        collector.visit_expr(&g.elt);
+        collector.finish(Vec::new())
+    }
+
     pub(crate) fn of_body(params: Vec<String>, body: &[py::Stmt]) -> Scope {
         let mut collector = Collector::default();
         for s in body {
@@ -140,6 +154,9 @@ impl<'a> Visitor<'a> for Collector {
             },
             py::Expr::Lambda(l) => {
                 self.children.push((String::new(), Scope::of_lambda(l)));
+            }
+            py::Expr::Generator(g) => {
+                self.children.push((String::new(), Scope::of_generator(g)));
             }
             _ => walk_expr(self, expr),
         }

@@ -17,8 +17,9 @@ use std::collections::{BTreeSet, HashMap};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression, TypedFieldAccess, TypedFor,
-    TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedMethodCall, TypedParameter,
-    TypedPattern, TypedRange, TypedStatement, TypedUnary, TypedWhile,
+    TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedMatch, TypedMatchArm,
+    TypedMethodCall, TypedParameter, TypedPattern, TypedRange, TypedStatement, TypedUnary,
+    TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
@@ -90,6 +91,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::List(e) => list_type(ir(e.ty())),
         Ty::Tuple | Ty::Dict | Ty::Set => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
+        Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         Ty::Object | Ty::Unknown => Type::Any,
     }
 }
@@ -123,6 +125,8 @@ enum Produce<'a> {
     List(Elem, &'a py::Expr),
     Set(&'a py::Expr),
     Dict(&'a py::Expr, &'a py::Expr),
+    /// A generator body: each element yielded.
+    Yield(&'a py::Expr),
 }
 
 /// A lowered expression and the static type it has.
@@ -425,6 +429,9 @@ pub(crate) struct Lowerer<'m> {
     /// Whether the statement being lowered recorded such a flag, so a
     /// loop containing it leaves again once the loop is left.
     redirected: bool,
+    /// Whether this function yields: it lowers to a fiber of dynamic
+    /// values, and `return` ends it.
+    is_generator: bool,
 }
 
 /// One `try` body's control flag: 0 fell through, 1 return, 2 break,
@@ -465,6 +472,7 @@ impl<'m> Lowerer<'m> {
         captured_types: HashMap<String, Ty>,
     ) -> Self {
         let bound = sig.params.iter().map(|(n, _)| intern(n)).collect();
+        let is_generator = sig.ret == Ty::Gen;
         // A variable a nested function reads or assigns is shared
         // through a cell, as is everything captured from further out.
         let mut cells: BTreeSet<String> = captured.iter().cloned().collect();
@@ -501,6 +509,7 @@ impl<'m> Lowerer<'m> {
             caught: None,
             try_ctls: Vec::new(),
             redirected: false,
+            is_generator,
         }
     }
 
@@ -631,6 +640,9 @@ impl<'m> Lowerer<'m> {
     /// The value a function returns when it leaves with an exception
     /// pending, which its caller never reads.
     fn placeholder(&mut self, span: Span) -> Option<Node> {
+        if self.is_generator {
+            return None;
+        }
         Some(match self.sig.ret {
             Ty::None => return None,
             Ty::Int => int_lit(0, span),
@@ -912,12 +924,56 @@ impl<'m> Lowerer<'m> {
         }
         let mut params = Vec::new();
         let mut prologue = Vec::new();
+        if self.is_generator {
+            prologue.extend(self.generator_prologue(span_of(f)));
+        }
         for (p, (_, declared)) in f
             .parameters
             .iter_non_variadic_params()
             .zip(self.sig.params.clone())
         {
             let name = intern(p.parameter.name.as_str());
+            if self.is_generator {
+                // The argument arrives in the environment, after the
+                // record slots and the captured cells.
+                let index = RECORD_CELLS_AT + self.captured.len() + params.len();
+                params.push(parameter(p.parameter.name.as_str(), declared, span_of(p)));
+                let value = self.coerce(
+                    Val {
+                        node: call(
+                            "zb_list_get_any",
+                            vec![
+                                var(intern("env"), Ty::List(Elem::Object), span_of(p)),
+                                int_lit(index as i64, span_of(p)),
+                            ],
+                            Ty::Object,
+                            span_of(p),
+                        ),
+                        ty: Ty::Object,
+                    },
+                    declared,
+                );
+                let local = self.var_ty(p.parameter.name.as_str());
+                let value = self.coerce(
+                    Val {
+                        node: value,
+                        ty: declared,
+                    },
+                    local,
+                );
+                prologue.push(TypedNode::new(
+                    TypedStatement::Let(TypedLet {
+                        name,
+                        ty: ir(local),
+                        mutability: Mutability::Mutable,
+                        initializer: Some(Box::new(value)),
+                        span: span_of(p),
+                    }),
+                    Type::Unknown,
+                    span_of(p),
+                ));
+                continue;
+            }
             let default_value = match &p.default {
                 Some(d) => {
                     let v = self.expr(d)?;
@@ -971,6 +1027,18 @@ impl<'m> Lowerer<'m> {
         for s in &f.body {
             self.stmt(s, &mut statements)?;
         }
+        // A generator is a fiber whose declared type is what it yields
+        // and whose arguments arrive in its environment.
+        let return_type = if self.is_generator {
+            Type::Any
+        } else {
+            ir(self.sig.ret)
+        };
+        let params = if self.is_generator {
+            Vec::new()
+        } else {
+            params
+        };
         Ok(TypedFunction {
             name: intern(name),
             annotations: Vec::new(),
@@ -978,11 +1046,11 @@ impl<'m> Lowerer<'m> {
             with_handlers: Vec::new(),
             type_params: Vec::new(),
             params,
-            return_type: ir(self.sig.ret),
+            return_type,
             body: Some(TypedBlock { statements, span }),
             visibility: Visibility::Public,
             is_async: false,
-            is_fiber: false,
+            is_fiber: self.is_generator,
             is_pure: false,
             is_external: false,
             calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
@@ -1054,8 +1122,10 @@ impl<'m> Lowerer<'m> {
             {
                 cast(v.node, target, span)
             }
-            // A dict iterates as its keys; a set is its list of elements.
+            // A dict iterates as its keys; a set is its list of elements;
+            // a generator is run to exhaustion.
             (Ty::Dict, Ty::List(Elem::Object)) => call("zb_dict_keys", vec![v.node], target, span),
+            (Ty::Gen, Ty::List(Elem::Object)) => self.generator_to_list(v.node, span),
             (Ty::Set, Ty::List(Elem::Object)) => Node {
                 ty: ir(target),
                 ..v.node
@@ -1114,6 +1184,11 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
+            Ty::Gen => node(
+                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                Ty::Bool,
+                span,
+            ),
             Ty::Class(k) => {
                 if let Some(r) = self.dunder(k as usize, "__bool__", v.node.clone(), vec![], span) {
                     self.truthy(r)
@@ -1156,6 +1231,7 @@ impl<'m> Lowerer<'m> {
             Ty::Tuple => call("zb_tuple_repr", vec![v.node], Ty::Str, span),
             Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
             Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
+            Ty::Gen => str_lit("<generator object>", span),
             Ty::Class(k) => {
                 let k = k as usize;
                 match self
@@ -1300,6 +1376,12 @@ impl<'m> Lowerer<'m> {
         };
         match s {
             py::Stmt::Pass(_) => {}
+            py::Stmt::Return(r) if self.is_generator => {
+                if r.value.is_some() {
+                    return unsupported("a value returned from a generator", r);
+                }
+                self.emit_return(None, span, out);
+            }
             py::Stmt::Return(r) => {
                 let value = match &r.value {
                     Some(v) => {
@@ -1321,6 +1403,26 @@ impl<'m> Lowerer<'m> {
                     }
                 };
                 self.emit_return(value.map(|b| *b), span, out);
+            }
+            py::Stmt::Expr(e) if matches!(&*e.value, py::Expr::Yield(_)) => {
+                let py::Expr::Yield(y) = &*e.value else {
+                    unreachable!()
+                };
+                let value = match &y.value {
+                    Some(v) => self.expr_as(v, Ty::Object)?,
+                    None => {
+                        let none = Val {
+                            node: node(
+                                TypedExpression::Literal(TypedLiteral::Null),
+                                Ty::None,
+                                span,
+                            ),
+                            ty: Ty::None,
+                        };
+                        self.coerce(none, Ty::Object)
+                    }
+                };
+                push(out, TypedStatement::Yield(Box::new(value)));
             }
             py::Stmt::Expr(e) => {
                 let v = self.expr(&e.value)?;
@@ -1783,6 +1885,9 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<TypedStatement> {
         let seq = self.expr(&f.iter)?;
+        if seq.ty == Ty::Gen {
+            return self.for_generator(f, seq, extra, span);
+        }
         let elem_ty = seq.ty.element().unwrap_or(Ty::Object);
         // The iterator is evaluated once, before the loop.
         let mut prologue = std::mem::take(&mut self.hoisted);
@@ -2061,6 +2166,7 @@ impl<'m> Lowerer<'m> {
                 ty,
             },
             py::Expr::Lambda(l) => self.lambda(l, span)?,
+            py::Expr::Generator(g) => self.generator_expr(g, span)?,
             py::Expr::Attribute(a) => {
                 let object = self.expr(&a.value)?;
                 self.attribute(object, a.attr.as_str(), span)?
@@ -2920,22 +3026,27 @@ impl<'m> Lowerer<'m> {
             Produce::List(elem, _) => Ty::List(elem),
             Produce::Set(_) => Ty::Set,
             Produce::Dict(..) => Ty::Dict,
+            Produce::Yield(_) => Ty::None,
         };
         let out = self.temp();
         // Loop variables are the comprehension's own; they shadow the
         // function's for the body and are forgotten after.
         let saved_vars = self.locals.vars.clone();
-        let mut statements = vec![TypedNode::new(
-            TypedStatement::Let(TypedLet {
-                name: out,
-                ty: ir(ty),
-                mutability: Mutability::Immutable,
-                initializer: Some(Box::new(self.list_of(Vec::new(), Elem::Object, span))),
+        let mut statements = if matches!(produce, Produce::Yield(_)) {
+            Vec::new()
+        } else {
+            vec![TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: out,
+                    ty: ir(ty),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(self.list_of(Vec::new(), Elem::Object, span))),
+                    span,
+                }),
+                Type::Unknown,
                 span,
-            }),
-            Type::Unknown,
-            span,
-        )];
+            )]
+        };
         if let Produce::List(elem, _) = produce {
             statements[0] = TypedNode::new(
                 TypedStatement::Let(TypedLet {
@@ -2958,6 +3069,9 @@ impl<'m> Lowerer<'m> {
             });
             bind_names(&mut self.locals.vars, &g.target, item_ty);
         }
+        // What the element and the conditions hoist belongs inside the
+        // loop, where they are evaluated.
+        let outer_hoisted = std::mem::take(&mut self.hoisted);
         let add = match produce {
             Produce::List(elem, elt) => {
                 let value = self.expr(elt)?;
@@ -2983,17 +3097,24 @@ impl<'m> Lowerer<'m> {
                     span,
                 )
             }
+            Produce::Yield(elt) => self.expr_as(elt, Ty::Object)?,
         };
-        let mut inner: Vec<Stmt> = vec![TypedNode::new(
-            TypedStatement::Expression(Box::new(add)),
+        let mut inner: Vec<Stmt> = std::mem::take(&mut self.hoisted);
+        inner.push(TypedNode::new(
+            if matches!(produce, Produce::Yield(_)) {
+                TypedStatement::Yield(Box::new(add))
+            } else {
+                TypedStatement::Expression(Box::new(add))
+            },
             Type::Unknown,
             span,
-        )];
+        ));
         for g in generators.iter().rev() {
             for cond in g.ifs.iter().rev() {
                 let test = self.expr(cond)?;
                 let condition = self.truthy(test);
-                inner = vec![TypedNode::new(
+                let mut with_test = std::mem::take(&mut self.hoisted);
+                with_test.push(TypedNode::new(
                     TypedStatement::If(TypedIf {
                         condition: Box::new(condition),
                         then_block: TypedBlock {
@@ -3005,7 +3126,8 @@ impl<'m> Lowerer<'m> {
                     }),
                     Type::Unknown,
                     span,
-                )];
+                ));
+                inner = with_test;
             }
             let for_stmt = py::StmtFor {
                 node_index: Default::default(),
@@ -3024,6 +3146,7 @@ impl<'m> Lowerer<'m> {
         }
         self.locals.vars = saved_vars;
         statements.extend(inner);
+        self.hoisted = outer_hoisted;
         self.hoisted.extend(statements);
         Ok(Val {
             node: var(out, ty, span),
@@ -3280,6 +3403,9 @@ impl<'m> Lowerer<'m> {
             }
             if let Some(sig) = self.module.funcs.get(name).cloned() {
                 let lowered = self.arguments(name, &sig, args, keywords, c)?;
+                if sig.ret == Ty::Gen {
+                    return Ok(self.start_generator(name, &sig, lowered, Vec::new(), span));
+                }
                 let v = Val {
                     node: call(name, lowered, sig.ret, span),
                     ty: sig.ret,
@@ -3377,6 +3503,17 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     return self.isinstance(v, &args[1], span);
                 }
+                "next" if !args.is_empty() && args.len() <= 2 => {
+                    let g = self.expr(&args[0])?;
+                    if g.ty != Ty::Gen {
+                        return unsupported("next() on something other than a generator", c);
+                    }
+                    let default = match args.get(1) {
+                        Some(d) => Some(self.expr_as(d, Ty::Object)?),
+                        None => None,
+                    };
+                    return Ok(self.next_of(g.node, default, span));
+                }
                 "len" => {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
@@ -3405,6 +3542,34 @@ impl<'m> Lowerer<'m> {
                         }
                     };
                     return Ok(Val { node, ty: Ty::Int });
+                }
+                // `range` as a value is the list of its numbers.
+                "range" if !args.is_empty() && args.len() <= 3 => {
+                    let mut bounds = Vec::new();
+                    for a in args {
+                        bounds.push(self.expr_as(a, Ty::Int)?);
+                    }
+                    let (start, stop, step) = match bounds.len() {
+                        1 => (int_lit(0, span), bounds.remove(0), int_lit(1, span)),
+                        2 => {
+                            let stop = bounds.remove(1);
+                            (bounds.remove(0), stop, int_lit(1, span))
+                        }
+                        _ => {
+                            let step = bounds.remove(2);
+                            let stop = bounds.remove(1);
+                            (bounds.remove(0), stop, step)
+                        }
+                    };
+                    return Ok(Val {
+                        node: call(
+                            "zb_list_range",
+                            vec![start, stop, step],
+                            Ty::List(Elem::Int),
+                            span,
+                        ),
+                        ty: Ty::List(Elem::Int),
+                    });
                 }
                 "sum" if args.len() == 1 => {
                     let v = self.expr(&args[0])?;
@@ -3540,7 +3705,7 @@ impl<'m> Lowerer<'m> {
                             let v = self.expr(a)?;
                             match v.ty {
                                 Ty::List(_) => v,
-                                Ty::Tuple | Ty::Set | Ty::Dict => {
+                                Ty::Tuple | Ty::Set | Ty::Dict | Ty::Gen => {
                                     let node = self.coerce(v, Ty::List(Elem::Object));
                                     Val {
                                         node,
@@ -4159,6 +4324,314 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
         ])
+    }
+
+    /// `match gen.next() { Some(x) => { ... }, _ => { ... } }` as a
+    /// statement, with `x` bound as `item` in the first arm.
+    fn next_match(
+        &mut self,
+        gen: Node,
+        item: InternedString,
+        some: Vec<Stmt>,
+        none: Vec<Stmt>,
+        span: Span,
+    ) -> Stmt {
+        let next = method_call(gen, "next", vec![], Ty::Object, span);
+        let next = Node {
+            ty: Type::Optional(Box::new(Type::Any)),
+            ..next
+        };
+        let some_pattern = TypedNode::new(
+            TypedPattern::Constructor {
+                constructor: Type::Unresolved(intern("Some")),
+                pattern: Box::new(TypedNode::new(
+                    TypedPattern::Identifier {
+                        name: item,
+                        mutability: Mutability::Immutable,
+                    },
+                    Type::Any,
+                    span,
+                )),
+            },
+            Type::Any,
+            span,
+        );
+        let arm = |pattern: TypedNode<TypedPattern>, statements: Vec<Stmt>| TypedMatchArm {
+            pattern: Box::new(pattern),
+            guard: None,
+            body: Box::new(node(
+                TypedExpression::Block(TypedBlock { statements, span }),
+                Ty::None,
+                span,
+            )),
+        };
+        TypedNode::new(
+            TypedStatement::Match(TypedMatch {
+                scrutinee: Box::new(next),
+                arms: vec![
+                    arm(some_pattern, some),
+                    arm(
+                        TypedNode::new(TypedPattern::Wildcard, Type::Any, span),
+                        none,
+                    ),
+                ],
+            }),
+            Type::Unknown,
+            span,
+        )
+    }
+
+    /// `for target in <generator>`: pull until exhausted.
+    fn for_generator(
+        &mut self,
+        f: &py::StmtFor,
+        gen: Val,
+        extra: Vec<Stmt>,
+        span: Span,
+    ) -> Result<TypedStatement> {
+        let mut prologue = std::mem::take(&mut self.hoisted);
+        let held = self.hold(gen, &mut prologue, span);
+        let item = self.temp();
+        let mut body = Vec::new();
+        self.bind(
+            &f.target,
+            Val {
+                node: var(item, Ty::Object, span),
+                ty: Ty::Object,
+            },
+            span,
+            &mut body,
+        )?;
+        self.in_loop(|this| -> Result<()> {
+            for s in &f.body {
+                this.stmt(s, &mut body)?;
+            }
+            Ok(())
+        })?;
+        body.extend(extra);
+        let stop = vec![TypedNode::new(
+            TypedStatement::Break(None),
+            Type::Unknown,
+            span,
+        )];
+        let pull = self.next_match(held.node, item, body, stop, span);
+        prologue.push(one_pass(vec![pull], span));
+        Ok(TypedStatement::Block(TypedBlock {
+            statements: prologue,
+            span,
+        }))
+    }
+
+    /// Every value a generator yields, as a list.
+    fn generator_to_list(&mut self, gen: Node, span: Span) -> Node {
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: gen,
+                ty: Ty::Gen,
+            },
+            &mut pre,
+            span,
+        );
+        let out = self.temp();
+        pre.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: out,
+                ty: ir(Ty::List(Elem::Object)),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(self.list_of(Vec::new(), Elem::Object, span))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let item = self.temp();
+        let push = vec![TypedNode::new(
+            TypedStatement::Expression(Box::new(method_call(
+                var(out, Ty::List(Elem::Object), span),
+                "push",
+                vec![var(item, Ty::Object, span)],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        )];
+        let stop = vec![TypedNode::new(
+            TypedStatement::Break(None),
+            Type::Unknown,
+            span,
+        )];
+        let pull = self.next_match(held.node, item, push, stop, span);
+        pre.push(one_pass(vec![pull], span));
+        self.hoisted.extend(pre);
+        var(out, Ty::List(Elem::Object), span)
+    }
+
+    /// `next(gen)`: the next value, or the default, or StopIteration.
+    fn next_of(&mut self, gen: Node, default: Option<Node>, span: Span) -> Val {
+        let mut pre = Vec::new();
+        let result = self.temp();
+        let initial = match &default {
+            Some(d) => d.clone(),
+            None => {
+                let none = Val {
+                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                    ty: Ty::None,
+                };
+                self.coerce(none, Ty::Object)
+            }
+        };
+        pre.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: result,
+                ty: ir(Ty::Object),
+                mutability: Mutability::Mutable,
+                initializer: Some(Box::new(initial)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let item = self.temp();
+        let take = vec![TypedNode::new(
+            TypedStatement::Expression(Box::new(binary(
+                BinaryOp::Assign,
+                var(result, Ty::Object, span),
+                var(item, Ty::Object, span),
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        )];
+        let mut exhausted = Vec::new();
+        if default.is_none() {
+            self.raise_named("StopIteration", str_lit("", span), span, &mut exhausted);
+        }
+        let pull = self.next_match(gen, item, take, exhausted, span);
+        pre.push(pull);
+        self.hoisted.extend(pre);
+        Val {
+            node: var(result, Ty::Object, span),
+            ty: Ty::Object,
+        }
+    }
+
+    /// `(e for x in it if c)`: a generator function of its own, made
+    /// and started here.
+    fn generator_expr(&mut self, g: &py::ExprGenerator, span: Span) -> Result<Val> {
+        let scope = Scope::of_generator(g);
+        let (captured, seeds) = self.captures_for(&scope);
+        let lifted = self.lifted_name("genexpr");
+        let sig = Sig {
+            params: Vec::new(),
+            ret: Ty::Gen,
+            defaults: Vec::new(),
+        };
+        let mut child = Lowerer::new(
+            self.module,
+            &lifted,
+            sig,
+            Locals::default(),
+            &scope,
+            captured.clone(),
+            seeds,
+        );
+        let mut body = child.generator_prologue(span);
+        body.extend(child.cell_prologue(span));
+        // The loop yields each element; the comprehension machinery
+        // leaves it in the child's hoisted statements.
+        child.comprehension(&g.generators, Produce::Yield(&g.elt), span)?;
+        body.append(&mut child.hoisted);
+        let function = TypedFunction {
+            name: intern(&lifted),
+            annotations: Vec::new(),
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            return_type: Type::Any,
+            body: Some(TypedBlock {
+                statements: body,
+                span,
+            }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: true,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: None,
+        };
+        self.module.lifted.borrow_mut().push(function);
+        let sig = Sig {
+            params: Vec::new(),
+            ret: Ty::Gen,
+            defaults: Vec::new(),
+        };
+        let cells = self.cells_of(&captured, span);
+        Ok(self.start_generator(&lifted, &sig, Vec::new(), cells, span))
+    }
+
+    /// `let env = <the fiber's environment>` at the start of a body.
+    fn generator_prologue(&mut self, span: Span) -> Vec<Stmt> {
+        self.bound.push(intern("env"));
+        vec![TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: intern("env"),
+                ty: ir(Ty::List(Elem::Object)),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(call(
+                    "zb_list_unbox_any",
+                    vec![call("zb_fiber_env", vec![], Ty::Object, span)],
+                    Ty::List(Elem::Object),
+                    span,
+                ))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        )]
+    }
+
+    /// A paused fiber for `code`, its environment holding the cells
+    /// and the arguments (already coerced to the parameter types).
+    fn start_generator(
+        &mut self,
+        code: &str,
+        sig: &Sig,
+        args: Vec<Node>,
+        cells: Vec<Val>,
+        span: Span,
+    ) -> Val {
+        let none = || Val {
+            node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+            ty: Ty::None,
+        };
+        let mut items = vec![none(), none()];
+        items.extend(cells);
+        for (a, (_, ty)) in args.into_iter().zip(&sig.params) {
+            items.push(Val { node: a, ty: *ty });
+        }
+        let env = self.list_of(items, Elem::Object, span);
+        let env = self.coerce(
+            Val {
+                node: env,
+                ty: Ty::List(Elem::Object),
+            },
+            Ty::Object,
+        );
+        Val {
+            node: call(
+                "zb_fiber_start",
+                vec![var(intern(code), Ty::Int, span), env],
+                Ty::Gen,
+                span,
+            ),
+            ty: Ty::Gen,
+        }
     }
 
     /// `isinstance(v, T)` for a type name or a class.

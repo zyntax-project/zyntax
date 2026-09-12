@@ -41,6 +41,11 @@ pub fn code_type(list_type: TypeId, arity: usize) -> Type {
     }
 }
 
+/// A fiber yielding dynamic values.
+pub fn fiber_type() -> Type {
+    Type::Fiber(Box::new(any()))
+}
+
 pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
     let mut d = vec![extern_fn(
@@ -49,6 +54,33 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         any(),
         Some("zyntax_box_ptr"),
     )];
+
+    // A fiber body takes nothing; what it needs travels as an
+    // environment it reads back when it starts.
+    d.push(extern_fn(
+        "zb_fiber_new_raw",
+        &[("code", i64()), ("env", any()), ("stack", i64())],
+        fiber_type(),
+        Some("krio_fiber_new_with_env"),
+    ));
+    d.push(extern_fn(
+        "zb_fiber_env",
+        &[],
+        any(),
+        Some("krio_fiber_env"),
+    ));
+    let code = local("code", i64());
+    let env = owned("env", any());
+    d.push(define(
+        "zb_fiber_start",
+        &[&code, &env],
+        fiber_type(),
+        vec![ret(call(
+            "zb_fiber_new_raw",
+            vec![code.e(), env.e(), int(0)],
+            fiber_type(),
+        ))],
+    ));
 
     // A record from a code address, an arity and the shared cells.
     let code = local("code", i64());
