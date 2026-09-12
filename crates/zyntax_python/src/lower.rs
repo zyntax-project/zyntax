@@ -56,7 +56,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Str => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
         Ty::List(e) => list_type(ir(e.ty())),
-        Ty::Tuple => list_type(Type::Any),
+        Ty::Tuple | Ty::Dict | Ty::Set => list_type(Type::Any),
         Ty::Object | Ty::Unknown => Type::Any,
     }
 }
@@ -82,6 +82,14 @@ fn bind_names(vars: &mut std::collections::HashMap<String, Ty>, target: &py::Exp
 /// `zb_list_<op>_<kind>`.
 fn list_fn(op: &str, elem: Elem) -> String {
     format!("zb_list_{op}_{}", elem.suffix())
+}
+
+/// What a comprehension builds.
+#[derive(Clone, Copy)]
+enum Produce<'a> {
+    List(Elem, &'a py::Expr),
+    Set(&'a py::Expr),
+    Dict(&'a py::Expr, &'a py::Expr),
 }
 
 /// A lowered expression and the static type it has.
@@ -596,8 +604,18 @@ impl<'m> Lowerer<'m> {
             // read back by checking that tag.
             (Ty::List(e), Ty::Object) => call(&list_fn("box", e), vec![v.node], Ty::Object, span),
             (Ty::Tuple, Ty::Object) => call("zb_box_tuple", vec![v.node], Ty::Object, span),
+            (Ty::Dict, Ty::Object) => call("zb_dict_box", vec![v.node], Ty::Object, span),
+            (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
             (Ty::Object, Ty::List(e)) => call(&list_fn("unbox", e), vec![v.node], target, span),
             (Ty::Object, Ty::Tuple) => call("zb_unbox_tuple", vec![v.node], Ty::Tuple, span),
+            (Ty::Object, Ty::Dict) => call("zb_dict_unbox", vec![v.node], Ty::Dict, span),
+            (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
+            // A dict iterates as its keys; a set is its list of elements.
+            (Ty::Dict, Ty::List(Elem::Object)) => call("zb_dict_keys", vec![v.node], target, span),
+            (Ty::Set, Ty::List(Elem::Object)) => Node {
+                ty: ir(target),
+                ..v.node
+            },
             // Lists of one kind into lists of dynamic values.
             (Ty::List(e), Ty::List(Elem::Object)) => {
                 call(&list_fn("to_any", e), vec![v.node], target, span)
@@ -639,7 +657,14 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => call("zb_str_truthy", vec![v.node], Ty::Bool, span),
-            Ty::List(_) | Ty::Tuple => binary(
+            Ty::Dict => binary(
+                BinaryOp::Ne,
+                call("zb_dict_len", vec![v.node], Ty::Int, span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            ),
+            Ty::List(_) | Ty::Tuple | Ty::Set => binary(
                 BinaryOp::Ne,
                 method_call(v.node, "len", vec![], Ty::Int, span),
                 int_lit(0, span),
@@ -666,6 +691,8 @@ impl<'m> Lowerer<'m> {
             Ty::None => call("zb_none_repr", vec![], Ty::Str, span),
             Ty::List(e) => call(&list_fn("repr", e), vec![v.node], Ty::Str, span),
             Ty::Tuple => call("zb_tuple_repr", vec![v.node], Ty::Str, span),
+            Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
+            Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
             Ty::Object | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
         }
     }
@@ -835,6 +862,10 @@ impl<'m> Lowerer<'m> {
                             let i = self.expr_as(&sub.slice, Ty::Int)?;
                             call(&list_fn("pop", e), vec![seq.node, i], e.ty(), span)
                         }
+                        Ty::Dict => {
+                            let k = self.expr_as(&sub.slice, Ty::Object)?;
+                            call("zb_dict_del", vec![seq.node, k], Ty::None, span)
+                        }
                         _ => {
                             let key = self.expr_as(&sub.slice, Ty::Object)?;
                             let seq = self.coerce(seq, Ty::Object);
@@ -888,6 +919,11 @@ impl<'m> Lowerer<'m> {
                         let i = self.expr_as(&sub.slice, Ty::Int)?;
                         let v = self.coerce(value, e.ty());
                         call(&list_fn("set", e), vec![seq.node, i, v], Ty::None, span)
+                    }
+                    Ty::Dict => {
+                        let k = self.expr_as(&sub.slice, Ty::Object)?;
+                        let v = self.coerce(value, Ty::Object);
+                        call("zb_dict_set", vec![seq.node, k, v], Ty::None, span)
                     }
                     Ty::Object => {
                         let i = self.expr_as(&sub.slice, Ty::Object)?;
@@ -1084,9 +1120,13 @@ impl<'m> Lowerer<'m> {
         let elem_ty = seq.ty.element().unwrap_or(Ty::Object);
         let mut prologue = Vec::new();
         let seq = match seq.ty {
-            // A dynamic iterable is snapshotted into a list of objects.
-            Ty::Object => {
-                let items = call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span);
+            // A dynamic iterable is snapshotted into a list of objects,
+            // and a dict iterates over a snapshot of its keys.
+            Ty::Object | Ty::Dict => {
+                let items = match seq.ty {
+                    Ty::Dict => call("zb_dict_keys", vec![seq.node], Ty::List(Elem::Object), span),
+                    _ => call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span),
+                };
                 self.hold(
                     Val {
                         node: items,
@@ -1365,7 +1405,45 @@ impl<'m> Lowerer<'m> {
                 }
             }
             py::Expr::Subscript(sub) => self.subscript(sub, ty, span)?,
-            py::Expr::ListComp(c) => self.list_comp(c, ty, span)?,
+            py::Expr::ListComp(c) => {
+                let Ty::List(elem) = ty else { unreachable!() };
+                self.comprehension(&c.generators, Produce::List(elem, &c.elt), span)?
+            }
+            py::Expr::SetComp(c) => {
+                self.comprehension(&c.generators, Produce::Set(&c.elt), span)?
+            }
+            py::Expr::DictComp(c) => {
+                let Some(key) = &c.key else {
+                    return unsupported("`**` in a dict comprehension", c);
+                };
+                self.comprehension(&c.generators, Produce::Dict(key, &c.value), span)?
+            }
+            py::Expr::Dict(d) => {
+                let mut items = Vec::with_capacity(d.items.len() * 2);
+                for item in &d.items {
+                    let Some(key) = &item.key else {
+                        return unsupported("`**` in a dict literal", d);
+                    };
+                    items.push(self.expr(key)?);
+                    items.push(self.expr(&item.value)?);
+                }
+                let pairs = self.list_of(items, Elem::Object, span);
+                Val {
+                    node: call("zb_dict_from_pairs", vec![pairs], Ty::Dict, span),
+                    ty: Ty::Dict,
+                }
+            }
+            py::Expr::Set(st) => {
+                let mut items = Vec::with_capacity(st.elts.len());
+                for e in &st.elts {
+                    items.push(self.expr(e)?);
+                }
+                let elements = self.list_of(items, Elem::Object, span);
+                Val {
+                    node: call("zb_set_from", vec![elements], Ty::Set, span),
+                    ty: Ty::Set,
+                }
+            }
             py::Expr::FString(f) => self.fstring(f, span)?,
             other => return unsupported(types::expr_kind(other), other),
         })
@@ -1465,6 +1543,22 @@ impl<'m> Lowerer<'m> {
                     });
                 }
                 _ => {}
+            }
+        }
+        // Set algebra.
+        if left.ty == Ty::Set && right.ty == Ty::Set {
+            let name = match op {
+                py::Operator::BitAnd => Some("zb_set_and"),
+                py::Operator::BitOr => Some("zb_set_or"),
+                py::Operator::Sub => Some("zb_set_sub"),
+                py::Operator::BitXor => Some("zb_set_xor"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                return Ok(Val {
+                    node: call(name, vec![left.node, right.node], Ty::Set, span),
+                    ty: Ty::Set,
+                });
             }
         }
         // Sequences concatenate and repeat.
@@ -1581,7 +1675,7 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     )
-                } else if right.ty == Ty::Tuple {
+                } else if right.ty == Ty::Tuple || right.ty == Ty::Set {
                     let item = self.coerce(left, Ty::Object);
                     call(
                         "zb_list_contains_any",
@@ -1589,6 +1683,9 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     )
+                } else if right.ty == Ty::Dict {
+                    let item = self.coerce(left, Ty::Object);
+                    call("zb_dict_contains", vec![right.node, item], Ty::Bool, span)
                 } else {
                     let item = self.coerce(left, Ty::Object);
                     let container = self.coerce(right, Ty::Object);
@@ -1608,6 +1705,13 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     ),
+                    // Containers are identical when they are the same heap object.
+                    (Ty::List(_) | Ty::Tuple | Ty::Dict | Ty::Set, _)
+                    | (_, Ty::List(_) | Ty::Tuple | Ty::Dict | Ty::Set) => {
+                        let l = self.coerce(left, Ty::Object);
+                        let r = self.coerce(right, Ty::Object);
+                        call("zb_any_same", vec![l, r], Ty::Bool, span)
+                    }
                     _ => {
                         let l = self.coerce(left, Ty::Object);
                         let r = self.coerce(right, Ty::Object);
@@ -1617,6 +1721,39 @@ impl<'m> Lowerer<'m> {
                 return Ok(if op == py::CmpOp::IsNot { negate(n) } else { n });
             }
             _ => {}
+        }
+        // Sets order by inclusion.
+        if left.ty == Ty::Set && right.ty == Ty::Set {
+            let subset = |this: &mut Self, a: Node, b: Node| {
+                let _ = this;
+                call("zb_set_issubset", vec![a, b], Ty::Bool, span)
+            };
+            let proper = |this: &mut Self, a: Node, b: Node| {
+                let sub = subset(this, a.clone(), b.clone());
+                let same_size = binary(
+                    BinaryOp::Eq,
+                    method_call(a, "len", vec![], Ty::Int, span),
+                    method_call(b, "len", vec![], Ty::Int, span),
+                    Ty::Bool,
+                    span,
+                );
+                binary(BinaryOp::And, sub, negate(same_size), Ty::Bool, span)
+            };
+            let (l, r) = (left.node, right.node);
+            return Ok(match op {
+                py::CmpOp::LtE => subset(self, l, r),
+                py::CmpOp::GtE => subset(self, r, l),
+                py::CmpOp::Lt => proper(self, l, r),
+                py::CmpOp::Gt => proper(self, r, l),
+                py::CmpOp::Eq => call("zb_set_eq", vec![l, r], Ty::Bool, span),
+                py::CmpOp::NotEq => negate(call("zb_set_eq", vec![l, r], Ty::Bool, span)),
+                _ => {
+                    return Err(Error::Unsupported {
+                        what: "this comparison of sets".to_string(),
+                        at: span.start,
+                    })
+                }
+            });
         }
         // Two sequences compare element by element.
         let seq_kind = |t: Ty| match t {
@@ -1923,6 +2060,13 @@ impl<'m> Lowerer<'m> {
                 let index = self.expr_as(&sub.slice, Ty::Int)?;
                 Ok(self.index_value(seq, index, ty, span))
             }
+            Ty::Dict => {
+                let key = self.expr_as(&sub.slice, Ty::Object)?;
+                Ok(Val {
+                    node: call("zb_dict_get", vec![seq.node, key], Ty::Object, span),
+                    ty: Ty::Object,
+                })
+            }
             _ => {
                 let key = self.expr_as(&sub.slice, Ty::Object)?;
                 let o = self.coerce(seq, Ty::Object);
@@ -1934,10 +2078,19 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// `[e for x in it if c]`: a fresh list, a loop appending to it, the
-    /// list as the value.
-    fn list_comp(&mut self, c: &py::ExprListComp, ty: Ty, span: Span) -> Result<Val> {
-        let Ty::List(elem) = ty else { unreachable!() };
+    /// `[e for x in it if c]`, `{e for ...}`, `{k: v for ...}`: a fresh
+    /// collection, a loop adding to it, the collection as the value.
+    fn comprehension(
+        &mut self,
+        generators: &[py::Comprehension],
+        produce: Produce<'_>,
+        span: Span,
+    ) -> Result<Val> {
+        let ty = match produce {
+            Produce::List(elem, _) => Ty::List(elem),
+            Produce::Set(_) => Ty::Set,
+            Produce::Dict(..) => Ty::Dict,
+        };
         let out = self.temp();
         // Loop variables are the comprehension's own; they shadow the
         // function's for the body and are forgotten after.
@@ -1947,35 +2100,66 @@ impl<'m> Lowerer<'m> {
                 name: out,
                 ty: ir(ty),
                 mutability: Mutability::Immutable,
-                initializer: Some(Box::new(self.list_of(Vec::new(), elem, span))),
+                initializer: Some(Box::new(self.list_of(Vec::new(), Elem::Object, span))),
                 span,
             }),
             Type::Unknown,
             span,
         )];
-        // Build innermost first: the append, wrapped in each `if`, wrapped
+        if let Produce::List(elem, _) = produce {
+            statements[0] = TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: out,
+                    ty: ir(ty),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(self.list_of(Vec::new(), elem, span))),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            );
+        }
+        // Build innermost first: the add, wrapped in each `if`, wrapped
         // in each `for`, from the last generator outwards.
-        for g in &c.generators {
+        for g in generators {
             let item_ty = self.ty_of(&g.iter).element().unwrap_or(match &g.iter {
                 py::Expr::Call(call) if types::is_name(&call.func, "range") => Ty::Int,
                 _ => Ty::Object,
             });
             bind_names(&mut self.locals.vars, &g.target, item_ty);
         }
-        let value = self.expr(&c.elt)?;
-        let value = self.coerce(value, elem.ty());
+        let add = match produce {
+            Produce::List(elem, elt) => {
+                let value = self.expr(elt)?;
+                let value = self.coerce(value, elem.ty());
+                method_call(var(out, ty, span), "push", vec![value], Ty::None, span)
+            }
+            Produce::Set(elt) => {
+                let value = self.expr_as(elt, Ty::Object)?;
+                call(
+                    "zb_set_add",
+                    vec![var(out, ty, span), value],
+                    Ty::None,
+                    span,
+                )
+            }
+            Produce::Dict(key, value) => {
+                let k = self.expr_as(key, Ty::Object)?;
+                let v = self.expr_as(value, Ty::Object)?;
+                call(
+                    "zb_dict_set",
+                    vec![var(out, ty, span), k, v],
+                    Ty::None,
+                    span,
+                )
+            }
+        };
         let mut inner: Vec<Stmt> = vec![TypedNode::new(
-            TypedStatement::Expression(Box::new(method_call(
-                var(out, ty, span),
-                "push",
-                vec![value],
-                Ty::None,
-                span,
-            ))),
+            TypedStatement::Expression(Box::new(add)),
             Type::Unknown,
             span,
         )];
-        for g in c.generators.iter().rev() {
+        for g in generators.iter().rev() {
             for cond in g.ifs.iter().rev() {
                 let test = self.expr(cond)?;
                 let condition = self.truthy(test);
@@ -2087,6 +2271,112 @@ impl<'m> Lowerer<'m> {
                                 )),
                             ),
                         )
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::Dict => {
+                let d = receiver.node;
+                let node = match (name, args.len()) {
+                    ("get", 1) => {
+                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        let none = self.coerce(
+                            Val {
+                                node: node(
+                                    TypedExpression::Literal(TypedLiteral::Null),
+                                    Ty::None,
+                                    span,
+                                ),
+                                ty: Ty::None,
+                            },
+                            Ty::Object,
+                        );
+                        call("zb_dict_get_default", vec![d, k, none], Ty::Object, span)
+                    }
+                    ("get", 2) => {
+                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        let default = self.expr_as(&args[1], Ty::Object)?;
+                        call("zb_dict_get_default", vec![d, k, default], Ty::Object, span)
+                    }
+                    ("setdefault", 2) => {
+                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        let v = self.expr_as(&args[1], Ty::Object)?;
+                        call("zb_dict_setdefault", vec![d, k, v], Ty::Object, span)
+                    }
+                    ("pop", 1) => {
+                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        call("zb_dict_pop", vec![d, k], Ty::Object, span)
+                    }
+                    ("pop", 2) => {
+                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        let default = self.expr_as(&args[1], Ty::Object)?;
+                        call("zb_dict_pop_default", vec![d, k, default], Ty::Object, span)
+                    }
+                    ("keys", 0) => call("zb_dict_keys", vec![d], Ty::List(Elem::Object), span),
+                    ("values", 0) => call("zb_dict_values", vec![d], Ty::List(Elem::Object), span),
+                    ("items", 0) => call("zb_dict_items", vec![d], Ty::List(Elem::Object), span),
+                    ("copy", 0) => call("zb_dict_copy", vec![d], Ty::Dict, span),
+                    ("clear", 0) => method_call(d, "clear", vec![], Ty::None, span),
+                    ("update", 1) => {
+                        let other = self.expr_as(&args[0], Ty::Dict)?;
+                        call("zb_dict_update", vec![d, other], Ty::None, span)
+                    }
+                    _ => {
+                        return Err(Error::Unsupported {
+                            what: format!("dict.{name} with {} argument(s)", args.len()),
+                            at: span.start,
+                        })
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::Set => {
+                let st = receiver.node;
+                let node = match (name, args.len()) {
+                    ("add", 1) => {
+                        let v = self.expr_as(&args[0], Ty::Object)?;
+                        call("zb_set_add", vec![st, v], Ty::None, span)
+                    }
+                    ("remove", 1) => {
+                        let v = self.expr_as(&args[0], Ty::Object)?;
+                        call("zb_set_remove", vec![st, v], Ty::None, span)
+                    }
+                    ("discard", 1) => {
+                        let v = self.expr_as(&args[0], Ty::Object)?;
+                        call("zb_set_discard", vec![st, v], Ty::None, span)
+                    }
+                    ("clear", 0) => method_call(st, "clear", vec![], Ty::None, span),
+                    ("copy", 0) => call("zb_list_copy_any", vec![st], Ty::Set, span),
+                    (
+                        "union"
+                        | "intersection"
+                        | "difference"
+                        | "symmetric_difference"
+                        | "issubset"
+                        | "issuperset",
+                        1,
+                    ) => {
+                        let other = self.expr_as(&args[0], Ty::Set)?;
+                        let (f, result) = match name {
+                            "union" => ("zb_set_or", Ty::Set),
+                            "intersection" => ("zb_set_and", Ty::Set),
+                            "difference" => ("zb_set_sub", Ty::Set),
+                            "symmetric_difference" => ("zb_set_xor", Ty::Set),
+                            "issubset" => ("zb_set_issubset", Ty::Bool),
+                            _ => ("zb_set_issubset", Ty::Bool),
+                        };
+                        let args = if name == "issuperset" {
+                            vec![other, st]
+                        } else {
+                            vec![st, other]
+                        };
+                        call(f, args, result, span)
+                    }
+                    _ => {
+                        return Err(Error::Unsupported {
+                            what: format!("set.{name} with {} argument(s)", args.len()),
+                            at: span.start,
+                        })
                     }
                 };
                 Ok(Val { node, ty })
@@ -2230,9 +2520,10 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
-                        Ty::List(_) | Ty::Tuple => {
+                        Ty::List(_) | Ty::Tuple | Ty::Set => {
                             method_call(v.node, "len", vec![], Ty::Int, span)
                         }
+                        Ty::Dict => call("zb_dict_len", vec![v.node], Ty::Int, span),
                         _ => {
                             let o = self.coerce(v, Ty::Object);
                             call("zb_any_len", vec![o], Ty::Int, span)
@@ -2287,6 +2578,42 @@ impl<'m> Lowerer<'m> {
                         ty,
                     });
                 }
+                "dict" => {
+                    let node = match args.first() {
+                        None => call(
+                            "zb_dict_from_pairs",
+                            vec![self.list_of(Vec::new(), Elem::Object, span)],
+                            Ty::Dict,
+                            span,
+                        ),
+                        Some(a) => {
+                            let d = self.expr_as(a, Ty::Dict)?;
+                            call("zb_dict_copy", vec![d], Ty::Dict, span)
+                        }
+                    };
+                    return Ok(Val { node, ty: Ty::Dict });
+                }
+                "set" => {
+                    let items = match args.first() {
+                        None => self.list_of(Vec::new(), Elem::Object, span),
+                        Some(a) => {
+                            let v = self.expr(a)?;
+                            match v.ty {
+                                Ty::List(_) | Ty::Tuple | Ty::Set | Ty::Dict => {
+                                    self.coerce(v, Ty::List(Elem::Object))
+                                }
+                                _ => {
+                                    let o = self.coerce(v, Ty::Object);
+                                    call("zb_any_iter", vec![o], Ty::List(Elem::Object), span)
+                                }
+                            }
+                        }
+                    };
+                    return Ok(Val {
+                        node: call("zb_set_from", vec![items], Ty::Set, span),
+                        ty: Ty::Set,
+                    });
+                }
                 "sorted" | "reversed" | "list" | "tuple" => {
                     let target_elem = match ty {
                         Ty::List(e) => e,
@@ -2338,13 +2665,13 @@ impl<'m> Lowerer<'m> {
                             let v = self.expr(a)?;
                             match v.ty {
                                 Ty::List(_) => v,
-                                Ty::Tuple => Val {
-                                    node: Node {
-                                        ty: ir(Ty::List(Elem::Object)),
-                                        ..v.node
-                                    },
-                                    ty: Ty::List(Elem::Object),
-                                },
+                                Ty::Tuple | Ty::Set | Ty::Dict => {
+                                    let node = self.coerce(v, Ty::List(Elem::Object));
+                                    Val {
+                                        node,
+                                        ty: Ty::List(Elem::Object),
+                                    }
+                                }
                                 Ty::Str => Val {
                                     node: call(
                                         "zb_str_chars",
@@ -2502,6 +2829,8 @@ impl<'m> Lowerer<'m> {
                         Ty::None => str_lit("NoneType", span),
                         Ty::List(_) => str_lit("list", span),
                         Ty::Tuple => str_lit("tuple", span),
+                        Ty::Dict => str_lit("dict", span),
+                        Ty::Set => str_lit("set", span),
                         _ => call("zb_any_type", vec![v.node], Ty::Str, span),
                     };
                     return Ok(Val { node, ty: Ty::Str });

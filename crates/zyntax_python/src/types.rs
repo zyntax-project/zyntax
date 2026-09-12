@@ -31,6 +31,10 @@ pub(crate) enum Ty {
     List(Elem),
     /// A tuple: an immutable list of dynamic values.
     Tuple,
+    /// A dict: keys and values, dynamic, in insertion order.
+    Dict,
+    /// A set of dynamic values.
+    Set,
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -96,7 +100,7 @@ impl Ty {
     pub(crate) fn element(self) -> Option<Ty> {
         match self {
             Ty::List(e) => Some(e.ty()),
-            Ty::Tuple => Some(Ty::Object),
+            Ty::Tuple | Ty::Dict | Ty::Set => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
             _ => None,
         }
@@ -535,6 +539,11 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             }
         }
         py::Operator::Add if l == Ty::Str && r == Ty::Str => Ty::Str,
+        py::Operator::BitAnd | py::Operator::BitOr | py::Operator::Sub | py::Operator::BitXor
+            if l == Ty::Set && r == Ty::Set =>
+        {
+            Ty::Set
+        }
         py::Operator::Add if matches!(l, Ty::List(_)) && l == r => l,
         py::Operator::Add if l == Ty::Tuple && r == Ty::Tuple => Ty::Tuple,
         py::Operator::Mult
@@ -644,6 +653,8 @@ impl Typer<'_> {
                 Ty::List(Elem::of(inner.expr(&c.elt)))
             }
             py::Expr::Tuple(_) => Ty::Tuple,
+            py::Expr::Dict(_) | py::Expr::DictComp(_) => Ty::Dict,
+            py::Expr::Set(_) | py::Expr::SetComp(_) => Ty::Set,
             _ => Ty::Object,
         }
     }
@@ -680,7 +691,7 @@ impl Typer<'_> {
                     "sorted" | "reversed" | "list" => match arg(0) {
                         Ty::List(e) => Ty::List(e),
                         Ty::Str => Ty::List(Elem::Str),
-                        Ty::Tuple => Ty::List(Elem::Object),
+                        Ty::Tuple | Ty::Dict | Ty::Set => Ty::List(Elem::Object),
                         _ => match args.first() {
                             Some(py::Expr::Call(c)) if is_name(&c.func, "range") => {
                                 Ty::List(Elem::Int)
@@ -689,6 +700,8 @@ impl Typer<'_> {
                         },
                     },
                     "tuple" => Ty::Tuple,
+                    "dict" => Ty::Dict,
+                    "set" => Ty::Set,
                     "sum" => match arg(0) {
                         Ty::List(Elem::Int) => Ty::Int,
                         Ty::List(Elem::Float) => Ty::Float,
@@ -737,6 +750,20 @@ impl Typer<'_> {
                     _ => Ty::None,
                 }
             }
+            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Dict => match a.attr.as_str() {
+                "keys" | "values" | "items" => Ty::List(Elem::Object),
+                "copy" => Ty::Dict,
+                "clear" | "update" => Ty::None,
+                _ => Ty::Object,
+            },
+            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Set => match a.attr.as_str() {
+                "add" | "remove" | "discard" | "clear" | "update" => Ty::None,
+                "union" | "intersection" | "difference" | "symmetric_difference" | "copy" => {
+                    Ty::Set
+                }
+                "issubset" | "issuperset" | "isdisjoint" => Ty::Bool,
+                _ => Ty::Object,
+            },
             // A method on a string, when the receiver is known to be one.
             py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Str => match a.attr.as_str() {
                 "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join"

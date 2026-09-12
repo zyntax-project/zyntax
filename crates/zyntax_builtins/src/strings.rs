@@ -53,7 +53,7 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
     (
         "zb_str_cmp",
         &[("a", "str"), ("b", "str")],
-        "i64",
+        "i32",
         "$String$compare",
     ),
     (
@@ -113,6 +113,7 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
 fn ty(name: &str) -> zyntax_typed_ast::Type {
     match name {
         "i64" => i64(),
+        "i32" => i32(),
         "f64" => f64(),
         "bool" => boolean(),
         "str" => string(),
@@ -162,8 +163,8 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
         &[&a, &b],
         boolean(),
         vec![ret(lt(
-            call("zb_str_cmp", vec![a.e(), b.e()], i64()),
-            int(0),
+            call("zb_str_cmp", vec![a.e(), b.e()], i32()),
+            int32(0),
         ))],
     ));
     out.push(define(

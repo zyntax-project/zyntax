@@ -11,6 +11,7 @@
 //! same primitives every frontend's strings rest on.
 
 pub mod build;
+mod dicts;
 mod dynamic;
 mod format;
 pub mod functions;
@@ -48,6 +49,8 @@ pub struct TypeNames {
     pub str: &'static str,
     pub list: &'static str,
     pub tuple: &'static str,
+    pub dict: &'static str,
+    pub set: &'static str,
     pub function: &'static str,
     pub object: &'static str,
 }
@@ -95,6 +98,10 @@ impl Kind {
 /// The box tag of a tuple: a list of dynamic values that prints and
 /// compares as a tuple.
 pub const TUPLE_TAG: i64 = (5 << 8) | 255;
+/// The box tag of a dict: keys and values alternating in one list.
+pub const DICT_TAG: i64 = (6 << 8) | 255;
+/// The box tag of a set: a list of distinct values.
+pub const SET_TAG: i64 = (7 << 8) | 255;
 /// The box tag of a function value: a record of dynamic values, see
 /// [`functions`].
 pub const FUNC_TAG: i64 = (8 << 8) | 255;
@@ -121,6 +128,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(dynamic::declarations(policy, list_type));
     declarations.extend(lists::declarations(policy, list_type));
     declarations.extend(functions::declarations(list_type));
+    declarations.extend(dicts::declarations(list_type));
     Library {
         declarations,
         type_registry: b.registry,
@@ -159,6 +167,8 @@ mod tests {
                 str: "str",
                 list: "list",
                 tuple: "tuple",
+                dict: "dict",
+                set: "set",
                 function: "function",
                 object: "object",
             },

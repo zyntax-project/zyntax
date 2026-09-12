@@ -244,6 +244,20 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(int(0)));
         s
     }));
+    d.push(define(&name("index_or_neg"), &[&xs, &v], i64(), {
+        let mut s = vec![n.decl(len(xs.e()))];
+        s.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![
+                e.decl(el(&xs, i.e())),
+                when((k.eq)(e.e(), v.e()), vec![ret(i.e())]),
+            ],
+        ));
+        s.push(ret(int(-1)));
+        s
+    }));
     d.push(define(&name("contains"), &[&xs, &v], boolean(), {
         let mut s = vec![n.decl(len(xs.e()))];
         s.extend(for_range(

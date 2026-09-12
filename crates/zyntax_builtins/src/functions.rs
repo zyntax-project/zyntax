@@ -103,10 +103,11 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     ));
 
     // One entry point per arity: check the arity, then jump to the code.
+    // The code may keep or return any argument.
     let args: Vec<Local> = (0..MAX_CALL_ARITY)
         .map(|i| {
             let name: &'static str = Box::leak(format!("a{i}").into_boxed_str());
-            local(name, any())
+            owned(name, any())
         })
         .collect();
     let fp_name = |n: usize| format!("zb_unbox_fnptr_raw_{n}");

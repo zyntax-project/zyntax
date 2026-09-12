@@ -5,7 +5,7 @@
 //! category and then does what the typed code does.
 
 use crate::build::*;
-use crate::{list_of, Kind, Policy, FUNC_TAG, TUPLE_TAG};
+use crate::{list_of, Kind, Policy, DICT_TAG, FUNC_TAG, SET_TAG, TUPLE_TAG};
 use zyntax_typed_ast::TypeId;
 
 const NONE: i64 = 0;
@@ -217,6 +217,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         eq(kind(x.e()), int(FUNC_TAG >> 8)),
                         vec![ret(text(names.function))],
                     ),
+                    when(
+                        eq(kind(x.e()), int(DICT_TAG >> 8)),
+                        vec![ret(text(names.dict))],
+                    ),
+                    when(
+                        eq(kind(x.e()), int(SET_TAG >> 8)),
+                        vec![ret(text(names.set))],
+                    ),
                     ret(text(names.list)),
                 ],
             ),
@@ -290,6 +298,9 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     // equal to anything.
     let iter = |x: Expr| call("zb_any_iter", vec![x], anys.clone());
     let is_tuple = |x: Expr| eq(kind(x), int(TUPLE_TAG >> 8));
+    let is_dict = |x: Expr| eq(kind(x), int(DICT_TAG >> 8));
+    let is_set = |x: Expr| eq(kind(x), int(SET_TAG >> 8));
+    let raw_any = |x: Expr| call("zb_unbox_list_raw_any", vec![x], anys.clone());
     d.push(define(
         "zb_any_eq",
         &[&a, &b],
@@ -327,7 +338,39 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![
-                    when(ne(is_tuple(a.e()), is_tuple(b.e())), vec![ret(bool(false))]),
+                    when(
+                        ne(kind(a.e()), kind(b.e())),
+                        vec![
+                            // Lists of different element kinds still compare
+                            // as lists; anything else differs by kind.
+                            when(
+                                or(
+                                    or(is_tuple(a.e()), is_tuple(b.e())),
+                                    or(
+                                        or(is_dict(a.e()), is_dict(b.e())),
+                                        or(is_set(a.e()), is_set(b.e())),
+                                    ),
+                                ),
+                                vec![ret(bool(false))],
+                            ),
+                        ],
+                    ),
+                    when(
+                        is_dict(a.e()),
+                        vec![ret(call(
+                            "zb_dict_eq",
+                            vec![raw_any(a.e()), raw_any(b.e())],
+                            boolean(),
+                        ))],
+                    ),
+                    when(
+                        is_set(a.e()),
+                        vec![ret(call(
+                            "zb_set_eq",
+                            vec![raw_any(a.e()), raw_any(b.e())],
+                            boolean(),
+                        ))],
+                    ),
                     ret(call(
                         "zb_list_eq_any",
                         vec![iter(a.e()), iter(b.e())],
@@ -387,8 +430,25 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(bool(false)),
         ],
     ));
-    // Identity: the singletons compare by category, everything else by
-    // value.
+    // Two boxed heap objects are the same when they hold the same
+    // address; a box's own address means nothing, boxes are made freely.
+    d.push(define(
+        "zb_any_same",
+        &[&a, &b],
+        boolean(),
+        vec![
+            when(
+                or(
+                    ne(category(a.e()), int(CUSTOM)),
+                    ne(category(b.e()), int(CUSTOM)),
+                ),
+                vec![ret(call("zb_any_is", vec![a.e(), b.e()], boolean()))],
+            ),
+            ret(eq(cast(raw_any(a.e()), i64()), cast(raw_any(b.e()), i64()))),
+        ],
+    ));
+    // Identity: the singletons compare by category, heap objects by
+    // address, everything else by value.
     d.push(define(
         "zb_any_is",
         &[&a, &b],
@@ -399,6 +459,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 or(is(&ca, NONE), is(&cb, NONE)),
                 vec![ret(eq(ca.e(), cb.e()))],
+            ),
+            when(
+                and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
+                vec![ret(eq(
+                    cast(raw_any(a.e()), i64()),
+                    cast(raw_any(b.e()), i64()),
+                ))],
             ),
             when(
                 and(is(&ca, BOOL), is(&cb, BOOL)),
@@ -501,7 +568,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(box_i64(sub(int(0), number_i64(x.e(), cat.e())))),
         ],
     ));
-    d.push(define("zb_any_pos", &[&x], any(), vec![ret(x.e())]));
+    let kept = owned("x", any());
+    d.push(define("zb_any_pos", &[&kept], any(), vec![ret(kept.e())]));
     d.push(define(
         "zb_any_invert",
         &[&x],
@@ -647,10 +715,21 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ))],
             ),
             when(
-                ne(cat.e(), int(CUSTOM)),
+                or(
+                    ne(cat.e(), int(CUSTOM)),
+                    eq(kind(x.e()), int(FUNC_TAG >> 8)),
+                ),
                 vec![type_error(add(
                     quoted(type_name(x.e())),
                     text(" object is not iterable"),
+                ))],
+            ),
+            when(
+                is_dict(x.e()),
+                vec![ret(call(
+                    "zb_dict_keys",
+                    vec![raw_any(x.e())],
+                    anys.clone(),
                 ))],
             ),
             when(
@@ -704,6 +783,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     string(),
                 ))],
             ),
+            when(
+                is_dict(x.e()),
+                vec![ret(call("zb_dict_repr", vec![raw_any(x.e())], string()))],
+            ),
+            when(
+                is_set(x.e()),
+                vec![ret(call("zb_set_repr", vec![raw_any(x.e())], string()))],
+            ),
             ret(repr_of(Kind::Any, x.e())),
         ],
     ));
@@ -725,11 +812,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 kind_is(Kind::Str, x.e()),
                 vec![ret(len_of(Kind::Str, x.e()))],
             ),
+            when(
+                is_dict(x.e()),
+                vec![ret(call("zb_dict_len", vec![raw_any(x.e())], i64()))],
+            ),
             ret(len_of(Kind::Any, x.e())),
         ],
     ));
     let i = local("i", any());
-    let v = local("v", any());
     let index = |i: Expr| call("zb_any_int", vec![i], i64());
     d.push(define(
         "zb_any_getitem",
@@ -752,6 +842,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     text(" object is not subscriptable"),
                 ))],
             ),
+            when(
+                is_dict(x.e()),
+                vec![ret(call("zb_dict_get", vec![raw_any(x.e()), i.e()], any()))],
+            ),
             ret(call(
                 "zb_list_get_any",
                 vec![iter(x.e()), index(i.e())],
@@ -760,11 +854,24 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ],
     ));
     let mutable_list = |x: Expr| and(eq(category(x.clone()), int(CUSTOM)), kind_is(Kind::Any, x));
+    let boxed_dict = |x: Expr| and(eq(category(x.clone()), int(CUSTOM)), is_dict(x));
+    let v = owned("v", any());
     d.push(define(
         "zb_any_setitem",
         &[&x, &i, &v],
         unit(),
         vec![
+            when(
+                boxed_dict(x.e()),
+                vec![
+                    expr(call(
+                        "zb_dict_set",
+                        vec![raw_any(x.e()), i.e(), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
             when(
                 not(mutable_list(x.e())),
                 vec![type_error(add(
@@ -785,6 +892,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x, &i],
         unit(),
         vec![
+            when(
+                boxed_dict(x.e()),
+                vec![
+                    expr(call("zb_dict_del", vec![raw_any(x.e()), i.e()], unit())),
+                    ret_void(),
+                ],
+            ),
             when(
                 not(mutable_list(x.e())),
                 vec![type_error(add(

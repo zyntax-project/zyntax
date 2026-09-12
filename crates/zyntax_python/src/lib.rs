@@ -63,6 +63,8 @@ const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
         str: "str",
         list: "list",
         tuple: "tuple",
+        dict: "dict",
+        set: "set",
         function: "function",
         object: "object",
     },
