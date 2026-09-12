@@ -4685,7 +4685,7 @@ impl CraneliftBackend {
                             // Special case: single-field struct being returned by value
                             // In this case, the struct is flattened and we just return the value
                             if let HirType::Struct(struct_ty) = &current_type {
-                                if struct_ty.fields.len() == 1
+                                if struct_carried_as_its_field(struct_ty).is_some()
                                     && indices.len() == 1
                                     && indices[0] == 0
                                 {
