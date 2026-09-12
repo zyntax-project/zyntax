@@ -447,15 +447,20 @@ fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
             )],
             span,
         ),
-        ret(call("zb_unbox_instance_raw", vec![x], Ty::Int, span), span),
+        ret(
+            lower::addr_call("zb_unbox_instance_raw", vec![x], span),
+            span,
+        ),
     ];
-    function(
+    let mut f = function(
         &format!("{}$unbox", class.name),
         vec![param("x", Ty::Object, span)],
         Ty::Int,
         statements,
         span,
-    )
+    );
+    f.return_type = lower::addr_type();
+    f
 }
 
 /// `Owner$m$dispatch(self, args)`: the override for the instance's
@@ -544,7 +549,7 @@ fn per_class(
         if !pick(c) {
             continue;
         }
-        let address = call("zb_unbox_instance_raw", vec![x.clone()], Ty::Int, span);
+        let address = lower::addr_call("zb_unbox_instance_raw", vec![x.clone()], span);
         let obj = cast(address, Ty::Class(c as u16), span);
         let mut then = vec![let_("obj", Ty::Class(c as u16), obj, span)];
         then.extend(body(

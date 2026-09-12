@@ -32,6 +32,10 @@ pub fn i32() -> Type {
 pub fn f64() -> Type {
     Type::Primitive(PrimitiveType::F64)
 }
+/// An address as a number, sized by the target.
+pub fn usize() -> Type {
+    Type::Primitive(PrimitiveType::USize)
+}
 pub fn boolean() -> Type {
     Type::Primitive(PrimitiveType::Bool)
 }

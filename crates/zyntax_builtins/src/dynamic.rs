@@ -508,7 +508,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ),
                 vec![ret(call("zb_any_is", vec![a.e(), b.e()], boolean()))],
             ),
-            ret(eq(cast(raw_any(a.e()), i64()), cast(raw_any(b.e()), i64()))),
+            ret(eq(
+                cast(raw_any(a.e()), usize()),
+                cast(raw_any(b.e()), usize()),
+            )),
         ],
     ));
     // Identity: the singletons compare by category, heap objects by
@@ -527,8 +530,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![ret(eq(
-                    cast(raw_any(a.e()), i64()),
-                    cast(raw_any(b.e()), i64()),
+                    cast(raw_any(a.e()), usize()),
+                    cast(raw_any(b.e()), usize()),
                 ))],
             ),
             when(

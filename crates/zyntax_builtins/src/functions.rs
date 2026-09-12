@@ -50,7 +50,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
     let mut d = vec![extern_fn(
         "zb_box_fnptr_raw",
-        &[("f", i64()), ("tag", i32())],
+        &[("f", usize()), ("tag", i32())],
         any(),
         Some("zyntax_box_ptr"),
     )];
@@ -59,7 +59,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     // environment it reads back when it starts.
     d.push(extern_fn(
         "zb_fiber_new_raw",
-        &[("code", i64()), ("env", any()), ("stack", i64())],
+        &[("code", usize()), ("env", any()), ("stack", i64())],
         fiber_type(),
         Some("krio_fiber_new_with_env"),
     ));
@@ -69,7 +69,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         any(),
         Some("krio_fiber_env"),
     ));
-    let code = local("code", i64());
+    let code = local("code", usize());
     let env = owned("env", any());
     d.push(define(
         "zb_fiber_start",
@@ -83,7 +83,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     ));
 
     // A record from a code address, an arity and the shared cells.
-    let code = local("code", i64());
+    let code = local("code", usize());
     let arity = local("arity", i64());
     let cells = local("cells", anys.clone());
     let rec = local("rec", anys.clone());

@@ -271,6 +271,42 @@ fn op_text(op: py::Operator) -> &'static str {
     }
 }
 
+/// An address as a number, sized by the target.
+pub(crate) fn addr_type() -> Type {
+    Type::Primitive(PrimitiveType::USize)
+}
+
+/// The address of function `name`.
+pub(crate) fn code_of(name: &str, span: Span) -> Node {
+    TypedNode::new(TypedExpression::Variable(intern(name)), addr_type(), span)
+}
+
+/// `value` as an address.
+pub(crate) fn as_addr(value: Node, span: Span) -> Node {
+    TypedNode::new(
+        TypedExpression::Cast(TypedCast {
+            expr: Box::new(value),
+            target_type: addr_type(),
+        }),
+        addr_type(),
+        span,
+    )
+}
+
+/// A call whose result is an address.
+pub(crate) fn addr_call(name: &str, args: Vec<Node>, span: Span) -> Node {
+    TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(var(intern(name), Ty::Unknown, span)),
+            positional_args: args,
+            named_args: Vec::new(),
+            type_args: Vec::new(),
+        }),
+        addr_type(),
+        span,
+    )
+}
+
 pub(crate) fn int32_lit(v: i32, span: Span) -> Node {
     node(
         TypedExpression::Literal(TypedLiteral::Integer(v as i128)),
@@ -1095,7 +1131,7 @@ impl<'m> Lowerer<'m> {
             // An instance is boxed as its address under the class tag, and
             // read back with a check; a subclass instance is its base.
             (Ty::Class(k), Ty::Object) => {
-                let address = cast(v.node, Ty::Int, span);
+                let address = as_addr(v.node, span);
                 call(
                     "zb_box_instance_raw",
                     vec![
@@ -1107,10 +1143,9 @@ impl<'m> Lowerer<'m> {
                 )
             }
             (Ty::Object, Ty::Class(k)) => {
-                let address = call(
+                let address = addr_call(
                     &format!("{}$unbox", self.module.classes[k as usize].name),
                     vec![v.node],
-                    Ty::Int,
                     span,
                 );
                 cast(address, target, span)
@@ -4626,7 +4661,7 @@ impl<'m> Lowerer<'m> {
         Val {
             node: call(
                 "zb_fiber_start",
-                vec![var(intern(code), Ty::Int, span), env],
+                vec![code_of(code, span), env],
                 Ty::Gen,
                 span,
             ),
@@ -5077,11 +5112,7 @@ impl<'m> Lowerer<'m> {
         Val {
             node: call(
                 "zb_func_new",
-                vec![
-                    var(intern(code), Ty::Int, span),
-                    int_lit(arity as i64, span),
-                    cells,
-                ],
+                vec![code_of(code, span), int_lit(arity as i64, span), cells],
                 Ty::Object,
                 span,
             ),
