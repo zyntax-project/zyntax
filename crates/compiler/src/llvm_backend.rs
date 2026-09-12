@@ -4466,11 +4466,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                 let new_size = self.get_value(args[1])?;
 
                 // Declare or get realloc function: declare ptr @realloc(ptr, i64)
-                let realloc_fn = self.module.get_function("realloc").unwrap_or_else(|| {
+                let realloc_fn = self.module.get_function("zyntax_realloc").unwrap_or_else(|| {
                     let ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
                     let i64_type = self.context.i64_type();
                     let fn_type = ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
-                    self.module.add_function("realloc", fn_type, None)
+                    self.module.add_function("zyntax_realloc", fn_type, None)
                 });
 
                 let call_site = self.builder.build_call(

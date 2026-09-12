@@ -132,6 +132,7 @@ impl BuiltinRegistry {
         reg.register(Arc::new(FiberClass));
         reg.register(Arc::new(VectorClass));
         reg.register(Arc::new(NumberClass));
+        reg.register(Arc::new(ListClass));
         reg
     }
 
@@ -411,4 +412,86 @@ fn ssa_unary(
     kind: crate::hir::VectorUnaryKind,
 ) -> CompilerResult<HirId> {
     ssa.emit_vector_unary(block_id, receiver, kind)
+}
+
+/// The growable list, `List<T>` or an array of no fixed size. Owns the
+/// operations that change a list's header: length, growth, insertion
+/// and removal. Element access is the index expression; searching,
+/// sorting and printing are written in the language over these.
+pub struct ListClass;
+
+impl BuiltinClass for ListClass {
+    fn name(&self) -> &str {
+        "List"
+    }
+
+    fn matches(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Array { size: None, .. })
+    }
+
+    fn dispatch(
+        &self,
+        ssa: &mut crate::ssa::SsaBuilder,
+        block_id: HirId,
+        method: &str,
+        receiver: &TypedNode<TypedExpression>,
+        receiver_ty: &Type,
+        args: &[TypedNode<TypedExpression>],
+        _result_ty: &Type,
+    ) -> CompilerResult<Option<HirId>> {
+        let Type::Array { element_type, .. } = receiver_ty else {
+            return Ok(None);
+        };
+        let elem = element_type.as_ref();
+        let arity = |n: usize| -> CompilerResult<()> {
+            if args.len() == n {
+                Ok(())
+            } else {
+                Err(crate::CompilerError::Lowering(format!(
+                    "List.{method} takes {n} argument(s), {} given",
+                    args.len()
+                )))
+            }
+        };
+        match method {
+            "len" | "length" => {
+                arity(0)?;
+                ssa.emit_list_count(block_id, receiver).map(Some)
+            }
+            "push" | "append" => {
+                arity(1)?;
+                ssa.emit_list_push(block_id, receiver, elem, &args[0])
+                    .map(Some)
+            }
+            "pop_last" => {
+                arity(0)?;
+                ssa.emit_list_pop(block_id, receiver, elem).map(Some)
+            }
+            "insert_at" => {
+                arity(2)?;
+                ssa.emit_list_insert_at(block_id, receiver, elem, &args[0], &args[1])
+                    .map(Some)
+            }
+            "remove_at" => {
+                arity(1)?;
+                ssa.emit_list_remove_at(block_id, receiver, elem, &args[0])
+                    .map(Some)
+            }
+            "clear" => {
+                arity(0)?;
+                ssa.emit_list_clear(block_id, receiver).map(Some)
+            }
+            "reserve" => {
+                arity(1)?;
+                ssa.emit_list_reserve(block_id, receiver, elem, &args[0])
+                    .map(Some)
+            }
+            "truncate" => {
+                arity(1)?;
+                ssa.emit_list_truncate(block_id, receiver, &args[0])
+                    .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
 }

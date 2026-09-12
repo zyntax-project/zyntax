@@ -1743,6 +1743,23 @@ pub unsafe extern "C" fn zyntax_box_str(s: *mut u8) -> *mut DynamicBoxRepr {
     }))
 }
 
+/// Box a pointer by reference under a tag of the caller's choosing: the
+/// box carries the pointer and owns nothing. For a frontend's own
+/// heap types, whose tags it defines and reads back itself.
+///
+/// # Safety
+/// `p` must stay valid for as long as the box is read.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_ptr(p: *mut u8, tag: u32) -> *mut DynamicBoxRepr {
+    Box::into_raw(Box::new(DynamicBoxRepr {
+        tag,
+        size: std::mem::size_of::<*mut u8>() as u32,
+        data: p,
+        dropper: None,
+        display_fn: None,
+    }))
+}
+
 /// Borrow the bytes a `zyntax_box_opaque` box holds.
 ///
 /// The pointer stays owned by the box, so it is valid until the box is
@@ -1976,6 +1993,7 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("zyntax_box_f64", zyntax_box_f64 as *const u8, 1),
         ("zyntax_box_bool", zyntax_box_bool as *const u8, 1),
         ("zyntax_box_str", zyntax_box_str as *const u8, 1),
+        ("zyntax_box_ptr", zyntax_box_ptr as *const u8, 2),
         ("zyntax_box_opaque", zyntax_box_opaque as *const u8, 3),
         (
             "zyntax_box_get_opaque",

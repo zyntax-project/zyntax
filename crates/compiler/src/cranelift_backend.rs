@@ -2848,9 +2848,81 @@ impl CraneliftBackend {
                                                     .to_string(),
                                             ));
                                         }
-                                        _ => {
-                                            // Other intrinsics not implemented yet
-                                            continue;
+                                        Intrinsic::Realloc => {
+                                            if arg_values.len() < 2 {
+                                                return Err(CompilerError::Backend(
+                                                    "realloc requires pointer and size arguments"
+                                                        .into(),
+                                                ));
+                                            }
+                                            let ptr_ty = self.module.target_config().pointer_type();
+                                            let mut sig = self.module.make_signature();
+                                            sig.params.push(AbiParam::new(ptr_ty));
+                                            sig.params.push(AbiParam::new(ptr_ty));
+                                            sig.returns.push(AbiParam::new(ptr_ty));
+                                            let realloc_id = self
+                                                .module
+                                                .declare_function(
+                                                    "zyntax_realloc",
+                                                    Linkage::Import,
+                                                    &sig,
+                                                )
+                                                .map_err(|e| {
+                                                    CompilerError::Backend(format!(
+                                                        "Failed to declare zyntax_realloc: {e}"
+                                                    ))
+                                                })?;
+                                            let local = self
+                                                .module
+                                                .declare_func_in_func(realloc_id, builder.func);
+                                            let call = builder
+                                                .ins()
+                                                .call(local, &[arg_values[0], arg_values[1]]);
+                                            builder.inst_results(call)[0]
+                                        }
+                                        Intrinsic::Memcpy | Intrinsic::Memmove => {
+                                            if arg_values.len() != 3 {
+                                                return Err(CompilerError::Backend(format!(
+                                                    "{intrinsic:?} requires 3 arguments"
+                                                )));
+                                            }
+                                            let (dst, src, size) =
+                                                (arg_values[0], arg_values[1], arg_values[2]);
+                                            if matches!(intrinsic, Intrinsic::Memcpy) {
+                                                builder.call_memcpy(
+                                                    self.module.target_config(),
+                                                    dst,
+                                                    src,
+                                                    size,
+                                                );
+                                            } else {
+                                                builder.call_memmove(
+                                                    self.module.target_config(),
+                                                    dst,
+                                                    src,
+                                                    size,
+                                                );
+                                            }
+                                            dst
+                                        }
+                                        Intrinsic::Memset => {
+                                            if arg_values.len() != 3 {
+                                                return Err(CompilerError::Backend(
+                                                    "memset requires 3 arguments".into(),
+                                                ));
+                                            }
+                                            builder.call_memset(
+                                                self.module.target_config(),
+                                                arg_values[0],
+                                                arg_values[1],
+                                                arg_values[2],
+                                            );
+                                            arg_values[0]
+                                        }
+                                        other => {
+                                            return Err(CompilerError::Backend(format!(
+                                                "intrinsic {other:?} has no lowering in this backend"
+                                            )));
                                         }
                                     };
 
@@ -6860,10 +6932,10 @@ impl CraneliftBackend {
         sig.params.push(AbiParam::new(ptr_ty));
         sig.returns.push(AbiParam::new(ptr_ty));
 
-        // Declare realloc as an external function
+        // The pool that served the malloc resizes it.
         let realloc_id = self
             .module
-            .declare_function("realloc", Linkage::Import, &sig)
+            .declare_function("zyntax_realloc", Linkage::Import, &sig)
             .map_err(|e| CompilerError::Backend(format!("Failed to declare realloc: {}", e)))?;
 
         // Import the function into the current function

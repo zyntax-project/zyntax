@@ -366,6 +366,72 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     });
 }
 
+/// The usable size of a block from [`zyntax_alloc`], or `None` for a
+/// pointer this pool did not hand out.
+///
+/// # Safety
+/// `ptr` must have come from [`zyntax_alloc`].
+unsafe fn usable_size(ptr: *mut u8) -> Option<usize> {
+    if !could_be_ours(ptr) {
+        return None;
+    }
+    let head = ptr.sub(HEADER) as *const Header;
+    if (*head).magic == MAGIC && (*head).class & LARGE_MARK != 0 {
+        return Some(((*head).class & !LARGE_MARK) - HEADER);
+    }
+    let slab = slab_of(ptr);
+    if (*slab).magic == MAGIC && (*slab).class & LARGE_MARK == 0 {
+        Some(slot_bytes((*slab).class))
+    } else {
+        None
+    }
+}
+
+/// Resize a block from [`zyntax_alloc`] to `new_size` bytes, keeping
+/// its contents up to the smaller of the two sizes. A block that already
+/// has room is returned as it is; a null pointer allocates.
+///
+/// # Safety
+/// `ptr` must be null or have come from [`zyntax_alloc`], and must not
+/// be used afterwards except through the returned pointer.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    if ptr.is_null() {
+        return zyntax_alloc(new_size);
+    }
+    let Some(have) = usable_size(ptr) else {
+        // Not this pool's: let the allocator that owns it resize it.
+        return libc_realloc(ptr, new_size);
+    };
+    if have >= new_size {
+        return ptr;
+    }
+    let fresh = zyntax_alloc(new_size);
+    if fresh.is_null() {
+        return fresh;
+    }
+    std::ptr::copy_nonoverlapping(ptr, fresh, have.min(new_size));
+    zyntax_free(ptr);
+    fresh
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn libc_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    extern "C" {
+        fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+    }
+    realloc(ptr as *mut core::ffi::c_void, new_size) as *mut u8
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn libc_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    let fresh = zyntax_alloc(new_size);
+    if !fresh.is_null() {
+        std::ptr::copy_nonoverlapping(ptr, fresh, new_size);
+    }
+    fresh
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn libc_free(ptr: *mut u8) {
     extern "C" {
@@ -387,6 +453,7 @@ unsafe fn libc_free(_ptr: *mut u8) {}
 pub fn alloc_runtime_symbols() -> Vec<(&'static str, *const u8)> {
     vec![
         ("zyntax_alloc", zyntax_alloc as *const u8),
+        ("zyntax_realloc", zyntax_realloc as *const u8),
         ("zyntax_free", zyntax_free as *const u8),
     ]
 }
@@ -394,6 +461,30 @@ pub fn alloc_runtime_symbols() -> Vec<(&'static str, *const u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Growing keeps the bytes, whether the block stays pooled or
+    /// crosses into a large allocation.
+    #[test]
+    fn realloc_keeps_contents_across_classes() {
+        unsafe {
+            let p = zyntax_alloc(24);
+            for i in 0..24u8 {
+                *p.add(i as usize) = i;
+            }
+            let q = zyntax_realloc(p, 40);
+            for i in 0..24u8 {
+                assert_eq!(*q.add(i as usize), i);
+            }
+            let big = zyntax_realloc(q, 100_000);
+            for i in 0..24u8 {
+                assert_eq!(*big.add(i as usize), i);
+            }
+            let same = zyntax_realloc(big, 50_000);
+            assert_eq!(same, big, "shrinking keeps the block");
+            zyntax_free(same);
+            assert!(!zyntax_realloc(std::ptr::null_mut(), 8).is_null());
+        }
+    }
 
     /// A block comes back usable, and its bytes are its own.
     #[test]

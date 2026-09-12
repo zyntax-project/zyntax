@@ -117,6 +117,15 @@ fn default_const_for(ty: &HirType) -> crate::hir::HirConstant {
 // Shared with `drop_glue`, which reads a field back out of the layout
 // this computes. The two have to agree on where a field sits or a
 // release reads one from the wrong offset.
+/// The `{ data, len, capacity }` header every list value points at.
+pub(crate) fn list_header_type() -> HirType {
+    HirType::Struct(crate::hir::HirStructType {
+        name: Some(InternedString::new_global("List")),
+        fields: vec![HirType::I64, HirType::I64, HirType::I64],
+        packed: false,
+    })
+}
+
 pub(crate) fn hir_ty_size(ty: &HirType) -> usize {
     match ty {
         HirType::Bool | HirType::I8 | HirType::U8 => 1,
@@ -230,6 +239,10 @@ pub struct SsaBuilder {
     /// then reads it back 8 bytes at a time. The annotation is the
     /// authority, so the binding pushes it down here.
     expected_elem_ty: Option<Type>,
+    /// Whether the literal being translated is bound to a growable list
+    /// (`let xs: List<T> = [...]`, or a `List<T>` parameter), and so
+    /// belongs on the heap.
+    expected_growable: bool,
     /// Continuation block for control flow expressions (if/match)
     /// When set, indicates that control flow has branched and this is the merge/end block
     continuation_block: Option<HirId>,
@@ -598,6 +611,14 @@ fn default_intrinsic_alias_map() -> IndexMap<InternedString, crate::hir::Intrins
         InternedString::new_global("abs"),
         crate::hir::Intrinsic::Fabs,
     );
+    m.insert(
+        InternedString::new_global("pow"),
+        crate::hir::Intrinsic::Pow,
+    );
+    m.insert(
+        InternedString::new_global("floor"),
+        crate::hir::Intrinsic::Floor,
+    );
     // `free(p)` releases an `alloc<T>` buffer (ML roadmap Phase 0.3),
     // rewritten to a direct `Intrinsic::Free` call. `alloc` needs the
     // element type for sizing so it goes through `try_emit_simd_intrinsic`;
@@ -660,6 +681,7 @@ impl SsaBuilder {
             idf_placement_done: false,
             match_context: None,
             expected_elem_ty: None,
+            expected_growable: false,
             continuation_block: None,
             original_return_type: None,
             address_taken_vars: HashSet::new(),
@@ -709,6 +731,7 @@ impl SsaBuilder {
             idf_placement_done: false,
             match_context: None,
             expected_elem_ty: None,
+            expected_growable: false,
             continuation_block: None,
             original_return_type: None,
             address_taken_vars: HashSet::new(),
@@ -1651,6 +1674,20 @@ impl SsaBuilder {
     /// Accepts both shapes the front-end produces: a raw `Type::Array`
     /// and the `List<T>` / `Array<T>` spelling that resolves to a
     /// `Type::Named` naming the prelude type.
+    /// Whether a declared type is a growable list.
+    fn declares_list(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Array { size: None, .. } => true,
+            Type::Optional(inner) => self.declares_list(inner),
+            Type::Named { id, .. } => self
+                .type_registry
+                .get_type_by_id(*id)
+                .and_then(|td| td.name.resolve_global())
+                .is_some_and(|n| n == "List"),
+            _ => false,
+        }
+    }
+
     fn declared_element_type(&self, ty: &Type) -> Option<Type> {
         let concrete = |t: &Type| {
             if matches!(t, Type::Any | Type::Unknown) {
@@ -2214,9 +2251,12 @@ impl SsaBuilder {
                     // the annotation has to reach it before it decides
                     // its layout. See `expected_elem_ty`.
                     let saved_expected = self.expected_elem_ty.take();
+                    let saved_growable = self.expected_growable;
                     self.expected_elem_ty = self.declared_element_type(&let_stmt.ty);
+                    self.expected_growable = self.declares_list(&let_stmt.ty);
                     let translated = self.translate_expression(block_id, value);
                     self.expected_elem_ty = saved_expected;
+                    self.expected_growable = saved_growable;
                     let value_id = translated?;
 
                     // Check if a try expression set a continuation block
@@ -2260,7 +2300,18 @@ impl SsaBuilder {
                     } else {
                         let_stmt.ty.clone()
                     };
-                    let hir_type = self.convert_type(&effective_ty);
+                    // A binding with no annotation and no resolvable
+                    // typed-AST type has the type of the value it holds.
+                    let hir_type = if matches!(effective_ty, Type::Any | Type::Unknown) {
+                        self.function
+                            .values
+                            .get(&value_id)
+                            .map(|v| v.ty.clone())
+                            .filter(|t| !matches!(t, HirType::Void))
+                            .unwrap_or_else(|| self.convert_type(&effective_ty))
+                    } else {
+                        self.convert_type(&effective_ty)
+                    };
                     self.var_types.insert(let_stmt.name, hir_type.clone());
 
                     // For TypedAST type, use initializer's type if variable type is Any/Unknown
@@ -3601,6 +3652,14 @@ impl SsaBuilder {
                     log::trace!("[SSA] Variable {:?} found in scope -> {:?}", name, value_id);
                     return Ok(value_id);
                 }
+                // A local defined in an earlier block is still the local:
+                // it reaches here through a phi, and shadows any function
+                // or constructor spelled the same.
+                let is_local = self.var_types.contains_key(name)
+                    || self.variable_writes.values().any(|w| w.contains(name));
+                if is_local {
+                    return Ok(self.read_variable(*name, block_id));
+                }
 
                 log::trace!("[SSA] Variable {:?} NOT found by try_read_variable!", name);
 
@@ -3802,7 +3861,12 @@ impl SsaBuilder {
                         .predecessors
                         .push(rhs_exit_block_id);
 
-                    let result_type = self.convert_type(&expr.ty);
+                    // The merge of a short-circuit is a bool; a node typed
+                    // dynamic or left untyped does not change that.
+                    let result_type = match &expr.ty {
+                        Type::Primitive(_) => self.convert_type(&expr.ty),
+                        _ => HirType::Bool,
+                    };
                     let result = self.create_value(result_type.clone(), HirValueKind::Instruction);
                     self.function
                         .blocks
@@ -3965,18 +4029,38 @@ impl SsaBuilder {
                     };
                 }
 
-                // For comparisons, use the operand type (not Bool result type) for the instruction
-                let inst_type = match hir_op {
+                // A comparison's value is a bool whatever the node was typed
+                // as; its instruction runs at the operand type so the
+                // backend knows the signedness.
+                let comparison = matches!(
+                    hir_op,
                     crate::hir::BinaryOp::Lt
-                    | crate::hir::BinaryOp::Le
-                    | crate::hir::BinaryOp::Gt
-                    | crate::hir::BinaryOp::Ge
-                    | crate::hir::BinaryOp::Eq
-                    | crate::hir::BinaryOp::Ne => {
-                        // Use the left operand type so cranelift can determine signed/unsigned
-                        self.convert_type(&left.ty)
+                        | crate::hir::BinaryOp::Le
+                        | crate::hir::BinaryOp::Gt
+                        | crate::hir::BinaryOp::Ge
+                        | crate::hir::BinaryOp::Eq
+                        | crate::hir::BinaryOp::Ne
+                        | crate::hir::BinaryOp::FLt
+                        | crate::hir::BinaryOp::FLe
+                        | crate::hir::BinaryOp::FGt
+                        | crate::hir::BinaryOp::FGe
+                        | crate::hir::BinaryOp::FEq
+                        | crate::hir::BinaryOp::FNe
+                );
+                let result_type = if comparison {
+                    HirType::Bool
+                } else {
+                    result_type
+                };
+                let inst_type = if comparison {
+                    // The operand's own type decides the signedness of the
+                    // compare; the node's type is what the frontend guessed.
+                    match self.function.values.get(&left_val).map(|v| v.ty.clone()) {
+                        Some(t) if !matches!(t, HirType::Void | HirType::Opaque(_)) => t,
+                        _ => self.convert_type(&left.ty),
                     }
-                    _ => result_type.clone(),
+                } else {
+                    result_type.clone()
                 };
 
                 // Float-op + integer-result-type mismatch: the typed AST
@@ -4072,6 +4156,42 @@ impl SsaBuilder {
                 // first non-int operand.
                 let (left_val, right_val) =
                     self.normalize_int_binary_operands(block_id, left_val, right_val);
+
+                // The result of integer arithmetic is as wide as its
+                // operands are computed at. When the typed AST declares a
+                // wider result (`i * i` bound to an i64), the operands are
+                // widened first so the operation happens at that width;
+                // when it declares a narrower one, the operands decide.
+                let is_comparison = matches!(
+                    hir_op,
+                    crate::hir::BinaryOp::Eq
+                        | crate::hir::BinaryOp::Ne
+                        | crate::hir::BinaryOp::Lt
+                        | crate::hir::BinaryOp::Le
+                        | crate::hir::BinaryOp::Gt
+                        | crate::hir::BinaryOp::Ge
+                );
+                let (left_val, right_val, result_type, inst_type) = if is_comparison {
+                    (left_val, right_val, result_type, inst_type)
+                } else {
+                    let operand_ty = self.function.values.get(&left_val).map(|v| v.ty.clone());
+                    match (
+                        operand_ty.as_ref().and_then(Self::int_type_width_and_sign),
+                        Self::int_type_width_and_sign(&result_type),
+                        operand_ty,
+                    ) {
+                        (Some((ow, _)), Some((rw, _)), Some(_)) if rw > ow => {
+                            let l = self.coerce_scalar_to(block_id, left_val, &result_type);
+                            let r = self.coerce_scalar_to(block_id, right_val, &result_type);
+                            (l, r, result_type.clone(), result_type)
+                        }
+                        (Some((ow, _)), Some((rw, _)), Some(oty)) if rw < ow => {
+                            (left_val, right_val, oty.clone(), oty)
+                        }
+                        (Some(_), Some(_), Some(oty)) => (left_val, right_val, result_type, oty),
+                        _ => (left_val, right_val, result_type, inst_type),
+                    }
+                };
 
                 // A float op is as wide as the operands it is given, and
                 // the typed AST does not always agree: adding two `f32`
@@ -4899,11 +5019,14 @@ impl SsaBuilder {
                         // apart, which no coercion afterwards can undo.
                         // Same reasoning as the annotated binding.
                         let saved_expected = self.expected_elem_ty.take();
+                        let saved_growable = self.expected_growable;
                         if let Some(params) = &declared_params {
                             self.expected_elem_ty = self.declared_element_type(&params[i]);
+                            self.expected_growable = self.declares_list(&params[i]);
                         }
                         let value = self.translate_operand(&mut block_id, arg);
                         self.expected_elem_ty = saved_expected;
+                        self.expected_growable = saved_growable;
                         let value = value?;
                         let value = match &declared_params {
                             Some(params) => {
@@ -6093,22 +6216,45 @@ impl SsaBuilder {
                 let elem_size = hir_ty_size(&elem_ty);
                 let num_elements = elements.len();
 
+                // A literal declared as a list lives on the heap, since a
+                // list grows and outlives the frame that built it. A
+                // fixed-size array stays on the stack.
+                let growable = self.expected_growable || self.declares_list(&expr.ty);
+                // A nested literal decides for itself.
+                self.expected_growable = false;
+                let capacity = if growable {
+                    num_elements.max(4)
+                } else {
+                    num_elements
+                };
+
                 // Step 1: Allocate element data buffer
                 let data_buf_size = num_elements * elem_size;
                 let data_alloc_ty = HirType::Array(Box::new(elem_ty.clone()), num_elements as u64);
-                let data_ptr = self.create_value(
-                    HirType::Ptr(Box::new(elem_ty.clone())),
-                    HirValueKind::Instruction,
-                );
-                self.add_instruction(
-                    block_id,
-                    HirInstruction::Alloca {
-                        result: data_ptr,
-                        ty: data_alloc_ty,
-                        count: None,
-                        align: elem_size.min(8) as u32,
-                    },
-                );
+                let data_ptr = if growable {
+                    let bytes = self.i64_const((capacity * elem_size.max(1)) as i64);
+                    self.emit_intrinsic(
+                        block_id,
+                        crate::hir::Intrinsic::Malloc,
+                        vec![bytes],
+                        &HirType::Ptr(Box::new(elem_ty.clone())),
+                    )
+                } else {
+                    let data_ptr = self.create_value(
+                        HirType::Ptr(Box::new(elem_ty.clone())),
+                        HirValueKind::Instruction,
+                    );
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Alloca {
+                            result: data_ptr,
+                            ty: data_alloc_ty,
+                            count: None,
+                            align: elem_size.min(8) as u32,
+                        },
+                    );
+                    data_ptr
+                };
 
                 // Pool-allocation eligibility: `elem_ty` is `Ptr(Struct(..))`
                 // (every element is an `@reference` class) AND every
@@ -6230,19 +6376,30 @@ impl SsaBuilder {
                     fields: vec![HirType::I64, HirType::I64, HirType::I64],
                     packed: false,
                 });
-                let list_alloc = self.create_value(
-                    HirType::Ptr(Box::new(list_struct_ty.clone())),
-                    HirValueKind::Instruction,
-                );
-                self.add_instruction(
-                    block_id,
-                    HirInstruction::Alloca {
-                        result: list_alloc,
-                        ty: list_struct_ty,
-                        count: None,
-                        align: 8,
-                    },
-                );
+                let list_alloc = if growable {
+                    let bytes = self.i64_const(24);
+                    self.emit_intrinsic(
+                        block_id,
+                        crate::hir::Intrinsic::Malloc,
+                        vec![bytes],
+                        &HirType::Ptr(Box::new(list_struct_ty.clone())),
+                    )
+                } else {
+                    let list_alloc = self.create_value(
+                        HirType::Ptr(Box::new(list_struct_ty.clone())),
+                        HirValueKind::Instruction,
+                    );
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Alloca {
+                            result: list_alloc,
+                            ty: list_struct_ty,
+                            count: None,
+                            align: 8,
+                        },
+                    );
+                    list_alloc
+                };
 
                 // Store the data pointer (field 0) directly as a pointer
                 // value. Symmetric to the load side: the previous PtrToInt
@@ -6295,7 +6452,7 @@ impl SsaBuilder {
                 // Store capacity (field 2) at offset 16
                 let cap_const = self.create_value(
                     HirType::I64,
-                    HirValueKind::Constant(crate::hir::HirConstant::I64(num_elements as i64)),
+                    HirValueKind::Constant(crate::hir::HirConstant::I64(capacity as i64)),
                 );
                 let offset_16 = self.create_value(
                     HirType::I64,
@@ -6572,13 +6729,16 @@ impl SsaBuilder {
                 let self_offset = usize::from(!is_static);
                 for (i, arg) in method_call.positional_args.iter().enumerate() {
                     let saved_expected = self.expected_elem_ty.take();
+                    let saved_growable = self.expected_growable;
                     if let Some(params) = &declared_method_params {
                         if let Some(param_ty) = params.get(i + self_offset) {
                             self.expected_elem_ty = self.declared_element_type(param_ty);
+                            self.expected_growable = self.declares_list(param_ty);
                         }
                     }
                     let arg_val = self.translate_expression(block_id, arg);
                     self.expected_elem_ty = saved_expected;
+                    self.expected_growable = saved_growable;
                     arg_vals.push(arg_val?);
                 }
 
@@ -7998,6 +8158,13 @@ impl SsaBuilder {
                         } else {
                             let_stmt.ty.clone()
                         };
+                        // A binding whose type nothing here can tell is
+                        // left for the translation to record from the
+                        // value it actually holds; guessing would give
+                        // its phis the dynamic type.
+                        if matches!(effective_ty, Type::Any | Type::Unknown) {
+                            continue;
+                        }
                         let hir_type = self.convert_type(&effective_ty);
                         self.var_types.insert(let_stmt.name, hir_type);
                     }
@@ -9029,8 +9196,12 @@ impl SsaBuilder {
             (HirType::F64, HirType::F32) => CastOp::FpTrunc,
             (HirType::F32, HirType::F64) => CastOp::FpExt,
             // An integer initializer under a float annotation is a
-            // float from the binding on, the same as at a parameter.
+            // float from the binding on, the same as at a parameter,
+            // and a float under an integer annotation is truncated.
             (int, HirType::F32 | HirType::F64) if Self::int_type_width_and_sign(int).is_some() => {
+                return self.coerce_scalar_to(block_id, value, &declared);
+            }
+            (HirType::F32 | HirType::F64, int) if Self::int_type_width_and_sign(int).is_some() => {
                 return self.coerce_scalar_to(block_id, value, &declared);
             }
             _ => return value,
@@ -9545,10 +9716,30 @@ impl SsaBuilder {
             None => return Ok(None),
         };
 
+        // A `List<T>` spelled through the registry is the same type as
+        // an unsized array of T; the classes see one spelling.
+        let canonical = match receiver_type {
+            Type::Named { id, type_args, .. }
+                if self
+                    .type_registry
+                    .get_type_by_id(*id)
+                    .and_then(|td| td.name.resolve_global())
+                    .is_some_and(|n| n == "List")
+                    && type_args.len() == 1 =>
+            {
+                Type::Array {
+                    element_type: Box::new(type_args[0].clone()),
+                    size: None,
+                    nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+                }
+            }
+            other => other.clone(),
+        };
+
         // Clone the matching class out of the registry as an Arc —
         // its lifetime is independent of `self`, so the subsequent
         // `dispatch` call can take `&mut self` freely.
-        let class = match self.builtin_registry.class_for(receiver_type) {
+        let class = match self.builtin_registry.class_for(&canonical) {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -9558,7 +9749,7 @@ impl SsaBuilder {
             block_id,
             method_name.as_str(),
             receiver_expr,
-            receiver_type,
+            &canonical,
             args,
             result_ty,
         )
@@ -10428,6 +10619,404 @@ impl SsaBuilder {
         acc
     }
 
+    // ─── Growable lists ─────────────────────────────────────────────
+    //
+    // A list value is the address of a `{ data, len, capacity }` header;
+    // the elements sit in a separate heap block `data` points at. These
+    // emit the operations that change the header, inline, with growth by
+    // the allocator's realloc. Anything above them (bounds rules,
+    // searching, sorting, printing) is written in the language.
+
+    fn emit_load(&mut self, block: HirId, ptr: HirId, ty: HirType) -> HirId {
+        let result = self.create_value(ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block,
+            HirInstruction::Load {
+                result,
+                ty,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        self.add_use(ptr, result);
+        result
+    }
+
+    fn emit_store(&mut self, block: HirId, ptr: HirId, value: HirId) {
+        self.add_instruction(
+            block,
+            HirInstruction::Store {
+                value,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+    }
+
+    /// `base + bytes`, as a pointer to `pointee`.
+    fn emit_byte_gep(
+        &mut self,
+        block: HirId,
+        base: HirId,
+        bytes: HirId,
+        pointee: HirType,
+    ) -> HirId {
+        let result = self.create_value(HirType::Ptr(Box::new(pointee)), HirValueKind::Instruction);
+        self.add_instruction(
+            block,
+            HirInstruction::GetElementPtr {
+                result,
+                ty: HirType::U8,
+                ptr: base,
+                indices: vec![bytes],
+            },
+        );
+        self.add_use(base, result);
+        self.add_use(bytes, result);
+        result
+    }
+
+    /// `data + index * size_of(elem)`.
+    fn emit_elem_gep(&mut self, block: HirId, data: HirId, index: HirId, elem: HirType) -> HirId {
+        let result = self.create_value(
+            HirType::Ptr(Box::new(elem.clone())),
+            HirValueKind::Instruction,
+        );
+        self.add_instruction(
+            block,
+            HirInstruction::GetElementPtr {
+                result,
+                ty: HirType::Ptr(Box::new(elem)),
+                ptr: data,
+                indices: vec![index],
+            },
+        );
+        self.add_use(data, result);
+        self.add_use(index, result);
+        result
+    }
+
+    fn i64_const(&mut self, v: i64) -> HirId {
+        self.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(v)))
+    }
+
+    fn list_field_ptr(&mut self, block: HirId, list: HirId, offset: i64) -> HirId {
+        let off = self.i64_const(offset);
+        self.emit_byte_gep(block, list, off, HirType::I64)
+    }
+
+    fn list_data(&mut self, block: HirId, list: HirId, elem: &HirType) -> HirId {
+        self.emit_load(block, list, HirType::Ptr(Box::new(elem.clone())))
+    }
+
+    fn list_len(&mut self, block: HirId, list: HirId) -> HirId {
+        let p = self.list_field_ptr(block, list, 8);
+        self.emit_load(block, p, HirType::I64)
+    }
+
+    fn list_set_len(&mut self, block: HirId, list: HirId, len: HirId) {
+        let p = self.list_field_ptr(block, list, 8);
+        self.emit_store(block, p, len);
+    }
+
+    fn new_block(&mut self) -> HirId {
+        let id = HirId::new();
+        self.function.blocks.insert(id, HirBlock::new(id));
+        self.definitions.insert(id, IndexMap::new());
+        id
+    }
+
+    fn branch(&mut self, from: HirId, to: HirId) {
+        let b = self.function.blocks.get_mut(&from).unwrap();
+        b.terminator = HirTerminator::Branch { target: to };
+        b.successors = vec![to];
+        self.function
+            .blocks
+            .get_mut(&to)
+            .unwrap()
+            .predecessors
+            .push(from);
+    }
+
+    fn cond_branch(&mut self, from: HirId, condition: HirId, t: HirId, f: HirId) {
+        let b = self.function.blocks.get_mut(&from).unwrap();
+        b.terminator = HirTerminator::CondBranch {
+            condition,
+            true_target: t,
+            false_target: f,
+        };
+        b.successors = vec![t, f];
+        self.function
+            .blocks
+            .get_mut(&t)
+            .unwrap()
+            .predecessors
+            .push(from);
+        self.function
+            .blocks
+            .get_mut(&f)
+            .unwrap()
+            .predecessors
+            .push(from);
+    }
+
+    /// Make room for `needed` elements, growing the block geometrically.
+    /// `block` is left after the growth branch.
+    fn list_reserve(&mut self, block: &mut HirId, list: HirId, needed: HirId, elem: &HirType) {
+        use crate::hir::BinaryOp as B;
+        let start = *block;
+        let cap_ptr = self.list_field_ptr(start, list, 16);
+        let cap = self.emit_load(start, cap_ptr, HirType::I64);
+        let must_grow = self.emit_bin(start, B::Lt, &HirType::I64, cap, needed);
+        let grow = self.new_block();
+        let done = self.new_block();
+        self.cond_branch(start, must_grow, grow, done);
+
+        let two = self.i64_const(2);
+        let doubled = self.emit_bin(grow, B::Mul, &HirType::I64, cap, two);
+        let enough = self.emit_bin(grow, B::Ge, &HirType::I64, doubled, needed);
+        let target = self.emit_select(grow, enough, doubled, needed, &HirType::I64);
+        let four = self.i64_const(4);
+        let small = self.emit_bin(grow, B::Lt, &HirType::I64, target, four);
+        let new_cap = self.emit_select(grow, small, four, target, &HirType::I64);
+        let size = self.i64_const(hir_ty_size(elem).max(1) as i64);
+        let bytes = self.emit_bin(grow, B::Mul, &HirType::I64, new_cap, size);
+        let data = self.list_data(grow, list, elem);
+        let new_data = self.emit_intrinsic(
+            grow,
+            crate::hir::Intrinsic::Realloc,
+            vec![data, bytes],
+            &HirType::Ptr(Box::new(elem.clone())),
+        );
+        self.emit_store(grow, list, new_data);
+        let cap_ptr = self.list_field_ptr(grow, list, 16);
+        self.emit_store(grow, cap_ptr, new_cap);
+        self.branch(grow, done);
+        *block = done;
+    }
+
+    /// `list.len()`.
+    pub(crate) fn emit_list_count(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let len = self.list_len(cur, list);
+        self.settle(block, cur);
+        Ok(len)
+    }
+
+    /// `list.push(x)`.
+    pub(crate) fn emit_list_push(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        value: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let raw = self.translate_operand(&mut cur, value)?;
+        let raw = self.coerce_for_transfer(cur, raw, value, elem_ty);
+        let val = self.coerce_scalar_to(cur, raw, &elem);
+        let len = self.list_len(cur, list);
+        let one = self.i64_const(1);
+        let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, one);
+        self.list_reserve(&mut cur, list, needed, &elem);
+        let data = self.list_data(cur, list, &elem);
+        let slot = self.emit_elem_gep(cur, data, len, elem);
+        self.emit_store(cur, slot, val);
+        self.list_set_len(cur, list, needed);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
+    /// `list.pop()`: the last element, which the list no longer holds.
+    /// Emptiness is the caller's to check.
+    pub(crate) fn emit_list_pop(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let len = self.list_len(cur, list);
+        let one = self.i64_const(1);
+        let last = self.emit_bin(cur, B::Sub, &HirType::I64, len, one);
+        let data = self.list_data(cur, list, &elem);
+        let slot = self.emit_elem_gep(cur, data, last, elem.clone());
+        let value = self.emit_load(cur, slot, elem);
+        self.list_set_len(cur, list, last);
+        self.settle(block, cur);
+        Ok(value)
+    }
+
+    /// `list.insert_at(i, x)` for `0 <= i <= len`, shifting the tail up.
+    pub(crate) fn emit_list_insert_at(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        index: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        value: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let idx = self.translate_operand(&mut cur, index)?;
+        let idx = self.coerce_scalar_to(cur, idx, &HirType::I64);
+        let raw = self.translate_operand(&mut cur, value)?;
+        let raw = self.coerce_for_transfer(cur, raw, value, elem_ty);
+        let val = self.coerce_scalar_to(cur, raw, &elem);
+        let len = self.list_len(cur, list);
+        let one = self.i64_const(1);
+        let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, one);
+        self.list_reserve(&mut cur, list, needed, &elem);
+        let data = self.list_data(cur, list, &elem);
+        let from = self.emit_elem_gep(cur, data, idx, elem.clone());
+        let after = self.emit_bin(cur, B::Add, &HirType::I64, idx, one);
+        let to = self.emit_elem_gep(cur, data, after, elem.clone());
+        let count = self.emit_bin(cur, B::Sub, &HirType::I64, len, idx);
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(cur, B::Mul, &HirType::I64, count, size);
+        self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Memmove,
+            vec![to, from, bytes],
+            &HirType::Void,
+        );
+        self.emit_store(cur, from, val);
+        self.list_set_len(cur, list, needed);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
+    /// `list.remove_at(i)` for `0 <= i < len`: the element, with the
+    /// tail shifted down over it.
+    pub(crate) fn emit_list_remove_at(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        index: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let idx = self.translate_operand(&mut cur, index)?;
+        let idx = self.coerce_scalar_to(cur, idx, &HirType::I64);
+        let len = self.list_len(cur, list);
+        let one = self.i64_const(1);
+        let data = self.list_data(cur, list, &elem);
+        let at = self.emit_elem_gep(cur, data, idx, elem.clone());
+        let value = self.emit_load(cur, at, elem.clone());
+        let after = self.emit_bin(cur, B::Add, &HirType::I64, idx, one);
+        let from = self.emit_elem_gep(cur, data, after, elem.clone());
+        let count = self.emit_bin(cur, B::Sub, &HirType::I64, len, after);
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(cur, B::Mul, &HirType::I64, count, size);
+        self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Memmove,
+            vec![at, from, bytes],
+            &HirType::Void,
+        );
+        let shorter = self.emit_bin(cur, B::Sub, &HirType::I64, len, one);
+        self.list_set_len(cur, list, shorter);
+        self.settle(block, cur);
+        Ok(value)
+    }
+
+    /// `list.clear()`.
+    pub(crate) fn emit_list_clear(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let zero = self.i64_const(0);
+        self.list_set_len(cur, list, zero);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
+    /// `list.reserve(n)`: room for at least `n` elements in all.
+    pub(crate) fn emit_list_reserve(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let n = self.translate_operand(&mut cur, wanted)?;
+        let n = self.coerce_scalar_to(cur, n, &HirType::I64);
+        self.list_reserve(&mut cur, list, n, &elem);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
+    /// `list.truncate(n)`: keep the first `n` elements (`n <= len`).
+    pub(crate) fn emit_list_truncate(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let n = self.translate_operand(&mut cur, wanted)?;
+        let n = self.coerce_scalar_to(cur, n, &HirType::I64);
+        self.list_set_len(cur, list, n);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
+    /// A fresh, empty list with room for `capacity` elements, on the heap.
+    pub(crate) fn emit_list_new(&mut self, block: HirId, elem_ty: &Type, capacity: HirId) -> HirId {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let header_bytes = self.i64_const(24);
+        let list_ty = HirType::Ptr(Box::new(list_header_type()));
+        let list = self.emit_intrinsic(
+            block,
+            crate::hir::Intrinsic::Malloc,
+            vec![header_bytes],
+            &list_ty,
+        );
+        let four = self.i64_const(4);
+        let small = self.emit_bin(block, B::Lt, &HirType::I64, capacity, four);
+        let cap = self.emit_select(block, small, four, capacity, &HirType::I64);
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(block, B::Mul, &HirType::I64, cap, size);
+        let data = self.emit_intrinsic(
+            block,
+            crate::hir::Intrinsic::Malloc,
+            vec![bytes],
+            &HirType::Ptr(Box::new(elem)),
+        );
+        self.emit_store(block, list, data);
+        let zero = self.i64_const(0);
+        self.list_set_len(block, list, zero);
+        let cap_ptr = self.list_field_ptr(block, list, 16);
+        self.emit_store(block, cap_ptr, cap);
+        list
+    }
+
     pub(crate) fn emit_scalar_unary_intrinsic(
         &mut self,
         block_id: HirId,
@@ -11079,6 +11668,9 @@ impl SsaBuilder {
                 };
                 HirType::Array(Box::new(self.convert_type(element_type)), size)
             }
+            // An array of no fixed size is a growable list: a header the
+            // value points at, with the elements behind it.
+            Type::Array { size: None, .. } => list_header_type(),
             Type::Optional(inner_ty) => {
                 // Convert Optional<T> to a tagged union: enum { None, Some(T) }
                 use crate::hir::{HirUnionType, HirUnionVariant};
@@ -12390,8 +12982,17 @@ impl SsaBuilder {
                         stack_slot
                     );
                 } else {
+                    // Every definition of a variable has the variable's
+                    // type, or the join phis downstream see two widths.
+                    let value = match self.var_types.get(name).cloned() {
+                        Some(var_ty) if Self::scalar_class(&var_ty).is_some() => {
+                            self.coerce_scalar_to(block_id, value, &var_ty)
+                        }
+                        _ => value,
+                    };
                     // Use write_variable to update the SSA variable tracking
                     self.write_variable(*name, block_id, value);
+                    return Ok(value);
                 }
                 // Assignment expression returns the assigned value
                 Ok(value)

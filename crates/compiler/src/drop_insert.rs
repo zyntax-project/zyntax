@@ -511,7 +511,7 @@ pub(crate) enum SymbolRole {
 pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
     match name {
         "zyntax_box_bool" | "zyntax_box_f32" | "zyntax_box_f64" | "zyntax_box_i32"
-        | "zyntax_box_i64" | "zyntax_box_str" | "zyntax_box_opaque" => {
+        | "zyntax_box_i64" | "zyntax_box_str" | "zyntax_box_ptr" | "zyntax_box_opaque" => {
             Some(SymbolRole::Allocates("zyntax_box_free"))
         }
         "zyntax_box_get_bool"
