@@ -5,7 +5,7 @@ use zyntax_typed_ast::{
     ast_convert::*, typed_ast::*, AstArena, InternedString, Mutability, PrimitiveType, Span, Type,
     TypeId, TypeRegistry, Visibility,
 };
-use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
+use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind, ParamOwnership};
 
 #[test]
 fn test_class_declaration() {
@@ -48,6 +48,7 @@ fn test_class_declaration() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: ParamOwnership::Copied,
             }],
             return_type: Type::Primitive(PrimitiveType::String),
             body: None,
@@ -150,6 +151,7 @@ fn test_interface_with_methods() {
                 kind: ParameterKind::Regular,
                 default_value: None,
                 attributes: vec![],
+                ownership: ParamOwnership::Copied,
             }],
             return_type: Type::Primitive(PrimitiveType::Unit),
             is_static: false,
