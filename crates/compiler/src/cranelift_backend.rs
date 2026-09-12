@@ -2871,8 +2871,15 @@ impl CraneliftBackend {
                                                 .get(&(link_name.clone(), param_index))
                                                 .copied()
                                                 .unwrap_or(false);
+                                            // A value that is already a box goes through as it is.
+                                            let already_boxed = function
+                                                .values
+                                                .get(&args[param_index])
+                                                .is_some_and(|v| {
+                                                    crate::zrtl::is_dynamic_box_pointer(&v.ty)
+                                                });
 
-                                            if needs_boxing {
+                                            if needs_boxing && !already_boxed {
                                                 // Apply DynamicBox wrapping - same logic as HirCallable::Symbol
                                                 let arg_hir_id = args[param_index];
                                                 let is_pointer_type = function
@@ -3318,7 +3325,12 @@ impl CraneliftBackend {
                                         if let Some(sig) = self.symbol_signatures.get(symbol_name) {
                                         } else {
                                         }
-                                        if needs_boxing {
+                                        // A value that is already a box goes through as it is.
+                                        let already_boxed =
+                                            function.values.get(&args[param_index]).is_some_and(
+                                                |v| crate::zrtl::is_dynamic_box_pointer(&v.ty),
+                                            );
+                                        if needs_boxing && !already_boxed {
                                             // This parameter expects DynamicBox - wrap it
                                             // For opaque types (i64 pointer), we need to create a DynamicBox struct
                                             // DynamicBox layout: { tag: u32, size: u32, data: i64, dropper: i64, display_fn: i64 }

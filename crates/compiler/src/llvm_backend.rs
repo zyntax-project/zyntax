@@ -3854,6 +3854,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                 if !sig.param_is_dynamic(i) {
                     return Ok(arg_val.into());
                 }
+                // A value that is already a box goes through as it is.
+                if let Some(Some(hir_ty)) = hir_types.get(i) {
+                    if crate::zrtl::is_dynamic_box_pointer(hir_ty) {
+                        return Ok(arg_val.into());
+                    }
+                }
 
                 // A value whose dynamic representation the box carries by
                 // pointer — a string, an opaque handle — is boxed by its
@@ -4227,7 +4233,13 @@ impl<'ctx> LLVMBackend<'ctx> {
                         .iter()
                         .enumerate()
                         .map(|(i, &arg_val)| {
-                            if sig.param_is_dynamic(i) {
+                            // A value that is already a box goes through as it is.
+                            let already_boxed = args.get(i).is_some_and(|id| {
+                                self.type_map
+                                    .get(id)
+                                    .is_some_and(crate::zrtl::is_dynamic_box_pointer)
+                            });
+                            if sig.param_is_dynamic(i) && !already_boxed {
                                 // This argument needs to be boxed as DynamicBox
                                 // Determine which boxing function to call based on type
                                 let func_name = if arg_val.is_int_value() {

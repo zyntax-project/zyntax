@@ -1293,10 +1293,13 @@ impl SsaBuilder {
                     // return a concrete type unboxes here rather than
                     // handing the caller a `DynamicBox` pointer to read
                     // as that type.
+                    // The conversion belongs where evaluation ended: an
+                    // expression that branched leaves the value in its
+                    // merge block, not the one this return started in.
                     if let Some(declared) = self.original_return_type.clone() {
                         if !matches!(declared, Type::Result { .. }) {
-                            value_id =
-                                self.coerce_for_transfer(block_id, value_id, expr, &declared);
+                            let at = self.continuation_block.unwrap_or(block_id);
+                            value_id = self.coerce_for_transfer(at, value_id, expr, &declared);
                         }
                     }
 
@@ -2681,7 +2684,17 @@ impl SsaBuilder {
         match &term.node {
             TypedStatement::Return(expr) => {
                 let values = if let Some(expr) = expr {
-                    vec![self.translate_expression(block_id, expr)?]
+                    let value = self.translate_expression(block_id, expr)?;
+                    // The value leaves as the type the function declared,
+                    // converted where evaluation ended.
+                    let value = match self.original_return_type.clone() {
+                        Some(declared) if !matches!(declared, Type::Result { .. }) => {
+                            let at = self.continuation_block.unwrap_or(block_id);
+                            self.coerce_for_transfer(at, value, expr, &declared)
+                        }
+                        _ => value,
+                    };
+                    vec![value]
                 } else {
                     vec![]
                 };
@@ -3851,12 +3864,15 @@ impl SsaBuilder {
                     )));
                 }
 
-                // String concatenation: "a" + "b" → $IO$string_concat(a, b)
+                // String concatenation: "a" + "b" → $IO$string_concat(a, b).
+                // Either operand being a string decides it, and a nested
+                // concatenation counts as one.
+                let string_ty = Type::Primitive(zyntax_typed_ast::PrimitiveType::String);
                 if matches!(op, FrontendOp::Add)
-                    && matches!(
-                        left_with_type.ty,
-                        Type::Primitive(zyntax_typed_ast::PrimitiveType::String)
-                    )
+                    && (left_with_type.ty == string_ty
+                        || right_with_type.ty == string_ty
+                        || self.resolve_expr_type(left) == string_ty
+                        || self.resolve_expr_type(right) == string_ty)
                 {
                     let mut cur = block_id;
                     let left_val = self.translate_operand(&mut cur, left)?;
@@ -5725,6 +5741,7 @@ impl SsaBuilder {
                 let then_val = self.translate_expression(then_block_id, then_branch)?;
                 let then_tail = self.continuation_block.take().unwrap_or(then_block_id);
                 self.continuation_block = saved_cont_before_then;
+                let then_val = self.meet_declared_any(then_tail, then_val, then_branch, &expr.ty);
                 self.function.blocks.get_mut(&then_tail).unwrap().terminator =
                     HirTerminator::Branch {
                         target: merge_block_id,
@@ -5743,6 +5760,7 @@ impl SsaBuilder {
                 let else_val = self.translate_expression(else_block_id, else_branch)?;
                 let else_tail = self.continuation_block.take().unwrap_or(else_block_id);
                 self.continuation_block = saved_cont_before_else;
+                let else_val = self.meet_declared_any(else_tail, else_val, else_branch, &expr.ty);
                 self.function.blocks.get_mut(&else_tail).unwrap().terminator =
                     HirTerminator::Branch {
                         target: merge_block_id,
@@ -8906,9 +8924,13 @@ impl SsaBuilder {
             HirType::I64 | HirType::U64 => "zyntax_box_i64",
             HirType::F32 => "zyntax_box_f32",
             HirType::F64 => "zyntax_box_f64",
+            HirType::Ptr(ref inner) if matches!(**inner, HirType::I8) => "zyntax_box_str",
             _ => return None,
         };
-        let boxed = self.create_value(HirType::I64, HirValueKind::Instruction);
+        let boxed = self.create_value(
+            crate::zrtl::dynamic_box_pointer_type(),
+            HirValueKind::Instruction,
+        );
         self.add_instruction(
             block_id,
             HirInstruction::Call {
@@ -8922,6 +8944,35 @@ impl SsaBuilder {
         );
         self.add_use(value, boxed);
         Some(boxed)
+    }
+
+    /// A branch value of an expression declared `Any` is boxed where it
+    /// is produced, so the merge holds one representation. Anything
+    /// already a box, or an expression not declared `Any`, is left alone.
+    fn meet_declared_any(
+        &mut self,
+        block_id: HirId,
+        value: HirId,
+        branch: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        declared: &Type,
+    ) -> HirId {
+        if !matches!(declared, Type::Any) {
+            return value;
+        }
+        let already_boxed = self
+            .function
+            .values
+            .get(&value)
+            .is_some_and(|v| crate::zrtl::is_dynamic_box_pointer(&v.ty));
+        if already_boxed {
+            return value;
+        }
+        let source = self.resolve_expr_type(branch);
+        if matches!(source, Type::Any) {
+            return value;
+        }
+        self.emit_box_to_any(block_id, value, &source)
+            .unwrap_or(value)
     }
 
     /// Coerce a value being handed across a declared boundary (a call
@@ -11362,12 +11413,9 @@ impl SsaBuilder {
                     HirType::I64
                 }
             }
-            Type::Any => {
-                // Type::Any means "infer from context" - we need to check the initializer's type
-                // For now, default to I64 but this should be improved
-                log::trace!("[WARN] Type::Any encountered in convert_type, defaulting to I64");
-                HirType::I64
-            }
+            // A dynamic value is a box pointer, and typed as one so the
+            // backends know not to box it again.
+            Type::Any => crate::zrtl::dynamic_box_pointer_type(),
             _ => HirType::I64, // Default for complex types
         }
     }
@@ -11976,6 +12024,21 @@ impl SsaBuilder {
                     element_type: Box::new(resolved),
                     size: Some(zyntax_typed_ast::ConstValue::Int(elements.len() as i64)),
                     nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+                }
+            }
+            // `+` with a string operand is a concatenation, so its value
+            // is a string whatever the parser recorded for the node.
+            TypedExpression::Binary(bin)
+                if matches!(bin.op, zyntax_typed_ast::typed_ast::BinaryOp::Add)
+                    && matches!(node.ty, Type::Any | Type::Unknown) =>
+            {
+                let string = Type::Primitive(zyntax_typed_ast::PrimitiveType::String);
+                if self.resolve_expr_type(&bin.left) == string
+                    || self.resolve_expr_type(&bin.right) == string
+                {
+                    string
+                } else {
+                    node.ty.clone()
                 }
             }
             _ => node.ty.clone(),

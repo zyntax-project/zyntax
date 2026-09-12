@@ -308,6 +308,27 @@ pub(crate) fn default_dynamic_box_opaque_tag_and_size() -> (u32, u32) {
 }
 
 /// Whether a dynamic box carries this HIR value by pointer.
+/// The opaque type a boxed `Any` value has in HIR. A value of this type
+/// is already a `DynamicBox*`, so a call site that boxes its arguments
+/// against a registered signature passes it through untouched.
+pub(crate) const DYNAMIC_BOX_TYPE: &str = "DynamicBox";
+
+pub(crate) fn dynamic_box_pointer_type() -> HirType {
+    HirType::Ptr(Box::new(HirType::Opaque(
+        zyntax_typed_ast::InternedString::new_global(DYNAMIC_BOX_TYPE),
+    )))
+}
+
+pub(crate) fn is_dynamic_box_pointer(ty: &HirType) -> bool {
+    match ty {
+        HirType::Ptr(inner) => matches!(
+            inner.as_ref(),
+            HirType::Opaque(name) if name.resolve_global().as_deref() == Some(DYNAMIC_BOX_TYPE)
+        ),
+        _ => false,
+    }
+}
+
 pub(crate) fn dynamic_box_uses_direct_pointer(ty: &HirType) -> bool {
     match ty {
         HirType::Opaque(_) => true,
@@ -1706,6 +1727,22 @@ pub unsafe extern "C" fn zyntax_box_opaque(
     }))
 }
 
+/// Box a string by reference. Strings are immutable and outlive the
+/// box, so the box carries the pointer and owns nothing.
+///
+/// # Safety
+/// `s` must be null or a live ZRTL string.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_str(s: *mut u8) -> *mut DynamicBoxRepr {
+    Box::into_raw(Box::new(DynamicBoxRepr {
+        tag: TypeTag::STRING.0,
+        size: std::mem::size_of::<*mut u8>() as u32,
+        data: s,
+        dropper: None,
+        display_fn: None,
+    }))
+}
+
 /// Borrow the bytes a `zyntax_box_opaque` box holds.
 ///
 /// The pointer stays owned by the box, so it is valid until the box is
@@ -1938,6 +1975,7 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("zyntax_box_f32", zyntax_box_f32 as *const u8, 1),
         ("zyntax_box_f64", zyntax_box_f64 as *const u8, 1),
         ("zyntax_box_bool", zyntax_box_bool as *const u8, 1),
+        ("zyntax_box_str", zyntax_box_str as *const u8, 1),
         ("zyntax_box_opaque", zyntax_box_opaque as *const u8, 3),
         (
             "zyntax_box_get_opaque",

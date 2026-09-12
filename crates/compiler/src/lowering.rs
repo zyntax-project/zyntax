@@ -4351,6 +4351,7 @@ impl LoweringContext {
                 }
             }
 
+            Type::Any => crate::zrtl::dynamic_box_pointer_type(),
             Type::Vector(inner, lanes) => {
                 // First-class SIMD surface type lowers directly to the
                 // HIR vector variant — identical shape to the builtin
