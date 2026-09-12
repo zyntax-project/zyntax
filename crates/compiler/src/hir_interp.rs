@@ -748,6 +748,12 @@ pub fn compile_function(
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
                     const_idx_for.insert(*val_id, idx);
+                } else {
+                    // A variable: one zeroed slot for the whole module.
+                    let ptr = memory.global_slot(*global_id, size_of_hir_ty(&global.ty));
+                    let idx = cf.const_pool.len() as u32;
+                    cf.const_pool.push(ZyntaxValue::Pointer(ptr));
+                    const_idx_for.insert(*val_id, idx);
                 }
             }
         }
@@ -1785,6 +1791,9 @@ pub struct ProfileSample {
 #[derive(Default)]
 pub struct Memory {
     allocations: Vec<Box<[u8]>>,
+    /// One storage slot per module global, shared by every function
+    /// that names it.
+    globals: HashMap<HirId, *mut u8>,
 }
 
 impl Memory {
@@ -1795,6 +1804,15 @@ impl Memory {
         let mut bytes: Box<[u8]> = vec![0u8; n_bytes].into_boxed_slice();
         let ptr = bytes.as_mut_ptr();
         self.allocations.push(bytes);
+        ptr
+    }
+    /// The slot of global `id`, allocated zeroed on first use.
+    pub fn global_slot(&mut self, id: HirId, n_bytes: usize) -> *mut u8 {
+        if let Some(ptr) = self.globals.get(&id) {
+            return *ptr;
+        }
+        let ptr = self.alloc_zeroed(n_bytes.max(8));
+        self.globals.insert(id, ptr);
         ptr
     }
 }

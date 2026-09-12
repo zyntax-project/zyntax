@@ -160,9 +160,9 @@ fn struct_carried_as_its_field(struct_ty: &crate::hir::HirStructType) -> Option<
 /// Only structs. `Array` and `Union` translate to a pointer too, but an
 /// array-typed value is not reliably the frame memory a struct's is:
 /// copying one that already points at a buffer would hand back a copy
-/// where the buffer itself was meant. A list literal builds a struct
-/// holding a separate data pointer, so the shape that actually reaches
-/// here is the one covered.
+/// where the buffer itself was meant. A growable list is excluded for
+/// the same reason: its header lives on the heap and is the list's
+/// identity, so its address is what a function hands back.
 fn destination_return_type(function: &HirFunction) -> Option<&HirType> {
     if function.is_external {
         return None;
@@ -171,9 +171,26 @@ fn destination_return_type(function: &HirFunction) -> Option<&HirType> {
         return None;
     }
     match function.signature.returns.first()? {
-        ret @ HirType::Struct(s) if struct_carried_as_its_field(s).is_none() => Some(ret),
+        ret @ HirType::Struct(s)
+            if struct_carried_as_its_field(s).is_none() && !is_growable_list_header(s) =>
+        {
+            Some(ret)
+        }
         _ => None,
     }
+}
+
+/// The `{data, len, capacity}` header of a growable list, by its shape.
+fn is_growable_list_header(struct_ty: &crate::hir::HirStructType) -> bool {
+    struct_ty
+        .name
+        .and_then(|n| n.resolve_global())
+        .is_some_and(|n| n == "List" || n == "Array")
+        && struct_ty.fields.len() == 3
+        && struct_ty
+            .fields
+            .iter()
+            .all(|f| matches!(f, HirType::I64 | HirType::U64 | HirType::Ptr(_)))
 }
 
 /// Function bodies this backend had no encoding for, across the process.
@@ -6321,11 +6338,12 @@ impl CraneliftBackend {
     /// which a dispatch table needs, since its contents are the
     /// addresses of functions compiled afterwards.
     pub fn declare_global(&mut self, id: HirId, global: &HirGlobal) -> CompilerResult<()> {
-        // A vtable is a dispatch table — hot reload patches its slots
-        // in place, so it must stay writable; everything else is
-        // immutable.
+        // A vtable is a dispatch table that hot reload patches in
+        // place, and a mutable global is written by the program; both
+        // stay writable. Everything else is immutable.
         let unique_name = format!("global__{:?}", id);
-        let writable = matches!(&global.initializer, Some(HirConstant::VTable(_)));
+        let writable =
+            matches!(&global.initializer, Some(HirConstant::VTable(_))) || !global.is_const;
         let data_id = self
             .module
             .declare_data(

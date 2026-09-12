@@ -252,6 +252,13 @@ pub struct SsaBuilder {
     address_taken_vars: HashSet<InternedString>,
     /// Stack slots for address-taken variables (var name -> alloca result)
     stack_slots: IndexMap<InternedString, HirId>,
+    /// Module globals by name, with the global's id and type. A name a
+    /// `let` or parameter binds in this function shadows the global.
+    module_globals: IndexMap<InternedString, (HirId, HirType)>,
+    /// Address values for the globals this function has touched.
+    global_refs: IndexMap<InternedString, HirId>,
+    /// Every name a `let` in this function binds, whatever its type.
+    let_names: HashSet<InternedString>,
     /// External function link names (alias -> ZRTL symbol)
     /// e.g., "tensor_add" -> "$Tensor$add"
     extern_link_names: IndexMap<InternedString, String>,
@@ -686,6 +693,9 @@ impl SsaBuilder {
             original_return_type: None,
             address_taken_vars: HashSet::new(),
             stack_slots: IndexMap::new(),
+            module_globals: IndexMap::new(),
+            global_refs: IndexMap::new(),
+            let_names: HashSet::new(),
             extern_link_names: IndexMap::new(),
             compute_yield_stack: Vec::new(),
             simd_continue_block: None,
@@ -736,6 +746,9 @@ impl SsaBuilder {
             original_return_type: None,
             address_taken_vars: HashSet::new(),
             stack_slots: IndexMap::new(),
+            module_globals: IndexMap::new(),
+            global_refs: IndexMap::new(),
+            let_names: HashSet::new(),
             extern_link_names: IndexMap::new(),
             compute_yield_stack: Vec::new(),
             simd_continue_block: None,
@@ -812,6 +825,15 @@ impl SsaBuilder {
     /// Set the set of function names this program declares with a body
     /// of its own. The Call handler will not rewrite a call to one of
     /// them into a same-named built-in intrinsic.
+    /// The module's global variables, for reads and writes by name.
+    pub fn with_module_globals(
+        mut self,
+        globals: IndexMap<InternedString, (HirId, HirType)>,
+    ) -> Self {
+        self.module_globals = globals;
+        self
+    }
+
     pub fn with_body_fn_names(mut self, names: HashSet<InternedString>) -> Self {
         self.body_fn_names = names;
         self
@@ -2735,7 +2757,15 @@ impl SsaBuilder {
         match &term.node {
             TypedStatement::Return(expr) => {
                 let values = if let Some(expr) = expr {
-                    let value = self.translate_expression(block_id, expr)?;
+                    // A literal returned as a list outlives this frame.
+                    let saved_growable = self.expected_growable;
+                    self.expected_growable = self
+                        .original_return_type
+                        .as_ref()
+                        .is_some_and(|t| self.declares_list(t));
+                    let value = self.translate_expression(block_id, expr);
+                    self.expected_growable = saved_growable;
+                    let value = value?;
                     // The value leaves as the type the function declared,
                     // converted where evaluation ended.
                     let value = match self.original_return_type.clone() {
@@ -3622,6 +3652,21 @@ impl SsaBuilder {
 
         match &expr.node {
             TypedExpression::Variable(name) => {
+                if let Some((ptr, ty)) = self.global_slot(*name) {
+                    let result = self.create_value(ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Load {
+                            result,
+                            ty,
+                            ptr,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
+                    self.add_use(ptr, result);
+                    return Ok(result);
+                }
                 // Check if this is an address-taken variable - need to load from stack
                 if let Some(&stack_slot) = self.stack_slots.get(name) {
                     let var_ty = self.var_types.get(name).cloned().unwrap_or(HirType::I64);
@@ -8116,6 +8161,35 @@ impl SsaBuilder {
 
     /// Scan CFG to collect variable types from Let statements
     /// This must be done before phi placement since phis need correct types
+    /// The address and type of module global `name`, unless a binding
+    /// in this function shadows it.
+    fn global_slot(&mut self, name: InternedString) -> Option<(HirId, HirType)> {
+        let (global_id, ty) = self.module_globals.get(&name).cloned()?;
+        if self.let_names.contains(&name)
+            || self.var_types.contains_key(&name)
+            || self
+                .function
+                .signature
+                .params
+                .iter()
+                .any(|p| p.name == name)
+        {
+            return None;
+        }
+        let ptr = match self.global_refs.get(&name) {
+            Some(ptr) => *ptr,
+            None => {
+                let ptr = self.create_value(
+                    HirType::Ptr(Box::new(ty.clone())),
+                    HirValueKind::Global(global_id),
+                );
+                self.global_refs.insert(name, ptr);
+                ptr
+            }
+        };
+        Some((ptr, ty))
+    }
+
     fn scan_cfg_for_variable_types(&mut self, cfg: &crate::typed_cfg::TypedControlFlowGraph) {
         use zyntax_typed_ast::typed_ast::TypedStatement;
 
@@ -8127,6 +8201,7 @@ impl SsaBuilder {
                 match &stmt.node {
                     // Let statements have type annotations
                     TypedStatement::Let(let_stmt) => {
+                        self.let_names.insert(let_stmt.name);
                         // Mirror the resolve-on-Any/Unknown logic the
                         // let-translation uses. Without it the scan
                         // records `Type::Any → HirType::I64` for
@@ -12965,6 +13040,19 @@ impl SsaBuilder {
         match &target.node {
             // Simple variable assignment: x = value
             TypedExpression::Variable(name) => {
+                if let Some((ptr, _)) = self.global_slot(*name) {
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::Store {
+                            value,
+                            ptr,
+                            align: 8,
+                            volatile: false,
+                        },
+                    );
+                    self.add_use(value, ptr);
+                    return Ok(value);
+                }
                 // Check if this is an address-taken variable - store to stack slot
                 if let Some(&stack_slot) = self.stack_slots.get(name) {
                     self.add_instruction(

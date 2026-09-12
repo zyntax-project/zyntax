@@ -749,14 +749,22 @@ impl AstLowering for LoweringContext {
         // brought to the end of the program, which puts every imported
         // effect after every function that could name it, so a perform
         // of an imported effect never resolved.
+        // Globals too: a body reads and writes them by name, so they
+        // exist before any body is built.
         for (index, decl) in program.declarations.iter().enumerate() {
-            if matches!(decl.node, TypedDeclaration::Effect(_)) {
+            if matches!(
+                decl.node,
+                TypedDeclaration::Effect(_) | TypedDeclaration::Variable(_)
+            ) {
                 self.current_decl = index;
                 self.lower_declaration(decl)?;
             }
         }
         for (index, decl) in program.declarations.iter().enumerate() {
-            if matches!(decl.node, TypedDeclaration::Effect(_)) {
+            if matches!(
+                decl.node,
+                TypedDeclaration::Effect(_) | TypedDeclaration::Variable(_)
+            ) {
                 continue;
             }
             self.current_decl = index;
@@ -2947,7 +2955,8 @@ impl LoweringContext {
         .with_resume_param_names(resume_param_names)
         .with_param_typed_ast_types(param_typed_ast_types)
         .with_fiber_fn_names(self.symbols.fiber_fn_names.clone())
-        .with_body_fn_names(self.symbols.body_fn_names.clone());
+        .with_body_fn_names(self.symbols.body_fn_names.clone())
+        .with_module_globals(self.module_globals());
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
         // Debug: check SSA result
@@ -4368,6 +4377,18 @@ impl LoweringContext {
     }
 
     /// Lower a global variable
+    /// The module's globals by name, with their ids and types.
+    fn module_globals(&self) -> indexmap::IndexMap<InternedString, (crate::hir::HirId, HirType)> {
+        self.symbols
+            .globals
+            .iter()
+            .filter_map(|(name, id)| {
+                let ty = self.module.globals.get(id)?.ty.clone();
+                Some((*name, (*id, ty)))
+            })
+            .collect()
+    }
+
     fn lower_global_variable(
         &mut self,
         var: &zyntax_typed_ast::TypedVariable,
