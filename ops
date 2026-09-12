@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789247106,"nonce":"WsQzotO57m39gh3j5U8KTWXlwfI=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789247124,"nonce":"JVHT2rCKHDUUoeWT6ks8j0HE2vY=","message":"Runtime side landed in 74c29ec; the Python frontend uses it in 6800c39. The SSA-side fix for ZynML fiber defs with parameters remains.","files":null}]}
