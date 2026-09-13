@@ -42,6 +42,21 @@ pub(crate) fn set_list_type(id: zyntax_typed_ast::TypeId) {
 }
 
 thread_local! {
+    /// The program's file the statement being lowered came from, as an
+    /// index into its source files; every span made while it is set
+    /// names that file.
+    static CURRENT_FILE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn set_current_file(file: u32) {
+    CURRENT_FILE.with(|c| c.set(file));
+}
+
+pub(crate) fn current_file() -> u32 {
+    CURRENT_FILE.with(|c| c.get())
+}
+
+thread_local! {
     /// The struct type of each class, by class index.
     static CLASS_TYPES: std::cell::RefCell<Vec<zyntax_typed_ast::TypeId>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -4936,17 +4951,20 @@ impl<'m> Lowerer<'m> {
             .map(|(s, _)| span_of(*s))
             .unwrap_or(Span::new(0, 0));
         self.escapes.push(Escape::Break);
-        // Each statement is reported against the module it came from.
+        // Each statement is reported against the module it came from,
+        // and its spans name that module's file.
         let mut body = match stmts.first() {
             Some((first, _)) => self.cell_prologue(span_of(*first)),
             None => Vec::new(),
         };
         for (s, origin) in stmts {
+            set_current_file(self.module.file_of(*origin));
             self.stmt(s, &mut body).map_err(|e| match origin {
                 Some(m) => e.in_module(m),
                 None => e,
             })?;
         }
+        set_current_file(0);
         self.escapes.pop();
         body.push(TypedNode::new(
             TypedStatement::Break(None),

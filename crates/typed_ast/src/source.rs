@@ -64,22 +64,40 @@ impl SourceFile {
     }
 }
 
-/// A span of source code from start to end position
+/// A span of source code from start to end position, in one of the
+/// program's source files.
+///
+/// `file` indexes [`crate::TypedProgram::source_files`] and the
+/// [`SourceMap`] built from it in the same order; a program with one
+/// file leaves it at 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
+    #[serde(default)]
+    pub file: u32,
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+    /// A span in the program's first file.
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            file: 0,
+        }
+    }
+
+    /// A span in the file with index `file`.
+    pub const fn in_file(start: usize, end: usize, file: u32) -> Self {
+        Self { start, end, file }
     }
 
     pub fn empty(pos: usize) -> Self {
         Self {
             start: pos,
             end: pos,
+            file: 0,
         }
     }
 
@@ -95,10 +113,12 @@ impl Span {
         self.start <= pos && pos < self.end
     }
 
+    /// The span covering both, in this span's file.
     pub fn merge(&self, other: Span) -> Span {
         Span {
             start: self.start.min(other.start),
             end: self.end.max(other.end),
+            file: self.file,
         }
     }
 
@@ -109,7 +129,7 @@ impl Span {
 
 impl Default for Span {
     fn default() -> Self {
-        Self { start: 0, end: 0 }
+        Self::new(0, 0)
     }
 }
 

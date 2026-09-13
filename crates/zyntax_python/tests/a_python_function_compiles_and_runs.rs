@@ -152,6 +152,52 @@ fn an_error_renders_against_its_source() {
     assert!(err.module().is_none(), "the main file has no module name");
 }
 
+/// A program of two files carries both as source files, and what came
+/// from the second names it, so a diagnostic about it quotes the right
+/// text.
+#[test]
+fn a_module_span_names_its_file() {
+    let helper = "def f(x):\n    return x * 2\n";
+    let resolve = |name: &str| (name == "helper").then(|| helper.to_string());
+    let program = zyntax_python::parse_program_with(
+        "import helper\nprint(helper.f(2))\n",
+        "main.py",
+        &resolve,
+    )
+    .expect("links");
+    let names: Vec<&str> = program
+        .source_files
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(names, ["main.py", "helper"]);
+    let f = program
+        .declarations
+        .iter()
+        .find(|d| match &d.node {
+            zyntax_typed_ast::TypedDeclaration::Function(f) => {
+                f.name.resolve_global().as_deref() == Some("helper$f")
+            }
+            _ => false,
+        })
+        .expect("the module's function is declared");
+    assert_eq!(
+        f.span.file, 1,
+        "the module's function is in the second file"
+    );
+    let main = program
+        .declarations
+        .iter()
+        .find(|d| match &d.node {
+            zyntax_typed_ast::TypedDeclaration::Function(f) => {
+                f.name.resolve_global().as_deref() == Some(zyntax_python::ENTRY)
+            }
+            _ => false,
+        })
+        .expect("the entry is declared");
+    assert_eq!(main.span.file, 0, "the entry is in the main file");
+}
+
 /// A short-circuit condition on an `if` statement and on a `while`,
 /// which reach the branch through the CFG builder rather than through
 /// the expression translator.

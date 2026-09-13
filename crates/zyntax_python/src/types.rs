@@ -168,9 +168,17 @@ pub(crate) struct Module {
     /// `from m import x [as y]`: the local name, to the module and the
     /// member.
     pub(crate) from_names: HashMap<String, (String, String)>,
+    /// The program's own modules, to the index of their source file.
+    pub(crate) files: HashMap<String, u32>,
 }
 
 impl Module {
+    /// The source file a module's statements are in; the main file when
+    /// `module` is `None`.
+    pub(crate) fn file_of(&self, module: Option<&str>) -> u32 {
+        module.and_then(|m| self.files.get(m).copied()).unwrap_or(0)
+    }
+
     /// What a module-qualified name stands for, when `alias` names an
     /// imported module and nothing shadows it.
     pub(crate) fn module_member(&self, alias: &str, name: &str) -> Option<crate::stdlib::Member> {

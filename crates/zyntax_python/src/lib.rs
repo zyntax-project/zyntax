@@ -248,6 +248,17 @@ pub fn parse_program_with(
     let mut module = parsed.into_syntax();
     let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
     let linked = modules::link(main, modules)?;
+    // The program's source files: the main file first, then each module
+    // in the order it was loaded; a span names its file by that index.
+    let mut source_files = vec![zyntax_typed_ast::source::SourceFile::new(
+        file.to_string(),
+        source.to_string(),
+    )];
+    let mut files: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (name, text) in linked.modules {
+        files.insert(name.clone(), source_files.len() as u32);
+        source_files.push(zyntax_typed_ast::source::SourceFile::new(name, text));
+    }
     // The prelude's declarations come first. `origins` names, for each
     // statement of the body, the program's module it came from.
     let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
@@ -255,7 +266,7 @@ pub fn parse_program_with(
         .into_syntax();
     let mut origins: Vec<Option<String>> = vec![None; prelude.body.len()];
     let mut body = prelude.body;
-    for (stmt, origin) in linked {
+    for (stmt, origin) in linked.statements {
         body.push(stmt);
         origins.push(origin);
     }
@@ -334,6 +345,7 @@ pub fn parse_program_with(
         name: ENTRY.to_string(),
         imports,
         from_names,
+        files,
         ..Default::default()
     };
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
@@ -420,6 +432,7 @@ pub fn parse_program_with(
             std::collections::HashMap::new(),
         );
         lowerer.class = item.class;
+        lower::set_current_file(inferred.file_of(item.module.as_deref()));
         let func = lowerer
             .function_named(item.def, &item.name)
             .map_err(|e| located(e, item.module.as_deref()))?;
@@ -428,6 +441,7 @@ pub fn parse_program_with(
             Type::Unknown,
             span_of(item.def),
         ));
+        lower::set_current_file(0);
     }
     if !top_level.is_empty() {
         let mut locals = types::infer_locals(&inferred, &entry_sig, &owned);
@@ -517,13 +531,7 @@ pub fn parse_program_with(
         declarations,
         language: Some(intern("python")),
         span: Span::new(0, source.len()),
-        // The main file, so a diagnostic can show its line. Spans from
-        // an imported module refer to that module's text, which the
-        // compiler's single-file source map cannot yet tell apart.
-        source_files: vec![zyntax_typed_ast::source::SourceFile::new(
-            file.to_string(),
-            source.to_string(),
-        )],
+        source_files,
         type_registry: library.type_registry,
     })
 }
@@ -658,9 +666,14 @@ pub(crate) fn intern(s: &str) -> InternedString {
     InternedString::new_global(s)
 }
 
+/// The span of a node, in the file being lowered.
 pub(crate) fn span_of<N: Ranged>(node: &N) -> Span {
     let r = node.range();
-    Span::new(r.start().to_usize(), r.end().to_usize())
+    Span::in_file(
+        r.start().to_usize(),
+        r.end().to_usize(),
+        lower::current_file(),
+    )
 }
 
 pub(crate) fn prim(p: PrimitiveType) -> Type {

@@ -30,27 +30,35 @@ struct UserImports {
     names: HashMap<String, String>,
 }
 
+/// A program linked into one body.
+pub(crate) struct Linked {
+    /// Every statement with the module it was written in, `None` for
+    /// the main file, so what is reported about it can name the file.
+    pub(crate) statements: Vec<(py::Stmt, Option<String>)>,
+    /// The modules loaded, by name with their source, in load order.
+    pub(crate) modules: Vec<(String, String)>,
+}
+
 /// Link `main`'s body with every module it imports, transitively.
 /// Imported modules come first, each once, in the order first reached.
-/// Each statement comes with the module it was written in, `None` for
-/// the main file, so what is reported about it can name the file.
-pub(crate) fn link(
-    main: Vec<py::Stmt>,
-    resolve: &Resolver<'_>,
-) -> Result<Vec<(py::Stmt, Option<String>)>> {
+pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Linked> {
     let mut linker = Linker {
         resolve,
         done: HashSet::new(),
         in_progress: Vec::new(),
         out: Vec::new(),
+        sources: Vec::new(),
     };
     let mut main = main;
     let imports = linker.link_imports(&mut main)?;
     let main_scope = Scope::of_body(Vec::new(), &main);
     Qualifier::new(None, &main_scope, imports).run(&mut main);
-    let mut out = linker.out;
-    out.extend(main.into_iter().map(|s| (s, None)));
-    Ok(out)
+    let mut statements = linker.out;
+    statements.extend(main.into_iter().map(|s| (s, None)));
+    Ok(Linked {
+        statements,
+        modules: linker.sources,
+    })
 }
 
 struct Linker<'r> {
@@ -58,6 +66,7 @@ struct Linker<'r> {
     done: HashSet<String>,
     in_progress: Vec<String>,
     out: Vec<(py::Stmt, Option<String>)>,
+    sources: Vec<(String, String)>,
 }
 
 impl Linker<'_> {
@@ -178,6 +187,7 @@ impl Linker<'_> {
         Qualifier::new(Some(module), &scope, imports).run(&mut body);
         self.in_progress.pop();
         self.done.insert(module.to_string());
+        self.sources.push((module.to_string(), source));
         self.out
             .extend(body.into_iter().map(|s| (s, Some(module.to_string()))));
         Ok(())

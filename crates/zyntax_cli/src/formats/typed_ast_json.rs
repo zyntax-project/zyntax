@@ -112,7 +112,7 @@ fn add_runtime_function_declarations(program: &mut TypedProgram, arena: &mut Ast
     let i32_type = Type::Primitive(PrimitiveType::I32);
     let bool_type = Type::Primitive(PrimitiveType::Bool);
     let unit_type = Type::Primitive(PrimitiveType::Unit);
-    let zero_span = Span { start: 0, end: 0 };
+    let zero_span = Span::new(0, 0);
 
     // Helper to create an external function declaration
     let mut add_extern_func = |name: &str, params: Vec<(&str, Type)>, return_type: Type| {

@@ -21,7 +21,7 @@ pub type Expr = TypedNode<TypedExpression>;
 pub type Stmt = TypedNode<TypedStatement>;
 pub type Decl = TypedNode<TypedDeclaration>;
 
-pub const SPAN: Span = Span { start: 0, end: 0 };
+pub const SPAN: Span = Span::new(0, 0);
 
 /// The module every declaration here is attributed to. A frontend's own
 /// declarations carry none, which is how lowering and codegen tell what

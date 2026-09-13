@@ -13,7 +13,7 @@ use zyntax_typed_ast::{
     Visibility,
 };
 
-const SPAN: Span = Span { start: 0, end: 0 };
+const SPAN: Span = Span::new(0, 0);
 
 fn i64_ty() -> Type {
     Type::Primitive(PrimitiveType::I64)

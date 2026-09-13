@@ -351,19 +351,11 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
 
         writeln!(f, "{}{}: {}", code_str, level_str, diagnostic.message)?;
 
-        // Group annotations by file and sort by line
+        // Group annotations by the file their span is in.
         let mut file_annotations: HashMap<String, Vec<&Annotation>> = HashMap::new();
-
-        // Get the first source file name from the source map (for single-file programs)
-        // TODO: For multi-file programs, track file_id in Span
-        let default_filename = source_map
-            .get_file_by_id(0)
-            .map(|f| f.name.clone())
-            .unwrap_or_else(|| "input.zy".to_string());
-
         for annotation in &diagnostic.annotations {
             file_annotations
-                .entry(default_filename.clone())
+                .entry(file_name_of(source_map, annotation.span.file))
                 .or_default()
                 .push(annotation);
         }
@@ -465,12 +457,18 @@ impl DiagnosticDisplay for ConsoleDiagnosticDisplay {
 // through the `ariadne` crate (snippet boxes, arrows, multi-span
 // support, colour fallback). Both implement `DiagnosticDisplay`.
 //
-// Multi-file caveat: `Span` carries no `file_id` today (see the TODO
-// at `ConsoleDiagnosticDisplay::fmt_diagnostic` ~line 358). We
-// preserve the single-file assumption — the renderer pulls the
-// filename from `SourceMap::get_file_by_id(0)` and labels every
-// annotation against that. Threading `file_id` through `Span` is a
-// separate piece of work.
+// A span names its file by index into the source map, so a report
+// may label lines of several files at once.
+
+/// The name of the file a span's index refers to; the first file when
+/// the index is out of range, which is every program with one file.
+fn file_name_of(source_map: &SourceMap, file: u32) -> String {
+    source_map
+        .get_file_by_id(file as usize)
+        .or_else(|| source_map.get_file_by_id(0))
+        .map(|f| f.name.clone())
+        .unwrap_or_else(|| "input.zy".to_string())
+}
 
 /// `ariadne`-backed diagnostic renderer. Default for the compiler
 /// from Phase L onward. Produces snippet boxes with arrow annotations
@@ -556,14 +554,6 @@ impl DiagnosticDisplay for AriadneDiagnosticDisplay {
         source_map: &SourceMap,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        // Single-file assumption: pull the filename from file_id 0.
-        // Multi-file diagnostics would need a `file_id` on `Span` —
-        // tracked at the TODO inside `ConsoleDiagnosticDisplay`.
-        let filename = source_map
-            .get_file_by_id(0)
-            .map(|sf| sf.name.clone())
-            .unwrap_or_else(|| "input.zy".to_string());
-
         let (kind, prefix) = Self::level_to_kind(diagnostic.level);
         let header = match prefix {
             Some(p) => format!("{p}: {}", diagnostic.message),
@@ -571,20 +561,20 @@ impl DiagnosticDisplay for AriadneDiagnosticDisplay {
         };
 
         // Anchor the report at the primary annotation's span when one
-        // exists; fall back to (file, 0) otherwise so even
+        // exists; fall back to the first file's start otherwise so even
         // span-less diagnostics still render a header.
-        let anchor_start = diagnostic
+        let anchor = diagnostic
             .annotations
             .iter()
             .find(|a| a.style == AnnotationStyle::Primary)
             .or_else(|| diagnostic.annotations.first())
-            .map(|a| a.span.start)
-            .unwrap_or(0);
+            .map(|a| a.span)
+            .unwrap_or_default();
+        let anchor_file = file_name_of(source_map, anchor.file);
 
-        let mut builder =
-            ariadne::Report::build(kind, (filename.clone(), anchor_start..anchor_start))
-                .with_message(header)
-                .with_config(ariadne::Config::new().with_color(self.use_colors));
+        let mut builder = ariadne::Report::build(kind, (anchor_file, anchor.start..anchor.start))
+            .with_message(header)
+            .with_config(ariadne::Config::new().with_color(self.use_colors));
 
         if let Some(code) = diagnostic.code {
             builder = builder.with_code(code.0);
@@ -600,7 +590,8 @@ impl DiagnosticDisplay for AriadneDiagnosticDisplay {
             } else {
                 annotation.span.start + 1
             };
-            let mut label = ariadne::Label::new((filename.clone(), start..end))
+            let file = file_name_of(source_map, annotation.span.file);
+            let mut label = ariadne::Label::new((file, start..end))
                 .with_color(Self::style_to_color(annotation.style));
             if let Some(msg) = &annotation.message {
                 label = label.with_message(msg.clone());
@@ -922,6 +913,31 @@ mod tests {
         assert_eq!(diag.annotations.len(), 2);
         assert_eq!(diag.help.len(), 1);
         assert_eq!(diag.notes.len(), 1);
+    }
+
+    #[test]
+    fn a_span_in_a_second_file_is_shown_against_that_file() {
+        // The program's files are added in order; a span's `file` picks
+        // one of them, so a report about the second file quotes it.
+        let mut source_map = SourceMap::new();
+        source_map.add_file("main.py".to_string(), "import helper\n".to_string());
+        source_map.add_file(
+            "helper.py".to_string(),
+            "def f(x):\n    return x +\n".to_string(),
+        );
+        let diag = Diagnostic::error("syntax error").with_primary(Span::in_file(24, 25, 1), "here");
+        let renderer = AriadneDiagnosticDisplay { use_colors: false };
+        let rendered = format!(
+            "{}",
+            DisplayWrapper {
+                diagnostic: &diag,
+                display: &renderer,
+                source_map: &source_map,
+            }
+        );
+        assert!(rendered.contains("helper.py:2:"), "got: {rendered}");
+        assert!(rendered.contains("return x +"), "got: {rendered}");
+        assert!(!rendered.contains("import helper"), "got: {rendered}");
     }
 
     #[test]
