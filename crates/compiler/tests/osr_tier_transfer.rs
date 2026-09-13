@@ -498,3 +498,273 @@ fn the_osr_frame_lays_out_live_ins_at_natural_alignment() {
     assert_eq!(empty.size, 0);
     assert!(empty.offsets.is_empty());
 }
+
+/// A loop that grows a heap header it holds by reference, with the header's
+/// length field addressed by a second live-in computed before the loop.
+///
+/// The helper has to keep writing into the same header the address live-in
+/// reads, so the frame must carry the header's pointer rather than a copy
+/// of its bytes: with a copy, the resumed loop advances the copy's data
+/// pointer while the real header's length keeps growing, which is a list
+/// whose length says one thing and whose storage says another.
+#[test]
+fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
+    use indexmap::IndexMap;
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+    use zyntax_compiler::hir::{
+        BinaryOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
+        HirParam, HirPhi, HirStructType, HirTerminator, HirType, HirValue, HirValueKind,
+    };
+
+    const BEAD: u64 = 0xB0A9;
+    let header_ty = HirType::Struct(HirStructType {
+        name: Some(InternedString::new_global("List")),
+        fields: vec![HirType::I64; 3],
+        packed: false,
+    });
+    let i64_ty = HirType::I64;
+    let ptr_i64 = HirType::Ptr(Box::new(HirType::I64));
+
+    let [entry_id, head_id, body_id, exit_id] = [(); 4].map(|_| HirId::new());
+    let [list, n, c0, c1, c8, len_addr, phi_i, cmp, data, bumped, len, len1, next_i] =
+        [(); 13].map(|_| HirId::new());
+
+    let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+    let mut value = |id: HirId, ty: HirType, kind: HirValueKind| {
+        values.insert(
+            id,
+            HirValue {
+                id,
+                ty,
+                kind,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+    };
+    value(list, header_ty.clone(), HirValueKind::Parameter(0));
+    value(n, i64_ty.clone(), HirValueKind::Parameter(1));
+    for (id, v) in [(c0, 0), (c1, 1), (c8, 8)] {
+        value(
+            id,
+            i64_ty.clone(),
+            HirValueKind::Constant(HirConstant::I64(v)),
+        );
+    }
+    for id in [len_addr, data, bumped] {
+        value(id, ptr_i64.clone(), HirValueKind::Instruction);
+    }
+    for id in [phi_i, len, len1, next_i] {
+        value(id, i64_ty.clone(), HirValueKind::Instruction);
+    }
+    value(cmp, HirType::Bool, HirValueKind::Instruction);
+
+    let block = |id, phis, instructions, terminator, predecessors, successors| HirBlock {
+        id,
+        label: None,
+        phis,
+        instructions,
+        terminator,
+        dominance_frontier: Default::default(),
+        predecessors,
+        successors,
+    };
+    let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+    blocks.insert(
+        entry_id,
+        block(
+            entry_id,
+            vec![],
+            vec![HirInstruction::GetElementPtr {
+                result: len_addr,
+                ty: HirType::U8,
+                ptr: list,
+                indices: vec![c8],
+            }],
+            HirTerminator::Branch { target: head_id },
+            vec![],
+            vec![head_id],
+        ),
+    );
+    blocks.insert(
+        head_id,
+        block(
+            head_id,
+            vec![HirPhi {
+                result: phi_i,
+                ty: i64_ty.clone(),
+                incoming: vec![(c0, entry_id), (next_i, body_id)],
+            }],
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: cmp,
+                ty: HirType::Bool,
+                left: phi_i,
+                right: n,
+            }],
+            HirTerminator::CondBranch {
+                condition: cmp,
+                true_target: body_id,
+                false_target: exit_id,
+            },
+            vec![entry_id, body_id],
+            vec![body_id, exit_id],
+        ),
+    );
+    blocks.insert(
+        body_id,
+        block(
+            body_id,
+            vec![],
+            vec![
+                // The element goes where the header's data pointer points,
+                // then the pointer is bumped and written back through the
+                // header, and the length is bumped through its address.
+                HirInstruction::Load {
+                    result: data,
+                    ty: ptr_i64.clone(),
+                    ptr: list,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::Store {
+                    value: phi_i,
+                    ptr: data,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::GetElementPtr {
+                    result: bumped,
+                    ty: HirType::U8,
+                    ptr: data,
+                    indices: vec![c8],
+                },
+                HirInstruction::Store {
+                    value: bumped,
+                    ptr: list,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::Load {
+                    result: len,
+                    ty: i64_ty.clone(),
+                    ptr: len_addr,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: len1,
+                    ty: i64_ty.clone(),
+                    left: len,
+                    right: c1,
+                },
+                HirInstruction::Store {
+                    value: len1,
+                    ptr: len_addr,
+                    align: 8,
+                    volatile: false,
+                },
+                HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: next_i,
+                    ty: i64_ty.clone(),
+                    left: phi_i,
+                    right: c1,
+                },
+            ],
+            HirTerminator::Branch { target: head_id },
+            vec![head_id],
+            vec![head_id],
+        ),
+    );
+    blocks.insert(
+        exit_id,
+        block(
+            exit_id,
+            vec![],
+            vec![],
+            HirTerminator::Return {
+                values: vec![phi_i],
+            },
+            vec![head_id],
+            vec![],
+        ),
+    );
+
+    let signature = HirFunctionSignature {
+        params: vec![
+            HirParam {
+                id: list,
+                name: InternedString::new_global("list"),
+                ty: header_ty,
+                attributes: Default::default(),
+                ownership: Default::default(),
+            },
+            HirParam {
+                id: n,
+                name: InternedString::new_global("n"),
+                ty: i64_ty.clone(),
+                attributes: Default::default(),
+                ownership: Default::default(),
+            },
+        ],
+        returns: vec![i64_ty],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+    let mut function = HirFunction::new(InternedString::new_global("fill"), signature);
+    function.values = values;
+    function.blocks = blocks;
+    function.entry_block = entry_id;
+    function.is_external = false;
+    let func_id = function.id;
+
+    let layout = osr::osr_layout(&function, head_id).expect("the loop has a layout");
+    let site = layout.site_key();
+    assert!(
+        layout.live_ins.contains(&list) && layout.live_ins.contains(&len_addr),
+        "the header and its length's address both arrive in the frame"
+    );
+
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut backend = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    backend.set_compile_tier(0);
+    backend.set_compile_bead_id(BEAD);
+    backend
+        .compile_function(func_id, &function)
+        .expect("tier-0 compile");
+    backend.finalize_definitions().expect("finalize tier 0");
+    let tier0 = backend.get_function_ptr(func_id).expect("tier-0 pointer");
+    backend.set_compile_tier(1);
+    backend
+        .compile_function(func_id, &function)
+        .expect("tier-1 compile");
+    backend.finalize_definitions().expect("finalize tier 1");
+    let (helper_site, helper_code) = backend
+        .take_pending_osr_helpers()
+        .into_iter()
+        .find(|(s, _)| *s == site)
+        .expect("tier 1 should emit a helper for the loop header");
+    osr::publish_helper(BEAD, helper_site, helper_code);
+
+    // A header over a buffer of eight; the first back edge transfers.
+    let count = 8i64;
+    let mut buffer = vec![-1i64; count as usize];
+    let mut header = [buffer.as_mut_ptr() as i64, 0i64, count];
+    let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(tier0) };
+    assert_eq!(f(header.as_mut_ptr(), count), count);
+    assert_eq!(header[1], count, "the length grew through its address");
+    assert_eq!(
+        header[0],
+        buffer.as_ptr() as i64 + count * 8,
+        "the data pointer grew through the header the helper was handed"
+    );
+    assert_eq!(buffer, (0..count).collect::<Vec<_>>());
+}
