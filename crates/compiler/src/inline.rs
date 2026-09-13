@@ -695,13 +695,13 @@ fn callee_contains_inline_safe_intrinsic(callee: &HirFunction) -> bool {
         })
 }
 
-/// Hardware-lowered, side-effect-free intrinsics that can survive
-/// being inlined as part of a callee body. Excludes libc/runtime
-/// trampolines (Memcpy/Memset/Memmove, Malloc/Free/Realloc,
-/// IncRef/DecRef, Panic/Abort, Await/Yield, Drop, GCSafepoint, and
-/// the ZRTL conversion helpers — all of which carry side effects or
-/// non-trivial lowering and must remain proper Calls).
-fn is_inline_safe_intrinsic(i: crate::hir::Intrinsic) -> bool {
+/// Hardware-lowered intrinsics that read their operands and write
+/// nothing: a call to one may be copied, hoisted or reordered like
+/// arithmetic. Excludes the libc and runtime trampolines (memory,
+/// allocation, refcounts, panics, suspension, drops, safepoints and
+/// the ZRTL conversions), which carry side effects or non-trivial
+/// lowering and must remain proper Calls.
+pub(crate) fn is_inline_safe_intrinsic(i: crate::hir::Intrinsic) -> bool {
     use crate::hir::Intrinsic::*;
     matches!(
         i,

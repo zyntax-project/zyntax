@@ -92,7 +92,7 @@
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
-    BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
+    BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -109,6 +109,11 @@ pub struct LicmStats {
 
 /// Run LICM over `func`.
 pub fn run(func: &mut HirFunction) -> LicmStats {
+    run_with(func, &HashSet::new())
+}
+
+/// [`run`], knowing which functions are pure.
+fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
     // SSA construction doesn't reliably populate `block.successors` /
     // `block.predecessors` — different lowering paths write the
     // fields at different times, the optimisation passes that splice
@@ -144,7 +149,7 @@ pub fn run(func: &mut HirFunction) -> LicmStats {
             }
         };
 
-        stats.hoisted += hoist_loop(func, lp, preheader);
+        stats.hoisted += hoist_loop(func, lp, preheader, pure);
     }
 
     stats
@@ -153,8 +158,16 @@ pub fn run(func: &mut HirFunction) -> LicmStats {
 /// Module-level entry — runs LICM on every function in `module`.
 pub fn run_module(module: &mut crate::hir::HirModule) -> LicmStats {
     let mut total = LicmStats::default();
+    // Functions inferred pure write nothing, so a call to one inside a
+    // loop leaves every load in the loop invariant.
+    let pure: HashSet<HirId> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| f.signature.is_pure)
+        .map(|(id, _)| *id)
+        .collect();
     for func in module.functions.values_mut() {
-        let s = run(func);
+        let s = run_with(func, &pure);
         total.hoisted += s.hoisted;
         total.loops_visited += s.loops_visited;
         total.loops_skipped_no_preheader += s.loops_skipped_no_preheader;
@@ -221,7 +234,12 @@ fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<Hi
 
 /// Hoist invariant instructions from `lp.body` into `preheader`.
 /// Returns the number of instructions hoisted.
-fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usize {
+fn hoist_loop(
+    func: &mut HirFunction,
+    lp: &NaturalLoop,
+    preheader: HirId,
+    pure: &HashSet<HirId>,
+) -> usize {
     // Seed invariant set with every value defined outside the
     // loop body. By "defined outside" we mean: produced by an
     // instruction whose containing block isn't in `lp.body`, or
@@ -371,6 +389,30 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
         })
         .collect();
 
+    // A call the loop makes to anything not known pure may write any
+    // memory a pointer reaches, a global included, and the stores it
+    // makes are not in this body to be checked against. No load leaves
+    // such a loop.
+    let impure_call_in_loop = lp
+        .body
+        .iter()
+        .filter_map(|b| func.blocks.get(b))
+        .flat_map(|b| b.instructions.iter())
+        .any(|inst| match inst {
+            HirInstruction::Call { callee, .. } => match callee {
+                HirCallable::Function(id) => !pure.contains(id),
+                HirCallable::Intrinsic(i) => !crate::inline::is_inline_safe_intrinsic(*i),
+                HirCallable::Symbol(_) | HirCallable::Indirect(_) | HirCallable::FuncRef(_) => true,
+            },
+            HirInstruction::IndirectCall { .. }
+            | HirInstruction::CallClosure { .. }
+            | HirInstruction::TraitMethodCall { .. }
+            | HirInstruction::PerformEffect { .. }
+            | HirInstruction::Atomic { .. }
+            | HirInstruction::Fence { .. } => true,
+            _ => false,
+        });
+
     // Iterate-to-fixed-point: each pass may unlock new candidates
     // because a hoisted instruction's result becomes invariant for
     // the next pass.
@@ -408,6 +450,9 @@ fn hoist_loop(func: &mut HirFunction, lp: &NaturalLoop, preheader: HirId) -> usi
                 // (root, offset, size) tuple for the Load and for
                 // every Store, then ask whether ranges may overlap.
                 if let HirInstruction::Load { ptr, ty, .. } = inst {
+                    if impure_call_in_loop {
+                        continue;
+                    }
                     let load_loc =
                         extract_mem_loc(*ptr, hir_ty_byte_size(ty), &identity_subst, &addr_index);
                     // A Load with an entirely opaque root (no GEP+Cast
