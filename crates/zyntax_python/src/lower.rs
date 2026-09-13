@@ -402,6 +402,7 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
         Vec::new(),
         HashMap::new(),
     );
+    lowerer.guards = false;
     let mut params = vec![parameter("env", Ty::List(Elem::Object), span)];
     let mut args = Vec::new();
     for (i, (_, ty)) in sig.params.iter().enumerate() {
@@ -514,6 +515,10 @@ pub(crate) struct Lowerer<'m> {
     /// Whether this function yields: it lowers to a fiber of dynamic
     /// values, and `return` ends it.
     is_generator: bool,
+    /// Whether a checked read this lowerer emits is followed by its
+    /// pending check. A lowerer building a function by hand drains no
+    /// hoisted statements; its callers check after calling it.
+    pub(crate) guards: bool,
 }
 
 /// One `try` body's control flag: 0 fell through, 1 return, 2 break,
@@ -576,6 +581,7 @@ impl<'m> Lowerer<'m> {
             bound,
             temps: 0,
             hoisted: Vec::new(),
+            guards: true,
             cells: cells
                 .into_iter()
                 .map(|n| {
@@ -1018,7 +1024,7 @@ impl<'m> Lowerer<'m> {
             Ty::Object,
             span,
         );
-        let node = self.coerce(
+        let node = self.trusted(
             Val {
                 node: element,
                 ty: Ty::Object,
@@ -1041,7 +1047,7 @@ impl<'m> Lowerer<'m> {
     fn global_read(&mut self, name: &str, span: Span) -> Val {
         let ty = self.var_ty(name);
         let stored = Self::storage(ty);
-        let node = self.coerce(
+        let node = self.trusted(
             Val {
                 node: var(intern(name), stored, span),
                 ty: stored,
@@ -1091,7 +1097,7 @@ impl<'m> Lowerer<'m> {
                 // record slots and the captured cells.
                 let index = RECORD_CELLS_AT + self.captured.len() + params.len();
                 params.push(parameter(p.parameter.name.as_str(), declared, span_of(p)));
-                let value = self.coerce(
+                let value = self.trusted(
                     Val {
                         node: call(
                             "zb_list_get_any",
@@ -1222,7 +1228,6 @@ impl<'m> Lowerer<'m> {
             (_, Ty::Unknown) => v.node,
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
-            (Ty::Float, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
             // A list is boxed by reference under a tag of its kind, and
             // read back by checking that tag.
@@ -1232,6 +1237,25 @@ impl<'m> Lowerer<'m> {
             (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
             (Ty::Object, Ty::List(e)) => call(&list_fn("unbox", e), vec![v.node], target, span),
             (Ty::Object, Ty::Tuple) => call("zb_unbox_tuple", vec![v.node], Ty::Tuple, span),
+            // A primitive read out of a box is checked: a box of another
+            // type is a TypeError, raised where the value is used.
+            (Ty::Object, Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => {
+                let read = match target {
+                    Ty::Int => "zb_any_as_i64",
+                    Ty::Float => "zb_any_as_f64",
+                    Ty::Str => "zb_any_as_str",
+                    _ => "zb_any_as_bool",
+                };
+                let checked = Val {
+                    node: call(read, vec![v.node], target, span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
+            }
             (Ty::Object, Ty::Dict) => call("zb_dict_unbox", vec![v.node], Ty::Dict, span),
             (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
             // An instance is boxed as its address under the class tag, and
@@ -1275,6 +1299,37 @@ impl<'m> Lowerer<'m> {
             (Ty::List(e), Ty::List(Elem::Object)) => {
                 call(&list_fn("to_any", e), vec![v.node], target, span)
             }
+            // Lists of dynamic values into lists of one kind: each element
+            // read back checked. Between two kinds, through the dynamic
+            // list.
+            (Ty::List(from), Ty::List(to)) => {
+                let anys = if from == Elem::Object {
+                    v.node
+                } else {
+                    call(
+                        &list_fn("to_any", from),
+                        vec![v.node],
+                        Ty::List(Elem::Object),
+                        span,
+                    )
+                };
+                let mut args = vec![anys];
+                if let Elem::Class(k) = to {
+                    args.push(int32_lit(
+                        zyntax_builtins::instance_tag(k as usize) as i32,
+                        span,
+                    ));
+                }
+                let converted = Val {
+                    node: call(&list_fn("from_any", to), args, target, span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(converted, span).node
+                } else {
+                    converted.node
+                }
+            }
             (Ty::Tuple, Ty::List(Elem::Object)) => Node {
                 ty: ir(target),
                 ..v.node
@@ -1288,10 +1343,32 @@ impl<'m> Lowerer<'m> {
             // Into the dynamic world: a box. Out of it: a checked read.
             (_, Ty::Object) => cast(v.node, Ty::Object, span),
             (Ty::Object, _) => cast(v.node, target, span),
-            // Two primitives with nothing between them. Type inference
-            // never asks for this; a Python program that does is
-            // treating the value dynamically, so it goes through a box.
-            (_, _) => cast(cast(v.node, Ty::Object, span), target, span),
+            // Two types with no conversion between them (a float where an
+            // int is needed, a string where a float is). Python does not
+            // convert either; the value goes through a box and the read
+            // back is the TypeError.
+            (_, _) => {
+                let boxed = self.coerce(v, Ty::Object);
+                self.coerce(
+                    Val {
+                        node: boxed,
+                        ty: Ty::Object,
+                    },
+                    target,
+                )
+            }
+        }
+    }
+
+    /// A value the lowering itself stored, read back as the type it was
+    /// stored with: a cell's content, a global's box, an argument in a
+    /// generator's environment. Nothing checks it, since nothing else
+    /// writes there.
+    pub(crate) fn trusted(&mut self, v: Val, target: Ty) -> Node {
+        let span = v.node.span;
+        match (v.ty, target) {
+            (Ty::Object, Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => cast(v.node, target, span),
+            _ => self.coerce(v, target),
         }
     }
 
@@ -4565,20 +4642,24 @@ impl<'m> Lowerer<'m> {
                             let f = self.coerce(v, Ty::Float);
                             call("zb_round_half_even", vec![f], Ty::Int, span)
                         }
+                        // With digits, the result keeps the argument's type:
+                        // an int rounded to tens is an int.
                         (Ty::Int | Ty::Float | Ty::Bool, 2) => {
                             let f = self.coerce(v, Ty::Float);
                             let n = self.expr_as(&args[1], Ty::Int)?;
                             let r = call("zb_round_digits", vec![f, n], Ty::Float, span);
-                            return Ok(Val {
-                                node: self.coerce(
+                            let node = if ty == Ty::Int {
+                                cast(r, Ty::Int, span)
+                            } else {
+                                self.coerce(
                                     Val {
                                         node: r,
                                         ty: Ty::Float,
                                     },
                                     ty,
-                                ),
-                                ty,
-                            });
+                                )
+                            };
+                            return Ok(Val { node, ty });
                         }
                         (_, 2) => {
                             let o = self.coerce(v, Ty::Object);
@@ -5536,7 +5617,7 @@ impl<'m> Lowerer<'m> {
                     stored,
                     span,
                 );
-                let node = self.coerce(
+                let node = self.trusted(
                     Val {
                         node: field,
                         ty: stored,
@@ -6001,6 +6082,8 @@ impl<'m> Lowerer<'m> {
                 },
                 local,
             );
+            // The checked read's pending check, ahead of the binding.
+            statements.append(&mut self.hoisted);
             statements.push(TypedNode::new(
                 TypedStatement::Let(TypedLet {
                     name: intern(pname),

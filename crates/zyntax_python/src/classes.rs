@@ -314,7 +314,7 @@ fn scratch(module: &Module) -> Lowerer<'_> {
         ret: Ty::None,
         defaults: Vec::new(),
     };
-    Lowerer::new(
+    let mut lowerer = Lowerer::new(
         module,
         "$class",
         sig,
@@ -322,7 +322,9 @@ fn scratch(module: &Module) -> Lowerer<'_> {
         &Scope::default(),
         Vec::new(),
         HashMap::new(),
-    )
+    );
+    lowerer.guards = false;
+    lowerer
 }
 
 use zyntax_typed_ast::typed_ast::TypedExpression;
@@ -804,18 +806,21 @@ fn builtin_arms(
             vars.push((a.as_str(), Ty::Object));
         }
         let mut lowerer = scratch_with(module, &vars);
-        let Ok(value) = lowerer.expr(&expr) else {
-            continue;
-        };
-        let boxed = lowerer.coerce(value, Ty::Object);
-        let receiver = lowerer.coerce(
+        // The receiver is what the arm's test says it is; the method
+        // then runs on it, and may leave statements to run ahead of it.
+        let receiver = lowerer.trusted(
             Val {
                 node: x.clone(),
                 ty: Ty::Object,
             },
             ty,
         );
-        let mut then = vec![let_("s", ty, receiver, span)];
+        let mut then = std::mem::take(&mut lowerer.hoisted);
+        then.push(let_("s", ty, receiver, span));
+        let Ok(value) = lowerer.expr(&expr) else {
+            continue;
+        };
+        let boxed = lowerer.coerce(value, Ty::Object);
         then.extend(std::mem::take(&mut lowerer.hoisted));
         then.push(ret(boxed, span));
         arms.push(when(test, then, span));
@@ -918,7 +923,57 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
-    vec![str_hook, type_hook, eq_hook, box_hook(module, span)]
+    vec![
+        str_hook,
+        type_hook,
+        eq_hook,
+        box_hook(module, span),
+        unbox_hook(module, span),
+    ]
+}
+
+/// `zb_hook_unbox_instance(x, tag)`: the address in a box holding an
+/// instance of the class `tag` names, or of a subclass; anything else
+/// is a TypeError. The library calls it for each element of a list
+/// becoming a list of one class.
+fn unbox_hook(module: &Module, span: Span) -> TypedFunction {
+    let x = var(intern("x"), Ty::Object, span);
+    let tag = var(intern("tag"), Ty::Int, span);
+    let tag_param = TypedParameter {
+        name: intern("tag"),
+        ty: Type::Primitive(zyntax_typed_ast::PrimitiveType::I32),
+        mutability: Mutability::Immutable,
+        kind: ParameterKind::Regular,
+        default_value: None,
+        attributes: Vec::new(),
+        ownership: ParamOwnership::Copied,
+        span,
+    };
+    let mut statements = Vec::new();
+    for (k, class) in module.classes.iter().enumerate() {
+        let matches = binary(
+            BinaryOp::Eq,
+            cast(tag.clone(), Ty::Int, span),
+            int_lit(zyntax_builtins::instance_tag(k) as i64, span),
+            Ty::Bool,
+            span,
+        );
+        let address = lower::addr_call(&format!("{}$unbox", class.name), vec![x.clone()], span);
+        statements.push(when(matches, vec![ret(address, span)], span));
+    }
+    statements.push(ret(
+        lower::addr_call("zb_unbox_instance_raw", vec![x], span),
+        span,
+    ));
+    let mut f = function(
+        "zb_hook_unbox_instance",
+        vec![param("x", Ty::Object, span), tag_param],
+        Ty::Int,
+        statements,
+        span,
+    );
+    f.return_type = lower::addr_type();
+    f
 }
 
 /// `zb_hook_box_instance(p)`: an instance from its address, boxed under

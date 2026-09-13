@@ -710,6 +710,41 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(out_any.e()));
         s
     }));
+    // The reverse: each element read back as this kind, or a TypeError.
+    // An instance list takes the class tag its elements must carry.
+    let anys_in = local("xs", any_list.clone());
+    let tag = local("tag", i32());
+    let out_typed = local("out", k.list.clone());
+    let read = |e: Expr| match k.kind {
+        Kind::Int => call("zb_any_as_i64", vec![e], i64()),
+        Kind::Float => call("zb_any_as_f64", vec![e], f64()),
+        Kind::Str => call("zb_any_as_str", vec![e], string()),
+        Kind::Ptr => call("zb_hook_unbox_instance", vec![e, tag.e()], usize()),
+        Kind::Any => e,
+    };
+    let from_params: Vec<&Local> = match k.kind {
+        Kind::Ptr => vec![&anys_in, &tag],
+        _ => vec![&anys_in],
+    };
+    d.push(define(&name("from_any"), &from_params, k.list.clone(), {
+        let mut s = vec![
+            out_typed.decl(list(Vec::new(), k.list.clone())),
+            n.decl(len(anys_in.e())),
+        ];
+        s.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(mcall(
+                out_typed.e(),
+                "push",
+                vec![read(idx(anys_in.e(), i.e(), any()))],
+                unit(),
+            ))],
+        ));
+        s.push(ret(out_typed.e()));
+        s
+    }));
     // Unpacking: exactly `n` elements.
     let have = local("have", i64());
     d.push(define(
@@ -818,12 +853,22 @@ pub(crate) fn ptr_declarations(policy: &Policy) -> Vec<Decl> {
     let a = local("a", usize());
     let b = local("b", usize());
     let p = local("p", usize());
+    let x = local("x", any());
+    let tag = local("tag", i32());
     let mut d = Vec::new();
     if policy.instance_hooks {
         d.push(extern_fn(
             "zb_hook_box_instance",
             &[("p", usize())],
             any(),
+            None,
+        ));
+        // The address in a box carrying `tag` (or a tag the frontend
+        // takes for one of its kind), or a TypeError.
+        d.push(extern_fn(
+            "zb_hook_unbox_instance",
+            &[("x", any()), ("tag", i32())],
+            usize(),
             None,
         ));
     } else {
@@ -836,6 +881,21 @@ pub(crate) fn ptr_declarations(policy: &Policy) -> Vec<Decl> {
                 vec![p.e(), int32(255)],
                 any(),
             ))],
+        ));
+        d.push(define(
+            "zb_hook_unbox_instance",
+            &[&x, &tag],
+            usize(),
+            vec![
+                when(
+                    ne(call("zb_box_tag", vec![x.e()], i32()), tag.e()),
+                    vec![fatal("TypeError", text("not an address of that kind"))],
+                ),
+                ret(cast(
+                    call("zb_unbox_instance_raw", vec![x.e()], i64()),
+                    usize(),
+                )),
+            ],
         ));
     }
     d.push(define(

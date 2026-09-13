@@ -608,6 +608,74 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
+    // A value read back as the type it was declared to be. Unlike the
+    // conversions below these change nothing: a box of another type
+    // is a TypeError.
+    d.push(define(
+        "zb_any_as_i64",
+        &[&x],
+        i64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                not(is_integral(&cat)),
+                vec![type_error(add(
+                    quoted(type_name(x.e())),
+                    text(" object cannot be interpreted as an integer"),
+                ))],
+            ),
+            ret(number_i64(x.e(), cat.e())),
+        ],
+    ));
+    d.push(define(
+        "zb_any_as_f64",
+        &[&x],
+        f64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                not(is_number(cat.e())),
+                vec![type_error(add(
+                    text("must be real number, not "),
+                    type_name(x.e()),
+                ))],
+            ),
+            ret(number_f64(x.e(), cat.e())),
+        ],
+    ));
+    d.push(define(
+        "zb_any_as_str",
+        &[&x],
+        string(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                not(is(&cat, STR)),
+                vec![type_error(add(
+                    add(text("expected str instance, "), type_name(x.e())),
+                    text(" found"),
+                ))],
+            ),
+            ret(get_str(x.e())),
+        ],
+    ));
+    d.push(define(
+        "zb_any_as_bool",
+        &[&x],
+        boolean(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                not(is_integral(&cat)),
+                vec![type_error(add(
+                    quoted(type_name(x.e())),
+                    text(" object cannot be interpreted as an integer"),
+                ))],
+            ),
+            ret(ne(number_i64(x.e(), cat.e()), int(0))),
+        ],
+    ));
+
     // Conversions.
     d.push(define(
         "zb_any_int",
@@ -939,6 +1007,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     ));
     let i = local("i", any());
     let index = |i: Expr| call("zb_any_int", vec![i], i64());
+    let list_get = |k: Kind, x: Expr, i: Expr| {
+        call(
+            &format!("zb_list_get_{}", k.suffix()),
+            vec![unbox(k, x), index(i)],
+            k.ty(),
+        )
+    };
     d.push(define(
         "zb_any_getitem",
         &[&x, &i],
@@ -964,6 +1039,27 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_dict(x.e()),
                 vec![ret(call("zb_dict_get", vec![raw_any(x.e()), i.e()], any()))],
             ),
+            // A list of one kind is read in place, the element boxed.
+            when(
+                kind_is(Kind::Int, x.e()),
+                vec![ret(box_i64(list_get(Kind::Int, x.e(), i.e())))],
+            ),
+            when(
+                kind_is(Kind::Float, x.e()),
+                vec![ret(box_f64(list_get(Kind::Float, x.e(), i.e())))],
+            ),
+            when(
+                kind_is(Kind::Str, x.e()),
+                vec![ret(box_str(list_get(Kind::Str, x.e(), i.e())))],
+            ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![ret(call(
+                    "zb_hook_box_instance",
+                    vec![list_get(Kind::Ptr, x.e(), i.e())],
+                    any(),
+                ))],
+            ),
             ret(call(
                 "zb_list_get_any",
                 vec![iter(x.e()), index(i.e())],
@@ -971,7 +1067,29 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             )),
         ],
     ));
-    let mutable_list = |x: Expr| and(eq(category(x.clone()), int(CUSTOM)), kind_is(Kind::Any, x));
+    let mutable_list = |x: Expr| {
+        and(
+            eq(category(x.clone()), int(CUSTOM)),
+            or(
+                kind_is(Kind::Any, x.clone()),
+                or(
+                    kind_is(Kind::Int, x.clone()),
+                    or(
+                        kind_is(Kind::Float, x.clone()),
+                        or(kind_is(Kind::Str, x.clone()), kind_is(Kind::Ptr, x)),
+                    ),
+                ),
+            ),
+        )
+    };
+    // A value stored into a list of one kind must be of that kind.
+    let list_set = |k: Kind, x: Expr, i: Expr, v: Expr| {
+        expr(call(
+            &format!("zb_list_set_{}", k.suffix()),
+            vec![unbox(k, x), index(i), v],
+            unit(),
+        ))
+    };
     let boxed_dict = |x: Expr| and(eq(category(x.clone()), int(CUSTOM)), is_dict(x));
     let v = owned("v", any());
     d.push(define(
@@ -996,6 +1114,61 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     quoted(type_name(x.e())),
                     text(" object does not support item assignment"),
                 ))],
+            ),
+            when(
+                kind_is(Kind::Int, x.e()),
+                vec![
+                    list_set(
+                        Kind::Int,
+                        x.e(),
+                        i.e(),
+                        call("zb_any_as_i64", vec![v.e()], i64()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                kind_is(Kind::Float, x.e()),
+                vec![
+                    list_set(
+                        Kind::Float,
+                        x.e(),
+                        i.e(),
+                        call("zb_any_as_f64", vec![v.e()], f64()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                kind_is(Kind::Str, x.e()),
+                vec![
+                    list_set(
+                        Kind::Str,
+                        x.e(),
+                        i.e(),
+                        call("zb_any_as_str", vec![v.e()], string()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![
+                    when(
+                        not(is_instance(v.e())),
+                        vec![type_error(add(
+                            text("expected an instance, got "),
+                            quoted(type_name(v.e())),
+                        ))],
+                    ),
+                    list_set(
+                        Kind::Ptr,
+                        x.e(),
+                        i.e(),
+                        cast(call("zb_unbox_instance_raw", vec![v.e()], i64()), usize()),
+                    ),
+                    ret_void(),
+                ],
             ),
             expr(call(
                 "zb_list_set_any",
