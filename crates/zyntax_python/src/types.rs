@@ -214,6 +214,12 @@ pub(crate) struct ClosureInfo {
     /// Whether the return type is inferred from the body rather than
     /// annotated.
     pub(crate) ret_inferred: bool,
+    /// Whether the body may read a variable of an enclosing function.
+    /// Then the typed entry takes the record, to reach the cells; a
+    /// closure over nothing takes its parameters alone. Decided from the
+    /// names in view, so it may say yes where the lowering finds no
+    /// cell, never no where it finds one.
+    pub(crate) captures: bool,
     /// Whether a value of this closure reaches anywhere but a call, a
     /// local, or a return. Then a call through it may come from code
     /// the inference cannot see, and its parameters stay dynamic.
@@ -252,45 +258,64 @@ pub(crate) fn in_file<T>(file: u32, f: impl FnOnce() -> T) -> T {
 /// of the file `file`. Generators keep their own lowering and are not
 /// closures here. `owner` names the function the body belongs to; a
 /// closure inside a closure is named after the outer one in turn.
+/// `visible` is every variable of the body's function: its parameters
+/// and what it binds.
 pub(crate) fn collect_closures(
     module: &mut Module,
     owner: &str,
     file: u32,
     body: &[py::Stmt],
     classes: &HashMap<String, usize>,
+    visible: std::collections::HashSet<String>,
 ) {
     use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
     struct Finder<'m, 'c> {
         module: &'m mut Module,
         classes: &'c HashMap<String, usize>,
         owner: Vec<String>,
+        /// The variables of the enclosing functions, innermost last.
+        visible: Vec<std::collections::HashSet<String>>,
         file: u32,
     }
     impl Finder<'_, '_> {
-        fn add(
+        /// Register the closure and enter it.
+        fn enter(
             &mut self,
             start: u32,
             kind: &str,
             sig: Sig,
             inferred: Vec<bool>,
             ret_inferred: bool,
-        ) -> String {
+            scope: &crate::scope::Scope,
+        ) {
             let index = self.module.closures.borrow().len();
             let name = format!(
                 "{}${kind}${index}",
                 self.owner.last().cloned().unwrap_or_default()
             );
+            let outer = self.visible.last().expect("an enclosing scope");
+            let captures = !scope.free.is_disjoint(outer);
+            let mut inner = outer.clone();
+            inner.extend(scope.bound.iter().cloned());
+            inner.extend(sig.params.iter().map(|(n, _)| n.clone()));
             self.module.closures.borrow_mut().push(ClosureInfo {
                 name: name.clone(),
                 sig,
                 inferred,
                 ret_inferred,
+                captures,
                 escapes: false,
             });
             self.module
                 .closure_index
                 .insert((self.file, start), index as u16);
-            name
+            self.owner.push(name);
+            self.visible.push(inner);
+        }
+
+        fn leave(&mut self) {
+            self.owner.pop();
+            self.visible.pop();
         }
     }
     impl<'a> Visitor<'a> for Finder<'_, '_> {
@@ -323,16 +348,16 @@ pub(crate) fn collect_closures(
                     if f.returns.is_none() {
                         sig.ret = Ty::Unknown;
                     }
-                    let name = self.add(
+                    self.enter(
                         f.range.start().to_u32(),
                         f.name.as_str(),
                         sig,
                         inferred,
                         f.returns.is_none(),
+                        &crate::scope::Scope::of_function(f),
                     );
-                    self.owner.push(name);
                     walk_stmt(self, stmt);
-                    self.owner.pop();
+                    self.leave();
                 }
                 py::Stmt::ClassDef(_) => {}
                 _ => walk_stmt(self, stmt),
@@ -364,11 +389,16 @@ pub(crate) fn collect_closures(
                         ret: Ty::Unknown,
                         defaults: vec![None; n],
                     };
-                    let name =
-                        self.add(l.range.start().to_u32(), "lambda", sig, vec![true; n], true);
-                    self.owner.push(name);
+                    self.enter(
+                        l.range.start().to_u32(),
+                        "lambda",
+                        sig,
+                        vec![true; n],
+                        true,
+                        &crate::scope::Scope::of_lambda(l),
+                    );
                     walk_expr(self, expr);
-                    self.owner.pop();
+                    self.leave();
                     return;
                 }
             }
@@ -379,6 +409,7 @@ pub(crate) fn collect_closures(
         module,
         classes,
         owner: vec![owner.to_string()],
+        visible: vec![visible],
         file,
     };
     for s in body {

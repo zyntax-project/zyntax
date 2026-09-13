@@ -5957,13 +5957,16 @@ impl<'m> Lowerer<'m> {
         if !keywords.is_empty() || args.len() != info.sig.params.len() {
             return self.call_value(callee, args, keywords, c, span);
         }
-        let record = self.coerce(callee, Ty::Object);
-        let mut lowered = vec![call(
-            "zb_unbox_list_raw_any",
-            vec![record],
-            Ty::List(Elem::Object),
-            span,
-        )];
+        let mut lowered = Vec::new();
+        if info.captures {
+            let record = self.coerce(callee, Ty::Object);
+            lowered.push(call(
+                "zb_unbox_list_raw_any",
+                vec![record],
+                Ty::List(Elem::Object),
+                span,
+            ));
+        }
         lowered.extend(self.arguments(&info.name, &info.sig, args, keywords, c)?);
         let v = Val {
             node: call(&info.typed_name(), lowered, info.sig.ret, span),
@@ -6026,7 +6029,7 @@ impl<'m> Lowerer<'m> {
         for s in &f.body {
             child.stmt(s, &mut body)?;
         }
-        self.lift(&mut child, known.as_ref(), &lifted, &params, body, span);
+        self.lift(&mut child, known.as_ref(), &lifted, &params, body, f)?;
         let cells = self.cells_of(&captured, span);
         Ok(self.record(&lifted, params.len(), cells, span))
     }
@@ -6082,7 +6085,7 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
-        self.lift(&mut child, known.as_ref(), &lifted, &params, body, span);
+        self.lift(&mut child, known.as_ref(), &lifted, &params, body, l)?;
         let cells = self.cells_of(&captured, span);
         Ok(self.record(&lifted, params.len(), cells, span))
     }
@@ -6104,12 +6107,24 @@ impl<'m> Lowerer<'m> {
         lifted: &str,
         params: &[(String, Ty)],
         body: Vec<Stmt>,
-        span: Span,
-    ) {
+        at: &dyn Ranged,
+    ) -> Result<()> {
+        let span = span_of(&at.range());
         match known {
             Some(info) => {
-                let typed = child.typed_function(&info.typed_name(), params, body, span);
-                let adapter = child.adapter_function(lifted, &info.typed_name(), params, span);
+                if !info.captures && !child.captured.is_empty() {
+                    return unsupported(
+                        format!(
+                            "internal: `{lifted}` captures {} where inference saw no capture",
+                            child.captured.join(", ")
+                        ),
+                        &at.range(),
+                    );
+                }
+                let typed =
+                    child.typed_function(&info.typed_name(), params, body, info.captures, span);
+                let adapter =
+                    child.adapter_function(lifted, &info.typed_name(), params, info.captures, span);
                 let mut lifted = self.module.lifted.borrow_mut();
                 lifted.push(typed);
                 lifted.push(adapter);
@@ -6119,6 +6134,7 @@ impl<'m> Lowerer<'m> {
                 self.module.lifted.borrow_mut().push(function);
             }
         }
+        Ok(())
     }
 
     /// Which of this function's cells a nested body uses, in record
@@ -6156,16 +6172,21 @@ impl<'m> Lowerer<'m> {
         format!("{}${inner}${n}", self.name)
     }
 
-    /// A closure's typed entry: the record, then each parameter as
-    /// inference typed it, to the result as inference typed it.
+    /// A closure's typed entry: the record when the body reads the
+    /// cells in it, then each parameter as inference typed it, to the
+    /// result as inference typed it.
     fn typed_function(
         &mut self,
         name: &str,
         params: &[(String, Ty)],
         body: Vec<Stmt>,
+        with_env: bool,
         span: Span,
     ) -> TypedFunction {
-        let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
+        let mut typed_params = Vec::new();
+        if with_env {
+            typed_params.push(parameter("env", Ty::List(Elem::Object), span));
+        }
         let mut statements = Vec::new();
         for (pname, declared) in params {
             typed_params.push(parameter(pname, *declared, span));
@@ -6235,13 +6256,17 @@ impl<'m> Lowerer<'m> {
         name: &str,
         typed: &str,
         params: &[(String, Ty)],
+        with_env: bool,
         span: Span,
     ) -> TypedFunction {
         // A check that fails leaves with a placeholder of this shape.
         let ret = std::mem::replace(&mut self.sig.ret, Ty::Object);
         let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
         let mut statements = Vec::new();
-        let mut args = vec![var(intern("env"), Ty::List(Elem::Object), span)];
+        let mut args = Vec::new();
+        if with_env {
+            args.push(var(intern("env"), Ty::List(Elem::Object), span));
+        }
         for (i, (_, declared)) in params.iter().enumerate() {
             let arg = format!("a{i}");
             typed_params.push(parameter(&arg, Ty::Object, span));

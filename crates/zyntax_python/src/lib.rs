@@ -363,14 +363,24 @@ pub fn parse_program_with(
         .collect();
     for item in &items {
         let file = inferred.file_of(item.module.as_deref());
+        let scope = scope::Scope::of_function(item.def);
+        let mut visible = scope.bound.clone();
+        visible.extend(
+            item.def
+                .parameters
+                .iter_non_variadic_params()
+                .map(|p| p.parameter.name.to_string()),
+        );
         types::collect_closures(
             &mut inferred,
             &item.name,
             file,
             &item.def.body,
             &class_index,
+            visible,
         );
     }
+    let entry_scope = scope::Scope::of_body(Vec::new(), &owned);
     for (stmt, file) in owned.iter().zip(&entry_files) {
         types::collect_closures(
             &mut inferred,
@@ -378,6 +388,7 @@ pub fn parse_program_with(
             *file,
             std::slice::from_ref(stmt),
             &class_index,
+            entry_scope.bound.clone(),
         );
     }
     // Names the lowering makes up start past the closures' indices.
