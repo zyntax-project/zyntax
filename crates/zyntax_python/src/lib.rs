@@ -36,18 +36,114 @@ mod stdlib;
 mod types;
 
 /// Why a program could not be turned into a `TypedProgram`.
+///
+/// Each carries where in the source it happened, as byte offsets into
+/// the main file, or into the module named by `module` when one is.
+/// [`Error::render`] shows it against the source.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Python syntax error: {0}")]
-    Syntax(String),
+    /// Python that does not parse.
+    #[error("Python syntax error: {message} at {}..{}{}", span.0, span.1, in_module(module))]
+    Syntax {
+        message: String,
+        span: (usize, usize),
+        module: Option<String>,
+    },
     /// Something Python allows that this frontend does not compile yet.
     /// Says what it was and where, so the gap is a fact rather than a
     /// guess.
-    #[error("{what} is not supported yet (at byte offset {at})")]
-    Unsupported { what: String, at: usize },
+    #[error("{what} is not supported yet (at byte offset {}{})", span.0, in_module(module))]
+    Unsupported {
+        what: String,
+        span: (usize, usize),
+        module: Option<String>,
+    },
     /// The built-in library this crate was built with cannot be read.
     #[error("the built-in library is unreadable: {0}")]
     Library(String),
+}
+
+fn in_module(module: &Option<String>) -> String {
+    match module {
+        Some(m) => format!(" in module `{m}`"),
+        None => String::new(),
+    }
+}
+
+impl Error {
+    pub(crate) fn syntax(message: impl Into<String>, at: ruff_text_size::TextRange) -> Self {
+        Error::Syntax {
+            message: message.into(),
+            span: (at.start().to_usize(), at.end().to_usize()),
+            module: None,
+        }
+    }
+
+    pub(crate) fn unsupported(what: impl Into<String>, at: &impl Ranged) -> Self {
+        let range = at.range();
+        Error::Unsupported {
+            what: what.into(),
+            span: (range.start().to_usize(), range.end().to_usize()),
+            module: None,
+        }
+    }
+
+    pub(crate) fn unsupported_span(what: impl Into<String>, span: Span) -> Self {
+        Error::Unsupported {
+            what: what.into(),
+            span: (span.start, span.end),
+            module: None,
+        }
+    }
+
+    /// The same error, located in the named module rather than the main
+    /// file.
+    pub(crate) fn in_module(mut self, name: &str) -> Self {
+        match &mut self {
+            Error::Syntax { module, .. } | Error::Unsupported { module, .. } => {
+                if module.is_none() {
+                    *module = Some(name.to_string());
+                }
+            }
+            Error::Library(_) => {}
+        }
+        self
+    }
+
+    /// The module the error is located in, when it is not the main file.
+    pub fn module(&self) -> Option<&str> {
+        match self {
+            Error::Syntax { module, .. } | Error::Unsupported { module, .. } => module.as_deref(),
+            Error::Library(_) => None,
+        }
+    }
+
+    /// The error shown against its source, the way the compiler shows
+    /// its own diagnostics. `file` names the source the error's span
+    /// refers to: the main file, or the module [`Error::module`] names.
+    pub fn render(&self, file: &str, source: &str, use_colors: bool) -> String {
+        use zyntax_typed_ast::diagnostics::{render_diagnostic, Diagnostic};
+        let (message, label, span) = match self {
+            Error::Syntax { message, span, .. } => {
+                (format!("syntax error: {message}"), "here", *span)
+            }
+            Error::Unsupported { what, span, .. } => (
+                format!("{what} is not supported yet"),
+                "this frontend does not compile this form",
+                *span,
+            ),
+            Error::Library(message) => {
+                return format!("error: the built-in library is unreadable: {message}\n")
+            }
+        };
+        // A span has to cover something to be shown; an empty one at the
+        // end of the file is drawn on its last byte.
+        let end = source.len().max(1);
+        let start = span.0.min(end - 1);
+        let stop = span.1.max(start + 1).min(end);
+        let diagnostic = Diagnostic::error(message).with_primary(Span::new(start, stop), label);
+        render_diagnostic(&diagnostic, file, source, use_colors)
+    }
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -132,67 +228,82 @@ pub fn register_runtime(
 /// Parse Python source and rewrite it into a `TypedProgram`. A program
 /// that imports its own modules needs [`parse_program_with`].
 pub fn parse_program(source: &str) -> Result<TypedProgram> {
-    parse_program_with(source, &|_| None)
+    parse_program_with(source, "<python>", &|_| None)
 }
 
 /// [`parse_program`] for a program of several files: `modules` finds
 /// the source of a module by its dotted name. Each module's body runs
 /// once, ahead of the file importing it, and its names are the
-/// module's own.
-pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Result<TypedProgram> {
+/// module's own. `file` names the main source in diagnostics.
+pub fn parse_program_with(
+    source: &str,
+    file: &str,
+    modules: &modules::Resolver<'_>,
+) -> Result<TypedProgram> {
     let parsed = ruff_python_parser::parse_module(source)
-        .map_err(|e| Error::Syntax(format!("{} at {:?}", e.error, e.location)))?;
+        .map_err(|e| Error::syntax(e.error.to_string(), e.location))?;
     if let Some(first) = parsed.errors().first() {
-        return Err(Error::Syntax(format!(
-            "{} at {:?}",
-            first.error, first.location
-        )));
+        return Err(Error::syntax(first.error.to_string(), first.location));
     }
     let mut module = parsed.into_syntax();
     let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
     let linked = modules::link(main, modules)?;
-    // The prelude's declarations come first.
+    // The prelude's declarations come first. `origins` names, for each
+    // statement of the body, the program's module it came from.
     let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
         .expect("the prelude parses")
         .into_syntax();
+    let mut origins: Vec<Option<String>> = vec![None; prelude.body.len()];
     let mut body = prelude.body;
-    body.extend(linked);
+    for (stmt, origin) in linked {
+        body.push(stmt);
+        origins.push(origin);
+    }
     module.body = body;
+    let located = |e: Error, module: Option<&str>| match module {
+        Some(m) => e.in_module(m),
+        None => e,
+    };
 
     // A module's body is the program. Statements outside any `def` run
     // top to bottom when the module is executed, so they become the
     // body of the entry point, in order.
-    let mut defs: Vec<&py::StmtFunctionDef> = Vec::new();
-    let mut top_level: Vec<&py::Stmt> = Vec::new();
-    for stmt in &module.body {
+    let mut defs: Vec<(&py::StmtFunctionDef, Option<&str>)> = Vec::new();
+    let mut top_level: Vec<(&py::Stmt, Option<&str>)> = Vec::new();
+    for (stmt, origin) in module.body.iter().zip(origins.iter()) {
+        let origin = origin.as_deref();
         match stmt {
             py::Stmt::FunctionDef(f) => {
                 if f.name.as_str() == ENTRY {
-                    return Err(Error::Unsupported {
-                        what: format!(
-                            "a function named `{ENTRY}`; the module body is the program's entry"
+                    return Err(located(
+                        Error::unsupported(
+                            format!(
+                                "a function named `{ENTRY}`; the module body is the program's entry"
+                            ),
+                            &f,
                         ),
-                        at: f.range().start().to_usize(),
-                    });
+                        origin,
+                    ));
                 }
-                defs.push(f);
+                defs.push((f, origin));
             }
             // A module docstring declares nothing and runs nothing.
             py::Stmt::Expr(e) if matches!(*e.value, py::Expr::StringLiteral(_)) => {}
             py::Stmt::Pass(_) => {}
             // Classes are declarations; their methods are functions.
             py::Stmt::ClassDef(_) => {}
-            other => top_level.push(other),
+            other => top_level.push((other, origin)),
         }
     }
-    let class_defs = classes::collect(&module.body)?;
+    let class_defs = classes::collect(&module.body, &origins)?;
     let (class_infos, class_index) = classes::skeletons(&class_defs)?;
     let mut items: Vec<types::Item<'_>> = defs
         .iter()
-        .map(|f| types::Item {
+        .map(|(f, origin)| types::Item {
             name: f.name.to_string(),
             class: None,
             def: f,
+            module: origin.map(str::to_string),
         })
         .collect();
     for (k, def) in class_defs.iter().enumerate() {
@@ -201,13 +312,14 @@ pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Resu
                 name: types::method_fn(&def.name, m.name.as_str()),
                 class: Some(k),
                 def: m,
+                module: def.module.clone(),
             });
         }
     }
 
     let mut library = library()?;
     lower::set_list_type(library.list_type);
-    let owned: Vec<py::Stmt> = top_level.iter().map(|s| (*s).clone()).collect();
+    let owned: Vec<py::Stmt> = top_level.iter().map(|(s, _)| (*s).clone()).collect();
     let entry_sig = types::Sig {
         params: Vec::new(),
         ret: types::Ty::None,
@@ -224,7 +336,8 @@ pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Resu
         from_names,
         ..Default::default()
     };
-    let global_names = module_globals(&module.body, &defs, &inferred.class_index);
+    let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
+    let global_names = module_globals(&module.body, &def_stmts, &inferred.class_index);
     // A global's type is the join of every assignment to it: the
     // module's own, then those under `global` in each function.
     let main_locals = types::infer_locals(&inferred, &entry_sig, &owned);
@@ -307,7 +420,9 @@ pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Resu
             std::collections::HashMap::new(),
         );
         lowerer.class = item.class;
-        let func = lowerer.function_named(item.def, &item.name)?;
+        let func = lowerer
+            .function_named(item.def, &item.name)
+            .map_err(|e| located(e, item.module.as_deref()))?;
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),
             Type::Unknown,
@@ -331,8 +446,8 @@ pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Resu
         )
         .entry_body(&top_level)?;
         let span = Span::new(
-            top_level[0].range().start().to_usize(),
-            top_level[top_level.len() - 1].range().end().to_usize(),
+            top_level[0].0.range().start().to_usize(),
+            top_level[top_level.len() - 1].0.range().end().to_usize(),
         );
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(TypedFunction {
@@ -402,7 +517,13 @@ pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Resu
         declarations,
         language: Some(intern("python")),
         span: Span::new(0, source.len()),
-        source_files: Vec::new(),
+        // The main file, so a diagnostic can show its line. Spans from
+        // an imported module refer to that module's text, which the
+        // compiler's single-file source map cannot yet tell apart.
+        source_files: vec![zyntax_typed_ast::source::SourceFile::new(
+            file.to_string(),
+            source.to_string(),
+        )],
         type_registry: library.type_registry,
     })
 }
@@ -426,10 +547,10 @@ fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
                     for alias in &i.names {
                         let module = alias.name.id.as_str();
                         if !stdlib::is_known(module) {
-                            return Err(Error::Unsupported {
-                                what: format!("import of module `{module}`"),
-                                at: alias.range().start().to_usize(),
-                            });
+                            return Err(Error::unsupported(
+                                format!("import of module `{module}`"),
+                                &alias,
+                            ));
                         }
                         let local = alias
                             .asname
@@ -441,40 +562,31 @@ fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
                 }
                 py::Stmt::ImportFrom(f) => {
                     let Some(module) = f.module.as_ref().map(|m| m.id.as_str()) else {
-                        return Err(Error::Unsupported {
-                            what: "a relative import".to_string(),
-                            at: f.range().start().to_usize(),
-                        });
+                        return Err(Error::unsupported("a relative import".to_string(), &f));
                     };
                     if !stdlib::is_known(module) {
-                        return Err(Error::Unsupported {
-                            what: format!("import of module `{module}`"),
-                            at: f.range().start().to_usize(),
-                        });
+                        return Err(Error::unsupported(
+                            format!("import of module `{module}`"),
+                            &f,
+                        ));
                     }
                     for alias in &f.names {
                         let name = alias.name.id.as_str();
                         if name == "*" {
-                            return Err(Error::Unsupported {
-                                what: format!("`from {module} import *`"),
-                                at: alias.range().start().to_usize(),
-                            });
+                            return Err(Error::unsupported(
+                                format!("`from {module} import *`"),
+                                &alias,
+                            ));
                         }
                         // typing's names are annotations, not values.
                         if module == "typing" {
                             if !stdlib::is_typing_name(name) {
-                                return Err(Error::Unsupported {
-                                    what: format!("`typing.{name}`"),
-                                    at: alias.range().start().to_usize(),
-                                });
+                                return Err(Error::unsupported(format!("`typing.{name}`"), &alias));
                             }
                             continue;
                         }
                         if stdlib::member(module, name).is_none() {
-                            return Err(Error::Unsupported {
-                                what: format!("`{module}.{name}`"),
-                                at: alias.range().start().to_usize(),
-                            });
+                            return Err(Error::unsupported(format!("`{module}.{name}`"), &alias));
                         }
                         let local = alias
                             .asname

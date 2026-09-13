@@ -17,10 +17,10 @@ use ruff_text_size::Ranged;
 use std::collections::{BTreeSet, HashMap};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
-    TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression, TypedFieldAccess, TypedFor,
-    TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral, TypedMatch, TypedMatchArm,
-    TypedMethodCall, TypedParameter, TypedPattern, TypedRange, TypedStatement, TypedUnary,
-    TypedWhile,
+    ParameterAttribute, TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression,
+    TypedFieldAccess, TypedFor, TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral,
+    TypedMatch, TypedMatchArm, TypedMethodCall, TypedParameter, TypedPattern, TypedRange,
+    TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
@@ -333,9 +333,24 @@ fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
         mutability: Mutability::Mutable,
         kind: ParameterKind::Regular,
         default_value: None,
-        attributes: Vec::new(),
+        attributes: dynamic_attribute(ty, span),
         ownership: ownership_of(ty),
         span,
+    }
+}
+
+/// The `dynamic` attribute on a parameter Python types dynamically: an
+/// unannotated parameter is dynamic by the language's rules, not by
+/// omission, and the lowering does not warn about it.
+pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
+    if ty == Ty::Object {
+        vec![ParameterAttribute {
+            name: intern("dynamic"),
+            args: Vec::new(),
+            span,
+        }]
+    } else {
+        Vec::new()
     }
 }
 
@@ -418,10 +433,7 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
 }
 
 fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
-    Err(Error::Unsupported {
-        what: what.into(),
-        at: at.range().start().to_usize(),
-    })
+    Err(Error::unsupported(what.into(), at))
 }
 
 /// One function's lowering state.
@@ -1098,7 +1110,7 @@ impl<'m> Lowerer<'m> {
                     ParameterKind::Regular
                 },
                 default_value,
-                attributes: Vec::new(),
+                attributes: dynamic_attribute(declared, span_of(p)),
                 ownership: ownership_of(declared),
                 span: span_of(p),
             });
@@ -1164,18 +1176,6 @@ impl<'m> Lowerer<'m> {
             link_name: None,
             module: None,
         })
-    }
-
-    /// The module body as the entry function's statements.
-    pub(crate) fn body(&mut self, stmts: &[&py::Stmt]) -> Result<Vec<Stmt>> {
-        let mut out = match stmts.first() {
-            Some(first) => self.cell_prologue(span_of(*first)),
-            None => Vec::new(),
-        };
-        for s in stmts {
-            self.stmt(s, &mut out)?;
-        }
-        Ok(out)
     }
 
     // ─── Conversions ────────────────────────────────────────────────
@@ -2963,14 +2963,14 @@ impl<'m> Lowerer<'m> {
             if let Some(r) = self.dunder(k as usize, name, left.node, vec![other], span) {
                 return Ok(r);
             }
-            return Err(Error::Unsupported {
-                what: format!(
+            return Err(Error::unsupported_span(
+                format!(
                     "`{}` on {}, which defines no {name}",
                     op_text(op),
                     self.module.classes[k as usize].name
                 ),
-                at: span.start,
-            });
+                span,
+            ));
         }
         let ty = types::binop(op, left.ty, right.ty, right_expr);
         // Strings have their own operators.
@@ -3163,13 +3163,13 @@ impl<'m> Lowerer<'m> {
                         same
                     });
                 }
-                return Err(Error::Unsupported {
-                    what: format!(
+                return Err(Error::unsupported_span(
+                    format!(
                         "ordering {} against a {right_ty:?}, which defines no {name}",
                         self.module.classes[k as usize].name
                     ),
-                    at: right_node.span.start,
-                });
+                    right_node.span,
+                ));
             }
         }
         match op {
@@ -3262,10 +3262,10 @@ impl<'m> Lowerer<'m> {
                 py::CmpOp::Eq => call("zb_set_eq", vec![l, r], Ty::Bool, span),
                 py::CmpOp::NotEq => negate(call("zb_set_eq", vec![l, r], Ty::Bool, span)),
                 _ => {
-                    return Err(Error::Unsupported {
-                        what: "this comparison of sets".to_string(),
-                        at: span.start,
-                    })
+                    return Err(Error::unsupported_span(
+                        "this comparison of sets".to_string(),
+                        span,
+                    ))
                 }
             });
         }
@@ -3782,10 +3782,10 @@ impl<'m> Lowerer<'m> {
             if args.len() == n {
                 Ok(())
             } else {
-                Err(Error::Unsupported {
-                    what: format!("{name}() with {} argument(s)", args.len()),
-                    at: span.start,
-                })
+                Err(Error::unsupported_span(
+                    format!("{name}() with {} argument(s)", args.len()),
+                    span,
+                ))
             }
         };
         match receiver.ty {
@@ -3889,10 +3889,10 @@ impl<'m> Lowerer<'m> {
                         call("zb_dict_update", vec![d, other], Ty::None, span)
                     }
                     _ => {
-                        return Err(Error::Unsupported {
-                            what: format!("dict.{name} with {} argument(s)", args.len()),
-                            at: span.start,
-                        })
+                        return Err(Error::unsupported_span(
+                            format!("dict.{name} with {} argument(s)", args.len()),
+                            span,
+                        ))
                     }
                 };
                 Ok(Val { node, ty })
@@ -3940,10 +3940,10 @@ impl<'m> Lowerer<'m> {
                         call(f, args, result, span)
                     }
                     _ => {
-                        return Err(Error::Unsupported {
-                            what: format!("set.{name} with {} argument(s)", args.len()),
-                            at: span.start,
-                        })
+                        return Err(Error::unsupported_span(
+                            format!("set.{name} with {} argument(s)", args.len()),
+                            span,
+                        ))
                     }
                 };
                 Ok(Val { node, ty })
@@ -3986,18 +3986,18 @@ impl<'m> Lowerer<'m> {
                         call("zb_str_join", vec![s, items], Ty::Str, span)
                     }
                     _ => {
-                        return Err(Error::Unsupported {
-                            what: format!("str.{name} with {} argument(s)", args.len()),
-                            at: span.start,
-                        })
+                        return Err(Error::unsupported_span(
+                            format!("str.{name} with {} argument(s)", args.len()),
+                            span,
+                        ))
                     }
                 };
                 Ok(Val { node, ty })
             }
-            _ => Err(Error::Unsupported {
-                what: format!("method `{name}` on a dynamic value"),
-                at: span.start,
-            }),
+            _ => Err(Error::unsupported_span(
+                format!("method `{name}` on a dynamic value"),
+                span,
+            )),
         }
     }
 
@@ -4187,13 +4187,13 @@ impl<'m> Lowerer<'m> {
                             match self.dunder(k as usize, "__len__", v.node, vec![], span) {
                                 Some(r) => self.coerce(r, Ty::Int),
                                 None => {
-                                    return Err(Error::Unsupported {
-                                        what: format!(
+                                    return Err(Error::unsupported_span(
+                                        format!(
                                             "len() of {}, which defines no __len__",
                                             self.module.classes[k as usize].name
                                         ),
-                                        at: span.start,
-                                    })
+                                        span,
+                                    ))
                                 }
                             }
                         }
@@ -4930,13 +4930,23 @@ impl<'m> Lowerer<'m> {
 
     /// The entry function's statements: the module body in a loop of one
     /// pass, then a report of whatever exception nothing caught.
-    pub(crate) fn entry_body(&mut self, stmts: &[&py::Stmt]) -> Result<Vec<Stmt>> {
+    pub(crate) fn entry_body(&mut self, stmts: &[(&py::Stmt, Option<&str>)]) -> Result<Vec<Stmt>> {
         let span = stmts
             .first()
-            .map(|s| span_of(*s))
+            .map(|(s, _)| span_of(*s))
             .unwrap_or(Span::new(0, 0));
         self.escapes.push(Escape::Break);
-        let mut body = self.body(stmts)?;
+        // Each statement is reported against the module it came from.
+        let mut body = match stmts.first() {
+            Some((first, _)) => self.cell_prologue(span_of(*first)),
+            None => Vec::new(),
+        };
+        for (s, origin) in stmts {
+            self.stmt(s, &mut body).map_err(|e| match origin {
+                Some(m) => e.in_module(m),
+                None => e,
+            })?;
+        }
         self.escapes.pop();
         body.push(TypedNode::new(
             TypedStatement::Break(None),
@@ -5465,13 +5475,13 @@ impl<'m> Lowerer<'m> {
         match object.ty {
             Ty::Class(k) => {
                 let Some((_, ty)) = self.module.field(k as usize, attr) else {
-                    return Err(Error::Unsupported {
-                        what: format!(
+                    return Err(Error::unsupported_span(
+                        format!(
                             "attribute `{attr}` of {}, which has no such field",
                             self.module.classes[k as usize].name
                         ),
-                        at: span.start,
-                    });
+                        span,
+                    ));
                 };
                 let stored = field_storage(ty);
                 let field = node(
@@ -5499,10 +5509,10 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(self.guard(v, span))
             }
-            other => Err(Error::Unsupported {
-                what: format!("attribute `{attr}` of a {other:?}"),
-                at: span.start,
-            }),
+            other => Err(Error::unsupported_span(
+                format!("attribute `{attr}` of a {other:?}"),
+                span,
+            )),
         }
     }
 
@@ -5511,13 +5521,13 @@ impl<'m> Lowerer<'m> {
         match object.ty {
             Ty::Class(k) => {
                 let Some((_, ty)) = self.module.field(k as usize, attr) else {
-                    return Err(Error::Unsupported {
-                        what: format!(
+                    return Err(Error::unsupported_span(
+                        format!(
                             "attribute `{attr}` of {}, which has no such field",
                             self.module.classes[k as usize].name
                         ),
-                        at: span.start,
-                    });
+                        span,
+                    ));
                 };
                 let stored = field_storage(ty);
                 let value = self.coerce(value, ty);
@@ -5545,10 +5555,10 @@ impl<'m> Lowerer<'m> {
                     span,
                 ))
             }
-            other => Err(Error::Unsupported {
-                what: format!("assignment to attribute `{attr}` of a {other:?}"),
-                at: span.start,
-            }),
+            other => Err(Error::unsupported_span(
+                format!("assignment to attribute `{attr}` of a {other:?}"),
+                span,
+            )),
         }
     }
 
@@ -5630,13 +5640,13 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<Val> {
         let Some((sig, _)) = self.module.method_sig(k, method) else {
-            return Err(Error::Unsupported {
-                what: format!(
+            return Err(Error::unsupported_span(
+                format!(
                     "method `{method}` of {}, which defines none",
                     self.module.classes[k].name
                 ),
-                at: span.start,
-            });
+                span,
+            ));
         };
         let sig = without_self(sig);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;

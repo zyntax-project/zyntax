@@ -42,10 +42,17 @@ fn main() -> ExitCode {
         file.set_extension("py");
         std::fs::read_to_string(&file).ok()
     };
-    let program = match zyntax_python::parse_program_with(&source, &resolve) {
+    let file = path.display().to_string();
+    let program = match zyntax_python::parse_program_with(&source, &file, &resolve) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("zypy: {e}");
+            // Shown against the file it happened in.
+            let (name, text) = match e.module().and_then(|m| resolve(m).map(|t| (m, t))) {
+                Some((module, text)) => (module.to_string(), text),
+                None => (file.clone(), source.clone()),
+            };
+            let colors = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            eprint!("{}", e.render(&name, &text, colors));
             return ExitCode::from(3);
         }
     };

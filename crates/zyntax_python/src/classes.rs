@@ -31,26 +31,45 @@ pub(crate) struct ClassDef<'a> {
     pub(crate) name: String,
     pub(crate) base: Option<String>,
     pub(crate) methods: Vec<&'a py::StmtFunctionDef>,
+    /// Where the class is written, for what is reported about it, and
+    /// in which of the program's modules (`None` for the main file).
+    pub(crate) range: ruff_text_size::TextRange,
+    pub(crate) module: Option<String>,
 }
 
-/// The classes of a module body, in order.
-pub(crate) fn collect(body: &[py::Stmt]) -> Result<Vec<ClassDef<'_>>> {
+/// The classes of a module body, in order. `origins` names the module
+/// each statement of `body` came from.
+pub(crate) fn collect<'a>(
+    body: &'a [py::Stmt],
+    origins: &[Option<String>],
+) -> Result<Vec<ClassDef<'a>>> {
     let mut out = Vec::new();
-    for stmt in body {
+    for (i, stmt) in body.iter().enumerate() {
         let py::Stmt::ClassDef(c) = stmt else {
             continue;
         };
+        let module = origins.get(i).cloned().flatten();
+        let located = |e: Error| match &module {
+            Some(m) => e.in_module(m),
+            None => e,
+        };
         if !c.decorator_list.is_empty() {
-            return unsupported("class decorators", c);
+            return Err(located(Error::unsupported("class decorators", c)));
         }
         let mut base = None;
         if let Some(args) = &c.arguments {
             if !args.keywords.is_empty() || args.args.len() > 1 {
-                return unsupported("more than one base class or class keywords", c);
+                return Err(located(Error::unsupported(
+                    "more than one base class or class keywords",
+                    c,
+                )));
             }
             if let Some(b) = args.args.first() {
                 let py::Expr::Name(n) = b else {
-                    return unsupported("a base class that is not a name", b);
+                    return Err(located(Error::unsupported(
+                        "a base class that is not a name",
+                        b,
+                    )));
                 };
                 if n.id.as_str() != "object" {
                     base = Some(n.id.to_string());
@@ -63,10 +82,17 @@ pub(crate) fn collect(body: &[py::Stmt]) -> Result<Vec<ClassDef<'_>>> {
                 py::Stmt::FunctionDef(f) => methods.push(f),
                 py::Stmt::Pass(_) => {}
                 py::Stmt::Expr(e) if matches!(*e.value, py::Expr::StringLiteral(_)) => {}
-                other => return unsupported("a class body statement other than a method", other),
+                other => {
+                    return Err(located(Error::unsupported(
+                        "a class body statement other than a method",
+                        other,
+                    )))
+                }
             }
         }
         out.push(ClassDef {
+            range: c.range(),
+            module: module.clone(),
             name: c.name.to_string(),
             base,
             methods,
@@ -82,12 +108,18 @@ pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMa
     let mut index = HashMap::new();
     for def in defs {
         let base = match &def.base {
-            Some(b) => Some(*index.get(b).ok_or_else(|| Error::Unsupported {
-                what: format!(
-                    "class {} deriving from `{b}`, which is not a class defined before it",
-                    def.name
-                ),
-                at: 0,
+            Some(b) => Some(*index.get(b).ok_or_else(|| {
+                let e = Error::unsupported(
+                    format!(
+                        "class {} deriving from `{b}`, which is not a class defined before it",
+                        def.name
+                    ),
+                    &def.range,
+                );
+                match &def.module {
+                    Some(m) => e.in_module(m),
+                    None => e,
+                }
             })?),
             None => None,
         };
@@ -181,13 +213,6 @@ pub(crate) fn register(
     decls
 }
 
-fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
-    Err(Error::Unsupported {
-        what: what.into(),
-        at: at.range().start().to_usize(),
-    })
-}
-
 fn stmt(e: Node, span: Span) -> TypedNode<TypedStatement> {
     TypedNode::new(TypedStatement::Expression(Box::new(e)), Type::Unknown, span)
 }
@@ -233,7 +258,7 @@ fn param(name: &str, ty: Ty, span: Span) -> TypedParameter {
         mutability: Mutability::Mutable,
         kind: ParameterKind::Regular,
         default_value: None,
-        attributes: Vec::new(),
+        attributes: lower::dynamic_attribute(ty, span),
         ownership: match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::None => ParamOwnership::Copied,
             _ => ParamOwnership::Owned,

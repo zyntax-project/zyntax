@@ -3618,9 +3618,16 @@ impl LoweringContext {
             // functions that intentionally accept DynamicBox.
             if matches!(param.ty, Type::Any | Type::Unknown | Type::Dynamic) {
                 let param_name = param.name.resolve_global().unwrap_or_default();
+                // A frontend whose parameters are dynamic unless annotated
+                // marks them `dynamic`; the type is then what was meant.
+                let declared_dynamic = param
+                    .attributes
+                    .iter()
+                    .any(|a| a.name.resolve_global().as_deref() == Some("dynamic"));
                 let is_internal = func_name == "main"
                     || (func.is_external && func.link_name.is_some())
                     || param.span.is_empty()
+                    || declared_dynamic
                     || func_name.starts_with('$')
                     || func_name.starts_with("__")
                     || matches!(

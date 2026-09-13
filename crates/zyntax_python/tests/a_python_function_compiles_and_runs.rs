@@ -124,6 +124,34 @@ fn an_unsupported_form_is_named() {
     );
 }
 
+/// An error renders the way the compiler's own diagnostics do: against
+/// the source, with the line and the offending text marked.
+#[test]
+fn an_error_renders_against_its_source() {
+    let source = "x = 1\ny = x +\n";
+    let err = zyntax_python::parse_program(source).expect_err("does not parse");
+    let shown = err.render("prog.py", source, false);
+    assert!(shown.contains("syntax error"), "got: {shown}");
+    assert!(
+        shown.contains("prog.py:2:"),
+        "should locate line 2, got: {shown}"
+    );
+    assert!(
+        shown.contains("y = x +"),
+        "should show the line, got: {shown}"
+    );
+
+    let source = "def f():\n    pass\n\nwith f() as g:\n    pass\n";
+    let err = zyntax_python::parse_program(source).expect_err("with is not in the subset");
+    let shown = err.render("prog.py", source, false);
+    assert!(shown.contains("not supported yet"), "got: {shown}");
+    assert!(
+        shown.contains("prog.py:4:"),
+        "should locate line 4, got: {shown}"
+    );
+    assert!(err.module().is_none(), "the main file has no module name");
+}
+
 /// A short-circuit condition on an `if` statement and on a `while`,
 /// which reach the branch through the CFG builder rather than through
 /// the expression translator.

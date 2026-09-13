@@ -394,6 +394,9 @@ pub(crate) struct Item<'a> {
     pub(crate) name: String,
     pub(crate) class: Option<usize>,
     pub(crate) def: &'a py::StmtFunctionDef,
+    /// The program's module the definition is written in; `None` for
+    /// the main file.
+    pub(crate) module: Option<String>,
 }
 
 /// Infer the module's signatures to a fixed point. Class layouts are

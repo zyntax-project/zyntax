@@ -32,7 +32,12 @@ struct UserImports {
 
 /// Link `main`'s body with every module it imports, transitively.
 /// Imported modules come first, each once, in the order first reached.
-pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Vec<py::Stmt>> {
+/// Each statement comes with the module it was written in, `None` for
+/// the main file, so what is reported about it can name the file.
+pub(crate) fn link(
+    main: Vec<py::Stmt>,
+    resolve: &Resolver<'_>,
+) -> Result<Vec<(py::Stmt, Option<String>)>> {
     let mut linker = Linker {
         resolve,
         done: HashSet::new(),
@@ -44,7 +49,7 @@ pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Vec<py
     let main_scope = Scope::of_body(Vec::new(), &main);
     Qualifier::new(None, &main_scope, imports).run(&mut main);
     let mut out = linker.out;
-    out.extend(main);
+    out.extend(main.into_iter().map(|s| (s, None)));
     Ok(out)
 }
 
@@ -52,7 +57,7 @@ struct Linker<'r> {
     resolve: &'r Resolver<'r>,
     done: HashSet<String>,
     in_progress: Vec<String>,
-    out: Vec<py::Stmt>,
+    out: Vec<(py::Stmt, Option<String>)>,
 }
 
 impl Linker<'_> {
@@ -69,7 +74,7 @@ impl Linker<'_> {
                         if stdlib::is_known(module) {
                             continue;
                         }
-                        self.load(module, alias.range().start().to_usize())?;
+                        self.load(module, alias.range())?;
                         let local = alias
                             .asname
                             .as_ref()
@@ -91,12 +96,12 @@ impl Linker<'_> {
                     }
                     for alias in &f.names {
                         let name = alias.name.id.as_str();
-                        let at = alias.range().start().to_usize();
+                        let at = alias.range();
                         if name == "*" {
-                            return Err(Error::Unsupported {
-                                what: format!("`from {module} import *`"),
-                                at,
-                            });
+                            return Err(Error::unsupported(
+                                format!("`from {module} import *`"),
+                                &at,
+                            ));
                         }
                         let local = alias
                             .asname
@@ -131,37 +136,33 @@ impl Linker<'_> {
 
     /// Load a module once: parse it, link its own imports, qualify its
     /// names, and append its body to the output.
-    fn load(&mut self, module: &str, at: usize) -> Result<()> {
+    fn load(&mut self, module: &str, at: ruff_text_size::TextRange) -> Result<()> {
         if self.done.contains(module) {
             return Ok(());
         }
         if self.in_progress.iter().any(|m| m == module) {
-            return Err(Error::Unsupported {
-                what: format!("a circular import of `{module}`"),
-                at,
-            });
+            return Err(Error::unsupported(
+                format!("a circular import of `{module}`"),
+                &at,
+            ));
         }
         let Some(source) = (self.resolve)(module) else {
-            return Err(Error::Unsupported {
-                what: format!("import of module `{module}`, which was not found"),
-                at,
-            });
+            return Err(Error::unsupported(
+                format!("import of module `{module}`, which was not found"),
+                &at,
+            ));
         };
-        let parsed = ruff_python_parser::parse_module(&source).map_err(|e| {
-            Error::Syntax(format!(
-                "in module `{module}`: {} at {:?}",
-                e.error, e.location
-            ))
-        })?;
+        let parsed = ruff_python_parser::parse_module(&source)
+            .map_err(|e| Error::syntax(e.error.to_string(), e.location).in_module(module))?;
         if let Some(first) = parsed.errors().first() {
-            return Err(Error::Syntax(format!(
-                "in module `{module}`: {} at {:?}",
-                first.error, first.location
-            )));
+            return Err(Error::syntax(first.error.to_string(), first.location).in_module(module));
         }
         self.in_progress.push(module.to_string());
         let mut body: Vec<py::Stmt> = parsed.into_syntax().body.into_iter().collect();
-        let imports = self.link_imports(&mut body)?;
+        // What goes wrong inside the module is reported against it.
+        let imports = self
+            .link_imports(&mut body)
+            .map_err(|e| e.in_module(module))?;
         // `__name__` is the module's own; the assignment binds it at
         // module level so the qualifier renames every read of it.
         let mut with_name: Vec<py::Stmt> =
@@ -177,7 +178,8 @@ impl Linker<'_> {
         Qualifier::new(Some(module), &scope, imports).run(&mut body);
         self.in_progress.pop();
         self.done.insert(module.to_string());
-        self.out.extend(body);
+        self.out
+            .extend(body.into_iter().map(|s| (s, Some(module.to_string()))));
         Ok(())
     }
 }

@@ -8,7 +8,6 @@ use crate::lower::{Lowerer, Node, Val};
 use crate::types::Ty;
 use crate::{span_of, Error, Result};
 use ruff_python_ast as py;
-use ruff_text_size::Ranged;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{TypedExpression, TypedLiteral};
 use zyntax_typed_ast::BinaryOp;
@@ -178,10 +177,10 @@ impl Lowerer<'_> {
                 let span = span_of(e);
                 let value = self.expr(&e.expression)?;
                 if e.debug_text.is_some() {
-                    return Err(Error::Unsupported {
-                        what: "the `=` debug form in an f-string".to_string(),
-                        at: span.start,
-                    });
+                    return Err(Error::unsupported_span(
+                        "the `=` debug form in an f-string".to_string(),
+                        span,
+                    ));
                 }
                 // `!r` and `!a` convert before formatting; `!s` is str().
                 let value = match e.conversion {
@@ -199,9 +198,8 @@ impl Lowerer<'_> {
                     return Ok(self.str_of(value));
                 };
                 let spec = self.spec_text(spec)?;
-                let spec = parse_spec(&spec).map_err(|message| Error::Unsupported {
-                    what: format!("format spec `{spec}` ({message})"),
-                    at: span.start,
+                let spec = parse_spec(&spec).map_err(|message| {
+                    Error::unsupported_span(format!("format spec `{spec}` ({message})"), span)
                 })?;
                 Ok(self.format(value, &spec, span))
             }
@@ -215,10 +213,10 @@ impl Lowerer<'_> {
             match element {
                 py::InterpolatedStringElement::Literal(l) => text.push_str(&l.value),
                 py::InterpolatedStringElement::Interpolation(e) => {
-                    return Err(Error::Unsupported {
-                        what: "a nested expression in a format spec".to_string(),
-                        at: e.range().start().to_usize(),
-                    })
+                    return Err(Error::unsupported(
+                        "a nested expression in a format spec".to_string(),
+                        &e,
+                    ))
                 }
             }
         }
