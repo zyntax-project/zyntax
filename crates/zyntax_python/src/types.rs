@@ -966,10 +966,76 @@ fn infer_locals_with(
             break;
         }
     }
+    // A body control can fall off the end of returns None there too.
+    if locals.returns && !terminates(body) {
+        locals.ret = locals.ret.join(Ty::None);
+    }
     if settled {
         settle(&mut locals);
     }
     locals
+}
+
+/// Whether control never reaches the end of `stmts`: some statement in
+/// the list leaves the function on every path. Anything not shown to
+/// leave is taken to fall through.
+fn terminates(stmts: &[py::Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        py::Stmt::Return(_) | py::Stmt::Raise(_) => true,
+        py::Stmt::If(i) => {
+            terminates(&i.body)
+                && i.elif_else_clauses.iter().all(|c| terminates(&c.body))
+                && i.elif_else_clauses.iter().any(|c| c.test.is_none())
+        }
+        // `while True` with no break of its own never falls out.
+        py::Stmt::While(w) => {
+            (is_true_literal(&w.test) && !breaks(&w.body)) || terminates(&w.orelse)
+        }
+        py::Stmt::For(f) => !breaks(&f.body) && terminates(&f.orelse),
+        py::Stmt::Try(t) => {
+            terminates(&t.finalbody)
+                || (terminates(&t.body) && t.handlers.iter().all(|h| terminates(handler_body(h))))
+        }
+        py::Stmt::With(w) => terminates(&w.body),
+        _ => false,
+    })
+}
+
+fn is_true_literal(e: &py::Expr) -> bool {
+    match e {
+        py::Expr::BooleanLiteral(b) => b.value,
+        py::Expr::NumberLiteral(n) => match &n.value {
+            py::Number::Int(i) => i.as_i64().is_some_and(|v| v != 0),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn handler_body(h: &py::ExceptHandler) -> &[py::Stmt] {
+    match h {
+        py::ExceptHandler::ExceptHandler(h) => &h.body,
+    }
+}
+
+/// Whether `stmts` has a `break` leaving the loop they are the body
+/// of: not one inside a nested loop, which leaves that loop.
+fn breaks(stmts: &[py::Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        py::Stmt::Break(_) => true,
+        py::Stmt::If(i) => breaks(&i.body) || i.elif_else_clauses.iter().any(|c| breaks(&c.body)),
+        py::Stmt::Try(t) => {
+            breaks(&t.body)
+                || breaks(&t.orelse)
+                || breaks(&t.finalbody)
+                || t.handlers.iter().any(|h| breaks(handler_body(h)))
+        }
+        py::Stmt::With(w) => breaks(&w.body),
+        // A loop's `else` runs in the enclosing loop's body.
+        py::Stmt::While(w) => breaks(&w.orelse),
+        py::Stmt::For(f) => breaks(&f.orelse),
+        _ => false,
+    })
 }
 
 /// The `nonlocal` assignments of the defs directly inside `body`, typed
