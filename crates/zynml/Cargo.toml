@@ -52,6 +52,9 @@ tempfile = "3.16"
 zyntax_compiler = { path = "../compiler" }
 zyntax_typed_ast = { path = "../typed_ast" }
 indexmap = "2.2"
+# The benchmark runner measures the Python frontend's kernels beside
+# the ZynML ones.
+zyntax_python = { path = "../zyntax_python" }
 
 [build-dependencies]
 zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }

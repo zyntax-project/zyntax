@@ -1,0 +1,32 @@
+import prelude
+
+// Method call latency on a reference type, against the inlined
+// baseline in `bench_inlined_call.zynml`.
+//
+// The loop body is one method call on a `@reference` struct doing the
+// arithmetic the baseline does inline, through the receiver's field.
+// The method is small, which is what the inliner takes, so the delta
+// to the baseline is expected to be near zero.
+//
+// Returns the same 350000000 the baseline does.
+
+@reference
+struct Acc {
+    total: i64
+}
+
+impl Acc {
+    def step(self, i: i64) {
+        self.total = self.total + (i % 8)
+    }
+}
+
+def main(): i64 {
+    let acc = Acc { total: 0 }
+    let mut i: i64 = 0
+    while i < 100000000 {
+        acc.step(i)
+        i = i + 1
+    }
+    return acc.total
+}

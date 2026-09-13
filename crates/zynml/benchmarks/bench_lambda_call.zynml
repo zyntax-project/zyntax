@@ -1,0 +1,19 @@
+import prelude
+
+// Calling a lambda held in a local: the closure calling shape, with
+// nothing captured. Ten million iterations, matching the Python
+// kernel of the same name, since this is the shape that has not been
+// made fast on either side.
+//
+// Returns 35000000.
+
+def main(): i64 {
+    let step: (i64, i64) => i64 = def(acc, i): acc + i % 8
+    let mut sum: i64 = 0
+    let mut i: i64 = 0
+    while i < 10000000 {
+        sum = step(sum, i)
+        i = i + 1
+    }
+    return sum
+}

@@ -1,7 +1,12 @@
 //! Benchmark suite runner for ZynML.
 //!
 //! Measures each `bench_*.zynml` source under
-//! `crates/zynml/benchmarks/` across the targets we control today:
+//! `crates/zynml/benchmarks/` across the targets we control today, and
+//! the same kernel written in Python, under
+//! `crates/zyntax_python/benchmarks/`, through the Python frontend
+//! (`zypy`) and through CPython (`cpython`) where `python3` is on the
+//! path. A kernel with no Python file has no Python rows; one with no
+//! ZynML source (`python_only`) has only those.
 //!
 //!   * `zyntax-interp`     — BC interpreter, NO HIR optimization
 //!                            pipeline. Floor for what the
@@ -270,6 +275,17 @@ const KERNELS: &[Kernel] = &[
         .without_pure_call_pre(),
     Kernel::new("bench_inlined_call", "Int(350000000)"),
     Kernel::new("bench_free_function_call", "Int(350000000)"),
+    // The same loop through a method on a reference type, and through
+    // a lambda held in a local. Both have a Python kernel of the same
+    // name, so the two frontends are read against each other.
+    Kernel::new("bench_method_call", "Int(350000000)"),
+    Kernel::new("bench_lambda_call", "Int(35000000)"),
+    // The free-function loop with nothing annotated, so the parameter
+    // types come from the call sites, and a closure that captures a
+    // variable of its defining function. ZynML's lambdas do not capture
+    // yet, so these rows have no ZynML counterpart.
+    Kernel::new("bench_free_function_call_untyped", "Int(350000000)").python_only(),
+    Kernel::new("bench_closure_call", "Int(35000000)").python_only(),
     // diagnostic-only — kept out of CI publish surface but used for
     // tracing operator-overload lowering. Expected: a + b * 10M with
     // a=(1,2,3), b=(4,5,6) → acc = (50000000, 70000000, 90000000)
@@ -341,6 +357,9 @@ struct Kernel {
     /// carrying its own list, so a kernel added here appears in the
     /// right place without the page being edited.
     group: Group,
+    /// No ZynML source: the row exists for what the Python frontend
+    /// does with a shape ZynML has no counterpart for yet.
+    python_only: bool,
 }
 
 /// The sections the published benchmark page is divided into.
@@ -441,7 +460,14 @@ impl Kernel {
             expected_without_opts: None,
             pure_call_pre: true,
             group: Group::Core,
+            python_only: false,
         }
+    }
+
+    /// Measured on the Python targets alone.
+    const fn python_only(mut self) -> Self {
+        self.python_only = true;
+        self
     }
 
     /// Publish this row under the ML section.
@@ -498,6 +524,8 @@ const TARGETS: &[Target] = &[
             "fib",
             "inlined_call",
             "free_function_call",
+            "method_call",
+            "lambda_call",
             "collatz",
             "branchy",
             "tensor_matmul",
@@ -519,6 +547,8 @@ const TARGETS: &[Target] = &[
             "fib",
             "inlined_call",
             "free_function_call",
+            "method_call",
+            "lambda_call",
             "collatz",
             "branchy",
             "tensor_matmul",
@@ -716,8 +746,11 @@ fn main() {
         }
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("benchmarks/{kernel}.zynml"));
-        let source = fs::read_to_string(&source_path)
-            .unwrap_or_else(|e| panic!("read {source_path:?}: {e}"));
+        let source = if kernel_spec.python_only {
+            String::new()
+        } else {
+            fs::read_to_string(&source_path).unwrap_or_else(|e| panic!("read {source_path:?}: {e}"))
+        };
 
         eprintln!("==> kernel {pretty}");
         let mut per_kernel: KernelResults = BTreeMap::new();
@@ -726,6 +759,10 @@ fn main() {
                 if !target.key.contains(tf.as_str()) {
                     continue;
                 }
+            }
+            if kernel_spec.python_only {
+                per_kernel.insert(target.key.to_string(), skipped_result());
+                continue;
             }
             // Opt-outs are keyed by the source, since what makes a
             // kernel too slow for a tier is what it computes, not which
@@ -797,6 +834,49 @@ fn main() {
                 }
             }
             per_kernel.insert(target.key.to_string(), r);
+        }
+
+        // The same kernel in Python, through this compiler and through
+        // CPython. Rows only where the file exists.
+        let python_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../zyntax_python/benchmarks/{kernel}.py"));
+        if python_path.exists() {
+            let python_targets: [(&str, fn(&Path, usize) -> TargetResult); 2] =
+                [("zypy", measure_zypy), ("cpython", measure_cpython)];
+            for (key, measure_with) in python_targets {
+                if let Some(tf) = &target_filter {
+                    if !key.contains(tf.as_str()) {
+                        continue;
+                    }
+                }
+                let r = measure_with(&python_path, runs);
+                if let Some(err) = r.error.as_ref() {
+                    eprintln!("    {key:<22} FAILED: {err}");
+                } else {
+                    eprintln!(
+                        "    {:<22} setup={:>6.2}ms compile={:>7.2}ms exec={:>9.2}ms \
+                         total={:>9.2}ms cold={:>9.2}ms  -> {}",
+                        key,
+                        r.setup_ms,
+                        r.compile_ms,
+                        r.exec_ms,
+                        r.seconds * 1000.0,
+                        r.cold_ms,
+                        r.result,
+                    );
+                    if r.result != kernel_spec.expected {
+                        eprintln!(
+                            "    {key:<22} VALUE MISMATCH: got {}, expected {}",
+                            r.result, kernel_spec.expected
+                        );
+                        value_mismatches.push(format!(
+                            "{pretty}/{key}: got {}, expected {}",
+                            r.result, kernel_spec.expected
+                        ));
+                    }
+                }
+                per_kernel.insert(key.to_string(), r);
+            }
         }
         suite.kernels.insert(pretty.to_string(), per_kernel);
     }
@@ -1227,6 +1307,117 @@ fn llvm_tier_engaged(zynml: &ZynML) -> bool {
         std::thread::sleep(Duration::from_millis(5));
     }
     reached()
+}
+
+/// The Python kernel through this compiler: a runtime set up as `zypy`
+/// sets one up, the program parsed and compiled, `main` called once.
+/// Each iteration starts from a fresh runtime, so every number is a
+/// first call rather than a warmed one, which is what a `zypy run` is.
+fn measure_zypy(path: &Path, runs: usize) -> TargetResult {
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => return failed_result(&format!("read {}: {e}", path.display())),
+    };
+    let file = path.display().to_string();
+    let mut setup = Vec::new();
+    let mut compile = Vec::new();
+    let mut exec = Vec::new();
+    let mut cold = 0.0;
+    let mut result = String::new();
+    for iteration in 0..runs.max(1) {
+        let t0 = Instant::now();
+        let mut runtime = match zyntax_embed::TieredRuntime::new(TieredConfig::default()) {
+            Ok(r) => r,
+            Err(e) => return failed_result(&format!("runtime: {e}")),
+        };
+        if let Err(e) = zyntax_python::register_runtime(&mut runtime) {
+            return failed_result(&format!("runtime: {e}"));
+        }
+        let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t0 = Instant::now();
+        let program = match zyntax_python::parse_program_with(&source, &file, &|_| None) {
+            Ok(p) => p,
+            Err(e) => return failed_result(&format!("parse: {e}")),
+        };
+        if let Err(e) = runtime.compile_typed_program(program) {
+            return failed_result(&format!("compile: {e}"));
+        }
+        let compile_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t0 = Instant::now();
+        let value = match runtime.call_raw("main", &[]) {
+            Ok(v) => v,
+            Err(e) => return failed_result(&format!("call: {e}")),
+        };
+        let exec_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        if iteration == 0 {
+            cold = setup_ms + compile_ms + exec_ms;
+        }
+        result = format!("{value:?}");
+        setup.push(setup_ms);
+        compile.push(compile_ms);
+        exec.push(exec_ms);
+    }
+    let (setup_ms, compile_ms, exec_ms) =
+        (median(&mut setup), median(&mut compile), median(&mut exec));
+    TargetResult {
+        seconds: (compile_ms + exec_ms) / 1000.0,
+        setup_ms,
+        compile_ms,
+        exec_ms,
+        cold_ms: cold,
+        result,
+        error: None,
+        skipped: false,
+    }
+}
+
+/// The Python kernel under CPython: `python3` on the file, its wall
+/// time as the execution time, since CPython has no compile step to
+/// separate out. The interpreter's own start-up is in the number, and
+/// is what a user of it pays too. The kernel prints its result, which
+/// is read back as the value.
+fn measure_cpython(path: &Path, runs: usize) -> TargetResult {
+    let mut exec = Vec::new();
+    let mut cold = 0.0;
+    let mut result = String::new();
+    for iteration in 0..runs.max(1) {
+        let t0 = Instant::now();
+        let output = match std::process::Command::new("python3").arg(path).output() {
+            Ok(o) => o,
+            Err(e) => return failed_result(&format!("python3: {e}")),
+        };
+        let exec_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if !output.status.success() {
+            return failed_result(&format!(
+                "python3 exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        result = match printed.parse::<i64>() {
+            Ok(n) => format!("Int({n})"),
+            Err(_) => printed,
+        };
+        if iteration == 0 {
+            cold = exec_ms;
+        }
+        exec.push(exec_ms);
+    }
+    let exec_ms = median(&mut exec);
+    TargetResult {
+        seconds: exec_ms / 1000.0,
+        setup_ms: 0.0,
+        compile_ms: 0.0,
+        exec_ms,
+        cold_ms: cold,
+        result,
+        error: None,
+        skipped: false,
+    }
 }
 
 fn median(samples: &mut [f64]) -> f64 {
