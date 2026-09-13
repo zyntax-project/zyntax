@@ -166,7 +166,7 @@ pub fn run_module(module: &mut crate::hir::HirModule) -> LicmStats {
         .filter(|(_, f)| f.signature.is_pure)
         .map(|(id, _)| *id)
         .collect();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run_with(func, &pure);
         total.hoisted += s.hoisted;
         total.loops_visited += s.loops_visited;
@@ -205,10 +205,12 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
         };
         succ_map.insert(id, succs);
     }
+    // In block order, so the predecessor lists come out the same on
+    // every run: a function's fingerprint reads them.
     let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    for (&src, succs) in &succ_map {
-        for &t in succs {
-            pred_map.entry(t).or_default().push(src);
+    for src in func.blocks.keys() {
+        for &t in &succ_map[src] {
+            pred_map.entry(t).or_default().push(*src);
         }
     }
     for (id, block) in func.blocks.iter_mut() {

@@ -1693,10 +1693,12 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
     }
 
     // Predecessors derived from successors.
+    // In block order, so the predecessor lists come out the same on
+    // every run: a function's fingerprint reads them.
     let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    for (&src, succs) in &succ_map {
-        for &t in succs {
-            pred_map.entry(t).or_default().push(src);
+    for src in func.blocks.keys() {
+        for &t in &succ_map[src] {
+            pred_map.entry(t).or_default().push(*src);
         }
     }
 

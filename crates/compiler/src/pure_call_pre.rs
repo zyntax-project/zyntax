@@ -91,7 +91,7 @@ pub fn run_module(module: &mut HirModule) -> PureCallPreStats {
     }
     let safe = crate::purity::speculation_safe_module(module);
     let mut stats = PureCallPreStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run_function(func, &safe);
         stats.hoisted += s.hoisted;
         stats.groups_visited += s.groups_visited;
@@ -186,7 +186,12 @@ fn run_function(
     }
     let mut plans: Vec<Plan> = Vec::new();
 
-    for (key, members) in &groups {
+    // Groups in the order their first site appears, so the values the
+    // hoists mint land in the same order on every run: a function's
+    // fingerprint reads the order.
+    let mut ordered: Vec<(&Key, &Vec<usize>)> = groups.iter().collect();
+    ordered.sort_by_key(|(_, members)| members[0]);
+    for (key, members) in ordered {
         if members.len() < 2 {
             continue;
         }
