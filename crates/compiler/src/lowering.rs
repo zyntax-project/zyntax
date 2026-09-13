@@ -692,14 +692,13 @@ impl LoweringContext {
         self.prelowered_bodies.contains(&name)
     }
 
-    /// Bring every prelowered module's contents into the module being
-    /// built, so calls the declarations were linked to have bodies to
-    /// land in and its types and globals are known.
+    /// Bring every prelowered module's globals and types into the module
+    /// being built, so its bodies are known to be well formed against
+    /// them. Functions follow as they are reached: see
+    /// [`Self::adopt_prelowered_reached`] and
+    /// [`Self::adopt_all_prelowered`].
     fn adopt_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
-            for (id, function) in &prelowered.functions {
-                self.module.functions.insert(*id, function.clone());
-            }
             for (id, global) in &prelowered.globals {
                 self.module.globals.insert(*id, global.clone());
             }
@@ -707,6 +706,74 @@ impl LoweringContext {
                 self.module.types.entry(*id).or_insert_with(|| ty.clone());
             }
         }
+    }
+
+    /// Every prelowered function, for a program with no entry point:
+    /// a host may call any of them.
+    fn adopt_all_prelowered(&mut self) {
+        for prelowered in &self.config.prelowered {
+            for (id, function) in &prelowered.functions {
+                self.module.functions.insert(*id, function.clone());
+            }
+        }
+    }
+
+    /// The prelowered functions the module's bodies reach, directly or
+    /// through one another, and nothing else: a program calls a little
+    /// of a library, and copying the rest in only to drop it again is
+    /// what an import would otherwise cost. Returns whether anything was
+    /// adopted.
+    fn adopt_prelowered_reached(&mut self) -> bool {
+        use crate::hir::{HirCallable, HirInstruction};
+        let by_id: std::collections::HashMap<crate::hir::HirId, usize> = self
+            .config
+            .prelowered
+            .iter()
+            .enumerate()
+            .flat_map(|(m, module)| module.functions.keys().map(move |id| (*id, m)))
+            .collect();
+        if by_id.is_empty() {
+            return false;
+        }
+        let targets_of = |function: &crate::hir::HirFunction| -> Vec<crate::hir::HirId> {
+            let mut targets = Vec::new();
+            for block in function.blocks.values() {
+                for inst in &block.instructions {
+                    match inst {
+                        HirInstruction::Call {
+                            callee: HirCallable::Function(target) | HirCallable::FuncRef(target),
+                            ..
+                        } => targets.push(*target),
+                        HirInstruction::CreateClosure { function, .. } => targets.push(*function),
+                        _ => {}
+                    }
+                }
+            }
+            targets
+        };
+        let mut pending: Vec<crate::hir::HirId> = Vec::new();
+        for function in self.module.functions.values() {
+            pending.extend(targets_of(function));
+        }
+        for global in self.module.globals.values() {
+            if let Some(init) = &global.initializer {
+                crate::dce::collect_vtable_funcs(init, &mut pending);
+            }
+        }
+        let mut adopted = false;
+        while let Some(target) = pending.pop() {
+            if self.module.functions.contains_key(&target) {
+                continue;
+            }
+            let Some(&m) = by_id.get(&target) else {
+                continue;
+            };
+            let function = self.config.prelowered[m].functions[&target].clone();
+            pending.extend(targets_of(&function));
+            self.module.functions.insert(target, function);
+            adopted = true;
+        }
+        adopted
     }
 
     /// The functions the program can be entered through, once
@@ -832,6 +899,9 @@ impl AstLowering for LoweringContext {
         phase.mark();
         self.wanted = self.initial_wanted(program);
         self.entered = self.wanted.is_some();
+        if self.wanted.is_none() {
+            self.adopt_all_prelowered();
+        }
 
         // Effects first, whatever order the declarations arrive in. A
         // function that declares one resolves the operations it may
@@ -2672,6 +2742,9 @@ impl LoweringContext {
         let forced = std::env::var_os("ZYNTAX_LOWER_FORCE_FALLBACK").is_some();
 
         loop {
+            // What a body reaches in a prelowered module is copied in
+            // first, so its own calls are seen by the round below.
+            while self.adopt_prelowered_reached() {}
             let owed = if forced {
                 Vec::new()
             } else {
@@ -2707,6 +2780,7 @@ impl LoweringContext {
             // Nothing owed is anything skipped here, so no round can
             // settle it. Build the rest and stop assuming.
             self.wanted = None;
+            self.adopt_all_prelowered();
             let mut rest: Vec<usize> = self.skipped_at.values().copied().collect();
             rest.sort_unstable();
             rest.dedup();

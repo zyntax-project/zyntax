@@ -1850,6 +1850,15 @@ pub fn run_interp_safe_opts_keeping_readers(module: &mut HirModule) -> InterpOpt
     run_interp_safe_opts_with(module, false)
 }
 
+/// Mark every function as through the pipeline, so a program that
+/// links the module later walks only its own functions. For a module
+/// about to be stored; see `FunctionAttributes::optimized`.
+pub fn mark_optimized(module: &mut HirModule) {
+    for func in module.functions.values_mut() {
+        func.attributes.optimized = true;
+    }
+}
+
 fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
 

@@ -66,7 +66,7 @@ pub struct TcoStats {
 pub fn run_module(module: &mut HirModule) -> TcoStats {
     let mut stats = TcoStats::default();
 
-    let func_ids: Vec<_> = module.functions.keys().copied().collect();
+    let func_ids: Vec<_> = module.ids_to_optimize();
     for fid in func_ids {
         let func = match module.functions.get_mut(&fid) {
             Some(f) => f,

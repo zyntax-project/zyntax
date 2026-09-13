@@ -74,7 +74,12 @@ pub fn run_module(module: &mut HirModule) -> BoxReadStats {
         if func.is_external {
             continue;
         }
-        stats.expanded += run_function(func, &externs);
+        let expanded = run_function(func, &externs);
+        // The loads are new to the passes that follow.
+        if expanded > 0 {
+            func.attributes.optimized = false;
+        }
+        stats.expanded += expanded;
     }
     stats
 }

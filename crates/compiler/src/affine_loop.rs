@@ -112,7 +112,7 @@ pub fn run_module(module: &mut HirModule) -> AffineLoopStats {
     if std::env::var("ZYNTAX_DISABLE_AFFINE").is_ok() {
         return stats;
     }
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         if func.is_external {
             continue;
         }

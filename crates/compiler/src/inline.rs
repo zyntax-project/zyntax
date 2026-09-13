@@ -201,7 +201,7 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
         let cycles = call_cycles(&callee_snapshot);
 
         let mut this_pass = 0;
-        let function_ids: Vec<HirId> = module.functions.keys().copied().collect();
+        let function_ids: Vec<HirId> = module.ids_to_optimize();
 
         for caller_id in function_ids {
             let caller = match module.functions.get_mut(&caller_id) {
@@ -277,7 +277,7 @@ pub struct RecursiveInlineStats {
 pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
     let mut stats = RecursiveInlineStats::default();
 
-    let func_ids: Vec<HirId> = module.functions.keys().copied().collect();
+    let func_ids: Vec<HirId> = module.ids_to_optimize();
     for fid in func_ids {
         // Snapshot of the body BEFORE inlining starts. Cloned self-
         // calls inside the snapshot still reference `fid`, so when

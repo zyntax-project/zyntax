@@ -151,7 +151,7 @@ pub fn run_module(module: &mut HirModule) -> DispatchStats {
         return stats;
     }
     // A rewrite adds a function, so the set to walk is fixed first.
-    let ids: Vec<HirId> = module.functions.keys().copied().collect();
+    let ids: Vec<HirId> = module.ids_to_optimize();
     let mut new_functions: Vec<HirFunction> = Vec::new();
     for id in ids {
         let Some(func) = module.functions.get(&id) else {

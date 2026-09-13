@@ -100,7 +100,7 @@ pub fn run_module(module: &mut HirModule) -> ScalarReplaceAllocStats {
     if std::env::var("ZYNTAX_DISABLE_SCALAR_REPLACE_ALLOC").is_ok() {
         return total;
     }
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         if func.is_external {
             continue;
         }

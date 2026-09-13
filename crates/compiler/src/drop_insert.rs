@@ -141,7 +141,7 @@ impl DropStats {
 pub fn run_module(module: &mut HirModule) -> DropStats {
     let mut total = DropStats::default();
     let facts = ModuleFacts::build(module);
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         if func.is_external {
             continue;
         }

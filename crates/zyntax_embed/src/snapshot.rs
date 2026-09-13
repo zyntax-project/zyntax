@@ -388,6 +388,7 @@ pub fn lower_for_snapshot_releasing(
     module.automatic_release = automatic_release;
     let _ = zyntax_compiler::run_interp_safe_opts_keeping_readers(&mut module);
     zyntax_compiler::run_native_only_opts(&mut module);
+    zyntax_compiler::mark_optimized(&mut module);
     Ok(module)
 }
 

@@ -150,7 +150,7 @@ pub fn eliminate_module(module: &mut HirModule) -> CseStats {
         .map(|(id, _)| *id)
         .collect();
     let mut total = CseStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let stats = eliminate_with(func, &pure_fns);
         total.eliminated += stats.eliminated;
         total.rewrites += stats.rewrites;

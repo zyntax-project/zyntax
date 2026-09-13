@@ -42,7 +42,7 @@ pub fn run_module(module: &mut HirModule) -> PhiPruneStats {
         return PhiPruneStats::default();
     }
     let mut stats = PhiPruneStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run_function(func);
         stats.removed += s.removed;
         stats.rounds = stats.rounds.max(s.rounds);

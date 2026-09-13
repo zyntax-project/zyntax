@@ -100,7 +100,7 @@ pub fn run(func: &mut HirFunction) -> LoadCseStats {
 /// Module-level entry.
 pub fn run_module(module: &mut HirModule) -> LoadCseStats {
     let mut total = LoadCseStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run(func);
         total.eliminated += s.eliminated;
     }

@@ -463,12 +463,21 @@ impl TieredBackend {
 
         // The filter applies to this module alone; a rebuild recompiles
         // earlier modules whole, and their ids are not in this set.
+        let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
+        let started = std::time::Instant::now();
         self.cranelift.with_lock(|be| {
             be.set_only_compile_reachable(reachable);
             let compiled = be.compile_module(&module);
             be.set_only_compile_reachable(None);
             compiled
         })?;
+        if trace {
+            eprintln!(
+                "[OPT] codegen: cranelift    {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let started = std::time::Instant::now();
 
         // Recorded before it becomes `current_module`, so a later
         // rebuild can put every one of them back. Kept by identity
@@ -526,6 +535,12 @@ impl TieredBackend {
 
         // Every bead now exists, so the handler can capture them.
         self.install_promotion_requester();
+        if trace {
+            eprintln!(
+                "[OPT] codegen: registration {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Ok(())
     }

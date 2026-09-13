@@ -88,7 +88,7 @@ impl PromoteStats {
 /// Run the Alloca→Malloc promotion pass over every function.
 pub fn run_module(module: &mut HirModule) -> PromoteStats {
     let mut total = PromoteStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         if func.is_external || func.signature.is_async {
             continue;
         }

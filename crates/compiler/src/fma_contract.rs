@@ -69,7 +69,7 @@ pub fn run_module(module: &mut HirModule) -> FmaStats {
     if std::env::var("ZYNTAX_DISABLE_FMA").is_ok() {
         return stats;
     }
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         stats.contracted += run_function(func);
     }
     stats

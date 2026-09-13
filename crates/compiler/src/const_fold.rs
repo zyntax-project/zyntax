@@ -68,7 +68,7 @@ pub struct FoldStats {
 /// reduces fold-eligible instructions, so we stop well short).
 pub fn fold_module(module: &mut HirModule) -> FoldStats {
     let mut stats = FoldStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         stats = combine(stats, fold_function(func));
     }
     stats

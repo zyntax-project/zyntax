@@ -2173,6 +2173,12 @@ pub struct FunctionAttributes {
     /// that reads this flag is a later phase.
     #[serde(default)]
     pub cooperative: bool,
+    /// The body has been through the optimisation pipeline already, in
+    /// the module it was compiled with, and nothing has changed it
+    /// since. A pass that rewrites functions one at a time leaves it
+    /// alone; one that does change it clears this.
+    #[serde(default)]
+    pub optimized: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2590,6 +2596,25 @@ impl HirFunction {
         };
         self.values.insert(value_id, value);
         value_id
+    }
+}
+
+impl HirModule {
+    /// The functions a per-function pass still has work in: those not
+    /// marked `optimized`.
+    pub fn functions_to_optimize(&mut self) -> impl Iterator<Item = &mut HirFunction> {
+        self.functions
+            .values_mut()
+            .filter(|f| !f.attributes.optimized)
+    }
+
+    /// The ids of [`Self::functions_to_optimize`].
+    pub fn ids_to_optimize(&self) -> Vec<HirId> {
+        self.functions
+            .iter()
+            .filter(|(_, f)| !f.attributes.optimized)
+            .map(|(id, _)| *id)
+            .collect()
     }
 }
 
