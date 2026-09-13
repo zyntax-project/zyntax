@@ -1379,10 +1379,14 @@ impl<'m> Lowerer<'m> {
     /// writes there.
     pub(crate) fn trusted(&mut self, v: Val, target: Ty) -> Node {
         let span = v.node.span;
-        match (v.ty, target) {
-            (Ty::Object, Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => cast(v.node, target, span),
-            _ => self.coerce(v, target),
-        }
+        let read = match (v.ty, target) {
+            (Ty::Object, Ty::Int) => "zb_box_payload_i64",
+            (Ty::Object, Ty::Float) => "zb_box_payload_f64",
+            (Ty::Object, Ty::Bool) => "zb_box_payload_truth",
+            (Ty::Object, Ty::Str) => "zb_box_get_str",
+            _ => return self.coerce(v, target),
+        };
+        call(read, vec![v.node], target, span)
     }
 
     fn expr_as(&mut self, e: &py::Expr, target: Ty) -> Result<Node> {

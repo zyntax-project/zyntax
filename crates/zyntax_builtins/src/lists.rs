@@ -797,7 +797,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         &format!("zb_unbox_list_raw_{}", k.kind.suffix()),
         &[("x", any())],
         k.list.clone(),
-        Some("zyntax_box_get_opaque"),
+        Some("zyntax_box_data"),
     ));
     d.push(define(
         &name("box"),
@@ -1176,7 +1176,7 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         "zb_unbox_tuple_raw",
         &[("x", any())],
         anys.clone(),
-        Some("zyntax_box_get_opaque"),
+        Some("zyntax_box_data"),
     ));
     d.push(define(
         "zb_box_tuple",

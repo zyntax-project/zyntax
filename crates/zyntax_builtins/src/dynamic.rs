@@ -15,6 +15,10 @@ const UINT: i64 = 3;
 const FLOAT: i64 = 4;
 const STR: i64 = 5;
 const CUSTOM: i64 = 255;
+/// The whole tag of a box of the width its category's readers assume:
+/// the width in the byte above the category.
+const I64_TAG: i64 = (4 << 8) | INT;
+const F64_TAG: i64 = (4 << 8) | FLOAT;
 
 fn tag(x: Expr) -> Expr {
     cast(call("zb_box_tag", vec![x], i32()), i64())
@@ -43,8 +47,20 @@ fn get_i64(x: Expr) -> Expr {
 fn get_f64(x: Expr) -> Expr {
     call("zb_box_get_f64", vec![x], f64())
 }
+/// The payload of a box whose tag has been read: the width is known,
+/// and the read is two loads.
+fn payload_i64(x: Expr) -> Expr {
+    call("zb_box_payload_i64", vec![x], i64())
+}
+fn payload_f64(x: Expr) -> Expr {
+    call("zb_box_payload_f64", vec![x], f64())
+}
+fn payload_bool(x: Expr) -> Expr {
+    call("zb_box_payload_bool", vec![x], i32())
+}
+/// A bool box's value; the box has been checked to be one.
 fn get_bool(x: Expr) -> Expr {
-    ne(call("zb_box_get_bool", vec![x], i32()), int32(0))
+    ne(payload_bool(x), int32(0))
 }
 fn get_str(x: Expr) -> Expr {
     call("zb_box_get_str", vec![x], string())
@@ -145,14 +161,38 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         "zb_unbox_instance_raw",
         &[("x", any())],
         i64(),
-        Some("zyntax_box_get_opaque"),
+        Some("zyntax_box_data"),
     ));
-    // The box accessors.
+    // The box accessors. The `data` and payload readers take a box that
+    // is known to be one, and are the loads they name; the tag reader
+    // answers None with the void tag first.
     d.push(extern_fn(
-        "zb_box_tag",
+        "zb_box_header_tag",
         &[("x", any())],
         i32(),
-        Some("zyntax_box_get_tag"),
+        Some("zyntax_box_header_tag"),
+    ));
+    d.push(define(
+        "zb_box_tag",
+        &[&x],
+        i32(),
+        vec![
+            when(eq(x.e(), null(any())), vec![ret(int32(0))]),
+            ret(call("zb_box_header_tag", vec![x.e()], i32())),
+        ],
+    ));
+    for (name, ty, link) in [
+        ("zb_box_payload_i64", i64(), "zyntax_box_payload_i64"),
+        ("zb_box_payload_f64", f64(), "zyntax_box_payload_f64"),
+        ("zb_box_payload_bool", i32(), "zyntax_box_payload_bool"),
+    ] {
+        d.push(extern_fn(name, &[("x", any())], ty, Some(link)));
+    }
+    d.push(define(
+        "zb_box_payload_truth",
+        &[&x],
+        boolean(),
+        vec![ret(get_bool(x.e()))],
     ));
     d.push(extern_fn(
         "zb_box_get_i64",
@@ -176,7 +216,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         "zb_box_get_str",
         &[("x", any())],
         string(),
-        Some("zyntax_box_get_opaque"),
+        Some("zyntax_box_data"),
     ));
 
     // A typed value becomes a dynamic one by being returned as one. A
@@ -222,11 +262,16 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         boolean(),
         vec![ret(and(ge(cat.e(), int(BOOL)), le(cat.e(), int(FLOAT))))],
     ));
+    // A number as f64 or i64, given its category. The boxes this library
+    // and its frontends make are 64 bits wide or a bool byte, read as
+    // loads; a box of another width comes from a plugin and goes through
+    // the runtime's reader.
     d.push(define(
         "zb_number_f64",
         &[&x, &cat],
         f64(),
         vec![
+            when(eq(tag(x.e()), int(F64_TAG)), vec![ret(payload_f64(x.e()))]),
             when(is(&cat, FLOAT), vec![ret(get_f64(x.e()))]),
             when(
                 is(&cat, BOOL),
@@ -234,6 +279,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     when(get_bool(x.e()), vec![ret(float(1.0))]),
                     ret(float(0.0)),
                 ],
+            ),
+            when(
+                eq(tag(x.e()), int(I64_TAG)),
+                vec![ret(cast(payload_i64(x.e()), f64()))],
             ),
             ret(cast(get_i64(x.e()), f64())),
         ],
@@ -247,6 +296,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is(&cat, BOOL),
                 vec![when(get_bool(x.e()), vec![ret(int(1))]), ret(int(0))],
             ),
+            when(eq(tag(x.e()), int(I64_TAG)), vec![ret(payload_i64(x.e()))]),
             ret(get_i64(x.e())),
         ],
     ));

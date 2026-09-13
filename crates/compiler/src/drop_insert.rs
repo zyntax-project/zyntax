@@ -85,7 +85,10 @@ fn automatic_release_for(module: &HirModule) -> bool {
 /// Runtime symbols whose result is what the box they were given holds: a
 /// name for storage the box owns, good for as long as the box is.
 fn symbol_result_aliases_arg(symbol: &str) -> bool {
-    matches!(symbol, "zyntax_box_get_str" | "zyntax_box_get_opaque")
+    matches!(
+        symbol,
+        "zyntax_box_get_str" | "zyntax_box_get_opaque" | "zyntax_box_data"
+    )
 }
 
 /// A dynamic box.
@@ -1089,7 +1092,12 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         | "zyntax_box_get_i64"
         | "zyntax_box_get_str"
         | "zyntax_box_get_opaque"
-        | "zyntax_box_get_tag" => Some(SymbolRole::BORROWS),
+        | "zyntax_box_get_tag"
+        | "zyntax_box_header_tag"
+        | "zyntax_box_data"
+        | "zyntax_box_payload_i64"
+        | "zyntax_box_payload_f64"
+        | "zyntax_box_payload_bool" => Some(SymbolRole::BORROWS),
         // A box holding its own copy of a string, released with the box.
         "$IO$string_to_dynamic" => Some(SymbolRole::COPIES_INTO_BOX),
         // The IO, string and math plugins read their arguments and hand

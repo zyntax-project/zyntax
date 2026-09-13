@@ -460,18 +460,23 @@ fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
         Ty::Str,
         span,
     );
+    // The raw read takes a box; a rejected value may be None, so the
+    // error path leaves with a null address instead.
     let statements = vec![
         when(
             not_accepted,
-            vec![stmt(
-                call(
-                    "zb_fatal",
-                    vec![str_lit("TypeError", span), message],
-                    Ty::None,
+            vec![
+                stmt(
+                    call(
+                        "zb_fatal",
+                        vec![str_lit("TypeError", span), message],
+                        Ty::None,
+                        span,
+                    ),
                     span,
                 ),
-                span,
-            )],
+                ret(lower::as_addr(lower::int_lit(0, span), span), span),
+            ],
             span,
         ),
         ret(
@@ -961,10 +966,20 @@ fn unbox_hook(module: &Module, span: Span) -> TypedFunction {
         let address = lower::addr_call(&format!("{}$unbox", class.name), vec![x.clone()], span);
         statements.push(when(matches, vec![ret(address, span)], span));
     }
-    statements.push(ret(
-        lower::addr_call("zb_unbox_instance_raw", vec![x], span),
+    // A tag of no class: nothing to read out of the value.
+    statements.push(stmt(
+        call(
+            "zb_fatal",
+            vec![
+                str_lit("TypeError", span),
+                str_lit("not an address of that kind", span),
+            ],
+            Ty::None,
+            span,
+        ),
         span,
     ));
+    statements.push(ret(lower::as_addr(lower::int_lit(0, span), span), span));
     let mut f = function(
         "zb_hook_unbox_instance",
         vec![param("x", Ty::Object, span), tag_param],

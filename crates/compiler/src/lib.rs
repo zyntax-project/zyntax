@@ -27,6 +27,7 @@ pub mod associated_type_resolver; // Associated type resolution for trait dispat
 pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
+pub mod box_reads; // A checked box's readers as the loads they are
 pub mod builtin_class; // Wrapper-class dispatch for compiler-known built-in types (Fiber, future SimdVector, etc.)
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cast_classify; // Pure classification of source/target coercions → CastKind
@@ -1773,6 +1774,7 @@ pub struct InterpOptStats {
     pub auto_vectorize: auto_vectorize::AutoVectorizeStats,
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
     pub drop_insert: drop_insert::DropStats,
+    pub box_reads: box_reads::BoxReadStats,
     /// Release functions synthesised for types that own another.
     pub drop_glue_emitted: usize,
     pub tco: tco::TcoStats,
@@ -1836,6 +1838,19 @@ pub fn run_native_only_opts(module: &mut HirModule) -> parallel_dispatch::Dispat
 }
 
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
+    run_interp_safe_opts_with(module, true)
+}
+
+/// [`run_interp_safe_opts`] for a module whose functions other modules
+/// will be analysed against later, as a snapshot's are: the box readers
+/// stay calls, since the release analysis of the program that links the
+/// module reads them to know what a result aliases. The program's own
+/// pass expands them.
+pub fn run_interp_safe_opts_keeping_readers(module: &mut HirModule) -> InterpOptStats {
+    run_interp_safe_opts_with(module, false)
+}
+
+fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
 
     // Alloca → Malloc promotion runs ONCE up front, before the
@@ -2179,6 +2194,25 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     stats.drop_insert.escapes_skipped += di.escapes_skipped;
     stats.drop_insert.multi_block_skipped += di.multi_block_skipped;
     stats.drop_insert.no_use_skipped += di.no_use_skipped;
+
+    // Box readers become loads once the release sites that needed to
+    // see them as calls are placed, and the loads get one more chance
+    // to leave a loop or merge with each other.
+    let br = if expand_box_reads {
+        box_reads::run_module(module)
+    } else {
+        box_reads::BoxReadStats::default()
+    };
+    stats.box_reads.expanded += br.expanded;
+    if br.expanded > 0 {
+        let lc = licm::run_module(module);
+        stats.licm.hoisted += lc.hoisted;
+        stats.licm.loops_visited += lc.loops_visited;
+        stats.licm.loops_skipped_no_preheader += lc.loops_skipped_no_preheader;
+        let cs = cse::eliminate_module(module);
+        stats.cse.eliminated += cs.eliminated;
+        stats.cse.rewrites += cs.rewrites;
+    }
 
     stats
 }

@@ -1846,6 +1846,44 @@ pub unsafe extern "C" fn zyntax_box_get_f64(boxed: *const DynamicBoxRepr) -> f64
     }
 }
 
+/// The payload readers of a box the caller has already checked: the box
+/// is not null, and its tag says its payload has the width read. Each is
+/// the loads it names and nothing else, so the compiler replaces a call
+/// to one with those loads (`box_reads`); the symbols stand for the
+/// paths that keep the call.
+///
+/// # Safety
+/// `boxed` must be a live box whose payload is at least as wide as the
+/// value read.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_data(boxed: *const DynamicBoxRepr) -> *mut u8 {
+    (*boxed).data
+}
+
+/// See [`zyntax_box_data`].
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_header_tag(boxed: *const DynamicBoxRepr) -> u32 {
+    (*boxed).tag
+}
+
+/// See [`zyntax_box_data`].
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_payload_i64(boxed: *const DynamicBoxRepr) -> i64 {
+    *((*boxed).data as *const i64)
+}
+
+/// See [`zyntax_box_data`].
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_payload_f64(boxed: *const DynamicBoxRepr) -> f64 {
+    *((*boxed).data as *const f64)
+}
+
+/// See [`zyntax_box_data`]. A bool payload is one byte.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_payload_bool(boxed: *const DynamicBoxRepr) -> i32 {
+    (*((*boxed).data as *const u8) != 0) as i32
+}
+
 /// Get the value from a DynamicBox as bool (returned as i32 for FFI).
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_get_bool(boxed: *const DynamicBoxRepr) -> i32 {
@@ -2022,6 +2060,27 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("zyntax_box_get_f64", zyntax_box_get_f64 as *const u8, 1),
         ("zyntax_box_get_bool", zyntax_box_get_bool as *const u8, 1),
         ("zyntax_box_get_tag", zyntax_box_get_tag as *const u8, 1),
+        ("zyntax_box_data", zyntax_box_data as *const u8, 1),
+        (
+            "zyntax_box_header_tag",
+            zyntax_box_header_tag as *const u8,
+            1,
+        ),
+        (
+            "zyntax_box_payload_i64",
+            zyntax_box_payload_i64 as *const u8,
+            1,
+        ),
+        (
+            "zyntax_box_payload_f64",
+            zyntax_box_payload_f64 as *const u8,
+            1,
+        ),
+        (
+            "zyntax_box_payload_bool",
+            zyntax_box_payload_bool as *const u8,
+            1,
+        ),
     ]
 }
 

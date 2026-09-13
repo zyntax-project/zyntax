@@ -149,7 +149,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &fp_name(n),
             &[("x", any())],
             code_ty.clone(),
-            Some("zyntax_box_get_opaque"),
+            Some("zyntax_box_data"),
         ));
         let fp = local("fp", code_ty.clone());
         let mut params: Vec<&Local> = vec![&f];
