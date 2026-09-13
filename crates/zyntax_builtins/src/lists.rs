@@ -85,6 +85,8 @@ struct KindOps {
     kind: Kind,
     elem: Type,
     list: Type,
+    /// `List<String>`, for building text piece by piece.
+    strs: Type,
     eq: fn(Expr, Expr) -> Expr,
     lt: fn(Expr, Expr) -> Expr,
     repr: fn(Expr) -> Expr,
@@ -134,6 +136,7 @@ fn ops(kind: Kind, list_type: TypeId) -> KindOps {
     KindOps {
         kind,
         list: list_of(list_type, elem.clone()),
+        strs: list_of(list_type, string()),
         elem,
         eq,
         lt,
@@ -498,25 +501,34 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             ret(lt(n.e(), m.e())),
         ],
     ));
+    // The text is gathered as pieces and joined once, so a long list
+    // prints in time and memory proportional to its text.
     let open = local("open", string());
     let close = local("close", string());
-    let text_out = local("text", string());
+    let pieces = local("pieces", k.strs.clone());
+    let piece = |p: Expr| expr(mcall(pieces.e(), "push", vec![p], unit()));
     d.push(define(&name("items"), &[&xs, &open, &close], string(), {
-        let mut s = vec![text_out.decl(open.e()), n.decl(len(xs.e()))];
+        let mut s = vec![
+            pieces.decl(list(Vec::new(), k.strs.clone())),
+            piece(open.e()),
+            n.decl(len(xs.e())),
+        ];
         s.extend(for_range(
             &i,
             int(0),
             n.e(),
             vec![
-                when(
-                    gt(i.e(), int(0)),
-                    vec![text_out.set(add(text_out.e(), text(", ")))],
-                ),
+                when(gt(i.e(), int(0)), vec![piece(text(", "))]),
                 e.decl(el(&xs, i.e())),
-                text_out.set(add(text_out.e(), (k.repr)(e.e()))),
+                piece((k.repr)(e.e())),
             ],
         ));
-        s.push(ret(add(text_out.e(), close.e())));
+        s.push(piece(close.e()));
+        s.push(ret(call(
+            "zb_str_join",
+            vec![text(""), pieces.e()],
+            string(),
+        )));
         s
     }));
     d.push(define(
@@ -929,28 +941,36 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
-    // Every character of a string as its own string.
+    // Every character of a string as its own string, walking the bytes
+    // once.
     let text_in = local("s", string());
     let chars = local("out", strs.clone());
-    d.push(define("zb_str_chars", &[&text_in], strs.clone(), {
-        let mut st = vec![
+    let pos = local("pos", i64());
+    let char_here = |s: Expr, pos: Expr| call("zb_str_char_at_byte", vec![s, pos], string());
+    let next_pos = |s: Expr, pos: Expr| call("zb_str_next_byte", vec![s, pos], i64());
+    d.push(define(
+        "zb_str_chars",
+        &[&text_in],
+        strs.clone(),
+        vec![
             chars.decl(list(Vec::new(), strs.clone())),
-            n.decl(call("zb_str_chars_len", vec![text_in.e()], i64())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![expr(mcall(
-                chars.e(),
-                "push",
-                vec![call("zb_str_char_at", vec![text_in.e(), i.e()], string())],
-                unit(),
-            ))],
-        ));
-        st.push(ret(chars.e()));
-        st
-    }));
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            while_(
+                lt(pos.e(), n.e()),
+                vec![
+                    expr(mcall(
+                        chars.e(),
+                        "push",
+                        vec![char_here(text_in.e(), pos.e())],
+                        unit(),
+                    )),
+                    pos.set(next_pos(text_in.e(), pos.e())),
+                ],
+            ),
+            ret(chars.e()),
+        ],
+    ));
     // split on a separator
     let sep = local("sep", string());
     let rest = local("rest", string());
@@ -999,7 +1019,6 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ],
     ));
     // split on runs of whitespace
-    let word = local("word", string());
     let c = local("c", string());
     let is_space = |c: Expr| call("zb_str_is_space", vec![c], boolean());
     d.push(define(
@@ -1017,57 +1036,73 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
         ))],
     ));
-    d.push(define("zb_str_split_ws", &[&text_in], strs.clone(), {
-        let mut st = vec![
+    // Words are the runs between spaces, cut out of the text by byte
+    // offset once each ends.
+    let word_at = local("word_at", i64());
+    let byte_slice = |s: Expr, a: Expr, b: Expr| call("zb_str_bytes", vec![s, a, b], string());
+    d.push(define(
+        "zb_str_split_ws",
+        &[&text_in],
+        strs.clone(),
+        vec![
             chars.decl(list(Vec::new(), strs.clone())),
-            word.decl(text("")),
-            n.decl(call("zb_str_chars_len", vec![text_in.e()], i64())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![
-                c.decl(call("zb_str_char_at", vec![text_in.e(), i.e()], string())),
-                if_(
-                    is_space(c.e()),
-                    vec![when(
-                        gt(call("zb_str_chars_len", vec![word.e()], i64()), int(0)),
-                        vec![
-                            expr(mcall(chars.e(), "push", vec![word.e()], unit())),
-                            word.set(text("")),
-                        ],
-                    )],
-                    vec![word.set(add(word.e(), c.e()))],
-                ),
-            ],
-        ));
-        st.push(when(
-            gt(call("zb_str_chars_len", vec![word.e()], i64()), int(0)),
-            vec![expr(mcall(chars.e(), "push", vec![word.e()], unit()))],
-        ));
-        st.push(ret(chars.e()));
-        st
-    }));
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            word_at.decl(int(-1)),
+            while_(
+                lt(pos.e(), n.e()),
+                vec![
+                    c.decl(char_here(text_in.e(), pos.e())),
+                    if_(
+                        is_space(c.e()),
+                        vec![when(
+                            ge(word_at.e(), int(0)),
+                            vec![
+                                expr(mcall(
+                                    chars.e(),
+                                    "push",
+                                    vec![byte_slice(text_in.e(), word_at.e(), pos.e())],
+                                    unit(),
+                                )),
+                                word_at.set(int(-1)),
+                            ],
+                        )],
+                        vec![when(lt(word_at.e(), int(0)), vec![word_at.set(pos.e())])],
+                    ),
+                    pos.set(next_pos(text_in.e(), pos.e())),
+                ],
+            ),
+            when(
+                ge(word_at.e(), int(0)),
+                vec![expr(mcall(
+                    chars.e(),
+                    "push",
+                    vec![byte_slice(text_in.e(), word_at.e(), n.e())],
+                    unit(),
+                ))],
+            ),
+            ret(chars.e()),
+        ],
+    ));
+    // One allocation for the whole result: the plugin reads the parts
+    // straight out of the list's storage.
     let parts = local("parts", strs.clone());
-    let joined = local("out", string());
-    d.push(define("zb_str_join", &[&sep, &parts], string(), {
-        let mut st = vec![joined.decl(text("")), n.decl(len(parts.e()))];
-        st.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![
-                when(
-                    gt(i.e(), int(0)),
-                    vec![joined.set(add(joined.e(), sep.e()))],
-                ),
-                joined.set(add(joined.e(), idx(parts.e(), i.e(), string()))),
-            ],
-        ));
-        st.push(ret(joined.e()));
-        st
-    }));
+    d.push(extern_fn(
+        "zb_str_join_raw",
+        &[("data", i64()), ("n", i64()), ("sep", string())],
+        string(),
+        Some("$String$join_n"),
+    ));
+    d.push(define(
+        "zb_str_join",
+        &[&sep, &parts],
+        string(),
+        vec![ret(call(
+            "zb_str_join_raw",
+            vec![fld(parts.e(), "data", i64()), len(parts.e()), sep.e()],
+            string(),
+        ))],
+    ));
 
     // Tuples: lists of dynamic values with their own tag and printing.
     let t = local("xs", anys.clone());

@@ -30,7 +30,10 @@
 //! - `$String$parse_int`, `$String$parse_float` - Parse numbers
 //! - `$String$from_int`, `$String$from_float` - Convert to string
 
-use zrtl::{zrtl_plugin, StringPtr, ArrayPtr, string_new, string_as_str, string_length, array_new, array_push};
+use zrtl::{
+    array_new, array_push, string_as_str, string_data, string_length, string_new, zrtl_plugin,
+    ArrayPtr, StringPtr,
+};
 
 // ============================================================================
 // Basic Operations
@@ -99,6 +102,34 @@ pub extern "C" fn string_join(arr: ArrayPtr, sep: StringPtr) -> StringPtr {
     }
 
     string_new(&parts.join(sep_str))
+}
+
+/// Join `n` strings held in a contiguous array of string pointers, the
+/// layout of a compiled `List<String>`'s data, with a separator. One
+/// allocation for the whole result.
+#[no_mangle]
+pub extern "C" fn string_join_n(data: *const StringPtr, n: i64, sep: StringPtr) -> StringPtr {
+    let sep_str = unsafe { string_as_str(sep) }.unwrap_or("");
+    if data.is_null() || n <= 0 {
+        return string_new("");
+    }
+    let mut total = 0usize;
+    for i in 0..n as usize {
+        let ptr = unsafe { *data.add(i) };
+        total += unsafe { string_length(ptr) } as usize;
+    }
+    total += sep_str.len() * (n as usize - 1);
+    let mut out = String::with_capacity(total);
+    for i in 0..n as usize {
+        if i > 0 {
+            out.push_str(sep_str);
+        }
+        let ptr = unsafe { *data.add(i) };
+        if let Some(part) = unsafe { string_as_str(ptr) } {
+            out.push_str(part);
+        }
+    }
+    string_new(&out)
 }
 
 // ============================================================================
@@ -316,6 +347,66 @@ pub extern "C" fn string_char_at(s: StringPtr, index: i64) -> StringPtr {
     }
 }
 
+/// The character whose first byte is at byte offset `pos`, as a string of
+/// its own. An offset at or past the end, or one inside a character,
+/// gives an empty string. Constant time, unlike indexing by character.
+#[no_mangle]
+pub extern "C" fn string_char_at_byte(s: StringPtr, pos: i64) -> StringPtr {
+    let len = unsafe { string_length(s) } as i64;
+    if s.is_null() || pos < 0 || pos >= len {
+        return string_new("");
+    }
+    let data = unsafe { string_data(s) };
+    let rest = unsafe { std::slice::from_raw_parts(data.add(pos as usize), (len - pos) as usize) };
+    let width = utf8_width(rest[0]).min(rest.len());
+    match std::str::from_utf8(&rest[..width]) {
+        Ok(c) => string_new(c),
+        Err(_) => string_new(""),
+    }
+}
+
+/// The bytes from offset `start` to `end`, as a string. Both must sit on
+/// character boundaries, as the offsets `string_next_byte` hands out do.
+#[no_mangle]
+pub extern "C" fn string_bytes(s: StringPtr, start: i64, end: i64) -> StringPtr {
+    let len = unsafe { string_length(s) } as i64;
+    let start = start.clamp(0, len);
+    let end = end.clamp(start, len);
+    if s.is_null() || start == end {
+        return string_new("");
+    }
+    let data = unsafe { string_data(s) };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(data.add(start as usize), (end - start) as usize) };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => string_new(text),
+        Err(_) => string_new(""),
+    }
+}
+
+/// The byte offset of the character after the one at `pos`; the string's
+/// byte length once there is none.
+#[no_mangle]
+pub extern "C" fn string_next_byte(s: StringPtr, pos: i64) -> i64 {
+    let len = unsafe { string_length(s) } as i64;
+    if s.is_null() || pos < 0 || pos >= len {
+        return len;
+    }
+    let lead = unsafe { *string_data(s).add(pos as usize) };
+    (pos + utf8_width(lead) as i64).min(len)
+}
+
+/// How many bytes a UTF-8 character occupies, from its first byte.
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
 /// Get character code at index (returns -1 if out of bounds)
 #[no_mangle]
 pub extern "C" fn string_char_code_at(s: StringPtr, index: i64) -> i32 {
@@ -351,7 +442,9 @@ pub extern "C" fn string_split(s: StringPtr, delimiter: StringPtr) -> ArrayPtr {
     let arr = array_new::<StringPtr>(parts.len());
     for part in parts {
         let part_ptr = string_new(part);
-        unsafe { array_push(arr, part_ptr); }
+        unsafe {
+            array_push(arr, part_ptr);
+        }
     }
     arr
 }
@@ -365,7 +458,9 @@ pub extern "C" fn string_lines(s: StringPtr) -> ArrayPtr {
     let arr = array_new::<StringPtr>(parts.len());
     for part in parts {
         let part_ptr = string_new(part);
-        unsafe { array_push(arr, part_ptr); }
+        unsafe {
+            array_push(arr, part_ptr);
+        }
     }
     arr
 }
@@ -376,7 +471,11 @@ pub extern "C" fn string_lines(s: StringPtr) -> ArrayPtr {
 
 /// Pad string on the left to reach target length
 #[no_mangle]
-pub extern "C" fn string_pad_start(s: StringPtr, target_len: i64, pad_char: StringPtr) -> StringPtr {
+pub extern "C" fn string_pad_start(
+    s: StringPtr,
+    target_len: i64,
+    pad_char: StringPtr,
+) -> StringPtr {
     let s_str = unsafe { string_as_str(s) }.unwrap_or("");
     let pad = unsafe { string_as_str(pad_char) }
         .and_then(|p| p.chars().next())
@@ -540,6 +639,7 @@ zrtl_plugin! {
         ("$String$concat", string_concat),
         ("$String$repeat", string_repeat),
         ("$String$join", string_join),
+        ("$String$join_n", string_join_n),
 
         // Case
         ("$String$to_upper", string_to_upper),
@@ -568,6 +668,9 @@ zrtl_plugin! {
         // Extract
         ("$String$substring", string_substring),
         ("$String$char_at", string_char_at),
+        ("$String$char_at_byte", string_char_at_byte),
+        ("$String$next_byte", string_next_byte),
+        ("$String$bytes", string_bytes),
         ("$String$char_code_at", string_char_code_at),
         ("$String$from_char_code", string_from_char_code),
         ("$String$split", string_split),

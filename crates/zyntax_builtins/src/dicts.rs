@@ -45,7 +45,6 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     let i = local("i", i64());
     let n = local("n", i64());
     let out = local("out", anys.clone());
-    let text_out = local("text", string());
     let x = local("x", any());
     let tag = local("tag", i64());
     let mut out_decls = Vec::new();
@@ -272,26 +271,27 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             ret(bool(true)),
         ],
     ));
+    // Pieces joined once, so the text costs what its length is.
+    let pieces = local("pieces", list_of(list_type, string()));
+    let piece = |p: Expr| expr(mcall(pieces.e(), "push", vec![p], unit()));
     out_decls.push(define("zb_dict_repr", &[&d], string(), {
         vec![
-            text_out.decl(text("{")),
+            pieces.decl(list(Vec::new(), list_of(list_type, string()))),
+            piece(text("{")),
             n.decl(len(d.e())),
             i.decl(int(0)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
-                    when(
-                        gt(i.e(), int(0)),
-                        vec![text_out.set(add(text_out.e(), text(", ")))],
-                    ),
-                    text_out.set(add(
-                        add(add(text_out.e(), any_repr(at(d.e(), i.e()))), text(": ")),
-                        any_repr(at(d.e(), add(i.e(), int(1)))),
-                    )),
+                    when(gt(i.e(), int(0)), vec![piece(text(", "))]),
+                    piece(any_repr(at(d.e(), i.e()))),
+                    piece(text(": ")),
+                    piece(any_repr(at(d.e(), add(i.e(), int(1))))),
                     i.add_assign(int(2)),
                 ],
             ),
-            ret(add(text_out.e(), text("}"))),
+            piece(text("}")),
+            ret(call("zb_str_join", vec![text(""), pieces.e()], string())),
         ]
     }));
     out_decls.push(extern_fn(

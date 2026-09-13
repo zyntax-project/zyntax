@@ -9,8 +9,8 @@
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     typed_node, TypedBinary, TypedBlock, TypedCall, TypedCast, TypedDeclaration, TypedExpression,
-    TypedFunction, TypedIf, TypedIfExpr, TypedIndex, TypedLet, TypedLiteral, TypedMethodCall,
-    TypedParameter, TypedStatement, TypedUnary, TypedWhile,
+    TypedFieldAccess, TypedFunction, TypedIf, TypedIfExpr, TypedIndex, TypedLet, TypedLiteral,
+    TypedMethodCall, TypedParameter, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, PrimitiveType, Type, TypedNode, UnaryOp,
@@ -305,6 +305,17 @@ pub fn idx(xs: Expr, i: Expr, elem: Type) -> Expr {
             index: Box::new(i),
         }),
         elem,
+    )
+}
+
+/// A field of a struct value.
+pub fn fld(obj: Expr, name: &str, ty: Type) -> Expr {
+    node(
+        TypedExpression::Field(TypedFieldAccess {
+            object: Box::new(obj),
+            field: intern(name),
+        }),
+        ty,
     )
 }
 

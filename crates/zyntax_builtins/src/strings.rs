@@ -31,6 +31,26 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
         "str",
         "$String$char_at",
     ),
+    // A cursor over the characters by byte offset, each step constant
+    // time; indexing by character position scans from the start.
+    (
+        "zb_str_char_at_byte",
+        &[("s", "str"), ("pos", "i64")],
+        "str",
+        "$String$char_at_byte",
+    ),
+    (
+        "zb_str_next_byte",
+        &[("s", "str"), ("pos", "i64")],
+        "i64",
+        "$String$next_byte",
+    ),
+    (
+        "zb_str_bytes",
+        &[("s", "str"), ("a", "i64"), ("b", "i64")],
+        "str",
+        "$String$bytes",
+    ),
     (
         "zb_str_repeat_raw",
         &[("s", "str"), ("n", "i64")],
@@ -134,7 +154,10 @@ fn str_eq(a: Expr, b: Expr) -> Expr {
     call("zb_str_eq", vec![a, b], boolean())
 }
 
-pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
+pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId) -> Vec<Decl> {
+    // Text built piece by piece is gathered in one of these and joined
+    // once, so the cost is the text's length rather than its square.
+    let strs = crate::list_of(list_type, string());
     let mut out = Vec::new();
     for (name, params, ret, symbol) in PRIMITIVES {
         let params: Vec<(&str, zyntax_typed_ast::Type)> =
@@ -232,10 +255,16 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
     let st = local("st", i64());
     let lo = local("lo", i64());
     let hi = local("hi", i64());
-    let out_s = local("out", string());
+    let pieces = local("pieces", strs.clone());
+    let piece = |p: Expr| expr(mcall(pieces.e(), "push", vec![p], unit()));
+    let joined = || call("zb_str_join", vec![text(""), pieces.e()], string());
+    // The characters as a list, so a position is one read rather than a
+    // scan from the start.
+    let chars = local("chars", strs.clone());
+    let char_list = |s: Expr| call("zb_str_chars", vec![s], strs.clone());
     let step_body = |f: &Local| {
         vec![
-            out_s.set(add(out_s.e(), char_at(s.e(), f.e()))),
+            piece(idx(chars.e(), f.e(), string())),
             f.set(add(f.e(), st.e())),
         ]
     };
@@ -277,14 +306,15 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
                     ret(substring(s.e(), lo.e(), hi.e())),
                 ],
             ),
-            out_s.decl(text("")),
+            pieces.decl(list(Vec::new(), strs.clone())),
+            chars.decl(char_list(s.e())),
             i.decl(lo.e()),
             if_(
                 gt(st.e(), int(0)),
                 vec![while_(lt(i.e(), hi.e()), step_body(&i))],
                 vec![while_(gt(i.e(), hi.e()), step_body(&i))],
             ),
-            ret(out_s.e()),
+            ret(joined()),
         ],
     ));
 
@@ -296,16 +326,16 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
     } else {
         ("\"", "'")
     };
-    let mut escapes: Vec<Stmt> = vec![out_s.set(add(out_s.e(), c.e()))];
+    let mut escapes: Vec<Stmt> = vec![piece(c.e())];
     escapes = vec![if_(
         str_eq(c.e(), quote.e()),
-        vec![out_s.set(add(add(out_s.e(), text("\\")), c.e()))],
+        vec![piece(text("\\")), piece(c.e())],
         escapes,
     )];
     for (ch, esc) in [("\t", "\\t"), ("\n", "\\n"), ("\\", "\\\\")] {
         escapes = vec![if_(
             str_eq(c.e(), text(ch)),
-            vec![out_s.set(add(out_s.e(), text(esc)))],
+            vec![piece(text(esc))],
             escapes,
         )];
     }
@@ -320,12 +350,15 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
             vec![quote.set(text(other))],
         ));
     }
-    repr_body.push(out_s.decl(quote.e()));
-    repr_body.push(n.decl(chars_len(s.e())));
-    let mut loop_body = vec![c.decl(char_at(s.e(), i.e()))];
+    repr_body.push(pieces.decl(list(Vec::new(), strs.clone())));
+    repr_body.push(piece(quote.e()));
+    repr_body.push(chars.decl(char_list(s.e())));
+    repr_body.push(n.decl(mcall(chars.e(), "len", vec![], i64())));
+    let mut loop_body = vec![c.decl(idx(chars.e(), i.e(), string()))];
     loop_body.extend(escapes);
     repr_body.extend(for_range(&i, int(0), n.e(), loop_body));
-    repr_body.push(ret(add(out_s.e(), quote.e())));
+    repr_body.push(piece(quote.e()));
+    repr_body.push(ret(joined()));
     out.push(define("zb_str_repr", &[&s], string(), repr_body));
 
     // Casing: capitalize the first character, or the first of every word.
@@ -333,7 +366,6 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
     let lower = local("lower", string());
     let upper = local("upper", string());
     let start = local("start", boolean());
-    let out_s = local("out", string());
     let to_upper = |s: Expr| call("zb_str_upper", vec![s], string());
     let to_lower = |s: Expr| call("zb_str_lower", vec![s], string());
     out.push(define(
@@ -351,34 +383,31 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
     ));
     out.push(define("zb_str_title", &[&s], string(), {
         let mut body = vec![
-            out_s.decl(text("")),
+            pieces.decl(list(Vec::new(), strs.clone())),
             start.decl(bool(true)),
-            n.decl(chars_len(s.e())),
+            chars.decl(char_list(s.e())),
+            n.decl(mcall(chars.e(), "len", vec![], i64())),
         ];
         body.extend(for_range(
             &i,
             int(0),
             n.e(),
             vec![
-                c.decl(char_at(s.e(), i.e())),
+                c.decl(idx(chars.e(), i.e(), string())),
                 lower.decl(to_lower(c.e())),
                 upper.decl(to_upper(c.e())),
                 // A character without case separates words.
                 if_(
                     str_eq(lower.e(), upper.e()),
-                    vec![out_s.set(add(out_s.e(), c.e())), start.set(bool(true))],
+                    vec![piece(c.e()), start.set(bool(true))],
                     vec![
-                        if_(
-                            start.e(),
-                            vec![out_s.set(add(out_s.e(), upper.e()))],
-                            vec![out_s.set(add(out_s.e(), lower.e()))],
-                        ),
+                        if_(start.e(), vec![piece(upper.e())], vec![piece(lower.e())]),
                         start.set(bool(false)),
                     ],
                 ),
             ],
         ));
-        body.push(ret(out_s.e()));
+        body.push(ret(joined()));
         body
     }));
 

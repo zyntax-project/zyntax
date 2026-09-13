@@ -153,7 +153,7 @@ pub fn library(policy: &Policy) -> Library {
     let list_type = lists::declare_list_type(&mut b);
     let mut declarations = Vec::new();
     declarations.extend(io::declarations(policy, list_type));
-    declarations.extend(strings::declarations(policy));
+    declarations.extend(strings::declarations(policy, list_type));
     declarations.extend(format::declarations());
     declarations.extend(dynamic::declarations(policy, list_type));
     declarations.extend(lists::declarations(policy, list_type));
