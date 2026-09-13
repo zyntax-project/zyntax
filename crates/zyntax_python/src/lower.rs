@@ -18,9 +18,9 @@ use std::collections::{BTreeSet, HashMap};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     ParameterAttribute, TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression,
-    TypedFieldAccess, TypedFor, TypedFunction, TypedIf, TypedIfExpr, TypedLet, TypedLiteral,
-    TypedMatch, TypedMatchArm, TypedMethodCall, TypedParameter, TypedPattern, TypedRange,
-    TypedStatement, TypedUnary, TypedWhile,
+    TypedFieldAccess, TypedFor, TypedFunction, TypedIf, TypedIfExpr, TypedIndex, TypedLet,
+    TypedLiteral, TypedMatch, TypedMatchArm, TypedMethodCall, TypedParameter, TypedPattern,
+    TypedRange, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
@@ -108,7 +108,9 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Tuple | Ty::Dict | Ty::Set => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
-        Ty::Object | Ty::Unknown => Type::Any,
+        // A known function value is still the record every function
+        // value is.
+        Ty::Closure(_) | Ty::Object | Ty::Unknown => Type::Any,
     }
 }
 
@@ -151,6 +153,19 @@ fn bind_names(vars: &mut std::collections::HashMap<String, Ty>, target: &py::Exp
 /// `zb_list_<op>_<kind>`.
 fn list_fn(op: &str, elem: Elem) -> String {
     format!("zb_list_{op}_{}", elem.suffix())
+}
+
+/// Element `i` of a list the lowering built itself and so knows the
+/// length of: a cell, a record. Nothing checks the index.
+fn slot(list: Node, i: usize, ty: Ty, span: Span) -> Node {
+    node(
+        TypedExpression::Index(TypedIndex {
+            object: Box::new(list),
+            index: Box::new(int_lit(i as i64, span)),
+        }),
+        ty,
+        span,
+    )
 }
 
 /// What a comprehension builds.
@@ -376,7 +391,7 @@ fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
 /// unannotated parameter is dynamic by the language's rules, not by
 /// omission, and the lowering does not warn about it.
 pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
-    if ty == Ty::Object {
+    if matches!(ty, Ty::Object | Ty::Closure(_)) {
         vec![ParameterAttribute {
             name: intern("dynamic"),
             args: Vec::new(),
@@ -754,7 +769,7 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => str_lit("", span),
-            Ty::Object | Ty::Unknown => {
+            Ty::Object | Ty::Unknown | Ty::Closure(_) => {
                 let none = Val {
                     node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
                     ty: Ty::None,
@@ -972,15 +987,14 @@ impl<'m> Lowerer<'m> {
         for name in names {
             let cell = self.cells[&name];
             let init = if let Some(i) = self.captured.iter().position(|c| *c == name) {
-                let slot = int_lit((RECORD_CELLS_AT + i) as i64, span);
-                let element = call(
-                    "zb_list_get_any",
-                    vec![var(intern("env"), Ty::List(Elem::Object), span), slot],
+                let element = slot(
+                    var(intern("env"), Ty::List(Elem::Object), span),
+                    RECORD_CELLS_AT + i,
                     Ty::Object,
                     span,
                 );
                 call(
-                    "zb_list_unbox_any",
+                    "zb_unbox_list_raw_any",
                     vec![element],
                     Ty::List(Elem::Object),
                     span,
@@ -1018,12 +1032,7 @@ impl<'m> Lowerer<'m> {
     fn cell_read(&mut self, name: &str, span: Span) -> Val {
         let ty = self.var_ty(name);
         let cell = var(self.cells[name], Ty::List(Elem::Object), span);
-        let element = call(
-            "zb_list_get_any",
-            vec![cell, int_lit(0, span)],
-            Ty::Object,
-            span,
-        );
+        let element = slot(cell, 0, Ty::Object, span);
         let node = self.trusted(
             Val {
                 node: element,
@@ -1226,6 +1235,8 @@ impl<'m> Lowerer<'m> {
         match (v.ty, target) {
             (a, b) if a == b => v.node,
             (_, Ty::Unknown) => v.node,
+            // A known function value is a dynamic value already.
+            (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
@@ -1420,7 +1431,7 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Gen => node(
+            Ty::Gen | Ty::Closure(_) => node(
                 TypedExpression::Literal(TypedLiteral::Bool(true)),
                 Ty::Bool,
                 span,
@@ -1468,6 +1479,7 @@ impl<'m> Lowerer<'m> {
             Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
             Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
             Ty::Gen => str_lit("<generator object>", span),
+            Ty::Closure(_) => str_lit("<function>", span),
             Ty::Class(k) => {
                 let k = k as usize;
                 match self
@@ -1988,13 +2000,10 @@ impl<'m> Lowerer<'m> {
         if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
             let value = self.coerce(value, ty);
             let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
-            let set = call(
-                "zb_list_set_any",
-                vec![
-                    var(cell, Ty::List(Elem::Object), span),
-                    int_lit(0, span),
-                    boxed,
-                ],
+            let set = binary(
+                BinaryOp::Assign,
+                slot(var(cell, Ty::List(Elem::Object), span), 0, Ty::Object, span),
+                boxed,
                 Ty::None,
                 span,
             );
@@ -2769,7 +2778,13 @@ impl<'m> Lowerer<'m> {
     // ─── Expressions ────────────────────────────────────────────────
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
-        let v = self.expr_unchecked(e)?;
+        let mut v = self.expr_unchecked(e)?;
+        // A function value whose function is known is the record every
+        // function value is; only a call reads the type, off the callee
+        // expression itself.
+        if let Ty::Closure(_) = v.ty {
+            v.ty = Ty::Object;
+        }
         // A library call that can raise is checked before its value is
         // used, wherever the lowering above produced it.
         let fallible = match &v.node.node {
@@ -4137,6 +4152,9 @@ impl<'m> Lowerer<'m> {
             let name = n.id.as_str();
             if self.is_variable(name) {
                 let callee = self.expr(&c.func)?;
+                if let Ty::Closure(k) = self.typer().callee_ty(&c.func) {
+                    return self.call_closure(k, callee, args, keywords, c, span);
+                }
                 return self.call_value(callee, args, keywords, c, span);
             }
             if !self.module.funcs.contains_key(name) && !self.module.class_index.contains_key(name)
@@ -4218,6 +4236,9 @@ impl<'m> Lowerer<'m> {
         }
         if !matches!(&*c.func, py::Expr::Name(_)) {
             let callee = self.expr(&c.func)?;
+            if let Ty::Closure(k) = self.ty_of(&c.func) {
+                return self.call_closure(k, callee, args, keywords, c, span);
+            }
             return self.call_value(callee, args, keywords, c, span);
         }
         if let py::Expr::Name(n) = &*c.func {
@@ -5918,6 +5939,39 @@ impl<'m> Lowerer<'m> {
         Ok(self.guard(v, span))
     }
 
+    /// A call through a value whose function inference knows: the
+    /// record is handed to the function's typed entry along with the
+    /// arguments as it declares them, and nothing is boxed. A call that
+    /// does not fit the parameters goes through the record, which
+    /// reports it as Python does.
+    fn call_closure(
+        &mut self,
+        k: u16,
+        callee: Val,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        let info = self.module.closures.borrow()[k as usize].clone();
+        if !keywords.is_empty() || args.len() != info.sig.params.len() {
+            return self.call_value(callee, args, keywords, c, span);
+        }
+        let record = self.coerce(callee, Ty::Object);
+        let mut lowered = vec![call(
+            "zb_unbox_list_raw_any",
+            vec![record],
+            Ty::List(Elem::Object),
+            span,
+        )];
+        lowered.extend(self.arguments(&info.name, &info.sig, args, keywords, c)?);
+        let v = Val {
+            node: call(&info.typed_name(), lowered, info.sig.ret, span),
+            ty: info.sig.ret,
+        };
+        Ok(self.guard(v, span))
+    }
+
     /// A function record: the code address, the arity and the cells.
     fn record(&mut self, code: &str, arity: usize, cells: Vec<Val>, span: Span) -> Val {
         let cells = self.list_of(cells, Elem::Object, span);
@@ -5947,10 +6001,17 @@ impl<'m> Lowerer<'m> {
             return unsupported("*args / **kwargs", &*f.parameters);
         }
         let scope = Scope::of_function(f);
-        let sig = types::declared_sig(f);
+        let known = self.closure_info(f.range.start().to_u32());
+        let sig = match &known {
+            Some(info) => info.sig.clone(),
+            None => types::declared_sig(f),
+        };
         let (captured, seeds) = self.captures_for(&scope);
         let locals = types::infer_locals_seeded(self.module, &sig, &f.body, &seeds);
-        let lifted = self.lifted_name(f.name.as_str());
+        let lifted = match &known {
+            Some(info) => info.name.clone(),
+            None => self.lifted_name(f.name.as_str()),
+        };
         let mut child = Lowerer::new(
             self.module,
             &lifted,
@@ -5965,8 +6026,7 @@ impl<'m> Lowerer<'m> {
         for s in &f.body {
             child.stmt(s, &mut body)?;
         }
-        let function = child.lifted_function(&lifted, &params, body, span);
-        self.module.lifted.borrow_mut().push(function);
+        self.lift(&mut child, known.as_ref(), &lifted, &params, body, span);
         let cells = self.cells_of(&captured, span);
         Ok(self.record(&lifted, params.len(), cells, span))
     }
@@ -5974,6 +6034,7 @@ impl<'m> Lowerer<'m> {
     /// A lambda: a lifted function returning its one expression.
     fn lambda(&mut self, l: &py::ExprLambda, span: Span) -> Result<Val> {
         let scope = Scope::of_lambda(l);
+        let known = self.closure_info(l.range.start().to_u32());
         let mut params: Vec<(String, Ty)> = Vec::new();
         if let Some(ps) = &l.parameters {
             if ps.vararg.is_some() || ps.kwarg.is_some() {
@@ -5986,17 +6047,25 @@ impl<'m> Lowerer<'m> {
                 params.push((p.parameter.name.to_string(), Ty::Object));
             }
         }
-        let sig = Sig {
-            params: params.clone(),
-            ret: Ty::Object,
-            defaults: vec![None; params.len()],
+        let sig = match &known {
+            Some(info) => info.sig.clone(),
+            None => Sig {
+                params: params.clone(),
+                ret: Ty::Object,
+                defaults: vec![None; params.len()],
+            },
         };
+        let params = sig.params.clone();
         let (captured, seeds) = self.captures_for(&scope);
         let mut locals = Locals::default();
         for (name, ty) in &params {
             locals.vars.insert(name.clone(), *ty);
         }
-        let lifted = self.lifted_name("lambda");
+        let lifted = match &known {
+            Some(info) => info.name.clone(),
+            None => self.lifted_name("lambda"),
+        };
+        let ret = sig.ret;
         let mut child = Lowerer::new(
             self.module,
             &lifted,
@@ -6006,17 +6075,50 @@ impl<'m> Lowerer<'m> {
             captured.clone(),
             seeds,
         );
-        let value = child.expr_as(&l.body, Ty::Object)?;
+        let value = child.expr_as(&l.body, ret)?;
         let mut body = std::mem::take(&mut child.hoisted);
         body.push(TypedNode::new(
             TypedStatement::Return(Some(Box::new(value))),
             Type::Unknown,
             span,
         ));
-        let function = child.lifted_function(&lifted, &params, body, span);
-        self.module.lifted.borrow_mut().push(function);
+        self.lift(&mut child, known.as_ref(), &lifted, &params, body, span);
         let cells = self.cells_of(&captured, span);
         Ok(self.record(&lifted, params.len(), cells, span))
+    }
+
+    /// What inference knows of the closure defined at `start` of the
+    /// current file, if it is one.
+    fn closure_info(&self, start: u32) -> Option<types::ClosureInfo> {
+        let k = self.module.closure_at(current_file(), start)?;
+        self.module.closures.borrow().get(k as usize).cloned()
+    }
+
+    /// Declare a nested body's functions: for a closure inference knows,
+    /// its typed entry and the adapter in front of it that the record
+    /// names; otherwise the one function every function value has.
+    fn lift(
+        &mut self,
+        child: &mut Lowerer<'_>,
+        known: Option<&types::ClosureInfo>,
+        lifted: &str,
+        params: &[(String, Ty)],
+        body: Vec<Stmt>,
+        span: Span,
+    ) {
+        match known {
+            Some(info) => {
+                let typed = child.typed_function(&info.typed_name(), params, body, span);
+                let adapter = child.adapter_function(lifted, &info.typed_name(), params, span);
+                let mut lifted = self.module.lifted.borrow_mut();
+                lifted.push(typed);
+                lifted.push(adapter);
+            }
+            None => {
+                let function = child.lifted_function(lifted, params, body, span);
+                self.module.lifted.borrow_mut().push(function);
+            }
+        }
     }
 
     /// Which of this function's cells a nested body uses, in record
@@ -6052,6 +6154,137 @@ impl<'m> Lowerer<'m> {
         let n = self.module.counter.get();
         self.module.counter.set(n + 1);
         format!("{}${inner}${n}", self.name)
+    }
+
+    /// A closure's typed entry: the record, then each parameter as
+    /// inference typed it, to the result as inference typed it.
+    fn typed_function(
+        &mut self,
+        name: &str,
+        params: &[(String, Ty)],
+        body: Vec<Stmt>,
+        span: Span,
+    ) -> TypedFunction {
+        let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
+        let mut statements = Vec::new();
+        for (pname, declared) in params {
+            typed_params.push(parameter(pname, *declared, span));
+            // A parameter the body also assigns another type to lives as
+            // an object from the start.
+            let local = self.var_ty(pname);
+            if local != *declared {
+                let value = self.coerce(
+                    Val {
+                        node: var(intern(pname), *declared, span),
+                        ty: *declared,
+                    },
+                    local,
+                );
+                statements.push(TypedNode::new(
+                    TypedStatement::Let(TypedLet {
+                        name: intern(pname),
+                        ty: ir(local),
+                        mutability: Mutability::Mutable,
+                        initializer: Some(Box::new(value)),
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+        }
+        statements.extend(self.cell_prologue(span));
+        statements.extend(body);
+        // Falling off the end returns None.
+        let none = Val {
+            node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+            ty: Ty::None,
+        };
+        let none = self.coerce(none, self.sig.ret);
+        statements.append(&mut self.hoisted);
+        statements.push(TypedNode::new(
+            TypedStatement::Return(Some(Box::new(none))),
+            Type::Unknown,
+            span,
+        ));
+        TypedFunction {
+            name: intern(name),
+            annotations: Vec::new(),
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params: typed_params,
+            return_type: ir(self.sig.ret),
+            body: Some(TypedBlock { statements, span }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: false,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: None,
+        }
+    }
+
+    /// The adapter a record names for a closure with a typed entry: the
+    /// shape every function value has, each argument read out of its
+    /// box as the entry's parameter type, the result boxed.
+    fn adapter_function(
+        &mut self,
+        name: &str,
+        typed: &str,
+        params: &[(String, Ty)],
+        span: Span,
+    ) -> TypedFunction {
+        // A check that fails leaves with a placeholder of this shape.
+        let ret = std::mem::replace(&mut self.sig.ret, Ty::Object);
+        let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
+        let mut statements = Vec::new();
+        let mut args = vec![var(intern("env"), Ty::List(Elem::Object), span)];
+        for (i, (_, declared)) in params.iter().enumerate() {
+            let arg = format!("a{i}");
+            typed_params.push(parameter(&arg, Ty::Object, span));
+            let value = self.coerce(
+                Val {
+                    node: var(intern(&arg), Ty::Object, span),
+                    ty: Ty::Object,
+                },
+                *declared,
+            );
+            statements.append(&mut self.hoisted);
+            args.push(value);
+        }
+        let result = Val {
+            node: call(typed, args, ret, span),
+            ty: ret,
+        };
+        let boxed = self.coerce(result, Ty::Object);
+        statements.append(&mut self.hoisted);
+        statements.push(TypedNode::new(
+            TypedStatement::Return(Some(Box::new(boxed))),
+            Type::Unknown,
+            span,
+        ));
+        self.sig.ret = ret;
+        TypedFunction {
+            name: intern(name),
+            annotations: Vec::new(),
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params: typed_params,
+            return_type: ir(Ty::Object),
+            body: Some(TypedBlock { statements, span }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: false,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: None,
+        }
     }
 
     /// This function in the shape every function value has: the record

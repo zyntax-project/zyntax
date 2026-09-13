@@ -354,6 +354,34 @@ pub fn parse_program_with(
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
     let global_names = module_globals(&module.body, &def_stmts, &inferred.class_index);
     inferred.closed = types::closed_items(&module.body, &items);
+    // Every lambda and nested def, so a call through a value of one is
+    // a direct call wherever the value's type is known.
+    let class_index = inferred.class_index.clone();
+    let entry_files: Vec<u32> = top_level
+        .iter()
+        .map(|(_, origin)| inferred.file_of(*origin))
+        .collect();
+    for item in &items {
+        let file = inferred.file_of(item.module.as_deref());
+        types::collect_closures(
+            &mut inferred,
+            &item.name,
+            file,
+            &item.def.body,
+            &class_index,
+        );
+    }
+    for (stmt, file) in owned.iter().zip(&entry_files) {
+        types::collect_closures(
+            &mut inferred,
+            ENTRY,
+            *file,
+            std::slice::from_ref(stmt),
+            &class_index,
+        );
+    }
+    // Names the lowering makes up start past the closures' indices.
+    inferred.counter.set(inferred.closures.borrow().len());
     // A global's type is the join of every assignment to it: the
     // module's own, then those under `global` in each function. The
     // module's own are retyped each round, as the functions they call
@@ -363,9 +391,10 @@ pub fn parse_program_with(
     }
     for _ in 0..8 {
         let before = inferred.globals.clone();
-        let out = types::infer_module(&inferred, &items, &owned);
+        let out = types::infer_module(&inferred, &items, &owned, &entry_files);
         inferred.funcs = out.funcs;
         inferred.classes = out.classes;
+        inferred.closures = std::cell::RefCell::new(out.closures);
         let mut writes: Vec<(String, types::Ty)> = global_names
             .iter()
             .map(|name| {
@@ -380,7 +409,10 @@ pub fn parse_program_with(
             .collect();
         for item in &items {
             let sig = inferred.funcs[&item.name].clone();
-            let locals = types::infer_locals(&inferred, &sig, &item.def.body);
+            let file = inferred.file_of(item.module.as_deref());
+            let locals = types::in_file(file, || {
+                types::infer_locals(&inferred, &sig, &item.def.body)
+            });
             writes.extend(locals.global_writes.iter().map(|(n, t)| (n.clone(), *t)));
         }
         for (name, ty) in writes {
@@ -433,6 +465,7 @@ pub fn parse_program_with(
     }
     for item in &items {
         let sig = inferred.funcs[&item.name].clone();
+        lower::set_current_file(inferred.file_of(item.module.as_deref()));
         let locals = types::infer_locals(&inferred, &sig, &item.def.body);
         let scope = scope::Scope::of_function(item.def);
         let mut lowerer = lower::Lowerer::new(
@@ -445,7 +478,6 @@ pub fn parse_program_with(
             std::collections::HashMap::new(),
         );
         lowerer.class = item.class;
-        lower::set_current_file(inferred.file_of(item.module.as_deref()));
         let func = lowerer
             .function_named(item.def, &item.name)
             .map_err(|e| located(e, item.module.as_deref()))?;
@@ -457,7 +489,7 @@ pub fn parse_program_with(
         lower::set_current_file(0);
     }
     if !top_level.is_empty() {
-        let mut locals = types::infer_locals(&inferred, &entry_sig, &owned);
+        let mut locals = types::infer_locals_entry(&inferred, &entry_sig, &owned, &entry_files);
         for name in inferred.globals.keys() {
             locals.vars.remove(name);
         }
