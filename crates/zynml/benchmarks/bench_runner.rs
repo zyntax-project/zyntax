@@ -4,9 +4,12 @@
 //! `crates/zynml/benchmarks/` across the targets we control today, and
 //! the same kernel written in Python, under
 //! `crates/zyntax_python/benchmarks/`, through the Python frontend
-//! (`zypy`) and through CPython (`cpython`) where `python3` is on the
-//! path. A kernel with no Python file has no Python rows; one with no
-//! ZynML source (`python_only`) has only those.
+//! (`zypy`) and through the Python runtimes on this machine: `cpython`
+//! (`python3` on the path), `pypy` (`pypy3`), and the newest CPython
+//! `uv` manages, with its JIT off (`uv`) and on (`uv-jit`). A runtime
+//! that is not installed is skipped. A kernel with no Python file has
+//! no Python rows; one with no ZynML source (`python_only`) has only
+//! those.
 //!
 //!   * `zyntax-interp`     — BC interpreter, NO HIR optimization
 //!                            pipeline. Floor for what the
@@ -841,8 +844,14 @@ fn main() {
         let python_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../zyntax_python/benchmarks/{kernel}.py"));
         if python_path.exists() {
-            let python_targets: [(&str, fn(&Path, usize) -> TargetResult); 2] =
-                [("zypy", measure_zypy), ("cpython", measure_cpython)];
+            let mut python_targets: Vec<(&str, Box<dyn Fn(&Path, usize) -> TargetResult>)> =
+                vec![("zypy", Box::new(measure_zypy))];
+            for runtime in python_runtimes() {
+                python_targets.push((
+                    runtime.key,
+                    Box::new(move |path, runs| measure_interpreter(&runtime, path, runs)),
+                ));
+            }
             for (key, measure_with) in python_targets {
                 if let Some(tf) = &target_filter {
                     if !key.contains(tf.as_str()) {
@@ -850,6 +859,10 @@ fn main() {
                     }
                 }
                 let r = measure_with(&python_path, runs);
+                if r.skipped {
+                    eprintln!("    {key:<22} SKIPPED (not installed)");
+                    continue;
+                }
                 if let Some(err) = r.error.as_ref() {
                     eprintln!("    {key:<22} FAILED: {err}");
                 } else {
@@ -1374,25 +1387,109 @@ fn measure_zypy(path: &Path, runs: usize) -> TargetResult {
     }
 }
 
-/// The Python kernel under CPython: `python3` on the file, its wall
-/// time as the execution time, since CPython has no compile step to
-/// separate out. The interpreter's own start-up is in the number, and
-/// is what a user of it pays too. The kernel prints its result, which
-/// is read back as the value.
-fn measure_cpython(path: &Path, runs: usize) -> TargetResult {
+/// A Python runtime on this machine: the row's key, the interpreter to
+/// spawn, and the environment it wants.
+#[derive(Clone)]
+struct PythonRuntime {
+    key: &'static str,
+    /// The interpreter, resolved to a path where the tool that manages
+    /// it can say; `None` when it is not installed.
+    program: Option<std::path::PathBuf>,
+    env: Vec<(&'static str, &'static str)>,
+}
+
+/// The Python runtimes to read `zypy` against: the `python3` on the
+/// path, PyPy, and the newest CPython `uv` manages, with and without
+/// its JIT. Each row is skipped rather than failed when the runtime is
+/// not installed, so the table reads the same on every machine.
+fn python_runtimes() -> Vec<PythonRuntime> {
+    let on_path = |name: &str| -> Option<std::path::PathBuf> {
+        std::process::Command::new(name)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| std::path::PathBuf::from(name))
+    };
+    // The interpreters uv manages, newest first, as `<name> <path>`
+    // lines; the interpreter is spawned directly so uv's own launcher
+    // stays out of the number. An active virtualenv does not steer this
+    // the way it steers `uv python find`.
+    let uv_python = std::process::Command::new("uv")
+        .args(["python", "list", "--only-installed", "--managed-python"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .map(std::path::PathBuf::from)
+                .find(|p| p.exists())
+        });
+    vec![
+        PythonRuntime {
+            key: "cpython",
+            program: on_path("python3"),
+            env: Vec::new(),
+        },
+        PythonRuntime {
+            key: "pypy",
+            program: on_path("pypy3"),
+            env: Vec::new(),
+        },
+        PythonRuntime {
+            key: "uv",
+            program: uv_python.clone(),
+            env: vec![("PYTHON_JIT", "0")],
+        },
+        // The row exists only where the interpreter confirms the JIT is
+        // on under this environment, so it never reads as a JIT number
+        // for a build without one.
+        PythonRuntime {
+            key: "uv-jit",
+            program: uv_python.filter(|p| {
+                std::process::Command::new(p)
+                    .env("PYTHON_JIT", "1")
+                    .args(["-c", "import sys; print(sys._jit.is_enabled())"])
+                    .output()
+                    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "True")
+            }),
+            env: vec![("PYTHON_JIT", "1")],
+        },
+    ]
+}
+
+/// The Python kernel under one interpreter: its wall time as the
+/// execution time, since an interpreter has no compile step to separate
+/// out. The interpreter's own start-up is in the number, and is what a
+/// user of it pays too. The kernel prints its result, which is read
+/// back as the value.
+fn measure_interpreter(runtime: &PythonRuntime, path: &Path, runs: usize) -> TargetResult {
+    let Some(program) = &runtime.program else {
+        return TargetResult {
+            skipped: true,
+            ..failed_result("not installed")
+        };
+    };
     let mut exec = Vec::new();
     let mut cold = 0.0;
     let mut result = String::new();
     for iteration in 0..runs.max(1) {
         let t0 = Instant::now();
-        let output = match std::process::Command::new("python3").arg(path).output() {
+        let output = match std::process::Command::new(program)
+            .arg(path)
+            .envs(runtime.env.iter().copied())
+            .output()
+        {
             Ok(o) => o,
-            Err(e) => return failed_result(&format!("python3: {e}")),
+            Err(e) => return failed_result(&format!("{}: {e}", program.display())),
         };
         let exec_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if !output.status.success() {
             return failed_result(&format!(
-                "python3 exited {}: {}",
+                "{} exited {}: {}",
+                program.display(),
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
