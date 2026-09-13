@@ -28,11 +28,11 @@
 //! * Caller and callee are different functions (no recursion).
 //! * Callee has exactly one block (its `entry_block`).
 //! * That block terminates in `Return` with ≤ 1 value.
-//! * That block has no nested `Call` / `IndirectCall` / `Alloca` /
+//! * That block has no nested `IndirectCall` / `Alloca` /
 //!   `AsyncSaveSlot` / `AsyncLoadSlot` / `CreateClosure` / `Atomic`
-//!   / `Fence`. (Allowing nested Calls would need recursion / a
-//!   queue; allowing Alloca would need stack-frame merging. Both
-//!   are interesting follow-ups but not v1.)
+//!   / `Fence`. A nested direct call (by id, by symbol, or an
+//!   address taken) is copied as it is and may inline in a later
+//!   round; an indirect call is not.
 //! * Callee instruction count ≤ `MAX_INLINE_INSTS` (8 by default
 //!   — calibrated to match LLVM's `InlineCostThreshold` for small
 //!   leaf functions, conservative).
@@ -62,8 +62,8 @@
 //! 6. Remove the original Call instruction.
 
 use crate::hir::{
-    HirCallable, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType, HirValue,
-    HirValueKind,
+    HirBlock, HirCallable, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType,
+    HirValue, HirValueKind,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -93,6 +93,15 @@ const MAX_INLINE_INSTS: usize = 64;
 // caller's IR.
 const MAX_INLINE_INSTS_MULTI_BLOCK: usize = 256;
 
+/// Size cap for a callee that itself calls other functions. Such a
+/// callee brings its call sites along, and the next round may inline
+/// those in turn; without a tight cap, two functions that call each
+/// other grow into each other round after round until the caller
+/// budget stops them, and every one of them ends up the size of the
+/// budget. Small helpers with an error path (a bounds check that
+/// raises) are what this admits.
+const MAX_INLINE_INSTS_WITH_CALLS: usize = 48;
+
 /// Caller-side post-inline instruction budget. Predicted at each
 /// candidate as `caller_inst_count + callee_inst_count - 1` (the
 /// `-1` accounts for the Call being replaced); if the prediction
@@ -100,6 +109,13 @@ const MAX_INLINE_INSTS_MULTI_BLOCK: usize = 256;
 /// (`load_cse`, `licm`, `aggregate_split`) scale super-linearly in
 /// `|insts|`, so an unbounded caller blows up compile time.
 const MAX_POST_INLINE_INSTS: usize = 2000;
+
+/// The caller size past which a callee carrying calls is no longer
+/// inlined. Each such inline brings the next level of calls into the
+/// loop for the following round, so without an early stop a loop keeps
+/// absorbing its call tree until the budget above; a function this size
+/// has had the helpers that matter and keeps the rest as calls.
+const MAX_POST_INLINE_INSTS_WITH_CALLS: usize = 512;
 
 /// Recursive-inline body-size cap. Bodies above this size are
 /// skipped — depth-1 inlining roughly *triples* the IR size of the
@@ -145,6 +161,9 @@ pub struct InlineStats {
     pub inlined_multiblock_intrinsic_call: usize,
     /// Skipped because the caller-instruction budget would overflow.
     pub skipped_caller_budget: usize,
+    /// Skipped because the site leads only to a cold call, or the
+    /// callee carries calls and the site is outside any loop.
+    pub skipped_cold: usize,
     /// Skipped because the per-pass-per-caller cap was reached.
     pub skipped_per_pass_cap: usize,
     /// Skipped because, after cloning, the actual post-inline size
@@ -176,6 +195,11 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
             .map(|(id, f)| (*id, f.clone()))
             .collect();
 
+        // Functions that reach each other through calls are one cycle;
+        // inlining within a cycle copies the cycle into itself round
+        // after round, so a callee in the caller's cycle stays a call.
+        let cycles = call_cycles(&callee_snapshot);
+
         let mut this_pass = 0;
         let function_ids: Vec<HirId> = module.functions.keys().copied().collect();
 
@@ -184,7 +208,7 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
                 Some(c) => c,
                 None => continue,
             };
-            let stats = inline_in_function(caller, caller_id, &callee_snapshot);
+            let stats = inline_in_function(caller, caller_id, &callee_snapshot, &cycles);
             this_pass += stats.inlined;
             total.inlined += stats.inlined;
             total.call_sites_visited += stats.call_sites_visited;
@@ -195,6 +219,7 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
             total.inlined_multiblock_alloca += stats.inlined_multiblock_alloca;
             total.inlined_multiblock_intrinsic_call += stats.inlined_multiblock_intrinsic_call;
             total.skipped_caller_budget += stats.skipped_caller_budget;
+            total.skipped_cold += stats.skipped_cold;
             total.skipped_per_pass_cap += stats.skipped_per_pass_cap;
             total.skipped_post_inline_overflow += stats.skipped_post_inline_overflow;
         }
@@ -440,6 +465,7 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
 
     let mut total_insts = 0usize;
     let mut has_alloca = false;
+    let mut has_calls = false;
     for block in callee.blocks.values() {
         total_insts += block.instructions.len();
         for inst in &block.instructions {
@@ -458,6 +484,13 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
                     // Inline-safe leaf intrinsics (Sqrt, Fabs, Fma,
                     // …) — same rule as the standard classifier.
                 }
+                // A call by id or by name copies as it is: ids are
+                // module-wide and a symbol is a name.
+                HirInstruction::Call {
+                    callee:
+                        HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
+                    ..
+                } => has_calls = true,
                 HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
@@ -466,6 +499,9 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
                 _ => {}
             }
         }
+    }
+    if has_calls && total_insts > MAX_INLINE_INSTS_WITH_CALLS {
+        return CalleeClass::TooLarge;
     }
 
     // Same terminator-safety rules as the standard classifier.
@@ -505,12 +541,247 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
     CalleeClass::OkMultiBlock
 }
 
+/// Whether a callee calls anything but an inline-safe intrinsic.
+fn has_calls(callee: &HirFunction) -> bool {
+    callee.blocks.values().any(|b| {
+        b.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                HirInstruction::Call {
+                    callee: HirCallable::Function(_)
+                        | HirCallable::Symbol(_)
+                        | HirCallable::FuncRef(_),
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// The successors of a block, by its terminator.
+fn successors(f: &HirFunction, id: HirId) -> Vec<HirId> {
+    match f.blocks.get(&id).map(|b| &b.terminator) {
+        Some(HirTerminator::Branch { target }) => vec![*target],
+        Some(HirTerminator::CondBranch {
+            true_target,
+            false_target,
+            ..
+        }) => vec![*true_target, *false_target],
+        Some(HirTerminator::Switch { default, cases, .. }) => {
+            let mut out = vec![*default];
+            out.extend(cases.iter().map(|(_, t)| *t));
+            out
+        }
+        Some(HirTerminator::Invoke { normal, unwind, .. }) => vec![*normal, *unwind],
+        _ => Vec::new(),
+    }
+}
+
+/// The blocks of `f` that lie inside a natural loop: reachable from a
+/// back edge's target and reaching its source. A call there runs many
+/// times; one elsewhere runs once.
+fn blocks_in_loops(f: &HirFunction) -> HashSet<HirId> {
+    // Back edges, by depth-first search from the entry: an edge to a
+    // block still on the stack.
+    let mut back_edges: Vec<(HirId, HirId)> = Vec::new();
+    let mut state: HashMap<HirId, u8> = HashMap::new(); // 1 on stack, 2 done
+    let mut stack: Vec<(HirId, Vec<HirId>)> = vec![(f.entry_block, successors(f, f.entry_block))];
+    state.insert(f.entry_block, 1);
+    while let Some((block, pending)) = stack.last_mut() {
+        match pending.pop() {
+            Some(next) => match state.get(&next) {
+                Some(1) => back_edges.push((*block, next)),
+                Some(_) => {}
+                None => {
+                    state.insert(next, 1);
+                    let succ = successors(f, next);
+                    stack.push((next, succ));
+                }
+            },
+            None => {
+                state.insert(*block, 2);
+                stack.pop();
+            }
+        }
+    }
+    // Each loop is its head plus everything that reaches the back
+    // edge's source without passing through the head. Each loop walks
+    // its own predecessors: a block shared with an inner loop is still
+    // a way back to the outer loop's head.
+    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for id in f.blocks.keys() {
+        for s in successors(f, *id) {
+            predecessors.entry(s).or_default().push(*id);
+        }
+    }
+    let mut in_loop = HashSet::new();
+    for (tail, head) in back_edges {
+        let mut body = HashSet::from([head]);
+        let mut work = vec![tail];
+        while let Some(b) = work.pop() {
+            if !body.insert(b) {
+                continue;
+            }
+            if let Some(preds) = predecessors.get(&b) {
+                work.extend(preds.iter().copied());
+            }
+        }
+        in_loop.extend(body);
+    }
+    in_loop
+}
+
+/// The blocks of `f` from which every path calls a cold function. Code
+/// there builds the report of an error and is left as calls: inlining
+/// it would cost the size at every site and save nothing that runs.
+/// A loop with no way out but a cold call counts, as do its blocks.
+fn blocks_leading_to_cold(
+    f: &HirFunction,
+    callees: &HashMap<HirId, HirFunction>,
+) -> HashSet<HirId> {
+    let calls_cold = |block: &HirBlock| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                HirInstruction::Call {
+                    callee: HirCallable::Function(fid),
+                    ..
+                } if callees.get(fid).is_some_and(|c| c.attributes.cold)
+            )
+        })
+    };
+    // Greatest fixpoint from every block cold: a block stays cold if it
+    // calls a cold function itself or all of its successors stay cold.
+    let mut cold: HashSet<HirId> = f.blocks.keys().copied().collect();
+    let seeds: HashSet<HirId> = f
+        .blocks
+        .iter()
+        .filter(|(_, b)| calls_cold(b))
+        .map(|(id, _)| *id)
+        .collect();
+    if seeds.is_empty() {
+        return HashSet::new();
+    }
+    loop {
+        let warmed: Vec<HirId> = cold
+            .iter()
+            .copied()
+            .filter(|id| {
+                if seeds.contains(id) {
+                    return false;
+                }
+                let succ = successors(f, *id);
+                succ.is_empty() || succ.iter().any(|s| !cold.contains(s))
+            })
+            .collect();
+        if warmed.is_empty() {
+            return cold;
+        }
+        for id in warmed {
+            cold.remove(&id);
+        }
+    }
+}
+
+/// The strongly connected component of each function in the graph of
+/// direct calls, so a caller and a callee in one component are known to
+/// reach each other.
+fn call_cycles(functions: &HashMap<HirId, HirFunction>) -> HashMap<HirId, usize> {
+    let mut callees_of: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (id, f) in functions {
+        let mut out = Vec::new();
+        for block in f.blocks.values() {
+            for inst in &block.instructions {
+                if let HirInstruction::Call {
+                    callee: HirCallable::Function(target),
+                    ..
+                } = inst
+                {
+                    if functions.contains_key(target) {
+                        out.push(*target);
+                    }
+                }
+            }
+        }
+        callees_of.insert(*id, out);
+    }
+    // Tarjan's algorithm, iteratively, so a long call chain cannot
+    // overflow the stack.
+    let mut index: HashMap<HirId, usize> = HashMap::new();
+    let mut low: HashMap<HirId, usize> = HashMap::new();
+    let mut on_stack: HashSet<HirId> = HashSet::new();
+    let mut stack: Vec<HirId> = Vec::new();
+    let mut component: HashMap<HirId, usize> = HashMap::new();
+    let mut next_index = 0usize;
+    let mut next_component = 0usize;
+    for &root in functions.keys() {
+        if index.contains_key(&root) {
+            continue;
+        }
+        let mut work: Vec<(HirId, usize)> = vec![(root, 0)];
+        index.insert(root, next_index);
+        low.insert(root, next_index);
+        next_index += 1;
+        stack.push(root);
+        on_stack.insert(root);
+        while let Some((node, pos)) = work.last_mut() {
+            let node = *node;
+            let succs = &callees_of[&node];
+            if *pos < succs.len() {
+                let next = succs[*pos];
+                *pos += 1;
+                if !index.contains_key(&next) {
+                    index.insert(next, next_index);
+                    low.insert(next, next_index);
+                    next_index += 1;
+                    stack.push(next);
+                    on_stack.insert(next);
+                    work.push((next, 0));
+                } else if on_stack.contains(&next) {
+                    let candidate = index[&next];
+                    let entry = low.get_mut(&node).expect("indexed");
+                    *entry = (*entry).min(candidate);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                let mine = low[&node];
+                let entry = low.get_mut(&parent).expect("indexed");
+                *entry = (*entry).min(mine);
+            }
+            if low[&node] == index[&node] {
+                while let Some(member) = stack.pop() {
+                    on_stack.remove(&member);
+                    component.insert(member, next_component);
+                    if member == node {
+                        break;
+                    }
+                }
+                next_component += 1;
+            }
+        }
+    }
+    component
+}
+
 fn inline_in_function(
     caller: &mut HirFunction,
     caller_id: HirId,
     callees: &HashMap<HirId, HirFunction>,
+    cycles: &HashMap<HirId, usize>,
 ) -> InlineStats {
     let mut stats = InlineStats::default();
+
+    // A callee that carries calls of its own is inlined only where it
+    // runs repeatedly, inside a loop of the caller; elsewhere the call
+    // costs less than the code it would bring. Nothing is inlined on
+    // the way to a cold call.
+    let cold_blocks = blocks_leading_to_cold(caller, callees);
+    let hot_blocks: HashSet<HirId> = blocks_in_loops(caller)
+        .difference(&cold_blocks)
+        .copied()
+        .collect();
 
     // Per-pass-per-caller budget tracking. `caller_inline_count`
     // increments per successful inline; `caller_inst_count` is
@@ -556,10 +827,10 @@ fn inline_in_function(
                 _ => continue,
             };
 
-            if callee_id == caller_id {
-                // Recursive call — skip. A real inliner with a cost
-                // model can unroll bounded recursion, but v1
-                // bails out.
+            if callee_id == caller_id || cycles.get(&callee_id) == cycles.get(&caller_id) {
+                // A call into the caller's own cycle: inlining it would
+                // copy the cycle into itself. The recursive inliner
+                // handles the direct self-call on its own terms.
                 stats.skipped_unsupported += 1;
                 continue;
             }
@@ -584,6 +855,12 @@ fn inline_in_function(
                     continue;
                 }
             };
+            if cold_blocks.contains(&block_id)
+                || (!hot_blocks.contains(&block_id) && has_calls(callee))
+            {
+                stats.skipped_cold += 1;
+                continue;
+            }
 
             jobs.push(InlineJob {
                 block_id,
@@ -625,7 +902,12 @@ fn inline_in_function(
             let predicted = caller_inst_count
                 .saturating_add(callee_inst_count)
                 .saturating_sub(1);
-            if predicted > MAX_POST_INLINE_INSTS {
+            let budget = if has_calls(callee) {
+                MAX_POST_INLINE_INSTS_WITH_CALLS
+            } else {
+                MAX_POST_INLINE_INSTS
+            };
+            if predicted > budget {
                 stats.skipped_caller_budget += 1;
                 continue;
             }
@@ -652,6 +934,17 @@ fn inline_in_function(
 
             caller_inline_count += 1;
             stats.inlined += 1;
+            // `ZYNTAX_TRACE_INLINE=1` names every inline made.
+            if std::env::var_os("ZYNTAX_TRACE_INLINE").is_some() {
+                eprintln!(
+                    "[inline] {} <- {} (hot site: {}, callee has calls: {}, callee insts: {})",
+                    caller.name.resolve_global().unwrap_or_default(),
+                    callee.name.resolve_global().unwrap_or_default(),
+                    hot_blocks.contains(&job.block_id),
+                    has_calls(callee),
+                    callee_inst_count
+                );
+            }
             if job.kind == InlineKind::MultiBlock {
                 if callee_has_alloca {
                     stats.inlined_multiblock_alloca += 1;
@@ -750,25 +1043,27 @@ fn classify(callee: &HirFunction) -> CalleeClass {
     if callee.signature.is_async || callee.is_external {
         return CalleeClass::Unsupported;
     }
+    // A function declared cold runs rarely: a call to it costs less
+    // than its body in the caller. One declared noinline stays a call.
+    if callee.attributes.cold
+        || callee.attributes.no_inline
+        || callee.attributes.inline == crate::hir::InlineHint::Never
+    {
+        return CalleeClass::Unsupported;
+    }
     if !callee.signature.effects.is_empty() {
         return CalleeClass::Unsupported;
     }
 
     // Universal per-instruction safety check across every block.
-    // The `Call` arm permits one specific shape: direct calls into
-    // an inline-safe `Intrinsic` (`Sqrt`, `Fabs`, `Fma`, `Sin`,
-    // `Cos`, `Pow`, …) — these are leaf hardware-or-libm ops, not
-    // user functions, and admitting them is what lets the inliner
-    // take callees like `advance` from `bench_nbody_ref` (which
-    // calls `sqrt` in the hot loop). Without this admission,
-    // `main`'s 10 M-iteration `advance(...)` call site never
-    // inlines, the j-loop stays opaque to LICM / vectorisation,
-    // and Cranelift / LLVM eat the call-frame overhead 10 M times.
-    // Every other `Call` shape (free function, indirect, trait
-    // method) still bails because the callee body would need its
-    // own inlining or vtable resolution.
+    // Calls the copy keeps as they are: inline-safe intrinsics
+    // (`Sqrt`, `Fabs`, `Fma`, …), and direct calls by id or by name,
+    // whose targets are module-wide and so mean the same thing in the
+    // caller; the next round may inline those in turn, under the same
+    // budgets. An indirect call or an atomic still bails.
     let mut total_insts = 0usize;
     let mut callee_has_alloca = false;
+    let mut has_calls = false;
     for block in callee.blocks.values() {
         total_insts += block.instructions.len();
         for inst in &block.instructions {
@@ -777,6 +1072,11 @@ fn classify(callee: &HirFunction) -> CalleeClass {
                     callee: HirCallable::Intrinsic(i),
                     ..
                 } if is_inline_safe_intrinsic(*i) => {}
+                HirInstruction::Call {
+                    callee:
+                        HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
+                    ..
+                } => has_calls = true,
                 HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
@@ -785,6 +1085,9 @@ fn classify(callee: &HirFunction) -> CalleeClass {
                 _ => {}
             }
         }
+    }
+    if has_calls && total_insts > MAX_INLINE_INSTS_WITH_CALLS {
+        return CalleeClass::TooLarge;
     }
     // Leaf path stays strictly Alloca-free (no leaf callee should
     // need one — if it does, something earlier should have promoted

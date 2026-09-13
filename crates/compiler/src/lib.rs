@@ -1878,20 +1878,39 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
     // for the relaxed inliner — the relaxations open new shapes the
     // downstream passes haven't been audited against.
     const ROUND_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    for _ in 0..8 {
+    // `ZYNTAX_TRACE_OPT_PHASES=1` prints each pass's time per round.
+    let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
+    let mut timed = |name: &str, at: &mut web_time::Instant| {
+        if trace {
+            eprintln!(
+                "[OPT] {name:<22} {:8.2} ms",
+                at.elapsed().as_secs_f64() * 1000.0
+            );
+            *at = web_time::Instant::now();
+        }
+    };
+    for round in 0..8 {
         let round_start = web_time::Instant::now();
+        let mut at = round_start;
+        if trace {
+            eprintln!("[OPT] round {round}");
+        }
         let cf = const_fold::fold_module(module);
+        timed("const_fold", &mut at);
         let cs = cse::eliminate_module(module);
+        timed("cse", &mut at);
         // load_cse runs after value-cse so canonical pointer ids are
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
         let lcse = load_cse::run_module(module);
+        timed("load_cse", &mut at);
         // aggregate_split runs after load_cse so the struct-typed
         // Loads it targets are the canonical ones (load_cse may
         // have collapsed sibling Loads of the same pointer).
         // Eliminates the load-modify-store cycle on struct values
         // produced by `let mut b = arr[i]; b.x = …; arr[i] = b`.
         let ags = aggregate_split::run_module(module);
+        timed("aggregate_split", &mut at);
         // scalar_replace_alloc runs after aggregate_split:
         //   * aggregate_split has just rewritten any struct-typed
         //     round-trips into direct GEP+Load/Store. That exposes the
@@ -1902,8 +1921,11 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         // Cranelift's mem2reg cannot promote heap allocations
         // (Call results are opaque); this is the HIR-only path.
         let sra = scalar_replace_alloc::run_module(module);
+        timed("scalar_replace_alloc", &mut at);
         let il = inline::run_module(module);
+        timed("inline", &mut at);
         let lc = licm::run_module(module);
+        timed("licm", &mut at);
         // Before the loops are matched against a shape. A variable live
         // across a loop but never reassigned in it still carries a phi,
         // which reads as a definition in the header and makes a buffer
@@ -1913,11 +1935,14 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         let ppf = phi_prune::run_module(module);
         stats.phi_prune.removed += ppf.removed;
         stats.phi_prune.rounds = stats.phi_prune.rounds.max(ppf.rounds);
+        timed("phi_prune", &mut at);
         let lv = loop_vectorize::run_module(module);
+        timed("loop_vectorize", &mut at);
         // Reduction vectorization runs alongside loop_vectorize; the
         // two recognise disjoint patterns (store-to-array vs.
         // accumulator) so they can't double-fire on the same loop.
         let rv = reduction_vectorize::run_module(module);
+        timed("reduction_vectorize", &mut at);
         // FMA contraction runs after the vectorizers, not before them.
         // A multiply feeding an add is the shape both the loop matcher
         // and this pass want, and whichever runs first takes it: fusing
@@ -1950,7 +1975,9 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
         // conditional branches into unconditional ones, which makes
         // the target block a straight-line successor ready for
         // merging.
+        timed("fma_contract", &mut at);
         let cs_cfg = cfg_simplify::run_module(module);
+        timed("cfg_simplify", &mut at);
 
         let made_progress = cf.folded > 0
             || cs.eliminated > 0

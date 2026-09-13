@@ -3835,16 +3835,26 @@ impl LoweringContext {
         // changes the lowering of user `TypedFunction`s.
         hir_func.calling_convention = crate::hir::CallingConvention::C;
 
+        let annotated = |name: &str| {
+            func.annotations
+                .iter()
+                .any(|a| a.name.resolve_global().as_deref() == Some(name))
+        };
+        // `@cold`: rarely runs, so it is never worth copying into a
+        // caller. `@noinline`: stays a call whatever its size.
+        if annotated("cold") {
+            hir_func.attributes.cold = true;
+            hir_func.attributes.hot = false;
+        }
+        if annotated("noinline") {
+            hir_func.attributes.no_inline = true;
+            hir_func.attributes.inline = crate::hir::InlineHint::Never;
+        }
         // `@cooperative` (short alias `@coop`) marks an async function whose
         // fiber steps may interleave at the executor's yield points. Recorded
         // here so both spellings are recognized; the interleaving lowering
         // that acts on it is a later phase.
-        hir_func.attributes.cooperative = func.annotations.iter().any(|a| {
-            matches!(
-                a.name.resolve_global().as_deref(),
-                Some("cooperative") | Some("coop")
-            )
-        });
+        hir_func.attributes.cooperative = annotated("cooperative") || annotated("coop");
     }
 
     /// Compute parameter attributes

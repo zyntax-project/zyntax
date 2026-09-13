@@ -525,9 +525,17 @@ impl TieredRuntime {
         // `run_interp_safe_opts` entry was the only place these fired,
         // leaving production code unoptimised. (Skippable via
         // `ZYNTAX_DISABLE_INTERP_OPTS=1`.)
+        let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
+        let started = std::time::Instant::now();
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut module);
             zyntax_compiler::run_native_only_opts(&mut module);
+        }
+        if trace {
+            eprintln!(
+                "[OPT] all passes            {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&module, "post-opt-tiered-compile_module");
 
@@ -553,7 +561,14 @@ impl TieredRuntime {
         });
 
         // Compile the module (consumes it)
+        let started = std::time::Instant::now();
         self.backend.compile_module_reaching(module, reachable)?;
+        if trace {
+            eprintln!(
+                "[OPT] codegen               {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Ok(())
     }
