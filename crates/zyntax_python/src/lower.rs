@@ -516,6 +516,13 @@ pub(crate) struct Lowerer<'m> {
     /// Whether the statement being lowered emitted a pending check, so a
     /// loop containing it re-checks once the loop is left.
     raised: bool,
+    /// Whether this function raises anywhere itself: a `raise`, or a
+    /// check after anything but a call to a function of the program.
+    /// Those calls are listed in `raise_callees` instead, and the
+    /// function raises only if one of them does; see
+    /// [`types::RaiseFact`].
+    pub(crate) may_raise_own: bool,
+    pub(crate) raise_callees: BTreeSet<String>,
     /// The variable holding the exception being handled, for a bare
     /// `raise`.
     caught: Option<InternedString>,
@@ -609,6 +616,8 @@ impl<'m> Lowerer<'m> {
             class: None,
             escapes: vec![Escape::Return],
             raised: false,
+            may_raise_own: false,
+            raise_callees: BTreeSet::new(),
             caught: None,
             try_ctls: Vec::new(),
             redirected: false,
@@ -719,6 +728,7 @@ impl<'m> Lowerer<'m> {
 
     /// `py$exc = value`.
     fn set_pending(&mut self, value: Node, span: Span) -> Stmt {
+        self.may_raise_own = true;
         TypedNode::new(
             TypedStatement::Expression(Box::new(binary(
                 BinaryOp::Assign,
@@ -845,6 +855,7 @@ impl<'m> Lowerer<'m> {
     /// `if <pending> { <escape> }`.
     fn pending_check(&mut self, span: Span) -> Stmt {
         self.raised = true;
+        self.may_raise_own = true;
         let cond = self.pending(span);
         let leave = self.escape(span);
         TypedNode::new(
@@ -860,6 +871,29 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         )
+    }
+
+    /// [`Self::guard`] for a call to function `name` of the program: no
+    /// check when the function is known not to raise, and otherwise a
+    /// check attributed to the callee rather than to this function.
+    fn guard_named(&mut self, v: Val, name: &str, span: Span) -> Val {
+        if self.module.non_raising.contains(name) {
+            return v;
+        }
+        self.raise_callees.insert(name.to_string());
+        let own = self.may_raise_own;
+        let held = self.guard(v, span);
+        self.may_raise_own = own;
+        held
+    }
+
+    /// What this function's lowering found about its raising, for the
+    /// module-wide fixed point.
+    pub(crate) fn raise_fact(&self) -> types::RaiseFact {
+        types::RaiseFact {
+            own: self.may_raise_own,
+            callees: self.raise_callees.clone(),
+        }
     }
 
     /// A value from a call that may have raised: held, then checked
@@ -4179,7 +4213,7 @@ impl<'m> Lowerer<'m> {
                     node: call(name, lowered, sig.ret, span),
                     ty: sig.ret,
                 };
-                return Ok(self.guard(v, span));
+                return Ok(self.guard_named(v, name, span));
             }
             if name == "print" {
                 return self.print(args, keywords, span);
@@ -5717,6 +5751,18 @@ impl<'m> Lowerer<'m> {
     /// The call of `method` on an instance of class `k`, through the
     /// dispatcher when a subclass overrides it. `args` are already
     /// coerced to the parameter types.
+    /// The function a call of `method` on class `k` reaches: the method
+    /// itself, or its dispatcher when a subclass overrides it.
+    fn invoke_target(&self, k: usize, method: &str) -> Option<String> {
+        let owner = self.module.method_owner(k, method)?;
+        let (_, fn_name) = self.module.method_sig(k, method)?;
+        Some(if self.module.overriders(owner, method).is_empty() {
+            fn_name
+        } else {
+            dispatch_name(&fn_name)
+        })
+    }
+
     pub(crate) fn invoke(
         &mut self,
         k: usize,
@@ -5725,14 +5771,10 @@ impl<'m> Lowerer<'m> {
         args: Vec<Node>,
         span: Span,
     ) -> Option<Val> {
-        let owner = self.module.method_owner(k, method)?;
-        let (sig, fn_name) = self.module.method_sig(k, method)?;
+        let (sig, _) = self.module.method_sig(k, method)?;
         let ret = sig.ret;
-        let target = if self.module.overriders(owner, method).is_empty() {
-            fn_name
-        } else {
-            dispatch_name(&fn_name)
-        };
+        let owner = self.module.method_owner(k, method)?;
+        let target = self.invoke_target(k, method)?;
         let receiver = self.coerce(
             Val {
                 node: receiver,
@@ -5805,7 +5847,10 @@ impl<'m> Lowerer<'m> {
         let v = self
             .invoke(k, method, receiver.node, lowered, span)
             .expect("the method was just found");
-        Ok(self.guard(v, span))
+        let target = self
+            .invoke_target(k, method)
+            .expect("the method was just found");
+        Ok(self.guard_named(v, &target, span))
     }
 
     /// `obj.m(args)` on a dynamic receiver: a dispatcher over every class
@@ -5852,11 +5897,12 @@ impl<'m> Lowerer<'m> {
                 return unsupported(format!("{name}() takes no arguments"), &at.range());
             }
         };
+        let constructor = new_name(&name);
         let v = Val {
-            node: call(&new_name(&name), lowered, Ty::Class(k as u16), span),
+            node: call(&constructor, lowered, Ty::Class(k as u16), span),
             ty: Ty::Class(k as u16),
         };
-        Ok(self.guard(v, span))
+        Ok(self.guard_named(v, &constructor, span))
     }
 
     /// `super().m(args)`: the base class's method, on `self`.
@@ -5902,7 +5948,7 @@ impl<'m> Lowerer<'m> {
             node: call(&fn_name, all, ret, span),
             ty: ret,
         };
-        Ok(self.guard(v, span))
+        Ok(self.guard_named(v, &fn_name, span))
     }
 
     /// A call through a function value: every argument boxed, the result
@@ -5972,11 +6018,12 @@ impl<'m> Lowerer<'m> {
             ));
         }
         lowered.extend(self.arguments(&info.name, &info.sig, args, keywords, c)?);
+        let typed = info.typed_name();
         let v = Val {
-            node: call(&info.typed_name(), lowered, info.sig.ret, span),
+            node: call(&typed, lowered, info.sig.ret, span),
             ty: info.sig.ret,
         };
-        Ok(self.guard(v, span))
+        Ok(self.guard_named(v, &typed, span))
     }
 
     /// A function record: the code address, the arity and the cells.
@@ -6125,6 +6172,12 @@ impl<'m> Lowerer<'m> {
                         &at.range(),
                     );
                 }
+                // The body's raising is the typed entry's; the adapter
+                // built next adds its own checked reads.
+                self.module
+                    .raise_facts
+                    .borrow_mut()
+                    .insert(info.typed_name(), child.raise_fact());
                 let typed =
                     child.typed_function(&info.typed_name(), params, body, info.captures, span);
                 let adapter =

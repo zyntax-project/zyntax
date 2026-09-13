@@ -474,31 +474,20 @@ pub fn parse_program_with(
             Span::new(0, 0),
         ));
     }
-    for item in &items {
-        let sig = inferred.funcs[&item.name].clone();
-        lower::set_current_file(inferred.file_of(item.module.as_deref()));
-        let locals = types::infer_locals(&inferred, &sig, &item.def.body);
-        let scope = scope::Scope::of_function(item.def);
-        let mut lowerer = lower::Lowerer::new(
-            &inferred,
-            &item.name,
-            sig,
-            locals,
-            &scope,
-            Vec::new(),
-            std::collections::HashMap::new(),
-        );
-        lowerer.class = item.class;
-        let func = lowerer
-            .function_named(item.def, &item.name)
-            .map_err(|e| located(e, item.module.as_deref()))?;
-        declarations.push(TypedNode::new(
-            TypedDeclaration::Function(func),
-            Type::Unknown,
-            span_of(item.def),
-        ));
-        lower::set_current_file(0);
-    }
+    // The functions are lowered twice. The first time teaches which of
+    // them can raise; the second time, a call to one that never does is
+    // not followed by a check. Only the second lowering is kept.
+    lower_items(&inferred, &items)?;
+    let mut facts = inferred.raise_facts.take();
+    classes::raise_facts(&inferred, &mut facts);
+    inferred.non_raising = types::non_raising(&facts);
+    inferred.lifted.take();
+    inferred.adapters.take();
+    inferred.attr_reads.take();
+    inferred.attr_writes.take();
+    inferred.dyn_methods.take();
+    inferred.counter.set(inferred.closures.borrow().len());
+    declarations.extend(lower_items(&inferred, &items)?);
     if !top_level.is_empty() {
         let mut locals = types::infer_locals_entry(&inferred, &entry_sig, &owned, &entry_files);
         for name in inferred.globals.keys() {
@@ -723,6 +712,48 @@ pub(crate) fn intern(s: &str) -> InternedString {
 }
 
 /// The span of a node, in the file being lowered.
+/// Lower every function of the program, recording what each one's
+/// lowering found about its raising in the module's table.
+fn lower_items(
+    inferred: &types::Module,
+    items: &[types::Item<'_>],
+) -> Result<Vec<TypedNode<TypedDeclaration>>> {
+    let mut declarations = Vec::with_capacity(items.len());
+    for item in items {
+        let sig = inferred.funcs[&item.name].clone();
+        lower::set_current_file(inferred.file_of(item.module.as_deref()));
+        let locals = types::infer_locals(inferred, &sig, &item.def.body);
+        let scope = scope::Scope::of_function(item.def);
+        let mut lowerer = lower::Lowerer::new(
+            inferred,
+            &item.name,
+            sig,
+            locals,
+            &scope,
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        lowerer.class = item.class;
+        let func = lowerer.function_named(item.def, &item.name).map_err(|e| {
+            match item.module.as_deref() {
+                Some(m) => e.in_module(m),
+                None => e,
+            }
+        })?;
+        inferred
+            .raise_facts
+            .borrow_mut()
+            .insert(item.name.clone(), lowerer.raise_fact());
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            span_of(item.def),
+        ));
+        lower::set_current_file(0);
+    }
+    Ok(declarations)
+}
+
 pub(crate) fn span_of<N: Ranged>(node: &N) -> Span {
     let r = node.range();
     Span::in_file(

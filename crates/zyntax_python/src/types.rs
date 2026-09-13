@@ -196,6 +196,49 @@ pub(crate) struct Module {
     pub(crate) closures: std::cell::RefCell<Vec<ClosureInfo>>,
     /// Closure index by `(file, start of range)`.
     pub(crate) closure_index: HashMap<(u32, u32), u16>,
+    /// What lowering each function found about its raising, by the
+    /// name it lowers to; see [`RaiseFact`].
+    pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
+    /// Functions of the program that never leave with an exception
+    /// pending, so a call to one needs no check after it.
+    pub(crate) non_raising: std::collections::HashSet<String>,
+}
+
+/// How a function of the program can come to raise: on its own (a
+/// `raise`, a check after a library call or a dynamic operation), or
+/// through one of the program's functions it calls. A function raises
+/// if it raises on its own or any callee does; one not in the table is
+/// taken to raise.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RaiseFact {
+    pub(crate) own: bool,
+    pub(crate) callees: std::collections::BTreeSet<String>,
+}
+
+/// The functions that never raise: the greatest fixed point over the
+/// facts, starting from every listed function and demoting each that
+/// raises on its own or calls a function not (or no longer) in the set.
+pub(crate) fn non_raising(
+    facts: &std::collections::BTreeMap<String, RaiseFact>,
+) -> std::collections::HashSet<String> {
+    let mut quiet: std::collections::HashSet<String> = facts
+        .iter()
+        .filter(|(_, f)| !f.own)
+        .map(|(n, _)| n.clone())
+        .collect();
+    loop {
+        let demoted: Vec<String> = quiet
+            .iter()
+            .filter(|n| facts[*n].callees.iter().any(|c| !quiet.contains(c)))
+            .cloned()
+            .collect();
+        if demoted.is_empty() {
+            return quiet;
+        }
+        for n in demoted {
+            quiet.remove(&n);
+        }
+    }
 }
 
 /// A lambda or nested `def`: a function value whose function is known

@@ -1,0 +1,9 @@
+caught b
+1
+8
+caught 'deep'
+2
+caught neg
+caught integer division or modulo by zero
+caught 'deep'
+done

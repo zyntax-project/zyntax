@@ -329,6 +329,37 @@ fn scratch(module: &Module) -> Lowerer<'_> {
 
 use zyntax_typed_ast::typed_ast::TypedExpression;
 
+/// How the generated functions raise: a constructor through the
+/// `__init__` it calls, a dispatcher through the methods it reaches.
+/// Neither raises on its own.
+pub(crate) fn raise_facts(
+    module: &Module,
+    facts: &mut std::collections::BTreeMap<String, crate::types::RaiseFact>,
+) {
+    for (k, class) in module.classes.iter().enumerate() {
+        let mut constructor = crate::types::RaiseFact::default();
+        if let Some((_, init)) = module.method_sig(k, "__init__") {
+            constructor.callees.insert(init);
+        }
+        facts.insert(lower::new_name(&class.name), constructor);
+        for method in &class.methods {
+            let fn_name = method_fn(&class.name, method);
+            let overriders = module.overriders(k, method);
+            if overriders.is_empty() {
+                continue;
+            }
+            let mut dispatcher = crate::types::RaiseFact::default();
+            dispatcher.callees.insert(fn_name.clone());
+            for sub in overriders {
+                dispatcher
+                    .callees
+                    .insert(method_fn(&module.classes[sub].name, method));
+            }
+            facts.insert(lower::dispatch_name(&fn_name), dispatcher);
+        }
+    }
+}
+
 /// The functions every class needs: construction, unboxing, dispatch.
 pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     let span = Span::new(0, 0);
