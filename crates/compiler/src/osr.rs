@@ -651,55 +651,25 @@ fn instruction_result(inst: &crate::hir::HirInstruction) -> Option<HirId> {
 /// caller should reject the layout.
 fn instruction_uses(inst: &crate::hir::HirInstruction) -> Result<Vec<HirId>, ()> {
     use crate::hir::HirInstruction as I;
-    let mut uses = Vec::new();
+    // The kinds a helper body is known to lower; their operands are what
+    // the instruction itself reports, so a use is never missed by naming
+    // fields here. Anything else (effects, atomics, trait method calls,
+    // fences, ...) rejects the layout rather than risk a use going unseen.
     match inst {
-        I::Binary { left, right, .. } => {
-            uses.push(*left);
-            uses.push(*right);
-        }
-        I::Unary { operand, .. } => uses.push(*operand),
-        I::Alloca { count, .. } => {
-            if let Some(c) = count {
-                uses.push(*c);
-            }
-        }
-        I::Load { ptr, .. } => uses.push(*ptr),
-        I::Store { value, ptr, .. } => {
-            uses.push(*value);
-            uses.push(*ptr);
-        }
-        I::GetElementPtr { ptr, indices, .. } => {
-            uses.push(*ptr);
-            uses.extend(indices.iter().copied());
-        }
-        I::Cast { operand, .. } => uses.push(*operand),
-        I::Select {
-            condition,
-            true_val,
-            false_val,
-            ..
-        } => {
-            uses.push(*condition);
-            uses.push(*true_val);
-            uses.push(*false_val);
-        }
-        I::ExtractValue { aggregate, .. } => uses.push(*aggregate),
-        I::InsertValue {
-            aggregate, value, ..
-        } => {
-            uses.push(*aggregate);
-            uses.push(*value);
-        }
-        I::Call { args, .. } | I::CallClosure { args, .. } => {
-            uses.extend(args.iter().copied());
-        }
-        // Anything else (effects, atomics, trait method calls, closures
-        // with captures, fences, …) — outside our supported subset for
-        // OSR helper bodies. Reject the layout rather than silently
-        // miss a use.
-        _ => return Err(()),
+        I::Binary { .. }
+        | I::Unary { .. }
+        | I::Alloca { .. }
+        | I::Load { .. }
+        | I::Store { .. }
+        | I::GetElementPtr { .. }
+        | I::Cast { .. }
+        | I::Select { .. }
+        | I::ExtractValue { .. }
+        | I::InsertValue { .. }
+        | I::Call { .. }
+        | I::CallClosure { .. } => Ok(inst.operands()),
+        _ => Err(()),
     }
-    Ok(uses)
 }
 
 fn terminator_uses(term: &HirTerminator) -> Vec<HirId> {

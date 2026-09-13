@@ -1052,7 +1052,12 @@ impl HirInstruction {
                     replace(idx, replacements);
                 }
             }
-            HirInstruction::Call { args, .. } => {
+            HirInstruction::Call { callee, args, .. } => {
+                // A callee reached through a pointer is an operand like
+                // any other.
+                if let HirCallable::Indirect(target) = callee {
+                    replace(target, replacements);
+                }
                 for arg in args {
                     replace(arg, replacements);
                 }
@@ -1342,7 +1347,10 @@ impl HirInstruction {
                 ops.push(*ptr);
                 ops.extend(indices.iter().copied());
             }
-            HirInstruction::Call { args, .. } => {
+            HirInstruction::Call { callee, args, .. } => {
+                if let HirCallable::Indirect(target) = callee {
+                    ops.push(*target);
+                }
                 ops.extend(args.iter().copied());
             }
             HirInstruction::IndirectCall { func_ptr, args, .. } => {
