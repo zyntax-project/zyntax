@@ -17,6 +17,9 @@
 //! loop inside one invocation of `main` never makes the function hot,
 //! and a test left on the defaults reports that compiled allocations do
 //! not arrive — which is true, of code that was never compiled.
+//!
+//! The counter exists in debug builds only, and so does this test.
+#![cfg(debug_assertions)]
 
 use std::sync::Mutex;
 use zynml::{ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD};
