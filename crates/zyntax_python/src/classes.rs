@@ -918,7 +918,70 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
-    vec![str_hook, type_hook, eq_hook]
+    vec![str_hook, type_hook, eq_hook, box_hook(module, span)]
+}
+
+/// `zb_hook_box_instance(p)`: an instance from its address, boxed under
+/// its class's tag. Every instance keeps its class index in its first
+/// field, so any class's layout reads it.
+fn box_hook(module: &Module, span: Span) -> TypedFunction {
+    let p = lower::code_of("p", span);
+    let param = TypedParameter {
+        name: intern("p"),
+        ty: lower::addr_type(),
+        mutability: Mutability::Immutable,
+        kind: ParameterKind::Regular,
+        default_value: None,
+        attributes: Vec::new(),
+        ownership: ParamOwnership::Copied,
+        span,
+    };
+    let tag = if module.classes.is_empty() {
+        // No class exists to be an instance of.
+        int_lit(255, span)
+    } else {
+        let index = field(cast(p.clone(), Ty::Class(0), span), "$class", Ty::Int, span);
+        let shifted = binary(
+            BinaryOp::Shl,
+            binary(
+                BinaryOp::Add,
+                int_lit(zyntax_builtins::INSTANCE_KIND_BASE, span),
+                index,
+                Ty::Int,
+                span,
+            ),
+            int_lit(8, span),
+            Ty::Int,
+            span,
+        );
+        binary(BinaryOp::BitOr, shifted, int_lit(255, span), Ty::Int, span)
+    };
+    let boxed = call(
+        "zb_box_instance_raw",
+        vec![p, cast_i32(tag, span)],
+        Ty::Object,
+        span,
+    );
+    function(
+        "zb_hook_box_instance",
+        vec![param],
+        Ty::Object,
+        vec![ret(boxed, span)],
+        span,
+    )
+}
+
+/// An int narrowed to the i32 a box tag is.
+fn cast_i32(value: Node, span: Span) -> Node {
+    let i32_ty = Type::Primitive(zyntax_typed_ast::PrimitiveType::I32);
+    TypedNode::new(
+        TypedExpression::Cast(zyntax_typed_ast::typed_ast::TypedCast {
+            expr: Box::new(value),
+            target_type: i32_ty.clone(),
+        }),
+        i32_ty,
+        span,
+    )
 }
 
 use zyntax_typed_ast::BinaryOp;

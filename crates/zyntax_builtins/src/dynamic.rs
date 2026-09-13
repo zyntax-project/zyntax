@@ -846,6 +846,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 kind_is(Kind::Str, x.e()),
                 vec![ret(to_any(Kind::Str, unbox(Kind::Str, x.e())))],
             ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![ret(to_any(Kind::Ptr, unbox(Kind::Ptr, x.e())))],
+            ),
             ret(unbox(Kind::Any, x.e())),
         ],
     ));
@@ -880,6 +884,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 kind_is(Kind::Str, x.e()),
                 vec![ret(repr_of(Kind::Str, x.e()))],
+            ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![ret(repr_of(Kind::Ptr, x.e()))],
             ),
             when(
                 is_tuple(x.e()),
@@ -917,6 +925,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 kind_is(Kind::Str, x.e()),
                 vec![ret(len_of(Kind::Str, x.e()))],
+            ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![ret(len_of(Kind::Ptr, x.e()))],
             ),
             when(
                 is_dict(x.e()),

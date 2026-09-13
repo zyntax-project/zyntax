@@ -52,6 +52,9 @@ pub(crate) enum Elem {
     Int,
     Float,
     Str,
+    /// Instances of one class, held by address, so an element is the
+    /// instance itself rather than a box to open.
+    Class(u16),
     Object,
 }
 
@@ -62,6 +65,7 @@ impl Elem {
             Ty::Int => Elem::Int,
             Ty::Float => Elem::Float,
             Ty::Str => Elem::Str,
+            Ty::Class(k) => Elem::Class(k),
             _ => Elem::Object,
         }
     }
@@ -71,6 +75,7 @@ impl Elem {
             Elem::Int => Ty::Int,
             Elem::Float => Ty::Float,
             Elem::Str => Ty::Str,
+            Elem::Class(k) => Ty::Class(k),
             Elem::Object => Ty::Object,
         }
     }
@@ -81,6 +86,7 @@ impl Elem {
             Elem::Int => "i64",
             Elem::Float => "f64",
             Elem::Str => "str",
+            Elem::Class(_) => "ptr",
             Elem::Object => "any",
         }
     }
@@ -314,6 +320,7 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
                 Ty::Int => Ty::List(Elem::Int),
                 Ty::Float => Ty::List(Elem::Float),
                 Ty::Str => Ty::List(Elem::Str),
+                Ty::Class(k) => Ty::List(Elem::Class(k)),
                 _ => Ty::List(Elem::Object),
             },
             other => other,

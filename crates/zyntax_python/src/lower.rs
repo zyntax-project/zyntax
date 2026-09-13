@@ -104,11 +104,29 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Bool => prim(PrimitiveType::Bool),
         Ty::Str => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
-        Ty::List(e) => list_type(ir(e.ty())),
+        Ty::List(e) => list_type(elem_ir(e)),
         Ty::Tuple | Ty::Dict | Ty::Set => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         Ty::Object | Ty::Unknown => Type::Any,
+    }
+}
+
+/// The IR type a list of `e` holds per element: an instance is held by
+/// address, everything else as itself.
+pub(crate) fn elem_ir(e: Elem) -> Type {
+    match e {
+        Elem::Class(_) => addr_type(),
+        other => ir(other.ty()),
+    }
+}
+
+/// A call to a list function that returns an element of kind `e`,
+/// typed as the element: an address comes back as the instance.
+fn elem_call(op: &str, e: Elem, args: Vec<Node>, span: Span) -> Node {
+    match e {
+        Elem::Class(k) => cast(addr_call(&list_fn(op, e), args, span), Ty::Class(k), span),
+        other => call(&list_fn(op, other), args, other.ty(), span),
     }
 }
 
@@ -663,15 +681,16 @@ impl<'m> Lowerer<'m> {
 
     /// Whether an exception is pending.
     fn pending(&self, span: Span) -> Node {
+        // No exception is the null dynamic value, so the check is a
+        // load and a compare.
         binary(
             BinaryOp::Ne,
-            call(
-                "zb_any_category",
-                vec![var(intern(PENDING), Ty::Object, span)],
-                Ty::Int,
+            var(intern(PENDING), Ty::Object, span),
+            node(
+                TypedExpression::Literal(TypedLiteral::Null),
+                Ty::Object,
                 span,
             ),
-            int_lit(0, span),
             Ty::Bool,
             span,
         )
@@ -1281,6 +1300,22 @@ impl<'m> Lowerer<'m> {
         Ok(self.coerce(v, target))
     }
 
+    /// A value as an element of a list of kind `e`: an instance goes in
+    /// by address.
+    fn elem_arg(&mut self, v: Val, e: Elem) -> Node {
+        let span = v.node.span;
+        let node = self.coerce(v, e.ty());
+        match e {
+            Elem::Class(_) => as_addr(node, span),
+            _ => node,
+        }
+    }
+
+    fn expr_as_elem(&mut self, expr: &py::Expr, e: Elem) -> Result<Node> {
+        let v = self.expr(expr)?;
+        Ok(self.elem_arg(v, e))
+    }
+
     /// `bool(v)`: the value as a condition.
     pub(crate) fn truthy(&mut self, v: Val) -> Node {
         let span = v.node.span;
@@ -1385,10 +1420,7 @@ impl<'m> Lowerer<'m> {
 
     /// A list literal of `elem` kind from already lowered elements.
     pub(crate) fn list_of(&mut self, items: Vec<Val>, elem: Elem, span: Span) -> Node {
-        let items = items
-            .into_iter()
-            .map(|v| self.coerce(v, elem.ty()))
-            .collect();
+        let items = items.into_iter().map(|v| self.elem_arg(v, elem)).collect();
         node(TypedExpression::Array(items), Ty::List(elem), span)
     }
 
@@ -1649,7 +1681,7 @@ impl<'m> Lowerer<'m> {
                     let stmt = match seq.ty {
                         Ty::List(e) => {
                             let i = self.expr_as(&sub.slice, Ty::Int)?;
-                            call(&list_fn("pop", e), vec![seq.node, i], e.ty(), span)
+                            elem_call("pop", e, vec![seq.node, i], span)
                         }
                         Ty::Dict => {
                             let k = self.expr_as(&sub.slice, Ty::Object)?;
@@ -1792,7 +1824,7 @@ impl<'m> Lowerer<'m> {
                 let stmt = match seq.ty {
                     Ty::List(e) => {
                         let i = self.expr_as(&sub.slice, Ty::Int)?;
-                        let v = self.coerce(value, e.ty());
+                        let v = self.elem_arg(value, e);
                         call(&list_fn("set", e), vec![seq.node, i, v], Ty::None, span)
                     }
                     Ty::Dict => {
@@ -1984,7 +2016,7 @@ impl<'m> Lowerer<'m> {
     /// `seq[i]` for a sequence value and an int index already lowered.
     fn index_value(&mut self, seq: Val, index: Node, elem_ty: Ty, span: Span) -> Val {
         let node = match seq.ty {
-            Ty::List(e) => call(&list_fn("get", e), vec![seq.node, index], e.ty(), span),
+            Ty::List(e) => elem_call("get", e, vec![seq.node, index], span),
             Ty::Tuple => call("zb_list_get_any", vec![seq.node, index], Ty::Object, span),
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
             _ => {
@@ -2642,12 +2674,7 @@ impl<'m> Lowerer<'m> {
                 );
                 let keys = call("zb_list_map1", vec![f, boxed], anys, span);
                 let best = Val {
-                    node: call(
-                        &list_fn(&format!("{name}_by"), e),
-                        vec![held.node, keys],
-                        e.ty(),
-                        span,
-                    ),
+                    node: elem_call(&format!("{name}_by"), e, vec![held.node, keys], span),
                     ty: e.ty(),
                 };
                 return Ok(Some(Val {
@@ -3197,7 +3224,7 @@ impl<'m> Lowerer<'m> {
                         span,
                     )
                 } else if let Ty::List(e) = right.ty {
-                    let item = self.coerce(left, e.ty());
+                    let item = self.elem_arg(left, e);
                     call(
                         &list_fn("contains", e),
                         vec![right.node, item],
@@ -3703,8 +3730,7 @@ impl<'m> Lowerer<'m> {
         let outer_hoisted = std::mem::take(&mut self.hoisted);
         let add = match produce {
             Produce::List(elem, elt) => {
-                let value = self.expr(elt)?;
-                let value = self.coerce(value, elem.ty());
+                let value = self.expr_as_elem(elt, elem)?;
                 method_call(var(out, ty, span), "push", vec![value], Ty::None, span)
             }
             Produce::Set(elt) => {
@@ -3809,7 +3835,7 @@ impl<'m> Lowerer<'m> {
                 let node = match name {
                     "append" => {
                         expect(1, self)?;
-                        let v = self.expr_as(&args[0], e.ty())?;
+                        let v = self.expr_as_elem(&args[0], e)?;
                         method_call(list, "push", vec![v], Ty::None, span)
                     }
                     "pop" => {
@@ -3818,17 +3844,17 @@ impl<'m> Lowerer<'m> {
                         } else {
                             self.expr_as(&args[0], Ty::Int)?
                         };
-                        call(&list_fn("pop", e), vec![list, i], e.ty(), span)
+                        elem_call("pop", e, vec![list, i], span)
                     }
                     "insert" => {
                         expect(2, self)?;
                         let i = self.expr_as(&args[0], Ty::Int)?;
-                        let v = self.expr_as(&args[1], e.ty())?;
+                        let v = self.expr_as_elem(&args[1], e)?;
                         call(&list_fn("insert", e), vec![list, i, v], Ty::None, span)
                     }
                     "remove" | "index" | "count" => {
                         expect(1, self)?;
-                        let v = self.expr_as(&args[0], e.ty())?;
+                        let v = self.expr_as_elem(&args[0], e)?;
                         call(&list_fn(name, e), vec![list, v], ty, span)
                     }
                     "extend" => {
@@ -4304,7 +4330,7 @@ impl<'m> Lowerer<'m> {
                         }
                     };
                     let Ty::List(e) = list.ty else { unreachable!() };
-                    let node = call(&list_fn(name, e), vec![list.node], e.ty(), span);
+                    let node = elem_call(name, e, vec![list.node], span);
                     let v = Val { node, ty: e.ty() };
                     return Ok(Val {
                         node: self.coerce(v, ty),

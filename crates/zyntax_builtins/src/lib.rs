@@ -75,11 +75,15 @@ pub enum Kind {
     Int,
     Float,
     Str,
+    /// The address of an instance of one of the frontend's classes.
+    /// Stored as a plain word; the frontend casts at either end, and
+    /// boxes one through `zb_hook_box_instance` when it becomes dynamic.
+    Ptr,
     Any,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Int, Kind::Float, Kind::Str, Kind::Any];
+    pub const ALL: [Kind; 5] = [Kind::Int, Kind::Float, Kind::Str, Kind::Ptr, Kind::Any];
 
     /// The suffix on this kind's functions: `zb_list_get_i64`.
     pub fn suffix(self) -> &'static str {
@@ -87,6 +91,7 @@ impl Kind {
             Kind::Int => "i64",
             Kind::Float => "f64",
             Kind::Str => "str",
+            Kind::Ptr => "ptr",
             Kind::Any => "any",
         }
     }
@@ -96,6 +101,7 @@ impl Kind {
             Kind::Int => build::i64(),
             Kind::Float => build::f64(),
             Kind::Str => build::string(),
+            Kind::Ptr => build::usize(),
             Kind::Any => build::any(),
         }
     }
@@ -110,16 +116,16 @@ impl Kind {
 
 /// The box tag of a tuple: a list of dynamic values that prints and
 /// compares as a tuple.
-pub const TUPLE_TAG: i64 = (5 << 8) | 255;
+pub const TUPLE_TAG: i64 = (6 << 8) | 255;
 /// The box tag of a dict: keys and values alternating in one list.
-pub const DICT_TAG: i64 = (6 << 8) | 255;
+pub const DICT_TAG: i64 = (7 << 8) | 255;
 /// The box tag of a set: a list of distinct values.
-pub const SET_TAG: i64 = (7 << 8) | 255;
+pub const SET_TAG: i64 = (8 << 8) | 255;
 /// The box tag of a function value: a record of dynamic values, see
 /// [`functions`].
-pub const FUNC_TAG: i64 = (8 << 8) | 255;
+pub const FUNC_TAG: i64 = (9 << 8) | 255;
 /// The box tag of a bare code address inside a function record.
-pub const CODE_TAG: i64 = (9 << 8) | 255;
+pub const CODE_TAG: i64 = (10 << 8) | 255;
 /// Kinds from here up are instances of a frontend's classes, in the
 /// order the frontend numbers them.
 pub const INSTANCE_KIND_BASE: i64 = 16;
@@ -163,6 +169,7 @@ pub fn library(policy: &Policy) -> Library {
     } else {
         declarations.extend(dynamic::default_instance_hooks(policy));
     }
+    declarations.extend(lists::ptr_declarations(policy));
     if policy.exceptions {
         declarations.push(build::extern_fn(
             "zb_hook_raise",

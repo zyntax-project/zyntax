@@ -117,6 +117,19 @@ fn ops(kind: Kind, list_type: TypeId) -> KindOps {
             |a, b| call("zb_any_lt", vec![a, b], boolean()),
             |x| call("zb_any_repr", vec![x], string()),
         ),
+        // Instances compare by identity; ordering them is an error, and
+        // printing one goes through its boxed form.
+        Kind::Ptr => (
+            |a, b| eq(a, b),
+            |a, b| call("zb_ptr_lt", vec![a, b], boolean()),
+            |x| {
+                call(
+                    "zb_any_repr",
+                    vec![call("zb_hook_box_instance", vec![x], any())],
+                    string(),
+                )
+            },
+        ),
     };
     KindOps {
         kind,
@@ -658,8 +671,14 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(best.e()));
         d.push(define(&name(op), &[&xs, &keys], k.elem.clone(), s));
     }
-    // Everything boxed, for a list that becomes dynamic.
+    // Everything boxed, for a list that becomes dynamic. A primitive
+    // boxes as itself on the push; an instance address boxes as the
+    // instance.
     let out_any = local("out", any_list.clone());
+    let boxed = |e: Expr| match k.kind {
+        Kind::Ptr => call("zb_hook_box_instance", vec![e], any()),
+        _ => e,
+    };
     d.push(define(&name("to_any"), &[&xs], any_list.clone(), {
         let mut s = vec![
             out_any.decl(list(Vec::new(), any_list.clone())),
@@ -672,7 +691,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             vec![expr(mcall(
                 out_any.e(),
                 "push",
-                vec![el(&xs, i.e())],
+                vec![boxed(el(&xs, i.e()))],
                 unit(),
             ))],
         ));
@@ -779,6 +798,49 @@ fn list_type_of(list: &Type) -> TypeId {
 }
 
 /// What is not per kind: sums, ranges, tuples, strings as lists.
+/// What instance addresses in a list need beyond the kind's own
+/// functions: the hook that boxes one, which a frontend with classes
+/// defines and which otherwise boxes the address as an opaque value,
+/// and the refusal to order two of them.
+pub(crate) fn ptr_declarations(policy: &Policy) -> Vec<Decl> {
+    let a = local("a", usize());
+    let b = local("b", usize());
+    let p = local("p", usize());
+    let mut d = Vec::new();
+    if policy.instance_hooks {
+        d.push(extern_fn(
+            "zb_hook_box_instance",
+            &[("p", usize())],
+            any(),
+            None,
+        ));
+    } else {
+        d.push(define(
+            "zb_hook_box_instance",
+            &[&p],
+            any(),
+            vec![ret(call(
+                "zb_box_fnptr_raw",
+                vec![p.e(), int32(255)],
+                any(),
+            ))],
+        ));
+    }
+    d.push(define(
+        "zb_ptr_lt",
+        &[&a, &b],
+        boolean(),
+        vec![
+            fatal(
+                "TypeError",
+                text("'<' not supported between instances of these objects"),
+            ),
+            ret(bool(false)),
+        ],
+    ));
+    d
+}
+
 fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let ints = list_of(list_type, i64());
     let floats = list_of(list_type, f64());
