@@ -144,6 +144,12 @@ pub(crate) fn declarations(policy: &Policy) -> Vec<Decl> {
     // The compiler's own intrinsics, resolved by name.
     out.push(extern_fn("pow", &[("a", f64()), ("b", f64())], f64(), None));
     out.push(extern_fn("floor", &[("x", f64())], f64(), None));
+    out.push(extern_fn(
+        "fma",
+        &[("a", f64()), ("b", f64()), ("c", f64())],
+        f64(),
+        None,
+    ));
 
     let s = local("s", string());
     let a = local("a", string());

@@ -627,6 +627,10 @@ fn default_intrinsic_alias_map() -> IndexMap<InternedString, crate::hir::Intrins
         InternedString::new_global("floor"),
         crate::hir::Intrinsic::Floor,
     );
+    m.insert(
+        InternedString::new_global("fma"),
+        crate::hir::Intrinsic::Fma,
+    );
     // `free(p)` releases an `alloc<T>` buffer (ML roadmap Phase 0.3),
     // rewritten to a direct `Intrinsic::Free` call. `alloc` needs the
     // element type for sizing so it goes through `try_emit_simd_intrinsic`;

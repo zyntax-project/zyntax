@@ -1,0 +1,25 @@
+['Apple', 'banana', 'cherry', 'date']
+['date', 'Apple', 'banana', 'cherry']
+['Apple', 'banana', 'cherry', 'date']
+['date', 'cherry', 'banana', 'Apple']
+['banana', 'cherry', 'Apple', 'date']
+[-1, 2, 3, -5]
+[3, 2, -1, -5]
+[3, 2, -1, -5]
+[(1, 'z'), (2, 'a'), (2, 'b')]
+[(1, 'z'), (2, 'b'), (2, 'a')]
+[(2, 'b'), (2, 'a'), (1, 'z')]
+[(2, 'a'), (2, 'b'), (1, 'z')]
+[9, 5, 2]
+[5, 2, 9]
+banana date
+-5 -1
+B
+B
+A
+[2.5, 0.0, -1.0]
+['e', 'h', 'l', 'l', 'o']
+['a', 'b']
+[('a', 2), ('b', 1)]
+[1, 2, 3]
+[1, 2, 3]

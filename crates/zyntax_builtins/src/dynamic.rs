@@ -651,6 +651,27 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     ));
     let kept = owned("x", any());
     d.push(define("zb_any_pos", &[&kept], any(), vec![ret(kept.e())]));
+    let f = local("f", f64());
+    let n = local("n", i64());
+    d.push(define(
+        "zb_any_abs",
+        &[&x],
+        any(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                is(&cat, FLOAT),
+                vec![
+                    f.decl(get_f64(x.e())),
+                    when(lt(f.e(), float(0.0)), vec![f.set(sub(float(0.0), f.e()))]),
+                    ret(box_f64(f.e())),
+                ],
+            ),
+            n.decl(number_i64(x.e(), cat.e())),
+            when(lt(n.e(), int(0)), vec![n.set(sub(int(0), n.e()))]),
+            ret(box_i64(n.e())),
+        ],
+    ));
     d.push(define(
         "zb_any_invert",
         &[&x],
@@ -1218,16 +1239,24 @@ fn rounding() -> Vec<Decl> {
     let digits = local("digits", i64());
     let scale = local("scale", f64());
     let scaled = local("scaled", f64());
-    let round_up = |value: &Local| {
-        vec![
-            whole.decl(call("floor", vec![value.e()], f64())),
-            diff.decl(sub(value.e(), whole.e())),
-            r.decl(whole.e()),
-            if_(
-                gt(diff.e(), float(0.5)),
+    // Round `value` to the nearest whole, ties to even. `err` is the
+    // sign of what rounding `value` itself lost, when it came from a
+    // computation: a half that was rounded up to is not a tie.
+    let err = local("err", f64());
+    let round_up = |value: &Local, err: Option<&Local>| {
+        let tie = match err {
+            None => vec![
+                half.decl(cast(whole.e(), i64())),
+                when(
+                    ne(rem(half.e(), int(2)), int(0)),
+                    vec![r.set(add(whole.e(), float(1.0)))],
+                ),
+            ],
+            Some(err) => vec![if_(
+                gt(err.e(), float(0.0)),
                 vec![r.set(add(whole.e(), float(1.0)))],
                 vec![when(
-                    eq(diff.e(), float(0.5)),
+                    eq(err.e(), float(0.0)),
                     vec![
                         half.decl(cast(whole.e(), i64())),
                         when(
@@ -1236,23 +1265,63 @@ fn rounding() -> Vec<Decl> {
                         ),
                     ],
                 )],
+            )],
+        };
+        vec![
+            whole.decl(call("floor", vec![value.e()], f64())),
+            diff.decl(sub(value.e(), whole.e())),
+            r.decl(whole.e()),
+            if_(
+                gt(diff.e(), float(0.5)),
+                vec![r.set(add(whole.e(), float(1.0)))],
+                vec![when(eq(diff.e(), float(0.5)), tie)],
             ),
         ]
     };
     let mut d = Vec::new();
-    let mut body = round_up(&x);
+    let mut body = round_up(&x, None);
     body.push(ret(cast(r.e(), i64())));
     d.push(define("zb_round_half_even", &[&x], i64(), body));
+    // Scaling by a power of ten is inexact, so the tie test reads the
+    // exact residual of the scaling through a fused multiply-add: a
+    // scaled value that landed on a half from below is not a tie.
+    let magnitude = local("magnitude", i64());
     let mut body = vec![
+        magnitude.decl(if_expr(
+            lt(digits.e(), int(0)),
+            sub(int(0), digits.e()),
+            digits.e(),
+        )),
         scale.decl(call(
             "pow",
-            vec![float(10.0), cast(digits.e(), f64())],
+            vec![float(10.0), cast(magnitude.e(), f64())],
             f64(),
         )),
-        scaled.decl(mul(x.e(), scale.e())),
+        scaled.decl(if_expr(
+            lt(digits.e(), int(0)),
+            div(x.e(), scale.e()),
+            mul(x.e(), scale.e()),
+        )),
+        err.decl(if_expr(
+            lt(digits.e(), int(0)),
+            call(
+                "fma",
+                vec![scaled.e(), sub(float(0.0), scale.e()), x.e()],
+                f64(),
+            ),
+            call(
+                "fma",
+                vec![x.e(), scale.e(), sub(float(0.0), scaled.e())],
+                f64(),
+            ),
+        )),
     ];
-    body.extend(round_up(&scaled));
-    body.push(ret(div(r.e(), scale.e())));
+    body.extend(round_up(&scaled, Some(&err)));
+    body.push(ret(if_expr(
+        lt(digits.e(), int(0)),
+        mul(r.e(), scale.e()),
+        div(r.e(), scale.e()),
+    )));
     d.push(define("zb_round_digits", &[&x, &digits], f64(), body));
     let v = local("x", any());
     d.push(define(

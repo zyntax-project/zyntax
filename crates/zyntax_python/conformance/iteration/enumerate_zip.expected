@@ -1,0 +1,23 @@
+0 ada
+1 grace
+2 linus
+1 ada
+2 grace
+3 linus
+[(0, 'a'), (1, 'b')]
+ada 36
+grace 45
+linus 28
+[(1, 'x'), (2, 'y')]
+('ada', 36) 3
+9
+12
+45
+80
+0 h
+1 e
+2 y
+a 1
+b 2
+[0, 6, 14]
+{0: 'p', 1: 'q'}

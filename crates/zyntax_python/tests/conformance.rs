@@ -243,4 +243,5 @@ categories! {
     generators,
     exceptions,
     builtin,
+    iteration,
 }

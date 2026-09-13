@@ -16,6 +16,7 @@ mod dynamic;
 mod format;
 pub mod functions;
 mod io;
+mod iteration;
 mod lists;
 mod strings;
 
@@ -151,6 +152,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(lists::declarations(policy, list_type));
     declarations.extend(functions::declarations(list_type));
     declarations.extend(dicts::declarations(list_type));
+    declarations.extend(iteration::declarations(list_type));
     // The hooks a frontend defines are declared here as externs, so the
     // library lowers on its own; the frontend's definition takes the
     // declaration's place when the two meet in a program.

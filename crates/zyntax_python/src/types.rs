@@ -982,11 +982,25 @@ impl Typer<'_> {
                     "tuple" => Ty::Tuple,
                     "dict" => Ty::Dict,
                     "set" => Ty::Set,
-                    "sum" => match arg(0) {
-                        Ty::List(Elem::Int) => Ty::Int,
-                        Ty::List(Elem::Float) => Ty::Float,
-                        _ => Ty::Object,
-                    },
+                    // Pairs and mapped values are dynamic; the lists are eager.
+                    "enumerate" | "zip" | "map" | "filter" => Ty::List(Elem::Object),
+                    "any" | "all" => Ty::Bool,
+                    "sum" => {
+                        let items = match arg(0) {
+                            Ty::List(Elem::Int) => Ty::Int,
+                            Ty::List(Elem::Float) => Ty::Float,
+                            _ => Ty::Object,
+                        };
+                        match args.get(1) {
+                            None => items,
+                            Some(start) => match (items, self.expr(start)) {
+                                (Ty::Int, Ty::Int | Ty::Bool) => Ty::Int,
+                                (Ty::Int | Ty::Float, Ty::Float)
+                                | (Ty::Float, Ty::Int | Ty::Bool) => Ty::Float,
+                                _ => Ty::Object,
+                            },
+                        }
+                    }
                     "min" | "max" if args.len() == 1 => match arg(0) {
                         Ty::List(e) => e.ty(),
                         _ => Ty::Object,
@@ -1007,6 +1021,14 @@ impl Typer<'_> {
                         Ty::Unknown => Ty::Unknown,
                         _ => Ty::Object,
                     },
+                    // With digits, the result keeps the argument's type.
+                    "round" if args.len() == 2 => match arg(0) {
+                        Ty::Int | Ty::Bool => Ty::Int,
+                        Ty::Float => Ty::Float,
+                        Ty::Unknown => Ty::Unknown,
+                        _ => Ty::Object,
+                    },
+                    "pow" if args.len() == 3 => Ty::Int,
                     "min" | "max" if args.len() >= 2 => {
                         let mut acc = Ty::Unknown;
                         for a in args.iter() {

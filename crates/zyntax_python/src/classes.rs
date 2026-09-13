@@ -707,6 +707,7 @@ fn dynamic_call(module: &Module, method: &str, arity: usize, span: Span) -> Type
         },
         span,
     );
+    statements.extend(builtin_arms(module, method, arity, x.clone(), span));
     statements.push(attribute_error(x.clone(), method, span));
     statements.push(ret(x, span));
     function(
@@ -715,6 +716,106 @@ fn dynamic_call(module: &Module, method: &str, arity: usize, span: Span) -> Type
         Ty::Object,
         statements,
         span,
+    )
+}
+
+/// The same method on a boxed string, list, tuple, dict or set: one
+/// arm per kind the typed lowering has the method for, found by lowering
+/// `s.method(a0, ...)` with `s` of that type. A kind without it gets no
+/// arm and falls through to the attribute error.
+fn builtin_arms(
+    module: &Module,
+    method: &str,
+    arity: usize,
+    x: Node,
+    span: Span,
+) -> Vec<TypedNode<TypedStatement>> {
+    use crate::types::Elem;
+    let args: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
+    let source = format!("s.{method}({})", args.join(", "));
+    let Ok(parsed) = ruff_python_parser::parse_expression(&source) else {
+        return Vec::new();
+    };
+    let expr = parsed.into_syntax().body;
+    let category = |c: i64| {
+        binary(
+            BinaryOp::Eq,
+            call("zb_any_category", vec![x.clone()], Ty::Int, span),
+            int_lit(c, span),
+            Ty::Bool,
+            span,
+        )
+    };
+    let kind = |k: i64| {
+        binary(
+            BinaryOp::Eq,
+            var(intern("kind"), Ty::Int, span),
+            int_lit(k, span),
+            Ty::Bool,
+            span,
+        )
+    };
+    let list_kind = |k: zyntax_builtins::Kind| kind(k.list_tag() >> 8);
+    let receivers: [(Node, Ty); 8] = [
+        (category(5), Ty::Str),
+        (list_kind(zyntax_builtins::Kind::Int), Ty::List(Elem::Int)),
+        (
+            list_kind(zyntax_builtins::Kind::Float),
+            Ty::List(Elem::Float),
+        ),
+        (list_kind(zyntax_builtins::Kind::Str), Ty::List(Elem::Str)),
+        (
+            list_kind(zyntax_builtins::Kind::Any),
+            Ty::List(Elem::Object),
+        ),
+        (kind(zyntax_builtins::TUPLE_TAG >> 8), Ty::Tuple),
+        (kind(zyntax_builtins::DICT_TAG >> 8), Ty::Dict),
+        (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set),
+    ];
+    let mut arms = Vec::new();
+    for (test, ty) in receivers {
+        let mut vars: Vec<(&str, Ty)> = vec![("s", ty)];
+        for a in &args {
+            vars.push((a.as_str(), Ty::Object));
+        }
+        let mut lowerer = scratch_with(module, &vars);
+        let Ok(value) = lowerer.expr(&expr) else {
+            continue;
+        };
+        let boxed = lowerer.coerce(value, Ty::Object);
+        let receiver = lowerer.coerce(
+            Val {
+                node: x.clone(),
+                ty: Ty::Object,
+            },
+            ty,
+        );
+        let mut then = vec![let_("s", ty, receiver, span)];
+        then.extend(std::mem::take(&mut lowerer.hoisted));
+        then.push(ret(boxed, span));
+        arms.push(when(test, then, span));
+    }
+    arms
+}
+
+fn scratch_with<'m>(module: &'m Module, vars: &[(&str, Ty)]) -> Lowerer<'m> {
+    let sig = Sig {
+        params: Vec::new(),
+        ret: Ty::Object,
+        defaults: Vec::new(),
+    };
+    let mut locals = Locals::default();
+    for (name, ty) in vars {
+        locals.vars.insert(name.to_string(), *ty);
+    }
+    Lowerer::new(
+        module,
+        "$class",
+        sig,
+        locals,
+        &Scope::default(),
+        Vec::new(),
+        HashMap::new(),
     )
 }
 

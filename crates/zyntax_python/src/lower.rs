@@ -437,7 +437,7 @@ pub(crate) struct Lowerer<'m> {
     /// Statements an expression needs run before the statement it is
     /// part of: a comprehension's loop, which the IR cannot hold inside
     /// an expression. Drained in front of each statement.
-    hoisted: Vec<Stmt>,
+    pub(crate) hoisted: Vec<Stmt>,
     /// Variables shared with nested functions. Each lives in a
     /// one-element list, the cell, that every function using it holds.
     cells: HashMap<String, InternedString>,
@@ -679,8 +679,16 @@ impl<'m> Lowerer<'m> {
         if self.is_generator {
             return None;
         }
-        Some(match self.sig.ret {
-            Ty::None => return None,
+        if self.sig.ret == Ty::None {
+            return None;
+        }
+        Some(self.zero_of(self.sig.ret, span))
+    }
+
+    /// A value of `ty` that stands for nothing: what a variable holds
+    /// before the branch that assigns it runs.
+    fn zero_of(&mut self, ty: Ty, span: Span) -> Node {
+        match ty {
             Ty::Int => int_lit(0, span),
             Ty::Float => node(
                 TypedExpression::Literal(TypedLiteral::Float(0.0)),
@@ -701,7 +709,69 @@ impl<'m> Lowerer<'m> {
                 self.coerce(none, Ty::Object)
             }
             other => cast(int_lit(0, span), other, span),
-        })
+        }
+    }
+
+    /// A value one of two branches computes, when a branch has statements
+    /// of its own to run first. Those cannot sit in a block expression (a
+    /// loop there is not lowered), so the choice is an `if` statement
+    /// assigning a temp, appended to `out`, and the value is the temp.
+    fn conditional_value(
+        &mut self,
+        condition: Node,
+        then: (Vec<Stmt>, Node),
+        otherwise: (Vec<Stmt>, Node),
+        ty: Ty,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> Node {
+        let t = self.temp();
+        let initial = self.zero_of(ty, span);
+        out.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: t,
+                ty: ir(ty),
+                mutability: Mutability::Mutable,
+                initializer: Some(Box::new(initial)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let assign = |value: Node| {
+            TypedNode::new(
+                TypedStatement::Expression(Box::new(binary(
+                    BinaryOp::Assign,
+                    var(t, ty, span),
+                    value,
+                    Ty::None,
+                    span,
+                ))),
+                Type::Unknown,
+                span,
+            )
+        };
+        let (mut then_statements, then_value) = then;
+        then_statements.push(assign(then_value));
+        let (mut else_statements, else_value) = otherwise;
+        else_statements.push(assign(else_value));
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(condition),
+                then_block: TypedBlock {
+                    statements: then_statements,
+                    span,
+                },
+                else_block: Some(TypedBlock {
+                    statements: else_statements,
+                    span,
+                }),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        var(t, ty, span)
     }
 
     /// `if <pending> { <escape> }`.
@@ -1117,6 +1187,7 @@ impl<'m> Lowerer<'m> {
             (_, Ty::Unknown) => v.node,
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
+            (Ty::Float, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
             // A list is boxed by reference under a tag of its kind, and
             // read back by checking that tag.
@@ -2109,6 +2180,330 @@ impl<'m> Lowerer<'m> {
         Ok(TypedStatement::Block(TypedBlock { statements, span }))
     }
 
+    // ─── Iteration builtins ────────────────────────────────────────
+
+    /// A value as a `List<Any>` to iterate: a typed list boxed, a string
+    /// its characters, a dynamic value whatever it iterates as.
+    fn iterable(&mut self, v: Val, span: Span) -> Node {
+        match v.ty {
+            Ty::Str => {
+                let chars = call("zb_str_chars", vec![v.node], Ty::List(Elem::Str), span);
+                call(
+                    &list_fn("to_any", Elem::Str),
+                    vec![chars],
+                    Ty::List(Elem::Object),
+                    span,
+                )
+            }
+            Ty::Object => call("zb_any_iter", vec![v.node], Ty::List(Elem::Object), span),
+            _ => self.coerce(v, Ty::List(Elem::Object)),
+        }
+    }
+
+    /// The typed list an iterable argument stands for: a `range(...)` is
+    /// its ints, a string its characters, anything else what it holds.
+    fn sequence(&mut self, e: &py::Expr, span: Span) -> Result<Val> {
+        if let py::Expr::Call(rc) = e {
+            if types::is_name(&rc.func, "range") && rc.arguments.keywords.is_empty() {
+                let mut bounds = Vec::new();
+                for a in rc.arguments.args.iter() {
+                    bounds.push(self.expr_as(a, Ty::Int)?);
+                }
+                let (start, stop, step) = match bounds.len() {
+                    1 => (int_lit(0, span), bounds.remove(0), int_lit(1, span)),
+                    2 => {
+                        let stop = bounds.remove(1);
+                        (bounds.remove(0), stop, int_lit(1, span))
+                    }
+                    3 => {
+                        let step = bounds.remove(2);
+                        let stop = bounds.remove(1);
+                        (bounds.remove(0), stop, step)
+                    }
+                    _ => return unsupported("range() with more than three arguments", rc),
+                };
+                return Ok(Val {
+                    node: call(
+                        "zb_list_range",
+                        vec![start, stop, step],
+                        Ty::List(Elem::Int),
+                        span,
+                    ),
+                    ty: Ty::List(Elem::Int),
+                });
+            }
+        }
+        let v = self.expr(e)?;
+        Ok(match v.ty {
+            Ty::List(_) => v,
+            Ty::Str => Val {
+                node: call("zb_str_chars", vec![v.node], Ty::List(Elem::Str), span),
+                ty: Ty::List(Elem::Str),
+            },
+            _ => Val {
+                node: self.iterable(v, span),
+                ty: Ty::List(Elem::Object),
+            },
+        })
+    }
+
+    /// An argument in a position that takes a function: a lambda, a def,
+    /// a variable holding one, or a builtin's name, which becomes a
+    /// function over one dynamic argument.
+    fn callable_value(&mut self, e: &py::Expr) -> Result<Node> {
+        const BUILTINS: [&str; 8] = ["str", "int", "float", "bool", "len", "abs", "repr", "type"];
+        if let py::Expr::Name(n) = e {
+            let name = n.id.as_str();
+            if !self.is_variable(name)
+                && !self.module.funcs.contains_key(name)
+                && !self.module.class_index.contains_key(name)
+                && BUILTINS.contains(&name)
+            {
+                // The builtin as a function value is the lambda that
+                // applies it.
+                let source = format!("lambda a0: {name}(a0)");
+                let parsed = ruff_python_parser::parse_expression(&source)
+                    .expect("a builtin applied to a name parses");
+                let py::Expr::Lambda(lambda) = &*parsed.into_syntax().body else {
+                    unreachable!("the source is a lambda")
+                };
+                let span = span_of(e);
+                return Ok(self.lambda(lambda, span)?.node);
+            }
+        }
+        self.expr_as(e, Ty::Object)
+    }
+
+    /// `key=` and `reverse=` on an ordering call; anything else is refused.
+    fn ordering_keywords(
+        &mut self,
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+    ) -> Result<(Option<Node>, Option<Node>)> {
+        let mut key = None;
+        let mut reverse = None;
+        for kw in keywords {
+            match kw.arg.as_ref().map(|a| a.as_str()) {
+                Some("key") => key = Some(self.callable_value(&kw.value)?),
+                Some("reverse") => reverse = Some(self.expr_as(&kw.value, Ty::Bool)?),
+                Some(other) => {
+                    return unsupported(format!("the keyword argument `{other}` here"), c)
+                }
+                None => return unsupported("** in a call", c),
+            }
+        }
+        Ok((key, reverse))
+    }
+
+    /// Sort a list in place by `key` and `reverse`, appending to `out`.
+    fn sort_in_place(
+        &mut self,
+        list: Node,
+        e: Elem,
+        key: Option<Node>,
+        reverse: Option<Node>,
+        out: &mut Vec<Stmt>,
+        span: Span,
+    ) -> Result<()> {
+        let statement = |node: Node| {
+            TypedNode::new(
+                TypedStatement::Expression(Box::new(node)),
+                Type::Unknown,
+                span,
+            )
+        };
+        if key.is_none() && reverse.is_none() {
+            out.push(statement(call(
+                &list_fn("sort", e),
+                vec![list],
+                Ty::None,
+                span,
+            )));
+            return Ok(());
+        }
+        // Keys are computed once, in a list parallel to the elements.
+        let boxed = self.coerce(
+            Val {
+                node: list.clone(),
+                ty: Ty::List(e),
+            },
+            Ty::List(Elem::Object),
+        );
+        let keys = match key {
+            Some(f) => call("zb_list_map1", vec![f, boxed], Ty::List(Elem::Object), span),
+            None => boxed,
+        };
+        let descending = reverse.unwrap_or_else(|| {
+            node(
+                TypedExpression::Literal(TypedLiteral::Bool(false)),
+                Ty::Bool,
+                span,
+            )
+        });
+        out.push(statement(call(
+            &list_fn("sort_by", e),
+            vec![list, keys, descending],
+            Ty::None,
+            span,
+        )));
+        Ok(())
+    }
+
+    /// The builtins that produce or consume sequences: `enumerate`, `zip`,
+    /// `map`, `filter`, `any`, `all`, and `sorted`, `min`, `max` with a
+    /// key. `None` when `name` is not one of them.
+    fn iteration_builtin(
+        &mut self,
+        name: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        ty: Ty,
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Option<Val>> {
+        let anys = Ty::List(Elem::Object);
+        let node = match (name, args.len()) {
+            ("enumerate", 1 | 2) => {
+                let v = self.expr(&args[0])?;
+                let xs = self.iterable(v, span);
+                let start = match (args.get(1), keywords.first()) {
+                    (Some(s), _) => self.expr_as(s, Ty::Int)?,
+                    (None, Some(kw)) if kw.arg.as_ref().map(|a| a.as_str()) == Some("start") => {
+                        self.expr_as(&kw.value, Ty::Int)?
+                    }
+                    (None, Some(_)) => return unsupported("this keyword on enumerate()", c),
+                    (None, None) => int_lit(0, span),
+                };
+                call("zb_list_enumerate", vec![xs, start], anys, span)
+            }
+            ("zip", 2 | 3) => {
+                let mut lists = Vec::new();
+                for a in args {
+                    let v = self.expr(a)?;
+                    lists.push(self.iterable(v, span));
+                }
+                let f = if lists.len() == 2 {
+                    "zb_list_zip2"
+                } else {
+                    "zb_list_zip3"
+                };
+                call(f, lists, anys, span)
+            }
+            ("map", 2 | 3) => {
+                let f = self.callable_value(&args[0])?;
+                let mut lowered = vec![f];
+                for a in &args[1..] {
+                    let v = self.expr(a)?;
+                    lowered.push(self.iterable(v, span));
+                }
+                let f = if lowered.len() == 2 {
+                    "zb_list_map1"
+                } else {
+                    "zb_list_map2"
+                };
+                call(f, lowered, anys, span)
+            }
+            ("filter", 2) => {
+                let v = self.expr(&args[1])?;
+                let xs = self.iterable(v, span);
+                if matches!(&args[0], py::Expr::NoneLiteral(_)) {
+                    call("zb_list_filter_truthy", vec![xs], anys, span)
+                } else {
+                    let f = self.callable_value(&args[0])?;
+                    call("zb_list_filter", vec![f, xs], anys, span)
+                }
+            }
+            ("any" | "all", 1) => {
+                let v = self.expr(&args[0])?;
+                let xs = self.iterable(v, span);
+                let f = if name == "any" {
+                    "zb_list_any"
+                } else {
+                    "zb_list_all"
+                };
+                let v = Val {
+                    node: call(f, vec![xs], Ty::Bool, span),
+                    ty: Ty::Bool,
+                };
+                return Ok(Some(Val {
+                    node: self.coerce(v, ty),
+                    ty,
+                }));
+            }
+            ("sorted", 1) if !keywords.is_empty() => {
+                let source = self.sequence(&args[0], span)?;
+                let Ty::List(e) = source.ty else {
+                    unreachable!()
+                };
+                let (key, reverse) = self.ordering_keywords(keywords, c)?;
+                let mut statements = Vec::new();
+                let copy = call(&list_fn("copy", e), vec![source.node], Ty::List(e), span);
+                let held = self.hold(
+                    Val {
+                        node: copy,
+                        ty: Ty::List(e),
+                    },
+                    &mut statements,
+                    span,
+                );
+                self.sort_in_place(held.node.clone(), e, key, reverse, &mut statements, span)?;
+                return Ok(Some(Val {
+                    node: Self::block_value(statements, held.node, Ty::List(e), span),
+                    ty: Ty::List(e),
+                }));
+            }
+            ("min" | "max", _) if !keywords.is_empty() => {
+                let (key, reverse) = self.ordering_keywords(keywords, c)?;
+                if reverse.is_some() {
+                    return unsupported(format!("reverse= on {name}()"), c);
+                }
+                let Some(f) = key else {
+                    return unsupported(format!("{name}() with these keywords"), c);
+                };
+                let list = if args.len() == 1 {
+                    self.sequence(&args[0], span)?
+                } else {
+                    let mut items = Vec::with_capacity(args.len());
+                    for a in args.iter() {
+                        items.push(self.expr(a)?);
+                    }
+                    let elem = Elem::of(ty);
+                    Val {
+                        node: self.list_of(items, elem, span),
+                        ty: Ty::List(elem),
+                    }
+                };
+                let Ty::List(e) = list.ty else { unreachable!() };
+                let mut statements = Vec::new();
+                let held = self.hold(list, &mut statements, span);
+                self.hoisted.extend(statements);
+                let boxed = self.coerce(
+                    Val {
+                        node: held.node.clone(),
+                        ty: Ty::List(e),
+                    },
+                    Ty::List(Elem::Object),
+                );
+                let keys = call("zb_list_map1", vec![f, boxed], anys, span);
+                let best = Val {
+                    node: call(
+                        &list_fn(&format!("{name}_by"), e),
+                        vec![held.node, keys],
+                        e.ty(),
+                        span,
+                    ),
+                    ty: e.ty(),
+                };
+                return Ok(Some(Val {
+                    node: self.coerce(best, ty),
+                    ty,
+                }));
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Val { node, ty: anys }))
+    }
+
     // ─── Expressions ────────────────────────────────────────────────
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
@@ -2223,27 +2618,31 @@ impl<'m> Lowerer<'m> {
                 let then_pre = std::mem::take(&mut self.hoisted);
                 let else_value = self.expr_as(&i.orelse, ty)?;
                 let else_pre = std::mem::replace(&mut self.hoisted, outer);
-                let then_branch = if then_pre.is_empty() {
-                    then_value
+                if then_pre.is_empty() && else_pre.is_empty() {
+                    Val {
+                        node: node(
+                            TypedExpression::If(TypedIfExpr {
+                                condition: Box::new(condition),
+                                then_branch: Box::new(then_value),
+                                else_branch: Box::new(else_value),
+                            }),
+                            ty,
+                            span,
+                        ),
+                        ty,
+                    }
                 } else {
-                    Self::block_value(then_pre, then_value, ty, span)
-                };
-                let else_branch = if else_pre.is_empty() {
-                    else_value
-                } else {
-                    Self::block_value(else_pre, else_value, ty, span)
-                };
-                Val {
-                    node: node(
-                        TypedExpression::If(TypedIfExpr {
-                            condition: Box::new(condition),
-                            then_branch: Box::new(then_branch),
-                            else_branch: Box::new(else_branch),
-                        }),
+                    let mut out = Vec::new();
+                    let picked = self.conditional_value(
+                        condition,
+                        (then_pre, then_value),
+                        (else_pre, else_value),
                         ty,
                         span,
-                    ),
-                    ty,
+                        &mut out,
+                    );
+                    self.hoisted.extend(out);
+                    Val { node: picked, ty }
                 }
             }
             py::Expr::Call(c) => self.call(c, ty, span)?,
@@ -2882,24 +3281,46 @@ impl<'m> Lowerer<'m> {
     /// or `b` is the value, both at the join type.
     fn bool_op(&mut self, b: &py::ExprBoolOp, ty: Ty, span: Span) -> Result<Val> {
         let is_and = b.op == py::BoolOp::And;
-        let mut vals = Vec::with_capacity(b.values.len());
+        // Each operand with what it hoists; a later operand's statements
+        // run only if it is reached. The first operand's run regardless.
+        let mut vals: Vec<(Vec<Stmt>, Val)> = Vec::with_capacity(b.values.len());
         for (i, v) in b.values.iter().enumerate() {
-            // What a later operand hoists must run only if it is reached,
-            // so it stays inside the operand as a block.
             let outer = std::mem::take(&mut self.hoisted);
             let val = self.expr(v)?;
             let mine = std::mem::replace(&mut self.hoisted, outer);
-            if i == 0 || mine.is_empty() {
+            if i == 0 {
                 self.hoisted.extend(mine);
-                vals.push(val);
+                vals.push((Vec::new(), val));
             } else {
-                let ty = val.ty;
-                vals.push(Val {
-                    node: Self::block_value(mine, val.node, ty, span),
-                    ty,
-                });
+                vals.push((mine, val));
             }
         }
+        let needs_statements = vals.iter().any(|(pre, _)| !pre.is_empty());
+        if needs_statements {
+            // Right to left: each step chooses between its operand and
+            // the rest, and the rest's statements go under the choice.
+            let mut it = vals.into_iter().rev();
+            let (last_pre, last) = it.next().expect("a bool op has operands");
+            let mut rest = (last_pre, self.coerce(last, ty));
+            for (pre, v) in it {
+                let mut statements = pre;
+                let coerced = self.coerce(v, ty);
+                let bound = self.hold(Val { node: coerced, ty }, &mut statements, span);
+                let test = self.truthy(Val {
+                    node: bound.node.clone(),
+                    ty,
+                });
+                let own = (Vec::new(), bound.node);
+                let (then, otherwise) = if is_and { (rest, own) } else { (own, rest) };
+                let picked =
+                    self.conditional_value(test, then, otherwise, ty, span, &mut statements);
+                rest = (statements, picked);
+            }
+            let (statements, picked) = rest;
+            self.hoisted.extend(statements);
+            return Ok(Val { node: picked, ty });
+        }
+        let vals: Vec<Val> = vals.into_iter().map(|(_, v)| v).collect();
         if ty == Ty::Bool {
             let op = if is_and { BinaryOp::And } else { BinaryOp::Or };
             let mut it = vals.into_iter();
@@ -3474,6 +3895,29 @@ impl<'m> Lowerer<'m> {
                 return self.dynamic_method(receiver, a.attr.as_str(), args, span);
             }
         }
+        // `xs.sort(key=..., reverse=...)` on a list.
+        if let py::Expr::Attribute(a) = &*c.func {
+            if a.attr.as_str() == "sort" && !keywords.is_empty() {
+                let receiver = self.expr(&a.value)?;
+                if let Ty::List(e) = receiver.ty {
+                    let (key, reverse) = self.ordering_keywords(keywords, c)?;
+                    let mut statements = Vec::new();
+                    let held = self.hold(receiver, &mut statements, span);
+                    self.sort_in_place(held.node, e, key, reverse, &mut statements, span)?;
+                    let none = node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
+                    return Ok(Val {
+                        node: Self::block_value(statements, none, Ty::None, span),
+                        ty: Ty::None,
+                    });
+                }
+                return unsupported("sort() with keyword arguments on a non-list", c);
+            }
+        }
+        if let py::Expr::Name(n) = &*c.func {
+            if let Some(v) = self.iteration_builtin(n.id.as_str(), args, keywords, ty, c, span)? {
+                return Ok(v);
+            }
+        }
         if !keywords.is_empty() {
             return unsupported("keyword arguments", c);
         }
@@ -3606,18 +4050,35 @@ impl<'m> Lowerer<'m> {
                         ty: Ty::List(Elem::Int),
                     });
                 }
-                "sum" if args.len() == 1 => {
+                "sum" if args.len() == 1 || args.len() == 2 => {
                     let v = self.expr(&args[0])?;
-                    let node = match v.ty {
+                    let (node, sum_ty) = match v.ty {
                         Ty::List(e @ (Elem::Int | Elem::Float | Elem::Object)) => {
-                            call(&list_fn("sum", e), vec![v.node], e.ty(), span)
+                            (call(&list_fn("sum", e), vec![v.node], e.ty(), span), e.ty())
                         }
                         _ => {
                             let xs = self.coerce(v, Ty::List(Elem::Object));
-                            call("zb_list_sum_any", vec![xs], Ty::Object, span)
+                            (
+                                call("zb_list_sum_any", vec![xs], Ty::Object, span),
+                                Ty::Object,
+                            )
                         }
                     };
-                    return Ok(Val { node, ty });
+                    // `sum(xs, start)` is `start + sum(xs)`.
+                    let total = match args.get(1) {
+                        None => Val { node, ty: sum_ty },
+                        Some(start) => {
+                            let mut statements = Vec::new();
+                            let total = self.hold(Val { node, ty: sum_ty }, &mut statements, span);
+                            self.hoisted.extend(statements);
+                            let start = self.expr(start)?;
+                            self.arithmetic(py::Operator::Add, start, total, &args[0], span)?
+                        }
+                    };
+                    return Ok(Val {
+                        node: self.coerce(total, ty),
+                        ty,
+                    });
                 }
                 "min" | "max" => {
                     // Several arguments are the one-argument form over a
@@ -3662,8 +4123,15 @@ impl<'m> Lowerer<'m> {
                             span,
                         ),
                         Some(a) => {
-                            let d = self.expr_as(a, Ty::Dict)?;
-                            call("zb_dict_copy", vec![d], Ty::Dict, span)
+                            let v = self.expr(a)?;
+                            match v.ty {
+                                Ty::Dict => call("zb_dict_copy", vec![v.node], Ty::Dict, span),
+                                // Anything else is a sequence of pairs.
+                                _ => {
+                                    let items = self.iterable(v, span);
+                                    call("zb_dict_from_tuples", vec![items], Ty::Dict, span)
+                                }
+                            }
                         }
                     };
                     return Ok(Val { node, ty: Ty::Dict });
@@ -3848,6 +4316,19 @@ impl<'m> Lowerer<'m> {
                         ty: Ty::Tuple,
                     });
                 }
+                "pow" if args.len() == 3 => {
+                    let a = self.expr_as(&args[0], Ty::Int)?;
+                    let b = self.expr_as(&args[1], Ty::Int)?;
+                    let m = self.expr_as(&args[2], Ty::Int)?;
+                    let v = Val {
+                        node: call("zb_int_pow_mod", vec![a, b, m], Ty::Int, span),
+                        ty: Ty::Int,
+                    };
+                    return Ok(Val {
+                        node: self.coerce(v, ty),
+                        ty,
+                    });
+                }
                 "pow" if args.len() == 2 => {
                     let a = self.expr(&args[0])?;
                     let b = self.expr(&args[1])?;
@@ -3912,6 +4393,13 @@ impl<'m> Lowerer<'m> {
                         _ => call("zb_any_type", vec![v.node], Ty::Str, span),
                     };
                     return Ok(Val { node, ty: Ty::Str });
+                }
+                "abs" if args.len() == 1 && ty == Ty::Object => {
+                    let o = self.expr_as(&args[0], Ty::Object)?;
+                    return Ok(Val {
+                        node: call("zb_any_abs", vec![o], Ty::Object, span),
+                        ty: Ty::Object,
+                    });
                 }
                 "abs" if ty != Ty::Object => {
                     let v = self.expr(&args[0])?;

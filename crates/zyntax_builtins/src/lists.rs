@@ -543,8 +543,122 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(best.e()));
         d.push(define(&name(op), &[&xs], k.elem.clone(), s));
     }
-    // Everything boxed, for a list that becomes dynamic.
+    // Ordering by keys computed elsewhere: `keys[i]` is the key of
+    // `xs[i]`, one dynamic value per element. Both lists move together,
+    // so the sort stays stable in either direction: an element moves past
+    // another only when its key is strictly smaller (or, descending,
+    // strictly greater), never when the two are equal.
     let any_list = list_of(list_type_of(&k.list), any());
+    let keys = local("keys", any_list.clone());
+    let descending = local("descending", boolean());
+    let key = local("key", any());
+    let key_j = local("key_j", any());
+    let moves = local("moves", boolean());
+    d.push(define(
+        &name("sort_by"),
+        &[&xs, &keys, &descending],
+        unit(),
+        vec![
+            n.decl(len(xs.e())),
+            i.decl(int(1)),
+            while_(
+                lt(i.e(), n.e()),
+                vec![
+                    v.decl(el(&xs, i.e())),
+                    key.decl(idx(keys.e(), i.e(), any())),
+                    j.decl(sub(i.e(), int(1))),
+                    moves.decl(bool(true)),
+                    while_(
+                        and(ge(j.e(), int(0)), moves.e()),
+                        vec![
+                            key_j.decl(idx(keys.e(), j.e(), any())),
+                            moves.set(if_expr(
+                                descending.e(),
+                                call("zb_any_lt", vec![key_j.e(), key.e()], boolean()),
+                                call("zb_any_lt", vec![key.e(), key_j.e()], boolean()),
+                            )),
+                            when(
+                                moves.e(),
+                                vec![
+                                    set_idx(xs.e(), add(j.e(), int(1)), el(&xs, j.e())),
+                                    set_idx(
+                                        keys.e(),
+                                        add(j.e(), int(1)),
+                                        idx(keys.e(), j.e(), any()),
+                                    ),
+                                    j.set(sub(j.e(), int(1))),
+                                ],
+                            ),
+                        ],
+                    ),
+                    set_idx(xs.e(), add(j.e(), int(1)), v.e()),
+                    set_idx(keys.e(), add(j.e(), int(1)), key.e()),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    // Descending order of the elements themselves, stable like `sort`.
+    d.push(define(
+        &name("sort_desc"),
+        &[&xs],
+        unit(),
+        vec![
+            n.decl(len(xs.e())),
+            i.decl(int(1)),
+            while_(
+                lt(i.e(), n.e()),
+                vec![
+                    v.decl(el(&xs, i.e())),
+                    j.decl(sub(i.e(), int(1))),
+                    while_(
+                        and(ge(j.e(), int(0)), (k.lt)(el(&xs, j.e()), v.e())),
+                        vec![
+                            set_idx(xs.e(), add(j.e(), int(1)), el(&xs, j.e())),
+                            j.set(sub(j.e(), int(1))),
+                        ],
+                    ),
+                    set_idx(xs.e(), add(j.e(), int(1)), v.e()),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    // The element whose key is least (or greatest); the first of equals.
+    let best_key = local("best_key", any());
+    for (op, message, better) in [
+        ("min_by", "min() arg is an empty sequence", true),
+        ("max_by", "max() arg is an empty sequence", false),
+    ] {
+        let pick: Expr = if better {
+            call("zb_any_lt", vec![key.e(), best_key.e()], boolean())
+        } else {
+            call("zb_any_lt", vec![best_key.e(), key.e()], boolean())
+        };
+        let mut s = vec![
+            when(
+                eq(len(xs.e()), int(0)),
+                vec![fatal("ValueError", text(message))],
+            ),
+            best.decl(el(&xs, int(0))),
+            best_key.decl(idx(keys.e(), int(0), any())),
+            n.decl(len(xs.e())),
+        ];
+        s.extend(for_range(
+            &i,
+            int(1),
+            n.e(),
+            vec![
+                key.decl(idx(keys.e(), i.e(), any())),
+                when(pick, vec![best.set(el(&xs, i.e())), best_key.set(key.e())]),
+            ],
+        ));
+        s.push(ret(best.e()));
+        d.push(define(&name(op), &[&xs, &keys], k.elem.clone(), s));
+    }
+    // Everything boxed, for a list that becomes dynamic.
     let out_any = local("out", any_list.clone());
     d.push(define(&name("to_any"), &[&xs], any_list.clone(), {
         let mut s = vec![
