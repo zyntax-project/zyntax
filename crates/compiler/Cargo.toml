@@ -67,19 +67,19 @@ once_cell = "1.19"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Hot-function promotion broker for interpreter-to-JIT tiering
-beadie = "0.3"
+beadie = { git = "https://github.com/darmie/beadie.git", rev = "868d106" }
 
 # Optional features for backend support
 # Pinned to a specific wasmtime commit (not `branch = "main"`) so a
 # zyntax main checkout resolves the same Cranelift build every time and
 # downstream projects can depend on it reproducibly. Bump the rev
 # deliberately. This rev carries the x64 VNNI vpdpbusd (VEX + EVEX) work.
-cranelift = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
-cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
-cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
-cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
-cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
-cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "60154144e42823007958fd9b9eda3ad11fc382fa", optional = true }
+cranelift = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
 inkwell = { version = "0.7.1", features = ["llvm21-1"], optional = true }  # LLVM bindings
 
 # Wasm encoder for the hot-function tier-1 JIT (Phase E). Optional
