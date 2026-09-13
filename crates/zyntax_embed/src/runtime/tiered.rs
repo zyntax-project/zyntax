@@ -83,6 +83,10 @@ pub struct TieredRuntime {
     /// Whether to run the interp-safe HIR optimisations before a module
     /// reaches a backend. See `ZyntaxRuntime::set_run_interp_opts`.
     run_interp_opts: bool,
+    /// Whether the modules this runtime compiles have their storage
+    /// released across blocks and through returned storage. See
+    /// [`Self::set_automatic_release`].
+    automatic_release: bool,
     /// Import resolver callbacks. Same role as `ZyntaxRuntime.import_resolvers`
     /// — consulted during `lower_typed_program` to pull in stdlib source
     /// (`prelude`, `tensor`, …) and any user-supplied module sources.
@@ -411,6 +415,7 @@ impl TieredRuntime {
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
             run_interp_opts: true,
+            automatic_release: false,
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
@@ -984,6 +989,15 @@ impl TieredRuntime {
         self.run_interp_opts = run;
     }
 
+    /// Release storage in the programs this runtime compiles wherever
+    /// the compiler can prove it dead, across blocks and through what
+    /// functions return. For a language whose programs never release
+    /// anything themselves; a program that does would free what the
+    /// compiler already freed.
+    pub fn set_automatic_release(&mut self, on: bool) {
+        self.automatic_release = on;
+    }
+
     /// Load all ZRTL plugins from a directory
     ///
     /// Loads all `.zrtl` files from the specified directory.
@@ -1255,6 +1269,7 @@ impl TieredRuntime {
         let fiber_decls = collect_fiber_decls(&program);
         let (mut hir_module, entered) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
+        hir_module.automatic_release = self.automatic_release;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -1285,6 +1300,7 @@ impl TieredRuntime {
         let fiber_decls = collect_fiber_decls(&program);
         let (mut hir_module, _) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
+        hir_module.automatic_release = self.automatic_release;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);

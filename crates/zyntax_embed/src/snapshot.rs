@@ -343,6 +343,19 @@ pub fn lower_for_snapshot(
     builtins: indexmap::IndexMap<String, String>,
     prelowered: Vec<Arc<HirModule>>,
 ) -> Result<HirModule, SnapshotError> {
+    lower_for_snapshot_releasing(name, program, builtins, prelowered, false)
+}
+
+/// [`lower_for_snapshot`] with the module's storage released as the
+/// runtime that loads it will release: a module compiled with automatic
+/// release on is optimised with it on, so the two agree.
+pub fn lower_for_snapshot_releasing(
+    name: &str,
+    program: zyntax_typed_ast::TypedProgram,
+    builtins: indexmap::IndexMap<String, String>,
+    prelowered: Vec<Arc<HirModule>>,
+    automatic_release: bool,
+) -> Result<HirModule, SnapshotError> {
     let none_grammars = std::collections::HashMap::new();
     let none_signatures = std::collections::HashMap::new();
     let none_modules = crate::import_chain::SnapshotModules::default();
@@ -372,6 +385,7 @@ pub fn lower_for_snapshot(
             module: name.to_string(),
         });
     }
+    module.automatic_release = automatic_release;
     let _ = zyntax_compiler::run_interp_safe_opts(&mut module);
     zyntax_compiler::run_native_only_opts(&mut module);
     Ok(module)

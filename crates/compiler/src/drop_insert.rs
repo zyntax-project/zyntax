@@ -34,8 +34,8 @@
 //! successor keeps it: after a last use, or on an edge into a block that
 //! reads it nowhere (an entry insertion, or a block spliced into the
 //! edge). This cross-block placement and the transfer through returned
-//! storage are on under [`automatic_release`], for a language whose
-//! programs never release anything by hand.
+//! storage are on for a module that asks (`HirModule::automatic_release`),
+//! for a language whose programs never release anything by hand.
 //!
 //! A value that reaches a phi is not released by its own name past the
 //! merge; the phi owns it instead when every incoming is owned storage
@@ -57,7 +57,6 @@
 //!   that stores or returns its parameter must say so with `Owned`.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hir::{
     HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
@@ -71,26 +70,16 @@ const STRING_COPY: &str = "$IO$string_copy";
 /// Releases a dynamic box and whatever it owns.
 const BOX_FREE: &str = "zyntax_box_free";
 
-static AUTOMATIC_RELEASE: AtomicBool = AtomicBool::new(false);
-
-/// Turn on release across blocks and through returned storage for every
-/// module compiled afterwards. For a language whose programs never
-/// release anything by hand; one that does keeps this off, or a release
-/// written in the program frees what this already freed.
-pub fn set_automatic_release(on: bool) {
-    AUTOMATIC_RELEASE.store(on, Ordering::Relaxed);
-}
-
 /// Whether storage is released across blocks and through returned
-/// storage: asked for by [`set_automatic_release`], or by
-/// `ZYNTAX_DROP_GLUE=1`, which turns on the type release glue as well.
+/// storage: asked for by the module (`HirModule::automatic_release`), or
+/// by `ZYNTAX_DROP_GLUE=1`, which turns on the type release glue as well.
 /// `ZYNTAX_DISABLE_AUTOMATIC_RELEASE=1` overrides both; safe, and what to
 /// try first when a program reads freed memory.
-pub fn automatic_release() -> bool {
+fn automatic_release_for(module: &HirModule) -> bool {
     if std::env::var_os("ZYNTAX_DISABLE_AUTOMATIC_RELEASE").is_some() {
         return false;
     }
-    AUTOMATIC_RELEASE.load(Ordering::Relaxed) || crate::drop_glue::enabled()
+    module.automatic_release || crate::drop_glue::enabled()
 }
 
 /// Runtime symbols whose result is what the box they were given holds: a
@@ -161,6 +150,8 @@ pub fn run_module(module: &mut HirModule) -> DropStats {
 /// What this pass knows about the other functions in the module.
 #[derive(Default)]
 struct ModuleFacts {
+    /// See [`automatic_release_for`].
+    automatic_release: bool,
     returns_owned: std::collections::HashSet<HirId>,
     /// Externs whose result is a fresh string: a call to one is an
     /// allocation the caller releases with the string free.
@@ -243,6 +234,7 @@ impl ModuleFacts {
             .map(|(key, f)| (*key, f.name.resolve_global().unwrap_or_default()))
             .collect();
         let mut facts = Self {
+            automatic_release: automatic_release_for(module),
             returns_owned: std::collections::HashSet::new(),
             string_makers,
             returns_param: std::collections::HashMap::new(),
@@ -373,7 +365,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     // since a program releasing by hand may release what arrives at one.
     let mut candidates: std::collections::HashSet<HirId> = phi_blocks
         .iter()
-        .filter(|(_, block)| automatic_release() || bodies.contains_key(block))
+        .filter(|(_, block)| facts.automatic_release || bodies.contains_key(block))
         .map(|(p, _)| *p)
         .collect();
     loop {
@@ -864,7 +856,7 @@ fn functions_returning_owned_storage(
         // More than one allocation transfers only under automatic
         // release. Off, a constructor with a branch stays untransferred,
         // which is what a program releasing by hand depends on.
-        if sites.len() > 1 && !automatic_release() {
+        if sites.len() > 1 && !facts.automatic_release {
             continue;
         }
         let name = || func.name.resolve_global().unwrap_or_default();
@@ -1656,7 +1648,8 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
                 UseKind::Use => {
                     had_any_use = true;
                     if *block_id != site.block {
-                        return match automatic_release()
+                        return match facts
+                            .automatic_release
                             .then(|| drop_points(func, site, &derived, facts))
                             .flatten()
                         {

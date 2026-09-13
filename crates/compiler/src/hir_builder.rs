@@ -124,6 +124,7 @@ impl<'arena> HirBuilder<'arena> {
                 dependencies: std::collections::HashSet::new(),
                 effects: IndexMap::new(),
                 handlers: IndexMap::new(),
+                automatic_release: false,
             },
             arena,
             current_function: None,

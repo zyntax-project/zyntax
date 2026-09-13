@@ -966,6 +966,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             dependencies: HashSet::new(),
             effects,
             handlers,
+            automatic_release: false,
         };
         self.compile_module(&temp_module)?;
         Ok(())

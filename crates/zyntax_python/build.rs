@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use zyntax_embed::{lower_for_snapshot, SnapshotBuilder};
+use zyntax_embed::{lower_for_snapshot_releasing, SnapshotBuilder};
 use zyntax_typed_ast::{InternedString, Span, TypedProgram};
 
 #[path = "src/policy.rs"]
@@ -23,9 +23,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Lowered for the target, not for the machine building it.
     let width: usize = env::var("CARGO_CFG_TARGET_POINTER_WIDTH")?.parse()?;
     zyntax_compiler::set_target_pointer_size(width / 8);
-    // Released as the runtime will release: no Python program frees
-    // anything by hand.
-    zyntax_compiler::drop_insert::set_automatic_release(true);
 
     let library = zyntax_builtins::library(&policy::POLICY);
     let program = TypedProgram {
@@ -36,11 +33,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         type_registry: library.type_registry,
     };
 
-    let hir = lower_for_snapshot(
+    // Released as the runtime will release: no Python program frees
+    // anything by hand.
+    let hir = lower_for_snapshot_releasing(
         policy::LIBRARY_MODULE,
         program.clone(),
         indexmap::IndexMap::new(),
         Vec::new(),
+        true,
     )?;
     SnapshotBuilder::new("python")
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?

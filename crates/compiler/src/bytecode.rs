@@ -455,6 +455,7 @@ mod tests {
             dependencies: std::collections::HashSet::new(),
             effects: IndexMap::new(),
             handlers: IndexMap::new(),
+            automatic_release: false,
         }
     }
 

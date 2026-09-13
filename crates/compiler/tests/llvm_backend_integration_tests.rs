@@ -53,6 +53,7 @@ mod llvm_tests {
             dependencies: HashSet::new(),
             effects: indexmap::IndexMap::new(),
             handlers: indexmap::IndexMap::new(),
+            automatic_release: false,
         }
     }
 

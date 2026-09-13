@@ -712,6 +712,7 @@ mod tests {
             dependencies: HashSet::new(),
             effects: IndexMap::new(),
             handlers: IndexMap::new(),
+            automatic_release: false,
         }
     }
 

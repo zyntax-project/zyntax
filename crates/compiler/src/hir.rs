@@ -300,6 +300,13 @@ pub struct HirModule {
     pub effects: IndexMap<HirId, HirEffect>,
     /// Effect handler definitions
     pub handlers: IndexMap<HirId, HirEffectHandler>,
+    /// Whether storage is released for this module across blocks and
+    /// through returned storage, in addition to the release of a value
+    /// that dies where it was made. For a language whose programs never
+    /// release anything themselves; a program that does keeps this off,
+    /// or its own release frees what was already freed.
+    #[serde(default)]
+    pub automatic_release: bool,
 }
 
 /// HIR function with CFG and SSA form
@@ -2437,6 +2444,7 @@ impl HirModule {
             dependencies: HashSet::new(),
             effects: IndexMap::new(),
             handlers: IndexMap::new(),
+            automatic_release: false,
         }
     }
 

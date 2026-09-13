@@ -43,6 +43,7 @@ fn create_test_module() -> HirModule {
         dependencies: HashSet::new(),
         effects: IndexMap::new(),
         handlers: IndexMap::new(),
+        automatic_release: false,
     }
 }
 
