@@ -159,7 +159,10 @@ impl Default for TieredConfig {
             tier2_backend: Tier2Backend::Cranelift,
             verbosity: 0,
             llvm_cache_key: None,
-            enable_osr: true,
+            // `ZYNTAX_DISABLE_OSR=1` keeps every function in the tier it
+            // started in; safe, and what to try first when a hot loop
+            // misbehaves.
+            enable_osr: std::env::var_os("ZYNTAX_DISABLE_OSR").is_none(),
             enable_hot_reload: false,
         }
     }

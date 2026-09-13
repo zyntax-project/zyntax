@@ -1965,23 +1965,24 @@ impl CraneliftBackend {
             let mut destination_ptr: Option<cranelift_codegen::ir::Value> = None;
             if let Some(layout) = &osr_helper {
                 // The sole argument is the frame's address. Recover each
-                // live-in from its offset: a value held by reference is
-                // already in the frame, so its address is the value; a
-                // scalar is loaded out.
+                // live-in from its offset: a scalar as itself, an aggregate
+                // as the pointer to its storage, which is how this backend
+                // holds one anyway.
                 let frame_ptr = builder.block_params(entry_block)[0];
                 for (i, hir_id) in layout.live_ins.iter().enumerate() {
                     let Some(&offset) = layout.frame.offsets.get(i) else {
                         break;
                     };
                     let hir_ty = &layout.live_in_types[i];
-                    let recovered = if crate::osr::is_held_by_reference(hir_ty) {
-                        builder.ins().iadd_imm(frame_ptr, offset as i64)
+                    let target = if crate::osr::is_held_by_reference(hir_ty) {
+                        pointer_type
                     } else {
-                        let target = type_cache.get(hir_ty).copied().unwrap_or(types::I64);
+                        type_cache.get(hir_ty).copied().unwrap_or(types::I64)
+                    };
+                    let recovered =
                         builder
                             .ins()
-                            .load(target, MemFlags::new(), frame_ptr, offset as i32)
-                    };
+                            .load(target, MemFlags::new(), frame_ptr, offset as i32);
                     if i < layout.phi_count {
                         osr_phi_jump_args.push(recovered);
                     } else {
@@ -2227,7 +2228,7 @@ impl CraneliftBackend {
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
                     let empty_frame = crate::osr::OsrFrame::for_types(&[]);
-                    let (site_key, live_in_clir, live_in_types, frame, return_clir) =
+                    let (site_key, live_in_clir, frame, return_clir) =
                         if let Some(layout) = osr_layouts.get(hir_block_id) {
                             // Collect the Cranelift value backing each live-in.
                             let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
@@ -2240,14 +2241,12 @@ impl CraneliftBackend {
                                 (
                                     layout.site_key(),
                                     clir_vals,
-                                    layout.live_in_types.clone(),
                                     layout.frame.clone(),
                                     osr_return_clir,
                                 )
                             } else {
                                 (
                                     crate::osr::encode_osr_site(block_index, 0),
-                                    Vec::new(),
                                     Vec::new(),
                                     empty_frame.clone(),
                                     None,
@@ -2257,7 +2256,6 @@ impl CraneliftBackend {
                             // Layout rejected → probe only, no dispatch.
                             (
                                 crate::osr::encode_osr_site(block_index, 0),
-                                Vec::new(),
                                 Vec::new(),
                                 empty_frame.clone(),
                                 None,
@@ -2279,7 +2277,6 @@ impl CraneliftBackend {
                         site_key,
                         &frame,
                         &live_in_clir,
-                        &live_in_types,
                         return_clir,
                     );
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
@@ -9630,7 +9627,6 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
 /// On exit the builder is positioned in `b_post_probe` so subsequent
 /// instruction/terminator emission lands there.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn emit_osr_back_edge_probe(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
@@ -9638,11 +9634,8 @@ fn emit_osr_back_edge_probe(
     site_key: u64,
     frame: &crate::osr::OsrFrame,
     live_ins: &[cranelift_codegen::ir::Value],
-    live_in_types: &[HirType],
     return_clir: Option<cranelift_codegen::ir::Type>,
 ) {
-    let target_config = module.target_config();
-
     // Helper signature: one pointer to the frame carrying the live-ins.
     // Passing them as arguments would force each to fit a register, which
     // rules out the aggregates real loops carry.
@@ -9703,8 +9696,7 @@ fn emit_osr_back_edge_probe(
                     builder.ins().call(f, &[site_v, helper_ptr]);
                 }
             }
-            let frame_addr =
-                emit_osr_frame_store(builder, target_config, frame, live_ins, live_in_types);
+            let frame_addr = emit_osr_frame_store(builder, frame, live_ins);
             let call = builder
                 .ins()
                 .call_indirect(sig_ref, helper_ptr, &[frame_addr]);
@@ -9724,16 +9716,14 @@ fn emit_osr_back_edge_probe(
 
 /// Spill the live-ins into a stack frame and return its address.
 ///
-/// A value held by reference has its bytes copied out of whatever it points
-/// at; a scalar is stored directly. Either way the frame ends up holding
-/// the value itself, which is what lets a helper compiled by a different
-/// backend read it without agreeing on how it is held in registers.
+/// Each live-in is stored as this backend holds it: a scalar as its value,
+/// an aggregate as the pointer to its storage. The pointer, not a copy of
+/// what it points at, so the resumed code and everything else that
+/// addresses that storage keep seeing the same bytes.
 fn emit_osr_frame_store(
     builder: &mut FunctionBuilder<'_>,
-    target_config: cranelift_codegen::isa::TargetFrontendConfig,
     frame: &crate::osr::OsrFrame,
     live_ins: &[cranelift_codegen::ir::Value],
-    live_in_types: &[HirType],
 ) -> cranelift_codegen::ir::Value {
     use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
 
@@ -9745,26 +9735,10 @@ fn emit_osr_frame_store(
     let base = builder.ins().stack_addr(types::I64, slot, 0);
 
     for (i, &v) in live_ins.iter().enumerate() {
-        let (Some(&offset), Some(ty)) = (frame.offsets.get(i), live_in_types.get(i)) else {
+        let Some(&offset) = frame.offsets.get(i) else {
             continue;
         };
-        let dst = builder.ins().iadd_imm(base, offset as i64);
-        if crate::osr::is_held_by_reference(ty) {
-            let size = crate::osr::frame_size_of(ty) as u64;
-            let align = crate::osr::frame_align_of(ty) as u8;
-            builder.emit_small_memory_copy(
-                target_config,
-                dst,
-                v,
-                size,
-                align,
-                align,
-                true,
-                MemFlags::new(),
-            );
-        } else {
-            builder.ins().store(MemFlags::new(), v, dst, 0);
-        }
+        builder.ins().store(MemFlags::new(), v, base, offset as i32);
     }
     base
 }

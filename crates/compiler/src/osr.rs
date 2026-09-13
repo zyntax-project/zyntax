@@ -961,6 +961,9 @@ pub fn blocks_reachable_from(
 /// in-memory aggregate. Frames are written by one backend and read by the
 /// other, so the two must agree byte for byte.
 pub fn frame_size_of(ty: &HirType) -> usize {
+    if is_held_by_reference(ty) {
+        return 8;
+    }
     match ty {
         HirType::Bool | HirType::I8 | HirType::U8 => 1,
         HirType::I16 | HirType::U16 => 2,
@@ -977,7 +980,6 @@ pub fn frame_size_of(ty: &HirType) -> usize {
             let a = frame_align_of(ty);
             size.div_ceil(a) * a
         }
-        HirType::Array(elem, n) => frame_size_of(elem).saturating_mul(*n as usize),
         HirType::Vector(elem, n) => frame_size_of(elem).saturating_mul(*n as usize),
         _ => 8,
     }
@@ -985,9 +987,11 @@ pub fn frame_size_of(ty: &HirType) -> usize {
 
 /// Alignment of `ty` in an OSR frame.
 pub fn frame_align_of(ty: &HirType) -> usize {
+    if is_held_by_reference(ty) {
+        return 8;
+    }
     match ty {
         HirType::Struct(s) => s.fields.iter().map(frame_align_of).max().unwrap_or(1),
-        HirType::Array(elem, _) => frame_align_of(elem),
         HirType::Vector(elem, _) => frame_align_of(elem),
         other => frame_size_of(other).min(16).max(1),
     }
@@ -996,10 +1000,11 @@ pub fn frame_align_of(ty: &HirType) -> usize {
 /// Whether a value of this type is held as a pointer to its storage rather
 /// than as the value itself.
 ///
-/// Cranelift gives a multi-field struct a pointer, so writing one into a
-/// frame means copying the bytes it points at rather than storing the
-/// value. LLVM holds the same struct by value, which is precisely why the
-/// frame exists.
+/// Such a value travels through the frame as that pointer, never as a
+/// copy of what it points at: the storage may be shared (a list header,
+/// an object, a stack slot other live-ins address), and the resumed code
+/// must keep writing where everything else reads. A backend that holds
+/// the struct by value loads it through the pointer on its side.
 pub fn is_held_by_reference(ty: &HirType) -> bool {
     match ty {
         HirType::Struct(s) => s.fields.len() > 1,
@@ -1010,11 +1015,11 @@ pub fn is_held_by_reference(ty: &HirType) -> bool {
 
 /// Where each live-in sits in the frame a back-edge hands to a helper.
 ///
-/// Passing live-ins as arguments forced every one to fit a register, which
-/// ruled out aggregates — and the backends do not even agree on how to hold
-/// one: a multi-field struct is a pointer in Cranelift and a value in LLVM.
-/// A frame sidesteps both. The writer stores bytes, the reader loads them,
-/// and neither has to care how the other represents the value in registers.
+/// Passing live-ins as arguments forced every one to fit a register, and
+/// the backends do not agree on how to hold an aggregate in one: a
+/// multi-field struct is a pointer in Cranelift and a value in LLVM. The
+/// frame holds scalars as themselves and aggregates as the pointer to
+/// their storage; a reader that wants the value loads it from there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsrFrame {
     /// Byte offset of each live-in, parallel to `OsrLayout::live_ins`.

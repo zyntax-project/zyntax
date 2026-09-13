@@ -906,11 +906,16 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // type is what the load has to match.
                 phi_seed_slots.push((*hir_id, slot, hir_ty.clone()));
             } else {
-                // A value the backends hold by reference was written as the
-                // pointee's bytes, so the slot already is the pointer the
-                // body expects.
+                // A value held by reference travels as the pointer to its
+                // storage, which is what the body expects for one.
                 let recovered = if crate::osr::is_held_by_reference(hir_ty) {
-                    slot.into()
+                    self.builder
+                        .build_load(
+                            self.context.ptr_type(inkwell::AddressSpace::default()),
+                            slot,
+                            "osr_live_in",
+                        )
+                        .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
                 } else {
                     self.builder
                         .build_load(target, slot, "osr_live_in")
@@ -953,17 +958,30 @@ impl<'ctx> LLVMBackend<'ctx> {
                 continue;
             };
             let want = phi_value.as_basic_value().get_type();
-            // Held by reference means the writer copied the pointee's bytes,
-            // so the slot is itself the pointer; load only where the phi
-            // wants the value.
-            let seed: BasicValueEnum<'ctx> =
-                if crate::osr::is_held_by_reference(hir_ty) && want.is_pointer_type() {
-                    (*slot).into()
+            // A value held by reference arrives as the pointer to its
+            // storage; a phi that holds the value itself loads it from
+            // there.
+            let seed: BasicValueEnum<'ctx> = if crate::osr::is_held_by_reference(hir_ty) {
+                let ptr = self
+                    .builder
+                    .build_load(
+                        self.context.ptr_type(inkwell::AddressSpace::default()),
+                        *slot,
+                        "osr_live_in",
+                    )
+                    .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?;
+                if want.is_pointer_type() {
+                    ptr
                 } else {
                     self.builder
-                        .build_load(want, *slot, "osr_live_in")
+                        .build_load(want, ptr.into_pointer_value(), "osr_live_in")
                         .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
-                };
+                }
+            } else {
+                self.builder
+                    .build_load(want, *slot, "osr_live_in")
+                    .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
+            };
             phi_seeds.push((*hir_id, seed));
         }
 
