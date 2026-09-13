@@ -60,7 +60,9 @@ struct Outcome {
 /// Run a command with a deadline. A conformance case that hangs is a
 /// failure that must be reported, not a suite that never finishes.
 fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Only stdout is compared. A piped stderr nobody reads would stall
+    // the child once it filled the pipe.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -70,22 +72,31 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
             }
         }
     };
+    // Drained as it is written, so a program that prints more than a
+    // pipe holds does not wait on a reader that waits on its exit.
+    let reader = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        })
+    });
+    let collect = |reader: Option<std::thread::JoinHandle<String>>| {
+        reader.and_then(|r| r.join().ok()).unwrap_or_default()
+    };
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_string(&mut out);
-                }
                 return Outcome {
-                    stdout: out,
+                    stdout: collect(reader),
                     status: status.code().unwrap_or(-2),
                 };
             }
             Ok(None) if start.elapsed() > limit => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = collect(reader);
                 return Outcome {
                     stdout: format!("<timed out after {:?}>", limit),
                     status: -3,
@@ -139,9 +150,21 @@ fn expected_for(case: &Path) -> Option<Outcome> {
 }
 
 fn ours_for(case: &Path) -> Outcome {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zypy"));
-    cmd.arg("run").arg(case);
-    run_bounded(cmd, Duration::from_secs(60))
+    // A binary run the moment it was linked can die before its first
+    // instruction (the loader refusing it, a spawn failing under load);
+    // that says nothing about the program, so it is tried again.
+    for attempt in 0..3 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_zypy"));
+        cmd.arg("run").arg(case);
+        let got = run_bounded(cmd, Duration::from_secs(60));
+        let died_before_running =
+            got.status < 0 && got.status != -3 && got.stdout.is_empty() || got.status == -1;
+        if !died_before_running || attempt == 2 {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// Run every case in one category and report.
