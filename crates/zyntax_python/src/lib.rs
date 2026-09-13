@@ -29,6 +29,7 @@ mod classes;
 mod format;
 mod host;
 mod lower;
+mod modules;
 mod prelude;
 mod scope;
 mod stdlib;
@@ -128,8 +129,17 @@ pub fn register_runtime(
     ])
 }
 
-/// Parse Python source and rewrite it into a `TypedProgram`.
+/// Parse Python source and rewrite it into a `TypedProgram`. A program
+/// that imports its own modules needs [`parse_program_with`].
 pub fn parse_program(source: &str) -> Result<TypedProgram> {
+    parse_program_with(source, &|_| None)
+}
+
+/// [`parse_program`] for a program of several files: `modules` finds
+/// the source of a module by its dotted name. Each module's body runs
+/// once, ahead of the file importing it, and its names are the
+/// module's own.
+pub fn parse_program_with(source: &str, modules: &modules::Resolver<'_>) -> Result<TypedProgram> {
     let parsed = ruff_python_parser::parse_module(source)
         .map_err(|e| Error::Syntax(format!("{} at {:?}", e.error, e.location)))?;
     if let Some(first) = parsed.errors().first() {
@@ -139,12 +149,14 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         )));
     }
     let mut module = parsed.into_syntax();
+    let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
+    let linked = modules::link(main, modules)?;
     // The prelude's declarations come first.
     let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
         .expect("the prelude parses")
         .into_syntax();
     let mut body = prelude.body;
-    body.append(&mut module.body);
+    body.extend(linked);
     module.body = body;
 
     // A module's body is the program. Statements outside any `def` run

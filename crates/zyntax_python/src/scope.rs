@@ -125,7 +125,19 @@ impl<'a> Visitor<'a> for Collector {
                 self.children
                     .push((f.name.to_string(), Scope::of_function(f)));
             }
-            py::Stmt::ClassDef(c) => self.bind(c.name.as_str()),
+            // A class binds its name; its methods are bodies of their
+            // own, reading the module the way any function does.
+            py::Stmt::ClassDef(c) => {
+                self.bind(c.name.as_str());
+                for s in &c.body {
+                    if let py::Stmt::FunctionDef(m) = s {
+                        self.children.push((
+                            format!("{}.{}", c.name.as_str(), m.name.as_str()),
+                            Scope::of_function(m),
+                        ));
+                    }
+                }
+            }
             py::Stmt::Global(g) => {
                 for n in &g.names {
                     self.globals.insert(n.to_string());

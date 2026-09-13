@@ -1,0 +1,9 @@
+shapes loaded as lib.shapes
+3.14 12.57
+6.283
+28.27 circle r=3 in lib.shapes
+*** HI *** area 3.14
+4 4 3
+__main__
+16
+[3.14, 12.57]

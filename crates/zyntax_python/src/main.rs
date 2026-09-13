@@ -28,7 +28,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let program = match zyntax_python::parse_program(&source) {
+    // A module the program imports is a file beside it, `a.b` at
+    // `a/b.py`.
+    let root = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let resolve = |module: &str| {
+        let mut file = root.clone();
+        for part in module.split('.') {
+            file.push(part);
+        }
+        file.set_extension("py");
+        std::fs::read_to_string(&file).ok()
+    };
+    let program = match zyntax_python::parse_program_with(&source, &resolve) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("zypy: {e}");
