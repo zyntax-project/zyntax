@@ -22,7 +22,7 @@ mod strings;
 use zyntax_typed_ast::typed_builder::TypedASTBuilder;
 use zyntax_typed_ast::{TypeId, TypeRegistry};
 
-pub use build::Decl;
+pub use build::{Decl, MODULE};
 
 /// How a language spells the values the library prints.
 #[derive(Clone, Debug)]
@@ -151,8 +151,21 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(lists::declarations(policy, list_type));
     declarations.extend(functions::declarations(list_type));
     declarations.extend(dicts::declarations(list_type));
-    if !policy.instance_hooks {
+    // The hooks a frontend defines are declared here as externs, so the
+    // library lowers on its own; the frontend's definition takes the
+    // declaration's place when the two meet in a program.
+    if policy.instance_hooks {
+        declarations.extend(dynamic::extern_instance_hooks());
+    } else {
         declarations.extend(dynamic::default_instance_hooks(policy));
+    }
+    if policy.exceptions {
+        declarations.push(build::extern_fn(
+            "zb_hook_raise",
+            &[("kind", build::string()), ("message", build::string())],
+            build::unit(),
+            None,
+        ));
     }
     let fallible = fallible_functions(&declarations);
     Library {

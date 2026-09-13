@@ -75,6 +75,20 @@ fn is_instance(x: Expr) -> Expr {
     ge(kind(x), int(INSTANCE_KIND_BASE))
 }
 
+/// The instance hooks as the frontend that defines them declares them.
+pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
+    vec![
+        extern_fn("zb_hook_instance_str", &[("x", any())], string(), None),
+        extern_fn("zb_hook_instance_type", &[("x", any())], string(), None),
+        extern_fn(
+            "zb_hook_instance_eq",
+            &[("a", any()), ("b", any())],
+            boolean(),
+            None,
+        ),
+    ]
+}
+
 /// What the library says about instances when the frontend defines no
 /// hooks: nothing is equal to anything, and they print as objects.
 pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {

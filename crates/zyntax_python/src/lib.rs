@@ -42,6 +42,9 @@ pub enum Error {
     /// guess.
     #[error("{what} is not supported yet (at byte offset {at})")]
     Unsupported { what: String, at: usize },
+    /// The built-in library this crate was built with cannot be read.
+    #[error("the built-in library is unreadable: {0}")]
+    Library(String),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -50,29 +53,58 @@ type Result<T> = std::result::Result<T, Error>;
 /// Python program by calling this.
 pub const ENTRY: &str = "__main__";
 
-/// Python's spellings for the built-in library.
-const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
-    true_text: "True",
-    false_text: "False",
-    none_text: "None",
-    single_quotes: true,
-    float_fraction: true,
-    instance_hooks: true,
-    exceptions: true,
-    type_names: zyntax_builtins::TypeNames {
-        none: "NoneType",
-        bool: "bool",
-        int: "int",
-        float: "float",
-        str: "str",
-        list: "list",
-        tuple: "tuple",
-        dict: "dict",
-        set: "set",
-        function: "function",
-        object: "object",
-    },
-};
+mod policy;
+use policy::LIBRARY_MODULE;
+pub use policy::POLICY;
+
+/// The built-in library, declared and lowered when this crate was
+/// built. A program imports it; the runtime links the HIR and lowers
+/// only the program.
+const SNAPSHOT: &[u8] = zyntax_embed::include_snapshot!("python");
+
+mod fallible {
+    include!(concat!(env!("OUT_DIR"), "/fallible.rs"));
+}
+
+/// The snapshot, decoded once per process.
+fn snapshot() -> Result<std::sync::Arc<zyntax_embed::Snapshot>> {
+    static SNAPSHOT_ONCE: std::sync::OnceLock<
+        std::result::Result<std::sync::Arc<zyntax_embed::Snapshot>, String>,
+    > = std::sync::OnceLock::new();
+    SNAPSHOT_ONCE
+        .get_or_init(|| {
+            zyntax_embed::Snapshot::load(SNAPSHOT)
+                .map(std::sync::Arc::new)
+                .map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(Error::Library)
+}
+
+/// What the frontend needs to know about the library: the registry its
+/// types live in, which type is `List<T>`, and which functions raise.
+struct Library {
+    type_registry: zyntax_typed_ast::TypeRegistry,
+    list_type: zyntax_typed_ast::TypeId,
+    fallible: std::collections::BTreeSet<String>,
+}
+
+fn library() -> Result<Library> {
+    let module = snapshot()?
+        .module(LIBRARY_MODULE)
+        .map_err(|e| Error::Library(e.to_string()))?
+        .ok_or_else(|| Error::Library(format!("the snapshot has no `{LIBRARY_MODULE}`")))?;
+    let type_registry = module.program().type_registry.clone();
+    let list_type = type_registry
+        .get_type_by_name(intern("List"))
+        .map(|def| def.id)
+        .ok_or_else(|| Error::Library("the library declares no List type".to_string()))?;
+    Ok(Library {
+        type_registry,
+        list_type,
+        fallible: fallible::FALLIBLE.iter().map(|s| s.to_string()).collect(),
+    })
+}
 
 /// Give a runtime what a compiled Python program links against: the IO
 /// and string plugins the library's primitives come from, and the name
@@ -81,6 +113,8 @@ const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
 pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {
+    let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
+    runtime.install_snapshot(snapshot)?;
     runtime.declare_entry_points([ENTRY]);
     runtime.register_static_plugins([zrtl_io::static_plugin(), zrtl_string::static_plugin()])
 }
@@ -150,7 +184,7 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         }
     }
 
-    let mut library = zyntax_builtins::library(&POLICY);
+    let mut library = library()?;
     lower::set_list_type(library.list_type);
     let owned: Vec<py::Stmt> = top_level.iter().map(|s| (*s).clone()).collect();
     let entry_sig = types::Sig {
@@ -326,7 +360,18 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
             Span::new(0, 0),
         ));
     }
-    declarations.extend(library.declarations);
+    // The library itself arrives by import: its declarations for
+    // typing, its HIR to link against.
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Import(zyntax_typed_ast::typed_ast::TypedImport {
+            language: Some(intern("python")),
+            module_path: vec![intern(LIBRARY_MODULE)],
+            items: Vec::new(),
+            span: Span::new(0, 0),
+        }),
+        Type::Unknown,
+        Span::new(0, 0),
+    ));
 
     Ok(TypedProgram {
         declarations,

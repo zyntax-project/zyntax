@@ -23,4 +23,11 @@ ruff_python_ast = "=0.0.12"
 thiserror = "1"
 ruff_text_size = "=0.0.12"
 
+[build-dependencies]
+zyntax_typed_ast = { path = "../typed_ast" }
+zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
+zyntax_compiler = { path = "../compiler", default-features = false }
+zyntax_builtins = { path = "../zyntax_builtins" }
+indexmap = "2"
+
 [dev-dependencies]
