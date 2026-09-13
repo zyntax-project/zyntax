@@ -34,6 +34,9 @@ use std::collections::HashSet;
 pub struct CfgSimplifyStats {
     /// Number of `succ` blocks absorbed into their predecessor.
     pub merged: usize,
+    /// Empty blocks whose predecessors now branch straight to their
+    /// target.
+    pub threaded: usize,
 }
 
 /// Run on one function. Iterates until no merge fires (covers chains
@@ -52,15 +55,86 @@ pub fn run(func: &mut HirFunction) -> CfgSimplifyStats {
         }
         total.merged += 1;
     }
+    for _ in 0..64 {
+        let Some(empty) = find_threadable_block(func) else {
+            break;
+        };
+        thread_block(func, empty);
+        total.threaded += 1;
+    }
     total
+}
+
+/// An empty block, holding nothing but a branch, that every predecessor
+/// can branch past: a landing pad that costs a taken branch and nothing
+/// else. Not the entry, not a block with phis (its target would need
+/// them), and not one whose predecessor already reaches the target on
+/// another edge, since the target's phis could not tell the two apart.
+fn find_threadable_block(func: &HirFunction) -> Option<HirId> {
+    for (&id, block) in &func.blocks {
+        if id == func.entry_block || !block.instructions.is_empty() || !block.phis.is_empty() {
+            continue;
+        }
+        let HirTerminator::Branch { target } = block.terminator else {
+            continue;
+        };
+        if target == id || block.predecessors.is_empty() {
+            continue;
+        }
+        let clear = block.predecessors.iter().all(|p| {
+            func.blocks.get(p).is_some_and(|pb| {
+                let targets = pb.terminator.targets();
+                targets.iter().filter(|t| **t == id).count() == 1 && !targets.contains(&target)
+            })
+        });
+        if clear {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Send every predecessor of `empty` to its target and drop it. The
+/// target's phis take each predecessor in the empty block's place, with
+/// the value that came through it.
+fn thread_block(func: &mut HirFunction, empty: HirId) {
+    let (preds, target) = match func.blocks.get(&empty) {
+        Some(b) => match b.terminator {
+            HirTerminator::Branch { target } => (b.predecessors.clone(), target),
+            _ => return,
+        },
+        None => return,
+    };
+    for &p in &preds {
+        if let Some(pb) = func.blocks.get_mut(&p) {
+            pb.terminator.retarget(empty, target);
+            for s in pb.successors.iter_mut() {
+                if *s == empty {
+                    *s = target;
+                }
+            }
+        }
+    }
+    if let Some(tb) = func.blocks.get_mut(&target) {
+        tb.predecessors.retain(|p| *p != empty);
+        tb.predecessors.extend(preds.iter().copied());
+        for phi in tb.phis.iter_mut() {
+            if let Some(pos) = phi.incoming.iter().position(|(_, src)| *src == empty) {
+                let (value, _) = phi.incoming.remove(pos);
+                phi.incoming.extend(preds.iter().map(|p| (value, *p)));
+            }
+        }
+    }
+    func.blocks.shift_remove(&empty);
 }
 
 /// Run on every function in a module.
 pub fn run_module(module: &mut HirModule) -> CfgSimplifyStats {
     let mut total = CfgSimplifyStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run(func);
         total.merged += s.merged;
+        total.threaded += s.threaded;
     }
     total
 }

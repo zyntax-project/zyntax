@@ -303,7 +303,15 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
         let kind = match classify_recursive(&snapshot, fid) {
             CalleeClass::OkLeaf => InlineKind::Leaf,
             CalleeClass::OkMultiBlock => InlineKind::MultiBlock,
-            _ => {
+            other => {
+                if std::env::var_os("ZYNTAX_TRACE_INLINE").is_some() {
+                    eprintln!(
+                        "[recursive-inline] {:?}: {:?} ({} insts)",
+                        snapshot.name.resolve_global(),
+                        other,
+                        count_insts(&snapshot)
+                    );
+                }
                 stats.skipped_unsupported += 1;
                 continue;
             }

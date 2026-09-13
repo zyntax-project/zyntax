@@ -6276,6 +6276,18 @@ impl CraneliftBackend {
         } else {
             None
         };
+        // ZYNTAX_DUMP_VCODE=<substring> prints the machine code of any
+        // function whose name contains it, after the CLIF dump above.
+        let dump_vcode = std::env::var("ZYNTAX_DUMP_VCODE").ok().filter(|filter| {
+            let fname = function
+                .name
+                .resolve_global()
+                .unwrap_or_else(|| function.name.to_string());
+            filter.is_empty() || fname.contains(filter.as_str())
+        });
+        if dump_vcode.is_some() {
+            self.codegen_context.set_disasm(true);
+        }
 
         // Compile the function
         log::debug!(
@@ -6340,6 +6352,18 @@ impl CraneliftBackend {
                 .compiled_code()
                 .and_then(|c| c.vcode.clone());
             self.captured_ir = Some((clif, disasm));
+        }
+        if dump_vcode.is_some() {
+            if let Some(vcode) = self
+                .codegen_context
+                .compiled_code()
+                .and_then(|c| c.vcode.as_ref())
+            {
+                eprintln!(
+                    "===== ZYNTAX_DUMP_VCODE: {:?} =====\n{vcode}\n===== end =====",
+                    function.name.resolve_global()
+                );
+            }
         }
 
         // Clear context for next function

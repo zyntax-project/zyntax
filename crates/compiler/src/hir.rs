@@ -1589,6 +1589,73 @@ impl HirTerminator {
             }
         }
     }
+
+    /// The blocks this terminator can go to, in operand order.
+    pub fn targets(&self) -> Vec<HirId> {
+        match self {
+            HirTerminator::Branch { target } => vec![*target],
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => vec![*true_target, *false_target],
+            HirTerminator::Switch { default, cases, .. } => {
+                let mut v = vec![*default];
+                v.extend(cases.iter().map(|(_, b)| *b));
+                v
+            }
+            HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+            HirTerminator::PatternMatch {
+                patterns, default, ..
+            } => {
+                let mut v: Vec<HirId> = patterns.iter().map(|p| p.target).collect();
+                v.extend(default.iter().copied());
+                v
+            }
+            HirTerminator::Return { .. } | HirTerminator::Unreachable => Vec::new(),
+        }
+    }
+
+    /// Point every edge that went to `from` at `to`.
+    pub fn retarget(&mut self, from: HirId, to: HirId) {
+        let swap = |t: &mut HirId| {
+            if *t == from {
+                *t = to;
+            }
+        };
+        match self {
+            HirTerminator::Branch { target } => swap(target),
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => {
+                swap(true_target);
+                swap(false_target);
+            }
+            HirTerminator::Switch { default, cases, .. } => {
+                swap(default);
+                for (_, t) in cases.iter_mut() {
+                    swap(t);
+                }
+            }
+            HirTerminator::Invoke { normal, unwind, .. } => {
+                swap(normal);
+                swap(unwind);
+            }
+            HirTerminator::PatternMatch {
+                patterns, default, ..
+            } => {
+                for p in patterns.iter_mut() {
+                    swap(&mut p.target);
+                }
+                if let Some(d) = default {
+                    swap(d);
+                }
+            }
+            HirTerminator::Return { .. } | HirTerminator::Unreachable => {}
+        }
+    }
 }
 
 /// HIR value in SSA form

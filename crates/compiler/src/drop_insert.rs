@@ -1266,43 +1266,7 @@ fn insert_free_on_edge(
 
 /// Point every edge of `term` that went to `from` at `to`.
 fn retarget(term: &mut HirTerminator, from: HirId, to: HirId) {
-    let swap = |t: &mut HirId| {
-        if *t == from {
-            *t = to;
-        }
-    };
-    match term {
-        HirTerminator::Branch { target } => swap(target),
-        HirTerminator::CondBranch {
-            true_target,
-            false_target,
-            ..
-        } => {
-            swap(true_target);
-            swap(false_target);
-        }
-        HirTerminator::Switch { default, cases, .. } => {
-            swap(default);
-            for (_, t) in cases.iter_mut() {
-                swap(t);
-            }
-        }
-        HirTerminator::Invoke { normal, unwind, .. } => {
-            swap(normal);
-            swap(unwind);
-        }
-        HirTerminator::PatternMatch {
-            patterns, default, ..
-        } => {
-            for p in patterns.iter_mut() {
-                swap(&mut p.target);
-            }
-            if let Some(d) = default {
-                swap(d);
-            }
-        }
-        HirTerminator::Return { .. } | HirTerminator::Unreachable => {}
-    }
+    term.retarget(from, to);
 }
 
 /// Allocation sites, counting a call whose callee hands back owned
@@ -1587,28 +1551,7 @@ fn drop_points_transferring(
 /// cached list, which a pass that rewrote control flow may not have
 /// kept up to date.
 fn successors_of(block: &crate::hir::HirBlock) -> Vec<HirId> {
-    match &block.terminator {
-        HirTerminator::Branch { target } => vec![*target],
-        HirTerminator::CondBranch {
-            true_target,
-            false_target,
-            ..
-        } => vec![*true_target, *false_target],
-        HirTerminator::Switch { default, cases, .. } => {
-            let mut v = vec![*default];
-            v.extend(cases.iter().map(|(_, b)| *b));
-            v
-        }
-        HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
-        HirTerminator::PatternMatch {
-            patterns, default, ..
-        } => {
-            let mut v: Vec<HirId> = patterns.iter().map(|p| p.target).collect();
-            v.extend(default.iter().copied());
-            v
-        }
-        HirTerminator::Return { .. } | HirTerminator::Unreachable => Vec::new(),
-    }
+    block.terminator.targets()
 }
 
 fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> SiteOutcome {

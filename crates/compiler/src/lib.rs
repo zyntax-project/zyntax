@@ -2005,7 +2005,8 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
             || lc.hoisted > 0
             || lv.vectorized > 0
             || rv.vectorized > 0
-            || cs_cfg.merged > 0;
+            || cs_cfg.merged > 0
+            || cs_cfg.threaded > 0;
 
         // Accumulate stats from this round.
         stats.const_fold.folded += cf.folded;
@@ -2045,6 +2046,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         stats.reduction_vectorize.skipped_shape += rv.skipped_shape;
         stats.reduction_vectorize.skipped_op_unsupported += rv.skipped_op_unsupported;
         stats.cfg_simplify.merged += cs_cfg.merged;
+        stats.cfg_simplify.threaded += cs_cfg.threaded;
 
         if !made_progress {
             break;
@@ -2129,12 +2131,22 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     stats.phi_prune.removed += pp.removed;
     stats.phi_prune.rounds = stats.phi_prune.rounds.max(pp.rounds);
 
-    let ri = inline::run_module_recursive(module);
-    stats.recursive_inline.functions_visited += ri.functions_visited;
-    stats.recursive_inline.self_calls_inlined += ri.self_calls_inlined;
-    stats.recursive_inline.skipped_too_large += ri.skipped_too_large;
-    stats.recursive_inline.skipped_too_many_sites += ri.skipped_too_many_sites;
-    stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
+    // Two levels of self-inlining: the second round takes the body the
+    // first produced as its snapshot, and the size limits inside bound
+    // it to functions whose depth-1 body is still small.
+    for _ in 0..2 {
+        let ri = inline::run_module_recursive(module);
+        stats.recursive_inline.functions_visited += ri.functions_visited;
+        stats.recursive_inline.self_calls_inlined += ri.self_calls_inlined;
+        stats.recursive_inline.skipped_too_large += ri.skipped_too_large;
+        stats.recursive_inline.skipped_too_many_sites += ri.skipped_too_many_sites;
+        stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
+    }
+    // The copies come with the callee's block seams; fold them before
+    // anything reads the shape.
+    let cs = cfg_simplify::run_module(module);
+    stats.cfg_simplify.merged += cs.merged;
+    stats.cfg_simplify.threaded += cs.threaded;
 
     // Recursive self-inlining above can leave two inlined copies of a
     // body sharing a pure sub-call — e.g. the depth-1 inline of `fib`
