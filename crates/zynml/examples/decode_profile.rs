@@ -38,7 +38,7 @@ fn main() {
 
     // The grammar is the other half of what installing a language reads.
     let snapshot = zyntax_embed::Snapshot::load(bytes).expect("load");
-    let grammar_bytes = snapshot.grammar_bytes().to_vec();
+    let grammar_bytes = snapshot.grammar_bytes().unwrap_or_default().to_vec();
     let t = Instant::now();
     for _ in 0..iters {
         let grammar =

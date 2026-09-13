@@ -35,7 +35,7 @@ mod types;
 
 pub use classic::{ExternalFunction, ZyntaxRuntime};
 use events::capture_runtime_events_from_program;
-use handler_state::synthesize_handler_state;
+pub(crate) use handler_state::synthesize_handler_state;
 use native_call::{
     call_dynamic_function, call_native_with_signature, call_with_signature, dynamic_to_i64,
 };

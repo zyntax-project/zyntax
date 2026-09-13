@@ -139,6 +139,7 @@ pub(crate) fn process_imports_for_traits(
     snapshot_modules: &SnapshotModules,
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
+    prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::hir::HirModule>>,
 ) -> RuntimeResult<()> {
     // Track imports processed during *this* lowering. Previously
     // lived in a thread-local — that caused a silent bug where the
@@ -157,6 +158,7 @@ pub(crate) fn process_imports_for_traits(
         snapshot_modules,
         program,
         type_registry,
+        prelowered,
         &mut processed,
     )
 }
@@ -169,6 +171,7 @@ fn process_imports_inner(
     snapshot_modules: &SnapshotModules,
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
+    prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::hir::HirModule>>,
     processed: &mut std::collections::HashSet<String>,
 ) -> RuntimeResult<()> {
     use zyntax_typed_ast::typed_ast::TypedDeclaration;
@@ -231,17 +234,26 @@ fn process_imports_inner(
                     module_name
                 )));
             }
-            let grammar = grammars.get(compiled_import.language()).ok_or_else(|| {
-                RuntimeError::Execution(format!(
-                    "Compiled import '{}' requires unregistered language '{}'",
-                    module_name,
-                    compiled_import.language()
-                ))
-            })?;
+            // A module that arrived lowered is linked rather than
+            // lowered again; its declarations still type the caller.
+            if let Some(hir) = compiled_import.hir() {
+                if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                    eprintln!(
+                        "[IMPORT-LINK] {module_name} arrives lowered ({} functions)",
+                        hir.functions.len()
+                    );
+                }
+                prelowered.push(std::sync::Arc::clone(hir));
+            }
+            // A language that parses on its own registers no grammar,
+            // and then has no builtin aliases to inject either.
+            let grammar = grammars.get(compiled_import.language());
             let mut imported_program = compiled_import.into_program();
-            grammar
-                .inject_builtin_externs(&mut imported_program, Some(plugin_signatures))
-                .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+            if let Some(grammar) = grammar {
+                grammar
+                    .inject_builtin_externs(&mut imported_program, Some(plugin_signatures))
+                    .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+            }
 
             if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
                 eprintln!(
@@ -319,6 +331,7 @@ fn process_imports_inner(
                 snapshot_modules,
                 &mut imported_program,
                 type_registry,
+                prelowered,
                 processed,
             )?;
 

@@ -16,6 +16,11 @@ pub struct CompiledImport {
     language: String,
     module_name: String,
     program: TypedProgram,
+    /// The module already lowered, when the artifact that carried it
+    /// held HIR this compiler can use. The program's function bodies
+    /// are then absent: the declarations type a caller, the HIR is what
+    /// runs.
+    hir: Option<std::sync::Arc<zyntax_compiler::hir::HirModule>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,7 +65,19 @@ impl CompiledImport {
             language,
             module_name,
             program,
+            hir: None,
         }
+    }
+
+    /// Attach the module's lowered form.
+    pub fn with_hir(mut self, hir: std::sync::Arc<zyntax_compiler::hir::HirModule>) -> Self {
+        self.hir = Some(hir);
+        self
+    }
+
+    /// The module's lowered form, when it arrived with one.
+    pub fn hir(&self) -> Option<&std::sync::Arc<zyntax_compiler::hir::HirModule>> {
+        self.hir.as_ref()
     }
 
     pub fn language(&self) -> &str {

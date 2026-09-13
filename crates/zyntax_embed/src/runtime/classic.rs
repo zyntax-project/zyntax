@@ -666,7 +666,8 @@ impl ZyntaxRuntime {
         // This merges declarations from imported modules into the program
         // and registers their opaque types in the type registry
         let t_imports = std::time::Instant::now();
-        self.process_imports_for_traits(&mut program, &mut type_registry)?;
+        let mut prelowered = Vec::new();
+        self.process_imports_for_traits(&mut program, &mut type_registry, &mut prelowered)?;
         let imports_ms = t_imports.elapsed().as_secs_f64() * 1000.0;
 
         // Now process extern declarations from the merged program (main + imports)
@@ -726,6 +727,7 @@ impl ZyntaxRuntime {
             // bodies an import brought in that nothing reaches. The
             // same names the backend filters codegen against.
             entry_names: self.entry_names(),
+            prelowered,
             ..LoweringConfig::default()
         };
 
@@ -827,6 +829,7 @@ impl ZyntaxRuntime {
         &self,
         program: &mut zyntax_typed_ast::TypedProgram,
         type_registry: &mut zyntax_typed_ast::TypeRegistry,
+        prelowered: &mut Vec<std::sync::Arc<HirModule>>,
     ) -> RuntimeResult<()> {
         crate::import_chain::process_imports_for_traits(
             &self.grammars,
@@ -836,6 +839,7 @@ impl ZyntaxRuntime {
             &self.snapshot_modules,
             program,
             type_registry,
+            prelowered,
         )
     }
 
@@ -1715,17 +1719,22 @@ impl ZyntaxRuntime {
     pub fn install_snapshot(
         &mut self,
         snapshot: Arc<crate::Snapshot>,
-    ) -> RuntimeResult<LanguageGrammar> {
-        let grammar =
-            LanguageGrammar::from_compiled_bytes(snapshot.grammar_bytes()).map_err(|e| {
-                RuntimeError::Execution(format!(
-                    "snapshot for '{}' has an unreadable grammar: {e}",
-                    snapshot.language()
-                ))
-            })?;
-        let mut grammar = grammar;
-        grammar.set_language(snapshot.language());
-        self.register_grammar(snapshot.language(), grammar.clone());
+    ) -> RuntimeResult<Option<LanguageGrammar>> {
+        // A language that parses on its own ships no grammar.
+        let grammar = match snapshot.grammar_bytes() {
+            Some(bytes) => {
+                let mut grammar = LanguageGrammar::from_compiled_bytes(bytes).map_err(|e| {
+                    RuntimeError::Execution(format!(
+                        "snapshot for '{}' has an unreadable grammar: {e}",
+                        snapshot.language()
+                    ))
+                })?;
+                grammar.set_language(snapshot.language());
+                self.register_grammar(snapshot.language(), grammar.clone());
+                Some(grammar)
+            }
+            None => None,
+        };
 
         // Reserve the ids before anything can parse against them. The
         // build recorded what to reserve, so no module is decoded here

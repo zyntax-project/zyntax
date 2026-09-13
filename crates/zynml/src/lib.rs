@@ -365,7 +365,8 @@ impl ZynML {
             RuntimeEngine::Classic(rt) => rt.install_snapshot(snapshot),
             RuntimeEngine::Tiered(rt) => rt.install_snapshot(snapshot),
         }
-        .map_err(|e| ZynMLError::GrammarError(e.to_string()))?;
+        .map_err(|e| ZynMLError::GrammarError(e.to_string()))?
+        .ok_or_else(|| ZynMLError::GrammarError("the snapshot carries no grammar".to_string()))?;
 
         // Share the already-decoded GrammarIR rather than parsing the grammar
         // a second time for the direct AST API.
@@ -683,7 +684,8 @@ mod tests {
         let snapshot = snapshot().unwrap();
         assert_eq!(snapshot.language(), "zynml");
 
-        let grammar = LanguageGrammar::from_compiled_bytes(snapshot.grammar_bytes()).unwrap();
+        let grammar =
+            LanguageGrammar::from_compiled_bytes(snapshot.grammar_bytes().unwrap()).unwrap();
         assert_eq!(grammar.name(), "ZynML");
         assert!(grammar.direct_parser().is_some());
 

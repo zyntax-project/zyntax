@@ -9,12 +9,20 @@
 //! A snapshot carries all of it. A build script writes a snapshot, and a host
 //! installs it, and the order things happen in belongs to the
 //! runtime rather than to every language that targets it.
+//!
+//! A module may also carry itself already lowered. Compiling a program
+//! then links against that HIR instead of lowering the module again,
+//! which is most of what compiling a small program costs. The HIR is
+//! only read by the compiler that produced it, for the pointer width
+//! it was produced for; anything else falls back to the parsed module.
 
 use crate::compiled_artifact::{CompiledArtifactError, CompiledImport};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -44,8 +52,13 @@ pub enum SnapshotError {
     #[error("failed to decode snapshot: {0}")]
     Decode(String),
 
-    #[error("snapshot for '{language}' has no grammar")]
-    MissingGrammar { language: String },
+    #[error("failed to lower module '{module}' for the snapshot: {reason}")]
+    Lowering { module: String, reason: String },
+
+    #[error(
+        "module '{module}' declares effects or handlers, which a snapshot cannot carry lowered"
+    )]
+    Effectful { module: String },
 
     #[error("snapshot is truncated: {what} runs past the end")]
     Truncated { what: String },
@@ -85,7 +98,8 @@ impl Extent {
 #[derive(Serialize, Deserialize)]
 struct Directory {
     language: String,
-    grammar: Extent,
+    /// Absent for a language that parses on its own.
+    grammar: Option<Extent>,
     modules: Vec<DirectoryEntry>,
 }
 
@@ -101,6 +115,26 @@ struct DirectoryEntry {
     artifact: Extent,
     /// The module's source, when the language chose to carry it.
     source: Option<Extent>,
+    /// The module lowered, when the build did that.
+    lowered: Option<LoweredEntry>,
+}
+
+/// Where a module's HIR sits, and what may read it.
+#[derive(Serialize, Deserialize, Clone)]
+struct LoweredEntry {
+    hir: Extent,
+    /// The compiler that produced it; no other reads it.
+    build_id: String,
+    /// The pointer width it was lowered for, in bytes.
+    pointer_size: u8,
+}
+
+impl LoweredEntry {
+    /// Whether this compiler, targeting what it targets, can use the HIR.
+    fn usable_here(&self) -> bool {
+        self.build_id == zyntax_compiler::BUILD_ID
+            && usize::from(self.pointer_size) == zyntax_compiler::target_pointer_size()
+    }
 }
 
 /// A language's grammar and standard library, ready to install.
@@ -113,7 +147,7 @@ pub struct Snapshot {
     /// Everything after the directory, addressed by the extents in it.
     blobs: Vec<u8>,
     language: String,
-    grammar: Extent,
+    grammar: Option<Extent>,
     modules: Vec<DirectoryEntry>,
     /// Each module, decoded when something first asks for it. A module
     /// nobody imports is never decoded.
@@ -184,11 +218,11 @@ impl Snapshot {
     }
 
     /// The grammar, as [`crate::LanguageGrammar::from_compiled_bytes`]
-    /// reads it.
-    pub fn grammar_bytes(&self) -> &[u8] {
+    /// reads it, when the language ships one.
+    pub fn grammar_bytes(&self) -> Option<&[u8]> {
         self.grammar
-            .slice(&self.blobs, "the grammar")
-            .unwrap_or(&[])
+            .as_ref()
+            .and_then(|extent| extent.slice(&self.blobs, "the grammar").ok())
     }
 
     /// The modules it carries, in the order they were built.
@@ -196,7 +230,9 @@ impl Snapshot {
         self.modules.iter().map(|m| m.name.as_str())
     }
 
-    /// One module, decoded on first use and kept after.
+    /// One module, decoded on first use and kept after. Its HIR comes
+    /// with it when this compiler can use it; otherwise the module
+    /// arrives parsed only and is lowered like any other import.
     pub fn module(&self, name: &str) -> Result<Option<CompiledImport>, SnapshotError> {
         let Some(index) = self.modules.iter().position(|m| m.name == name) else {
             return Ok(None);
@@ -208,11 +244,30 @@ impl Snapshot {
                     .artifact
                     .slice(&self.blobs, &entry.name)
                     .map_err(|e| e.to_string())?;
-                CompiledImport::decode(bytes).map_err(|e| e.to_string())
+                let import = CompiledImport::decode(bytes).map_err(|e| e.to_string())?;
+                let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
+                    return Ok(import);
+                };
+                let hir_bytes = lowered
+                    .hir
+                    .slice(&self.blobs, &entry.name)
+                    .map_err(|e| e.to_string())?;
+                let hir = zyntax_compiler::bytecode::deserialize_module(hir_bytes)
+                    .map_err(|e| e.to_string())?;
+                Ok(import.with_hir(Arc::new(hir)))
             })
             .as_ref()
             .map(|module| Some(module.clone()))
             .map_err(|e| SnapshotError::Decode(e.clone()))
+    }
+
+    /// Whether a module's lowered form is carried and readable here.
+    pub fn carries_hir(&self, name: &str) -> bool {
+        self.modules
+            .iter()
+            .find(|m| m.name == name)
+            .and_then(|m| m.lowered.as_ref())
+            .is_some_and(LoweredEntry::usable_here)
     }
 
     /// Reserve the type ids every module was built against.
@@ -269,6 +324,74 @@ struct PendingModule {
     max_type_id: u32,
     artifact: Vec<u8>,
     source: Option<String>,
+    /// The module's HIR, encoded, with what may read it.
+    lowered: Option<(Vec<u8>, String, u8)>,
+}
+
+/// Lower a module the way a runtime would, for a snapshot to carry.
+///
+/// `builtins` are the language's extern aliases (a grammar's
+/// `builtins().functions`); `prelowered` are the snapshot's earlier
+/// modules that this one imports, already lowered. The result is
+/// optimised, so what inlines into a program later is what the runtime
+/// would have inlined. A module declaring effects or handlers is
+/// refused: their ids are also baked into constants the loader cannot
+/// relocate.
+pub fn lower_for_snapshot(
+    name: &str,
+    program: zyntax_typed_ast::TypedProgram,
+    builtins: indexmap::IndexMap<String, String>,
+    prelowered: Vec<Arc<HirModule>>,
+) -> Result<HirModule, SnapshotError> {
+    let none_grammars = std::collections::HashMap::new();
+    let none_signatures = std::collections::HashMap::new();
+    let none_modules = crate::import_chain::SnapshotModules::default();
+    let lowered = crate::lower::lower_typed_program(
+        program,
+        crate::lower::Inputs {
+            grammars: &none_grammars,
+            plugin_signatures: &none_signatures,
+            import_resolvers: &[],
+            compiled_import_resolvers: &[],
+            snapshot_modules: &none_modules,
+            builtins,
+            builtin_registry: Arc::new(
+                zyntax_compiler::builtin_class::BuiltinRegistry::with_defaults(),
+            ),
+            entry_names: Vec::new(),
+            prelowered,
+        },
+    )
+    .map_err(|e| SnapshotError::Lowering {
+        module: name.to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut module = lowered.module;
+    if !module.effects.is_empty() || !module.handlers.is_empty() {
+        return Err(SnapshotError::Effectful {
+            module: name.to_string(),
+        });
+    }
+    let _ = zyntax_compiler::run_interp_safe_opts(&mut module);
+    zyntax_compiler::run_native_only_opts(&mut module);
+    Ok(module)
+}
+
+/// Drop every function body from a program whose HIR travels beside it.
+/// What remains types a caller; nothing lowers it.
+fn strip_bodies(program: &mut zyntax_typed_ast::TypedProgram) {
+    use zyntax_typed_ast::TypedDeclaration;
+    for decl in &mut program.declarations {
+        match &mut decl.node {
+            TypedDeclaration::Function(function) => function.body = None,
+            TypedDeclaration::Impl(imp) => {
+                for method in &mut imp.methods {
+                    method.body = None;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl SnapshotBuilder {
@@ -311,10 +434,46 @@ impl SnapshotBuilder {
     }
 
     fn push(
+        self,
+        name: impl Into<String>,
+        program: zyntax_typed_ast::TypedProgram,
+        source: Option<String>,
+    ) -> Result<Self, SnapshotError> {
+        self.push_with(name, program, source, None)
+    }
+
+    /// Add a module together with its lowered form, from
+    /// [`lower_for_snapshot`]. The program's function bodies are left
+    /// out: the HIR is what runs, the declarations are what a caller
+    /// types against.
+    pub fn module_lowered(
+        self,
+        name: impl Into<String>,
+        mut program: zyntax_typed_ast::TypedProgram,
+        hir: &HirModule,
+    ) -> Result<Self, SnapshotError> {
+        strip_bodies(&mut program);
+        let encoded = zyntax_compiler::bytecode::serialize_module(
+            hir,
+            zyntax_compiler::bytecode::Format::Postcard,
+        )
+        .map_err(|e| SnapshotError::Encode(e.to_string()))?;
+        let pointer_size = u8::try_from(zyntax_compiler::target_pointer_size())
+            .map_err(|e| SnapshotError::Encode(e.to_string()))?;
+        self.push_with(
+            name,
+            program,
+            None,
+            Some((encoded, zyntax_compiler::BUILD_ID.to_string(), pointer_size)),
+        )
+    }
+
+    fn push_with(
         mut self,
         name: impl Into<String>,
         program: zyntax_typed_ast::TypedProgram,
         source: Option<String>,
+        lowered: Option<(Vec<u8>, String, u8)>,
     ) -> Result<Self, SnapshotError> {
         let name = name.into();
         let max_type_id = program.type_registry.max_type_id();
@@ -324,6 +483,7 @@ impl SnapshotBuilder {
             max_type_id,
             artifact: artifact.encode()?,
             source,
+            lowered,
         });
         Ok(self)
     }
@@ -334,10 +494,6 @@ impl SnapshotBuilder {
     /// point at. Reading the directory is the whole cost of loading;
     /// the parts are read where they lie.
     pub fn encode(self) -> Result<Vec<u8>, SnapshotError> {
-        let grammar = self.grammar.ok_or_else(|| SnapshotError::MissingGrammar {
-            language: self.language.clone(),
-        })?;
-
         let mut blobs: Vec<u8> = Vec::new();
         let mut put = |bytes: &[u8], blobs: &mut Vec<u8>| {
             let extent = Extent::of(bytes, blobs.len());
@@ -345,7 +501,7 @@ impl SnapshotBuilder {
             extent
         };
 
-        let grammar_extent = put(&grammar, &mut blobs);
+        let grammar_extent = self.grammar.as_ref().map(|bytes| put(bytes, &mut blobs));
         let mut entries = Vec::with_capacity(self.modules.len());
         for module in &self.modules {
             let artifact = put(&module.artifact, &mut blobs);
@@ -353,11 +509,20 @@ impl SnapshotBuilder {
                 .source
                 .as_ref()
                 .map(|text| put(text.as_bytes(), &mut blobs));
+            let lowered = module
+                .lowered
+                .as_ref()
+                .map(|(bytes, build_id, pointer_size)| LoweredEntry {
+                    hir: put(bytes, &mut blobs),
+                    build_id: build_id.clone(),
+                    pointer_size: *pointer_size,
+                });
             entries.push(DirectoryEntry {
                 name: module.name.clone(),
                 max_type_id: module.max_type_id,
                 artifact,
                 source,
+                lowered,
             });
         }
 
@@ -420,7 +585,7 @@ mod tests {
 
         let snapshot = Snapshot::load(&bytes).expect("load");
         assert_eq!(snapshot.language(), "demo");
-        assert_eq!(snapshot.grammar_bytes(), &[1, 2, 3]);
+        assert_eq!(snapshot.grammar_bytes(), Some(&[1u8, 2, 3][..]));
         assert_eq!(snapshot.module_names().collect::<Vec<_>>(), vec!["prelude"]);
     }
 
@@ -452,11 +617,55 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_without_a_grammar_is_refused() {
-        let built = SnapshotBuilder::new("demo").encode();
+    fn a_snapshot_without_a_grammar_ships_none() {
+        // A frontend that parses on its own still ships its library.
+        let bytes = SnapshotBuilder::new("demo")
+            .module("builtins", empty_program())
+            .expect("module")
+            .encode()
+            .expect("encode");
+        let snapshot = Snapshot::load(&bytes).expect("load");
+        assert_eq!(snapshot.grammar_bytes(), None);
+        assert_eq!(
+            snapshot.module_names().collect::<Vec<_>>(),
+            vec!["builtins"]
+        );
+    }
+
+    #[test]
+    fn a_lowered_module_arrives_with_its_hir() {
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let hir = HirModule::new(arena.intern_string("lib"));
+        let bytes = SnapshotBuilder::new("demo")
+            .module_lowered("lib", empty_program(), &hir)
+            .expect("module")
+            .encode()
+            .expect("encode");
+        let snapshot = Snapshot::load(&bytes).expect("load");
+        assert!(snapshot.carries_hir("lib"));
+        let module = snapshot.module("lib").expect("decodes").expect("present");
+        assert!(module.hir().is_some(), "the HIR came with the module");
+    }
+
+    #[test]
+    fn hir_from_another_compiler_is_left_behind() {
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let hir = HirModule::new(arena.intern_string("lib"));
+        let mut builder = SnapshotBuilder::new("demo")
+            .module_lowered("lib", empty_program(), &hir)
+            .expect("module");
+        // The build id is the compiler's own; a snapshot built by a
+        // different one says so and its HIR is not read.
+        if let Some((_, build_id, _)) = builder.modules[0].lowered.as_mut() {
+            build_id.push('x');
+        }
+        let bytes = builder.encode().expect("encode");
+        let snapshot = Snapshot::load(&bytes).expect("load");
+        assert!(!snapshot.carries_hir("lib"));
+        let module = snapshot.module("lib").expect("decodes").expect("present");
         assert!(
-            matches!(built, Err(SnapshotError::MissingGrammar { .. })),
-            "a language with no grammar cannot parse anything"
+            module.hir().is_none(),
+            "the parsed module is all that is used"
         );
     }
 
@@ -496,7 +705,7 @@ mod tests {
         let cut = &bytes[..bytes.len() - 32];
         let snapshot = Snapshot::load(cut).expect("the directory still reads");
         assert!(
-            snapshot.module("prelude").is_err() || snapshot.grammar_bytes().is_empty(),
+            snapshot.module("prelude").is_err() || snapshot.grammar_bytes().is_none(),
             "a part that runs past the end is refused rather than guessed at"
         );
     }

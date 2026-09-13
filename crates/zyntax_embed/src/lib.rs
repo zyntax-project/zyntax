@@ -71,7 +71,6 @@ mod grammar2;
 /// targets get the same surface so the per-bridge stdlib code
 /// stays target-uniform.
 pub mod host_futures;
-#[cfg(feature = "native")]
 mod import_chain;
 /// BC-interpreter-backed execution engine. On native it's internal
 /// scaffolding for [`runtime::ZyntaxRuntime`]; on wasm32 (where the
@@ -87,6 +86,7 @@ pub mod iterator;
 /// path delegates to these; the wasm `run_impl` calls them
 /// directly after `compile_to_hir`).
 pub mod krio_lowering;
+mod lower;
 mod snapshot;
 // `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
 // loader, async executor). Native-only — the wasm-target entry point
@@ -94,6 +94,20 @@ mod snapshot;
 // directly without dragging the native backend along.
 #[cfg(feature = "native")]
 mod runtime;
+/// Without a native backend there is no runtime to speak of, but
+/// lowering still needs its error type, its resolver callbacks and the
+/// handler-state synthesis, so those parts stand on their own here.
+#[cfg(not(feature = "native"))]
+mod runtime {
+    #[path = "handler_state.rs"]
+    mod handler_state;
+    #[path = "types.rs"]
+    mod types;
+    pub(crate) use handler_state::synthesize_handler_state;
+    pub use types::{
+        CompiledImportResolverCallback, ImportResolverCallback, RuntimeError, RuntimeResult,
+    };
+}
 mod string;
 mod value;
 
@@ -117,7 +131,8 @@ pub use host_futures::{__zyntax_register_future, __zyntax_reject_future, __zynta
 pub use array::ZyntaxArray;
 pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
 pub use snapshot::{
-    snapshot_file_name, Snapshot, SnapshotBuilder, SnapshotError, SNAPSHOT_EXTENSION,
+    lower_for_snapshot, snapshot_file_name, Snapshot, SnapshotBuilder, SnapshotError,
+    SNAPSHOT_EXTENSION,
 };
 // Re-export the BC interpreter so embedders that want a bare
 // HirInterpreter without the beadie wrapper can grab it directly.

@@ -510,6 +510,15 @@ impl TieredRuntime {
         mut module: HirModule,
         entered: Option<Vec<String>>,
     ) -> RuntimeResult<()> {
+        // What the entry points cannot reach is dropped before the
+        // optimisers run, so they walk the program rather than the
+        // library it imported.
+        if let Some(names) = &entered {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let keep = zyntax_compiler::reachable_function_ids(&module, &names);
+            module.functions.retain(|id, _| keep.contains(id));
+        }
+
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `TieredRuntime::compile_module` never get
         // CSE / LICM / inline / const_fold / aggregate_split — the bench-only
@@ -1064,17 +1073,22 @@ impl TieredRuntime {
     pub fn install_snapshot(
         &mut self,
         snapshot: Arc<crate::Snapshot>,
-    ) -> RuntimeResult<LanguageGrammar> {
-        let grammar =
-            LanguageGrammar::from_compiled_bytes(snapshot.grammar_bytes()).map_err(|e| {
-                RuntimeError::Execution(format!(
-                    "snapshot for '{}' has an unreadable grammar: {e}",
-                    snapshot.language()
-                ))
-            })?;
-        let mut grammar = grammar;
-        grammar.set_language(snapshot.language());
-        self.register_grammar(snapshot.language(), grammar.clone());
+    ) -> RuntimeResult<Option<LanguageGrammar>> {
+        // A language that parses on its own ships no grammar.
+        let grammar = match snapshot.grammar_bytes() {
+            Some(bytes) => {
+                let mut grammar = LanguageGrammar::from_compiled_bytes(bytes).map_err(|e| {
+                    RuntimeError::Execution(format!(
+                        "snapshot for '{}' has an unreadable grammar: {e}",
+                        snapshot.language()
+                    ))
+                })?;
+                grammar.set_language(snapshot.language());
+                self.register_grammar(snapshot.language(), grammar.clone());
+                Some(grammar)
+            }
+            None => None,
+        };
 
         // Reserve the ids before anything can parse against them. The
         // build recorded what to reserve, so no module is decoded here
@@ -2363,190 +2377,24 @@ impl TieredRuntime {
     /// compile only what those reach.
     fn lower_typed_program(
         &self,
-        mut program: zyntax_typed_ast::TypedProgram,
+        program: zyntax_typed_ast::TypedProgram,
         builtins: indexmap::IndexMap<String, String>,
     ) -> RuntimeResult<(HirModule, Option<Vec<String>>)> {
-        use zyntax_compiler::lowering::{LoweringConfig, LoweringContext};
-        use zyntax_typed_ast::{
-            type_registry::*, AstArena, InternedString, TypeRegistry, TypedDeclaration,
-        };
-
-        // Stateful handlers need their state struct, ctor and implicit
-        // `self` synthesized before the registry snapshot, exactly as
-        // in the classic runtime's lowering above.
-        synthesize_handler_state(&mut program);
-
-        // Rebuild type registry from declarations
-        for decl_node in &program.declarations {
-            if let TypedDeclaration::Class(class) = &decl_node.node {
-                let type_id = if let zyntax_typed_ast::Type::Named { id, .. } = &decl_node.ty {
-                    *id
-                } else {
-                    TypeId::next()
-                };
-
-                let field_defs: Vec<FieldDef> = class
-                    .fields
-                    .iter()
-                    .map(|f| FieldDef {
-                        name: f.name,
-                        ty: f.ty.clone(),
-                        visibility: f.visibility,
-                        mutability: f.mutability,
-                        is_static: f.is_static,
-                        span: f.span,
-                        getter: None,
-                        setter: None,
-                        is_synthetic: false,
-                    })
-                    .collect();
-
-                // Strict V1 reference-class lowering: propagate `@reference`
-                // annotation in the rebuild path that precedes
-                // `lower_typed_program`.
-                let is_reference = class.annotations.iter().any(|ann| {
-                    ann.name
-                        .resolve_global()
-                        .as_deref()
-                        .map(|n| n == "reference")
-                        .unwrap_or(false)
-                });
-                let mut metadata: zyntax_typed_ast::type_registry::TypeMetadata =
-                    Default::default();
-                metadata.is_reference = is_reference;
-
-                let type_def = TypeDefinition {
-                    id: type_id,
-                    module: None,
-                    name: class.name,
-                    kind: TypeKind::Struct {
-                        fields: field_defs.clone(),
-                        is_tuple: false,
-                    },
-                    type_params: vec![],
-                    constraints: vec![],
-                    fields: field_defs,
-                    methods: vec![],
-                    constructors: vec![],
-                    metadata,
-                    span: class.span,
-                };
-                program.type_registry.register_type(type_def);
-            }
-        }
-
-        let mut type_registry = program.type_registry.clone();
-
-        // Process imports FIRST so stdlib `extern def`s (e.g. tensor.zynml's
-        // `arange`, `Tensor::sum`) get parsed and merged into the program
-        // before lowering. Without this, calls like `Tensor::arange(...)`
-        // lower to a call against an unresolved function and segfault at
-        // runtime. Mirrors `ZyntaxRuntime::lower_typed_program`.
-        crate::import_chain::process_imports_for_traits(
-            &self.grammars,
-            &self.plugin_signatures,
-            &self.import_resolvers,
-            &self.compiled_import_resolvers,
-            &self.snapshot_modules,
-            &mut program,
-            &mut type_registry,
+        let lowered = crate::lower::lower_typed_program(
+            program,
+            crate::lower::Inputs {
+                grammars: &self.grammars,
+                plugin_signatures: &self.plugin_signatures,
+                import_resolvers: &self.import_resolvers,
+                compiled_import_resolvers: &self.compiled_import_resolvers,
+                snapshot_modules: &self.snapshot_modules,
+                builtins,
+                builtin_registry: self.snapshot_builtin_registry(),
+                entry_names: self.entry_names(),
+                prelowered: Vec::new(),
+            },
         )?;
-
-        // Now process extern declarations from the merged program
-        // to ensure all opaque types are registered.
-        crate::import_chain::process_extern_declarations_mut(&program, &mut type_registry)?;
-
-        // Resolve all `Type::Unresolved` in the TypedAST before lowering
-        // (e.g. extern types coming from imports become `Type::Extern`).
-        crate::import_chain::resolve_unresolved_types(&mut program, &type_registry);
-
-        // Sync the program's type registry with the locally-merged one
-        // before passing it on to register_impl_blocks et al.
-        program.type_registry = type_registry;
-
-        // Register impl blocks before lowering
-        zyntax_compiler::register_impl_blocks(&mut program).map_err(|e| {
-            RuntimeError::Execution(format!("Failed to register impl blocks: {:?}", e))
-        })?;
-
-        // Generate automatic trait implementations for abstract types
-        zyntax_compiler::generate_abstract_trait_impls(&mut program).map_err(|e| {
-            RuntimeError::Execution(format!("Failed to generate abstract trait impls: {:?}", e))
-        })?;
-
-        // Register the generated impl blocks
-        zyntax_compiler::register_impl_blocks(&mut program).map_err(|e| {
-            RuntimeError::Execution(format!("Failed to register generated impl blocks: {:?}", e))
-        })?;
-
-        let arena = AstArena::new();
-        // The module a program lowers under is the file it came from.
-        // Naming every program `main` put them all in one module, which
-        // is the wrong answer for anything that qualifies a name by the
-        // module holding it.
-        let module_name = program
-            .source_files
-            .first()
-            .map(|file| crate::grammar::module_name_of(&file.name))
-            .or_else(|| program.type_registry.current_module())
-            .unwrap_or_else(|| InternedString::new_global("module"));
-        // Use the type registry from the parsed program (now contains registered structs)
-        let type_registry = std::sync::Arc::new(program.type_registry.clone());
-
-        // Fiber<T>'s `Fiber.abort(err)` static method maps to the
-        // `krio_fiber_abort_with` runtime stub (Wren-style abort
-        // from inside the fiber body). See the matching entry in
-        // `lower_typed_program`'s public entry point.
-        let mut builtins = builtins;
-        builtins
-            .entry("Fiber$abort".to_string())
-            .or_insert_with(|| "krio_fiber_abort_with".to_string());
-
-        // Create LoweringConfig with builtins for extern call resolution
-        let lowering_config = LoweringConfig {
-            builtins,
-            use_krio_async: cfg!(feature = "krio-async-backend"),
-            // Where a program can begin, so lowering can skip the
-            // bodies an import brought in that nothing reaches.
-            entry_names: self.entry_names(),
-            ..LoweringConfig::default()
-        };
-
-        // Run pattern engine
-        {
-            let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
-                target: pattern_engine::LoweringTarget::Cpu,
-                max_iterations: 64,
-                trace: cfg!(debug_assertions),
-                verify_after: false,
-            });
-            engine.register_pass(normalization_pass::Pass);
-            engine.register_pass(algebraic_effects_pass::Pass);
-            engine.finalize().map_err(|e| {
-                RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
-            })?;
-            let _result = engine.run(&mut program, &type_registry);
-        }
-
-        let mut lowering_ctx = LoweringContext::new(
-            module_name,
-            type_registry.clone(),
-            std::sync::Arc::new(std::sync::Mutex::new(arena)),
-            lowering_config,
-        );
-        lowering_ctx.set_builtin_registry(self.snapshot_builtin_registry());
-
-        let mut hir_module = lowering_ctx
-            .lower_program(&mut program)
-            .map_err(|e| RuntimeError::Execution(format!("Lowering error: {:?}", e)))?;
-
-        // Display lowering diagnostics (type inference warnings, etc.)
-        lowering_ctx.display_diagnostics(&program);
-
-        zyntax_compiler::monomorphize_module(&mut hir_module)
-            .map_err(|e| RuntimeError::Execution(format!("Monomorphization error: {:?}", e)))?;
-
-        Ok((hir_module, lowering_ctx.entered_functions()))
+        Ok((lowered.module, lowered.entered))
     }
 
     /// List all loaded function names

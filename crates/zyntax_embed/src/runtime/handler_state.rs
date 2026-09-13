@@ -3,7 +3,7 @@
 //!
 //! Runs on the parsed program before the type registry is snapshotted.
 
-pub(super) fn synthesize_handler_state(program: &mut zyntax_typed_ast::TypedProgram) {
+pub(crate) fn synthesize_handler_state(program: &mut zyntax_typed_ast::TypedProgram) {
     use zyntax_typed_ast::source::Span;
     use zyntax_typed_ast::type_registry::{
         FieldDef, Mutability, NullabilityKind, PrimitiveType, TypeDefinition, TypeId, TypeKind,
