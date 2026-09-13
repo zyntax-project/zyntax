@@ -1557,6 +1557,7 @@ pub fn compile_to_hir(
         builtins: config.builtins.clone(),
         use_krio_async: config.use_krio_async,
         entry_names: Vec::new(),
+        prelowered: Vec::new(),
     };
 
     // Create arena for string interning (needed for async transformation)
@@ -2180,6 +2181,11 @@ pub fn compile_to_jit(
 
     Ok(backend)
 }
+
+/// Which compiler this is, as a digest of its sources. Lowered HIR
+/// carried between processes records the id that produced it, and is
+/// only read back by the same one.
+pub const BUILD_ID: &str = env!("ZYNTAX_COMPILER_BUILD_ID");
 
 /// The pointer size of the code being produced, in bytes. The JIT
 /// targets the host; a cross-compiling backend sets it for its target

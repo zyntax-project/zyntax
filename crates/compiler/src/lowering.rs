@@ -243,6 +243,13 @@ pub struct LoweringContext {
     /// Functions an import brought in, by name. Everything else in the
     /// module is the program's own and a host may call it.
     imported: std::collections::HashSet<InternedString>,
+    /// Functions and globals a prelowered module already holds, by name,
+    /// so a declaration of one takes that id. A body is lowered for it
+    /// only when the module holds a declaration without one: the module
+    /// then calls whatever the program defines under the name.
+    prelowered_functions: std::collections::HashMap<InternedString, crate::hir::HirId>,
+    prelowered_bodies: std::collections::HashSet<InternedString>,
+    prelowered_globals: std::collections::HashMap<InternedString, crate::hir::HirId>,
     /// Functions dropped because their body failed analysis, keyed by
     /// the id a call site still carries, with the name and what the
     /// analysis said. A drop is only tolerable while nothing calls the
@@ -410,6 +417,11 @@ pub struct LoweringConfig {
     /// them in shape for `krio_adapter` to transform via a post-lowering pass.
     /// Set by `zyntax_embed` when its `krio-async-backend` feature is on.
     pub use_krio_async: bool,
+    /// Modules already lowered elsewhere, whose functions the program's
+    /// declarations name. A declaration matching one of their functions
+    /// is linked to it instead of being lowered, and the modules' contents
+    /// join the program's module.
+    pub prelowered: Vec<Arc<HirModule>>,
 }
 
 impl std::fmt::Debug for LoweringConfig {
@@ -439,6 +451,7 @@ impl Default for LoweringConfig {
             import_resolver: None,
             builtins: indexmap::IndexMap::new(),
             entry_names: Vec::new(),
+            prelowered: Vec::new(),
             use_krio_async: false,
         }
     }
@@ -534,6 +547,23 @@ impl LoweringContext {
             saw_indirect_call: false,
             entered: false,
             imported: std::collections::HashSet::new(),
+            prelowered_functions: config
+                .prelowered
+                .iter()
+                .flat_map(|m| m.functions.values().map(|f| (f.name, f.id)))
+                .collect(),
+            prelowered_bodies: config
+                .prelowered
+                .iter()
+                .flat_map(|m| m.functions.values())
+                .filter(|f| !f.is_external)
+                .map(|f| f.name)
+                .collect(),
+            prelowered_globals: config
+                .prelowered
+                .iter()
+                .flat_map(|m| m.globals.values().map(|g| (g.name, g.id)))
+                .collect(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
             arena,
@@ -648,6 +678,37 @@ impl LoweringContext {
         let _ = self.diagnostics.borrow_mut().add(diagnostic);
     }
 
+    /// The id a function declared under `name` lowers to: the one a
+    /// prelowered module already gave it, or a fresh one.
+    fn function_id_for(&self, name: InternedString) -> crate::hir::HirId {
+        self.prelowered_functions
+            .get(&name)
+            .copied()
+            .unwrap_or_else(crate::hir::HirId::new)
+    }
+
+    /// Whether a prelowered module already holds this function's body.
+    fn is_prelowered(&self, name: InternedString) -> bool {
+        self.prelowered_bodies.contains(&name)
+    }
+
+    /// Bring every prelowered module's contents into the module being
+    /// built, so calls the declarations were linked to have bodies to
+    /// land in and its types and globals are known.
+    fn adopt_prelowered(&mut self) {
+        for prelowered in &self.config.prelowered {
+            for (id, function) in &prelowered.functions {
+                self.module.functions.insert(*id, function.clone());
+            }
+            for (id, global) in &prelowered.globals {
+                self.module.globals.insert(*id, global.clone());
+            }
+            for (id, ty) in &prelowered.types {
+                self.module.types.entry(*id).or_insert_with(|| ty.clone());
+            }
+        }
+    }
+
     /// The functions the program can be entered through, once
     /// `lower_program` has run: everything it declared itself, since a
     /// host may call any of those by name, but nothing an import brought
@@ -750,6 +811,7 @@ impl AstLowering for LoweringContext {
 
         // First pass: collect all declarations
         self.collect_declarations(program)?;
+        self.adopt_prelowered();
         let collect_ms = phase.lap();
 
         // Wrap typed-AST `Call(...)` expressions for fiber defs so
@@ -1955,7 +2017,7 @@ impl LoweringContext {
         for decl in &program.declarations {
             match &decl.node {
                 TypedDeclaration::Function(func) => {
-                    let func_id = crate::hir::HirId::new();
+                    let func_id = self.function_id_for(func.name);
                     // Imported modules are merged into the program
                     // before this runs, so two of them declaring the
                     // same name arrive as two declarations and the
@@ -2050,15 +2112,14 @@ impl LoweringContext {
                 TypedDeclaration::Class(class_decl) => {
                     // Pre-register class methods in symbol table
                     for method in &class_decl.methods {
-                        let method_id = crate::hir::HirId::new();
                         // Methods become mangled names: ClassName_methodName
                         let mangled_name = self.mangle_method_name(class_decl.name, method.name);
+                        let method_id = self.function_id_for(mangled_name);
                         self.symbols.functions.insert(mangled_name, method_id);
                     }
 
                     // Pre-register constructors
                     for (i, _ctor) in class_decl.constructors.iter().enumerate() {
-                        let ctor_id = crate::hir::HirId::new();
                         // Constructors: ClassName_constructor_N
                         // Use resolve_global() for portability across interner sources
                         let class_name_str = class_decl
@@ -2069,6 +2130,7 @@ impl LoweringContext {
                         let ctor_name =
                             arena.intern_string(&format!("{}_constructor_{}", class_name_str, i));
                         drop(arena);
+                        let ctor_id = self.function_id_for(ctor_name);
                         self.symbols.functions.insert(ctor_name, ctor_id);
                     }
                 }
@@ -2131,8 +2193,6 @@ impl LoweringContext {
                     let is_inherent = trait_name_str.is_empty();
 
                     for method in &impl_block.methods {
-                        let method_id = crate::hir::HirId::new();
-
                         // Generate mangled name matching lower_impl_block
                         let mangled_name = if is_inherent {
                             let type_name_str = type_name
@@ -2161,6 +2221,7 @@ impl LoweringContext {
                             )
                         };
 
+                        let method_id = self.function_id_for(mangled_name);
                         self.symbols.functions.insert(mangled_name, method_id);
                         // The declared parameter types, so a call site can
                         // know what it is passing into before it lowers the
@@ -2824,6 +2885,16 @@ impl LoweringContext {
     fn lower_function(&mut self, func: &TypedFunction) -> CompilerResult<()> {
         if func.module.is_some() {
             self.imported.insert(func.name);
+        }
+        // The body is already in the module, under the id the
+        // declaration was given.
+        if self.is_prelowered(func.name) {
+            return Ok(());
+        }
+        // An extern spelled like something this program defines is a
+        // declaration of it, not a replacement for it.
+        if func.is_external && self.symbols.body_fn_names.contains(&func.name) {
+            return Ok(());
         }
         if !self.should_lower(func) {
             return Ok(());
@@ -4442,6 +4513,11 @@ impl LoweringContext {
         &mut self,
         var: &zyntax_typed_ast::TypedVariable,
     ) -> CompilerResult<()> {
+        // A prelowered module's global is already in the module.
+        if let Some(id) = self.prelowered_globals.get(&var.name).copied() {
+            self.symbols.globals.insert(var.name, id);
+            return Ok(());
+        }
         let hir_type = self.convert_type(&var.ty);
 
         // Evaluate initializer expression if present
@@ -5394,7 +5470,7 @@ impl LoweringContext {
             } else {
                 // Fallback: create new (shouldn't happen if collect_declarations ran first)
                 log::trace!("[LOWERING] WARNING: Creating new function_id for {:?} (should have been pre-registered)", mangled_name);
-                let new_id = crate::hir::HirId::new();
+                let new_id = self.function_id_for(mangled_name);
                 self.symbols.functions.insert(mangled_name, new_id);
                 new_id
             };

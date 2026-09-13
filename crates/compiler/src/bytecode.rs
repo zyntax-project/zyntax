@@ -319,32 +319,30 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
         return Err(BytecodeError::ChecksumMismatch);
     }
 
-    // Deserialize payload
+    // Deserialize payload. The module's ids were minted by whichever
+    // process wrote it and may already be in use here, so every id read
+    // is shifted above the next unminted one; the counter is then moved
+    // past the highest id the module holds, so later `HirId::new()`
+    // calls cannot land on one of them either.
     let format = Format::from_u8(header.format)?;
-    let module = match format {
-        Format::Postcard => postcard::from_bytes(payload)
-            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
-        Format::Json => serde_json::from_slice(payload)
-            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
-        Format::Bincode => bincode::deserialize(payload)
-            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))?,
-    };
-
-    // Deserialization rebuilds every HirId via `from_raw`, leaving the
-    // global id counter untouched. If this process later mints ids with
-    // `HirId::new()` (e.g. an optimization pass run on the loaded module)
-    // they must not collide with the ids already present, or a new value
-    // would overwrite a deserialized one in its id-keyed map. Advance the
-    // counter past the module's maximum id.
+    let module: HirModule =
+        crate::hir::HirId::relocated_by(crate::hir::HirId::next_unminted(), || match format {
+            Format::Postcard => postcard::from_bytes(payload)
+                .map_err(|e| BytecodeError::DeserializationError(e.to_string())),
+            Format::Json => serde_json::from_slice(payload)
+                .map_err(|e| BytecodeError::DeserializationError(e.to_string())),
+            Format::Bincode => bincode::deserialize(payload)
+                .map_err(|e| BytecodeError::DeserializationError(e.to_string())),
+        })?;
     advance_hir_id_counter(&module);
 
     Ok(module)
 }
 
-/// Bump the global `HirId` counter above every id defined in `module`
-/// (function ids, value ids, block ids). See [`HirId::ensure_counter_above`].
+/// Bump the global `HirId` counter above every id defined in `module`.
+/// See [`HirId::ensure_counter_above`].
 fn advance_hir_id_counter(module: &HirModule) {
-    let mut max_id = 0u32;
+    let mut max_id = module.id.as_u32();
     for func in module.functions.values() {
         max_id = max_id.max(func.id.as_u32());
         for id in func.values.keys() {
@@ -353,6 +351,21 @@ fn advance_hir_id_counter(module: &HirModule) {
         for id in func.blocks.keys() {
             max_id = max_id.max(id.as_u32());
         }
+        for id in func.locals.keys() {
+            max_id = max_id.max(id.as_u32());
+        }
+        for param in &func.signature.params {
+            max_id = max_id.max(param.id.as_u32());
+        }
+    }
+    for id in module.globals.keys() {
+        max_id = max_id.max(id.as_u32());
+    }
+    for id in module.effects.keys() {
+        max_id = max_id.max(id.as_u32());
+    }
+    for id in module.handlers.keys() {
+        max_id = max_id.max(id.as_u32());
     }
     crate::hir::HirId::ensure_counter_above(max_id);
 }
@@ -504,6 +517,59 @@ mod tests {
             next > big,
             "deserialize must advance the id counter past the module max ({big}); got {next}"
         );
+    }
+
+    #[test]
+    fn a_loaded_module_lands_above_every_id_minted_here() {
+        // A module carries the ids its own process minted, and this
+        // process may have minted the same numbers already. Loading
+        // shifts every id in the module together, so a function still
+        // finds its own values and the counter keeps clear of them.
+        let mut module = create_test_module();
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let sig = HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(arena.intern_string("f"), sig);
+        func.id = HirId::from_raw(1);
+        func.entry_block = HirId::from_raw(2);
+        func.values.insert(
+            HirId::from_raw(3),
+            HirValue {
+                id: HirId::from_raw(3),
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: std::collections::HashSet::new(),
+                span: None,
+            },
+        );
+        module.functions.insert(func.id, func);
+
+        let bytes = serialize_module(&module, Format::Postcard).unwrap();
+        let floor = HirId::new().as_u32();
+        let loaded = deserialize_module(&bytes).unwrap();
+
+        let (id, function) = loaded.functions.iter().next().unwrap();
+        assert!(id.as_u32() > floor, "function id {id:?} not above {floor}");
+        assert_eq!(*id, function.id, "the key moved with the function");
+        assert_eq!(
+            function.entry_block.as_u32(),
+            id.as_u32() + 1,
+            "references shift by the same amount"
+        );
+        let (value_id, value) = function.values.iter().next().unwrap();
+        assert_eq!(*value_id, value.id);
+        assert_eq!(value_id.as_u32(), id.as_u32() + 2);
+        assert!(HirId::new().as_u32() > value_id.as_u32());
     }
 
     #[test]

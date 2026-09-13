@@ -191,14 +191,55 @@ impl HirLifetime {
 ///    throughout the compiler.
 ///
 /// The counter starts at 1; `0` is reserved as a sentinel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// Ids are written out raw and read back shifted by the relocation
+/// base in force on the reading thread (see [`HirId::relocated_by`]),
+/// so a module lowered in another process lands above every id this
+/// one has minted, and every reference inside it moves with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct HirId(u32);
 
 static HIR_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
+thread_local! {
+    static RELOCATION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl<'de> serde::Deserialize<'de> for HirId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "HirId")]
+        struct Raw(u32);
+        let Raw(raw) = Raw::deserialize(deserializer)?;
+        Ok(HirId::relocate(raw))
+    }
+}
+
 impl HirId {
     pub fn new() -> Self {
         HirId(HIR_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The id the counter would hand out next. Ids relocated above it
+    /// cannot collide with anything minted so far.
+    pub fn next_unminted() -> u32 {
+        HIR_ID_COUNTER.load(Ordering::Relaxed)
+    }
+
+    /// Run `read` with every id it deserializes on this thread shifted
+    /// up by `base`. The sentinel stays where it is.
+    pub fn relocated_by<R>(base: u32, read: impl FnOnce() -> R) -> R {
+        let previous = RELOCATION.replace(base);
+        let out = read();
+        RELOCATION.set(previous);
+        out
+    }
+
+    fn relocate(raw: u32) -> Self {
+        if raw == 0 {
+            return HirId(0);
+        }
+        HirId(raw.saturating_add(RELOCATION.get()))
     }
 
     /// Construct a HirId from a raw u32. For deserialization /
