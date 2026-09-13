@@ -111,7 +111,7 @@ impl LoopForest {
         //    backwards, stopping at the header. That gives the body.
         let mut loops: Vec<NaturalLoop> = Vec::new();
         for (header, latches) in by_header {
-            let body = collect_body(func, header, &latches);
+            let body = collect_body(func, dt, header, &latches);
             let exits = collect_exits(func, &body);
             loops.push(NaturalLoop {
                 header,
@@ -205,8 +205,15 @@ impl LoopForest {
 
 /// Flood predecessors backwards from every latch, stopping at the
 /// header. The result is the loop body — every block on some path
-/// from `header` back to a latch.
-fn collect_body(func: &HirFunction, header: HirId, latches: &[HirId]) -> HashSet<HirId> {
+/// from `header` back to a latch. A predecessor the header does not
+/// dominate is not on such a path: it is a block nothing reaches any
+/// more that still names a block of the loop as its successor.
+fn collect_body(
+    func: &HirFunction,
+    dt: &DominatorTree,
+    header: HirId,
+    latches: &[HirId],
+) -> HashSet<HirId> {
     let mut body: HashSet<HirId> = HashSet::new();
     body.insert(header);
     let mut stack: Vec<HirId> = latches.to_vec();
@@ -216,6 +223,9 @@ fn collect_body(func: &HirFunction, header: HirId, latches: &[HirId]) -> HashSet
     while let Some(b) = stack.pop() {
         if let Some(block) = func.blocks.get(&b) {
             for &p in &block.predecessors {
+                if !dt.dominates(header, p) {
+                    continue;
+                }
                 if body.insert(p) {
                     // First time we've seen `p`; flood its preds too.
                     // Stop at header — anything past it is outside
@@ -299,6 +309,36 @@ mod tests {
         assert!(lf.loops().is_empty());
         assert_eq!(lf.loop_depth(a), 0);
         assert_eq!(lf.loop_depth(b), 0);
+    }
+
+    #[test]
+    fn a_block_nothing_reaches_is_not_in_the_loop_it_branches_into() {
+        // entry → header ⇄ latch ← dead
+        //           ↓
+        //          exit
+        let entry = HirId::new();
+        let header = HirId::new();
+        let latch = HirId::new();
+        let dead = HirId::new();
+        let exit = HirId::new();
+        let func = build_func(
+            "dead_pred",
+            entry,
+            &[
+                (entry, &[header]),
+                (header, &[latch, exit]),
+                (latch, &[header]),
+                (dead, &[latch]),
+                (exit, &[]),
+            ],
+        );
+        let dt = DominatorTree::new(&func);
+        let lf = LoopForest::detect(&func, &dt);
+        assert_eq!(lf.loops().len(), 1);
+        let l = &lf.loops()[0];
+        assert!(l.body.contains(&latch));
+        assert!(!l.body.contains(&dead));
+        assert_eq!(lf.loop_depth(dead), 0);
     }
 
     #[test]
