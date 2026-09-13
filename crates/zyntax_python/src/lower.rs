@@ -9,6 +9,7 @@
 //! built-in library.
 
 use crate::scope::Scope;
+use crate::stdlib;
 use crate::types::{self, Elem, Locals, Module, Sig, Ty, Typer};
 use crate::{intern, prim, span_of, Error, Result};
 use ruff_python_ast as py;
@@ -1739,6 +1740,9 @@ impl<'m> Lowerer<'m> {
                 });
                 self.bind(&target, value, span, out)?;
             }
+            // Imports were resolved when the module was collected; the
+            // statement itself does nothing at run time.
+            py::Stmt::Import(_) | py::Stmt::ImportFrom(_) => {}
             other => return unsupported(types::stmt_kind(other), other),
         }
         Ok(())
@@ -2180,6 +2184,112 @@ impl<'m> Lowerer<'m> {
         Ok(TypedStatement::Block(TypedBlock { statements, span }))
     }
 
+    // ─── Imported modules ──────────────────────────────────────────
+
+    /// The member `value.attr` names when `value` is an imported
+    /// module's name that no variable shadows.
+    fn module_member_of(&self, value: &py::Expr, attr: &str) -> Option<stdlib::Member> {
+        let py::Expr::Name(m) = value else {
+            return None;
+        };
+        if self.is_variable(m.id.as_str()) {
+            return None;
+        }
+        self.module.module_member(m.id.as_str(), attr)
+    }
+
+    /// A module member read as a value: a constant, or what the library
+    /// computes for it. A function is not a value here.
+    fn member_value(
+        &mut self,
+        member: stdlib::Member,
+        name: &str,
+        e: &py::Expr,
+        span: Span,
+    ) -> Result<Val> {
+        Ok(match member {
+            stdlib::Member::Float(f) => Val {
+                node: node(
+                    TypedExpression::Literal(TypedLiteral::Float(f)),
+                    Ty::Float,
+                    span,
+                ),
+                ty: Ty::Float,
+            },
+            stdlib::Member::Int(i) => Val {
+                node: int_lit(i, span),
+                ty: Ty::Int,
+            },
+            stdlib::Member::Value { ty, zb } => Val {
+                node: call(zb, Vec::new(), ty, span),
+                ty,
+            },
+            stdlib::Member::Func { .. } => {
+                return unsupported(format!("`{name}` of a module as a value"), e)
+            }
+        })
+    }
+
+    /// A call to a module's function: arguments converted to the
+    /// declared parameter types, the library function called.
+    fn stdlib_call(
+        &mut self,
+        member: stdlib::Member,
+        name: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        let stdlib::Member::Func { params, ret, zb } = member else {
+            return unsupported(format!("calling `{name}`, which is not a function"), c);
+        };
+        if !keywords.is_empty() {
+            return unsupported(format!("keyword arguments to `{name}`"), c);
+        }
+        // Forms with a default or a second signature.
+        let (params, zb): (Vec<Ty>, &str) = match (zb, args.len()) {
+            ("zb_exit", 0) => {
+                return Ok(Val {
+                    node: call("zb_exit", vec![int_lit(0, span)], Ty::None, span),
+                    ty: Ty::None,
+                })
+            }
+            ("zb_exit", 1) if matches!(&args[0], py::Expr::NoneLiteral(_)) => {
+                return Ok(Val {
+                    node: call("zb_exit", vec![int_lit(0, span)], Ty::None, span),
+                    ty: Ty::None,
+                })
+            }
+            ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
+            _ => (params.to_vec(), zb),
+        };
+        if args.len() != params.len() {
+            return unsupported(
+                format!(
+                    "calling `{name}` with {} argument(s); it takes {}",
+                    args.len(),
+                    params.len()
+                ),
+                c,
+            );
+        }
+        let mut lowered = Vec::with_capacity(args.len());
+        for (a, &want) in args.iter().zip(params.iter()) {
+            let v = self.expr(a)?;
+            let node = match (v.ty, want) {
+                (Ty::Object, Ty::Float) => call("zb_any_float", vec![v.node], Ty::Float, span),
+                (Ty::Object, Ty::Int) => call("zb_any_int", vec![v.node], Ty::Int, span),
+                _ => self.coerce(v, want),
+            };
+            lowered.push(node);
+        }
+        Ok(Val {
+            node: call(zb, lowered, ret, span),
+            ty: ret,
+        })
+    }
+
     // ─── Iteration builtins ────────────────────────────────────────
 
     /// A value as a `List<Any>` to iterate: a typed list boxed, a string
@@ -2252,6 +2362,37 @@ impl<'m> Lowerer<'m> {
     /// function over one dynamic argument.
     fn callable_value(&mut self, e: &py::Expr) -> Result<Node> {
         const BUILTINS: [&str; 8] = ["str", "int", "float", "bool", "len", "abs", "repr", "type"];
+        // A module's function (`math.sqrt`) or a name brought in from one
+        // becomes the lambda that calls it.
+        let imported = match e {
+            py::Expr::Attribute(a) => {
+                match (&*a.value, self.module_member_of(&a.value, a.attr.as_str())) {
+                    (py::Expr::Name(m), Some(member)) => {
+                        Some((member, format!("{}.{}", m.id.as_str(), a.attr.as_str())))
+                    }
+                    _ => None,
+                }
+            }
+            py::Expr::Name(n)
+                if !self.is_variable(n.id.as_str())
+                    && !self.module.funcs.contains_key(n.id.as_str()) =>
+            {
+                self.module
+                    .imported_name(n.id.as_str())
+                    .map(|m| (m, n.id.to_string()))
+            }
+            _ => None,
+        };
+        if let Some((stdlib::Member::Func { params, .. }, source)) = imported {
+            let args: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
+            let text = format!("lambda {}: {source}({})", args.join(", "), args.join(", "));
+            let parsed = ruff_python_parser::parse_expression(&text).expect("a module call parses");
+            let py::Expr::Lambda(lambda) = &*parsed.into_syntax().body else {
+                unreachable!("the source is a lambda")
+            };
+            let span = span_of(e);
+            return Ok(self.lambda(lambda, span)?.node);
+        }
         if let py::Expr::Name(n) = e {
             let name = n.id.as_str();
             if !self.is_variable(name)
@@ -2578,6 +2719,20 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Str,
                 }
             }
+            py::Expr::Name(n) if n.id.as_str() == "__name__" && !self.is_variable("__name__") => {
+                Val {
+                    node: str_lit(&self.module.name, span),
+                    ty: Ty::Str,
+                }
+            }
+            py::Expr::Name(n)
+                if !self.is_variable(n.id.as_str())
+                    && !self.module.funcs.contains_key(n.id.as_str())
+                    && self.module.imported_name(n.id.as_str()).is_some() =>
+            {
+                let member = self.module.imported_name(n.id.as_str()).expect("checked");
+                self.member_value(member, n.id.as_str(), e, span)?
+            }
             py::Expr::Name(n) if self.cells.contains_key(n.id.as_str()) => {
                 self.cell_read(n.id.as_str(), span)
             }
@@ -2598,6 +2753,9 @@ impl<'m> Lowerer<'m> {
             py::Expr::Lambda(l) => self.lambda(l, span)?,
             py::Expr::Generator(g) => self.generator_expr(g, span)?,
             py::Expr::Attribute(a) => {
+                if let Some(member) = self.module_member_of(&a.value, a.attr.as_str()) {
+                    return self.member_value(member, a.attr.as_str(), e, span);
+                }
                 let object = self.expr(&a.value)?;
                 self.attribute(object, a.attr.as_str(), span)?
             }
@@ -3848,11 +4006,24 @@ impl<'m> Lowerer<'m> {
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
         let args = &c.arguments.args;
         let keywords = &c.arguments.keywords;
+        // A function of an imported module, named through the module or
+        // brought in by name.
+        if let py::Expr::Attribute(a) = &*c.func {
+            if let Some(member) = self.module_member_of(&a.value, a.attr.as_str()) {
+                return self.stdlib_call(member, a.attr.as_str(), args, keywords, c, span);
+            }
+        }
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
             if self.is_variable(name) {
                 let callee = self.expr(&c.func)?;
                 return self.call_value(callee, args, keywords, c, span);
+            }
+            if !self.module.funcs.contains_key(name) && !self.module.class_index.contains_key(name)
+            {
+                if let Some(member) = self.module.imported_name(name) {
+                    return self.stdlib_call(member, name, args, keywords, c, span);
+                }
             }
             if let Some(&k) = self.module.class_index.get(name) {
                 return self.construct(k, args, keywords, c, span);
@@ -3977,6 +4148,17 @@ impl<'m> Lowerer<'m> {
                         self.truthy(v)
                     };
                     return Ok(Val { node, ty: Ty::Bool });
+                }
+                "input" if args.len() <= 1 => {
+                    let node = match args.first() {
+                        None => call("zb_read_line", Vec::new(), Ty::Str, span),
+                        Some(p) => {
+                            let prompt = self.expr(p)?;
+                            let prompt = self.str_of(prompt);
+                            call("zb_input", vec![prompt], Ty::Str, span)
+                        }
+                    };
+                    return Ok(Val { node, ty: Ty::Str });
                 }
                 "isinstance" if args.len() == 2 => {
                     let v = self.expr(&args[0])?;
@@ -4356,6 +4538,11 @@ impl<'m> Lowerer<'m> {
                                 ),
                                 ty,
                             });
+                        }
+                        (_, 2) => {
+                            let o = self.coerce(v, Ty::Object);
+                            let n = self.expr_as(&args[1], Ty::Int)?;
+                            call("zb_any_round_digits", vec![o, n], Ty::Object, span)
                         }
                         _ => {
                             let o = self.coerce(v, Ty::Object);

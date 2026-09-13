@@ -161,6 +161,39 @@ pub(crate) struct Module {
     /// Library functions that can raise.
     pub(crate) fallible: std::collections::BTreeSet<String>,
     pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
+    /// What `__name__` is in this module.
+    pub(crate) name: String,
+    /// `import m [as n]`: the name a module goes by, to the module.
+    pub(crate) imports: HashMap<String, String>,
+    /// `from m import x [as y]`: the local name, to the module and the
+    /// member.
+    pub(crate) from_names: HashMap<String, (String, String)>,
+}
+
+impl Module {
+    /// What a module-qualified name stands for, when `alias` names an
+    /// imported module and nothing shadows it.
+    pub(crate) fn module_member(&self, alias: &str, name: &str) -> Option<crate::stdlib::Member> {
+        let module = self.imports.get(alias)?;
+        crate::stdlib::member(module, name)
+    }
+
+    /// What a name brought in by `from m import x` stands for.
+    pub(crate) fn imported_name(&self, name: &str) -> Option<crate::stdlib::Member> {
+        let (module, member) = self.from_names.get(name)?;
+        crate::stdlib::member(module, member)
+    }
+}
+
+/// The type of what a module member evaluates to, or of what calling it
+/// returns.
+pub(crate) fn member_ty(member: crate::stdlib::Member) -> Ty {
+    match member {
+        crate::stdlib::Member::Func { ret, .. } => ret,
+        crate::stdlib::Member::Float(_) => Ty::Float,
+        crate::stdlib::Member::Int(_) => Ty::Int,
+        crate::stdlib::Member::Value { ty, .. } => ty,
+    }
 }
 
 /// A class: its place in the hierarchy, its layout and its methods.
@@ -257,10 +290,10 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
             "bool" => Ty::Bool,
             "str" => Ty::Str,
             "None" => Ty::None,
-            "list" => Ty::List(Elem::Object),
-            "dict" => Ty::Dict,
-            "set" => Ty::Set,
-            "tuple" => Ty::Tuple,
+            "list" | "List" | "Sequence" | "Iterable" => Ty::List(Elem::Object),
+            "dict" | "Dict" | "Mapping" => Ty::Dict,
+            "set" | "Set" => Ty::Set,
+            "tuple" | "Tuple" => Ty::Tuple,
             other => classes
                 .get(other)
                 .map(|k| Ty::Class(*k as u16))
@@ -856,13 +889,24 @@ impl Typer<'_> {
             py::Expr::BooleanLiteral(_) => Ty::Bool,
             py::Expr::NoneLiteral(_) => Ty::None,
             py::Expr::StringLiteral(_) | py::Expr::FString(_) => Ty::Str,
-            py::Expr::Name(n) => self
-                .vars
-                .get(n.id.as_str())
-                .or_else(|| self.outer.get(n.id.as_str()))
-                .or_else(|| self.module.globals.get(n.id.as_str()))
-                .copied()
-                .unwrap_or(Ty::Object),
+            py::Expr::Name(n) => {
+                let name = n.id.as_str();
+                if let Some(ty) = self
+                    .vars
+                    .get(name)
+                    .or_else(|| self.outer.get(name))
+                    .or_else(|| self.module.globals.get(name))
+                {
+                    return *ty;
+                }
+                if name == "__name__" {
+                    return Ty::Str;
+                }
+                match self.module.imported_name(name) {
+                    Some(m) => member_ty(m),
+                    None => Ty::Object,
+                }
+            }
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left);
                 let r = self.expr(&b.right);
@@ -890,14 +934,19 @@ impl Typer<'_> {
             }
             py::Expr::If(i) => self.expr(&i.body).join(self.expr(&i.orelse)),
             py::Expr::Call(c) => self.call(c),
-            py::Expr::Attribute(a) => match self.expr(&a.value) {
-                Ty::Class(k) => self
-                    .module
-                    .field(k as usize, a.attr.as_str())
-                    .map(|(_, ty)| ty)
-                    .unwrap_or(Ty::Object),
-                _ => Ty::Object,
-            },
+            py::Expr::Attribute(a) => {
+                if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
+                    return member_ty(m);
+                }
+                match self.expr(&a.value) {
+                    Ty::Class(k) => self
+                        .module
+                        .field(k as usize, a.attr.as_str())
+                        .map(|(_, ty)| ty)
+                        .unwrap_or(Ty::Object),
+                    _ => Ty::Object,
+                }
+            }
             py::Expr::Subscript(s) => {
                 let seq = self.expr(&s.value);
                 if matches!(&*s.slice, py::Expr::Slice(_)) {
@@ -950,9 +999,34 @@ impl Typer<'_> {
         kind.unwrap_or(Elem::Object)
     }
 
+    /// The module member `value.attr` names, when `value` is an imported
+    /// module's name and no variable shadows it.
+    pub(crate) fn module_member_of(
+        &self,
+        value: &py::Expr,
+        attr: &str,
+    ) -> Option<crate::stdlib::Member> {
+        let py::Expr::Name(m) = value else {
+            return None;
+        };
+        let alias = m.id.as_str();
+        if self.vars.contains_key(alias)
+            || self.outer.contains_key(alias)
+            || self.module.globals.contains_key(alias)
+        {
+            return None;
+        }
+        self.module.module_member(alias, attr)
+    }
+
     fn call(&self, c: &py::ExprCall) -> Ty {
         let args = &c.arguments.args;
         let arg = |i: usize| args.get(i).map(|a| self.expr(a)).unwrap_or(Ty::Unknown);
+        if let py::Expr::Attribute(a) = &*c.func {
+            if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
+                return member_ty(m);
+            }
+        }
         match &*c.func {
             py::Expr::Name(n) => {
                 let name = n.id.as_str();
@@ -961,6 +1035,11 @@ impl Typer<'_> {
                 }
                 if let Some(sig) = self.module.funcs.get(name) {
                     return sig.ret;
+                }
+                if !self.vars.contains_key(name) && !self.outer.contains_key(name) {
+                    if let Some(m) = self.module.imported_name(name) {
+                        return member_ty(m);
+                    }
                 }
                 match name {
                     "print" => Ty::None,

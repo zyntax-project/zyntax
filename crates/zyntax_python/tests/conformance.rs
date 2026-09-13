@@ -107,16 +107,23 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
 /// neither Python nor a decision).
 fn expected_for(case: &Path) -> Option<Outcome> {
     let pin = case.with_extension("expected");
+    // A program that exits with a status pins it beside its output; one
+    // that exits 0 pins nothing extra.
+    let status_pin = case.with_extension("status");
     if let Ok(text) = fs::read_to_string(&pin) {
+        let status = fs::read_to_string(&status_pin)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         return Some(Outcome {
             stdout: text,
-            status: 0,
+            status,
         });
     }
     let mut cmd = Command::new("python3");
     cmd.arg(case);
     let got = run_bounded(cmd, Duration::from_secs(30));
-    if got.status != 0 {
+    if got.status < 0 || got.status > 100 {
         eprintln!(
             "  cannot pin {}: python3 exited {} (is python3 installed?)",
             case.display(),
@@ -125,6 +132,9 @@ fn expected_for(case: &Path) -> Option<Outcome> {
         return None;
     }
     let _ = fs::write(&pin, &got.stdout);
+    if got.status != 0 {
+        let _ = fs::write(&status_pin, got.status.to_string());
+    }
     Some(got)
 }
 
@@ -159,14 +169,15 @@ fn category(name: &str) {
             continue;
         };
         let got = ours_for(case);
-        let ok = got.status == 0 && got.stdout == expected.stdout;
+        let ok = got.status == expected.status && got.stdout == expected.stdout;
         match (ok, known.get(&key)) {
             (true, None) => passed += 1,
             (true, Some(issue)) => fixed.push((key, issue.clone())),
             (false, Some(issue)) => known_failed.push((key, issue.clone())),
             (false, None) => {
                 regressions.push(format!(
-                    "{key}\n    expected (CPython):\n{}\n    got (zypy, exit {}):\n{}",
+                    "{key}\n    expected (CPython, exit {}):\n{}\n    got (zypy, exit {}):\n{}",
+                    expected.status,
                     indent(&expected.stdout),
                     got.status,
                     indent(&got.stdout)
@@ -244,4 +255,5 @@ categories! {
     exceptions,
     builtin,
     iteration,
+    modules,
 }

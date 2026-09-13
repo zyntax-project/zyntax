@@ -15,8 +15,10 @@ zyntax_compiler = { path = "../compiler" }
 zyntax_builtins = { path = "../zyntax_builtins" }
 # The plugins a Python program links: the primitives the built-in
 # library is written against.
+zrtl = { path = "../../sdk/zrtl" }
 zrtl_io = { path = "../../plugins/zrtl_io", features = ["linked-into-host"] }
 zrtl_string = { path = "../../plugins/zrtl_string", features = ["linked-into-host"] }
+zrtl_math = { path = "../../plugins/zrtl_math", features = ["linked-into-host"] }
 # Pinned exactly: the crate publishes 0.0.x and makes no semver promise.
 ruff_python_parser = "=0.0.12"
 ruff_python_ast = "=0.0.12"

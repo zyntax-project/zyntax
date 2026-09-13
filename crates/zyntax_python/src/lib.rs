@@ -27,9 +27,11 @@ use zyntax_typed_ast::{
 
 mod classes;
 mod format;
+mod host;
 mod lower;
 mod prelude;
 mod scope;
+mod stdlib;
 mod types;
 
 /// Why a program could not be turned into a `TypedProgram`.
@@ -54,6 +56,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub const ENTRY: &str = "__main__";
 
 mod policy;
+pub use host::set_args;
 use policy::LIBRARY_MODULE;
 pub use policy::POLICY;
 
@@ -106,17 +109,23 @@ fn library() -> Result<Library> {
     })
 }
 
-/// Give a runtime what a compiled Python program links against: the IO
-/// and string plugins the library's primitives come from, and the name
-/// a program is entered through, so only the library the program
-/// reaches is built. A host calls this once before compiling a program.
+/// Give a runtime what a compiled Python program links against: the IO,
+/// string and math plugins the library's primitives come from, the
+/// host's own symbols, and the name a program is entered through, so
+/// only the library the program reaches is built. A host calls this
+/// once before compiling a program, after [`set_args`] if it has any.
 pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {
     let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
     runtime.install_snapshot(snapshot)?;
     runtime.declare_entry_points([ENTRY]);
-    runtime.register_static_plugins([zrtl_io::static_plugin(), zrtl_string::static_plugin()])
+    runtime.register_static_plugins([
+        zrtl_io::static_plugin(),
+        zrtl_string::static_plugin(),
+        zrtl_math::static_plugin(),
+        host::static_plugin(),
+    ])
 }
 
 /// Parse Python source and rewrite it into a `TypedProgram`.
@@ -192,11 +201,15 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         ret: types::Ty::None,
         defaults: Vec::new(),
     };
+    let (imports, from_names) = collect_imports(&module.body)?;
     let mut inferred = types::Module {
         list_type: Some(library.list_type),
         classes: class_infos,
         class_index,
         fallible: library.fallible.clone(),
+        name: ENTRY.to_string(),
+        imports,
+        from_names,
         ..Default::default()
     };
     let global_names = module_globals(&module.body, &defs, &inferred.class_index);
@@ -380,6 +393,118 @@ pub fn parse_program(source: &str) -> Result<TypedProgram> {
         source_files: Vec::new(),
         type_registry: library.type_registry,
     })
+}
+
+/// Module aliases to modules, and local names to the module and member
+/// they were imported from.
+type Imports = std::collections::HashMap<String, String>;
+type FromNames = std::collections::HashMap<String, (String, String)>;
+
+/// Every `import` in the program, wherever it appears: the modules go
+/// by their aliases, the names brought in by `from` by theirs. A module
+/// this frontend does not know is refused here, before anything is
+/// lowered.
+fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
+    let mut imports = Imports::new();
+    let mut from_names = FromNames::new();
+    fn walk(stmts: &[py::Stmt], imports: &mut Imports, from_names: &mut FromNames) -> Result<()> {
+        for s in stmts {
+            match s {
+                py::Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let module = alias.name.id.as_str();
+                        if !stdlib::is_known(module) {
+                            return Err(Error::Unsupported {
+                                what: format!("import of module `{module}`"),
+                                at: alias.range().start().to_usize(),
+                            });
+                        }
+                        let local = alias
+                            .asname
+                            .as_ref()
+                            .map(|a| a.id.to_string())
+                            .unwrap_or_else(|| module.to_string());
+                        imports.insert(local, module.to_string());
+                    }
+                }
+                py::Stmt::ImportFrom(f) => {
+                    let Some(module) = f.module.as_ref().map(|m| m.id.as_str()) else {
+                        return Err(Error::Unsupported {
+                            what: "a relative import".to_string(),
+                            at: f.range().start().to_usize(),
+                        });
+                    };
+                    if !stdlib::is_known(module) {
+                        return Err(Error::Unsupported {
+                            what: format!("import of module `{module}`"),
+                            at: f.range().start().to_usize(),
+                        });
+                    }
+                    for alias in &f.names {
+                        let name = alias.name.id.as_str();
+                        if name == "*" {
+                            return Err(Error::Unsupported {
+                                what: format!("`from {module} import *`"),
+                                at: alias.range().start().to_usize(),
+                            });
+                        }
+                        // typing's names are annotations, not values.
+                        if module == "typing" {
+                            if !stdlib::is_typing_name(name) {
+                                return Err(Error::Unsupported {
+                                    what: format!("`typing.{name}`"),
+                                    at: alias.range().start().to_usize(),
+                                });
+                            }
+                            continue;
+                        }
+                        if stdlib::member(module, name).is_none() {
+                            return Err(Error::Unsupported {
+                                what: format!("`{module}.{name}`"),
+                                at: alias.range().start().to_usize(),
+                            });
+                        }
+                        let local = alias
+                            .asname
+                            .as_ref()
+                            .map(|a| a.id.to_string())
+                            .unwrap_or_else(|| name.to_string());
+                        from_names.insert(local, (module.to_string(), name.to_string()));
+                    }
+                }
+                py::Stmt::FunctionDef(d) => walk(&d.body, imports, from_names)?,
+                py::Stmt::ClassDef(c) => walk(&c.body, imports, from_names)?,
+                py::Stmt::If(i) => {
+                    walk(&i.body, imports, from_names)?;
+                    for clause in &i.elif_else_clauses {
+                        walk(&clause.body, imports, from_names)?;
+                    }
+                }
+                py::Stmt::For(f) => {
+                    walk(&f.body, imports, from_names)?;
+                    walk(&f.orelse, imports, from_names)?;
+                }
+                py::Stmt::While(w) => {
+                    walk(&w.body, imports, from_names)?;
+                    walk(&w.orelse, imports, from_names)?;
+                }
+                py::Stmt::Try(t) => {
+                    walk(&t.body, imports, from_names)?;
+                    for h in &t.handlers {
+                        let py::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, imports, from_names)?;
+                    }
+                    walk(&t.orelse, imports, from_names)?;
+                    walk(&t.finalbody, imports, from_names)?;
+                }
+                py::Stmt::With(w) => walk(&w.body, imports, from_names)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    walk(body, &mut imports, &mut from_names)?;
+    Ok((imports, from_names))
 }
 
 /// The module-level names that are variables of the module rather than

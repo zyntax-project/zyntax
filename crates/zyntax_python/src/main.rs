@@ -13,10 +13,14 @@ fn main() -> ExitCode {
     let path = match (args.next().as_deref(), args.next()) {
         (Some("run"), Some(p)) => PathBuf::from(p),
         _ => {
-            eprintln!("usage: zypy run <file.py>");
+            eprintln!("usage: zypy run <file.py> [args...]");
             return ExitCode::from(2);
         }
     };
+    // What the program sees as `sys.argv`: its own path, then the rest.
+    let mut argv = vec![path.display().to_string()];
+    argv.extend(args);
+    zyntax_python::set_args(argv);
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {

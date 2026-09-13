@@ -1344,5 +1344,43 @@ fn rounding() -> Vec<Decl> {
             ret(v.e()),
         ],
     ));
+    // With digits: a float stays a float; an int rounds only when the
+    // digits are negative, and stays an int.
+    let digits = local("digits", i64());
+    d.push(define(
+        "zb_any_round_digits",
+        &[&v, &digits],
+        any(),
+        vec![
+            when(
+                eq(call("zb_any_category", vec![v.e()], i64()), int(FLOAT)),
+                vec![ret(call(
+                    "zb_box_f64",
+                    vec![call(
+                        "zb_round_digits",
+                        vec![call("zb_box_get_f64", vec![v.e()], f64()), digits.e()],
+                        f64(),
+                    )],
+                    any(),
+                ))],
+            ),
+            when(ge(digits.e(), int(0)), vec![ret(v.e())]),
+            ret(call(
+                "zb_box_i64",
+                vec![cast(
+                    call(
+                        "zb_round_digits",
+                        vec![
+                            cast(call("zb_any_int", vec![v.e()], i64()), f64()),
+                            digits.e(),
+                        ],
+                        f64(),
+                    ),
+                    i64(),
+                )],
+                any(),
+            )),
+        ],
+    ));
     d
 }

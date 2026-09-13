@@ -18,6 +18,7 @@ pub mod functions;
 mod io;
 mod iteration;
 mod lists;
+mod math;
 mod strings;
 
 use zyntax_typed_ast::typed_builder::TypedASTBuilder;
@@ -145,7 +146,7 @@ pub fn library(policy: &Policy) -> Library {
     let mut b = TypedASTBuilder::new();
     let list_type = lists::declare_list_type(&mut b);
     let mut declarations = Vec::new();
-    declarations.extend(io::declarations(policy));
+    declarations.extend(io::declarations(policy, list_type));
     declarations.extend(strings::declarations(policy));
     declarations.extend(format::declarations());
     declarations.extend(dynamic::declarations(policy, list_type));
@@ -153,6 +154,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(functions::declarations(list_type));
     declarations.extend(dicts::declarations(list_type));
     declarations.extend(iteration::declarations(list_type));
+    declarations.extend(math::declarations());
     // The hooks a frontend defines are declared here as externs, so the
     // library lowers on its own; the frontend's definition takes the
     // declaration's place when the two meet in a program.

@@ -330,6 +330,11 @@ pub fn if_expr(c: Expr, t: Expr, e: Expr) -> Expr {
     )
 }
 
+/// The null of a pointer type.
+pub fn null(ty: Type) -> Expr {
+    node(TypedExpression::Literal(TypedLiteral::Null), ty)
+}
+
 /// A list literal of the given list type.
 pub fn list(items: Vec<Expr>, list_ty: Type) -> Expr {
     node(TypedExpression::Array(items), list_ty)
