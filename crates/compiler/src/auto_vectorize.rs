@@ -117,7 +117,7 @@ pub fn run_module(module: &mut HirModule) -> AutoVectorizeStats {
     }
     let pass = AutoVectorizePass::default();
     let mut total = AutoVectorizeStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         total.add(pass.run(func));
     }
     total
@@ -1206,10 +1206,17 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         }
     }
 
-    // Wire exit predecessors.
+    // Wire exit predecessors, and the exit's own phis with them.
     if let Some(exit_blk) = func.blocks.get_mut(&plan.exit) {
         exit_blk.predecessors.retain(|p| *p != plan.header);
         exit_blk.predecessors.push(scalar_check);
+        for phi in &mut exit_blk.phis {
+            for (_, src) in &mut phi.incoming {
+                if *src == plan.header {
+                    *src = scalar_check;
+                }
+            }
+        }
     }
 
     // Move the accumulator's outside-the-loop uses onto the tail.

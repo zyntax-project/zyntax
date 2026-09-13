@@ -101,7 +101,7 @@ pub fn run(func: &mut HirFunction) -> ReductionStats {
 /// Module-level entry.
 pub fn run_module(module: &mut HirModule) -> ReductionStats {
     let mut total = ReductionStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run(func);
         total.vectorized += s.vectorized;
         total.loops_visited += s.loops_visited;
@@ -881,6 +881,15 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
     if let Some(exit_blk) = func.blocks.get_mut(&pat.exit) {
         exit_blk.predecessors.retain(|p| *p != pat.header);
         exit_blk.predecessors.push(scalar_check);
+        // The exit may be a block with phis of its own, whose incoming
+        // from the header now arrives from the scalar check.
+        for phi in &mut exit_blk.phis {
+            for (_, src) in &mut phi.incoming {
+                if *src == pat.header {
+                    *src = scalar_check;
+                }
+            }
+        }
     }
 
     // Redirect post-loop uses of the reduction result. `sum_phi` is now the

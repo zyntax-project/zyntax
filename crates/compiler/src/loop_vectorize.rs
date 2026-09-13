@@ -122,7 +122,7 @@ pub fn run(func: &mut HirFunction) -> VectorizeStats {
 /// Module-level entry.
 pub fn run_module(module: &mut HirModule) -> VectorizeStats {
     let mut total = VectorizeStats::default();
-    for func in module.functions.values_mut() {
+    for func in module.functions_to_optimize() {
         let s = run(func);
         total.vectorized += s.vectorized;
         total.loops_visited += s.loops_visited;
@@ -868,6 +868,15 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
     if let Some(exit_blk) = func.blocks.get_mut(&pat.exit) {
         exit_blk.predecessors.retain(|p| *p != pat.header);
         exit_blk.predecessors.push(scalar_check);
+        // The exit may be a block with phis of its own, whose incoming
+        // from the header now arrives from the scalar check.
+        for phi in &mut exit_blk.phis {
+            for (_, src) in &mut phi.incoming {
+                if *src == pat.header {
+                    *src = scalar_check;
+                }
+            }
+        }
     }
 }
 
