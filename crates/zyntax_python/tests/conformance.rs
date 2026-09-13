@@ -279,4 +279,5 @@ categories! {
     builtin,
     iteration,
     modules,
+    inference,
 }

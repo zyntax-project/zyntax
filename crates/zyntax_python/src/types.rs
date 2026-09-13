@@ -12,6 +12,10 @@
 //! signatures, so an unannotated return type is the join of what the
 //! body returns, and inside each function over its locals, so a name
 //! gets the join of everything assigned to it anywhere in the body.
+//! An unannotated parameter is dynamic, as Python has it, unless every
+//! call of its function is in view; then it is the join of what the
+//! calls pass and what the body assigns to it, which is exact where the
+//! program is consistent and dynamic where it is not.
 
 use ruff_python_ast as py;
 use std::collections::HashMap;
@@ -112,6 +116,7 @@ impl Ty {
             Ty::List(e) => Some(e.ty()),
             Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
+            Ty::Unknown => Some(Ty::Unknown),
             _ => None,
         }
     }
@@ -176,6 +181,9 @@ pub(crate) struct Module {
     pub(crate) from_names: HashMap<String, (String, String)>,
     /// The program's own modules, to the index of their source file.
     pub(crate) files: HashMap<String, u32>,
+    /// Functions every call of which is in view, so an unannotated
+    /// parameter can be typed by what is passed; see [`closed_items`].
+    pub(crate) closed: std::collections::HashSet<String>,
 }
 
 impl Module {
@@ -293,6 +301,10 @@ pub(crate) struct Locals {
     /// Attributes assigned on the first parameter (`self.x = ...`), and
     /// what is assigned to them.
     pub(crate) field_writes: HashMap<String, Ty>,
+    /// What the body assigns to its own parameters.
+    pub(crate) param_writes: HashMap<String, Ty>,
+    /// Whether the body has a `return`; without one it returns None.
+    pub(crate) returns: bool,
 }
 
 /// An annotation, with the module's class names known.
@@ -402,7 +414,6 @@ pub(crate) fn is_generator(body: &[py::Stmt]) -> bool {
     finder.0
 }
 
-/// Infer the module's signatures to a fixed point.
 /// A function the module defines: the name it lowers to, the class it
 /// is a method of, and its definition.
 pub(crate) struct Item<'a> {
@@ -414,37 +425,149 @@ pub(crate) struct Item<'a> {
     pub(crate) module: Option<String>,
 }
 
-/// Infer the module's signatures to a fixed point. Class layouts are
-/// taken from `known` and refined from what methods assign to `self`.
-pub(crate) fn infer_module(
-    known: &Module,
+/// What [`infer_module`] decided.
+pub(crate) struct Inferred {
+    pub(crate) funcs: HashMap<String, Sig>,
+    pub(crate) classes: Vec<ClassInfo>,
+    /// The entry body's locals, against the signatures above.
+    pub(crate) entry: Locals,
+}
+
+/// The items every call of which is in view: module functions never
+/// mentioned but as a callee, and constructors never reached but
+/// through their class. An unannotated parameter of one is typed by
+/// what is passed to it, everywhere it is passed; any other stays
+/// dynamic, as Python has it.
+pub(crate) fn closed_items(
+    body: &[py::Stmt],
     items: &[Item<'_>],
-) -> (HashMap<String, Sig>, Vec<ClassInfo>) {
+) -> std::collections::HashSet<String> {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    #[derive(Default)]
+    struct Mentions {
+        /// Names used as anything but a callee: values, assignment
+        /// targets, deletions.
+        names: std::collections::HashSet<String>,
+        /// `x.__init__` on anything but `super()`: a constructor
+        /// reached without its class.
+        init: bool,
+    }
+    impl<'a> Visitor<'a> for Mentions {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            if let py::Stmt::FunctionDef(f) = stmt {
+                // A decorator receives the function as a value.
+                if !f.decorator_list.is_empty() {
+                    self.names.insert(f.name.to_string());
+                }
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            match expr {
+                py::Expr::Call(c) => {
+                    match &*c.func {
+                        py::Expr::Name(_) => {}
+                        other => self.visit_expr(other),
+                    }
+                    for a in &c.arguments.args {
+                        self.visit_expr(a);
+                    }
+                    for k in &c.arguments.keywords {
+                        self.visit_expr(&k.value);
+                    }
+                }
+                py::Expr::Name(n) => {
+                    self.names.insert(n.id.to_string());
+                }
+                py::Expr::Attribute(a) if a.attr.as_str() == "__init__" => {
+                    if !is_super_call(&a.value) {
+                        self.init = true;
+                    }
+                    walk_expr(self, expr);
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut seen = Mentions::default();
+    for s in body {
+        seen.visit_stmt(s);
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for item in items {
+        *counts.entry(item.name.as_str()).or_default() += 1;
+    }
+    items
+        .iter()
+        .filter(|item| counts[item.name.as_str()] == 1)
+        .filter(|item| item.def.parameters.vararg.is_none() && item.def.parameters.kwarg.is_none())
+        .filter(|item| match item.class {
+            None => !seen.names.contains(&item.name),
+            // The exception classes the library and the lowering raise
+            // by name are constructed out of view.
+            Some(_) => {
+                item.def.name.as_str() == "__init__"
+                    && !seen.init
+                    && !crate::prelude::EXCEPTION_KINDS
+                        .iter()
+                        .any(|kind| item.name == method_fn(kind, "__init__"))
+            }
+        })
+        .map(|item| item.name.clone())
+        .collect()
+}
+
+/// Infer the module's signatures to a fixed point. Class layouts are
+/// taken from `known` and refined from what methods assign to `self`;
+/// the unannotated parameters of `known.closed` functions are the join
+/// of what every call passes and what the body assigns to them.
+/// Nothing undecided is settled before the end, so a value not yet
+/// typed contributes nothing to a join rather than making it dynamic.
+pub(crate) fn infer_module(known: &Module, items: &[Item<'_>], entry: &[py::Stmt]) -> Inferred {
     let mut module = Module {
         funcs: HashMap::new(),
         globals: known.globals.clone(),
         list_type: known.list_type,
         classes: known.classes.clone(),
         class_index: known.class_index.clone(),
+        closed: known.closed.clone(),
         ..Default::default()
     };
+    // Which parameters of each function are inferred, by position.
+    let mut inferring: HashMap<String, Vec<bool>> = HashMap::new();
     for item in items {
-        module.funcs.insert(
-            item.name.clone(),
-            declared_sig_in(&module.class_index, item.def, item.class),
-        );
+        let mut sig = declared_sig_in(&module.class_index, item.def, item.class);
+        if known.closed.contains(&item.name) {
+            let flags: Vec<bool> = item
+                .def
+                .parameters
+                .iter_non_variadic_params()
+                .enumerate()
+                .map(|(i, p)| p.parameter.annotation.is_none() && !(i == 0 && item.class.is_some()))
+                .collect();
+            for (flag, (_, ty)) in flags.iter().zip(sig.params.iter_mut()) {
+                if *flag {
+                    *ty = Ty::Unknown;
+                }
+            }
+            inferring.insert(item.name.clone(), flags);
+        }
+        module.funcs.insert(item.name.clone(), sig);
     }
-    for _ in 0..8 {
+    let entry_sig = Sig {
+        params: Vec::new(),
+        ret: Ty::None,
+        defaults: Vec::new(),
+    };
+    let mut entry_locals = Locals::default();
+    for _ in 0..32 {
         let mut changed = false;
+        let mut passed: Vec<(String, usize, Ty)> = Vec::new();
         for item in items {
             let sig = module.funcs[&item.name].clone();
-            let locals = infer_locals(&module, &sig, &item.def.body);
+            let locals = infer_locals_open(&module, &sig, &item.def.body);
             if item.def.returns.is_none() && sig.ret != Ty::Gen {
-                let ret = if locals.ret == Ty::Unknown {
-                    Ty::None
-                } else {
-                    locals.ret
-                };
+                let ret = if locals.returns { locals.ret } else { Ty::None };
                 if ret != sig.ret {
                     module.funcs.get_mut(&item.name).unwrap().ret = ret;
                     changed = true;
@@ -457,15 +580,61 @@ pub(crate) fn infer_module(
                     changed |= widen_field(&mut module.classes, k, field, *ty);
                 }
             }
+            if let Some(flags) = inferring.get(&item.name) {
+                for (i, (name, _)) in sig.params.iter().enumerate() {
+                    if let (true, Some(ty)) = (flags[i], locals.param_writes.get(name)) {
+                        passed.push((item.name.clone(), i, *ty));
+                    }
+                }
+            }
+            Calls {
+                module: &module,
+                vars: &locals.vars,
+                class: item.class,
+                opaque: false,
+                passed: &mut passed,
+            }
+            .stmts(&item.def.body);
+        }
+        entry_locals = infer_locals_open(&module, &entry_sig, entry);
+        Calls {
+            module: &module,
+            vars: &entry_locals.vars,
+            class: None,
+            opaque: false,
+            passed: &mut passed,
+        }
+        .stmts(entry);
+        for (callee, index, ty) in passed {
+            let Some(flags) = inferring.get(&callee) else {
+                continue;
+            };
+            if !flags[index] {
+                continue;
+            }
+            let slot = &mut module.funcs.get_mut(&callee).unwrap().params[index].1;
+            let joined = slot.join(ty);
+            if joined != *slot {
+                *slot = joined;
+                changed = true;
+            }
         }
         if !changed {
             break;
         }
     }
-    // Whatever recursion left undecided is dynamic.
-    for sig in module.funcs.values_mut() {
+    // Whatever recursion left undecided is dynamic. So is a parameter
+    // only ever passed None: the IR has no value of that type to pass.
+    for (name, sig) in module.funcs.iter_mut() {
         if sig.ret == Ty::Unknown {
             sig.ret = Ty::Object;
+        }
+        if let Some(flags) = inferring.get(name) {
+            for (flag, (_, ty)) in flags.iter().zip(sig.params.iter_mut()) {
+                if *flag && matches!(ty, Ty::Unknown | Ty::None) {
+                    *ty = Ty::Object;
+                }
+            }
         }
     }
     for class in &mut module.classes {
@@ -476,7 +645,187 @@ pub(crate) fn infer_module(
         }
     }
     normalize_layouts(&mut module.classes);
-    (module.funcs, module.classes)
+    settle(&mut entry_locals);
+    Inferred {
+        funcs: module.funcs,
+        classes: module.classes,
+        entry: entry_locals,
+    }
+}
+
+/// The calls a body makes to the module's own functions and
+/// constructors, and what each passes to which parameter.
+struct Calls<'a> {
+    module: &'a Module,
+    vars: &'a HashMap<String, Ty>,
+    /// The class whose method this body is, for `super()`.
+    class: Option<usize>,
+    /// Inside a nested function or lambda, whose variables are not in
+    /// `vars`: every argument counts as dynamic.
+    opaque: bool,
+    passed: &'a mut Vec<(String, usize, Ty)>,
+}
+
+impl Calls<'_> {
+    fn stmts(&mut self, stmts: &[py::Stmt]) {
+        use ruff_python_ast::visitor::Visitor;
+        for s in stmts {
+            self.visit_stmt(s);
+        }
+    }
+
+    /// Walk a nested scope, whose variables are not in `vars`.
+    fn nested(&mut self, walk: impl FnOnce(&mut Self)) {
+        let was = self.opaque;
+        self.opaque = true;
+        walk(self);
+        self.opaque = was;
+    }
+
+    /// The function a call reaches and the index of its first parameter
+    /// the arguments fill: a constructor's `self` is not passed.
+    fn callee(&self, func: &py::Expr) -> Option<(String, usize)> {
+        match func {
+            py::Expr::Name(n) => {
+                let name = n.id.as_str();
+                if let Some(&k) = self.module.class_index.get(name) {
+                    let (_, init) = self.module.method_sig(k, "__init__")?;
+                    return Some((init, 1));
+                }
+                self.module
+                    .funcs
+                    .contains_key(name)
+                    .then(|| (name.to_string(), 0))
+            }
+            py::Expr::Attribute(a) if a.attr.as_str() == "__init__" && is_super_call(&a.value) => {
+                let base = self.module.classes[self.class?].base?;
+                let (_, init) = self.module.method_sig(base, "__init__")?;
+                Some((init, 1))
+            }
+            _ => None,
+        }
+    }
+
+    fn arg_ty(&self, e: &py::Expr) -> Ty {
+        if self.opaque {
+            return Ty::Object;
+        }
+        Typer {
+            module: self.module,
+            vars: self.vars,
+            outer: &HashMap::new(),
+        }
+        .expr(e)
+    }
+
+    /// Record what a call passes to each parameter from `first` on. A
+    /// parameter left out takes its default; a call that cannot be
+    /// matched to the parameters makes them all dynamic.
+    fn record(
+        &mut self,
+        callee: String,
+        first: usize,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+    ) {
+        let sig = &self.module.funcs[&callee];
+        let n = sig.params.len();
+        let mut given: Vec<Option<Ty>> = vec![None; n];
+        let mut matched = !args.iter().any(|a| matches!(a, py::Expr::Starred(_)))
+            && keywords.iter().all(|k| k.arg.is_some())
+            && first + args.len() <= n;
+        if matched {
+            for (i, a) in args.iter().enumerate() {
+                given[first + i] = Some(self.arg_ty(a));
+            }
+            for k in keywords {
+                let name = k.arg.as_ref().unwrap().as_str();
+                match sig.params.iter().position(|(p, _)| p == name) {
+                    Some(i) if i >= first && given[i].is_none() => {
+                        given[i] = Some(self.arg_ty(&k.value));
+                    }
+                    _ => matched = false,
+                }
+            }
+        }
+        for i in first..n {
+            let ty = if !matched {
+                Ty::Object
+            } else {
+                match (given[i], &sig.defaults[i]) {
+                    (Some(t), _) => t,
+                    (None, Some(d)) => Typer {
+                        module: self.module,
+                        vars: &HashMap::new(),
+                        outer: &HashMap::new(),
+                    }
+                    .expr(d),
+                    // Missing with no default: the call fails before the
+                    // function runs.
+                    (None, None) => continue,
+                }
+            };
+            self.passed.push((callee.clone(), i, ty));
+        }
+    }
+}
+
+impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
+    fn visit_stmt(&mut self, stmt: &'ast py::Stmt) {
+        use ruff_python_ast::visitor::walk_stmt;
+        match stmt {
+            // Defaults are evaluated where the function is defined.
+            py::Stmt::FunctionDef(f) => {
+                for p in f.parameters.iter_non_variadic_params() {
+                    if let Some(d) = &p.default {
+                        self.visit_expr(d);
+                    }
+                }
+                self.nested(|c| c.visit_body(&f.body));
+            }
+            py::Stmt::ClassDef(c) => self.nested(|v| v.visit_body(&c.body)),
+            // `raise C`: the class is called with nothing.
+            py::Stmt::Raise(r) => {
+                if let Some(py::Expr::Name(n)) = r.exc.as_deref() {
+                    if let Some(&k) = self.module.class_index.get(n.id.as_str()) {
+                        if let Some((_, name)) = self.module.method_sig(k, "__init__") {
+                            self.record(name, 1, &[], &[]);
+                        }
+                    }
+                }
+                walk_stmt(self, stmt);
+            }
+            _ => walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast py::Expr) {
+        use ruff_python_ast::visitor::walk_expr;
+        match expr {
+            py::Expr::Call(c) => {
+                if let Some((name, first)) = self.callee(&c.func) {
+                    self.record(name, first, &c.arguments.args, &c.arguments.keywords);
+                }
+                walk_expr(self, expr);
+            }
+            py::Expr::Lambda(l) => {
+                if let Some(params) = &l.parameters {
+                    for p in params.iter_non_variadic_params() {
+                        if let Some(d) = &p.default {
+                            self.visit_expr(d);
+                        }
+                    }
+                }
+                self.nested(|c| c.visit_expr(&l.body));
+            }
+            // A comprehension's own variables are not in `vars`.
+            py::Expr::ListComp(_)
+            | py::Expr::SetComp(_)
+            | py::Expr::DictComp(_)
+            | py::Expr::Generator(_) => self.nested(|c| walk_expr(c, expr)),
+            _ => walk_expr(self, expr),
+        }
+    }
 }
 
 /// Lay each class out as its base's fields followed by its own, so an
@@ -533,9 +882,26 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
 }
 
 /// Infer one body's locals: parameters as declared, every other name
-/// the join of what is assigned to it, iterated until stable.
+/// the join of what is assigned to it, iterated until stable. A name
+/// nothing decides is dynamic.
 pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Locals {
     infer_locals_seeded(module, sig, body, &HashMap::new())
+}
+
+/// [`infer_locals`] leaving what is undecided undecided, for the
+/// module-wide fixed point: a value another function has yet to type
+/// must not settle as dynamic here and poison every join it reaches.
+fn infer_locals_open(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Locals {
+    infer_locals_with(module, sig, body, &HashMap::new(), false)
+}
+
+/// Whatever inference left undecided is dynamic.
+fn settle(locals: &mut Locals) {
+    for ty in locals.vars.values_mut() {
+        if *ty == Ty::Unknown {
+            *ty = Ty::Object;
+        }
+    }
 }
 
 /// [`infer_locals`] with the variables captured from an enclosing scope
@@ -546,6 +912,16 @@ pub(crate) fn infer_locals_seeded(
     sig: &Sig,
     body: &[py::Stmt],
     seeds: &HashMap<String, Ty>,
+) -> Locals {
+    infer_locals_with(module, sig, body, seeds, true)
+}
+
+fn infer_locals_with(
+    module: &Module,
+    sig: &Sig,
+    body: &[py::Stmt],
+    seeds: &HashMap<String, Ty>,
+    settled: bool,
 ) -> Locals {
     let mut locals = Locals::default();
     for (name, ty) in seeds {
@@ -590,10 +966,8 @@ pub(crate) fn infer_locals_seeded(
             break;
         }
     }
-    for ty in locals.vars.values_mut() {
-        if *ty == Ty::Unknown {
-            *ty = Ty::Object;
-        }
+    if settled {
+        settle(&mut locals);
     }
     locals
 }
@@ -642,8 +1016,20 @@ impl Walker<'_> {
 
         // A parameter keeps its declared type unless the body assigns it
         // another, in which case it lives as an object from the start.
+        // One still being inferred takes the assignment into its type.
         if let Some((_, declared)) = self.params.iter().find(|(n, _)| n == name) {
-            if *declared != Ty::Object && ty != *declared && ty != Ty::Unknown {
+            let written = self
+                .locals
+                .param_writes
+                .get(name)
+                .copied()
+                .unwrap_or(Ty::Unknown)
+                .join(ty);
+            self.locals.param_writes.insert(name.to_string(), written);
+            if !matches!(*declared, Ty::Object | Ty::Unknown)
+                && ty != *declared
+                && ty != Ty::Unknown
+            {
                 self.locals.vars.insert(name.to_string(), Ty::Object);
             }
             return;
@@ -723,6 +1109,7 @@ impl Walker<'_> {
                     None => Ty::None,
                 };
                 self.locals.ret = self.locals.ret.join(ty);
+                self.locals.returns = true;
             }
             py::Stmt::For(f) => {
                 let iter = self.expr(&f.iter);
@@ -962,6 +1349,7 @@ impl Typer<'_> {
                         .field(k as usize, a.attr.as_str())
                         .map(|(_, ty)| ty)
                         .unwrap_or(Ty::Object),
+                    Ty::Unknown => Ty::Unknown,
                     _ => Ty::Object,
                 }
             }
@@ -1137,6 +1525,8 @@ impl Typer<'_> {
                     _ => Ty::Object,
                 }
             }
+            // A method on a value not yet typed.
+            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Unknown => Ty::Unknown,
             // A method on a list.
             py::Expr::Attribute(a) if matches!(self.expr(&a.value), Ty::List(_)) => {
                 let Ty::List(e) = self.expr(&a.value) else {

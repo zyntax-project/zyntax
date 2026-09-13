@@ -350,34 +350,44 @@ pub fn parse_program_with(
     };
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
     let global_names = module_globals(&module.body, &def_stmts, &inferred.class_index);
+    inferred.closed = types::closed_items(&module.body, &items);
     // A global's type is the join of every assignment to it: the
-    // module's own, then those under `global` in each function.
-    let main_locals = types::infer_locals(&inferred, &entry_sig, &owned);
+    // module's own, then those under `global` in each function. The
+    // module's own are retyped each round, as the functions they call
+    // become known; nothing settles as dynamic before the end.
     for name in &global_names {
-        let ty = main_locals
-            .vars
-            .get(name)
-            .copied()
-            .unwrap_or(types::Ty::Unknown);
-        inferred.globals.insert(name.clone(), ty);
+        inferred.globals.insert(name.clone(), types::Ty::Unknown);
     }
-    for _ in 0..4 {
+    for _ in 0..8 {
         let before = inferred.globals.clone();
-        let (funcs, class_infos) = types::infer_module(&inferred, &items);
-        inferred.funcs = funcs;
-        inferred.classes = class_infos;
+        let out = types::infer_module(&inferred, &items, &owned);
+        inferred.funcs = out.funcs;
+        inferred.classes = out.classes;
+        let mut writes: Vec<(String, types::Ty)> = global_names
+            .iter()
+            .map(|name| {
+                let ty = out
+                    .entry
+                    .vars
+                    .get(name)
+                    .copied()
+                    .unwrap_or(types::Ty::Unknown);
+                (name.clone(), ty)
+            })
+            .collect();
         for item in &items {
             let sig = inferred.funcs[&item.name].clone();
             let locals = types::infer_locals(&inferred, &sig, &item.def.body);
-            for (name, ty) in &locals.global_writes {
-                let joined = inferred
-                    .globals
-                    .get(name)
-                    .copied()
-                    .unwrap_or(types::Ty::Unknown)
-                    .join(*ty);
-                inferred.globals.insert(name.clone(), joined);
-            }
+            writes.extend(locals.global_writes.iter().map(|(n, t)| (n.clone(), *t)));
+        }
+        for (name, ty) in writes {
+            let joined = inferred
+                .globals
+                .get(&name)
+                .copied()
+                .unwrap_or(types::Ty::Unknown)
+                .join(ty);
+            inferred.globals.insert(name, joined);
         }
         if inferred.globals == before {
             break;
