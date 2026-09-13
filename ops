@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1789333162,"nonce":"0cxq6FWbpAebSbOqZrY74GVk7Zg=","status":2}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789333821,"nonce":"JxK0kUDQ8nA8tQyuV1LSvvBniaI=","message":"Follow-up 27f97945c33b1a35b36b75a127cc671ba1b77d4b: a capture-free closure's typed entry takes no record. lambda_call: zypy 10.0 ms exec vs zynml 13.2 ms (runs=5).","files":null}]}
