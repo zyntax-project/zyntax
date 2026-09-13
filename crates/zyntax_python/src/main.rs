@@ -51,7 +51,8 @@ fn main() -> ExitCode {
                 Some((module, text)) => (module.to_string(), text),
                 None => (file.clone(), source.clone()),
             };
-            let colors = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            // Colour follows the terminal, NO_COLOR and CLICOLOR_FORCE.
+            let colors = zyntax_typed_ast::diagnostics::colors_enabled();
             eprint!("{}", e.render(&name, &text, colors));
             return ExitCode::from(3);
         }
