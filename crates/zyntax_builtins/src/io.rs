@@ -72,7 +72,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             unit(),
             vec![expr(call("zb_print", vec![s.e()], unit())), ret_void()],
         ),
-        define("zb_fatal", &[&kind, &message], unit(), fatal_body),
+        define_cold("zb_fatal", &[&kind, &message], unit(), fatal_body),
     ];
     out.extend(host(list_type));
     out

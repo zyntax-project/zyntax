@@ -492,11 +492,38 @@ fn leave_after_fatal(stmts: Vec<Stmt>, ret_ty: &Type) -> Vec<Stmt> {
 
 /// A function with a body.
 pub fn define(name: &str, params: &[&Local], ret_ty: Type, body: Vec<Stmt>) -> Decl {
+    define_with(name, params, ret_ty, body, Vec::new())
+}
+
+/// A function that runs on an error path and nowhere else: marked cold,
+/// so a caller keeps it as a call rather than copying it into its own
+/// body.
+pub fn define_cold(name: &str, params: &[&Local], ret_ty: Type, body: Vec<Stmt>) -> Decl {
+    define_with(
+        name,
+        params,
+        ret_ty,
+        body,
+        vec![zyntax_typed_ast::typed_ast::TypedAnnotation {
+            name: intern("cold"),
+            args: Vec::new(),
+            span: SPAN,
+        }],
+    )
+}
+
+fn define_with(
+    name: &str,
+    params: &[&Local],
+    ret_ty: Type,
+    body: Vec<Stmt>,
+    annotations: Vec<zyntax_typed_ast::typed_ast::TypedAnnotation>,
+) -> Decl {
     let body = leave_after_fatal(body, &ret_ty);
     typed_node(
         TypedDeclaration::Function(TypedFunction {
             name: intern(name),
-            annotations: Vec::new(),
+            annotations,
             effects: Vec::new(),
             with_handlers: Vec::new(),
             type_params: Vec::new(),

@@ -927,6 +927,18 @@ use zyntax_typed_ast::BinaryOp;
 /// class of that name, pending.
 pub(crate) fn raise_hook(module: &Module) -> TypedFunction {
     let span = Span::new(0, 0);
+    let mut hook = raise_hook_body(module, span);
+    // An error path: a caller keeps the call rather than copying the
+    // hook's switch over every exception class into its own body.
+    hook.annotations.push(TypedAnnotation {
+        name: intern("cold"),
+        args: Vec::new(),
+        span,
+    });
+    hook
+}
+
+fn raise_hook_body(module: &Module, span: Span) -> TypedFunction {
     let mut lowerer = scratch(module);
     let kind = var(intern("kind"), Ty::Str, span);
     let message = var(intern("message"), Ty::Str, span);
