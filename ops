@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789314362,"nonce":"fB9bSHXIKUYsrBPuy0ilvdo5neE=","added":["perf","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789314673,"nonce":"ai/ufUrVZndcrltEdfzjqRvwoKA=","message":"Landed in 7fdb121 (inliner, annotations, traces) and 7efcfb3 (zb_fatal and the Python raise hook marked cold).","files":null}]}
