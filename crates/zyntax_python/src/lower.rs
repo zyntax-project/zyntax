@@ -1340,6 +1340,8 @@ impl<'m> Lowerer<'m> {
                 Ty::Object,
                 span,
             ),
+            // A string's box holds a copy of it, released with the box.
+            (Ty::Str, Ty::Object) => call("zb_box_str", vec![v.node], Ty::Object, span),
             // Into the dynamic world: a box. Out of it: a checked read.
             (_, Ty::Object) => cast(v.node, Ty::Object, span),
             (Ty::Object, _) => cast(v.node, target, span),
@@ -4357,7 +4359,7 @@ impl<'m> Lowerer<'m> {
                             (call(&list_fn("sum", e), vec![v.node], e.ty(), span), e.ty())
                         }
                         _ => {
-                            let xs = self.coerce(v, Ty::List(Elem::Object));
+                            let xs = self.iterable(v, span);
                             (
                                 call("zb_list_sum_any", vec![xs], Ty::Object, span),
                                 Ty::Object,

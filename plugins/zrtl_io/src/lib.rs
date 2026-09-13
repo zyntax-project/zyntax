@@ -370,6 +370,17 @@ pub unsafe extern "C" fn io_string_free(s: StringPtr) {
     string_free(s);
 }
 
+/// A fresh copy of a string, owned by the caller and released with
+/// `string_free`. What compiled code makes of a string it does not own
+/// before it starts replacing it in a loop.
+///
+/// # Safety
+/// `s` must be null or a valid string pointer.
+#[no_mangle]
+pub unsafe extern "C" fn io_string_copy(s: StringConstPtr) -> StringPtr {
+    zrtl::string_copy(s)
+}
+
 // ============================================================================
 // Dynamic Print (DynamicBox) - Handles ALL known ZRTL types
 // ============================================================================
@@ -1100,6 +1111,7 @@ zrtl_plugin! {
 
         // Memory management
         ("$IO$string_free", io_string_free),
+        ("$IO$string_copy", io_string_copy, (i64) -> i64),
 
         // Dynamic (DynamicBox) printing - handles ALL ZRTL types
         // These functions expect DynamicBox, so compiler will auto-box arguments

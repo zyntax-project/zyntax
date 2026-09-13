@@ -214,6 +214,9 @@ fn library() -> Result<Library> {
 pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {
+    // No Python program releases anything itself, so the compiler
+    // releases what it can prove dead.
+    zyntax_compiler::drop_insert::set_automatic_release(true);
     let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
     runtime.install_snapshot(snapshot)?;
     runtime.declare_entry_points([ENTRY]);

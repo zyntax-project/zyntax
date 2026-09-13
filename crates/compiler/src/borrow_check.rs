@@ -292,9 +292,8 @@ impl<'a> HirBorrowChecker<'a> {
                     }
                     let releases = match callee {
                         HirCallable::Intrinsic(Intrinsic::Free) => true,
-                        HirCallable::Symbol(name) => {
-                            matches!(symbol_role(name), Some(SymbolRole::Allocates(_)))
-                        }
+                        HirCallable::Symbol(name) => symbol_role(name)
+                            .is_some_and(|r| r.allocates.is_some() && !r.borrows_args),
                         // A callee that takes the argument owned is
                         // being handed the claim, which a borrower has
                         // not got to give.

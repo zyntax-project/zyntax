@@ -23,6 +23,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Lowered for the target, not for the machine building it.
     let width: usize = env::var("CARGO_CFG_TARGET_POINTER_WIDTH")?.parse()?;
     zyntax_compiler::set_target_pointer_size(width / 8);
+    // Released as the runtime will release: no Python program frees
+    // anything by hand.
+    zyntax_compiler::drop_insert::set_automatic_release(true);
 
     let library = zyntax_builtins::library(&policy::POLICY);
     let program = TypedProgram {

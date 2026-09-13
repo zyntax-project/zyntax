@@ -1,71 +1,119 @@
 //! Compile-time speculative drop-site analysis.
 //!
-//! Pairs each `Call(Intrinsic::Malloc)` with a matching
-//! `Call(Intrinsic::Free)` inserted at the allocation's last use,
-//! when static analysis can prove the allocation does not escape
-//! the function. Implements the *speculative drop-site* memory
-//! strategy that's the default in
-//! `CompilationConfig.memory_strategy` (the opt-in GC variants
-//! sit alongside it as alternatives selected per program).
+//! Pairs each allocation with a release at the allocation's last use,
+//! when static analysis can prove the allocation does not escape the
+//! function. Implements the *speculative drop-site* memory strategy
+//! that's the default in `CompilationConfig.memory_strategy` (the
+//! opt-in GC variants sit alongside it as alternatives selected per
+//! program).
 //!
-//! ## Scope of this first slice
+//! ## What counts as an allocation
 //!
-//! This pass is intentionally conservative. It only inserts a free
-//! when *all* of the following hold:
+//! * `Call(Intrinsic::Malloc)`, released by `Free`.
+//! * A runtime symbol that hands back storage: a box (`zyntax_box_*`,
+//!   released by `zyntax_box_free`) and a string from the IO or string
+//!   plugins (released by `$IO$string_free`). An extern function
+//!   standing for such a symbol counts the same.
+//! * A call to a function of this module that returns storage it
+//!   allocated and lets leave no other way
+//!   ([`functions_returning_owned_storage`]); the caller owns the
+//!   result and releases it by its type.
 //!
-//! 1. The allocation is `HirInstruction::Call { callee:
-//!    HirCallable::Intrinsic(Intrinsic::Malloc), .. }` and has a
-//!    result HirId (otherwise nothing to free).
-//! 2. Every use of that result lives in the *same* block as the
-//!    malloc itself. Multi-block escapes need cross-block liveness
-//!    and a worklist; not in this slice.
-//! 3. No use looks like an *escape* — being returned, stored as a
-//!    `value` (vs. as a `ptr`) into someone else's pointer, passed
-//!    as an arg to a non-Free `Call`/`IndirectCall`, cast away, or
-//!    captured by an `AsyncSaveSlot`/`CreateClosure`.
+//! ## Where the release goes
 //!
-//! When all three hold, we walk the block's instruction list,
-//! identify the position of the last use, and splice in a
-//! `Call(Intrinsic::Free)` immediately after that index.
+//! Every use of the allocation is classified: a read, a borrow by a
+//! callee that keeps nothing, a store through the pointer are uses; a
+//! store of the pointer, a hand to a callee that keeps it, a return, a
+//! capture are escapes, and any escape forfeits the release. The
+//! aliases of the storage (casts, aggregates it is put into and taken
+//! out of, the result of a callee that hands its argument back) are
+//! tracked as further names for it.
 //!
-//! ## Why not free at end-of-block unconditionally
+//! Within one block the release follows the last use. Across blocks a
+//! backward liveness places it wherever the value is live and no
+//! successor keeps it: after a last use, or on an edge into a block that
+//! reads it nowhere (an entry insertion, or a block spliced into the
+//! edge). This cross-block placement and the transfer through returned
+//! storage are on under [`automatic_release`], for a language whose
+//! programs never release anything by hand.
 //!
-//! Two reasons. First, the post-use slot might be in a sub-region
-//! that doesn't dominate every exit (think early-return branches
-//! that jump to a different block). Second, lifetimes that are
-//! actually shorter than the block let downstream passes reuse the
-//! freed bytes — putting the free as early as possible matters
-//! once we add a pooling allocator later.
+//! A value that reaches a phi is not released by its own name past the
+//! merge; the phi owns it instead when every incoming is owned storage
+//! nothing else keeps ([`release_owned_phis`]). A loop header's phi is
+//! the accumulator, released after the body has read it; a string
+//! accumulator seeded from anywhere else is copied on the way in.
 //!
-//! ## What this does NOT do (yet)
+//! `ZYNTAX_TRACE_DROP=1` prints what was decided and why. The pass may
+//! run more than once over a function: a release it inserted is
+//! recognised and never doubled.
 //!
-//! * Cross-block liveness — needed for malloc-in-loop,
-//!   malloc-in-branch-merged-via-phi, malloc-then-conditionally-
-//!   returned. The existing [`crate::analysis::LivenessAnalysis`]
-//!   computes the block-level live-in/live-out sets, but
-//!   `compute_instruction_uses` over there is incomplete (no GEP,
-//!   no Cast, no ExtractValue, …) so its results would silently
-//!   undercount uses for our purpose. Building on it carries risk
-//!   of double-free; we'd rather miss frees than insert wrong
-//!   ones. A standalone full-fidelity dataflow lives next.
+//! ## What this does NOT do
 //!
-//! * Escape through stores — `Store { value: M, ptr: P }` where
-//!   `P` is itself a local allocation that doesn't escape is
-//!   technically still safe to free transitively, but tracking the
-//!   alias chain takes a points-to analysis. We treat any such
-//!   Store as an escape.
-//!
-//! * Stack→heap promotion. Today's ZynML lowering emits `Alloca`
-//!   for array literals and List structs (stack); only explicit
-//!   `Call(Intrinsic::Malloc)` lands in this pass's scope. When
-//!   Alloca→Malloc promotion ships (so allocations can outlive
-//!   their stack frame), it'll feed into this pass naturally.
+//! * Escape through stores: `Store { value: M, ptr: P }` where `P` is
+//!   itself a local allocation that doesn't escape is technically still
+//!   safe to free transitively, but tracking the alias chain takes a
+//!   points-to analysis. We treat any such Store as an escape.
+//! * Storage handed to an owning parameter is the callee's; a callee
+//!   that stores or returns its parameter must say so with `Owned`.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hir::{
-    HirCallable, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType, Intrinsic,
+    HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
+    HirType, Intrinsic,
 };
+
+/// Releases a string the IO plugin's string functions hand out.
+const STRING_FREE: &str = "$IO$string_free";
+/// A fresh copy of a string, owned by the caller.
+const STRING_COPY: &str = "$IO$string_copy";
+/// Releases a dynamic box and whatever it owns.
+const BOX_FREE: &str = "zyntax_box_free";
+
+static AUTOMATIC_RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// Turn on release across blocks and through returned storage for every
+/// module compiled afterwards. For a language whose programs never
+/// release anything by hand; one that does keeps this off, or a release
+/// written in the program frees what this already freed.
+pub fn set_automatic_release(on: bool) {
+    AUTOMATIC_RELEASE.store(on, Ordering::Relaxed);
+}
+
+/// Whether storage is released across blocks and through returned
+/// storage: asked for by [`set_automatic_release`], or by
+/// `ZYNTAX_DROP_GLUE=1`, which turns on the type release glue as well.
+/// `ZYNTAX_DISABLE_AUTOMATIC_RELEASE=1` overrides both; safe, and what to
+/// try first when a program reads freed memory.
+pub fn automatic_release() -> bool {
+    if std::env::var_os("ZYNTAX_DISABLE_AUTOMATIC_RELEASE").is_some() {
+        return false;
+    }
+    AUTOMATIC_RELEASE.load(Ordering::Relaxed) || crate::drop_glue::enabled()
+}
+
+/// Runtime symbols whose result is what the box they were given holds: a
+/// name for storage the box owns, good for as long as the box is.
+fn symbol_result_aliases_arg(symbol: &str) -> bool {
+    matches!(symbol, "zyntax_box_get_str" | "zyntax_box_get_opaque")
+}
+
+/// A dynamic box.
+fn is_box(ty: &HirType) -> bool {
+    crate::zrtl::is_dynamic_box_pointer(ty)
+}
+
+/// A string: the plugins hand these out as fresh storage.
+fn is_string(ty: &HirType) -> bool {
+    matches!(ty, HirType::Ptr(inner) if **inner == HirType::I8)
+}
+
+/// Whether a plugin symbol's string result is fresh storage the caller
+/// owns. Every string the IO and string plugins return is one.
+fn makes_strings(symbol: &str) -> bool {
+    symbol.starts_with("$IO$") || symbol.starts_with("$String$")
+}
 
 /// Per-run statistics. Mainly for telemetry + test assertions.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +162,17 @@ pub fn run_module(module: &mut HirModule) -> DropStats {
 #[derive(Default)]
 struct ModuleFacts {
     returns_owned: std::collections::HashSet<HirId>,
+    /// Externs whose result is a fresh string: a call to one is an
+    /// allocation the caller releases with the string free.
+    string_makers: std::collections::HashSet<HirId>,
+    /// Per function, which parameters it may hand back as its result. The
+    /// result of such a call is another name for the argument, so the
+    /// argument lives as long as the result does.
+    returns_param: std::collections::HashMap<HirId, Vec<bool>>,
+    /// The runtime symbol behind each extern function.
+    extern_links: std::collections::HashMap<HirId, String>,
+    /// Function names by key, for the trace.
+    names: std::collections::HashMap<HirId, String>,
     /// Per callee, which parameters are only borrowed. Keyed on the
     /// module's own key for the function, which is what a call names and
     /// is not always the function's `id` field.
@@ -135,7 +194,7 @@ impl ModuleFacts {
                 && func
                     .link_name
                     .as_deref()
-                    .is_some_and(|name| symbol_role(name) == Some(SymbolRole::Borrows));
+                    .is_some_and(|name| symbol_role(name).is_some_and(|r| r.borrows_args));
             borrowed_params.insert(
                 *key,
                 func.signature
@@ -162,13 +221,87 @@ impl ModuleFacts {
                 glue.insert(ty, *key);
             }
         }
+        let string_makers = module
+            .functions
+            .iter()
+            .filter(|(_, f)| {
+                f.is_external
+                    && f.link_name.as_deref().is_some_and(makes_strings)
+                    && matches!(f.signature.returns.as_slice(), [ty] if is_string(ty))
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let extern_links = module
+            .functions
+            .iter()
+            .filter(|(_, f)| f.is_external)
+            .filter_map(|(key, f)| f.link_name.clone().map(|n| (*key, n)))
+            .collect();
+        let names = module
+            .functions
+            .iter()
+            .map(|(key, f)| (*key, f.name.resolve_global().unwrap_or_default()))
+            .collect();
         let mut facts = Self {
             returns_owned: std::collections::HashSet::new(),
+            string_makers,
+            returns_param: std::collections::HashMap::new(),
+            extern_links,
+            names,
             borrowed_params,
             glue,
         };
-        facts.returns_owned = functions_returning_owned_storage(module, &facts);
+        // A function returning a callee's result that is itself an
+        // argument returns its own parameter, so this grows until it
+        // stops; owned-returning functions likewise.
+        loop {
+            let returned = functions_returning_params(module, &facts);
+            if returned == facts.returns_param {
+                break;
+            }
+            facts.returns_param = returned;
+        }
+        loop {
+            let owned = functions_returning_owned_storage(module, &facts);
+            if owned.len() == facts.returns_owned.len() {
+                break;
+            }
+            facts.returns_owned = owned;
+        }
+        if trace_enabled() {
+            let mut names: Vec<String> = facts
+                .returns_owned
+                .iter()
+                .filter_map(|k| module.functions.get(k))
+                .map(|f| f.name.resolve_global().unwrap_or_default())
+                .collect();
+            names.sort();
+            eprintln!("[drop] returning owned storage: {}", names.join(" "));
+        }
         facts
+    }
+
+    /// The result of `callee` that is another name for `args[i]`: the
+    /// callee may return that parameter, or hands back what the box it
+    /// was given holds.
+    fn result_aliases_arg(&self, callee: &HirCallable, args: &[HirId], value: HirId) -> bool {
+        match callee {
+            HirCallable::Symbol(name) => {
+                symbol_result_aliases_arg(name) && args.iter().any(|a| *a == value)
+            }
+            HirCallable::Function(id) => {
+                if let Some(link) = self.extern_links.get(id) {
+                    return symbol_result_aliases_arg(link) && args.iter().any(|a| *a == value);
+                }
+                let Some(returned) = self.returns_param.get(id) else {
+                    return false;
+                };
+                args.iter()
+                    .enumerate()
+                    .any(|(i, a)| *a == value && returned.get(i).copied().unwrap_or(false))
+            }
+            _ => false,
+        }
     }
 
     /// Whether passing `target` here leaves the caller holding it.
@@ -186,100 +319,405 @@ impl ModuleFacts {
     }
 }
 
-/// Release storage an accumulator replaces each time round a loop.
+/// Release storage that reaches a phi.
 ///
-/// `sum = sum + a + b` keeps one object per iteration. The header phi
-/// holds the previous one, the body builds a new one, and the previous
-/// is unreachable the moment the body has read it. Nothing released it,
-/// because a phi is exactly what the per-site analysis turns down.
+/// A phi is another name for whatever arrives on the edge taken, so the
+/// per-site analysis leaves anything that flows into one alone: a
+/// release placed by the merged name's liveness would name one incoming
+/// where another was live. The phi itself can own the storage instead.
+/// Then the phi is the definition, and its value is released wherever it
+/// has been read for the last time and no path keeps it; an edge into
+/// another owning phi hands the value on rather than releasing it.
 ///
-/// The release goes after the phi's last use in the body, so it frees
-/// only what the body actually consumed. What leaves through the exit is
-/// the value the last body execution produced, which no body execution
-/// ever read, so code after the loop still holds live storage. That last
-/// object is not released here: one outlives the loop, rather than one
-/// per iteration.
+/// A phi owns its value when every incoming is storage this function
+/// owns, a site or another owning phi, that nothing reads once it has
+/// arrived and no other phi keeps. Ownership is decided for all phis
+/// together, since one hands on to the next: every phi starts as a
+/// candidate and those with an incoming that fails drop out until none
+/// do.
 ///
-/// The conditions are narrow deliberately. Releasing the wrong incoming
-/// is a use after free, not a slow program.
-fn release_loop_carried(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
+/// A loop header's phi is the accumulator `sum = sum + a`: the value
+/// round the back edge must be built by the body (or be the phi itself,
+/// carried unchanged), so the phi never carries one object twice, and it
+/// may be read in the body since the release frees only what the body
+/// consumed. A string arriving on an entry edge from anywhere else is
+/// copied there first, which is what lets an accumulator start from a
+/// literal.
+fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     use crate::analysis::{DominatorTree, LoopForest};
 
-    let owned: std::collections::HashSet<HirId> = collect_owned_sites(func, facts)
+    let sites: std::collections::HashMap<HirId, Release> = collect_owned_sites(func, facts)
         .iter()
-        .map(|s| s.result)
+        .map(|s| (s.result, s.release))
         .collect();
-    if owned.is_empty() {
+    if sites.is_empty() {
+        return 0;
+    }
+    let dt = DominatorTree::new(func);
+    let forest = LoopForest::detect(func, &dt);
+    let bodies: std::collections::HashMap<HirId, std::collections::HashSet<HirId>> = forest
+        .loops()
+        .iter()
+        .map(|lp| (lp.header, lp.body.iter().copied().collect()))
+        .collect();
+    let phi_blocks: std::collections::HashMap<HirId, HirId> = func
+        .blocks
+        .iter()
+        .flat_map(|(b, block)| block.phis.iter().map(move |p| (p.result, *b)))
+        .collect();
+
+    // Copies to make on entry edges: the predecessor block, the phi, the
+    // position of its incoming, and the value to copy.
+    let mut copies: Vec<(HirId, HirId, usize, HirId)> = Vec::new();
+    // Every phi to begin with; a join's phi only under automatic release,
+    // since a program releasing by hand may release what arrives at one.
+    let mut candidates: std::collections::HashSet<HirId> = phi_blocks
+        .iter()
+        .filter(|(_, block)| automatic_release() || bodies.contains_key(block))
+        .map(|(p, _)| *p)
+        .collect();
+    loop {
+        let before = candidates.len();
+        copies.clear();
+        for (block_id, block) in &func.blocks {
+            let body = bodies.get(block_id);
+            for phi in &block.phis {
+                if !candidates.contains(&phi.result) {
+                    continue;
+                }
+                match phi_incomings_owned(func, facts, &sites, &candidates, body, phi) {
+                    Some(seed_copies) => copies.extend(seed_copies),
+                    None => {
+                        candidates.remove(&phi.result);
+                    }
+                }
+            }
+        }
+        // The phi's own value: read only by borrowers, and handed on only
+        // to phis that own what they are handed.
+        let dropped: Vec<HirId> = candidates
+            .iter()
+            .copied()
+            .filter(|p| {
+                let derived = derived_values_local(func, *p, facts);
+                !uses_are_all_borrows(func, &derived, facts)
+                    || phis_using_any(func, &derived)
+                        .iter()
+                        .any(|other| !candidates.contains(other))
+            })
+            .collect();
+        for p in dropped {
+            candidates.remove(&p);
+        }
+        if candidates.len() == before {
+            break;
+        }
+    }
+    if candidates.is_empty() {
         return 0;
     }
 
-    let dt = DominatorTree::new(func);
-    let forest = LoopForest::detect(func, &dt);
-    let mut plan: Vec<(HirId, usize, HirId)> = Vec::new();
-
-    for lp in forest.loops() {
-        // One body block, so "the last use in the body" is unambiguous
-        // and every way round the loop passes through it.
-        if lp.body.len() != 2 {
-            continue;
-        }
-        let Some(&body_id) = lp.body.iter().find(|&&b| b != lp.header) else {
-            continue;
-        };
-        let (Some(header), Some(body)) = (func.blocks.get(&lp.header), func.blocks.get(&body_id))
-        else {
-            continue;
-        };
-        // The body must close the loop itself, or what reaches the phi
-        // next is not what this body produced.
-        if !matches!(body.terminator, HirTerminator::Branch { target } if target == lp.header) {
-            continue;
-        }
-
-        for phi in &header.phis {
-            if phi.incoming.len() != 2 {
-                continue;
-            }
-            // Every incoming must be storage this function owns, and the
-            // one arriving round the back edge must be built by the
-            // body. Otherwise the phi can carry one object twice and the
-            // release would run on it after it was already gone.
-            let mut all_owned = true;
-            let mut back_edge_fresh = false;
-            for (val, pred) in &phi.incoming {
-                if !owned.contains(val) {
-                    all_owned = false;
-                    break;
+    // What releases each owning phi's value: what releases what reaches
+    // it, agreed on by every incoming or the phi is not owned.
+    let mut releases: std::collections::HashMap<HirId, Release> = std::collections::HashMap::new();
+    for _ in 0..candidates.len() {
+        for (_, block) in &func.blocks {
+            for phi in &block.phis {
+                if !candidates.contains(&phi.result) || releases.contains_key(&phi.result) {
+                    continue;
                 }
-                if *pred == body_id {
-                    back_edge_fresh = defines_value(body, *val);
+                let mut agreed: Option<Release> = None;
+                let mut known = true;
+                for (val, _) in &phi.incoming {
+                    let r = if *val == phi.result {
+                        continue;
+                    } else if let Some(r) = sites.get(val) {
+                        *r
+                    } else if let Some(r) = releases.get(val) {
+                        *r
+                    } else if copies
+                        .iter()
+                        .any(|(_, p, _, v)| *p == phi.result && *v == *val)
+                    {
+                        Release::Symbol(STRING_FREE)
+                    } else {
+                        known = false;
+                        break;
+                    };
+                    if agreed.is_none_or(|have| have == r) {
+                        agreed = Some(r);
+                    } else {
+                        known = false;
+                        break;
+                    }
+                }
+                if let (true, Some(r)) = (known, agreed) {
+                    releases.insert(phi.result, r);
                 }
             }
-            if !all_owned || !back_edge_fresh {
-                continue;
-            }
+        }
+    }
+    candidates.retain(|p| releases.contains_key(p));
+    copies.retain(|(_, p, _, _)| candidates.contains(p));
 
-            // Nothing anywhere may keep the value, or releasing it here
-            // pulls the storage out from under whatever kept it.
-            let derived = derived_values(func, phi.result);
-            if !uses_are_all_borrows(func, &derived, facts) {
-                continue;
+    for (pred, phi_result, index, val) in copies {
+        let copy = HirId::new();
+        let ty = func
+            .values
+            .get(&val)
+            .map(|v| v.ty.clone())
+            .unwrap_or(HirType::Ptr(Box::new(HirType::I8)));
+        func.values.insert(
+            copy,
+            crate::hir::HirValue {
+                id: copy,
+                ty,
+                kind: crate::hir::HirValueKind::Instruction,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        if let Some(block) = func.blocks.get_mut(&pred) {
+            block.instructions.push(HirInstruction::Call {
+                result: Some(copy),
+                callee: HirCallable::Symbol(STRING_COPY.to_string()),
+                args: vec![val],
+                type_args: Vec::new(),
+                const_args: Vec::new(),
+                is_tail: false,
+            });
+        }
+        for block in func.blocks.values_mut() {
+            for phi in block.phis.iter_mut() {
+                if phi.result == phi_result {
+                    if let Some(incoming) = phi.incoming.get_mut(index) {
+                        incoming.0 = copy;
+                    }
+                }
             }
-
-            let Some(last) = last_use_index(body, &derived, facts) else {
-                continue;
-            };
-            plan.push((body_id, last, phi.result));
         }
     }
 
-    let inserted = plan.len();
-    // Back to front, so earlier indices stay valid.
-    plan.sort_by_key(|(_, idx, _)| std::cmp::Reverse(*idx));
-    for (block_id, idx, value) in plan {
-        insert_free_after(func, block_id, idx, value, Release::Intrinsic);
+    // One phi at a time, each analysed against the blocks as the last
+    // one left them: a release placed at a block's entry or on a split
+    // edge moves what an earlier analysis counted.
+    let owned_phis: Vec<(HirId, HirId, Release)> = func
+        .blocks
+        .iter()
+        .flat_map(|(b, block)| block.phis.iter().map(move |p| (*b, p.result)))
+        .filter_map(|(b, p)| releases.get(&p).map(|r| (b, p, *r)))
+        .collect();
+    let mut inserted = 0;
+    for (block_id, phi_result, release) in owned_phis {
+        let derived = derived_values_local(func, phi_result, facts);
+        // Leaving a block along an edge into an owning phi hands the
+        // value on.
+        let transfer_out: std::collections::HashSet<HirId> = func
+            .blocks
+            .values()
+            .flat_map(|b| b.phis.iter())
+            .filter(|other| releases.contains_key(&other.result))
+            .flat_map(|other| other.incoming.iter())
+            .filter(|(v, _)| derived.contains(v))
+            .map(|(_, pred)| *pred)
+            .collect();
+        let site = MallocSite {
+            result: phi_result,
+            block: block_id,
+            inst_idx: usize::MAX,
+            release,
+        };
+        if let Some(points) = drop_points_transferring(func, &site, &derived, facts, &transfer_out)
+        {
+            inserted += apply_points(func, points, phi_result, release);
+        }
     }
     inserted
+}
+
+/// Whether every incoming of `phi` is storage the phi may own, given the
+/// sites and the phis still candidates. Returns the string seeds to copy
+/// on their entry edges, or `None` where an incoming fails.
+fn phi_incomings_owned(
+    func: &HirFunction,
+    facts: &ModuleFacts,
+    sites: &std::collections::HashMap<HirId, Release>,
+    candidates: &std::collections::HashSet<HirId>,
+    body: Option<&std::collections::HashSet<HirId>>,
+    phi: &crate::hir::HirPhi,
+) -> Option<Vec<(HirId, HirId, usize, HirId)>> {
+    let merge = phi_block_of(func, phi.result)?;
+    let mut copies = Vec::new();
+    for (index, (val, pred)) in phi.incoming.iter().enumerate() {
+        // Carried round unchanged: one object, handed back to itself.
+        if *val == phi.result {
+            continue;
+        }
+        let round_back_edge = body.is_some_and(|b| b.contains(pred));
+        let owned = sites.contains_key(val) || candidates.contains(val);
+        // Nothing but owning phis may keep the incoming.
+        let kept_elsewhere = phis_using(func, *val)
+            .iter()
+            .any(|p| *p != phi.result && !candidates.contains(p));
+        let derived = derived_values_local(func, *val, facts);
+        let borrowed_only = uses_are_all_borrows(func, &derived, facts);
+        let fine = if round_back_edge {
+            // Built by the body, so the phi never carries one object
+            // twice.
+            let fresh = body.is_some_and(|b| {
+                b.iter()
+                    .filter(|id| **id != merge)
+                    .filter_map(|id| func.blocks.get(id))
+                    .any(|blk| {
+                        defines_value(blk, *val) || blk.phis.iter().any(|p| p.result == *val)
+                    })
+            });
+            owned && !kept_elsewhere && fresh && borrowed_only
+        } else {
+            // Read by nothing once it has arrived: the phi's release
+            // would free it under another name.
+            owned
+                && !kept_elsewhere
+                && borrowed_only
+                && !used_past_merge(func, &derived, def_block_of(func, *val), merge)
+        };
+        if fine {
+            continue;
+        }
+        if trace_enabled() {
+            eprintln!(
+                "[drop] {}: phi {:?} cannot own incoming {:?} (owned {owned}, kept elsewhere {kept_elsewhere}, borrowed only {borrowed_only}, back edge {round_back_edge})",
+                func.name.resolve_global().unwrap_or_default(),
+                phi.result,
+                val
+            );
+        }
+        // An accumulator's seed a string from anywhere: a copy is ours.
+        if body.is_some() && !round_back_edge && is_string(&phi.ty) && is_string_value(func, *val) {
+            copies.push((*pred, phi.result, index, *val));
+            continue;
+        }
+        return None;
+    }
+    Some(copies)
+}
+
+/// The block holding the phi `result`.
+fn phi_block_of(func: &HirFunction, result: HirId) -> Option<HirId> {
+    func.blocks
+        .iter()
+        .find(|(_, b)| b.phis.iter().any(|p| p.result == result))
+        .map(|(id, _)| *id)
+}
+
+/// The block defining `value`, by instruction or phi.
+fn def_block_of(func: &HirFunction, value: HirId) -> Option<HirId> {
+    func.blocks
+        .iter()
+        .find(|(_, b)| defines_value(b, value) || b.phis.iter().any(|p| p.result == value))
+        .map(|(id, _)| *id)
+}
+
+/// Whether any of `names` is read on a path from `merge` that does not
+/// pass the block defining them again: the merged storage is still
+/// referred to under its old name past the merge.
+fn used_past_merge(
+    func: &HirFunction,
+    names: &std::collections::HashSet<HirId>,
+    def_block: Option<HirId>,
+    merge: HirId,
+) -> bool {
+    let Some(def_block) = def_block else {
+        // Defined by nothing this walks: a parameter, read anywhere.
+        return true;
+    };
+    if def_block == merge {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![merge];
+    while let Some(b) = stack.pop() {
+        if b == def_block || !seen.insert(b) {
+            continue;
+        }
+        let Some(block) = func.blocks.get(&b) else {
+            continue;
+        };
+        let reads = block
+            .instructions
+            .iter()
+            .any(|i| i.operands().iter().any(|o| names.contains(o)))
+            || terminator_operands(&block.terminator)
+                .iter()
+                .any(|o| names.contains(o));
+        if reads {
+            return true;
+        }
+        stack.extend(successors_of(block));
+    }
+    false
+}
+
+/// The phis that read `value` on some edge.
+fn phis_using(func: &HirFunction, value: HirId) -> Vec<HirId> {
+    let mut out = Vec::new();
+    for block in func.blocks.values() {
+        for phi in &block.phis {
+            if phi.incoming.iter().any(|(v, _)| *v == value) {
+                out.push(phi.result);
+            }
+        }
+    }
+    out
+}
+
+/// The phis that read any of `values` on some edge.
+fn phis_using_any(func: &HirFunction, values: &std::collections::HashSet<HirId>) -> Vec<HirId> {
+    let mut out = Vec::new();
+    for block in func.blocks.values() {
+        for phi in &block.phis {
+            if phi.incoming.iter().any(|(v, _)| values.contains(v)) {
+                out.push(phi.result);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `value` is read by nothing but the phi `phi_result`.
+fn only_use_is_phi(func: &HirFunction, value: HirId, phi_result: HirId) -> bool {
+    for block in func.blocks.values() {
+        for phi in &block.phis {
+            if phi.result != phi_result && phi.incoming.iter().any(|(v, _)| *v == value) {
+                return false;
+            }
+        }
+        for inst in &block.instructions {
+            if inst.operands().contains(&value) {
+                return false;
+            }
+        }
+        if terminator_operands(&block.terminator).contains(&value) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_string_value(func: &HirFunction, value: HirId) -> bool {
+    func.values.get(&value).is_some_and(|v| is_string(&v.ty))
+}
+
+/// The values a terminator reads.
+fn terminator_operands(term: &HirTerminator) -> Vec<HirId> {
+    match term {
+        HirTerminator::Return { values } => values.clone(),
+        HirTerminator::CondBranch { condition, .. } => vec![*condition],
+        HirTerminator::Switch { value, .. } => vec![*value],
+        HirTerminator::Invoke { args, .. } => args.clone(),
+        HirTerminator::PatternMatch { value, .. } => vec![*value],
+        _ => Vec::new(),
+    }
 }
 
 /// Whether this block defines `value`.
@@ -316,6 +754,20 @@ fn uses_are_all_borrows(
     for block in func.blocks.values() {
         for inst in &block.instructions {
             if matches!(classify_derived_use(inst, derived, facts), UseKind::Escape) {
+                if trace_enabled() {
+                    let callee = match inst {
+                        HirInstruction::Call {
+                            callee: HirCallable::Function(id),
+                            ..
+                        } => facts
+                            .names
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{id:?}")),
+                        _ => String::new(),
+                    };
+                    eprintln!("[drop]   escapes through {inst:?} {callee}");
+                }
                 return false;
             }
         }
@@ -324,6 +776,9 @@ fn uses_are_all_borrows(
                 classify_terminator_use(&block.terminator, *d),
                 UseKind::Escape
             ) {
+                if trace_enabled() {
+                    eprintln!("[drop]   escapes through terminator {:?}", block.terminator);
+                }
                 return false;
             }
         }
@@ -346,6 +801,45 @@ fn last_use_index(
     last
 }
 
+/// Per function, which parameters may come back as its result, by
+/// position. A parameter that reaches a return through phis, casts, or a
+/// call to a function that returns its own parameter counts.
+fn functions_returning_params(
+    module: &HirModule,
+    facts: &ModuleFacts,
+) -> std::collections::HashMap<HirId, Vec<bool>> {
+    let mut out = std::collections::HashMap::new();
+    for (key, func) in module.functions.iter() {
+        if func.is_external {
+            continue;
+        }
+        let returned: Vec<HirId> = func
+            .blocks
+            .values()
+            .filter_map(|b| match &b.terminator {
+                HirTerminator::Return { values } => Some(values.iter().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // A parameter's value is the one of `Parameter` kind at its
+        // position; the signature's own ids name nothing in the body.
+        let flags: Vec<bool> = (0..func.signature.params.len())
+            .map(|i| {
+                func.values
+                    .values()
+                    .filter(|v| matches!(v.kind, crate::hir::HirValueKind::Parameter(n) if n as usize == i))
+                    .any(|v| {
+                        let names = derived_values_with(func, v.id, true, Some(facts));
+                        returned.iter().any(|r| names.contains(r))
+                    })
+            })
+            .collect();
+        out.insert(*key, flags);
+    }
+    out
+}
+
 /// Functions whose result is storage the caller owns.
 ///
 /// Deliberately strict, because being wrong here releases something the
@@ -363,37 +857,64 @@ fn functions_returning_owned_storage(
         if func.is_external {
             continue;
         }
-        let sites = collect_malloc_sites(func);
+        let sites = collect_owned_sites(func, facts);
         if sites.is_empty() {
             continue;
         }
-        // More than one allocation transfers only where releasing from
-        // a type's fields is on. Off, a constructor with a branch
-        // stays untransferred, which is what it was before any of this
-        // and what a program releasing by hand depends on.
-        if sites.len() > 1 && !crate::drop_glue::enabled() {
+        // More than one allocation transfers only under automatic
+        // release. Off, a constructor with a branch stays untransferred,
+        // which is what a program releasing by hand depends on.
+        if sites.len() > 1 && !automatic_release() {
             continue;
         }
+        let name = || func.name.resolve_global().unwrap_or_default();
         // A box is released by a named symbol the caller would have to
         // know, and what the caller picks is decided by the returned
         // type. Only storage the caller can release from the type alone
-        // transfers.
-        if sites
-            .iter()
-            .any(|s| !matches!(s.release, Release::Intrinsic | Release::Glue(_)))
-        {
+        // transfers: plain storage, a type with its own release, and a
+        // string.
+        if sites.iter().any(|s| {
+            !matches!(
+                s.release,
+                Release::Intrinsic
+                    | Release::Glue(_)
+                    | Release::Symbol(STRING_FREE)
+                    | Release::Symbol(BOX_FREE)
+            )
+        }) {
+            if trace_enabled() {
+                eprintln!(
+                    "[drop] {}: a site's release is not known from its type",
+                    name()
+                );
+            }
             continue;
         }
-        // Every allocation the function makes, not one. A constructor
+        // Every allocation that reaches a return, not one. A constructor
         // with a branch allocates in each arm and returns whichever it
         // took: `sites.len() != 1` refused all of them, so a type built
         // by anything more than a single unconditional allocation never
         // transferred and its callers never released it. The rule is
-        // the same for each: it may leave only by being returned.
+        // the same for each returned allocation: it may leave only by
+        // being returned, or the caller and whoever else kept it would
+        // both hold it. An allocation that never reaches a return is the
+        // function's own affair.
+        let returned: Vec<HirId> = func
+            .blocks
+            .values()
+            .filter_map(|b| match &b.terminator {
+                HirTerminator::Return { values } => Some(values.iter().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         let mut derived = std::collections::HashSet::new();
         let mut all_transfer = true;
         for site in &sites {
-            let d = derived_values(func, site.result);
+            let d = derived_values_in(func, site.result, facts);
+            if !returned.iter().any(|r| d.contains(r)) {
+                continue;
+            }
             if !escapes_only_by_return(func, &d, site, facts) {
                 all_transfer = false;
                 break;
@@ -401,23 +922,69 @@ fn functions_returning_owned_storage(
             derived.extend(d);
         }
         if !all_transfer {
+            if trace_enabled() {
+                eprintln!(
+                    "[drop] {}: a returned allocation also leaves another way",
+                    name()
+                );
+            }
             continue;
         }
+        // Every return hands back an allocation, or nothing: a null is
+        // what an error path returns in place of one, and releasing
+        // nothing is a no-op.
+        let returns_nothing = |v: &HirId| {
+            func.values.get(v).is_some_and(|value| {
+                matches!(
+                    value.kind,
+                    crate::hir::HirValueKind::Constant(HirConstant::Null(_))
+                )
+            })
+        };
         let mut returns = 0usize;
         let mut all_return_it = true;
         for block in func.blocks.values() {
             if let HirTerminator::Return { values } = &block.terminator {
                 returns += 1;
-                if !values.iter().any(|v| derived.contains(v)) {
+                if !values
+                    .iter()
+                    .any(|v| derived.contains(v) || returns_nothing(v))
+                {
                     all_return_it = false;
+                    if trace_enabled() {
+                        eprintln!(
+                            "[drop] {}: returns {:?}, which is not an allocation of its own",
+                            name(),
+                            values
+                                .first()
+                                .and_then(|v| block
+                                    .instructions
+                                    .iter()
+                                    .find(|i| i.result_id() == Some(*v))
+                                    .map(|i| format!("{i:?}")))
+                                .unwrap_or_default()
+                        );
+                    }
                 }
             }
         }
         if returns > 0 && all_return_it {
             owned.insert(*key);
+        } else if trace_enabled() {
+            eprintln!(
+                "[drop] {} does not return owned storage: {} returns, all owned: {}",
+                func.name.resolve_global().unwrap_or_default(),
+                returns,
+                all_return_it
+            );
         }
     }
     owned
+}
+
+/// `ZYNTAX_TRACE_DROP=1` prints what the pass decided and why.
+fn trace_enabled() -> bool {
+    std::env::var_os("ZYNTAX_TRACE_DROP").is_some()
 }
 
 /// Whether the allocation leaves this function only by being returned.
@@ -471,21 +1038,14 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
                 stats.frees_inserted += 1;
             }
             SiteOutcome::MultiBlockDrop { points } => {
-                // Back to front, so an earlier point's index is still
-                // valid after a later one has been spliced in.
-                let mut points = points;
-                points.sort_by(|a, b| b.1.cmp(&a.1));
-                for (block, after_idx) in points {
-                    insert_free_after(func, block, after_idx, site.result, site.release);
-                    stats.frees_inserted += 1;
-                }
+                stats.frees_inserted += apply_points(func, points, site.result, site.release);
             }
             SiteOutcome::Escaped => stats.escapes_skipped += 1,
             SiteOutcome::MultiBlock => stats.multi_block_skipped += 1,
             SiteOutcome::NoUse => stats.no_use_skipped += 1,
         }
     }
-    stats.frees_inserted += release_loop_carried(func, facts);
+    stats.frees_inserted += release_owned_phis(func, facts);
     stats
 }
 
@@ -498,12 +1058,28 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
 /// that boxes in a loop allocates once per iteration and releases
 /// nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SymbolRole {
-    /// Returns storage the caller owns, released by the named symbol.
-    Allocates(&'static str),
-    /// Reads through a pointer argument without keeping it, so passing
-    /// one here does not end the caller's claim.
-    Borrows,
+pub(crate) struct SymbolRole {
+    /// Hands back storage the caller owns, released by the named symbol.
+    pub(crate) allocates: Option<&'static str>,
+    /// Reads through its pointer arguments without keeping them, so
+    /// passing one here does not end the caller's claim. A box that
+    /// keeps the pointer it is given does not borrow it.
+    pub(crate) borrows_args: bool,
+}
+
+impl SymbolRole {
+    const BORROWS: SymbolRole = SymbolRole {
+        allocates: None,
+        borrows_args: true,
+    };
+    const KEEPS_INTO_BOX: SymbolRole = SymbolRole {
+        allocates: Some(BOX_FREE),
+        borrows_args: false,
+    };
+    const COPIES_INTO_BOX: SymbolRole = SymbolRole {
+        allocates: Some(BOX_FREE),
+        borrows_args: true,
+    };
 }
 
 /// The role of a runtime symbol, or `None` where the pass knows nothing
@@ -512,22 +1088,25 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
     match name {
         "zyntax_box_bool" | "zyntax_box_f32" | "zyntax_box_f64" | "zyntax_box_i32"
         | "zyntax_box_i64" | "zyntax_box_str" | "zyntax_box_ptr" | "zyntax_box_opaque" => {
-            Some(SymbolRole::Allocates("zyntax_box_free"))
+            Some(SymbolRole::KEEPS_INTO_BOX)
         }
         "zyntax_box_get_bool"
         | "zyntax_box_get_f32"
         | "zyntax_box_get_f64"
         | "zyntax_box_get_i32"
         | "zyntax_box_get_i64"
+        | "zyntax_box_get_str"
         | "zyntax_box_get_opaque"
-        | "zyntax_box_get_tag" => Some(SymbolRole::Borrows),
+        | "zyntax_box_get_tag" => Some(SymbolRole::BORROWS),
+        // A box holding its own copy of a string, released with the box.
+        "$IO$string_to_dynamic" => Some(SymbolRole::COPIES_INTO_BOX),
         // The IO, string and math plugins read their arguments and hand
         // back fresh storage; none keeps a pointer it was given.
         _ if name.starts_with("$IO$")
             || name.starts_with("$String$")
             || name.starts_with("$Math$") =>
         {
-            Some(SymbolRole::Borrows)
+            Some(SymbolRole::BORROWS)
         }
         _ => None,
     }
@@ -568,11 +1147,162 @@ enum SiteOutcome {
     /// it so. More than one point because a value can die on two paths
     /// out of a branch, and each has to release it exactly once.
     MultiBlockDrop {
-        points: Vec<(HirId, usize)>,
+        points: Vec<Point>,
     },
     Escaped,
     MultiBlock,
     NoUse,
+}
+
+/// Where a release goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Point {
+    /// After the instruction at this index of the block.
+    After(HirId, usize),
+    /// On the edge from the first block to the second: the value is live
+    /// leaving the one and dead entering the other, which reads it
+    /// nowhere. Placed at the target's entry when this is its only way
+    /// in, else on a block of its own spliced into the edge.
+    Edge(HirId, HirId),
+}
+
+/// Insert releases of `value` at `points`. Insertions after an index go
+/// back to front so earlier indices stay valid; edges are done last,
+/// since an entry insertion shifts the block's indices.
+fn apply_points(
+    func: &mut HirFunction,
+    points: Vec<Point>,
+    value: HirId,
+    release: Release,
+) -> usize {
+    let mut after: Vec<(HirId, usize)> = Vec::new();
+    let mut edges: Vec<(HirId, HirId)> = Vec::new();
+    for p in points {
+        match p {
+            Point::After(b, i) => after.push((b, i)),
+            Point::Edge(from, to) => edges.push((from, to)),
+        }
+    }
+    let count = after.len() + edges.len();
+    after.sort_by(|a, b| b.1.cmp(&a.1));
+    for (block, idx) in after {
+        insert_free_after(func, block, idx, value, release);
+    }
+    for (from, to) in edges {
+        insert_free_on_edge(func, from, to, value, release);
+    }
+    count
+}
+
+/// Release `value` on the edge `from -> to`.
+fn insert_free_on_edge(
+    func: &mut HirFunction,
+    from: HirId,
+    to: HirId,
+    value: HirId,
+    release: Release,
+) {
+    let release_inst = |value| HirInstruction::Call {
+        result: None,
+        callee: match release {
+            Release::Intrinsic => HirCallable::Intrinsic(Intrinsic::Free),
+            Release::Symbol(name) => HirCallable::Symbol(name.to_string()),
+            Release::Glue(id) => HirCallable::Function(id),
+        },
+        args: vec![value],
+        type_args: Vec::new(),
+        const_args: Vec::new(),
+        is_tail: false,
+    };
+    let predecessors: Vec<HirId> = func
+        .blocks
+        .iter()
+        .filter(|(_, b)| successors_of(b).contains(&to))
+        .map(|(id, _)| *id)
+        .collect();
+    if predecessors.len() == 1 && predecessors[0] == from {
+        if let Some(block) = func.blocks.get_mut(&to) {
+            block.instructions.insert(0, release_inst(value));
+        }
+        return;
+    }
+    // A block of its own on the edge, so no other way into `to` runs the
+    // release.
+    let middle = HirId::new();
+    let block = crate::hir::HirBlock {
+        id: middle,
+        label: None,
+        phis: Vec::new(),
+        instructions: vec![release_inst(value)],
+        terminator: HirTerminator::Branch { target: to },
+        dominance_frontier: Default::default(),
+        predecessors: vec![from],
+        successors: vec![to],
+    };
+    func.blocks.insert(middle, block);
+    if let Some(source) = func.blocks.get_mut(&from) {
+        retarget(&mut source.terminator, to, middle);
+        for s in source.successors.iter_mut() {
+            if *s == to {
+                *s = middle;
+            }
+        }
+    }
+    if let Some(target) = func.blocks.get_mut(&to) {
+        for phi in target.phis.iter_mut() {
+            for (_, pred) in phi.incoming.iter_mut() {
+                if *pred == from {
+                    *pred = middle;
+                }
+            }
+        }
+        for p in target.predecessors.iter_mut() {
+            if *p == from {
+                *p = middle;
+            }
+        }
+    }
+}
+
+/// Point every edge of `term` that went to `from` at `to`.
+fn retarget(term: &mut HirTerminator, from: HirId, to: HirId) {
+    let swap = |t: &mut HirId| {
+        if *t == from {
+            *t = to;
+        }
+    };
+    match term {
+        HirTerminator::Branch { target } => swap(target),
+        HirTerminator::CondBranch {
+            true_target,
+            false_target,
+            ..
+        } => {
+            swap(true_target);
+            swap(false_target);
+        }
+        HirTerminator::Switch { default, cases, .. } => {
+            swap(default);
+            for (_, t) in cases.iter_mut() {
+                swap(t);
+            }
+        }
+        HirTerminator::Invoke { normal, unwind, .. } => {
+            swap(normal);
+            swap(unwind);
+        }
+        HirTerminator::PatternMatch {
+            patterns, default, ..
+        } => {
+            for p in patterns.iter_mut() {
+                swap(&mut p.target);
+            }
+            if let Some(d) = default {
+                swap(d);
+            }
+        }
+        HirTerminator::Return { .. } | HirTerminator::Unreachable => {}
+    }
 }
 
 /// Allocation sites, counting a call whose callee hands back owned
@@ -588,6 +1318,12 @@ fn release_for(func: &HirFunction, result: HirId, facts: &ModuleFacts) -> Releas
     let Some(ty) = func.values.get(&result).map(|v| &v.ty) else {
         return Release::Intrinsic;
     };
+    if is_string(ty) {
+        return Release::Symbol(STRING_FREE);
+    }
+    if is_box(ty) {
+        return Release::Symbol(BOX_FREE);
+    }
     if let HirType::Ptr(inner) = ty {
         if let HirType::Struct(s) = &**inner {
             if let Some(id) = s.name.and_then(|n| facts.glue.get(&n)) {
@@ -608,6 +1344,9 @@ fn collect_owned_sites(func: &HirFunction, facts: &ModuleFacts) -> Vec<MallocSit
             site.release = release_for(func, site.result, facts);
         }
     }
+    // Calls handing back storage the caller owns: a function that
+    // returns what it allocated, an extern that makes a string, and an
+    // extern standing for a runtime symbol that allocates.
     for (block_id, block) in &func.blocks {
         for (idx, inst) in block.instructions.iter().enumerate() {
             if let HirInstruction::Call {
@@ -616,7 +1355,20 @@ fn collect_owned_sites(func: &HirFunction, facts: &ModuleFacts) -> Vec<MallocSit
                 ..
             } = inst
             {
-                if facts.returns_owned.contains(callee_id) {
+                let allocating_extern = facts
+                    .extern_links
+                    .get(callee_id)
+                    .and_then(|link| symbol_role(link).and_then(|r| r.allocates));
+                if let Some(free) = allocating_extern {
+                    sites.push(MallocSite {
+                        result: *result,
+                        block: *block_id,
+                        inst_idx: idx,
+                        release: Release::Symbol(free),
+                    });
+                } else if facts.returns_owned.contains(callee_id)
+                    || facts.string_makers.contains(callee_id)
+                {
                     sites.push(MallocSite {
                         result: *result,
                         block: *block_id,
@@ -645,7 +1397,17 @@ fn collect_malloc_sites(func: &HirFunction) -> Vec<MallocSite> {
                     callee: HirCallable::Symbol(name),
                     ..
                 } => match symbol_role(name) {
-                    Some(SymbolRole::Allocates(free_name)) => (*result, Release::Symbol(free_name)),
+                    Some(SymbolRole {
+                        allocates: Some(free_name),
+                        ..
+                    }) => (*result, Release::Symbol(free_name)),
+                    // A plugin's string result is fresh storage.
+                    Some(_)
+                        if makes_strings(name)
+                            && func.values.get(result).is_some_and(|v| is_string(&v.ty)) =>
+                    {
+                        (*result, Release::Symbol(STRING_FREE))
+                    }
                     _ => continue,
                 },
                 _ => continue,
@@ -681,7 +1443,27 @@ fn drop_points(
     site: &MallocSite,
     derived: &std::collections::HashSet<HirId>,
     facts: &ModuleFacts,
-) -> Option<Vec<(HirId, usize)>> {
+) -> Option<Vec<Point>> {
+    drop_points_transferring(
+        func,
+        site,
+        derived,
+        facts,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// [`drop_points`] where leaving `transfer_out` blocks hands the storage
+/// to whoever owns it past the edge, a phi that releases it later: the
+/// value is live out of such a block whatever its successors do, so no
+/// release is placed in it.
+fn drop_points_transferring(
+    func: &HirFunction,
+    site: &MallocSite,
+    derived: &std::collections::HashSet<HirId>,
+    facts: &ModuleFacts,
+    transfer_out: &std::collections::HashSet<HirId>,
+) -> Option<Vec<Point>> {
     // Only blocks the entry can get to. An unreachable one has no
     // bearing on where the value dies and its successors would drag
     // liveness around the graph for nothing.
@@ -745,7 +1527,8 @@ fn drop_points(
             if !reachable.contains(block_id) {
                 continue;
             }
-            let out = successors_of(block).iter().any(|sc| live_in.contains(sc));
+            let out = transfer_out.contains(block_id)
+                || successors_of(block).iter().any(|sc| live_in.contains(sc));
             if out && live_out.insert(*block_id) {
                 changed = true;
             }
@@ -759,14 +1542,29 @@ fn drop_points(
         }
     }
 
-    // Where it is live and nothing after it is.
+    // Where it is live and nothing after it is: after the last use in a
+    // block no successor of which keeps it, and on each edge out of a
+    // block that keeps it into one that does not.
     let mut points = Vec::new();
     for (block_id, block) in &func.blocks {
         if !reachable.contains(block_id) {
             continue;
         }
         let holds = *block_id == site.block || live_in.contains(block_id);
-        if !holds || live_out.contains(block_id) {
+        if !holds {
+            continue;
+        }
+        if live_out.contains(block_id) {
+            // Handed on along a transfer edge, or read further on along
+            // some successor; the others end its life as they are taken.
+            if transfer_out.contains(block_id) {
+                continue;
+            }
+            for succ in successors_of(block) {
+                if !live_in.contains(&succ) && succ != site.block && reachable.contains(&succ) {
+                    points.push(Point::Edge(*block_id, succ));
+                }
+            }
             continue;
         }
         if !uses_block.contains(block_id) && *block_id != site.block {
@@ -780,7 +1578,7 @@ fn drop_points(
             None if *block_id == site.block && !uses_block.contains(block_id) => return None,
             None => block.instructions.len(),
         };
-        points.push((*block_id, at.saturating_sub(1)));
+        points.push(Point::After(*block_id, at.saturating_sub(1)));
     }
     (!points.is_empty()).then_some(points)
 }
@@ -828,26 +1626,26 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
     // hold the claim too and their uses keep the storage live. Without
     // this, storing a box in a struct forfeits it: the store reads as
     // an escape even where the struct never leaves.
-    let derived = derived_values(func, site.result);
+    let derived = derived_values_in(func, site.result, facts);
     let target = site.result;
     let mut last_idx_in_block: Option<usize> = None;
     let mut had_any_use = false;
 
-    for (block_id, block) in &func.blocks {
-        // Phis: any phi reading a derived value from a predecessor
-        // implies cross-block flow → multi-block.
-        for phi in &block.phis {
-            if phi.incoming.iter().any(|(v, _)| derived.contains(v)) {
-                return SiteOutcome::MultiBlock;
-            }
-            if phi.result == target {
-                // The malloc itself isn't a phi result, but defend
-                // against unusual lowerings — if it is, treat as
-                // multi-block to avoid surprising the rewriter.
-                return SiteOutcome::MultiBlock;
-            }
-        }
+    // A value merged through a phi is another name past the merge, and
+    // a release placed by that name's liveness would name this one where
+    // it was never defined. Such storage is released through the phi
+    // (`release_owned_phis`), never here, so this is decided before any
+    // block's instructions are read.
+    if !phis_using_any(func, &derived).is_empty()
+        || func
+            .blocks
+            .values()
+            .any(|b| b.phis.iter().any(|p| p.result == target))
+    {
+        return SiteOutcome::MultiBlock;
+    }
 
+    for (block_id, block) in &func.blocks {
         for (idx, inst) in block.instructions.iter().enumerate() {
             // Skip the malloc instruction itself.
             if *block_id == site.block && idx == site.inst_idx {
@@ -858,7 +1656,7 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
                 UseKind::Use => {
                     had_any_use = true;
                     if *block_id != site.block {
-                        return match crate::drop_glue::enabled()
+                        return match automatic_release()
                             .then(|| drop_points(func, site, &derived, facts))
                             .flatten()
                         {
@@ -917,6 +1715,35 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
 /// into an aggregate, taking it back out, and casting it. Following more
 /// would widen the live range without making anything reclaimable.
 pub(crate) fn derived_values(func: &HirFunction, root: HirId) -> std::collections::HashSet<HirId> {
+    derived_values_with(func, root, true, None)
+}
+
+/// [`derived_values`] knowing which callees hand an argument back.
+fn derived_values_in(
+    func: &HirFunction,
+    root: HirId,
+    facts: &ModuleFacts,
+) -> std::collections::HashSet<HirId> {
+    derived_values_with(func, root, true, Some(facts))
+}
+
+/// [`derived_values_in`] stopping at phis: the names for the storage on
+/// the paths where `root` itself is defined, which is where a release by
+/// its name is defined too.
+fn derived_values_local(
+    func: &HirFunction,
+    root: HirId,
+    facts: &ModuleFacts,
+) -> std::collections::HashSet<HirId> {
+    derived_values_with(func, root, false, Some(facts))
+}
+
+fn derived_values_with(
+    func: &HirFunction,
+    root: HirId,
+    through_phis: bool,
+    facts: Option<&ModuleFacts>,
+) -> std::collections::HashSet<HirId> {
     let mut set = std::collections::HashSet::new();
     set.insert(root);
     // Blocks are unordered here, so a single sweep can miss a chain
@@ -925,9 +1752,11 @@ pub(crate) fn derived_values(func: &HirFunction, root: HirId) -> std::collection
     loop {
         let before = set.len();
         for block in func.blocks.values() {
-            for phi in &block.phis {
-                if phi.incoming.iter().any(|(v, _)| set.contains(v)) {
-                    set.insert(phi.result);
+            if through_phis {
+                for phi in &block.phis {
+                    if phi.incoming.iter().any(|(v, _)| set.contains(v)) {
+                        set.insert(phi.result);
+                    }
                 }
             }
             for inst in &block.instructions {
@@ -946,11 +1775,29 @@ pub(crate) fn derived_values(func: &HirFunction, root: HirId) -> std::collection
                 // an escape, and one that borrows has promised not to
                 // keep it. Following it instead made `t.check()`, an
                 // integer, an alias of the tree, and printing that
-                // integer read as the tree escaping.
+                // integer read as the tree escaping. The exception is a
+                // callee known to hand the argument itself back: its
+                // result is this storage under another name.
+                if let HirInstruction::Call {
+                    result: Some(result),
+                    callee,
+                    args,
+                    ..
+                } = inst
+                {
+                    if let Some(facts) = facts {
+                        if args
+                            .iter()
+                            .any(|a| set.contains(a) && facts.result_aliases_arg(callee, args, *a))
+                        {
+                            set.insert(*result);
+                        }
+                    }
+                    continue;
+                }
                 if matches!(
                     inst,
                     HirInstruction::Load { .. }
-                        | HirInstruction::Call { .. }
                         | HirInstruction::IndirectCall { .. }
                         | HirInstruction::TraitMethodCall { .. }
                         | HirInstruction::CallClosure { .. }
@@ -1029,6 +1876,17 @@ fn classify_derived_use(
         .fold(UseKind::None, strongest)
 }
 
+/// Whether a call to `callee` releases its argument: the free intrinsic,
+/// a runtime release symbol, or a type's own release.
+fn is_release(callee: &HirCallable, facts: &ModuleFacts) -> bool {
+    match callee {
+        HirCallable::Intrinsic(Intrinsic::Free) => true,
+        HirCallable::Symbol(name) => name == STRING_FREE || name == BOX_FREE,
+        HirCallable::Function(id) => facts.glue.values().any(|g| g == id),
+        _ => false,
+    }
+}
+
 /// Use-kind classification for a single instruction against one
 /// target value.
 #[derive(Clone, Copy)]
@@ -1098,10 +1956,10 @@ fn classify_inst_use(inst: &HirInstruction, target: HirId, facts: &ModuleFacts) 
             }
         }
         HirInstruction::Call { callee, args, .. } => {
-            // Free of `target` is exactly what this pass would have
-            // inserted — refuse to double-insert.
-            let is_free_call = matches!(callee, HirCallable::Intrinsic(Intrinsic::Free));
-            if is_free_call && args.iter().any(|a| *a == target) {
+            // A release of `target` is what this pass inserts, and the
+            // pass may run again over the same function: a released
+            // value is forfeit, never released twice.
+            if is_release(callee, facts) && args.iter().any(|a| *a == target) {
                 return UseKind::Escape;
             }
             if let HirCallable::Indirect(v) = callee {
@@ -1118,7 +1976,7 @@ fn classify_inst_use(inst: &HirInstruction, target: HirId, facts: &ModuleFacts) 
             // call, and treating it as an escape would mean no box that
             // is ever read could be released.
             match callee {
-                HirCallable::Symbol(name) if symbol_role(name) == Some(SymbolRole::Borrows) => {
+                HirCallable::Symbol(name) if symbol_role(name).is_some_and(|r| r.borrows_args) => {
                     UseKind::Use
                 }
                 // A parameter the callee only borrows leaves the caller
@@ -1852,38 +2710,50 @@ mod tests {
     }
 
     /// The object the accumulator replaces is released in the body,
-    /// after the body has read it. What leaves through the exit is the
-    /// one the last iteration built, which the body never read.
+    /// after the body has read it, and the one the last iteration built
+    /// is released after the exit has read it.
     #[test]
     fn an_accumulator_releases_what_it_replaces() {
         let (mut f, acc) = build_accumulator_loop(false);
+        let is_body = |blk: &HirBlock| {
+            blk.instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::Load { .. }))
+                && matches!(blk.terminator, HirTerminator::Branch { .. })
+        };
         let body_id = f
             .blocks
             .iter()
-            .find(|(_, blk)| {
-                blk.instructions
-                    .iter()
-                    .any(|i| matches!(i, HirInstruction::Load { .. }))
-                    && matches!(blk.terminator, HirTerminator::Branch { .. })
-            })
+            .find(|(_, blk)| is_body(blk))
             .map(|(id, _)| *id)
             .expect("the body");
-
-        assert_eq!(release_loop_carried(&mut f, &ModuleFacts::default()), 1);
-
-        let body = &f.blocks[&body_id];
-        let free_at = body.instructions.iter().position(|i| {
-            matches!(i, HirInstruction::Call { callee: HirCallable::Intrinsic(Intrinsic::Free), args, .. } if args == &vec![acc])
-        });
-        let read_at = body
-            .instructions
+        let exit_id = f
+            .blocks
             .iter()
-            .position(|i| matches!(i, HirInstruction::Load { .. }));
-        let free_at = free_at.expect("the accumulator should be released in the body");
-        assert!(
-            free_at > read_at.expect("the read"),
-            "releasing before the body reads it would be a use after free"
-        );
+            .find(|(_, blk)| matches!(blk.terminator, HirTerminator::Return { .. }))
+            .map(|(id, _)| *id)
+            .expect("the exit");
+
+        assert_eq!(release_owned_phis(&mut f, &ModuleFacts::default()), 2);
+
+        let free_of = |blk: &HirBlock| {
+            blk.instructions.iter().position(|i| {
+                matches!(i, HirInstruction::Call { callee: HirCallable::Intrinsic(Intrinsic::Free), args, .. } if args == &vec![acc])
+            })
+        };
+        let read_of = |blk: &HirBlock| {
+            blk.instructions
+                .iter()
+                .position(|i| matches!(i, HirInstruction::Load { .. }))
+        };
+        for id in [body_id, exit_id] {
+            let blk = &f.blocks[&id];
+            let free_at = free_of(blk).expect("the accumulator should be released here");
+            assert!(
+                free_at > read_of(blk).expect("the read"),
+                "releasing before the read would be a use after free"
+            );
+        }
     }
 
     /// If anything might keep the accumulator, it is not ours to
@@ -1892,7 +2762,7 @@ mod tests {
     fn an_accumulator_that_might_be_kept_is_left_alone() {
         let (mut f, _) = build_accumulator_loop(true);
         assert_eq!(
-            release_loop_carried(&mut f, &ModuleFacts::default()),
+            release_owned_phis(&mut f, &ModuleFacts::default()),
             0,
             "a call that might keep the pointer forfeits the release"
         );

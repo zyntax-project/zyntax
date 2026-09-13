@@ -179,16 +179,30 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         Some("zyntax_box_get_opaque"),
     ));
 
-    // A typed value becomes a dynamic one by being returned as one.
+    // A typed value becomes a dynamic one by being returned as one. A
+    // string's box holds its own copy and frees it with the box, so the
+    // string given stays the caller's.
     for (name, ty) in [
         ("zb_box_i64", i64()),
         ("zb_box_f64", f64()),
         ("zb_box_bool", boolean()),
-        ("zb_box_str", string()),
     ] {
         let v = local("v", ty);
         d.push(define(name, &[&v], any(), vec![ret(v.e())]));
     }
+    d.push(extern_fn(
+        "zb_str_to_dynamic",
+        &[("s", string())],
+        any(),
+        Some("$IO$string_to_dynamic"),
+    ));
+    let s_in = local("v", string());
+    d.push(define(
+        "zb_box_str",
+        &[&s_in],
+        any(),
+        vec![ret(call("zb_str_to_dynamic", vec![s_in.e()], any()))],
+    ));
 
     d.push(define(
         "zb_any_category",
@@ -847,7 +861,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ),
                 quoted(type_name(b.e())),
             )),
-            ret(a.e()),
+            ret(null(any())),
         ],
     ));
 
