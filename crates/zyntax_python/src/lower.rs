@@ -78,12 +78,12 @@ pub(crate) fn class_type(k: usize) -> Type {
     }
 }
 
-/// A field holds its own scalar; anything on the heap is stored boxed,
-/// so a list field is one shared header and a class's layout never
-/// depends on another's.
+/// A field holds its own scalar, or the pointer to an instance; anything
+/// else on the heap is stored boxed, so a list field is one shared
+/// header and a class's layout never depends on another's.
 pub(crate) fn field_storage(ty: Ty) -> Ty {
     match ty {
-        Ty::Int | Ty::Float | Ty::Bool | Ty::Str => ty,
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) => ty,
         _ => Ty::Object,
     }
 }
@@ -500,6 +500,11 @@ pub(crate) struct Lowerer<'m> {
     /// part of: a comprehension's loop, which the IR cannot hold inside
     /// an expression. Drained in front of each statement.
     pub(crate) hoisted: Vec<Stmt>,
+    /// Class-typed variables known not to be None where the lowering
+    /// stands: assigned from a constructor, or checked since. Cleared
+    /// at every compound statement, so it never crosses a branch or a
+    /// loop back edge.
+    nonnull: std::collections::HashSet<InternedString>,
     /// Variables shared with nested functions. Each lives in a
     /// one-element list, the cell, that every function using it holds.
     cells: HashMap<String, InternedString>,
@@ -603,6 +608,7 @@ impl<'m> Lowerer<'m> {
             bound,
             temps: 0,
             hoisted: Vec::new(),
+            nonnull: std::collections::HashSet::new(),
             guards: true,
             cells: cells
                 .into_iter()
@@ -1303,12 +1309,15 @@ impl<'m> Lowerer<'m> {
             }
             (Ty::Object, Ty::Dict) => call("zb_dict_unbox", vec![v.node], Ty::Dict, span),
             (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
+            // None is the null instance.
+            (Ty::None, Ty::Class(_)) => cast(int_lit(0, span), target, span),
             // An instance is boxed as its address under the class tag, and
-            // read back with a check; a subclass instance is its base.
+            // read back with a check; a subclass instance is its base. A
+            // null instance boxes as None.
             (Ty::Class(k), Ty::Object) => {
                 let address = as_addr(v.node, span);
                 call(
-                    "zb_box_instance_raw",
+                    "zb_box_instance",
                     vec![
                         address,
                         int32_lit(zyntax_builtins::instance_tag(k as usize) as i32, span),
@@ -1474,18 +1483,38 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
+            // None is false; an instance is true unless its class says.
             Ty::Class(k) => {
-                if let Some(r) = self.dunder(k as usize, "__bool__", v.node.clone(), vec![], span) {
-                    self.truthy(r)
-                } else if let Some(r) = self.dunder(k as usize, "__len__", v.node, vec![], span) {
-                    self.truthy(r)
-                } else {
-                    node(
-                        TypedExpression::Literal(TypedLiteral::Bool(true)),
+                let k = k as usize;
+                let has_dunder = self.module.method_sig(k, "__bool__").is_some()
+                    || self.module.method_sig(k, "__len__").is_some();
+                if !has_dunder {
+                    return binary(
+                        BinaryOp::Ne,
+                        as_addr(v.node, span),
+                        int_lit(0, span),
                         Ty::Bool,
                         span,
-                    )
+                    );
                 }
+                let no = node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                );
+                self.unless_null(v, no, Ty::Bool, |this, held| {
+                    if let Some(r) = this.dunder(k, "__bool__", held.node.clone(), vec![], span) {
+                        this.truthy(r)
+                    } else if let Some(r) = this.dunder(k, "__len__", held.node, vec![], span) {
+                        this.truthy(r)
+                    } else {
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(true)),
+                            Ty::Bool,
+                            span,
+                        )
+                    }
+                })
             }
             Ty::List(_) | Ty::Tuple | Ty::Set => binary(
                 BinaryOp::Ne,
@@ -1520,13 +1549,16 @@ impl<'m> Lowerer<'m> {
             Ty::Closure(_) => str_lit("<function>", span),
             Ty::Class(k) => {
                 let k = k as usize;
-                match self
-                    .dunder(k, "__str__", v.node.clone(), vec![], span)
-                    .or_else(|| self.dunder(k, "__repr__", v.node, vec![], span))
-                {
-                    Some(r) => self.coerce(r, Ty::Str),
-                    None => str_lit(&format!("<{} object>", self.module.classes[k].name), span),
-                }
+                let none = str_lit(crate::policy::POLICY.none_text, span);
+                self.unless_null(v, none, Ty::Str, |this, held| {
+                    match this
+                        .dunder(k, "__str__", held.node.clone(), vec![], span)
+                        .or_else(|| this.dunder(k, "__repr__", held.node, vec![], span))
+                    {
+                        Some(r) => this.coerce(r, Ty::Str),
+                        None => str_lit(&format!("<{} object>", this.module.classes[k].name), span),
+                    }
+                })
             }
             Ty::Object | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
         }
@@ -1537,11 +1569,19 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         match v.ty {
             Ty::Str => call("zb_str_repr", vec![v.node], Ty::Str, span),
-            Ty::Class(k) => match self.dunder(k as usize, "__repr__", v.node.clone(), vec![], span)
-            {
-                Some(r) => self.coerce(r, Ty::Str),
-                None => self.str_of(v),
-            },
+            Ty::Class(k) => {
+                let k = k as usize;
+                if self.module.method_sig(k, "__repr__").is_none() {
+                    return self.str_of(v);
+                }
+                let none = str_lit(crate::policy::POLICY.none_text, span);
+                self.unless_null(v, none, Ty::Str, |this, held| {
+                    match this.dunder(k, "__repr__", held.node.clone(), vec![], span) {
+                        Some(r) => this.coerce(r, Ty::Str),
+                        None => this.str_of(held),
+                    }
+                })
+            }
             Ty::Object | Ty::Unknown => call("zb_any_repr", vec![v.node], Ty::Str, span),
             _ => self.str_of(v),
         }
@@ -1603,8 +1643,27 @@ impl<'m> Lowerer<'m> {
     fn stmt(&mut self, s: &py::Stmt, out: &mut Vec<Stmt>) -> Result<()> {
         let raised_before = self.raised;
         self.raised = false;
+        // What is known about instances holds within one straight run of
+        // statements: a branch or a loop may reach here from elsewhere.
+        let compound = matches!(
+            s,
+            py::Stmt::If(_)
+                | py::Stmt::While(_)
+                | py::Stmt::For(_)
+                | py::Stmt::Try(_)
+                | py::Stmt::With(_)
+                | py::Stmt::Match(_)
+                | py::Stmt::FunctionDef(_)
+                | py::Stmt::ClassDef(_)
+        );
+        if compound {
+            self.nonnull.clear();
+        }
         let mut own = Vec::new();
         self.stmt_into(s, &mut own)?;
+        if compound {
+            self.nonnull.clear();
+        }
         // Whatever the statement's expressions hoisted runs first.
         out.append(&mut self.hoisted);
         out.append(&mut own);
@@ -2035,6 +2094,15 @@ impl<'m> Lowerer<'m> {
         };
         let ty = self.var_ty(n.id.as_str());
         let name = intern(n.id.as_str());
+        // An instance assigned from its constructor is known to be one
+        // until the block ends or the variable is assigned again.
+        if let Ty::Class(_) = ty {
+            if value.ty != Ty::None && self.known_instance(&value.node) {
+                self.nonnull.insert(name);
+            } else {
+                self.nonnull.remove(&name);
+            }
+        }
         if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
             let value = self.coerce(value, ty);
             let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
@@ -3306,7 +3374,7 @@ impl<'m> Lowerer<'m> {
                         k as usize,
                         "__eq__",
                         left.node.clone(),
-                        vec![other.clone()],
+                        vec![right.clone()],
                         span,
                     ) {
                         let t = self.truthy(r);
@@ -3316,6 +3384,7 @@ impl<'m> Lowerer<'m> {
                 if matches!(op, py::CmpOp::Eq | py::CmpOp::NotEq) {
                     // No `__eq__`: identity.
                     let l = self.coerce(left, Ty::Object);
+                    let other = self.coerce(right, Ty::Object);
                     let same = call("zb_any_same", vec![l, other], Ty::Bool, span);
                     return Ok(if op == py::CmpOp::NotEq {
                         negate(same)
@@ -3371,6 +3440,28 @@ impl<'m> Lowerer<'m> {
                 let n = match (left.ty, right.ty) {
                     (Ty::None, Ty::None) => node(
                         TypedExpression::Literal(TypedLiteral::Bool(true)),
+                        Ty::Bool,
+                        span,
+                    ),
+                    // An instance is None when its pointer is null.
+                    (Ty::None, Ty::Class(_)) => binary(
+                        BinaryOp::Eq,
+                        as_addr(right.node, span),
+                        int_lit(0, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    (Ty::Class(_), Ty::None) => binary(
+                        BinaryOp::Eq,
+                        as_addr(left.node, span),
+                        int_lit(0, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    (Ty::Class(_), Ty::Class(_)) => binary(
+                        BinaryOp::Eq,
+                        as_addr(left.node, span),
+                        as_addr(right.node, span),
                         Ty::Bool,
                         span,
                     ),
@@ -4210,6 +4301,14 @@ impl<'m> Lowerer<'m> {
                 return self.super_call(a.attr.as_str(), args, keywords, c, span);
             }
             let receiver = self.expr(&a.value)?;
+            let receiver = if receiver.ty == Ty::None {
+                Val {
+                    node: self.coerce(receiver, Ty::Object),
+                    ty: Ty::Object,
+                }
+            } else {
+                receiver
+            };
             if let Ty::Class(k) = receiver.ty {
                 return self.method_on(
                     k as usize,
@@ -5642,10 +5741,144 @@ impl<'m> Lowerer<'m> {
         Ok(Val { node, ty: Ty::Bool })
     }
 
+    /// Take `name` to hold an instance from here on, as generated code
+    /// that has just unboxed one does.
+    pub(crate) fn assume_instance(&mut self, name: InternedString) {
+        self.nonnull.insert(name);
+    }
+
+    /// Whether the lowering knows `node` is an instance and not None:
+    /// a method's own receiver, a constructor's result, or a variable
+    /// checked or assigned an instance since the block began.
+    fn known_instance(&self, node: &Node) -> bool {
+        match &node.node {
+            TypedExpression::Variable(name) => {
+                let is_self = self.class.is_some()
+                    && self
+                        .sig
+                        .params
+                        .first()
+                        .is_some_and(|(p, _)| intern(p) == *name);
+                is_self || self.nonnull.contains(name)
+            }
+            TypedExpression::Call(c) => match &c.callee.node {
+                TypedExpression::Variable(callee) => {
+                    callee.resolve_global().is_some_and(|n| n.ends_with("$new"))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// An instance about to be read through: None raises AttributeError
+    /// here, so the read can trust the pointer. The check is hoisted
+    /// ahead of the expression, and a variable checked once is known
+    /// for the rest of the block.
+    fn checked_instance(&mut self, object: Val, attr: &str, span: Span) -> Val {
+        if self.known_instance(&object.node) {
+            return object;
+        }
+        let held = match &object.node.node {
+            TypedExpression::Variable(name) => {
+                self.nonnull.insert(*name);
+                object
+            }
+            _ => {
+                let mut pre = Vec::new();
+                let held = self.hold(object, &mut pre, span);
+                self.hoisted.extend(pre);
+                held
+            }
+        };
+        let is_null = binary(
+            BinaryOp::Eq,
+            as_addr(held.node.clone(), span),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        );
+        let mut raise = Vec::new();
+        self.raise_named(
+            "AttributeError",
+            str_lit(
+                &format!("'NoneType' object has no attribute '{attr}'"),
+                span,
+            ),
+            span,
+            &mut raise,
+        );
+        self.hoisted.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(is_null),
+                then_block: TypedBlock {
+                    statements: raise,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        held
+    }
+
+    /// `then(v)` when `v` is an instance, `when_null` when it is None.
+    fn unless_null(
+        &mut self,
+        v: Val,
+        when_null: Node,
+        ty: Ty,
+        then: impl FnOnce(&mut Self, Val) -> Node,
+    ) -> Node {
+        let span = v.node.span;
+        if self.known_instance(&v.node) {
+            return then(self, v);
+        }
+        let mut pre = Vec::new();
+        let held = self.hold(v, &mut pre, span);
+        self.hoisted.extend(pre);
+        let is_instance = binary(
+            BinaryOp::Ne,
+            as_addr(held.node.clone(), span),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        );
+        // What `then` hoists belongs inside the branch.
+        let outer = std::mem::take(&mut self.hoisted);
+        let value = then(self, held);
+        let inner = std::mem::take(&mut self.hoisted);
+        self.hoisted = outer;
+        let mut out = Vec::new();
+        let result = self.conditional_value(
+            is_instance,
+            (inner, value),
+            (Vec::new(), when_null),
+            ty,
+            span,
+            &mut out,
+        );
+        self.hoisted.extend(out);
+        result
+    }
+
     /// `obj.attr` read.
     fn attribute(&mut self, object: Val, attr: &str, span: Span) -> Result<Val> {
+        // A value known to be None reads as any dynamic value would:
+        // the AttributeError is raised at run time.
+        let object = if object.ty == Ty::None {
+            Val {
+                node: self.coerce(object, Ty::Object),
+                ty: Ty::Object,
+            }
+        } else {
+            object
+        };
         match object.ty {
             Ty::Class(k) => {
+                let object = self.checked_instance(object, attr, span);
                 let Some((_, ty)) = self.module.field(k as usize, attr) else {
                     return Err(Error::unsupported_span(
                         format!(
@@ -5690,8 +5923,17 @@ impl<'m> Lowerer<'m> {
 
     /// `obj.attr = value` as a statement expression.
     fn set_attribute(&mut self, object: Val, attr: &str, value: Val, span: Span) -> Result<Node> {
+        let object = if object.ty == Ty::None {
+            Val {
+                node: self.coerce(object, Ty::Object),
+                ty: Ty::Object,
+            }
+        } else {
+            object
+        };
         match object.ty {
             Ty::Class(k) => {
+                let object = self.checked_instance(object, attr, span);
                 let Some((_, ty)) = self.module.field(k as usize, attr) else {
                     return Err(Error::unsupported_span(
                         format!(
@@ -5794,17 +6036,14 @@ impl<'m> Lowerer<'m> {
         let args = args
             .into_iter()
             .zip(param_tys)
-            .map(|(a, t)| {
-                self.coerce(
-                    Val {
-                        node: a,
-                        ty: Ty::Object,
-                    },
-                    t,
-                )
-            })
+            .map(|(a, t)| self.coerce(a, t))
             .collect();
-        self.invoke(k, method, receiver, args, span)
+        let v = self.invoke(k, method, receiver, args, span)?;
+        if !self.guards {
+            return Some(v);
+        }
+        let target = self.invoke_target(k, method)?;
+        Some(self.guard_named(v, &target, span))
     }
 
     /// `obj.m(args)` on a receiver of known class.
@@ -5829,6 +6068,7 @@ impl<'m> Lowerer<'m> {
             ));
         };
         let sig = without_self(sig);
+        let receiver = self.checked_instance(receiver, method, span);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
         let v = self
             .invoke(k, method, receiver.node, lowered, span)

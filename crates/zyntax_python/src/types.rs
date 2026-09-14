@@ -39,7 +39,10 @@ pub(crate) enum Ty {
     Dict,
     /// A set of dynamic values.
     Set,
-    /// An instance of the module's class at this index.
+    /// An instance of the module's class at this index, or None: the
+    /// value is a pointer, and None is the null one. Reading through
+    /// None raises AttributeError, where the lowering does not know the
+    /// value is an instance.
     Class(u16),
     /// A generator: a fiber yielding dynamic values.
     Gen,
@@ -107,6 +110,8 @@ impl Ty {
         match (self, other) {
             (Ty::Unknown, t) | (t, Ty::Unknown) => t,
             (a, b) if a == b => a,
+            // An instance is a pointer, and None is the null one.
+            (Ty::None, Ty::Class(k)) | (Ty::Class(k), Ty::None) => Ty::Class(k),
             _ => Ty::Object,
         }
     }

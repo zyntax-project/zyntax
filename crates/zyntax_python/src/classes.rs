@@ -16,12 +16,13 @@ use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::type_registry::{FieldDef, TypeMetadata};
+use zyntax_typed_ast::type_registry::{FieldDef, TypeDefinition, TypeKind, TypeMetadata};
 use zyntax_typed_ast::typed_ast::{
     TypedAnnotation, TypedBlock, TypedClass, TypedDeclaration, TypedField, TypedFieldAccess,
     TypedFieldInit, TypedFunction, TypedIf, TypedLet, TypedLiteral, TypedParameter, TypedStatement,
     TypedStructLiteral,
 };
+use zyntax_typed_ast::TypeId;
 use zyntax_typed_ast::{
     Mutability, ParamOwnership, ParameterKind, Type, TypeRegistry, TypedNode, Visibility,
 };
@@ -142,8 +143,11 @@ pub(crate) fn register(
 ) -> Vec<TypedNode<TypedDeclaration>> {
     let span = Span::new(0, 0);
     let mut decls = Vec::new();
-    let mut ids = Vec::new();
-    for class in &mut module.classes {
+    // Every class has its id before any is laid out, so a field holding
+    // an instance of a class declared later, or of its own, has a type.
+    let ids: Vec<TypeId> = module.classes.iter().map(|_| TypeId::next()).collect();
+    lower::set_class_types(ids.clone());
+    for (k, class) in module.classes.iter_mut().enumerate() {
         let fields: Vec<FieldDef> = class
             .fields
             .iter()
@@ -159,20 +163,27 @@ pub(crate) fn register(
                 is_synthetic: false,
             })
             .collect();
-        let id = registry.register_struct_type(
-            intern(&class.name),
-            Vec::new(),
+        let id = ids[k];
+        registry.register_type(TypeDefinition {
+            id,
+            module: None,
+            name: intern(&class.name),
+            kind: TypeKind::Struct {
+                fields: fields.clone(),
+                is_tuple: false,
+            },
+            type_params: Vec::new(),
+            constraints: Vec::new(),
             fields,
-            Vec::new(),
-            Vec::new(),
-            TypeMetadata {
+            methods: Vec::new(),
+            constructors: Vec::new(),
+            metadata: TypeMetadata {
                 is_reference: true,
                 ..Default::default()
             },
             span,
-        );
+        });
         class.type_id = Some(id);
-        ids.push(id);
         decls.push(TypedNode::new(
             TypedDeclaration::Class(TypedClass {
                 name: intern(&class.name),
@@ -209,7 +220,6 @@ pub(crate) fn register(
             span,
         ));
     }
-    lower::set_class_types(ids);
     decls
 }
 
@@ -410,6 +420,7 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
                     span,
                 ),
                 Ty::Str => str_lit("", span),
+                Ty::Class(c) => lowerer.coerce(none(span), Ty::Class(c)),
                 _ => lowerer.coerce(none(span), Ty::Object),
             }
         };
@@ -458,6 +469,18 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
 fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
     let class = &module.classes[k];
     let x = var(intern("x"), Ty::Object, span);
+    // None is the null instance of any class.
+    let is_none = binary(
+        BinaryOp::Eq,
+        x.clone(),
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        Ty::Bool,
+        span,
+    );
     let kind = call("zb_any_kind", vec![x.clone()], Ty::Int, span);
     let mut accepted: Option<Node> = None;
     for c in 0..module.classes.len() {
@@ -494,6 +517,11 @@ fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
     // The raw read takes a box; a rejected value may be None, so the
     // error path leaves with a null address instead.
     let statements = vec![
+        when(
+            is_none,
+            vec![ret(lower::as_addr(lower::int_lit(0, span), span), span)],
+            span,
+        ),
         when(
             not_accepted,
             vec![
@@ -615,11 +643,15 @@ fn per_class(
         let address = lower::addr_call("zb_unbox_instance_raw", vec![x.clone()], span);
         let obj = cast(address, Ty::Class(c as u16), span);
         let mut then = vec![let_("obj", Ty::Class(c as u16), obj, span)];
-        then.extend(body(
+        // The box held an instance of this class, so `obj` is one.
+        lowerer.assume_instance(intern("obj"));
+        let arm = body(
             &mut lowerer,
             c,
             var(intern("obj"), Ty::Class(c as u16), span),
-        ));
+        );
+        then.append(&mut lowerer.hoisted);
+        then.extend(arm);
         statements.push(when(
             binary(
                 BinaryOp::Eq,
@@ -1155,7 +1187,14 @@ fn box_hook(module: &Module, span: Span) -> TypedFunction {
     };
     let boxed = call(
         "zb_box_instance_raw",
-        vec![p, cast_i32(tag, span)],
+        vec![p.clone(), cast_i32(tag, span)],
+        Ty::Object,
+        span,
+    );
+    // A null address is None.
+    let is_null = binary(BinaryOp::Eq, p, lower::int_lit(0, span), Ty::Bool, span);
+    let none = node(
+        TypedExpression::Literal(TypedLiteral::Null),
         Ty::Object,
         span,
     );
@@ -1163,7 +1202,7 @@ fn box_hook(module: &Module, span: Span) -> TypedFunction {
         "zb_hook_box_instance",
         vec![param],
         Ty::Object,
-        vec![ret(boxed, span)],
+        vec![when(is_null, vec![ret(none, span)], span), ret(boxed, span)],
         span,
     )
 }

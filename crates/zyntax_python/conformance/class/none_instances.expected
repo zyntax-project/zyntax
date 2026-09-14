@@ -1,0 +1,10 @@
+2
+False True True
+None
+True False
+True None
+1
+2
+AttributeError 'NoneType' object has no attribute 'item'
+AttributeError 'NoneType' object has no attribute 'depth'
+None

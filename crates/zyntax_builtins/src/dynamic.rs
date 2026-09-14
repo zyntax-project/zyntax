@@ -182,6 +182,18 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         Some("zyntax_box_pointer"),
     ));
+    // A null instance is None.
+    let p = local("p", i64());
+    let itag = local("tag", i32());
+    d.push(define(
+        "zb_box_instance",
+        &[&p, &itag],
+        any(),
+        vec![
+            when(eq(p.e(), int(0)), vec![ret(null(any()))]),
+            ret(call("zb_box_instance_raw", vec![p.e(), itag.e()], any())),
+        ],
+    ));
     // The box accessors. The `data` and payload readers take a box that
     // is known to be one, and are the loads they name; the tag reader
     // answers None with the void tag first.
