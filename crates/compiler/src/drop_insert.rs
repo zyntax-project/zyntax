@@ -991,6 +991,7 @@ fn returns_owned_storage(func: &HirFunction, facts: &ModuleFacts) -> bool {
                 s.release,
                 Release::Intrinsic
                     | Release::Glue(_)
+                    | Release::List
                     | Release::Symbol(STRING_FREE)
                     | Release::Symbol(BOX_FREE)
             )
@@ -1300,6 +1301,9 @@ enum Release {
     /// freeing the object. Synthesised by [`crate::drop_glue`]; freeing
     /// such an object with a bare `Free` would leak everything it holds.
     Glue(HirId),
+    /// A list header: the elements, in storage only the header names,
+    /// are freed first, then the header.
+    List,
 }
 
 /// One allocation we're considering for drop insertion.
@@ -1379,18 +1383,7 @@ fn insert_free_on_edge(
     value: HirId,
     release: Release,
 ) {
-    let release_inst = |value| HirInstruction::Call {
-        result: None,
-        callee: match release {
-            Release::Intrinsic => HirCallable::Intrinsic(Intrinsic::Free),
-            Release::Symbol(name) => HirCallable::Symbol(name.to_string()),
-            Release::Glue(id) => HirCallable::Function(id),
-        },
-        args: vec![value],
-        type_args: Vec::new(),
-        const_args: Vec::new(),
-        is_tail: false,
-    };
+    let insts = release_instructions(func, value, release);
     let predecessors: Vec<HirId> = func
         .blocks
         .iter()
@@ -1399,7 +1392,7 @@ fn insert_free_on_edge(
         .collect();
     if predecessors.len() == 1 && predecessors[0] == from {
         if let Some(block) = func.blocks.get_mut(&to) {
-            block.instructions.insert(0, release_inst(value));
+            block.instructions.splice(0..0, insts);
         }
         return;
     }
@@ -1410,7 +1403,7 @@ fn insert_free_on_edge(
         id: middle,
         label: None,
         phis: Vec::new(),
-        instructions: vec![release_inst(value)],
+        instructions: insts,
         terminator: HirTerminator::Branch { target: to },
         dominance_frontier: Default::default(),
         predecessors: vec![from],
@@ -1464,6 +1457,9 @@ fn release_for(func: &HirFunction, result: HirId, facts: &ModuleFacts) -> Releas
     }
     if is_box(ty) {
         return Release::Symbol(BOX_FREE);
+    }
+    if crate::ssa::is_list_header(ty) {
+        return Release::List;
     }
     if let HirType::Ptr(inner) = ty {
         if let HirType::Struct(s) = &**inner {
@@ -1903,11 +1899,37 @@ fn derived_values_with(
 ) -> std::collections::HashSet<HirId> {
     let mut set = std::collections::HashSet::new();
     set.insert(root);
+    // A list header owns the element storage its first field names:
+    // releasing the header frees that too, so what is read out of the
+    // field is another name for what the release ends. `heads` are the
+    // names for the header's own address, which the field is read
+    // through.
+    let list = func
+        .values
+        .get(&root)
+        .is_some_and(|v| crate::ssa::is_list_header(&v.ty));
+    let mut heads = std::collections::HashSet::new();
+    if list {
+        heads.insert(root);
+    }
+    let zero = |id: &HirId| {
+        func.values.get(id).is_some_and(|v| {
+            matches!(
+                v.kind,
+                crate::hir::HirValueKind::Constant(
+                    HirConstant::I64(0)
+                        | HirConstant::I32(0)
+                        | HirConstant::U64(0)
+                        | HirConstant::USize(0)
+                )
+            )
+        })
+    };
     // Blocks are unordered here, so a single sweep can miss a chain
     // that runs backwards through the map. Repeat until nothing new
     // appears; the set only grows and is bounded by the value count.
     loop {
-        let before = set.len();
+        let before = set.len() + heads.len();
         for block in func.blocks.values() {
             if through_phis {
                 for phi in &block.phis {
@@ -1917,6 +1939,39 @@ fn derived_values_with(
                 }
             }
             for inst in &block.instructions {
+                if list {
+                    match inst {
+                        HirInstruction::Cast {
+                            result, operand, ..
+                        } if heads.contains(operand) => {
+                            heads.insert(*result);
+                        }
+                        HirInstruction::GetElementPtr {
+                            result,
+                            ptr,
+                            indices,
+                            ..
+                        } if heads.contains(ptr) && indices.iter().all(zero) => {
+                            heads.insert(*result);
+                        }
+                        HirInstruction::Load {
+                            result, ptr, ty, ..
+                        } if heads.contains(ptr) && matches!(ty, HirType::Ptr(_)) => {
+                            set.insert(*result);
+                        }
+                        // Growing the elements moves them: the result is
+                        // the same storage at its new address.
+                        HirInstruction::Call {
+                            result: Some(result),
+                            callee: HirCallable::Intrinsic(Intrinsic::Realloc),
+                            args,
+                            ..
+                        } if args.first().is_some_and(|a| set.contains(a)) => {
+                            set.insert(*result);
+                        }
+                        _ => {}
+                    }
+                }
                 // Two shapes produce a value that is not another name
                 // for this storage, and following them would put the
                 // whole program in the set.
@@ -1978,7 +2033,7 @@ fn derived_values_with(
                 }
             }
         }
-        if set.len() == before {
+        if set.len() + heads.len() == before {
             return set;
         }
     }
@@ -2023,6 +2078,23 @@ fn classify_derived_use(
         HirInstruction::Cast {
             result, operand, ..
         } if derived.contains(operand) && derived.contains(result) => {
+            return UseKind::Use;
+        }
+        // A name for the storage kept inside the storage itself, as a
+        // list header keeps its elements' address.
+        HirInstruction::Store { value, ptr, .. }
+            if derived.contains(value) && derived.contains(ptr) =>
+        {
+            return UseKind::Use;
+        }
+        // Growth whose result is known to be this storage moved: the
+        // old address is given up for the new one, not for good.
+        HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Intrinsic(Intrinsic::Realloc),
+            args,
+            ..
+        } if derived.contains(result) && args.first().is_some_and(|a| derived.contains(a)) => {
             return UseKind::Use;
         }
         _ => {}
@@ -2133,6 +2205,11 @@ fn classify_inst_use(inst: &HirInstruction, target: HirId, facts: &ModuleFacts) 
             // call, and treating it as an escape would mean no box that
             // is ever read could be released.
             match callee {
+                // A copy reads and writes through its pointers and
+                // keeps neither.
+                HirCallable::Intrinsic(
+                    Intrinsic::Memcpy | Intrinsic::Memmove | Intrinsic::Memset,
+                ) => UseKind::Use,
                 HirCallable::Symbol(name) if symbol_role(name).is_some_and(|r| r.borrows_args) => {
                     UseKind::Use
                 }
@@ -2242,21 +2319,58 @@ fn insert_free_after(
     target: HirId,
     release: Release,
 ) {
-    let free_inst = HirInstruction::Call {
+    let insts = release_instructions(func, target, release);
+    if let Some(block) = func.blocks.get_mut(&block_id) {
+        let insert_at = (after_idx + 1).min(block.instructions.len());
+        block.instructions.splice(insert_at..insert_at, insts);
+    }
+}
+
+/// The instructions that release `value`, in order.
+fn release_instructions(
+    func: &mut HirFunction,
+    value: HirId,
+    release: Release,
+) -> Vec<HirInstruction> {
+    let call = |callee: HirCallable, arg: HirId| HirInstruction::Call {
         result: None,
-        callee: match release {
-            Release::Intrinsic => HirCallable::Intrinsic(Intrinsic::Free),
-            Release::Symbol(name) => HirCallable::Symbol(name.to_string()),
-            Release::Glue(id) => HirCallable::Function(id),
-        },
-        args: vec![target],
+        callee,
+        args: vec![arg],
         type_args: Vec::new(),
         const_args: Vec::new(),
         is_tail: false,
     };
-    if let Some(block) = func.blocks.get_mut(&block_id) {
-        let insert_at = (after_idx + 1).min(block.instructions.len());
-        block.instructions.insert(insert_at, free_inst);
+    match release {
+        Release::Intrinsic => vec![call(HirCallable::Intrinsic(Intrinsic::Free), value)],
+        Release::Symbol(name) => vec![call(HirCallable::Symbol(name.to_string()), value)],
+        Release::Glue(id) => vec![call(HirCallable::Function(id), value)],
+        Release::List => {
+            // The element storage is whatever the header's first field
+            // holds at this point, since growing the list replaces it.
+            let data = HirId::new();
+            let ty = HirType::Ptr(Box::new(HirType::U8));
+            func.values.insert(
+                data,
+                crate::hir::HirValue {
+                    id: data,
+                    ty: ty.clone(),
+                    kind: crate::hir::HirValueKind::Instruction,
+                    uses: Default::default(),
+                    span: None,
+                },
+            );
+            vec![
+                HirInstruction::Load {
+                    result: data,
+                    ty,
+                    ptr: value,
+                    align: 8,
+                    volatile: false,
+                },
+                call(HirCallable::Intrinsic(Intrinsic::Free), data),
+                call(HirCallable::Intrinsic(Intrinsic::Free), value),
+            ]
+        }
     }
 }
 
@@ -2493,6 +2607,106 @@ mod tests {
         assert_eq!(stats.mallocs_scanned, 1);
         assert_eq!(stats.frees_inserted, 0);
         assert_eq!(stats.escapes_skipped, 1);
+    }
+
+    /// Releasing a list header frees the elements first.
+    ///
+    /// `data = malloc; header = malloc List; store data -> header;
+    /// d = load header; e = load d[0]; return e`. The element storage
+    /// is stored into the header, so its own site escapes; the header's
+    /// release reads it back out and frees it before the header. The
+    /// element read through the loaded data pointer is a use of the
+    /// header, so the release lands after it.
+    #[test]
+    fn a_list_header_release_frees_the_elements_first() {
+        let mut f = HirFunction::new(
+            InternedString::new_global("list_literal"),
+            empty_sig(HirType::I64),
+        );
+        let entry = *f.blocks.keys().next().unwrap();
+        let data_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(32));
+        let header_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(24));
+        let data = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let header = add_inst_val(
+            &mut f,
+            HirType::Ptr(Box::new(crate::ssa::list_header_type())),
+        );
+        let loaded = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let elem = add_inst_val(&mut f, HirType::I64);
+        let block = f.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(data),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![data_bytes],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.instructions.push(HirInstruction::Call {
+            result: Some(header),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![header_bytes],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.instructions.push(HirInstruction::Store {
+            value: data,
+            ptr: header,
+            align: 8,
+            volatile: false,
+        });
+        block.instructions.push(HirInstruction::Load {
+            result: loaded,
+            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ptr: header,
+            align: 8,
+            volatile: false,
+        });
+        block.instructions.push(HirInstruction::Load {
+            result: elem,
+            ty: HirType::I64,
+            ptr: loaded,
+            align: 8,
+            volatile: false,
+        });
+        block.terminator = HirTerminator::Return { values: vec![elem] };
+
+        let stats = run_function(&mut f, &ModuleFacts::default());
+        assert_eq!(stats.mallocs_scanned, 2);
+        assert_eq!(
+            stats.escapes_skipped, 1,
+            "the element storage is the header's"
+        );
+        assert_eq!(stats.frees_inserted, 1);
+
+        let block = f.blocks.values().next().unwrap();
+        let freed: Vec<HirId> = block
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Free),
+                    args,
+                    ..
+                } => Some(args[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(freed.len(), 2, "elements and header");
+        assert_eq!(freed[1], header, "the header goes last");
+        let read_back = block
+            .instructions
+            .iter()
+            .position(|i| matches!(i, HirInstruction::Load { result, .. } if *result == freed[0]));
+        let last_use = block
+            .instructions
+            .iter()
+            .position(|i| matches!(i, HirInstruction::Load { result, .. } if *result == elem));
+        assert!(
+            read_back > last_use,
+            "the release reads the elements' address after the last element read"
+        );
     }
 
     #[test]

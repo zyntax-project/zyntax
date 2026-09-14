@@ -143,6 +143,24 @@ pub(crate) fn list_header_type() -> HirType {
     })
 }
 
+/// Whether a value of this type is a list header, on the heap: the
+/// header itself or a pointer to it, since a call hands one back as
+/// the struct and a local names it through the pointer.
+pub(crate) fn is_list_header(ty: &HirType) -> bool {
+    let s = match ty {
+        HirType::Ptr(inner) => match &**inner {
+            HirType::Struct(s) => s,
+            _ => return false,
+        },
+        HirType::Struct(s) => s,
+        _ => return false,
+    };
+    s.fields.len() == 3
+        && s.name
+            .and_then(|n| n.resolve_global())
+            .is_some_and(|n| n == "List")
+}
+
 pub(crate) fn hir_ty_size(ty: &HirType) -> usize {
     match ty {
         HirType::Bool | HirType::I8 | HirType::U8 => 1,
@@ -6445,11 +6463,17 @@ impl SsaBuilder {
                 }
 
                 // Step 3: Build List<T> struct: { data: i64 (ptr), len: i64, capacity: i64 }
-                let list_struct_ty = HirType::Struct(crate::hir::HirStructType {
-                    name: None,
-                    fields: vec![HirType::I64, HirType::I64, HirType::I64],
-                    packed: false,
-                });
+                // A heap header carries the list type's name, which is
+                // what tells a release to free the elements with it.
+                let list_struct_ty = if growable {
+                    list_header_type()
+                } else {
+                    HirType::Struct(crate::hir::HirStructType {
+                        name: None,
+                        fields: vec![HirType::I64, HirType::I64, HirType::I64],
+                        packed: false,
+                    })
+                };
                 let list_alloc = if growable {
                     let bytes = self.i64_const(24);
                     self.emit_intrinsic(
