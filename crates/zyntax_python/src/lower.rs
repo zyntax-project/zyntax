@@ -1785,9 +1785,20 @@ impl<'m> Lowerer<'m> {
                 let Some(v) = &a.value else {
                     return unsupported("annotation without a value", a);
                 };
-                // An annotation is a hint, not a conversion: `x: float = 3`
-                // binds the int 3.
+                // An annotation converts nothing: `x: float = 3` binds the
+                // int 3. A dynamic value is read back as the annotation
+                // says, with the check a parameter's annotation gets.
                 let value = self.expr(v)?;
+                let declared =
+                    types::annotated_value(&self.module.class_index, &a.annotation, value.ty);
+                let value = if declared != value.ty {
+                    Val {
+                        node: self.coerce(value, declared),
+                        ty: declared,
+                    }
+                } else {
+                    value
+                };
                 self.bind(&a.target, value, span, out)?;
             }
             py::Stmt::AugAssign(a) => {

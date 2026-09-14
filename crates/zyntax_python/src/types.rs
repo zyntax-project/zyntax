@@ -801,6 +801,25 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
     }
 }
 
+/// The type of `x: T = v`. A typed value keeps its type: the annotation
+/// converts nothing, `x: float = 3` binds the int. A dynamic value takes
+/// the annotation, read back with a check as an annotated parameter is,
+/// so that the annotation is what makes `v: float = bag.payload` a
+/// float.
+pub(crate) fn annotated_value(
+    classes: &HashMap<String, usize>,
+    annotation: &py::Expr,
+    value: Ty,
+) -> Ty {
+    if value != Ty::Object {
+        return value;
+    }
+    match annotation_in(classes, annotation) {
+        Ty::Object | Ty::None | Ty::Unknown => value,
+        declared => declared,
+    }
+}
+
 /// Signature from the annotations alone; an unannotated return is
 /// `Unknown` until the body says.
 pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
@@ -1837,7 +1856,7 @@ impl Walker<'_> {
                     let ty = if is_dynamic_annotation(&a.annotation) {
                         Ty::Object
                     } else {
-                        self.expr(v)
+                        annotated_value(&self.module.class_index, &a.annotation, self.expr(v))
                     };
                     self.target(&a.target, ty);
                 }
