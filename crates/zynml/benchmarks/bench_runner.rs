@@ -322,6 +322,13 @@ const KERNELS: &[Kernel] = &[
     Kernel::new("bench_llm_decode", "Int(55842)").ml(),
     Kernel::new("bench_collatz", "Int(35669673)"),
     Kernel::new("bench_branchy", "Int(140)"),
+    // What a data script does between its I/O calls: rows as dicts,
+    // comprehension pipelines with a keyed sort, and text split into
+    // tokens counted by string key. Python idioms without a ZynML
+    // counterpart, read against the Python runtimes alone.
+    Kernel::new("bench_records", "Int(5997822)").python_only(),
+    Kernel::new("bench_pipeline", "Int(867144200)").python_only(),
+    Kernel::new("bench_tokenize", "Int(2729)").python_only(),
 ];
 
 /// One published measurement: a source file plus the pipeline it is
