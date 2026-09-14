@@ -24,6 +24,7 @@ ruff_python_parser = "=0.0.12"
 ruff_python_ast = "=0.0.12"
 thiserror = "1"
 ruff_text_size = "=0.0.12"
+indexmap = "2"
 
 [build-dependencies]
 zyntax_typed_ast = { path = "../typed_ast" }

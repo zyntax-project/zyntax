@@ -852,7 +852,9 @@ pub(crate) struct Locals {
     pub(crate) nonlocal_writes: HashMap<String, Ty>,
     /// Attributes assigned on the first parameter (`self.x = ...`), and
     /// what is assigned to them.
-    pub(crate) field_writes: HashMap<String, Ty>,
+    /// Fields written through `self`, in the order first written, which
+    /// is the order they are laid out in.
+    pub(crate) field_writes: indexmap::IndexMap<String, Ty>,
     /// What the body assigns to its own parameters.
     pub(crate) param_writes: HashMap<String, Ty>,
     /// Whether the body has a `return`; without one it returns None.

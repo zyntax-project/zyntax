@@ -2981,6 +2981,11 @@ impl<'m> Lowerer<'m> {
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
         let mut v = self.expr_unchecked(e)?;
+        // Whatever a call did to an object's fields, nothing settled
+        // about them before it holds after.
+        if matches!(e, py::Expr::Call(_)) {
+            self.nonnull_fields.clear();
+        }
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
@@ -6215,6 +6220,9 @@ impl<'m> Lowerer<'m> {
 
     /// `obj.attr = value` as a statement expression.
     fn set_attribute(&mut self, object: Val, attr: &str, value: Val, span: Span) -> Result<Node> {
+        // The field may now hold anything, on this object or another
+        // that aliases it.
+        self.nonnull_fields.retain(|(_, field)| field != attr);
         let object = if object.ty == Ty::None {
             Val {
                 node: self.coerce(object, Ty::Object),
