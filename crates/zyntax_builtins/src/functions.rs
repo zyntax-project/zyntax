@@ -69,6 +69,13 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         any(),
         Some("krio_fiber_env"),
     ));
+    // A fiber nothing will resume again: its stack and record go.
+    d.push(extern_fn(
+        "zb_fiber_free",
+        &[("f", fiber_type())],
+        unit(),
+        Some("krio_fiber_free"),
+    ));
     let code = local("code", usize());
     let env = kept("env", any());
     d.push(define(

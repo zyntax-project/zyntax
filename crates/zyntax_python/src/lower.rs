@@ -386,6 +386,27 @@ fn ownership_of(ty: Ty) -> ParamOwnership {
     }
 }
 
+/// Whether a generator expression is the start of a fresh generator,
+/// which whoever drains it owns, rather than a name for one held
+/// elsewhere.
+fn is_generator_start(gen: &Node) -> bool {
+    matches!(
+        &gen.node,
+        TypedExpression::Call(c)
+            if matches!(&c.callee.node, TypedExpression::Variable(v)
+                if v.resolve_global().as_deref() == Some("zb_fiber_start"))
+    )
+}
+
+/// `zb_fiber_free(gen)`: a drained generator's fiber released.
+fn free_generator(gen: Node, span: Span) -> Stmt {
+    TypedNode::new(
+        TypedStatement::Expression(Box::new(call("zb_fiber_free", vec![gen], Ty::None, span))),
+        Type::Unknown,
+        span,
+    )
+}
+
 /// `zb_release_caught(caught)`: the exception's instance and box freed.
 fn release_caught(caught: InternedString, span: Span) -> Stmt {
     TypedNode::new(
@@ -5531,6 +5552,7 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<TypedStatement> {
         let mut prologue = std::mem::take(&mut self.hoisted);
+        let held_from = gen.node.clone();
         let held = self.hold(gen, &mut prologue, span);
         let item = self.temp();
         let mut body = Vec::new();
@@ -5555,8 +5577,12 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         )];
-        let pull = self.next_match(held.node, item, body, stop, span);
+        let fresh = is_generator_start(&held_from);
+        let pull = self.next_match(held.node.clone(), item, body, stop, span);
         prologue.push(one_pass(vec![pull], span));
+        if fresh {
+            prologue.push(free_generator(held.node, span));
+        }
         Ok(TypedStatement::Block(TypedBlock {
             statements: prologue,
             span,
@@ -5566,6 +5592,7 @@ impl<'m> Lowerer<'m> {
     /// Every value a generator yields, as a list.
     fn generator_to_list(&mut self, gen: Node, span: Span) -> Node {
         let mut pre = Vec::new();
+        let fresh = is_generator_start(&gen);
         let held = self.hold(
             Val {
                 node: gen,
@@ -5603,8 +5630,11 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         )];
-        let pull = self.next_match(held.node, item, push, stop, span);
+        let pull = self.next_match(held.node.clone(), item, push, stop, span);
         pre.push(one_pass(vec![pull], span));
+        if fresh {
+            pre.push(free_generator(held.node, span));
+        }
         self.hoisted.extend(pre);
         var(out, Ty::List(Elem::Object), span)
     }
