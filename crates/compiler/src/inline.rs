@@ -186,39 +186,36 @@ fn count_insts(function: &HirFunction) -> usize {
 pub fn run_module(module: &mut HirModule) -> InlineStats {
     let mut total = InlineStats::default();
 
-    // Callees are read from a snapshot while the caller is mutated. A
-    // function this pass leaves alone never changes, so it is copied
-    // once; the functions being optimised are copied afresh each round.
-    let optimizing: HashSet<HirId> = module.ids_to_optimize().into_iter().collect();
-    let stable: HashMap<HirId, Arc<HirFunction>> = module
-        .functions
-        .iter()
-        .filter(|(id, _)| !optimizing.contains(id))
-        .map(|(id, f)| (*id, Arc::new(f.clone())))
-        .collect();
+    // The functions being optimised are taken out of the module while
+    // they are worked on, so the rest can be read in place as callees;
+    // only the ones taken out are copied for that, each round. They go
+    // back where they were.
+    let optimizing: Vec<HirId> = module.ids_to_optimize();
+    let mut taken: Vec<(usize, HirId, HirFunction)> = Vec::with_capacity(optimizing.len());
+    for id in &optimizing {
+        if let Some((index, _, f)) = module.functions.shift_remove_full(id) {
+            taken.push((index, *id, f));
+        }
+    }
 
     for _ in 0..8 {
-        let mut callee_snapshot = stable.clone();
-        for id in &optimizing {
-            if let Some(f) = module.functions.get(id) {
-                callee_snapshot.insert(*id, Arc::new(f.clone()));
-            }
-        }
+        let changing: HashMap<HirId, Arc<HirFunction>> = taken
+            .iter()
+            .map(|(_, id, f)| (*id, Arc::new(f.clone())))
+            .collect();
+        let callees = Callees {
+            stable: &module.functions,
+            changing: &changing,
+        };
 
         // Functions that reach each other through calls are one cycle;
         // inlining within a cycle copies the cycle into itself round
         // after round, so a callee in the caller's cycle stays a call.
-        let cycles = call_cycles(&callee_snapshot);
+        let cycles = call_cycles(&callees);
 
         let mut this_pass = 0;
-        let function_ids: Vec<HirId> = module.ids_to_optimize();
-
-        for caller_id in function_ids {
-            let caller = match module.functions.get_mut(&caller_id) {
-                Some(c) => c,
-                None => continue,
-            };
-            let stats = inline_in_function(caller, caller_id, &callee_snapshot, &cycles);
+        for (_, caller_id, caller) in taken.iter_mut() {
+            let stats = inline_in_function(caller, *caller_id, &callees, &cycles);
             this_pass += stats.inlined;
             total.inlined += stats.inlined;
             total.call_sites_visited += stats.call_sites_visited;
@@ -239,7 +236,40 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
         }
     }
 
+    // Back in their places, lowest index first so each lands where the
+    // ones before it left room.
+    taken.sort_by_key(|(index, _, _)| *index);
+    for (index, id, f) in taken {
+        let at = index.min(module.functions.len());
+        module.functions.shift_insert(at, id, f);
+    }
+
     total
+}
+
+/// The functions a caller may inline: the module's, read in place, and
+/// copies of the ones being worked on.
+struct Callees<'a> {
+    stable: &'a IndexMap<HirId, HirFunction>,
+    changing: &'a HashMap<HirId, Arc<HirFunction>>,
+}
+
+impl Callees<'_> {
+    fn get(&self, id: &HirId) -> Option<&HirFunction> {
+        self.stable
+            .get(id)
+            .or_else(|| self.changing.get(id).map(|f| f.as_ref()))
+    }
+
+    fn contains_key(&self, id: &HirId) -> bool {
+        self.stable.contains_key(id) || self.changing.contains_key(id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&HirId, &HirFunction)> {
+        self.stable
+            .iter()
+            .chain(self.changing.iter().map(|(id, f)| (id, f.as_ref())))
+    }
 }
 
 /// Stats for the recursive-inline pass — kept separate from the
@@ -658,10 +688,7 @@ fn blocks_in_loops(f: &HirFunction) -> HashSet<HirId> {
 /// there builds the report of an error and is left as calls: inlining
 /// it would cost the size at every site and save nothing that runs.
 /// A loop with no way out but a cold call counts, as do its blocks.
-fn blocks_leading_to_cold(
-    f: &HirFunction,
-    callees: &HashMap<HirId, Arc<HirFunction>>,
-) -> HashSet<HirId> {
+fn blocks_leading_to_cold(f: &HirFunction, callees: &Callees<'_>) -> HashSet<HirId> {
     let calls_cold = |block: &HirBlock| {
         block.instructions.iter().any(|inst| {
             matches!(
@@ -709,9 +736,9 @@ fn blocks_leading_to_cold(
 /// The strongly connected component of each function in the graph of
 /// direct calls, so a caller and a callee in one component are known to
 /// reach each other.
-fn call_cycles(functions: &HashMap<HirId, Arc<HirFunction>>) -> HashMap<HirId, usize> {
+fn call_cycles(functions: &Callees<'_>) -> HashMap<HirId, usize> {
     let mut callees_of: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    for (id, f) in functions {
+    for (id, f) in functions.iter() {
         let mut out = Vec::new();
         for block in f.blocks.values() {
             for inst in &block.instructions {
@@ -737,7 +764,7 @@ fn call_cycles(functions: &HashMap<HirId, Arc<HirFunction>>) -> HashMap<HirId, u
     let mut component: HashMap<HirId, usize> = HashMap::new();
     let mut next_index = 0usize;
     let mut next_component = 0usize;
-    for &root in functions.keys() {
+    for (&root, _) in functions.iter() {
         if index.contains_key(&root) {
             continue;
         }
@@ -791,7 +818,7 @@ fn call_cycles(functions: &HashMap<HirId, Arc<HirFunction>>) -> HashMap<HirId, u
 fn inline_in_function(
     caller: &mut HirFunction,
     caller_id: HirId,
-    callees: &HashMap<HirId, Arc<HirFunction>>,
+    callees: &Callees<'_>,
     cycles: &HashMap<HirId, usize>,
 ) -> InlineStats {
     let mut stats = InlineStats::default();

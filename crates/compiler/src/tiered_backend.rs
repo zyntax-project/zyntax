@@ -298,7 +298,7 @@ pub struct TieredBackend {
     /// installable as soon as the second file loads. A module stays
     /// usable for as long as it is loaded, whatever loads after it, and
     /// that needs all of them kept and all of them restored.
-    loaded: Vec<HirModule>,
+    loaded: Vec<Arc<HirModule>>,
     /// Undo record for the most recent applied reload, consumed by
     /// [`Self::rollback_last_reload`].
     last_undo: Option<ReloadUndo>,
@@ -455,7 +455,7 @@ impl TieredBackend {
             // only the newest satisfies the requirement stated above
             // for one module and leaves every other one with code it
             // cannot resolve its own globals from.
-            let previously: Vec<HirModule> = self.loaded.clone();
+            let previously: Vec<Arc<HirModule>> = self.loaded.clone();
             for earlier in &previously {
                 self.cranelift.with_lock(|be| be.compile_module(earlier))?;
             }
@@ -523,21 +523,19 @@ impl TieredBackend {
         // all the same module name, so matching on that discarded every
         // earlier file and restored only the newest, which is the
         // behaviour this list exists to fix.
-        self.loaded.push(module.clone());
-
         self.current_module = Some(module.clone());
+        let module_context = Arc::new(module);
+        self.loaded.push(Arc::clone(&module_context));
 
         // Hand the LLVM tier the whole module before anything promotes out
         // of it: a promotion recompiles one function, and that function's
         // callees have to come with it.
         #[cfg(feature = "llvm-backend")]
         if let Some(llvm) = &self.llvm {
-            let shared = Arc::new(module.clone());
-            llvm.with_lock(|be| be.set_module_context(Arc::clone(&shared)));
+            llvm.with_lock(|be| be.set_module_context(Arc::clone(&module_context)));
         }
 
-        let module_context = Arc::new(module.clone());
-        for (func_id, function) in module.functions.iter() {
+        for (func_id, function) in module_context.functions.iter() {
             let bound = self.adapter.register(ptr::null_mut(), None);
 
             // Eagerly install the tier-0 code pointer so the bead reports
@@ -1414,7 +1412,7 @@ impl TieredBackend {
     pub fn rebuild_and_restore(&mut self) -> CompilerResult<()> {
         self.cranelift
             .with_lock(|be| be.rebuild_with_accumulated_symbols())?;
-        let previously: Vec<HirModule> = self.loaded.clone();
+        let previously: Vec<Arc<HirModule>> = self.loaded.clone();
         for earlier in &previously {
             self.cranelift.with_lock(|be| be.compile_module(earlier))?;
         }
@@ -1434,6 +1432,7 @@ impl TieredBackend {
             out.push(m);
         }
         for m in &self.loaded {
+            let m: &HirModule = m;
             if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
                 out.push(m);
             }
