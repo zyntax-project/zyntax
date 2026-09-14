@@ -148,6 +148,102 @@ fn len(xs: Expr) -> Expr {
     mcall(xs, "len", vec![], i64())
 }
 
+/// A stable bottom-up merge sort of `xs`, ordered by `less` over the
+/// elements, or over `keys` when given, in which case the keys move
+/// with their elements. Runs are merged into a scratch copy and
+/// written back after each pass; an element moves past another only
+/// when `less` says so, never when the two compare equal. `copy` is the
+/// element list's copy function.
+fn merge_sort(
+    xs: &Local,
+    keys: Option<&Local>,
+    copy: &str,
+    less: &dyn Fn(Expr, Expr) -> Expr,
+) -> Vec<Stmt> {
+    let elem = match &xs.ty {
+        Type::Named { type_args, .. } if !type_args.is_empty() => type_args[0].clone(),
+        other => other.clone(),
+    };
+    // What `less` compares for the element at `i` of the source.
+    let key_of = |i: Expr| match keys {
+        Some(ks) => idx(ks.e(), i, any()),
+        None => idx(xs.e(), i, elem.clone()),
+    };
+    let n = local("n", i64());
+    let tmp = local("tmp", xs.ty.clone());
+    let ktmp = local("ktmp", keys.map(|ks| ks.ty.clone()).unwrap_or_else(any));
+    let width = local("width", i64());
+    let lo = local("lo", i64());
+    let mid = local("mid", i64());
+    let hi = local("hi", i64());
+    let a = local("a", i64());
+    let b = local("b", i64());
+    let o = local("o", i64());
+    let i = local("i", i64());
+
+    // Move `src[from]` to `dst[o]`, keys alongside.
+    let place = |from: &Local| {
+        let mut s = vec![set_idx(tmp.e(), o.e(), idx(xs.e(), from.e(), elem.clone()))];
+        if let Some(ks) = keys {
+            s.push(set_idx(ktmp.e(), o.e(), idx(ks.e(), from.e(), any())));
+        }
+        s.push(from.add_assign(int(1)));
+        s
+    };
+    // The right run's element goes first only when it is strictly
+    // less than the left's.
+    let merge = vec![
+        a.decl(lo.e()),
+        b.decl(mid.e()),
+        o.decl(lo.e()),
+        while_(
+            lt(o.e(), hi.e()),
+            vec![
+                if_(
+                    ge(a.e(), mid.e()),
+                    place(&b),
+                    vec![if_(
+                        ge(b.e(), hi.e()),
+                        place(&a),
+                        vec![if_(
+                            less(key_of(b.e()), key_of(a.e())),
+                            place(&b),
+                            place(&a),
+                        )],
+                    )],
+                ),
+                o.add_assign(int(1)),
+            ],
+        ),
+    ];
+    let mut write_back = vec![set_idx(xs.e(), i.e(), idx(tmp.e(), i.e(), elem.clone()))];
+    if let Some(ks) = keys {
+        write_back.push(set_idx(ks.e(), i.e(), idx(ktmp.e(), i.e(), any())));
+    }
+    let mut body = vec![n.decl(len(xs.e()))];
+    body.push(when(lt(n.e(), int(2)), vec![ret_void()]));
+    body.push(tmp.decl(call(copy, vec![xs.e()], xs.ty.clone())));
+    if let Some(ks) = keys {
+        body.push(ktmp.decl(call("zb_list_copy_any", vec![ks.e()], ks.ty.clone())));
+    }
+    body.push(width.decl(int(1)));
+    let mut pass = vec![lo.decl(int(0))];
+    let mut one_merge = vec![
+        mid.decl(add(lo.e(), width.e())),
+        when(gt(mid.e(), n.e()), vec![mid.set(n.e())]),
+        hi.decl(add(lo.e(), mul(width.e(), int(2)))),
+        when(gt(hi.e(), n.e()), vec![hi.set(n.e())]),
+    ];
+    one_merge.extend(merge);
+    one_merge.push(lo.set(add(lo.e(), mul(width.e(), int(2)))));
+    pass.push(while_(lt(lo.e(), n.e()), one_merge));
+    pass.extend(for_range(&i, int(0), n.e(), write_back));
+    pass.push(width.set(mul(width.e(), int(2))));
+    body.push(while_(lt(width.e(), n.e()), pass));
+    body.push(ret_void());
+    body
+}
+
 pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let mut out = vec![list_class()];
     for kind in Kind::ALL {
@@ -336,32 +432,12 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             ret_void(),
         ],
     ));
-    // Insertion sort: stable, and short lists are the common case.
+    // Ascending order of the elements, stable.
     d.push(define(
         &name("sort"),
         &[&xs],
         unit(),
-        vec![
-            n.decl(len(xs.e())),
-            i.decl(int(1)),
-            while_(
-                lt(i.e(), n.e()),
-                vec![
-                    v.decl(el(&xs, i.e())),
-                    j.decl(sub(i.e(), int(1))),
-                    while_(
-                        and(ge(j.e(), int(0)), (k.lt)(v.e(), el(&xs, j.e()))),
-                        vec![
-                            set_idx(xs.e(), add(j.e(), int(1)), el(&xs, j.e())),
-                            j.set(sub(j.e(), int(1))),
-                        ],
-                    ),
-                    set_idx(xs.e(), add(j.e(), int(1)), v.e()),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret_void(),
-        ],
+        merge_sort(&xs, None, &name("copy"), &|a, b| (k.lt)(a, b)),
     ));
     d.push(define(&name("extend"), &[&xs, &ys], unit(), {
         let mut s = vec![n.decl(len(ys.e()))];
@@ -577,79 +653,28 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let keys = local("keys", any_list.clone());
     let descending = local("descending", boolean());
     let key = local("key", any());
-    let key_j = local("key_j", any());
-    let moves = local("moves", boolean());
+    // One sort per direction, chosen once: a direction test inside
+    // the comparison would be paid at every step.
     d.push(define(
         &name("sort_by"),
         &[&xs, &keys, &descending],
         unit(),
-        vec![
-            n.decl(len(xs.e())),
-            i.decl(int(1)),
-            while_(
-                lt(i.e(), n.e()),
-                vec![
-                    v.decl(el(&xs, i.e())),
-                    key.decl(idx(keys.e(), i.e(), any())),
-                    j.decl(sub(i.e(), int(1))),
-                    moves.decl(bool(true)),
-                    while_(
-                        and(ge(j.e(), int(0)), moves.e()),
-                        vec![
-                            key_j.decl(idx(keys.e(), j.e(), any())),
-                            moves.set(if_expr(
-                                descending.e(),
-                                call("zb_any_lt", vec![key_j.e(), key.e()], boolean()),
-                                call("zb_any_lt", vec![key.e(), key_j.e()], boolean()),
-                            )),
-                            when(
-                                moves.e(),
-                                vec![
-                                    set_idx(xs.e(), add(j.e(), int(1)), el(&xs, j.e())),
-                                    set_idx(
-                                        keys.e(),
-                                        add(j.e(), int(1)),
-                                        idx(keys.e(), j.e(), any()),
-                                    ),
-                                    j.set(sub(j.e(), int(1))),
-                                ],
-                            ),
-                        ],
-                    ),
-                    set_idx(xs.e(), add(j.e(), int(1)), v.e()),
-                    set_idx(keys.e(), add(j.e(), int(1)), key.e()),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret_void(),
-        ],
+        vec![if_(
+            descending.e(),
+            merge_sort(&xs, Some(&keys), &name("copy"), &|a, b| {
+                call("zb_any_lt", vec![b, a], boolean())
+            }),
+            merge_sort(&xs, Some(&keys), &name("copy"), &|a, b| {
+                call("zb_any_lt", vec![a, b], boolean())
+            }),
+        )],
     ));
     // Descending order of the elements themselves, stable like `sort`.
     d.push(define(
         &name("sort_desc"),
         &[&xs],
         unit(),
-        vec![
-            n.decl(len(xs.e())),
-            i.decl(int(1)),
-            while_(
-                lt(i.e(), n.e()),
-                vec![
-                    v.decl(el(&xs, i.e())),
-                    j.decl(sub(i.e(), int(1))),
-                    while_(
-                        and(ge(j.e(), int(0)), (k.lt)(el(&xs, j.e()), v.e())),
-                        vec![
-                            set_idx(xs.e(), add(j.e(), int(1)), el(&xs, j.e())),
-                            j.set(sub(j.e(), int(1))),
-                        ],
-                    ),
-                    set_idx(xs.e(), add(j.e(), int(1)), v.e()),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret_void(),
-        ],
+        merge_sort(&xs, None, &name("copy"), &|a, b| (k.lt)(b, a)),
     ));
     // The element whose key is least (or greatest); the first of equals.
     let best_key = local("best_key", any());
@@ -1031,9 +1056,9 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(chars.e()),
         ],
     ));
-    // split on a separator
+    // split on a separator: each piece is cut out by byte offset, and
+    // the search resumes after the separator without copying the rest.
     let sep = local("sep", string());
-    let rest = local("rest", string());
     let at = local("at", i64());
     let w = local("w", i64());
     d.push(define(
@@ -1042,13 +1067,18 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         strs.clone(),
         vec![
             chars.decl(list(Vec::new(), strs.clone())),
+            w.decl(call("zb_str_len", vec![sep.e()], i64())),
             when(
-                eq(call("zb_str_chars_len", vec![sep.e()], i64()), int(0)),
+                eq(w.e(), int(0)),
                 vec![fatal("ValueError", text("empty separator"))],
             ),
-            rest.decl(text_in.e()),
-            at.decl(call("zb_str_index_of", vec![rest.e(), sep.e()], i64())),
-            w.decl(call("zb_str_chars_len", vec![sep.e()], i64())),
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            at.decl(call(
+                "zb_str_index_of_from",
+                vec![text_in.e(), sep.e(), pos.e()],
+                i64(),
+            )),
             while_(
                 ge(at.e(), int(0)),
                 vec![
@@ -1056,25 +1086,30 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         chars.e(),
                         "push",
                         vec![call(
-                            "zb_str_substring",
-                            vec![rest.e(), int(0), at.e()],
+                            "zb_str_bytes",
+                            vec![text_in.e(), pos.e(), at.e()],
                             string(),
                         )],
                         unit(),
                     )),
-                    rest.set(call(
-                        "zb_str_substring",
-                        vec![
-                            rest.e(),
-                            add(at.e(), w.e()),
-                            call("zb_str_chars_len", vec![rest.e()], i64()),
-                        ],
-                        string(),
+                    pos.set(add(at.e(), w.e())),
+                    at.set(call(
+                        "zb_str_index_of_from",
+                        vec![text_in.e(), sep.e(), pos.e()],
+                        i64(),
                     )),
-                    at.set(call("zb_str_index_of", vec![rest.e(), sep.e()], i64())),
                 ],
             ),
-            expr(mcall(chars.e(), "push", vec![rest.e()], unit())),
+            expr(mcall(
+                chars.e(),
+                "push",
+                vec![call(
+                    "zb_str_bytes",
+                    vec![text_in.e(), pos.e(), n.e()],
+                    string(),
+                )],
+                unit(),
+            )),
             ret(chars.e()),
         ],
     ));
