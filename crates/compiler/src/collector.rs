@@ -249,13 +249,19 @@ pub(crate) fn note_large(payload: usize, total: usize) {
     }
 }
 
-/// A large block the program has released itself.
-pub(crate) fn forget_large(payload: usize) {
-    if let Some(total) = registry().large.remove(&payload) {
-        if is_enabled() && on_owner_thread() {
-            update(|l| l.heap = l.heap.saturating_sub(total));
-        }
+/// A large block the program has released itself: its total length,
+/// or none for an address that is not a large block of the pool's.
+pub(crate) fn forget_large(payload: usize) -> Option<usize> {
+    let total = registry().large.remove(&payload)?;
+    if is_enabled() && on_owner_thread() {
+        update(|l| l.heap = l.heap.saturating_sub(total));
     }
+    Some(total)
+}
+
+/// The total length of the large block at `payload`, if it is one.
+pub(crate) fn large_total(payload: usize) -> Option<usize> {
+    registry().large.get(&payload).copied()
 }
 
 /// The calling thread uses the pool. A second mutator thread has a
@@ -453,7 +459,7 @@ impl<'a> Marker<'a> {
     #[inline]
     fn slab_bits(&mut self, slab: usize) -> Option<&mut SlabBits> {
         if !self.bits.contains_key(&slab) {
-            if !self.reg.slabs.contains(&slab) {
+            if !pool_alloc::in_a_slab_at(slab) {
                 return None;
             }
             // SAFETY: a registered slab is live for the life of the process.

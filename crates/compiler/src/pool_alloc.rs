@@ -37,15 +37,13 @@
 //! corrupting a list. That is a guard against a mistake, not a licence
 //! to mix them.
 //!
-//! What the guard does not cover: reading that magic word means reading
-//! through an address derived from the pointer, at its slab base and at
-//! sixteen bytes in front of it. For a pointer far enough from anything
-//! mapped, the read itself faults before any word can be compared.
-//! [`could_be_ours`] rules out the one case that is certain rather than
-//! unlucky, which is an address below a single slab: those all mask to
-//! zero. Ruling out the rest needs slabs carved from one reserved range
-//! so that membership is a comparison, and that is a different design
-//! rather than another check.
+//! Whether a pointer lies in a slab is answered by [`SLAB_INDEX`], and
+//! whether it is a large block by the collector's registry, so a
+//! pointer from another allocator is handed back to it without reading
+//! through it: the memory in front of it, or where its slab header
+//! would be, may not be mapped. [`could_be_ours`] turns away the one
+//! address no allocator returns, a small integer mistaken for a
+//! pointer.
 //!
 //! Segregating by slab is what makes a small object cheap. A header
 //! per block cost sixteen bytes on top of a class that was already
@@ -68,7 +66,8 @@
 use std::alloc::{alloc as sys_alloc, dealloc as sys_dealloc, Layout};
 use std::cell::Cell;
 #[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 /// Largest request served from a pool. Above this, libc.
 const MAX_POOLED: usize = 1024;
@@ -108,10 +107,13 @@ const POISON: u8 = 0x55;
 /// two and slabs have to be aligned to it.
 const SLAB: usize = 64 * 1024;
 
-/// A slab header's second word: the size class in the low half and the
-/// bytes carved so far, header included, in the half above.
-const CLASS_MASK: usize = 0xFFFF_FFFF;
-const USED_SHIFT: u32 = 32;
+/// A slab header's second word: the size class in the low bits and the
+/// bytes carved so far, header included, above them. Twelve bits of
+/// class leaves twenty for the extent on a 32-bit target, enough for a
+/// slab sixteen times this size.
+const CLASS_BITS: u32 = 12;
+const CLASS_MASK: usize = (1 << CLASS_BITS) - 1;
+const USED_SHIFT: u32 = CLASS_BITS;
 
 /// The class of a slab the collector found empty and set aside. It is
 /// carved again under whatever class next needs a slab; until then no
@@ -418,6 +420,7 @@ unsafe fn refill(class: usize) -> bool {
                         return (std::ptr::null_mut(), 0);
                     }
                     (*(fresh as *mut Header)).magic = MAGIC;
+                    index_slab(fresh as usize);
                     #[cfg(not(target_arch = "wasm32"))]
                     crate::collector::note_slab(fresh as usize);
                     fresh
@@ -487,6 +490,80 @@ pub(crate) unsafe fn free_large(payload: usize) {
     LARGE_LIVE.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// Every slab this pool has taken, as a two-level bitmap over the
+/// address space: one bit per slab-sized span, in leaves of a
+/// [`INDEX_LEAF_SPAN`] each, made on demand. Asking whether an address
+/// lies in a slab is then two loads and no read through the address,
+/// which is what lets a pointer from another allocator be handed back
+/// to it without first reading where its slab header would be, memory
+/// this process may never have mapped.
+const INDEX_LEAF_BITS: usize = if usize::BITS > 32 { 16 } else { 15 };
+const INDEX_LEAF_SPAN: usize = SLAB << INDEX_LEAF_BITS;
+const INDEX_LEAF_WORDS: usize = (1 << INDEX_LEAF_BITS) / 64;
+/// Leaves for a 48-bit address space, or the whole of a 32-bit one; an
+/// address above that is not this pool's.
+const INDEX_LEAVES: usize = if usize::BITS > 32 {
+    1 << (48 - INDEX_LEAF_BITS - 16)
+} else {
+    2
+};
+
+type IndexLeaf = [AtomicU64; INDEX_LEAF_WORDS];
+
+static SLAB_INDEX: [AtomicPtr<IndexLeaf>; INDEX_LEAVES] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; INDEX_LEAVES];
+
+/// Record a slab in the index.
+///
+/// # Safety
+/// `slab` must be the base of a slab this pool just took.
+unsafe fn index_slab(slab: usize) {
+    let leaf_no = slab / INDEX_LEAF_SPAN;
+    let Some(slot) = SLAB_INDEX.get(leaf_no) else {
+        return;
+    };
+    let mut leaf = slot.load(Ordering::Acquire);
+    if leaf.is_null() {
+        let fresh: Box<IndexLeaf> = Box::new([const { AtomicU64::new(0) }; INDEX_LEAF_WORDS]);
+        let fresh = Box::into_raw(fresh);
+        match slot.compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => leaf = fresh,
+            Err(other) => {
+                drop(Box::from_raw(fresh));
+                leaf = other;
+            }
+        }
+    }
+    let bit = (slab % INDEX_LEAF_SPAN) / SLAB;
+    (*leaf)[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+}
+
+/// Whether `ptr` lies in a slab this pool took.
+#[inline]
+fn in_a_slab(ptr: *mut u8) -> bool {
+    in_a_slab_at(ptr as usize)
+}
+
+/// [`in_a_slab`] for an address.
+#[inline]
+pub(crate) fn in_a_slab_at(a: usize) -> bool {
+    let Some(slot) = SLAB_INDEX.get(a / INDEX_LEAF_SPAN) else {
+        return false;
+    };
+    let leaf = slot.load(Ordering::Acquire);
+    if leaf.is_null() {
+        return false;
+    }
+    let bit = (a % INDEX_LEAF_SPAN) / SLAB;
+    // SAFETY: a leaf, once published, lives for the process.
+    unsafe { (*leaf)[bit / 64].load(Ordering::Relaxed) & (1 << (bit % 64)) != 0 }
+}
+
 /// Whether an address could have come from here at all.
 ///
 /// A slab is taken from the system allocator aligned to its own size,
@@ -494,11 +571,10 @@ pub(crate) unsafe fn free_large(payload: usize) {
 /// Nothing this pool hands out is below that, and the bound therefore
 /// turns no real block away.
 ///
-/// It matters because of how a block is found back to its slab. Masking
-/// an address down to the slab size sends everything in the first slab's
-/// worth of address space to zero, so reading the header there is a
-/// fault rather than a wrong guess. That is exactly where a small
-/// integer mistaken for a pointer lands.
+/// It matters because a large block keeps its header in front of its
+/// payload, and reading there for an address in the first slab's worth
+/// of address space is a fault rather than a wrong guess. That is
+/// exactly where a small integer mistaken for a pointer lands.
 #[inline]
 fn could_be_ours(ptr: *mut u8) -> bool {
     (ptr as usize) >= SLAB
@@ -534,44 +610,40 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
         );
         return;
     }
-    // The sixteen bytes in front of the payload are read first, and the
-    // order is the point rather than a preference. They are always the
-    // program's own memory for anything this pool handed out: a large
-    // block's payload starts sixteen bytes into its allocation, and a
-    // pooled block's slab begins at or before the same place, because a
-    // slab spends its own first sixteen bytes on a header. Masking to
-    // the slab is what cannot be done first. A large block is taken
-    // from the system allocator wherever it likes, so its address masks
-    // down to as much as a slab's width in front of it, and that is
-    // memory this process may never have asked for.
-    let head = ptr.sub(HEADER) as *const Header;
-    if (*head).magic == MAGIC && (*head).class & LARGE_MARK != 0 {
-        let total = (*head).class & !LARGE_MARK;
+    // A pooled block is found by the index, a large one by the
+    // collector's registry, and neither read through the pointer, since
+    // for a block from another allocator the memory in front of it or
+    // where its slab header would be may not be mapped at all.
+    if !in_a_slab(ptr) {
         #[cfg(not(target_arch = "wasm32"))]
-        crate::collector::forget_large(ptr as usize);
-        sys_dealloc(
-            ptr.sub(HEADER),
-            Layout::from_size_align_unchecked(total, HEADER),
-        );
-        #[cfg(debug_assertions)]
-        LARGE_LIVE.fetch_sub(1, Ordering::Relaxed);
-        return;
-    }
-
-    // Not a large block, so it is pooled or foreign, and either way the
-    // mask now lands on a slab this pool wrote or on nothing. Reading
-    // in front of a pooled block can only have found another block's
-    // payload or the slab's own header, neither of which carries the
-    // large mark, so arriving here says nothing was mistaken above.
-    let slab = slab_of(ptr);
-    let class = if (*slab).magic == MAGIC && (*slab).class & LARGE_MARK == 0 {
-        (*slab).class & CLASS_MASK
-    } else {
+        if let Some(total) = crate::collector::forget_large(ptr as usize) {
+            sys_dealloc(
+                ptr.sub(HEADER),
+                Layout::from_size_align_unchecked(total, HEADER),
+            );
+            #[cfg(debug_assertions)]
+            LARGE_LIVE.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let head = ptr.sub(HEADER) as *const Header;
+            if (*head).magic == MAGIC && (*head).class & LARGE_MARK != 0 {
+                let total = (*head).class & !LARGE_MARK;
+                sys_dealloc(
+                    ptr.sub(HEADER),
+                    Layout::from_size_align_unchecked(total, HEADER),
+                );
+                return;
+            }
+        }
         // Hand it to the allocator that most likely owns it rather than
         // threading a foreign block onto a free list.
         libc_free(ptr);
         return;
-    };
+    }
+    let slab = slab_of(ptr);
+    let class = (*slab).class & CLASS_MASK;
     if class >= CLASSES {
         // A block of a slab the collector set aside: nothing held it,
         // so this release is of storage already reclaimed.
@@ -606,18 +678,22 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
 /// # Safety
 /// `ptr` must have come from [`zyntax_alloc`].
 unsafe fn usable_size(ptr: *mut u8) -> Option<usize> {
-    if !could_be_ours(ptr) {
-        return None;
+    if in_a_slab(ptr) {
+        let slab = slab_of(ptr);
+        return Some(slot_bytes((*slab).class & CLASS_MASK));
     }
-    let head = ptr.sub(HEADER) as *const Header;
-    if (*head).magic == MAGIC && (*head).class & LARGE_MARK != 0 {
-        return Some(((*head).class & !LARGE_MARK) - HEADER);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::collector::large_total(ptr as usize).map(|total| total - HEADER)
     }
-    let slab = slab_of(ptr);
-    if (*slab).magic == MAGIC && (*slab).class & LARGE_MARK == 0 {
-        Some(slot_bytes((*slab).class & CLASS_MASK))
-    } else {
-        None
+    #[cfg(target_arch = "wasm32")]
+    {
+        let head = ptr.sub(HEADER) as *const Header;
+        if (*head).magic == MAGIC && (*head).class & LARGE_MARK != 0 {
+            Some(((*head).class & !LARGE_MARK) - HEADER)
+        } else {
+            None
+        }
     }
 }
 
