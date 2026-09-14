@@ -493,12 +493,17 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
                     // …) — same rule as the standard classifier.
                 }
                 // A call by id or by name copies as it is: ids are
-                // module-wide and a symbol is a name.
+                // module-wide and a symbol is a name. So does a
+                // runtime intrinsic that is a plain call.
                 HirInstruction::Call {
                     callee:
                         HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
                     ..
                 } => has_calls = true,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(i),
+                    ..
+                } if is_plain_call_intrinsic(*i) => has_calls = true,
                 HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
@@ -552,16 +557,16 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
 /// Whether a callee calls anything but an inline-safe intrinsic.
 fn has_calls(callee: &HirFunction) -> bool {
     callee.blocks.values().any(|b| {
-        b.instructions.iter().any(|inst| {
-            matches!(
-                inst,
-                HirInstruction::Call {
-                    callee: HirCallable::Function(_)
-                        | HirCallable::Symbol(_)
-                        | HirCallable::FuncRef(_),
-                    ..
-                }
-            )
+        b.instructions.iter().any(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
+                ..
+            } => true,
+            HirInstruction::Call {
+                callee: HirCallable::Intrinsic(i),
+                ..
+            } => is_plain_call_intrinsic(*i),
+            _ => false,
         })
     })
 }
@@ -1039,6 +1044,35 @@ enum InlineKind {
     MultiBlock,
 }
 
+/// Runtime trampolines that are a plain call wherever they stand: they
+/// carry side effects, so nothing hoists or reorders one, but a copy in
+/// the caller means what the original meant. A constructor is its
+/// allocation and a few stores, and inlines like any other callee.
+/// Excludes what depends on the enclosing function: its stack
+/// (`Alloca`), its suspension (`Await`, `Yield`), safepoints and the
+/// ZRTL conversions.
+fn is_plain_call_intrinsic(i: crate::hir::Intrinsic) -> bool {
+    use crate::hir::Intrinsic::*;
+    matches!(
+        i,
+        Memcpy
+            | Memset
+            | Memmove
+            | Floor
+            | AddWithOverflow
+            | SubWithOverflow
+            | MulWithOverflow
+            | Malloc
+            | Free
+            | Realloc
+            | Drop
+            | IncRef
+            | DecRef
+            | Panic
+            | Abort
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CalleeClass {
     OkLeaf,
@@ -1085,6 +1119,10 @@ fn classify(callee: &HirFunction) -> CalleeClass {
                         HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
                     ..
                 } => has_calls = true,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(i),
+                    ..
+                } if is_plain_call_intrinsic(*i) => has_calls = true,
                 HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
