@@ -362,8 +362,8 @@ impl DynamicBox {
 
     /// Allocate a new box with the given tag and size
     pub fn alloc(tag: TypeTag, size: u32) -> Self {
-        let layout = std::alloc::Layout::from_size_align(size as usize, 8).unwrap();
-        let data = unsafe { std::alloc::alloc(layout) };
+        // SAFETY: a zero size is bumped to one.
+        let data = unsafe { crate::heap::alloc((size as usize).max(1), 8) };
 
         Self {
             tag,
@@ -376,15 +376,48 @@ impl DynamicBox {
 
     /// Create an owned box from a value (moves value to heap)
     pub fn from_value<T: Sized>(tag: TypeTag, value: T) -> Self {
-        let boxed = Box::new(value);
-        let ptr = Box::into_raw(boxed);
+        let size = std::mem::size_of::<T>();
+        // SAFETY: the block is as large and as aligned as `T` needs,
+        // and the write fills it.
+        let ptr = unsafe {
+            let p = crate::heap::alloc(size.max(1), std::mem::align_of::<T>().max(1)) as *mut T;
+            p.write(value);
+            p
+        };
 
         Self {
             tag,
-            size: std::mem::size_of::<T>() as u32,
+            size: size as u32,
             data: ptr as *mut u8,
             dropper: Some(drop_box::<T>),
             display_fn: None,
+        }
+    }
+
+    /// Release a box made by [`Self::into_raw`], without running its
+    /// dropper.
+    ///
+    /// # Safety
+    /// `ptr` must have come from `into_raw` and must not be used
+    /// afterwards.
+    pub unsafe fn free_raw(ptr: *mut Self) {
+        crate::heap::free(
+            ptr as *mut u8,
+            std::mem::size_of::<Self>(),
+            std::mem::align_of::<Self>(),
+        );
+    }
+
+    /// Move the box to the heap and hand back its address, which a
+    /// host releases with its box release.
+    pub fn into_raw(self) -> *mut Self {
+        // SAFETY: the block is as large and as aligned as a box, and
+        // the write fills it.
+        unsafe {
+            let p = crate::heap::alloc(std::mem::size_of::<Self>(), std::mem::align_of::<Self>())
+                as *mut Self;
+            p.write(self);
+            p
         }
     }
 
@@ -443,10 +476,15 @@ extern "C" fn default_dropper(ptr: *mut u8) {
     let _ = ptr;
 }
 
-// Typed dropper for Box<T>
+// Typed dropper for a value put on the heap by `from_value`.
 extern "C" fn drop_box<T>(ptr: *mut u8) {
     unsafe {
-        let _ = Box::from_raw(ptr as *mut T);
+        std::ptr::drop_in_place(ptr as *mut T);
+        crate::heap::free(
+            ptr,
+            std::mem::size_of::<T>().max(1),
+            std::mem::align_of::<T>().max(1),
+        );
     }
 }
 

@@ -389,6 +389,7 @@ fn collect_fiber_decls(
 impl TieredRuntime {
     /// Create a tiered runtime with the given configuration
     pub fn new(config: TieredConfig) -> RuntimeResult<Self> {
+        super::install_sdk_allocator();
         let mut backend = TieredBackend::new(config.clone())?;
 
         // Tier-0 loops carry a back-edge probe so a frame already running

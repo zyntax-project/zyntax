@@ -99,6 +99,7 @@ pub mod async_support;
 pub mod closure;
 pub mod dynamic_box;
 pub mod generic_box;
+pub mod heap;
 pub mod plugin;
 pub mod string;
 pub mod type_system;

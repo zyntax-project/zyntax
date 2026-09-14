@@ -760,6 +760,18 @@ macro_rules! zrtl_plugin {
             $crate::ZrtlSymbol::null(),
         ];
 
+        /// The loader hands the host's allocator to this copy of the
+        /// SDK, so the plugin's strings and boxes come from the heap
+        /// the program's own values live on.
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
+        #[no_mangle]
+        pub extern "C" fn _zrtl_set_allocator(
+            alloc: $crate::heap::AllocFn,
+            free: $crate::heap::FreeFn,
+        ) {
+            $crate::heap::set_allocator(alloc, free);
+        }
+
         /// Static accessor for register-without-dlopen flows
         /// (wasm32, embedded native binaries). Always emitted.
         pub fn static_plugin() -> $crate::StaticPlugin {

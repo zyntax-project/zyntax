@@ -1173,6 +1173,19 @@ impl ZrtlPlugin {
                     path: path.to_path_buf(),
                 })?;
 
+            // A plugin built with the SDK allocates its strings and
+            // boxes from the program's heap once told where that is.
+            type SetAllocator = unsafe extern "C" fn(
+                unsafe extern "C" fn(usize) -> *mut u8,
+                unsafe extern "C" fn(*mut u8),
+            );
+            if let Ok(set) = library.get::<SetAllocator>(b"_zrtl_set_allocator\0") {
+                set(
+                    crate::pool_alloc::zyntax_alloc,
+                    crate::pool_alloc::zyntax_free,
+                );
+            }
+
             // Collect symbols until sentinel (null name)
             let mut symbols = Vec::new();
             let mut symbols_with_sig = Vec::new();
@@ -1590,93 +1603,102 @@ pub unsafe extern "C" fn zyntax_primitive_to_box(
 ) -> *mut DynamicBoxRepr {
     // Allocate and copy value data
     let data = if size > 0 && !value_ptr.is_null() {
-        let layout = std::alloc::Layout::from_size_align(size as usize, 8).unwrap();
-        let ptr = std::alloc::alloc(layout);
+        let ptr = crate::pool_alloc::zyntax_alloc(size as usize);
         std::ptr::copy_nonoverlapping(value_ptr, ptr, size as usize);
         ptr
     } else {
         std::ptr::null_mut()
     };
 
-    let boxed = Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: type_tag,
         size,
         data,
-        dropper: Some(default_box_dropper),
+        dropper: Some(drop_box_scalar),
         display_fn: None,
-    });
+    })
+}
 
-    Box::into_raw(boxed)
+/// Put a box on the program's heap, where `zyntax_box_free` releases
+/// it and the collector sees it.
+///
+/// # Safety
+/// The pool serves any request this size.
+unsafe fn box_on_heap(repr: DynamicBoxRepr) -> *mut DynamicBoxRepr {
+    let p = crate::pool_alloc::zyntax_alloc(std::mem::size_of::<DynamicBoxRepr>())
+        as *mut DynamicBoxRepr;
+    p.write(repr);
+    p
+}
+
+/// A scalar payload on the program's heap.
+///
+/// # Safety
+/// As [`box_on_heap`].
+unsafe fn scalar_on_heap<T: Copy>(value: T) -> *mut u8 {
+    let p = crate::pool_alloc::zyntax_alloc(std::mem::size_of::<T>().max(1)) as *mut T;
+    p.write(value);
+    p as *mut u8
 }
 
 /// Create a DynamicBox for an i32 value
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_i32(value: i32) -> *mut DynamicBoxRepr {
-    let data = Box::into_raw(Box::new(value)) as *mut u8;
-    let boxed = Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: TypeTag::I32.0,
         size: 4,
-        data,
-        dropper: Some(drop_box_i32),
+        data: scalar_on_heap(value),
+        dropper: Some(drop_box_scalar),
         display_fn: None,
-    });
-    Box::into_raw(boxed)
+    })
 }
 
 /// Create a DynamicBox for an i64 value
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_i64(value: i64) -> *mut DynamicBoxRepr {
-    let data = Box::into_raw(Box::new(value)) as *mut u8;
-    let boxed = Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: TypeTag::I64.0,
         size: 8,
-        data,
-        dropper: Some(drop_box_i64),
+        data: scalar_on_heap(value),
+        dropper: Some(drop_box_scalar),
         display_fn: None,
-    });
-    Box::into_raw(boxed)
+    })
 }
 
 /// Create a DynamicBox for an f32 value
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_f32(value: f32) -> *mut DynamicBoxRepr {
-    let data = Box::into_raw(Box::new(value)) as *mut u8;
-    let boxed = Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: TypeTag::F32.0,
         size: 4,
-        data,
-        dropper: Some(drop_box_f32),
+        data: scalar_on_heap(value),
+        dropper: Some(drop_box_scalar),
         display_fn: None,
-    });
-    Box::into_raw(boxed)
+    })
 }
 
 /// Create a DynamicBox for an f64 value
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_f64(value: f64) -> *mut DynamicBoxRepr {
-    let data = Box::into_raw(Box::new(value)) as *mut u8;
-    let boxed = Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: TypeTag::F64.0,
         size: 8,
-        data,
-        dropper: Some(drop_box_f64),
+        data: scalar_on_heap(value),
+        dropper: Some(drop_box_scalar),
         display_fn: None,
-    });
-    Box::into_raw(boxed)
+    })
 }
 
 /// Create a DynamicBox for a bool value
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_bool(value: i32) -> *mut DynamicBoxRepr {
-    let data = Box::into_raw(Box::new(value as u8)) as *mut u8;
-    let boxed = Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: TypeTag::BOOL.0,
         size: 1,
-        data,
-        dropper: Some(drop_box_u8),
+        data: scalar_on_heap(value as u8),
+        dropper: Some(drop_box_scalar),
         display_fn: None,
-    });
-    Box::into_raw(boxed)
+    })
 }
 
 /// Width of the length header `zyntax_box_opaque` puts in front of its
@@ -1706,25 +1728,20 @@ pub unsafe extern "C" fn zyntax_box_opaque(
     // the allocation carries its own length in a header. The header is
     // one max-align word wide, which also leaves the payload aligned
     // for whatever the boxed type needs.
-    let Ok(layout) =
-        std::alloc::Layout::from_size_align(OPAQUE_BOX_HEADER + size as usize, OPAQUE_BOX_HEADER)
-    else {
-        return std::ptr::null_mut();
-    };
-    let base = std::alloc::alloc(layout);
+    let base = crate::pool_alloc::zyntax_alloc(OPAQUE_BOX_HEADER + size as usize);
     if base.is_null() {
         return std::ptr::null_mut();
     }
     (base as *mut u64).write(size as u64);
     let copied = base.add(OPAQUE_BOX_HEADER);
     std::ptr::copy_nonoverlapping(data, copied, size as usize);
-    Box::into_raw(Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag,
         size,
         data: copied,
         dropper: Some(drop_box_opaque),
         display_fn: None,
-    }))
+    })
 }
 
 /// Box a string by reference. Strings are immutable and outlive the
@@ -1734,13 +1751,13 @@ pub unsafe extern "C" fn zyntax_box_opaque(
 /// `s` must be null or a live ZRTL string.
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_str(s: *mut u8) -> *mut DynamicBoxRepr {
-    Box::into_raw(Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag: TypeTag::STRING.0,
         size: std::mem::size_of::<*mut u8>() as u32,
         data: s,
         dropper: None,
         display_fn: None,
-    }))
+    })
 }
 
 /// Box a pointer by reference under a tag of the caller's choosing: the
@@ -1751,13 +1768,13 @@ pub unsafe extern "C" fn zyntax_box_str(s: *mut u8) -> *mut DynamicBoxRepr {
 /// `p` must stay valid for as long as the box is read.
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_ptr(p: *mut u8, tag: u32) -> *mut DynamicBoxRepr {
-    Box::into_raw(Box::new(DynamicBoxRepr {
+    box_on_heap(DynamicBoxRepr {
         tag,
         size: std::mem::size_of::<*mut u8>() as u32,
         data: p,
         dropper: None,
         display_fn: None,
-    }))
+    })
 }
 
 /// Borrow the bytes a `zyntax_box_opaque` box holds.
@@ -1924,59 +1941,18 @@ pub unsafe extern "C" fn zyntax_box_get_tag(boxed: *const DynamicBoxRepr) -> u32
     (*boxed).tag
 }
 
-// Default dropper for raw data
-extern "C" fn default_box_dropper(ptr: *mut u8) {
-    // Can't properly deallocate without knowing the layout
-    // This is a fallback - typed droppers should be used
-    let _ = ptr;
+/// Release a scalar payload the runtime put on the program's heap.
+extern "C" fn drop_box_scalar(ptr: *mut u8) {
+    unsafe { crate::pool_alloc::zyntax_free(ptr) }
 }
 
-// Typed droppers
-extern "C" fn drop_box_i32(ptr: *mut u8) {
-    unsafe {
-        let _ = Box::from_raw(ptr as *mut i32);
-    }
-}
-
-extern "C" fn drop_box_i64(ptr: *mut u8) {
-    unsafe {
-        let _ = Box::from_raw(ptr as *mut i64);
-    }
-}
-
-/// Free a `zyntax_box_opaque` payload, reading the length back out of
-/// the header that sits in front of it.
+/// Free a `zyntax_box_opaque` payload, which sits behind its length
+/// header.
 extern "C" fn drop_box_opaque(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    unsafe {
-        let base = ptr.sub(OPAQUE_BOX_HEADER);
-        let size = (base as *const u64).read() as usize;
-        if let Ok(layout) =
-            std::alloc::Layout::from_size_align(OPAQUE_BOX_HEADER + size, OPAQUE_BOX_HEADER)
-        {
-            std::alloc::dealloc(base, layout);
-        }
-    }
-}
-
-extern "C" fn drop_box_f32(ptr: *mut u8) {
-    unsafe {
-        let _ = Box::from_raw(ptr as *mut f32);
-    }
-}
-
-extern "C" fn drop_box_f64(ptr: *mut u8) {
-    unsafe {
-        let _ = Box::from_raw(ptr as *mut f64);
-    }
-}
-
-extern "C" fn drop_box_u8(ptr: *mut u8) {
-    unsafe {
-        let _ = Box::from_raw(ptr);
-    }
+    unsafe { crate::pool_alloc::zyntax_free(ptr.sub(OPAQUE_BOX_HEADER)) }
 }
 
 /// Get the TypeTag for a HIR type.

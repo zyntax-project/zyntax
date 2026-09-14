@@ -21,6 +21,19 @@ use zyntax_compiler::{
     CompilerError,
 };
 
+/// Route the SDK's strings and boxes through the program's heap, so
+/// what a linked plugin makes is storage the compiler's release and the
+/// collector both see. Once per process, before a runtime allocates.
+pub(crate) fn install_sdk_allocator() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        zrtl::heap::set_allocator(
+            zyntax_compiler::pool_alloc::zyntax_alloc,
+            zyntax_compiler::pool_alloc::zyntax_free,
+        );
+    });
+}
+
 /// Handler state (Phase 3): synthesize the state struct, constructor, and
 /// implicit `self` param for every stateful handler. Runs on the parsed
 /// program before the type registry is snapshotted. See the call site in

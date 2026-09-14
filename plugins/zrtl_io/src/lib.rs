@@ -946,25 +946,26 @@ pub unsafe extern "C" fn io_println_array_f64(arr: zrtl::ArrayConstPtr) {
 /// # Safety
 /// - `s` must be a valid ZRTL string pointer or null
 /// - The string must remain valid for the lifetime of the returned DynamicBox
-/// - The caller must free the returned DynamicBox with `Box::from_raw`
+/// - The caller must free the returned DynamicBox with `DynamicBox::free_raw`
 #[no_mangle]
 pub unsafe extern "C" fn io_string_to_dynamic(s: StringConstPtr) -> *mut zrtl::DynamicBox {
     use zrtl::{DynamicBox, TypeTag};
 
     if s.is_null() {
-        return Box::into_raw(Box::new(DynamicBox::null()));
+        return DynamicBox::null().into_raw();
     }
 
     // Copy the string so the DynamicBox owns its data and can free it via dropper
     let copy = zrtl::string_copy(s);
 
-    Box::into_raw(Box::new(DynamicBox {
+    DynamicBox {
         tag: TypeTag::STRING,
         size: std::mem::size_of::<*const u8>() as u32,
         data: copy as *mut u8,
         dropper: Some(drop_zrtl_string),
         display_fn: None,
-    }))
+    }
+    .into_raw()
 }
 
 /// Concatenate two ZRTL strings
@@ -1055,13 +1056,14 @@ pub unsafe extern "C" fn io_concat_dynamic(
     // Create a new ZRTL string and wrap in DynamicBox
     let str_ptr = string_new(&result);
 
-    Box::into_raw(Box::new(DynamicBox {
+    DynamicBox {
         tag: TypeTag::STRING,
         size: std::mem::size_of::<*const u8>() as u32,
         data: str_ptr as *mut u8,
         dropper: Some(drop_zrtl_string),
         display_fn: None,
-    }))
+    }
+    .into_raw()
 }
 
 // ============================================================================
@@ -1269,7 +1271,7 @@ mod tests {
             if let Some(dropper) = boxed.dropper {
                 dropper(boxed.data);
             }
-            let _ = Box::from_raw(boxed_ptr);
+            zrtl::DynamicBox::free_raw(boxed_ptr);
             string_free(original);
         }
     }
@@ -1284,7 +1286,7 @@ mod tests {
                 boxed.data.is_null(),
                 "null input should produce null DynamicBox"
             );
-            let _ = Box::from_raw(boxed_ptr);
+            zrtl::DynamicBox::free_raw(boxed_ptr);
         }
     }
 
@@ -1316,19 +1318,19 @@ mod tests {
             if let Some(dropper) = result_box.dropper {
                 dropper(result_box.data);
             }
-            let _ = Box::from_raw(result);
+            zrtl::DynamicBox::free_raw(result);
 
             // Clean up inputs
             let b1 = &*box1;
             if let Some(dropper) = b1.dropper {
                 dropper(b1.data);
             }
-            let _ = Box::from_raw(box1);
+            zrtl::DynamicBox::free_raw(box1);
             let b2 = &*box2;
             if let Some(dropper) = b2.dropper {
                 dropper(b2.data);
             }
-            let _ = Box::from_raw(box2);
+            zrtl::DynamicBox::free_raw(box2);
 
             string_free(s1);
             string_free(s2);

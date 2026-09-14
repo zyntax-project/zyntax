@@ -71,8 +71,7 @@ pub fn string_new(s: &str) -> StringPtr {
     let total_size = string_alloc_size(s.len());
 
     unsafe {
-        let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
-        let ptr = std::alloc::alloc(layout) as StringPtr;
+        let ptr = crate::heap::alloc(total_size, 4) as StringPtr;
 
         if ptr.is_null() {
             return std::ptr::null_mut();
@@ -96,8 +95,7 @@ pub fn string_from_bytes(bytes: &[u8]) -> StringPtr {
     let total_size = string_alloc_size(bytes.len());
 
     unsafe {
-        let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
-        let ptr = std::alloc::alloc(layout) as StringPtr;
+        let ptr = crate::heap::alloc(total_size, 4) as StringPtr;
 
         if ptr.is_null() {
             return std::ptr::null_mut();
@@ -116,8 +114,7 @@ pub fn string_from_bytes(bytes: &[u8]) -> StringPtr {
 /// Create an empty string
 pub fn string_empty() -> StringPtr {
     unsafe {
-        let layout = std::alloc::Layout::from_size_align(STRING_HEADER_SIZE, 4).unwrap();
-        let ptr = std::alloc::alloc(layout) as StringPtr;
+        let ptr = crate::heap::alloc(STRING_HEADER_SIZE, 4) as StringPtr;
         if !ptr.is_null() {
             *ptr = 0;
         }
@@ -132,9 +129,7 @@ pub fn string_empty() -> StringPtr {
 pub unsafe fn string_free(ptr: StringPtr) {
     if !ptr.is_null() {
         let len = *ptr as usize;
-        let total_size = string_alloc_size(len);
-        let layout = std::alloc::Layout::from_size_align_unchecked(total_size, 4);
-        std::alloc::dealloc(ptr as *mut u8, layout);
+        crate::heap::free(ptr as *mut u8, string_alloc_size(len), 4);
     }
 }
 
@@ -150,8 +145,7 @@ pub unsafe fn string_copy(src: StringConstPtr) -> StringPtr {
     let len = string_length(src) as usize;
     let total_size = string_alloc_size(len);
 
-    let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
-    let dst = std::alloc::alloc(layout) as StringPtr;
+    let dst = crate::heap::alloc(total_size, 4) as StringPtr;
 
     if !dst.is_null() {
         std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, total_size);

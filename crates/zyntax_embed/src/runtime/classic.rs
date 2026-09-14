@@ -128,6 +128,7 @@ impl ZyntaxRuntime {
 
     /// Create a new runtime with custom configuration
     pub fn with_config(config: CompilationConfig) -> RuntimeResult<Self> {
+        super::install_sdk_allocator();
         let mut backend = CraneliftBackend::new()?;
 
         // OSR back-edge probes fire at every loop header but the tier-up
