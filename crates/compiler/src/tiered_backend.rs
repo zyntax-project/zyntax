@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ptr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, TieredBound};
 
@@ -411,6 +411,19 @@ impl TieredBackend {
         module: HirModule,
         reachable: Option<HashSet<HirId>>,
     ) -> CompilerResult<()> {
+        self.compile_module_lazily(module, reachable, HashSet::new())
+    }
+
+    /// [`Self::compile_module_reaching`] with `lazy` naming functions to
+    /// compile on their first call instead of now: each gets a stub in
+    /// its cell, and the first call through it optimises and compiles
+    /// the body (see `dce::cold_only_function_ids` for who qualifies).
+    pub fn compile_module_lazily(
+        &mut self,
+        module: HirModule,
+        reachable: Option<HashSet<HirId>>,
+        lazy: HashSet<HirId>,
+    ) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             eprintln!(
                 "[TieredBackend] Compiling {} functions at Tier 0 (Baseline)",
@@ -461,12 +474,37 @@ impl TieredBackend {
         self.cranelift
             .with_lock(|be| be.set_bead_ids(bead_ids.clone()));
 
+        // Only what codegen would compile at all can wait for its call.
+        let lazy: HashSet<HirId> = match &reachable {
+            Some(reachable) => lazy.intersection(reachable).copied().collect(),
+            None => lazy,
+        };
+        if std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some() {
+            let mut eager: Vec<String> = module
+                .functions
+                .iter()
+                .filter(|(id, f)| {
+                    !f.is_external
+                        && !lazy.contains(id)
+                        && reachable.as_ref().is_none_or(|r| r.contains(id))
+                })
+                .map(|(_, f)| f.name.resolve_global().unwrap_or_default())
+                .collect();
+            eager.sort();
+            eprintln!(
+                "[OPT] codegen: {} functions compiled on first call; compiled now: {}",
+                lazy.len(),
+                eager.join(" ")
+            );
+        }
+
         // The filter applies to this module alone; a rebuild recompiles
         // earlier modules whole, and their ids are not in this set.
         let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
         let started = std::time::Instant::now();
         self.cranelift.with_lock(|be| {
             be.set_only_compile_reachable(reachable);
+            be.add_lazy_functions(lazy.iter().copied());
             let compiled = be.compile_module(&module);
             be.set_only_compile_reachable(None);
             compiled
@@ -535,6 +573,9 @@ impl TieredBackend {
 
         // Every bead now exists, so the handler can capture them.
         self.install_promotion_requester();
+        if !lazy.is_empty() {
+            self.install_lazy_compiler(&lazy);
+        }
         if trace {
             eprintln!(
                 "[OPT] codegen: registration {:8.2} ms",
@@ -1781,6 +1822,81 @@ impl TieredBackend {
     /// needs, and the intermediate tier produces the same code as the one
     /// it is already in. Called once every function is registered, since
     /// the handler captures their beads.
+    /// How a function left uncompiled gets its body: compiled at tier 0
+    /// on the thread that called its stub, then published into its cell
+    /// so the next call goes straight there.
+    fn install_lazy_compiler(&self, lazy: &HashSet<HirId>) {
+        let cranelift = Arc::clone(&self.cranelift);
+        let verbosity = self.config.verbosity;
+        let tier2_backend = self.config.tier2_backend;
+        #[cfg(feature = "llvm-backend")]
+        let llvm = self.llvm.as_ref().map(Arc::clone);
+        let by_bead: HashMap<u64, (HirId, TieredBound, Arc<HirModule>)> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| lazy.contains(id))
+            .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.module))))
+            .collect();
+        let reload_key = self.cranelift.with_lock(|be| be.reload_key());
+        let lazy = lazy.clone();
+        // Compiled once: a second call arriving while the first compiles
+        // waits on the lock and then finds the entry published.
+        let done: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
+        // The cold bodies were left as lowered; the first cold call
+        // optimises them all together, once, and later calls take the
+        // result from here.
+        let optimized: Mutex<Option<HashMap<HirId, Arc<HirFunction>>>> = Mutex::new(None);
+        osr::set_lazy_compiler(move |bead_id| {
+            let mut done = done.lock().unwrap();
+            if let Some(entry) = done.get(&bead_id) {
+                return *entry as *const u8;
+            }
+            let Some((func_id, bound, module_arc)) = by_bead.get(&bead_id) else {
+                return ptr::null();
+            };
+            let body = {
+                let mut optimized = optimized.lock().unwrap();
+                let bodies = optimized.get_or_insert_with(|| {
+                    let mut scratch: HirModule = (**module_arc).clone();
+                    for (id, f) in scratch.functions.iter_mut() {
+                        f.attributes.optimized = !lazy.contains(id);
+                    }
+                    crate::run_interp_safe_opts(&mut scratch);
+                    scratch
+                        .functions
+                        .into_iter()
+                        .filter(|(id, _)| lazy.contains(id))
+                        .map(|(id, f)| (id, Arc::new(f)))
+                        .collect()
+                });
+                match bodies.get(func_id) {
+                    Some(b) => Arc::clone(b),
+                    None => return ptr::null(),
+                }
+            };
+            let entry = compile_at_tier(
+                0,
+                bound.bead(),
+                *func_id,
+                bead_id,
+                &body,
+                module_arc,
+                &cranelift,
+                #[cfg(feature = "llvm-backend")]
+                llvm.as_ref(),
+                tier2_backend,
+                verbosity,
+            );
+            if entry.is_null() {
+                return ptr::null();
+            }
+            crate::reload::set_call_target(reload_key, *func_id, entry as usize);
+            bound.bead().eager_install(entry);
+            done.insert(bead_id, entry as usize);
+            entry as *const u8
+        });
+    }
+
     fn install_promotion_requester(&self) {
         // Aim at whichever tier actually differs from the one the frame is
         // already in. Without LLVM the ladder emits the same code at every

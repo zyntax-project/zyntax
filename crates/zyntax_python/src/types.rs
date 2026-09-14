@@ -215,6 +215,16 @@ pub(crate) struct Module {
     /// Functions whose result is an instance and never None; see
     /// [`returning_instances`].
     pub(crate) returns_instance: std::collections::HashSet<String>,
+    /// Exception classes the lowering raises by name, each getting a
+    /// cold `py$raise$Class(message)` that builds the instance and
+    /// leaves it pending; see `classes::raisers`.
+    pub(crate) raisers: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+/// The name of the function raising exception class `class` with a
+/// message.
+pub(crate) fn raiser_name(class: &str) -> String {
+    format!("py$raise${class}")
 }
 
 /// The name of the variant of `name` whose instance-typed parameters

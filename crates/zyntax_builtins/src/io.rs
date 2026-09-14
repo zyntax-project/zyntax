@@ -76,6 +76,36 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ),
         define_cold("zb_fatal", &[&kind, &message], unit(), fatal_body),
     ];
+    // An exception nothing caught ends the program: its kind and text on
+    // stderr, status 1. Cold, so the formatting it reaches stays out of
+    // the program's own code.
+    let exc = local("exc", any());
+    let shown = local("shown", string());
+    let type_name = call("zb_any_type", vec![exc.e()], string());
+    out.push(define_cold(
+        "zb_uncaught",
+        &[&exc],
+        unit(),
+        vec![
+            shown.decl(call("zb_any_str", vec![exc.e()], string())),
+            expr(call(
+                "zb_eprintln",
+                vec![text("Traceback (most recent call last):")],
+                unit(),
+            )),
+            if_(
+                call("zb_str_truthy", vec![shown.e()], boolean()),
+                vec![expr(call(
+                    "zb_eprintln",
+                    vec![add(add(type_name.clone(), text(": ")), shown.e())],
+                    unit(),
+                ))],
+                vec![expr(call("zb_eprintln", vec![type_name], unit()))],
+            ),
+            expr(call("zb_exit", vec![int32(1)], unit())),
+            ret_void(),
+        ],
+    ));
     out.extend(host(list_type));
     out
 }

@@ -202,11 +202,12 @@ pub const OSR_PROBE_SYMBOL: &str = "__zyntax_osr_probe";
 /// `(name, function_pointer)` pairs to feed
 /// `CraneliftBackend::with_runtime_symbols` so JIT'd code can resolve
 /// the OSR runtime functions at link time.
-pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 3] {
+pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 4] {
     [
         (OSR_PROBE_SYMBOL, osr_probe as *const u8),
         (OSR_TRANSFER_SYMBOL, osr_transfer as *const u8),
         (OSR_REQUEST_SYMBOL, osr_request_promotion as *const u8),
+        (LAZY_COMPILE_SYMBOL, lazy_compile as *const u8),
     ]
 }
 
@@ -1134,6 +1135,51 @@ pub fn note_llvm_helper(addr: usize) {
 /// Whether `addr` was published by the LLVM tier.
 pub fn is_llvm_helper(addr: usize) -> bool {
     llvm_helpers().read().unwrap().contains(&addr)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy compilation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Symbol the stub standing in for a function not yet compiled calls:
+/// `(bead_id) -> entry`. The stub then calls the entry with its own
+/// arguments.
+pub const LAZY_COMPILE_SYMBOL: &str = "__zyntax_lazy_compile";
+
+/// Installed by the runtime: compile the function behind a bead now and
+/// hand back its entry, publishing it wherever the stub was.
+type LazyCompiler = Box<dyn Fn(u64) -> *const u8 + Send + Sync>;
+
+fn lazy_compiler() -> &'static RwLock<Option<LazyCompiler>> {
+    static R: OnceLock<RwLock<Option<LazyCompiler>>> = OnceLock::new();
+    R.get_or_init(|| RwLock::new(None))
+}
+
+/// Register how a function left uncompiled is compiled on its first call.
+pub fn set_lazy_compiler(f: impl Fn(u64) -> *const u8 + Send + Sync + 'static) {
+    *lazy_compiler().write().unwrap() = Some(Box::new(f));
+}
+
+/// Called by a stub on the first call of the function it stands for.
+/// The runtime compiles the function and publishes its entry; the stub
+/// calls what comes back. With no compiler installed the process
+/// cannot continue, since the stub has nothing to call.
+///
+/// # Safety
+/// Called from generated code with C ABI.
+#[no_mangle]
+pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
+    let guard = lazy_compiler().read().unwrap();
+    let Some(f) = guard.as_ref() else {
+        eprintln!("a function compiled on first call was called before the runtime could compile it (bead {bead_id})");
+        std::process::abort();
+    };
+    let entry = f(bead_id);
+    if entry.is_null() {
+        eprintln!("a function compiled on first call could not be compiled (bead {bead_id})");
+        std::process::abort();
+    }
+    entry
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

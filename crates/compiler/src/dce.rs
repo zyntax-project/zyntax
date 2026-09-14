@@ -52,6 +52,147 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
     reachable_from_roots(module, roots)
 }
 
+/// Of `reachable`, the functions reached only through a cold function:
+/// a cold function itself, or one that only cold code calls. These may
+/// be compiled on first call. A function whose address is taken, or
+/// that is called by name or entered by the host, is excluded, since
+/// its code has to exist before anything runs.
+pub fn cold_only_function_ids(
+    module: &HirModule,
+    entry_names: &[&str],
+    reachable: &HashSet<HirId>,
+) -> HashSet<HirId> {
+    let mut hot: HashSet<HirId> = HashSet::new();
+    let mut worklist: Vec<HirId> = Vec::new();
+    for (id, function) in &module.functions {
+        if let Some(name) = function.name.resolve_global() {
+            if entry_names.iter().any(|e| *e == name) {
+                worklist.push(*id);
+            }
+        }
+    }
+    worklist.extend(host_reachable_roots(module));
+    // Anything reached other than by a direct call has to be there.
+    worklist.extend(address_taken_functions(module));
+    for global in module.globals.values() {
+        if let Some(init) = &global.initializer {
+            let mut refs = HashSet::new();
+            collect_vtable_funcs(init, &mut refs);
+            worklist.extend(refs);
+        }
+    }
+    let mut by_name: HashMap<String, HirId> = HashMap::new();
+    for (id, f) in &module.functions {
+        if let Some(name) = f.name.resolve_global() {
+            by_name.insert(name, *id);
+        }
+    }
+    let mut pinned: HashSet<HirId> = worklist.iter().copied().collect();
+    for function in module.functions.values() {
+        for block in function.blocks.values() {
+            for inst in &block.instructions {
+                match inst {
+                    HirInstruction::Call {
+                        callee: HirCallable::Symbol(name),
+                        ..
+                    } => {
+                        if let Some(id) = by_name.get(name) {
+                            pinned.insert(*id);
+                            worklist.push(*id);
+                        }
+                    }
+                    HirInstruction::Call {
+                        callee: HirCallable::FuncRef(target),
+                        ..
+                    }
+                    | HirInstruction::CreateClosure {
+                        function: target, ..
+                    } => {
+                        pinned.insert(*target);
+                        worklist.push(*target);
+                    }
+                    HirInstruction::PerformEffect { .. } => {
+                        // Handler operations are reached by dispatch.
+                        for handler in module.handlers.values() {
+                            for imp in &handler.implementations {
+                                let mangled = crate::effect_codegen::mangle_handler_op_name(
+                                    handler.name,
+                                    imp.op_name,
+                                );
+                                if let Some(id) = by_name.get(&mangled) {
+                                    pinned.insert(*id);
+                                    worklist.push(*id);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Hot code is what a direct call from hot code reaches; a cold
+    // function's body is not walked, so what only it calls stays cold.
+    // `ZYNTAX_TRACE_LAZY=1` prints what is hot and what made it so.
+    let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
+    let name_of = |id: &HirId| {
+        module
+            .functions
+            .get(id)
+            .and_then(|f| f.name.resolve_global())
+            .unwrap_or_default()
+    };
+    if trace {
+        let mut names: Vec<String> = pinned.iter().map(name_of).collect();
+        names.sort();
+        eprintln!("[lazy] pinned: {}", names.join(" "));
+    }
+    let mut visited: HashSet<HirId> = HashSet::new();
+    let mut worklist: Vec<(HirId, Option<HirId>)> =
+        worklist.into_iter().map(|id| (id, None)).collect();
+    while let Some((id, from)) = worklist.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let Some(function) = module.functions.get(&id) else {
+            continue;
+        };
+        if function.is_external {
+            continue;
+        }
+        if function.attributes.cold && !pinned.contains(&id) {
+            continue;
+        }
+        if trace {
+            eprintln!(
+                "[lazy] hot {} <- {}",
+                name_of(&id),
+                from.map(|f| name_of(&f)).unwrap_or_else(|| "root".into())
+            );
+        }
+        hot.insert(id);
+        for block in function.blocks.values() {
+            for inst in &block.instructions {
+                if let HirInstruction::Call {
+                    callee: HirCallable::Function(target),
+                    ..
+                } = inst
+                {
+                    if !visited.contains(target) {
+                        worklist.push((*target, Some(id)));
+                    }
+                }
+            }
+        }
+    }
+    reachable
+        .iter()
+        .copied()
+        .filter(|id| !hot.contains(id))
+        .filter(|id| module.functions.get(id).is_some_and(|f| !f.is_external))
+        .collect()
+}
+
 /// Functions the HOST can enter without any compiled call site naming
 /// them.
 ///

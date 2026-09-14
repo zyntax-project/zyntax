@@ -393,8 +393,52 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     for (method, arity) in module.dyn_methods.borrow().iter() {
         out.push(dynamic_call(module, method, *arity, span));
     }
+    for class in module.raisers.borrow().iter() {
+        out.push(raiser(module, class, span));
+    }
     out.extend(hooks(module, span));
     out
+}
+
+/// `py$raise$Class(message)`: the instance built and left pending.
+/// Cold, so a raise is a call the caller neither inlines nor compiles
+/// ahead of its first use.
+fn raiser(module: &Module, class: &str, span: Span) -> TypedFunction {
+    let mut lowerer = scratch(module);
+    let k = module.class_index[class];
+    let instance = Val {
+        node: call(
+            &new_name(class),
+            vec![var(intern("message"), Ty::Str, span)],
+            Ty::Class(k as u16),
+            span,
+        ),
+        ty: Ty::Class(k as u16),
+    };
+    let boxed = lowerer.coerce(instance, Ty::Object);
+    let set = binary(
+        BinaryOp::Assign,
+        var(intern(lower::PENDING), Ty::Object, span),
+        boxed,
+        Ty::None,
+        span,
+    );
+    let mut f = function(
+        &crate::types::raiser_name(class),
+        vec![param("message", Ty::Str, span)],
+        Ty::None,
+        vec![
+            stmt(set, span),
+            TypedNode::new(TypedStatement::Return(None), Type::Unknown, span),
+        ],
+        span,
+    );
+    f.annotations.push(TypedAnnotation {
+        name: intern("cold"),
+        args: Vec::new(),
+        span,
+    });
+    f
 }
 
 /// `C$new(args)`: the struct with its tag and zeroed fields, then

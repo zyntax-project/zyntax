@@ -518,10 +518,40 @@ impl TieredRuntime {
         // What the entry points cannot reach is dropped before the
         // optimisers run, so they walk the program rather than the
         // library it imported.
+        let trace_phases = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+        let started = std::time::Instant::now();
+        // What only an error path reaches is compiled, and optimised, on
+        // its first call rather than now. Decided from the declared entry
+        // points; a host calling anything else by name reaches it through
+        // its stub. Not under hot reload, whose cells are spoken for.
+        // `ZYNTAX_DISABLE_LAZY_COLD=1` compiles everything up front.
+        let mut lazy: std::collections::HashSet<HirId> = std::collections::HashSet::new();
         if let Some(names) = &entered {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let keep = zyntax_compiler::reachable_function_ids(&module, &names);
             module.functions.retain(|id, _| keep.contains(id));
+            if !self.config.enable_hot_reload
+                && std::env::var_os("ZYNTAX_DISABLE_LAZY_COLD").is_none()
+            {
+                let entries = self.entry_names();
+                let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+                lazy = zyntax_compiler::dce::cold_only_function_ids(&module, &entries, &keep);
+                // The optimisers walk only what runs now; the rest is
+                // optimised with its first compile.
+                for id in &lazy {
+                    if let Some(f) = module.functions.get_mut(id) {
+                        f.attributes.optimized = true;
+                    }
+                }
+            }
+        }
+        if trace_phases {
+            eprintln!(
+                "[COMPILE] prune              {:8.2} ms ({} functions kept, {} left for their first call)",
+                started.elapsed().as_secs_f64() * 1000.0,
+                module.functions.len(),
+                lazy.len()
+            );
         }
 
         // Run interp-safe HIR opts before backend installation. Without this,
@@ -561,14 +591,21 @@ impl TieredRuntime {
         // Reachability is read after the optimisers, since inlining
         // removes calls and the set has to describe the module codegen
         // sees.
-        let reachable = entered.map(|names| {
+        let reachable = entered.as_ref().map(|names| {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             zyntax_compiler::reachable_function_ids(&module, &names)
         });
+        if trace_phases {
+            eprintln!(
+                "[COMPILE] names+reach        {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
-        // Compile the module (consumes it)
+        // Compile the module (consumes it).
         let started = std::time::Instant::now();
-        self.backend.compile_module_reaching(module, reachable)?;
+        self.backend
+            .compile_module_lazily(module, reachable, lazy)?;
         if trace {
             eprintln!(
                 "[OPT] codegen               {:8.2} ms",

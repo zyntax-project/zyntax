@@ -433,6 +433,14 @@ pub struct CraneliftBackend {
     /// [`Self::set_only_compile_reachable`] to shave the ~30-40 ms spent on
     /// prelude helpers that a benchmark kernel never calls.
     only_compile_reachable: Option<HashSet<HirId>>,
+    /// Functions compiled on their first call: each gets a stub that
+    /// compiles the body and calls it, and calls to one go through its
+    /// reload cell so the compiled entry replaces the stub. See
+    /// [`Self::set_lazy_functions`].
+    lazy_functions: HashSet<HirId>,
+    /// Stubs emitted for lazy functions in the module being compiled,
+    /// published into the functions' cells once finalised.
+    lazy_stubs: Vec<(HirId, FuncId)>,
     /// Code offsets of tier-0 probe sites from the most recent compile,
     /// as `(site_key, offset_from_function_start)`. Recovered from the
     /// source-location table, which is the only post-codegen mapping from
@@ -590,6 +598,8 @@ impl CraneliftBackend {
             compile_osr_layout: None,
             compile_osr_func_id: None,
             only_compile_reachable: None,
+            lazy_functions: HashSet::new(),
+            lazy_stubs: Vec::new(),
             compile_generation: HashMap::new(),
             bead_ids: HashMap::new(),
             probe_sites: Vec::new(),
@@ -718,6 +728,16 @@ impl CraneliftBackend {
         self.only_compile_reachable = allowed;
     }
 
+    /// Compile these functions on their first call rather than now. A
+    /// call to one loads its entry from its reload cell, which holds a
+    /// stub until the body is compiled; the stub asks the runtime for
+    /// the body through [`crate::osr::LAZY_COMPILE_SYMBOL`] and calls
+    /// it with its own arguments. The set is kept: code compiled later,
+    /// the bodies themselves included, keeps calling through the cells.
+    pub fn add_lazy_functions(&mut self, lazy: impl IntoIterator<Item = HirId>) {
+        self.lazy_functions.extend(lazy);
+    }
+
     /// Whether OSR back-edge probes will be emitted at tier 0.
     pub fn emit_osr_probes(&self) -> bool {
         self.emit_osr_probes
@@ -821,6 +841,10 @@ impl CraneliftBackend {
                         continue;
                     }
                 }
+                if self.lazy_functions.contains(id) {
+                    self.compile_lazy_stub(*id, function)?;
+                    continue;
+                }
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 let body_result = self.compile_function_body(*id, function, module);
                 if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
@@ -855,6 +879,17 @@ impl CraneliftBackend {
 
         // Finalize the module
         let _ = self.module.finalize_definitions();
+
+        // A lazy function's cell holds its stub until its first call.
+        for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
+            let code_ptr = self.module.get_finalized_function(stub);
+            crate::reload::set_call_target(self.reload_key, hir_id, code_ptr as usize);
+            self.hot_reload
+                .function_pointers
+                .write()
+                .unwrap()
+                .insert(hir_id, code_ptr);
+        }
 
         // Update function pointers after finalization
         for (hir_id, compiled_func) in &self.compiled_functions {
@@ -1275,6 +1310,76 @@ impl CraneliftBackend {
                 self.compile_osr_helpers(id, function)?;
             }
         }
+        Ok(())
+    }
+
+    /// The stub standing in for `function` until its first call: it asks
+    /// the runtime to compile the body, then calls the entry it gets
+    /// with its own arguments and returns what that returns.
+    fn compile_lazy_stub(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
+        let Some(&declared) = self.function_map.get(&id) else {
+            return Err(CompilerError::Backend(format!(
+                "lazy stub for an undeclared function {:?}",
+                function.name
+            )));
+        };
+        let sig = self
+            .module
+            .declarations()
+            .get_function_decl(declared)
+            .signature
+            .clone();
+        let base_name = function
+            .name
+            .resolve_global()
+            .unwrap_or_else(|| format!("{:?}", function.name));
+        let stub_id = self
+            .module
+            .declare_function(&format!("{base_name}__{id:?}__lazy"), Linkage::Local, &sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare lazy stub: {e}")))?;
+        let bead_id = self
+            .bead_ids
+            .get(&id)
+            .copied()
+            .unwrap_or(self.compile_bead_id);
+
+        let mut compile_sig = self.module.make_signature();
+        compile_sig.params.push(AbiParam::new(types::I64));
+        compile_sig.returns.push(AbiParam::new(types::I64));
+        let compile_fn = self
+            .module
+            .declare_function(
+                crate::osr::LAZY_COMPILE_SYMBOL,
+                Linkage::Import,
+                &compile_sig,
+            )
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare lazy compile: {e}")))?;
+
+        let frontend_config = self.module.target_config();
+        self.codegen_context.clear();
+        self.codegen_context.func.signature = sig.clone();
+        let mut builder =
+            FunctionBuilder::new(&mut self.codegen_context.func, &mut self.builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let args: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
+        let compile_ref = self.module.declare_func_in_func(compile_fn, builder.func);
+        let bead_v = builder.ins().iconst(types::I64, bead_id as i64);
+        let compiled = builder.ins().call(compile_ref, &[bead_v]);
+        let target = builder.inst_results(compiled)[0];
+        let sig_ref = builder.import_signature(sig);
+        let call = builder.ins().call_indirect(sig_ref, target, &args);
+        let results: Vec<cranelift_codegen::ir::Value> = builder.inst_results(call).to_vec();
+        builder.ins().return_(&results);
+        builder.finalize(frontend_config);
+
+        self.module
+            .define_function(stub_id, &mut self.codegen_context)
+            .map_err(|e| CompilerError::Backend(format!("Failed to define lazy stub: {e}")))?;
+        self.codegen_context.clear();
+        self.lazy_stubs.push((id, stub_id));
         Ok(())
     }
 
@@ -3324,7 +3429,9 @@ impl CraneliftBackend {
                                                 }
                                             }
 
-                                            let call = if self.reloadable_calls {
+                                            let call = if self.reloadable_calls
+                                                || self.lazy_functions.contains(func_id)
+                                            {
                                                 let sig_ref =
                                                     builder.import_signature(declared_sig);
                                                 let ptr_ty =
@@ -3376,7 +3483,8 @@ impl CraneliftBackend {
                                     if let Some(&cranelift_func_id) = self.function_map.get(func_id)
                                     {
                                         let ptr_ty = types::I64;
-                                        let addr = if self.reloadable_calls
+                                        let addr = if (self.reloadable_calls
+                                            || self.lazy_functions.contains(func_id))
                                             && !self.external_link_names.contains_key(func_id)
                                             && self.current_compile_id != Some(*func_id)
                                         {
@@ -4581,7 +4689,8 @@ impl CraneliftBackend {
                                 // out its own address: that is a frame's
                                 // continuation, and it must stay in this
                                 // generation.
-                                let func_ptr = if self.reloadable_calls
+                                let func_ptr = if (self.reloadable_calls
+                                    || self.lazy_functions.contains(function))
                                     && !self.external_link_names.contains_key(function)
                                     && self.current_compile_id != Some(*function)
                                 {
@@ -7612,12 +7721,14 @@ impl CraneliftBackend {
                         // (LLVM gets the hint), but Cranelift falls
                         // back to the standard call until the
                         // terminator-skip plumbing lands.
-                        let call = if self.reloadable_calls
+                        let call = if (self.reloadable_calls
+                            || self.lazy_functions.contains(func_id))
                             && !self.external_link_names.contains_key(func_id)
                         {
                             // Reloadable dispatch: the callee's current
                             // entry lives in its cell, and replacing it
-                            // is one store every caller observes.
+                            // is one store every caller observes. A lazy
+                            // callee's cell holds its stub until then.
                             let sig = self
                                 .module
                                 .declarations()
@@ -7648,7 +7759,8 @@ impl CraneliftBackend {
                     HirCallable::FuncRef(func_id) => {
                         // Get function address (same as main path)
                         let ptr_ty = self.module.target_config().pointer_type();
-                        let addr = if self.reloadable_calls
+                        let addr = if (self.reloadable_calls
+                            || self.lazy_functions.contains(func_id))
                             && self.function_map.contains_key(func_id)
                             && !self.external_link_names.contains_key(func_id)
                             && self.current_compile_id != Some(*func_id)

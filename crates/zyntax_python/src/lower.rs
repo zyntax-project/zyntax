@@ -954,15 +954,24 @@ impl<'m> Lowerer<'m> {
 
     /// `raise Class(message)` built here: pending set, control leaving.
     fn raise_named(&mut self, class: &str, message: Node, span: Span, out: &mut Vec<Stmt>) {
-        let Some(&k) = self.module.class_index.get(class) else {
+        if !self.module.class_index.contains_key(class) {
             return;
-        };
-        let instance = Val {
-            node: call(&new_name(class), vec![message], Ty::Class(k as u16), span),
-            ty: Ty::Class(k as u16),
-        };
-        let boxed = self.coerce(instance, Ty::Object);
-        out.push(self.set_pending(boxed, span));
+        }
+        // The instance is built and left pending by a cold function, so
+        // the path here is an error path to everything downstream: not
+        // inlined into, and compiled only if it runs.
+        self.module.raisers.borrow_mut().insert(class.to_string());
+        out.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                &types::raiser_name(class),
+                vec![message],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        self.may_raise_own = true;
         self.raised = true;
         out.push(self.escape(span));
     }
@@ -5295,80 +5304,18 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
-        let pending = || var(intern(PENDING), Ty::Object, span);
-        let eprint = |line: Node| {
-            TypedNode::new(
-                TypedStatement::Expression(Box::new(call(
-                    "zb_eprintln",
-                    vec![line],
-                    Ty::None,
-                    span,
-                ))),
-                Type::Unknown,
+        // An exception left pending ends the program; the report and
+        // the exit are the library's, kept out of this function's code.
+        let report = vec![TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                "zb_uncaught",
+                vec![var(intern(PENDING), Ty::Object, span)],
+                Ty::None,
                 span,
-            )
-        };
-        // `Name: message`, or just `Name` when the message is empty.
-        let text_var = self.temp();
-        let kind = call("zb_any_type", vec![pending()], Ty::Str, span);
-        let line = binary(
-            BinaryOp::Add,
-            binary(
-                BinaryOp::Add,
-                kind.clone(),
-                str_lit(": ", span),
-                Ty::Str,
-                span,
-            ),
-            var(text_var, Ty::Str, span),
-            Ty::Str,
+            ))),
+            Type::Unknown,
             span,
-        );
-        let report = vec![
-            TypedNode::new(
-                TypedStatement::Let(TypedLet {
-                    name: text_var,
-                    ty: ir(Ty::Str),
-                    mutability: Mutability::Immutable,
-                    initializer: Some(Box::new(call("zb_any_str", vec![pending()], Ty::Str, span))),
-                    span,
-                }),
-                Type::Unknown,
-                span,
-            ),
-            eprint(str_lit("Traceback (most recent call last):", span)),
-            TypedNode::new(
-                TypedStatement::If(TypedIf {
-                    condition: Box::new(call(
-                        "zb_str_truthy",
-                        vec![var(text_var, Ty::Str, span)],
-                        Ty::Bool,
-                        span,
-                    )),
-                    then_block: TypedBlock {
-                        statements: vec![eprint(line)],
-                        span,
-                    },
-                    else_block: Some(TypedBlock {
-                        statements: vec![eprint(kind)],
-                        span,
-                    }),
-                    span,
-                }),
-                Type::Unknown,
-                span,
-            ),
-            TypedNode::new(
-                TypedStatement::Expression(Box::new(call(
-                    "zb_exit",
-                    vec![int32_lit(1, span)],
-                    Ty::None,
-                    span,
-                ))),
-                Type::Unknown,
-                span,
-            ),
-        ];
+        )];
         let pending_now = self.pending(span);
         Ok(vec![
             one_pass(body, span),
