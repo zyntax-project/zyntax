@@ -3118,21 +3118,7 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<Val> {
         if let Ty::Class(k) = left.ty {
-            let name = match op {
-                py::Operator::Add => "__add__",
-                py::Operator::Sub => "__sub__",
-                py::Operator::Mult => "__mul__",
-                py::Operator::Div => "__truediv__",
-                py::Operator::FloorDiv => "__floordiv__",
-                py::Operator::Mod => "__mod__",
-                py::Operator::Pow => "__pow__",
-                py::Operator::MatMult => "__matmul__",
-                py::Operator::BitAnd => "__and__",
-                py::Operator::BitOr => "__or__",
-                py::Operator::BitXor => "__xor__",
-                py::Operator::LShift => "__lshift__",
-                py::Operator::RShift => "__rshift__",
-            };
+            let name = types::dunder_name(op);
             let other = self.coerce(right, Ty::Object);
             if let Some(r) = self.dunder(k as usize, name, left.node, vec![other], span) {
                 return Ok(r);
@@ -5792,7 +5778,7 @@ impl<'m> Lowerer<'m> {
 
     /// A dunder method call with already-boxed operands, when the class
     /// chain defines it.
-    fn dunder(
+    pub(crate) fn dunder(
         &mut self,
         k: usize,
         method: &str,

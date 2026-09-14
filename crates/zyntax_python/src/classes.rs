@@ -963,9 +963,105 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         str_hook,
         type_hook,
         eq_hook,
+        arith_hook(module, span),
         box_hook(module, span),
         unbox_hook(module, span),
     ]
+}
+
+/// `zb_hook_instance_arith(code, a, b)`: `a op b` where `a` is an
+/// instance, through the operator method its class defines for the
+/// operation `code` names; anything else is a TypeError. The library
+/// calls it from dynamic arithmetic when either side is an instance.
+fn arith_hook(module: &Module, span: Span) -> TypedFunction {
+    const OPS: [ruff_python_ast::Operator; 13] = crate::types::OPERATORS;
+    let code = var(intern("code"), Ty::Int, span);
+    let a = var(intern("a"), Ty::Object, span);
+    let b = var(intern("b"), Ty::Object, span);
+    let mut statements = per_class(
+        module,
+        a.clone(),
+        |c| {
+            OPS.iter().any(|op| {
+                module
+                    .method_sig(c, crate::types::dunder_name(*op))
+                    .is_some()
+            })
+        },
+        |lowerer, c, obj| {
+            let mut arms = Vec::new();
+            for op in OPS {
+                let name = crate::types::dunder_name(op);
+                if module.method_sig(c, name).is_none() {
+                    continue;
+                }
+                let Some(result) = lowerer.dunder(c, name, obj.clone(), vec![b.clone()], span)
+                else {
+                    continue;
+                };
+                let boxed = lowerer.coerce(result, Ty::Object);
+                arms.push(when(
+                    binary(
+                        BinaryOp::Eq,
+                        code.clone(),
+                        int_lit(crate::types::arith_code(op), span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    vec![ret(boxed, span)],
+                    span,
+                ));
+            }
+            arms
+        },
+        span,
+    );
+    let message = binary(
+        BinaryOp::Add,
+        binary(
+            BinaryOp::Add,
+            str_lit("unsupported operand type(s): '", span),
+            call("zb_any_type", vec![a], Ty::Str, span),
+            Ty::Str,
+            span,
+        ),
+        binary(
+            BinaryOp::Add,
+            str_lit("' and '", span),
+            binary(
+                BinaryOp::Add,
+                call("zb_any_type", vec![b], Ty::Str, span),
+                str_lit("'", span),
+                Ty::Str,
+                span,
+            ),
+            Ty::Str,
+            span,
+        ),
+        Ty::Str,
+        span,
+    );
+    statements.push(stmt(
+        call(
+            "zb_fatal",
+            vec![str_lit("TypeError", span), message],
+            Ty::None,
+            span,
+        ),
+        span,
+    ));
+    statements.push(ret(none(span).node, span));
+    function(
+        "zb_hook_instance_arith",
+        vec![
+            param("code", Ty::Int, span),
+            param("a", Ty::Object, span),
+            param("b", Ty::Object, span),
+        ],
+        Ty::Object,
+        statements,
+        span,
+    )
 }
 
 /// `zb_hook_unbox_instance(x, tag)`: the address in a box holding an

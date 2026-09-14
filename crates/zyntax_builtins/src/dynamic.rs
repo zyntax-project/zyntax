@@ -102,6 +102,12 @@ pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
             boolean(),
             None,
         ),
+        extern_fn(
+            "zb_hook_instance_arith",
+            &[("code", i64()), ("a", any()), ("b", any())],
+            any(),
+            None,
+        ),
     ]
 }
 
@@ -111,6 +117,7 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
     let x = local("x", any());
     let a = local("a", any());
     let b = local("b", any());
+    let code = local("code", i64());
     vec![
         define(
             "zb_hook_instance_str",
@@ -129,6 +136,18 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
             &[&a, &b],
             boolean(),
             vec![ret(bool(false))],
+        ),
+        define(
+            "zb_hook_instance_arith",
+            &[&code, &a, &b],
+            any(),
+            vec![
+                fatal(
+                    "TypeError",
+                    text("unsupported operand type(s) for an object"),
+                ),
+                ret(null(any())),
+            ],
         ),
     ]
 }
@@ -845,6 +864,18 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     vec![get_str(b.e()), number_i64(a.e(), ca.e())],
                     string(),
                 )))],
+            ),
+            // An instance on either side takes part through its class.
+            when(
+                or(
+                    and(is(&ca, CUSTOM), is_instance(a.e())),
+                    and(is(&cb, CUSTOM), is_instance(b.e())),
+                ),
+                vec![ret(call(
+                    "zb_hook_instance_arith",
+                    vec![code.e(), a.e(), b.e()],
+                    any(),
+                ))],
             ),
             when(
                 and(and(is(&ca, CUSTOM), is(&cb, CUSTOM)), eq(code.e(), int(0))),

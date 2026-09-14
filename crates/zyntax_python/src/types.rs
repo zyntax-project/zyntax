@@ -752,6 +752,16 @@ pub(crate) struct Locals {
     pub(crate) returns: bool,
 }
 
+/// Whether an annotation asks for a dynamic value: `Any`, `typing.Any`
+/// or `object`.
+pub(crate) fn is_dynamic_annotation(e: &py::Expr) -> bool {
+    match e {
+        py::Expr::Name(n) => matches!(n.id.as_str(), "Any" | "object"),
+        py::Expr::Attribute(a) => a.attr.as_str() == "Any",
+        _ => false,
+    }
+}
+
 /// An annotation, with the module's class names known.
 pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> Ty {
     match e {
@@ -951,12 +961,16 @@ pub(crate) fn closed_items(
             None => !seen.names.contains(&item.name),
             // The exception classes the library and the lowering raise
             // by name are constructed out of view.
+            // An operator method is reached from the operators on its
+            // class, which are in view, and from dynamic arithmetic,
+            // which reads the operand back as the type inferred here.
             Some(_) => {
-                item.def.name.as_str() == "__init__"
+                (item.def.name.as_str() == "__init__"
                     && !seen.init
                     && !crate::prelude::EXCEPTION_KINDS
                         .iter()
-                        .any(|kind| item.name == method_fn(kind, "__init__"))
+                        .any(|kind| item.name == method_fn(kind, "__init__")))
+                    || is_operator_method(item.def.name.as_str())
             }
         })
         .map(|item| item.name.clone())
@@ -1286,6 +1300,22 @@ impl Calls<'_> {
         }
     }
 
+    /// `left op right` where `left` is an instance: a call of the
+    /// class's method for `op` with `right` as its one argument.
+    fn operator_site(&mut self, op: py::Operator, left: &py::Expr, right: &py::Expr) {
+        if self.opaque {
+            return;
+        }
+        let Ty::Class(k) = self.typer().expr(left) else {
+            return;
+        };
+        let Some((_, name)) = self.module.method_sig(k as usize, dunder_name(op)) else {
+            return;
+        };
+        let ty = self.arg_ty(right);
+        self.passed.push((Target::Item(name), 1, ty));
+    }
+
     /// Record what a call passes to each parameter from `first` on. A
     /// parameter left out takes its default; a call that cannot be
     /// matched to the parameters makes them all dynamic.
@@ -1369,6 +1399,10 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                 }
                 walk_stmt(self, stmt);
             }
+            py::Stmt::AugAssign(a) => {
+                self.operator_site(a.op, &a.target, &a.value);
+                walk_stmt(self, stmt);
+            }
             // A closure bound to a name, or returned, is still in view.
             py::Stmt::Assign(a) if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) => {
                 self.allow_closure = true;
@@ -1399,6 +1433,11 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             if let Some(k) = self.closure_of(expr) {
                 self.escape(k);
             }
+        }
+        // An operator on an instance passes the right operand to the
+        // class's method for it.
+        if let py::Expr::BinOp(b) = expr {
+            self.operator_site(b.op, &b.left, &b.right);
         }
         match expr {
             py::Expr::Call(c) => {
@@ -1788,7 +1827,13 @@ impl Walker<'_> {
             }
             py::Stmt::AnnAssign(a) => {
                 if let Some(v) = &a.value {
-                    let ty = self.expr(v);
+                    // `x: Any = v` asks for a dynamic variable, as an
+                    // unannotated parameter is one.
+                    let ty = if is_dynamic_annotation(&a.annotation) {
+                        Ty::Object
+                    } else {
+                        self.expr(v)
+                    };
                     self.target(&a.target, ty);
                 }
             }
@@ -1925,6 +1970,47 @@ pub(crate) fn arith_code(op: py::Operator) -> i64 {
     }
 }
 
+/// Every operator a class can define a method for.
+pub(crate) const OPERATORS: [py::Operator; 13] = [
+    py::Operator::Add,
+    py::Operator::Sub,
+    py::Operator::Mult,
+    py::Operator::Div,
+    py::Operator::FloorDiv,
+    py::Operator::Mod,
+    py::Operator::Pow,
+    py::Operator::MatMult,
+    py::Operator::BitAnd,
+    py::Operator::BitOr,
+    py::Operator::BitXor,
+    py::Operator::LShift,
+    py::Operator::RShift,
+];
+
+/// Whether `name` is the method of one of [`OPERATORS`].
+pub(crate) fn is_operator_method(name: &str) -> bool {
+    OPERATORS.iter().any(|op| dunder_name(*op) == name)
+}
+
+/// The method a class defines to take part in `op`.
+pub(crate) fn dunder_name(op: py::Operator) -> &'static str {
+    match op {
+        py::Operator::Add => "__add__",
+        py::Operator::Sub => "__sub__",
+        py::Operator::Mult => "__mul__",
+        py::Operator::Div => "__truediv__",
+        py::Operator::FloorDiv => "__floordiv__",
+        py::Operator::Mod => "__mod__",
+        py::Operator::Pow => "__pow__",
+        py::Operator::MatMult => "__matmul__",
+        py::Operator::BitAnd => "__and__",
+        py::Operator::BitOr => "__or__",
+        py::Operator::BitXor => "__xor__",
+        py::Operator::LShift => "__lshift__",
+        py::Operator::RShift => "__rshift__",
+    }
+}
+
 /// What `left op right` produces. `/` is always a float on numbers,
 /// `**` with a negative literal exponent too.
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
@@ -2017,6 +2103,13 @@ impl Typer<'_> {
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left);
                 let r = self.expr(&b.right);
+                // An instance takes part through its class's method, and
+                // the result is what that method returns.
+                if let Ty::Class(k) = l {
+                    if let Some((sig, _)) = self.module.method_sig(k as usize, dunder_name(b.op)) {
+                        return sig.ret;
+                    }
+                }
                 binop(b.op, l, r, &b.right)
             }
             py::Expr::UnaryOp(u) => match u.op {
