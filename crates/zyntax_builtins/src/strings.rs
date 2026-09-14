@@ -20,6 +20,12 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
         "$String$index_of",
     ),
     (
+        "zb_str_index_of_from",
+        &[("h", "str"), ("n", "str"), ("from", "i64")],
+        "i64",
+        "$String$index_of_from",
+    ),
+    (
         "zb_str_substring",
         &[("s", "str"), ("a", "i64"), ("b", "i64")],
         "str",

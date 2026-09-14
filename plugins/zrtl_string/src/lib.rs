@@ -260,6 +260,42 @@ pub extern "C" fn string_index_of(haystack: StringPtr, needle: StringPtr) -> i64
     }
 }
 
+/// Find the first byte index of `needle` at or after byte `from`, or
+/// -1. `from` is clamped to the haystack and rounded up to a character
+/// boundary.
+#[no_mangle]
+pub extern "C" fn string_index_of_from(haystack: StringPtr, needle: StringPtr, from: i64) -> i64 {
+    // Over the bytes: a search that resumes along a long text must not
+    // re-read the whole of it each time, which decoding it would.
+    let h_len = unsafe { string_length(haystack) }.max(0) as usize;
+    if haystack.is_null() {
+        return -1;
+    }
+    let h = unsafe { std::slice::from_raw_parts(string_data(haystack), h_len) };
+    let n = unsafe { string_as_str(needle) }.unwrap_or("").as_bytes();
+    let mut from = (from.max(0) as usize).min(h.len());
+    // A continuation byte is never a match start.
+    while from < h.len() && (h[from] & 0xC0) == 0x80 {
+        from += 1;
+    }
+    if n.is_empty() {
+        return from as i64;
+    }
+    if from + n.len() > h.len() {
+        return -1;
+    }
+    let rest = &h[from..];
+    let found = if n.len() == 1 {
+        rest.iter().position(|&b| b == n[0])
+    } else {
+        rest.windows(n.len()).position(|w| w == n)
+    };
+    match found {
+        Some(i) => (from + i) as i64,
+        None => -1,
+    }
+}
+
 /// Find last index of substring, returns -1 if not found
 #[no_mangle]
 pub extern "C" fn string_last_index_of(haystack: StringPtr, needle: StringPtr) -> i64 {
@@ -657,6 +693,7 @@ zrtl_plugin! {
         ("$String$starts_with", string_starts_with),
         ("$String$ends_with", string_ends_with),
         ("$String$index_of", string_index_of),
+        ("$String$index_of_from", string_index_of_from),
         ("$String$last_index_of", string_last_index_of),
         ("$String$count", string_count),
 
