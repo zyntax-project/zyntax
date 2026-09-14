@@ -194,6 +194,33 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(call("zb_box_instance_raw", vec![p.e(), itag.e()], any())),
         ],
     ));
+    d.push(extern_fn(
+        "zb_box_free",
+        &[("x", any())],
+        unit(),
+        Some("zyntax_box_free"),
+    ));
+    // A caught exception the handler is done with: the instance, then
+    // the box it travelled in. What the instance's fields hold stays.
+    d.push(extern_fn("free", &[("p", string())], unit(), None));
+    d.push(define(
+        "zb_release_caught",
+        &[&x],
+        unit(),
+        vec![
+            when(eq(x.e(), null(any())), vec![ret_void()]),
+            expr(call(
+                "free",
+                vec![cast(
+                    call("zb_unbox_instance_raw", vec![x.e()], i64()),
+                    string(),
+                )],
+                unit(),
+            )),
+            expr(call("zb_box_free", vec![x.e()], unit())),
+            ret_void(),
+        ],
+    ));
     // The box accessors. The `data` and payload readers take a box that
     // is known to be one, and are the loads they name; the tag reader
     // answers None with the void tag first.

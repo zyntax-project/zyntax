@@ -175,9 +175,117 @@ impl<'a> Visitor<'a> for Collector {
     }
 }
 
+/// Whether an `except` clause may still hold its exception once it has
+/// run: it re-raises it with a bare `raise`, or it does something with
+/// the name it bound the exception to other than read from it. Reading
+/// is a field access, a conversion to text, or an argument to one of
+/// the built-in functions that keep nothing.
+pub(crate) fn handler_keeps_exception(body: &[py::Stmt], name: Option<&str>) -> bool {
+    let mut k = Keeps { name, keeps: false };
+    for s in body {
+        k.visit_stmt(s);
+    }
+    k.keeps
+}
+
+struct Keeps<'n> {
+    name: Option<&'n str>,
+    keeps: bool,
+}
+
+impl Keeps<'_> {
+    fn is_it(&self, e: &py::Expr) -> bool {
+        matches!((e, self.name), (py::Expr::Name(n), Some(name)) if n.id.as_str() == name)
+    }
+}
+
+/// Built-in functions that read an argument and keep nothing of it.
+const READERS: &[&str] = &["print", "str", "repr", "len", "type", "isinstance", "bool"];
+
+impl<'a> Visitor<'a> for Keeps<'_> {
+    fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+        match stmt {
+            py::Stmt::Raise(r) if r.exc.is_none() => self.keeps = true,
+            // A nested body that reads the name may run after the
+            // clause is done.
+            py::Stmt::FunctionDef(f) => {
+                if self
+                    .name
+                    .is_some_and(|n| Scope::of_function(f).free.contains(n))
+                {
+                    self.keeps = true;
+                }
+            }
+            _ => walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'a py::Expr) {
+        if self.name.is_none() {
+            return;
+        }
+        match expr {
+            py::Expr::Name(n) => {
+                if self.is_it(expr) && n.ctx == py::ExprContext::Load {
+                    self.keeps = true;
+                }
+            }
+            py::Expr::Attribute(a) if self.is_it(&a.value) => {}
+            py::Expr::Call(c) => {
+                // A method is handed the exception as its receiver.
+                if matches!(&*c.func, py::Expr::Attribute(a) if self.is_it(&a.value)) {
+                    self.keeps = true;
+                    return;
+                }
+                let reader =
+                    matches!(&*c.func, py::Expr::Name(f) if READERS.contains(&f.id.as_str()));
+                if reader {
+                    for arg in &c.arguments.args {
+                        if !self.is_it(arg) {
+                            self.visit_expr(arg);
+                        }
+                    }
+                    for kw in &c.arguments.keywords {
+                        self.visit_expr(&kw.value);
+                    }
+                } else {
+                    walk_expr(self, expr);
+                }
+            }
+            py::Expr::Lambda(l) => {
+                if self
+                    .name
+                    .is_some_and(|n| Scope::of_lambda(l).free.contains(n))
+                {
+                    self.keeps = true;
+                }
+            }
+            py::Expr::Generator(g) => {
+                if self
+                    .name
+                    .is_some_and(|n| Scope::of_generator(g).free.contains(n))
+                {
+                    self.keeps = true;
+                }
+            }
+            _ => walk_expr(self, expr),
+        }
+    }
+
+    fn visit_interpolated_string_element(&mut self, element: &'a py::InterpolatedStringElement) {
+        // An interpolation is a conversion to text.
+        if let py::InterpolatedStringElement::Interpolation(e) = element {
+            if self.is_it(&e.expression) {
+                return;
+            }
+        }
+        ruff_python_ast::visitor::walk_interpolated_string_element(self, element);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Scope;
+    use super::{handler_keeps_exception, Scope};
 
     fn scope_of(src: &str) -> Scope {
         let module = ruff_python_parser::parse_module(src).unwrap().into_syntax();
@@ -201,5 +309,37 @@ mod tests {
         assert!(f.free.contains("m"));
         assert!(s.free.contains("m"));
         assert!(s.declared_globals().contains("total"));
+    }
+
+    fn keeps(handler_body: &str, name: Option<&str>) -> bool {
+        let src = format!("try:\n    pass\nexcept E as e:\n{handler_body}");
+        let module = ruff_python_parser::parse_module(&src)
+            .unwrap()
+            .into_syntax();
+        let ruff_python_ast::Stmt::Try(t) = &module.body[0] else {
+            panic!("a try statement");
+        };
+        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = &t.handlers[0];
+        handler_keeps_exception(&h.body, name)
+    }
+
+    #[test]
+    fn a_handler_that_only_reads_its_exception_keeps_nothing() {
+        assert!(!keeps(
+            "    print(e)\n    m = e.message\n    s = f'{e}: {str(e)}'\n",
+            Some("e")
+        ));
+        assert!(!keeps("    total += 1\n", None));
+        assert!(!keeps("    return 0\n", Some("e")));
+    }
+
+    #[test]
+    fn a_handler_that_stores_raises_or_captures_its_exception_keeps_it() {
+        assert!(keeps("    raise\n", None));
+        assert!(keeps("    saved = e\n", Some("e")));
+        assert!(keeps("    errors.append(e)\n", Some("e")));
+        assert!(keeps("    return e\n", Some("e")));
+        assert!(keeps("    f = lambda: e\n", Some("e")));
+        assert!(keeps("    e.register()\n", Some("e")));
     }
 }

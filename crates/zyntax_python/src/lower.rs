@@ -386,6 +386,30 @@ fn ownership_of(ty: Ty) -> ParamOwnership {
     }
 }
 
+/// `zb_release_caught(caught)`: the exception's instance and box freed.
+fn release_caught(caught: InternedString, span: Span) -> Stmt {
+    TypedNode::new(
+        TypedStatement::Expression(Box::new(call(
+            "zb_release_caught",
+            vec![var(caught, Ty::Object, span)],
+            Ty::None,
+            span,
+        ))),
+        Type::Unknown,
+        span,
+    )
+}
+
+/// Whether a body's end can be reached: it neither leaves the function
+/// on every path nor ends by leaving a loop.
+fn falls_through(body: &[py::Stmt]) -> bool {
+    !types::terminates(body)
+        && !matches!(
+            body.last(),
+            Some(py::Stmt::Break(_) | py::Stmt::Continue(_))
+        )
+}
+
 fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
     TypedParameter {
         name: intern(name),
@@ -561,6 +585,9 @@ pub(crate) struct Lowerer<'m> {
     /// body's flag and leaves the body; the flag is acted on after
     /// `finally`.
     try_ctls: Vec<TryCtl>,
+    /// The `except` clauses being lowered that release their exception
+    /// on the way out, innermost last.
+    handler_ctls: Vec<HandlerCtl>,
     /// Whether the statement being lowered recorded such a flag, so a
     /// loop containing it leaves again once the loop is left.
     redirected: bool,
@@ -581,6 +608,17 @@ struct TryCtl {
     ret: Option<InternedString>,
     /// How many loops of the body's own the statement being lowered is
     /// inside; a `break` at depth 0 is the body's to redirect.
+    loop_depth: usize,
+}
+
+/// One `except` clause that keeps nothing of its exception, which is
+/// released wherever control leaves the clause.
+struct HandlerCtl {
+    /// The variable holding the caught exception.
+    caught: InternedString,
+    /// How many loops of the clause's own the statement being lowered
+    /// is inside, a `try` body's single pass counted as one: an exit
+    /// from a loop at depth 0 leaves the clause.
     loop_depth: usize,
 }
 
@@ -654,6 +692,7 @@ impl<'m> Lowerer<'m> {
             raise_callees: BTreeSet::new(),
             caught: None,
             try_ctls: Vec::new(),
+            handler_ctls: Vec::new(),
             redirected: false,
             is_generator,
         }
@@ -676,9 +715,28 @@ impl<'m> Lowerer<'m> {
                     span,
                 ));
             }
+            // The body's pass is left; the return itself happens after
+            // the `try`, where the clauses outside the body are left.
+            self.release_left_handlers(false, span, out);
             self.set_flag_and_leave(flag, 1, span, out);
             return;
         }
+        // The value is computed while the exception is still there.
+        let value = match value {
+            Some(v) if !self.handler_ctls.is_empty() => Some(
+                self.hold(
+                    Val {
+                        node: v,
+                        ty: self.sig.ret,
+                    },
+                    out,
+                    span,
+                )
+                .node,
+            ),
+            other => other,
+        };
+        self.release_left_handlers(true, span, out);
         out.push(TypedNode::new(
             TypedStatement::Return(value.map(Box::new)),
             Type::Unknown,
@@ -686,9 +744,20 @@ impl<'m> Lowerer<'m> {
         ));
     }
 
+    /// Release the exceptions of the `except` clauses an exit leaves:
+    /// every one for a return, else those the loop being left encloses.
+    fn release_left_handlers(&mut self, all: bool, span: Span, out: &mut Vec<Stmt>) {
+        for ctl in &self.handler_ctls {
+            if all || ctl.loop_depth == 0 {
+                out.push(release_caught(ctl.caught, span));
+            }
+        }
+    }
+
     /// `break` or `continue` (`code` 2 or 3), or the `try` body's way of
     /// recording one when the loop it means is outside the body.
     fn emit_loop_exit(&mut self, code: i64, span: Span, out: &mut Vec<Stmt>) {
+        self.release_left_handlers(false, span, out);
         if let Some(ctl) = self.try_ctls.last() {
             if ctl.loop_depth == 0 {
                 let flag = ctl.flag;
@@ -736,8 +805,21 @@ impl<'m> Lowerer<'m> {
         if let Some(ctl) = self.try_ctls.last_mut() {
             ctl.loop_depth += 1;
         }
-        let r = f(self);
+        let r = self.in_handler_loop(f);
         if let Some(ctl) = self.try_ctls.last_mut() {
+            ctl.loop_depth -= 1;
+        }
+        r
+    }
+
+    /// Lower a loop body, or a `try` body's single pass, counting it
+    /// for every `except` clause it sits in.
+    fn in_handler_loop<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        for ctl in &mut self.handler_ctls {
+            ctl.loop_depth += 1;
+        }
+        let r = f(self);
+        for ctl in &mut self.handler_ctls {
             ctl.loop_depth -= 1;
         }
         r
@@ -776,13 +858,16 @@ impl<'m> Lowerer<'m> {
         )
     }
 
-    /// Leave, the way the current context leaves.
-    fn escape(&mut self, span: Span) -> Stmt {
-        let st = match self.escapes.last().copied().unwrap_or(Escape::Return) {
+    /// Leave, the way the current context leaves, releasing the
+    /// exceptions of the `except` clauses left on the way.
+    fn escape_into(&mut self, span: Span, out: &mut Vec<Stmt>) {
+        let how = self.escapes.last().copied().unwrap_or(Escape::Return);
+        self.release_left_handlers(how == Escape::Return, span, out);
+        let st = match how {
             Escape::Break => TypedStatement::Break(None),
             Escape::Return => TypedStatement::Return(self.placeholder(span).map(Box::new)),
         };
-        TypedNode::new(st, Type::Unknown, span)
+        out.push(TypedNode::new(st, Type::Unknown, span));
     }
 
     /// The value a function returns when it leaves with an exception
@@ -891,12 +976,13 @@ impl<'m> Lowerer<'m> {
         self.raised = true;
         self.may_raise_own = true;
         let cond = self.pending(span);
-        let leave = self.escape(span);
+        let mut leave = Vec::new();
+        self.escape_into(span, &mut leave);
         TypedNode::new(
             TypedStatement::If(TypedIf {
                 condition: Box::new(cond),
                 then_block: TypedBlock {
-                    statements: vec![leave],
+                    statements: leave,
                     span,
                 },
                 else_block: None,
@@ -973,7 +1059,7 @@ impl<'m> Lowerer<'m> {
         ));
         self.may_raise_own = true;
         self.raised = true;
-        out.push(self.escape(span));
+        self.escape_into(span, out);
     }
 
     /// Integer division and remainder trap on zero, so the divisor is
@@ -2004,7 +2090,7 @@ impl<'m> Lowerer<'m> {
                     }
                 }
                 self.raised = true;
-                out.push(self.escape(span));
+                self.escape_into(span, out);
             }
             py::Stmt::Assert(a) => {
                 let test = self.expr(&a.test)?;
@@ -5082,9 +5168,12 @@ impl<'m> Lowerer<'m> {
         });
         self.escapes.push(Escape::Break);
         let mut body = Vec::new();
-        for s in &t.body {
-            self.stmt(s, &mut body)?;
-        }
+        self.in_handler_loop(|this| -> Result<()> {
+            for s in &t.body {
+                this.stmt(s, &mut body)?;
+            }
+            Ok(())
+        })?;
         self.escapes.pop();
         self.try_ctls.pop();
         let body_redirected = self.redirected;
@@ -5189,8 +5278,30 @@ impl<'m> Lowerer<'m> {
             };
             let cleared = self.coerce(none, Ty::Object);
             handler.push(self.set_pending(cleared, hspan));
+            // A clause that keeps nothing of the exception releases it:
+            // at once when it never reads it, else wherever it leaves.
+            let keeps = crate::scope::handler_keeps_exception(
+                &h.body,
+                h.name.as_ref().map(|n| n.id.as_str()),
+            );
+            let released_on_leaving = !keeps && h.name.is_some();
+            if !keeps && h.name.is_none() {
+                handler.push(release_caught(caught_name, hspan));
+            }
+            if released_on_leaving {
+                self.handler_ctls.push(HandlerCtl {
+                    caught: caught_name,
+                    loop_depth: 0,
+                });
+            }
             for s in &h.body {
                 self.stmt(s, &mut handler)?;
+            }
+            if released_on_leaving {
+                self.handler_ctls.pop();
+                if falls_through(&h.body) {
+                    handler.push(release_caught(caught_name, hspan));
+                }
             }
             self.caught = saved_caught;
             chain = Some(TypedNode::new(
