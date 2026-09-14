@@ -258,7 +258,7 @@ const KERNELS: &[Kernel] = &[
     // outlives them all; nothing else in the suite allocates per
     // iteration. See the kernel's own header for the shape.
     Kernel::new("bench_binary_trees", "Int(-104864)"),
-    Kernel::new("bench_nbody_ref", "Int(-169077)"),
+    Kernel::new("bench_nbody_ref", "Int(-169077)").python_kernel("bench_nbody"),
     Kernel::new("bench_fib", "Int(102334155)"),
     // Same source as `bench_fib`, compiled with pure-call PRE off.
     //
@@ -352,6 +352,10 @@ struct Kernel {
     /// do not change this kernel's result, which is true of every
     /// kernel that computes in integers.
     expected_without_opts: Option<&'static str>,
+    /// The Python kernel to read this one against, when it is not the
+    /// file of the same name: two ZynML kernels that differ only in a
+    /// representation Python does not distinguish share one.
+    python_kernel: Option<&'static str>,
     /// Whether cross-branch pure-call PRE runs for this row.
     pure_call_pre: bool,
     /// Which section of the published page this row belongs under.
@@ -455,12 +459,20 @@ impl Kernel {
         self
     }
 
+    /// Read this kernel against the Python kernel `name` instead of the
+    /// file of the same name.
+    const fn python_kernel(mut self, name: &'static str) -> Self {
+        self.python_kernel = Some(name);
+        self
+    }
+
     const fn new(source: &'static str, expected: &'static str) -> Self {
         Self {
             source,
             published_as: None,
             expected,
             expected_without_opts: None,
+            python_kernel: None,
             pure_call_pre: true,
             group: Group::Core,
             python_only: false,
@@ -841,8 +853,9 @@ fn main() {
 
         // The same kernel in Python, through this compiler and through
         // CPython. Rows only where the file exists.
+        let python_kernel = kernel_spec.python_kernel.unwrap_or(kernel);
         let python_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../zyntax_python/benchmarks/{kernel}.py"));
+            .join(format!("../zyntax_python/benchmarks/{python_kernel}.py"));
         if python_path.exists() {
             let mut python_targets: Vec<(&str, Box<dyn Fn(&Path, usize) -> TargetResult>)> =
                 vec![("zypy", Box::new(measure_zypy))];
@@ -877,7 +890,12 @@ fn main() {
                         r.cold_ms,
                         r.result,
                     );
-                    if r.result != kernel_spec.expected {
+                    // An interpreter contracts no arithmetic, so a kernel
+                    // whose value the HIR passes change is right at
+                    // either value.
+                    let accepted = r.result == kernel_spec.expected
+                        || kernel_spec.expected_without_opts == Some(r.result.as_str());
+                    if !accepted {
                         eprintln!(
                             "    {key:<22} VALUE MISMATCH: got {}, expected {}",
                             r.result, kernel_spec.expected
