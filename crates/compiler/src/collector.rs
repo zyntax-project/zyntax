@@ -30,18 +30,24 @@
 //! lists the sweep rebuilds are the collecting thread's, and another
 //! thread's stack is never read. The thread that enables the collector
 //! is the one it runs on; the first allocation or release from any
-//! other thread turns it off for good.
+//! other thread turns it off. Turning it off also forgets the roots,
+//! since they belong to the runtime that registered them; a runtime
+//! that enables it again registers its own.
 //!
 //! ## When it runs
 //!
-//! Only when the heap grows: the pool counts the bytes it has carved
-//! from slab space or taken from libc, and a collection starts when
-//! that heap would pass twice what the last collection found live, or
-//! a floor below which no collection is worth its time. Between two
-//! collections the free lists are used up before anything is carved,
-//! so a program whose drop analysis releases everything it makes never
-//! collects at all, and one that releases nothing collects once per
-//! heap's worth of allocation with the heap held at the bound.
+//! Each collection grants a budget of storage: as much as it found
+//! live, or a floor below which no collection is worth its time. The
+//! pool spends the budget on what it carves from slab space, takes
+//! from libc, or hands back out from what the last sweep reclaimed;
+//! a block the program itself released and takes again costs nothing.
+//! So a program whose drop analysis releases everything it makes
+//! never collects at all, and one that releases nothing collects once
+//! per live set's worth of allocation, with the heap held near twice
+//! the live set. A slab the sweep finds wholly unreached is set aside
+//! whole and carved again under any class, so the sweep costs by the
+//! live slabs rather than by every dead block, and storage freed in
+//! one size class serves another.
 //!
 //! `ZYNTAX_DISABLE_GC=1` keeps it off however it was enabled; safe, the
 //! program merely leaks what it would have collected. `ZYNTAX_TRACE_GC=1`
@@ -55,7 +61,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::pool_alloc;
@@ -70,9 +76,9 @@ pub enum Collector {
     MarkSweep,
 }
 
-/// The heap below which nothing is collected: small enough to keep a
-/// short program's memory small, large enough that a collection sweeps
-/// a worthwhile amount.
+/// The least budget a collection grants, and what the first one waits
+/// for: small enough to keep a short program's memory small, large
+/// enough that a collection sweeps a worthwhile amount.
 const MIN_HEAP: usize = 16 << 20;
 
 fn heap_floor() -> usize {
@@ -105,6 +111,9 @@ struct Registry {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Bumped whenever the owner changes, so a thread's cached answer to
+/// "am I the owner" is only trusted for the owner it was made for.
+static OWNER_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     slabs: BTreeSet::new(),
     large: BTreeMap::new(),
@@ -114,18 +123,48 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 });
 /// The thread the collector was enabled on, which is the only one it
 /// runs on.
-static OWNER: OnceLock<std::thread::ThreadId> = OnceLock::new();
+static OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// What the collector keeps per thread, in one place so a request
+/// pays one thread-local access, not one per fact.
+#[derive(Clone, Copy)]
+struct Local {
+    /// Bytes the heap holds: slab space taken and large blocks out.
+    heap: usize,
+    /// Bytes spent against the budget since the last collection.
+    spent: usize,
+    /// Bytes the last collection allowed before the next.
+    budget: usize,
+    collecting: bool,
+    /// Whether this thread owns the collector, with the owner
+    /// generation the answer was made for; `None` until asked.
+    owner: Option<(usize, bool)>,
+}
 
 thread_local! {
-    /// Bytes the heap holds: slab space carved and large blocks out.
-    static HEAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Bytes carved since the last collection, for the trace.
-    static CARVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The heap size that starts the next collection.
-    static THRESHOLD: std::cell::Cell<usize> = const { std::cell::Cell::new(MIN_HEAP) };
-    static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Whether this thread is the owner; decided once per thread.
-    static IS_OWNER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static LOCAL: std::cell::Cell<Local> = const {
+        std::cell::Cell::new(Local {
+            heap: 0,
+            spent: 0,
+            budget: MIN_HEAP,
+            collecting: false,
+            owner: None,
+        })
+    };
+}
+
+#[inline]
+fn local() -> Local {
+    LOCAL.with(|l| l.get())
+}
+
+#[inline]
+fn update(f: impl FnOnce(&mut Local)) {
+    LOCAL.with(|l| {
+        let mut v = l.get();
+        f(&mut v);
+        l.set(v);
+    });
 }
 
 fn registry() -> MutexGuard<'static, Registry> {
@@ -147,20 +186,31 @@ fn disabled_by_env() -> bool {
     *OFF.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_GC").is_some())
 }
 
-/// Turn the collector on, on this thread.
+/// Turn the collector on, on this thread. Roots registered before are
+/// forgotten: they belonged to whatever enabled it last.
 pub fn enable() {
     if disabled_by_env() {
         return;
     }
-    let _ = OWNER.set(std::thread::current().id());
-    IS_OWNER.with(|c| c.set(None));
-    THRESHOLD.with(|t| t.set(heap_floor()));
+    let mut owner = OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    if *owner != Some(std::thread::current().id()) {
+        *owner = Some(std::thread::current().id());
+        OWNER_GENERATION.fetch_add(1, Ordering::SeqCst);
+    }
+    drop(owner);
+    registry().roots.clear();
+    update(|l| {
+        l.spent = 0;
+        l.budget = heap_floor();
+    });
     ENABLED.store(true, Ordering::SeqCst);
 }
 
-/// Turn the collector off; what is allocated stays allocated.
+/// Turn the collector off and forget its roots; what is allocated
+/// stays allocated.
 pub fn disable() {
     ENABLED.store(false, Ordering::SeqCst);
+    registry().roots.clear();
 }
 
 pub fn is_enabled() -> bool {
@@ -169,38 +219,41 @@ pub fn is_enabled() -> bool {
 
 /// Whether the calling thread is the one the collector belongs to.
 fn on_owner_thread() -> bool {
-    IS_OWNER.with(|c| match c.get() {
-        Some(b) => b,
-        None => {
-            let b = OWNER.get() == Some(&std::thread::current().id());
-            c.set(Some(b));
+    let generation = OWNER_GENERATION.load(Ordering::Relaxed);
+    match local().owner {
+        Some((g, b)) if g == generation => b,
+        _ => {
+            let b = *OWNER.lock().unwrap_or_else(|e| e.into_inner())
+                == Some(std::thread::current().id());
+            update(|l| l.owner = Some((generation, b)));
             b
         }
-    })
+    }
 }
 
-/// A slab the pool has just carved.
+/// A slab the pool has just taken from the system.
 pub(crate) fn note_slab(slab: usize) {
     registry().slabs.insert(slab);
+    note_grown(pool_alloc::SLAB_BYTES);
 }
 
-/// A large block the pool has just handed out.
+/// A large block the pool has just handed out. Recorded whether or
+/// not the collector is on: the registry says what is allocated, and
+/// an entry a later collection would find stale is a read of memory
+/// that may no longer be mapped.
 pub(crate) fn note_large(payload: usize, total: usize) {
-    if !is_enabled() {
-        return;
-    }
     registry().large.insert(payload, total);
-    note_carved(total);
+    if is_enabled() {
+        note_carved(total);
+        note_grown(total);
+    }
 }
 
 /// A large block the program has released itself.
 pub(crate) fn forget_large(payload: usize) {
-    if !is_enabled() {
-        return;
-    }
     if let Some(total) = registry().large.remove(&payload) {
-        if on_owner_thread() {
-            HEAP.with(|h| h.set(h.get().saturating_sub(total)));
+        if is_enabled() && on_owner_thread() {
+            update(|l| l.heap = l.heap.saturating_sub(total));
         }
     }
 }
@@ -218,21 +271,37 @@ pub(crate) fn note_thread() -> bool {
     false
 }
 
-/// Fresh bytes the pool has handed out.
+/// Fresh bytes the pool has handed out, spent against the budget.
 pub(crate) fn note_carved(bytes: usize) {
     if !is_enabled() || !note_thread() {
         return;
     }
-    CARVED.with(|c| c.set(c.get() + bytes));
-    HEAP.with(|h| h.set(h.get() + bytes));
+    update(|l| l.spent += bytes);
 }
 
-/// Whether the heap has reached the size that starts a collection.
+/// A reclaimed block handed out again, spent against the budget. Only
+/// the collecting thread has any, so there is no thread to check.
+#[inline]
+pub(crate) fn note_spent(bytes: usize) {
+    update(|l| l.spent += bytes);
+}
+
+/// Fresh bytes the heap has grown by.
+pub(crate) fn note_grown(bytes: usize) {
+    if !is_enabled() || !on_owner_thread() {
+        return;
+    }
+    update(|l| l.heap += bytes);
+}
+
+/// Whether what was spent since the last collection has used up its
+/// budget.
 pub(crate) fn wants_collection() -> bool {
-    is_enabled()
-        && !COLLECTING.with(|c| c.get())
-        && on_owner_thread()
-        && HEAP.with(|h| h.get()) >= THRESHOLD.with(|t| t.get())
+    if !is_enabled() {
+        return false;
+    }
+    let l = local();
+    l.spent >= l.budget && !l.collecting && on_owner_thread()
 }
 
 /// Memory outside the heap the collector must read for pointers: a
@@ -276,11 +345,17 @@ impl SlabBits {
     /// `slab` must be the base of a live slab.
     unsafe fn read(slab: usize) -> Box<Self> {
         let (class, used) = pool_alloc::slab_layout(slab);
-        let slot = pool_alloc::class_slot_bytes(class);
+        // A slab set aside holds nothing until it is carved again.
+        let (slot, count) = if pool_alloc::is_retired_class(class) {
+            (pool_alloc::SLAB_BYTES, 0)
+        } else {
+            let slot = pool_alloc::class_slot_bytes(class);
+            (slot, (used - pool_alloc::SLAB_HEADER) / slot)
+        };
         Box::new(SlabBits {
             class,
             slot,
-            count: (used - pool_alloc::SLAB_HEADER) / slot,
+            count,
             marks: [0; SLAB_WORDS],
             free: [0; SLAB_WORDS],
         })
@@ -332,7 +407,9 @@ fn bit(offset: usize) -> (usize, u64) {
 /// One collection's working state.
 struct Marker<'a> {
     reg: &'a Registry,
-    /// Every slab, by base address.
+    /// The slabs touched so far, by base address: made on first touch,
+    /// so a slab nothing reaches costs nothing to mark and is set
+    /// aside whole by the sweep.
     bits: SlabMap<Box<SlabBits>>,
     /// The lowest and highest addresses any block may have, so most
     /// words are turned away without a lookup.
@@ -346,11 +423,7 @@ struct Marker<'a> {
 
 impl<'a> Marker<'a> {
     fn new(reg: &'a Registry) -> Self {
-        let mut bits = SlabMap::with_capacity_and_hasher(reg.slabs.len(), Default::default());
-        for &slab in &reg.slabs {
-            // SAFETY: a registered slab is live for the life of the process.
-            bits.insert(slab, unsafe { SlabBits::read(slab) });
-        }
+        let bits = SlabMap::with_capacity_and_hasher(reg.slabs.len(), Default::default());
         let mut lo = reg.slabs.iter().next().copied().unwrap_or(usize::MAX);
         let mut hi = reg
             .slabs
@@ -375,10 +448,24 @@ impl<'a> Marker<'a> {
         }
     }
 
+    /// The bits of the slab at `slab`, made on first touch; none for
+    /// an address outside every slab.
+    #[inline]
+    fn slab_bits(&mut self, slab: usize) -> Option<&mut SlabBits> {
+        if !self.bits.contains_key(&slab) {
+            if !self.reg.slabs.contains(&slab) {
+                return None;
+            }
+            // SAFETY: a registered slab is live for the life of the process.
+            self.bits.insert(slab, unsafe { SlabBits::read(slab) });
+        }
+        self.bits.get_mut(&slab).map(|b| &mut **b)
+    }
+
     /// Note a block on a free list, which is not storage to follow.
     fn note_free(&mut self, block: usize) {
         let slab = block & !(pool_alloc::SLAB_BYTES - 1);
-        if let Some(bits) = self.bits.get_mut(&slab) {
+        if let Some(bits) = self.slab_bits(slab) {
             let (w, m) = bit(block - slab);
             bits.free[w] |= m;
         }
@@ -391,7 +478,7 @@ impl<'a> Marker<'a> {
             return;
         }
         let slab = a & !(pool_alloc::SLAB_BYTES - 1);
-        if let Some(bits) = self.bits.get_mut(&slab) {
+        if let Some(bits) = self.slab_bits(slab) {
             let Some(idx) = bits.block_at(a - slab) else {
                 return;
             };
@@ -416,6 +503,10 @@ impl<'a> Marker<'a> {
 
     /// Read every aligned word in `[lo, hi)` as a possible pointer.
     fn scan(&mut self, lo: usize, hi: usize) {
+        if trace_detail() && !mapped(lo, hi) {
+            eprintln!("[gc]   UNMAPPED {lo:#x}..{hi:#x}, skipped");
+            return;
+        }
         let mut p = (lo + 7) & !7;
         while p + 8 <= hi {
             // SAFETY: the caller hands over memory it owns and that is
@@ -436,17 +527,54 @@ impl<'a> Marker<'a> {
     /// Put every unreached block back on the free lists, the lists
     /// being rebuilt from nothing so a block is on one exactly once.
     /// Returns the blocks and bytes that were not free before.
-    fn sweep(&self) -> (usize, usize) {
+    /// Returns the blocks and bytes that were not free before, and the
+    /// bytes on the free lists afterwards.
+    fn sweep(&self) -> (usize, usize, usize) {
         pool_alloc::clear_free_lists();
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0usize;
+        let mut free_bytes = 0usize;
         // Highest first, so the lowest addresses come off the lists
         // first. A slab's blocks are chained here and joined to the
         // list in one go.
-        let mut slabs: Vec<usize> = self.bits.keys().copied().collect();
-        slabs.sort_unstable_by(|a, b| b.cmp(a));
-        for slab in slabs {
-            let bits = &self.bits[&slab];
+        for &slab in self.reg.slabs.iter().rev() {
+            let Some(bits) = self.bits.get(&slab) else {
+                // Never touched: nothing in it is reached or on a list,
+                // so whatever it holds is garbage.
+                // SAFETY: a registered slab is live.
+                let (class, used) = unsafe { pool_alloc::slab_layout(slab) };
+                if pool_alloc::is_retired_class(class) {
+                    continue;
+                }
+                let slot = pool_alloc::class_slot_bytes(class);
+                let count = (used - pool_alloc::SLAB_HEADER) / slot;
+                if count == 0 {
+                    continue;
+                }
+                freed_blocks += count;
+                freed_bytes += count * slot;
+                // SAFETY: nothing reaches any block of the slab.
+                unsafe { pool_alloc::retire_slab(slab) };
+                continue;
+            };
+            if bits.count == 0 {
+                continue;
+            }
+            // A slab with nothing reached is set aside whole rather
+            // than threaded block by block, and can serve any class.
+            if bits.marks.iter().all(|w| *w == 0) {
+                for idx in 0..bits.count {
+                    let (w, m) = bit(bits.base(idx));
+                    if bits.free[w] & m == 0 {
+                        freed_blocks += 1;
+                        freed_bytes += bits.slot;
+                    }
+                }
+                // SAFETY: nothing reaches any block of the slab, and the
+                // lists that held its free blocks were emptied above.
+                unsafe { pool_alloc::retire_slab(slab) };
+                continue;
+            }
             let mut head = 0usize;
             let mut tail = 0usize;
             for idx in (0..bits.count).rev() {
@@ -456,6 +584,7 @@ impl<'a> Marker<'a> {
                     continue;
                 }
                 let block = slab + base;
+                free_bytes += bits.slot;
                 // SAFETY: nothing reaches the block; the sweep owns it.
                 unsafe {
                     if bits.free[w] & m == 0 {
@@ -476,8 +605,27 @@ impl<'a> Marker<'a> {
                 unsafe { pool_alloc::push_free_chain(bits.class, head, tail) };
             }
         }
-        (freed_blocks, freed_bytes)
+        (freed_blocks, freed_bytes, free_bytes)
     }
+}
+
+/// Whether every page of `[lo, hi)` is mapped; a diagnostic, asked
+/// only when tracing. `msync` refuses a range with a hole in it.
+#[cfg(unix)]
+fn mapped(lo: usize, hi: usize) -> bool {
+    let page = 16384usize;
+    let start = lo & !(page - 1);
+    let end = (hi + page - 1) & !(page - 1);
+    if end <= start {
+        return true;
+    }
+    // SAFETY: asks the kernel about the range; nothing is read.
+    unsafe { libc::msync(start as *mut libc::c_void, end - start, libc::MS_ASYNC) == 0 }
+}
+
+#[cfg(not(unix))]
+fn mapped(_lo: usize, _hi: usize) -> bool {
+    true
 }
 
 /// The highest address of the calling thread's stack.
@@ -543,7 +691,7 @@ fn query_stack_top() -> usize {
 /// the rest.
 #[inline(never)]
 pub fn collect() {
-    if !is_enabled() || !on_owner_thread() || COLLECTING.with(|c| c.get()) {
+    if !is_enabled() || !on_owner_thread() || local().collecting {
         return;
     }
     let mut regs = [0usize; 12];
@@ -588,17 +736,20 @@ fn collect_from(sp: usize) {
         if trace() {
             eprintln!("[gc] skipped: the stack's extent is unknown");
         }
-        THRESHOLD.with(|t| t.set(usize::MAX));
+        update(|l| l.budget = usize::MAX);
         return;
     }
-    COLLECTING.with(|c| c.set(true));
+    update(|l| l.collecting = true);
     let started = web_time::Instant::now();
     let mut reg = registry();
-    let carved = CARVED.with(|c| c.replace(0));
+    let carved = local().spent;
+    update(|l| l.spent = 0);
 
-    let (live, freed_blocks, freed_bytes, large_freed) = {
+    let (live, freed_blocks, freed_bytes, free_bytes, large_freed) = {
         let mut marker = Marker::new(&reg);
+        let built_at = started.elapsed();
         pool_alloc::for_each_free_block(|b| marker.note_free(b));
+        let free_walked_at = started.elapsed();
 
         // Roots: the stacks, the globals, what the fiber runtime holds.
         let mut windows: Vec<(usize, usize)> = Vec::new();
@@ -609,14 +760,24 @@ fn collect_from(sp: usize) {
             }
             None => windows.push((sp, host_top)),
         }
+        if trace_detail() {
+            eprintln!(
+                "[gc]   {} slabs, {} large blocks, {} root ranges",
+                marker.reg.slabs.len(),
+                marker.reg.large.len(),
+                marker.reg.roots.len()
+            );
+        }
         for (lo, hi) in windows {
             if lo < hi {
+                if trace_detail() {
+                    eprintln!("[gc]   stack {lo:#x}..{hi:#x} ({} KB)", (hi - lo) >> 10);
+                }
                 let before = marker.marked_bytes;
                 marker.scan(lo, hi);
                 if trace_detail() {
                     eprintln!(
-                        "[gc]   stack {lo:#x}..{hi:#x} ({} KB): {} KB reached directly",
-                        (hi - lo) >> 10,
+                        "[gc]     {} KB reached directly",
                         (marker.marked_bytes - before) >> 10
                     );
                 }
@@ -624,26 +785,27 @@ fn collect_from(sp: usize) {
         }
         let roots: Vec<(usize, usize)> = marker.reg.roots.iter().map(|(a, l)| (*a, *l)).collect();
         for (a, l) in roots {
-            let before = marker.marked_bytes;
-            marker.scan(a, a + l);
-            if trace_detail() && marker.marked_bytes > before {
-                eprintln!(
-                    "[gc]   global {a:#x} ({l} bytes): {} KB reached directly",
-                    (marker.marked_bytes - before) >> 10
-                );
+            if trace_detail() {
+                eprintln!("[gc]   global {a:#x} ({l} bytes)");
             }
+            marker.scan(a, a + l);
         }
         let direct = marker.marked_bytes;
+        let roots_at = started.elapsed();
         marker.drain();
         let marked_at = started.elapsed();
-        let (freed_blocks, freed_bytes) = marker.sweep();
-        if trace_detail() {
+        let (freed_blocks, freed_bytes, free_bytes) = marker.sweep();
+        if trace() {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
-                "[gc]   {} KB reached directly, {} KB through what they hold; setup+mark {:.2} ms, sweep {:.2} ms",
+                "[gc]   {} KB reached directly, {} KB through what they hold; tables {:.2} ms, free lists {:.2} ms, roots {:.2} ms, mark {:.2} ms, sweep {:.2} ms",
                 direct >> 10,
                 (marker.marked_bytes - direct) >> 10,
-                marked_at.as_secs_f64() * 1e3,
-                (started.elapsed() - marked_at).as_secs_f64() * 1e3
+                ms(built_at),
+                ms(free_walked_at - built_at),
+                ms(roots_at - free_walked_at),
+                ms(marked_at - roots_at),
+                ms(started.elapsed() - marked_at)
             );
         }
         let dead_large: Vec<usize> = marker
@@ -653,36 +815,42 @@ fn collect_from(sp: usize) {
             .copied()
             .filter(|p| !marker.large_marked.contains(p))
             .collect();
-        (marker.marked_bytes, freed_blocks, freed_bytes, dead_large)
+        (
+            marker.marked_bytes,
+            freed_blocks,
+            freed_bytes,
+            free_bytes,
+            dead_large,
+        )
     };
     let large_count = large_freed.len();
     let mut freed_bytes = freed_bytes;
     for payload in large_freed {
         if let Some(total) = reg.large.remove(&payload) {
             freed_bytes += total;
-            HEAP.with(|h| h.set(h.get().saturating_sub(total)));
+            update(|l| l.heap = l.heap.saturating_sub(total));
             // SAFETY: unreached, and taken out of the registry first.
             unsafe { pool_alloc::free_large(payload) };
         }
     }
     reg.live = live;
     reg.collections += 1;
-    // The heap may reach twice what is live before the next one, and
-    // never less than the floor.
-    THRESHOLD.with(|t| t.set((live * 2).max(heap_floor())));
+    // As much again as is live before the next one.
+    update(|l| l.budget = live.max(heap_floor()));
     if trace() {
         eprintln!(
-            "[gc] #{}: heap {} KB, {} KB carved since last, {} KB reached, {} blocks / {} KB and {} large freed, {:.2} ms",
+            "[gc] #{}: heap {} KB, {} KB carved since last, {} KB reached, {} blocks / {} KB and {} large freed, {} KB free, {:.2} ms",
             reg.collections,
-            HEAP.with(|h| h.get()) >> 10,
+            local().heap >> 10,
             carved >> 10,
             live >> 10,
             freed_blocks,
             freed_bytes >> 10,
             large_count,
+            free_bytes >> 10,
             started.elapsed().as_secs_f64() * 1e3
         );
     }
     drop(reg);
-    COLLECTING.with(|c| c.set(false));
+    update(|l| l.collecting = false);
 }

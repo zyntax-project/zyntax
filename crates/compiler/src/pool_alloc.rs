@@ -8,10 +8,14 @@
 //!
 //! A general allocator has to serve any size and return memory to the
 //! OS. A language runtime allocating one small object at a time does
-//! not, so this keeps a free list per size class, carves fresh slots
-//! from slabs, and never gives a slab back. Freeing is pushing onto a
-//! list and allocating is popping off one, which is what makes it
-//! cheaper than the thing it replaces rather than merely different.
+//! not, so this keeps a free list per size class, carves slabs onto
+//! the lists a slab at a time, and never gives a slab back to the
+//! system. Freeing is pushing onto a list and allocating is popping
+//! off one, which is what makes it cheaper than the thing it replaces
+//! rather than merely different. The collector in [`crate::collector`]
+//! sweeps what it finds unreached onto a second list per class, and a
+//! slab it finds wholly unreached is set aside to be carved again under
+//! whatever class next needs one.
 //!
 //! Anything larger than [`MAX_POOLED`] goes to libc, since a pool that
 //! keeps every size forever is a leak wearing a hat.
@@ -109,6 +113,12 @@ const SLAB: usize = 64 * 1024;
 const CLASS_MASK: usize = 0xFFFF_FFFF;
 const USED_SHIFT: u32 = 32;
 
+/// The class of a slab the collector found empty and set aside. It is
+/// carved again under whatever class next needs a slab; until then no
+/// block in it is anyone's, and a cursor still pointing at it sees a
+/// class that is not its own and takes another slab.
+const RETIRED: usize = CLASS_MASK;
+
 /// Set in a header's `class` to mark a block libc owns, with the rest
 /// of the word carrying its total length.
 ///
@@ -160,9 +170,23 @@ pub(crate) fn class_slot_bytes(class: usize) -> usize {
     slot_bytes(class)
 }
 
-/// Every block on this thread's free lists, by address.
+/// A block of `class` the collector reclaimed, or null.
+#[inline]
+fn pop_swept(class: usize) -> *mut u8 {
+    SWEPT.with(|lists| {
+        let head = lists[class].get();
+        if !head.is_null() {
+            // SAFETY: a block on the list holds the next in its first
+            // word.
+            lists[class].set(unsafe { *(head as *mut *mut u8) });
+        }
+        head
+    })
+}
+
+/// Every block on this thread's free and swept lists, by address.
 pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
-    FREE.with(|lists| {
+    let mut walk = |lists: &[Cell<*mut u8>; CLASSES]| {
         for list in lists.iter() {
             let mut p = list.get();
             while !p.is_null() {
@@ -172,28 +196,32 @@ pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
                 p = unsafe { *(p as *mut *mut u8) };
             }
         }
-    });
+    };
+    FREE.with(&mut walk);
+    SWEPT.with(&mut walk);
 }
 
-/// Empty this thread's free lists; the collector fills them again from
-/// what its sweep finds unreached.
+/// Empty this thread's free and swept lists; the collector fills the
+/// swept lists again from what its sweep finds unreached.
 pub(crate) fn clear_free_lists() {
-    FREE.with(|lists| {
-        for list in lists.iter() {
-            list.set(std::ptr::null_mut());
-        }
-    });
+    for lists in [&FREE, &SWEPT] {
+        lists.with(|lists| {
+            for list in lists.iter() {
+                list.set(std::ptr::null_mut());
+            }
+        });
+    }
 }
 
-/// Put a chain of blocks of `class`, threaded through their first
-/// words from `head` to `tail`, at the front of this thread's free
-/// list.
+/// Put a chain of reclaimed blocks of `class`, threaded through their
+/// first words from `head` to `tail`, at the front of this thread's
+/// swept list.
 ///
 /// # Safety
 /// Every block on the chain must be one of `class` from this pool
 /// that nothing reads any more.
 pub(crate) unsafe fn push_free_chain(class: usize, head: usize, tail: usize) {
-    FREE.with(|lists| {
+    SWEPT.with(|lists| {
         *(tail as *mut *mut u8) = lists[class].get();
         lists[class].set(head as *mut u8);
     });
@@ -218,12 +246,37 @@ thread_local! {
     /// what the pool exists to save.
     static FREE: [Cell<*mut u8>; CLASSES] =
         const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
-    /// The slab being carved for each class, and how much of it is
-    /// spoken for. One per class now: a slab serves a single class, so
-    /// that masking a block's address back to it says which.
+    /// Blocks the collector's sweep found unreached, by class. Served
+    /// after the free list and counted like fresh storage, since a
+    /// program that lives on these is one whose garbage the collector
+    /// has to keep finding.
+    static SWEPT: [Cell<*mut u8>; CLASSES] =
+        const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
+    /// The slab being carved for each class. One per class: a slab
+    /// serves a single class, so that masking a block's address back to
+    /// it says which. How much of it is spoken for is in its header.
     static SLAB_PTR: [Cell<*mut u8>; CLASSES] =
         const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
-    static SLAB_USED: [Cell<usize>; CLASSES] = const { [const { Cell::new(SLAB) }; CLASSES] };
+}
+
+/// Slabs the collector found empty, waiting to be carved again.
+static EMPTY_SLABS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Set an empty slab aside for reuse under any class.
+///
+/// # Safety
+/// No block in the slab may be reached or on any list any more.
+pub(crate) unsafe fn retire_slab(slab: usize) {
+    (*(slab as *mut Header)).class = RETIRED | (SLAB << USED_SHIFT);
+    EMPTY_SLABS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(slab);
+}
+
+/// Whether a slab has been set aside.
+pub(crate) fn is_retired_class(class: usize) -> bool {
+    class == RETIRED
 }
 
 /// Requests the pools have served, across every thread.
@@ -302,62 +355,105 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
         return reused;
     }
 
-    // Nothing to reuse means the heap grows. The collector gets its
-    // say first: what it finds unreached goes on the lists, and a
-    // list that filled up serves the request after all.
+    // Then a block the collector reclaimed, which counts as fresh.
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::collector::wants_collection() {
-        crate::collector::collect();
-        let reused = FREE.with(|lists| {
-            let head = lists[class].get();
-            if head.is_null() {
-                return std::ptr::null_mut();
+    {
+        let swept = pop_swept(class);
+        if !swept.is_null() {
+            crate::collector::note_spent(slot_bytes(class));
+            return swept;
+        }
+        // Nothing to reuse means the heap grows. The collector gets
+        // its say first: what it finds unreached serves the request
+        // after all.
+        if crate::collector::wants_collection() {
+            crate::collector::collect();
+            let swept = pop_swept(class);
+            if !swept.is_null() {
+                crate::collector::note_spent(slot_bytes(class));
+                return swept;
             }
-            lists[class].set(*(head as *mut *mut u8));
-            head
-        });
-        if !reused.is_null() {
-            return reused;
         }
     }
 
-    // Otherwise carve one, taking a fresh slab for this class if the
-    // current one cannot fit. A slab is aligned to its own size so that
-    // masking any block in it lands on its header.
-    let want = slot_bytes(class);
-    let block = SLAB_PTR.with(|sp| {
-        SLAB_USED.with(|su| {
-            let mut used = su[class].get();
-            if used + want > SLAB {
-                let slab = sys_alloc(Layout::from_size_align_unchecked(SLAB, SLAB));
-                if slab.is_null() {
-                    return std::ptr::null_mut();
-                }
-                // Said once per slab rather than once per block.
-                let head = slab as *mut Header;
-                (*head).magic = MAGIC;
-                (*head).class = class | (HEADER << USED_SHIFT);
-                sp[class].set(slab);
-                used = HEADER;
-                #[cfg(not(target_arch = "wasm32"))]
-                crate::collector::note_slab(slab as usize);
-            }
-            let slab = sp[class].get();
-            let block = slab.add(used);
-            su[class].set(used + want);
-            // The header keeps the carved extent too, so a reader that
-            // only has the slab knows where its blocks end.
-            (*(slab as *mut Header)).class = class | ((used + want) << USED_SHIFT);
-            block
-        })
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::collector::note_carved(want);
-    if block.is_null() {
+    // Otherwise carve. The rest of a slab goes on the free list in one
+    // go, so the bookkeeping is paid once per slab and the blocks come
+    // off the list like any other.
+    if !refill(class) {
         // Out of memory for a slab; the request itself may still fit.
         return large_alloc(size);
     }
-    block
+    FREE.with(|lists| {
+        let head = lists[class].get();
+        lists[class].set(*(head as *mut *mut u8));
+        head
+    })
+}
+
+/// Put the rest of `class`'s slab on the free list, taking another
+/// slab if the current one cannot fit a block or has been set aside.
+/// A slab is aligned to its own size so that masking any block in it
+/// lands on its header, which is where the carved extent lives.
+///
+/// # Safety
+/// Called with the pool's lists consistent; the list gains blocks
+/// nothing else names.
+unsafe fn refill(class: usize) -> bool {
+    let want = slot_bytes(class);
+    let (slab, used) = SLAB_PTR.with(|sp| {
+        let mut slab = sp[class].get();
+        let (slab_class, mut used) = if slab.is_null() {
+            (RETIRED, SLAB)
+        } else {
+            (*(slab as *const Header)).slab_class_and_used()
+        };
+        if slab_class != class || used + want > SLAB {
+            // An empty slab set aside by the collector, or a fresh one.
+            let recycled = EMPTY_SLABS.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            slab = match recycled {
+                Some(s) => s as *mut u8,
+                None => {
+                    let fresh = sys_alloc(Layout::from_size_align_unchecked(SLAB, SLAB));
+                    if fresh.is_null() {
+                        return (std::ptr::null_mut(), 0);
+                    }
+                    (*(fresh as *mut Header)).magic = MAGIC;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    crate::collector::note_slab(fresh as usize);
+                    fresh
+                }
+            };
+            sp[class].set(slab);
+            used = HEADER;
+        }
+        (slab, used)
+    });
+    if slab.is_null() {
+        return false;
+    }
+    // Every block that fits, threaded lowest first so the lowest
+    // address is handed out first, and the header marked as carved to
+    // the end.
+    let count = (SLAB - used) / want;
+    let first = slab.add(used);
+    let last = first.add((count - 1) * want);
+    let mut p = last;
+    FREE.with(|lists| {
+        let mut next = lists[class].get();
+        loop {
+            *(p as *mut *mut u8) = next;
+            next = p;
+            if p == first {
+                break;
+            }
+            p = p.sub(want);
+        }
+        lists[class].set(first);
+    });
+    (*(slab as *mut Header)).class = class | ((used + count * want) << USED_SHIFT);
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::collector::note_carved(count * want);
+    true
 }
 
 /// Anything a pool will not take.
@@ -476,6 +572,15 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
         libc_free(ptr);
         return;
     };
+    if class >= CLASSES {
+        // A block of a slab the collector set aside: nothing held it,
+        // so this release is of storage already reclaimed.
+        debug_assert!(
+            false,
+            "release of {ptr:p}, a block the collector already reclaimed"
+        );
+        return;
+    }
     let block = ptr;
     // A freed block keeps its bytes, so a read through a stale pointer
     // returns the old contents: plausible, wrong, and silent. Overwrite

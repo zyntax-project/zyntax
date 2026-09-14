@@ -87,6 +87,9 @@ pub struct TieredRuntime {
     /// released across blocks and through returned storage. See
     /// [`Self::set_automatic_release`].
     automatic_release: bool,
+    /// Whether this runtime turned the collector on, and so turns it
+    /// off again when it goes.
+    collecting: bool,
     /// Import resolver callbacks. Same role as `ZyntaxRuntime.import_resolvers`
     /// — consulted during `lower_typed_program` to pull in stdlib source
     /// (`prelude`, `tensor`, …) and any user-supplied module sources.
@@ -417,6 +420,7 @@ impl TieredRuntime {
             loaded_plugins: Vec::new(),
             run_interp_opts: true,
             automatic_release: false,
+            collecting: false,
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
@@ -850,6 +854,12 @@ impl TieredRuntime {
             unsafe { crate::effect_runtime::free_handler_state(e.state as *mut u8) };
         }
         self.backend.shutdown();
+        // The collector's roots were this runtime's globals, which go
+        // with its code.
+        if self.collecting {
+            zyntax_compiler::collector::disable();
+            self.collecting = false;
+        }
     }
 
     /// Load a ZRTL plugin from a file path
@@ -1044,8 +1054,14 @@ impl TieredRuntime {
     pub fn set_collector(&mut self, collector: zyntax_compiler::collector::Collector) {
         use zyntax_compiler::collector::{self, Collector};
         match collector {
-            Collector::None => collector::disable(),
-            Collector::MarkSweep => collector::enable(),
+            Collector::None => {
+                collector::disable();
+                self.collecting = false;
+            }
+            Collector::MarkSweep => {
+                collector::enable();
+                self.collecting = true;
+            }
         }
     }
 
