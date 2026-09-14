@@ -1538,6 +1538,16 @@ impl CraneliftBackend {
             value_type_cache.insert(*value_id, value.ty.clone());
         }
 
+        // A helper reads each live-in from the frame at the type's own
+        // width, which is what the probe stored it at.
+        if let Some(layout) = &osr_helper {
+            for ty in &layout.live_in_types {
+                if let Ok(cranelift_ty) = self.translate_type(ty) {
+                    type_cache.insert(ty.clone(), cranelift_ty);
+                }
+            }
+        }
+
         for (_block_id, block) in &function.blocks {
             // Pre-translate phi types
             for phi in &block.phis {
@@ -1775,6 +1785,26 @@ impl CraneliftBackend {
                 } else {
                     HashMap::new()
                 };
+            // The width each live-in is stored at: its type's own, which
+            // is what the helper loads it at. A value the body holds
+            // narrower or wider than that is converted on the way in.
+            let osr_slot_types: HashMap<HirId, Vec<cranelift_codegen::ir::Type>> = osr_layouts
+                .iter()
+                .map(|(h, layout)| {
+                    let slots = layout
+                        .live_in_types
+                        .iter()
+                        .map(|ty| {
+                            if crate::osr::is_held_by_reference(ty) {
+                                self.module.target_config().pointer_type()
+                            } else {
+                                self.translate_type(ty).unwrap_or(types::I64)
+                            }
+                        })
+                        .collect();
+                    (*h, slots)
+                })
+                .collect();
             let osr_return_clir: Option<cranelift_codegen::ir::Type> =
                 match function.signature.returns.as_slice() {
                     [] => None,
@@ -2228,7 +2258,7 @@ impl CraneliftBackend {
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
                     let empty_frame = crate::osr::OsrFrame::for_types(&[]);
-                    let (site_key, live_in_clir, frame, return_clir) =
+                    let (site_key, live_in_clir, slot_types, frame, return_clir) =
                         if let Some(layout) = osr_layouts.get(hir_block_id) {
                             // Collect the Cranelift value backing each live-in.
                             let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
@@ -2241,12 +2271,17 @@ impl CraneliftBackend {
                                 (
                                     layout.site_key(),
                                     clir_vals,
+                                    osr_slot_types
+                                        .get(hir_block_id)
+                                        .cloned()
+                                        .unwrap_or_default(),
                                     layout.frame.clone(),
                                     osr_return_clir,
                                 )
                             } else {
                                 (
                                     crate::osr::encode_osr_site(block_index, 0),
+                                    Vec::new(),
                                     Vec::new(),
                                     empty_frame.clone(),
                                     None,
@@ -2256,6 +2291,7 @@ impl CraneliftBackend {
                             // Layout rejected → probe only, no dispatch.
                             (
                                 crate::osr::encode_osr_site(block_index, 0),
+                                Vec::new(),
                                 Vec::new(),
                                 empty_frame.clone(),
                                 None,
@@ -2277,6 +2313,7 @@ impl CraneliftBackend {
                         site_key,
                         &frame,
                         &live_in_clir,
+                        &slot_types,
                         return_clir,
                     );
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
@@ -9658,6 +9695,7 @@ fn emit_osr_back_edge_probe(
     site_key: u64,
     frame: &crate::osr::OsrFrame,
     live_ins: &[cranelift_codegen::ir::Value],
+    slot_types: &[cranelift_codegen::ir::Type],
     return_clir: Option<cranelift_codegen::ir::Type>,
 ) {
     // Helper signature: one pointer to the frame carrying the live-ins.
@@ -9720,7 +9758,7 @@ fn emit_osr_back_edge_probe(
                     builder.ins().call(f, &[site_v, helper_ptr]);
                 }
             }
-            let frame_addr = emit_osr_frame_store(builder, frame, live_ins);
+            let frame_addr = emit_osr_frame_store(builder, frame, live_ins, slot_types);
             let call = builder
                 .ins()
                 .call_indirect(sig_ref, helper_ptr, &[frame_addr]);
@@ -9744,10 +9782,15 @@ fn emit_osr_back_edge_probe(
 /// an aggregate as the pointer to its storage. The pointer, not a copy of
 /// what it points at, so the resumed code and everything else that
 /// addresses that storage keep seeing the same bytes.
+///
+/// `slot_types` is the width the helper reads each slot at. An integer
+/// the body holds at another width is brought to it first, so the bytes
+/// the helper reads are all the value's own.
 fn emit_osr_frame_store(
     builder: &mut FunctionBuilder<'_>,
     frame: &crate::osr::OsrFrame,
     live_ins: &[cranelift_codegen::ir::Value],
+    slot_types: &[cranelift_codegen::ir::Type],
 ) -> cranelift_codegen::ir::Value {
     use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
 
@@ -9761,6 +9804,17 @@ fn emit_osr_frame_store(
     for (i, &v) in live_ins.iter().enumerate() {
         let Some(&offset) = frame.offsets.get(i) else {
             continue;
+        };
+        let held = builder.func.dfg.value_type(v);
+        let v = match slot_types.get(i) {
+            Some(&want) if want != held && want.is_int() && held.is_int() => {
+                if want.bits() > held.bits() {
+                    builder.ins().uextend(want, v)
+                } else {
+                    builder.ins().ireduce(want, v)
+                }
+            }
+            _ => v,
         };
         builder.ins().store(MemFlags::new(), v, base, offset as i32);
     }

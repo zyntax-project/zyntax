@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::counted_loop;
+use common::{counted_loop, flagged_counted_loop};
 use zyntax_compiler::hir::HirModule;
 use zyntax_compiler::osr;
 use zyntax_compiler::tiered_backend::{OptimizationTier, TieredBackend, TieredConfig};
@@ -313,6 +313,64 @@ fn the_tier1_helper_completes_the_loop_it_inherits() {
             f(n),
             expected,
             "sum 0..{n} through the tier-1 helper should be {expected}"
+        );
+    }
+}
+
+/// A live-in narrower than a word arrives with only its own bytes.
+///
+/// The flag is a `bool` the frame holds in one byte, ahead of the wider
+/// `3 * n`. A helper that read it as a word would take that value's
+/// bytes for part of the flag and see it set, adding 1000 a step where
+/// the tier-0 code added `3 * n`.
+#[test]
+fn the_tier1_helper_reads_a_byte_live_in_as_a_byte() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+
+    const BEAD: u64 = 0xB0AB;
+    let (function, header_id) = flagged_counted_loop();
+    let func_id = function.id;
+    let layout =
+        osr::osr_layout(&function, header_id).expect("flagged loop should have an OSR layout");
+    assert!(
+        layout
+            .live_in_types
+            .iter()
+            .any(|t| matches!(t, zyntax_compiler::hir::HirType::Bool)),
+        "the flag should travel as a bool: {:?}",
+        layout.live_in_types
+    );
+    let site = layout.site_key();
+
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut backend = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+
+    backend.set_compile_tier(0);
+    backend.set_compile_bead_id(BEAD);
+    backend
+        .compile_function(func_id, &function)
+        .expect("tier-0 compile");
+    backend.finalize_definitions().expect("finalize tier 0");
+    let tier0 = backend.get_function_ptr(func_id).expect("tier-0 pointer");
+
+    backend.set_compile_tier(1);
+    backend
+        .compile_function(func_id, &function)
+        .expect("tier-1 compile");
+    backend.finalize_definitions().expect("finalize tier 1");
+    let (helper_site, helper_code) = backend
+        .take_pending_osr_helpers()
+        .into_iter()
+        .find(|(s, _)| *s == site)
+        .expect("tier 1 should emit a helper for the loop header");
+    osr::publish_helper(BEAD, helper_site, helper_code);
+
+    let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+    for (n, expected) in [(10, 300), (7, 10_000), (100, 3000)] {
+        assert_eq!(
+            f(n),
+            expected,
+            "count_flagged({n}) through the tier-1 helper should be {expected}"
         );
     }
 }

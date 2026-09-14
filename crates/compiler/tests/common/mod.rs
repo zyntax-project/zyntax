@@ -262,3 +262,304 @@ pub fn counted_loop() -> (HirFunction, HirId) {
 
     (function, header_id)
 }
+
+/// `count_flagged(n)`: ten steps, each adding `3 * n`, or 1000 when
+/// `n == 7`. The flag is a `bool` decided before the loop and read inside
+/// it, so it is a non-phi live-in of one byte, and it is read before the
+/// wider `3 * n` is, so it lies ahead of that in an OSR frame.
+///
+/// ```text
+/// entry:  flag = eq n, 7; k = mul n, 3; br header
+/// header: i = phi [0, entry], [i', latch]
+///         sum = phi [0, entry], [sum', latch]
+///         cmp = lt i, 10; brcond cmp, body, exit
+/// body:   brcond flag, big, small
+/// big:    s1 = add sum, 1000; br latch
+/// small:  s2 = add sum, k; br latch
+/// latch:  sum' = phi [s1, big], [s2, small]; i' = add i, 1; br header
+/// exit:   return sum
+/// ```
+pub fn flagged_counted_loop() -> (HirFunction, HirId) {
+    let i32_ty = HirType::I32;
+
+    let entry_id = HirId::new();
+    let header_id = HirId::new();
+    let body_id = HirId::new();
+    let big_id = HirId::new();
+    let small_id = HirId::new();
+    let latch_id = HirId::new();
+    let exit_id = HirId::new();
+
+    let n_id = HirId::new();
+    let zero_i_id = HirId::new();
+    let zero_sum_id = HirId::new();
+    let one_id = HirId::new();
+    let three_id = HirId::new();
+    let seven_id = HirId::new();
+    let ten_id = HirId::new();
+    let thousand_id = HirId::new();
+    let flag_id = HirId::new();
+    let k_id = HirId::new();
+    let phi_i = HirId::new();
+    let phi_sum = HirId::new();
+    let big_sum_id = HirId::new();
+    let small_sum_id = HirId::new();
+    let next_sum_id = HirId::new();
+    let next_i_id = HirId::new();
+    let cmp_id = HirId::new();
+
+    let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+    values.insert(
+        n_id,
+        HirValue {
+            id: n_id,
+            ty: i32_ty.clone(),
+            kind: HirValueKind::Parameter(0),
+            uses: Default::default(),
+            span: None,
+        },
+    );
+    for (id, v) in [
+        (zero_i_id, 0),
+        (zero_sum_id, 0),
+        (one_id, 1),
+        (three_id, 3),
+        (seven_id, 7),
+        (ten_id, 10),
+        (thousand_id, 1000),
+    ] {
+        values.insert(
+            id,
+            HirValue {
+                id,
+                ty: i32_ty.clone(),
+                kind: HirValueKind::Constant(HirConstant::I32(v)),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+    }
+    for id in [
+        k_id,
+        phi_i,
+        phi_sum,
+        big_sum_id,
+        small_sum_id,
+        next_sum_id,
+        next_i_id,
+    ] {
+        values.insert(
+            id,
+            HirValue {
+                id,
+                ty: i32_ty.clone(),
+                kind: HirValueKind::Instruction,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+    }
+    for id in [cmp_id, flag_id] {
+        values.insert(
+            id,
+            HirValue {
+                id,
+                ty: HirType::Bool,
+                kind: HirValueKind::Instruction,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+    }
+
+    let block =
+        |id, label: &str, phis, instructions, terminator, predecessors, successors| HirBlock {
+            id,
+            label: Some(InternedString::new_global(label)),
+            phis,
+            instructions,
+            terminator,
+            dominance_frontier: Default::default(),
+            predecessors,
+            successors,
+        };
+
+    let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+    blocks.insert(
+        entry_id,
+        block(
+            entry_id,
+            "entry",
+            vec![],
+            vec![
+                // A compare runs at its operands' type; its value is the
+                // bool registered above.
+                HirInstruction::Binary {
+                    op: BinaryOp::Eq,
+                    result: flag_id,
+                    ty: i32_ty.clone(),
+                    left: n_id,
+                    right: seven_id,
+                },
+                HirInstruction::Binary {
+                    op: BinaryOp::Mul,
+                    result: k_id,
+                    ty: i32_ty.clone(),
+                    left: n_id,
+                    right: three_id,
+                },
+            ],
+            HirTerminator::Branch { target: header_id },
+            vec![],
+            vec![header_id],
+        ),
+    );
+    blocks.insert(
+        header_id,
+        block(
+            header_id,
+            "header",
+            vec![
+                HirPhi {
+                    result: phi_i,
+                    ty: i32_ty.clone(),
+                    incoming: vec![(zero_i_id, entry_id), (next_i_id, latch_id)],
+                },
+                HirPhi {
+                    result: phi_sum,
+                    ty: i32_ty.clone(),
+                    incoming: vec![(zero_sum_id, entry_id), (next_sum_id, latch_id)],
+                },
+            ],
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: cmp_id,
+                ty: i32_ty.clone(),
+                left: phi_i,
+                right: ten_id,
+            }],
+            HirTerminator::CondBranch {
+                condition: cmp_id,
+                true_target: body_id,
+                false_target: exit_id,
+            },
+            vec![entry_id, latch_id],
+            vec![body_id, exit_id],
+        ),
+    );
+    blocks.insert(
+        body_id,
+        block(
+            body_id,
+            "body",
+            vec![],
+            vec![],
+            HirTerminator::CondBranch {
+                condition: flag_id,
+                true_target: big_id,
+                false_target: small_id,
+            },
+            vec![header_id],
+            vec![big_id, small_id],
+        ),
+    );
+    blocks.insert(
+        big_id,
+        block(
+            big_id,
+            "big",
+            vec![],
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: big_sum_id,
+                ty: i32_ty.clone(),
+                left: phi_sum,
+                right: thousand_id,
+            }],
+            HirTerminator::Branch { target: latch_id },
+            vec![body_id],
+            vec![latch_id],
+        ),
+    );
+    blocks.insert(
+        small_id,
+        block(
+            small_id,
+            "small",
+            vec![],
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: small_sum_id,
+                ty: i32_ty.clone(),
+                left: phi_sum,
+                right: k_id,
+            }],
+            HirTerminator::Branch { target: latch_id },
+            vec![body_id],
+            vec![latch_id],
+        ),
+    );
+    blocks.insert(
+        latch_id,
+        block(
+            latch_id,
+            "latch",
+            vec![HirPhi {
+                result: next_sum_id,
+                ty: i32_ty.clone(),
+                incoming: vec![(big_sum_id, big_id), (small_sum_id, small_id)],
+            }],
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: next_i_id,
+                ty: i32_ty.clone(),
+                left: phi_i,
+                right: one_id,
+            }],
+            HirTerminator::Branch { target: header_id },
+            vec![big_id, small_id],
+            vec![header_id],
+        ),
+    );
+    blocks.insert(
+        exit_id,
+        block(
+            exit_id,
+            "exit",
+            vec![],
+            vec![],
+            HirTerminator::Return {
+                values: vec![phi_sum],
+            },
+            vec![header_id],
+            vec![],
+        ),
+    );
+
+    let signature = HirFunctionSignature {
+        params: vec![HirParam {
+            id: n_id,
+            name: InternedString::new_global("n"),
+            ty: i32_ty.clone(),
+            attributes: Default::default(),
+            ownership: Default::default(),
+        }],
+        returns: vec![i32_ty],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: true,
+    };
+
+    let mut function = HirFunction::new(InternedString::new_global("count_flagged"), signature);
+    function.values = values;
+    function.blocks = blocks;
+    function.entry_block = entry_id;
+    function.is_external = false;
+
+    (function, header_id)
+}
