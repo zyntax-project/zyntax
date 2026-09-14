@@ -67,6 +67,7 @@ use crate::hir::{
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Maximum number of instructions a single-block (leaf) callee can
 /// have to be eligible for inlining. Calibrated to match small leaf
@@ -185,15 +186,24 @@ fn count_insts(function: &HirFunction) -> usize {
 pub fn run_module(module: &mut HirModule) -> InlineStats {
     let mut total = InlineStats::default();
 
+    // Callees are read from a snapshot while the caller is mutated. A
+    // function this pass leaves alone never changes, so it is copied
+    // once; the functions being optimised are copied afresh each round.
+    let optimizing: HashSet<HirId> = module.ids_to_optimize().into_iter().collect();
+    let stable: HashMap<HirId, Arc<HirFunction>> = module
+        .functions
+        .iter()
+        .filter(|(id, _)| !optimizing.contains(id))
+        .map(|(id, f)| (*id, Arc::new(f.clone())))
+        .collect();
+
     for _ in 0..8 {
-        // Snapshot callees we might inline (their bodies are read
-        // while the caller's block is mutated; we work from a
-        // detached snapshot so the borrow checker is happy).
-        let callee_snapshot: HashMap<HirId, HirFunction> = module
-            .functions
-            .iter()
-            .map(|(id, f)| (*id, f.clone()))
-            .collect();
+        let mut callee_snapshot = stable.clone();
+        for id in &optimizing {
+            if let Some(f) = module.functions.get(id) {
+                callee_snapshot.insert(*id, Arc::new(f.clone()));
+            }
+        }
 
         // Functions that reach each other through calls are one cycle;
         // inlining within a cycle copies the cycle into itself round
@@ -650,7 +660,7 @@ fn blocks_in_loops(f: &HirFunction) -> HashSet<HirId> {
 /// A loop with no way out but a cold call counts, as do its blocks.
 fn blocks_leading_to_cold(
     f: &HirFunction,
-    callees: &HashMap<HirId, HirFunction>,
+    callees: &HashMap<HirId, Arc<HirFunction>>,
 ) -> HashSet<HirId> {
     let calls_cold = |block: &HirBlock| {
         block.instructions.iter().any(|inst| {
@@ -699,7 +709,7 @@ fn blocks_leading_to_cold(
 /// The strongly connected component of each function in the graph of
 /// direct calls, so a caller and a callee in one component are known to
 /// reach each other.
-fn call_cycles(functions: &HashMap<HirId, HirFunction>) -> HashMap<HirId, usize> {
+fn call_cycles(functions: &HashMap<HirId, Arc<HirFunction>>) -> HashMap<HirId, usize> {
     let mut callees_of: HashMap<HirId, Vec<HirId>> = HashMap::new();
     for (id, f) in functions {
         let mut out = Vec::new();
@@ -781,7 +791,7 @@ fn call_cycles(functions: &HashMap<HirId, HirFunction>) -> HashMap<HirId, usize>
 fn inline_in_function(
     caller: &mut HirFunction,
     caller_id: HirId,
-    callees: &HashMap<HirId, HirFunction>,
+    callees: &HashMap<HirId, Arc<HirFunction>>,
     cycles: &HashMap<HirId, usize>,
 ) -> InlineStats {
     let mut stats = InlineStats::default();

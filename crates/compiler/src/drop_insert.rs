@@ -140,7 +140,7 @@ impl DropStats {
 /// Run the drop-site pass over every function in `module`.
 pub fn run_module(module: &mut HirModule) -> DropStats {
     let mut total = DropStats::default();
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let facts = ModuleFacts::build(module);
     let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
     if tprof {
@@ -154,7 +154,7 @@ pub fn run_module(module: &mut HirModule) -> DropStats {
         if func.is_external {
             continue;
         }
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         total.combine(run_function(func, &facts));
         if tprof {
             times.push((
@@ -272,7 +272,7 @@ impl ModuleFacts {
         // argument returns its own parameter, so this grows until it
         // stops; owned-returning functions likewise.
         let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         let mut rounds = 0;
         loop {
             rounds += 1;
@@ -292,7 +292,7 @@ impl ModuleFacts {
         // Owned-returning functions, to a fixed point. A function's
         // answer reads only its callees' facts, so after the first pass
         // only the callers of whoever changed are asked again.
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         let mut rounds = 0;
         let callees = callees_of(module);
         let mut dirty: Vec<HirId> = module

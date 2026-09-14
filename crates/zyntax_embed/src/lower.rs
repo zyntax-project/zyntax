@@ -52,6 +52,17 @@ pub(crate) fn lower_typed_program(
     use zyntax_typed_ast::type_registry::*;
     use zyntax_typed_ast::TypedDeclaration;
 
+    let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+    let mut at = std::time::Instant::now();
+    let mut lap = |name: &str, at: &mut std::time::Instant| {
+        if trace {
+            eprintln!(
+                "[LOWER] {name:<20} {:8.2} ms",
+                at.elapsed().as_secs_f64() * 1000.0
+            );
+            *at = std::time::Instant::now();
+        }
+    };
     // Stateful handlers need their state struct, ctor and implicit
     // `self` synthesized before the registry snapshot.
     crate::runtime::synthesize_handler_state(&mut program);
@@ -112,6 +123,7 @@ pub(crate) fn lower_typed_program(
     }
 
     let mut type_registry = program.type_registry.clone();
+    lap("registry", &mut at);
 
     // Imports first, so what they declare is in the program before
     // anything resolves against it. Modules that arrive already lowered
@@ -128,9 +140,12 @@ pub(crate) fn lower_typed_program(
         &mut prelowered,
     )?;
 
+    lap("imports", &mut at);
+
     crate::import_chain::process_extern_declarations_mut(&program, &mut type_registry)?;
     crate::import_chain::resolve_unresolved_types(&mut program, &type_registry);
     program.type_registry = type_registry;
+    lap("externs+resolve", &mut at);
 
     zyntax_compiler::register_impl_blocks(&mut program)
         .map_err(|e| RuntimeError::Execution(format!("Failed to register impl blocks: {:?}", e)))?;
@@ -140,6 +155,7 @@ pub(crate) fn lower_typed_program(
     zyntax_compiler::register_impl_blocks(&mut program).map_err(|e| {
         RuntimeError::Execution(format!("Failed to register generated impl blocks: {:?}", e))
     })?;
+    lap("impl blocks", &mut at);
 
     let arena = AstArena::new();
     // The module a program lowers under is the file it came from.
@@ -179,6 +195,7 @@ pub(crate) fn lower_typed_program(
         })?;
         let _result = engine.run(&mut program, &type_registry);
     }
+    lap("pattern engine", &mut at);
 
     let mut lowering_ctx = LoweringContext::new(
         module_name,
@@ -193,9 +210,11 @@ pub(crate) fn lower_typed_program(
         .map_err(|e| RuntimeError::Execution(format!("Lowering error: {:?}", e)))?;
 
     lowering_ctx.display_diagnostics(&program);
+    lap("lower_program", &mut at);
 
     zyntax_compiler::monomorphize_module(&mut module)
         .map_err(|e| RuntimeError::Execution(format!("Monomorphization error: {:?}", e)))?;
+    lap("monomorphize", &mut at);
 
     Ok(Lowered {
         module,

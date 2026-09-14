@@ -544,6 +544,7 @@ impl TieredRuntime {
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&module, "post-opt-tiered-compile_module");
 
+        let started = std::time::Instant::now();
         // Store function name -> ID mapping and signatures (resolve InternedString to actual string)
         for (id, func) in &module.functions {
             if let Some(name) = func.name.resolve_global() {
@@ -1267,8 +1268,17 @@ impl TieredRuntime {
             self.event_sink.as_ref(),
         );
         let fiber_decls = collect_fiber_decls(&program);
+        let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+        let started = std::time::Instant::now();
         let (mut hir_module, entered) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
+        if trace {
+            eprintln!(
+                "[COMPILE] lower              {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let started = std::time::Instant::now();
         hir_module.automatic_release = self.automatic_release;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
@@ -1280,6 +1290,12 @@ impl TieredRuntime {
             .filter(|f| !f.is_external)
             .filter_map(|f| f.name.resolve_global())
             .collect();
+        if trace {
+            eprintln!(
+                "[COMPILE] krio passes        {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         self.compile_module_entered(hir_module, entered)?;
         let _ = self.apply_fiber_decls(fiber_decls);

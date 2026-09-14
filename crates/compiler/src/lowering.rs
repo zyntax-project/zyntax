@@ -2511,6 +2511,32 @@ impl LoweringContext {
 
     /// Lower a declaration
     fn lower_declaration(&mut self, decl: &TypedNode<TypedDeclaration>) -> CompilerResult<()> {
+        let timing = std::env::var_os("ZYNTAX_TRACE_LOWER_DECLS").is_some();
+        let started = web_time::Instant::now();
+        let result = self.lower_declaration_inner(decl);
+        if timing {
+            let (kind, name) = match &decl.node {
+                TypedDeclaration::Function(f) => {
+                    ("function", f.name.resolve_global().unwrap_or_default())
+                }
+                TypedDeclaration::Class(c) => {
+                    ("class", c.name.resolve_global().unwrap_or_default())
+                }
+                TypedDeclaration::Extern(_) => ("extern", String::new()),
+                _ => ("other", String::new()),
+            };
+            eprintln!(
+                "[LOWER-DECL] {:8.3} ms {kind} {name}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        result
+    }
+
+    fn lower_declaration_inner(
+        &mut self,
+        decl: &TypedNode<TypedDeclaration>,
+    ) -> CompilerResult<()> {
         match &decl.node {
             TypedDeclaration::Function(func) => {
                 // Generic functions are allowed to fail here: their
