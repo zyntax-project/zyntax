@@ -490,6 +490,20 @@ pub fn parse_program_with(
             Span::new(0, 0),
         ));
     }
+    // Which items get a variant that trusts its instance-typed
+    // parameters, and which never return None, are read at every call
+    // site, so both are settled before any body is lowered.
+    inferred.trusted = items
+        .iter()
+        .filter(|item| {
+            inferred
+                .funcs
+                .get(&item.name)
+                .is_some_and(|sig| types::has_instance_params(sig, item.class.is_some()))
+        })
+        .map(|item| item.name.clone())
+        .collect();
+    inferred.returns_instance = types::returning_instances(&inferred, &items);
     // The functions are lowered twice. The first time teaches which of
     // them can raise; the second time, a call to one that never does is
     // not followed by a check. Only the second lowering is kept.
@@ -736,36 +750,45 @@ fn lower_items(
 ) -> Result<Vec<TypedNode<TypedDeclaration>>> {
     let mut declarations = Vec::with_capacity(items.len());
     for item in items {
-        let sig = inferred.funcs[&item.name].clone();
-        lower::set_current_file(inferred.file_of(item.module.as_deref()));
-        let locals = types::infer_locals(inferred, &sig, &item.def.body);
-        let scope = scope::Scope::of_function(item.def);
-        let mut lowerer = lower::Lowerer::new(
-            inferred,
-            &item.name,
-            sig,
-            locals,
-            &scope,
-            Vec::new(),
-            std::collections::HashMap::new(),
-        );
-        lowerer.class = item.class;
-        let func = lowerer.function_named(item.def, &item.name).map_err(|e| {
-            match item.module.as_deref() {
-                Some(m) => e.in_module(m),
-                None => e,
-            }
-        })?;
-        inferred
-            .raise_facts
-            .borrow_mut()
-            .insert(item.name.clone(), lowerer.raise_fact());
-        declarations.push(TypedNode::new(
-            TypedDeclaration::Function(func),
-            Type::Unknown,
-            span_of(item.def),
-        ));
-        lower::set_current_file(0);
+        // The item itself, and the variant trusting its instance-typed
+        // parameters where it has any.
+        let mut variants = vec![(item.name.clone(), false)];
+        if inferred.trusted.contains(&item.name) {
+            variants.push((types::trusted_name(&item.name), true));
+        }
+        for (name, trusted) in variants {
+            let sig = inferred.funcs[&item.name].clone();
+            lower::set_current_file(inferred.file_of(item.module.as_deref()));
+            let locals = types::infer_locals(inferred, &sig, &item.def.body);
+            let scope = scope::Scope::of_function(item.def);
+            let mut lowerer = lower::Lowerer::new(
+                inferred,
+                &item.name,
+                sig,
+                locals,
+                &scope,
+                Vec::new(),
+                std::collections::HashMap::new(),
+            );
+            lowerer.class = item.class;
+            lowerer.trusted = trusted;
+            let func = lowerer.function_named(item.def, &name).map_err(|e| {
+                match item.module.as_deref() {
+                    Some(m) => e.in_module(m),
+                    None => e,
+                }
+            })?;
+            inferred
+                .raise_facts
+                .borrow_mut()
+                .insert(name, lowerer.raise_fact());
+            declarations.push(TypedNode::new(
+                TypedDeclaration::Function(func),
+                Type::Unknown,
+                span_of(item.def),
+            ));
+            lower::set_current_file(0);
+        }
     }
     Ok(declarations)
 }

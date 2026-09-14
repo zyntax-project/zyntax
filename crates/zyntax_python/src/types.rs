@@ -207,6 +207,101 @@ pub(crate) struct Module {
     /// Functions of the program that never leave with an exception
     /// pending, so a call to one needs no check after it.
     pub(crate) non_raising: std::collections::HashSet<String>,
+    /// Items with a parameter typed as an instance, which are lowered a
+    /// second time under [`trusted_name`] with those parameters taken
+    /// to be instances; a call whose every such argument is known to be
+    /// one goes there.
+    pub(crate) trusted: std::collections::HashSet<String>,
+    /// Functions whose result is an instance and never None; see
+    /// [`returning_instances`].
+    pub(crate) returns_instance: std::collections::HashSet<String>,
+}
+
+/// The name of the variant of `name` whose instance-typed parameters
+/// are trusted not to be None.
+pub(crate) fn trusted_name(name: &str) -> String {
+    format!("{name}$trusted")
+}
+
+/// Whether `sig` has a parameter typed as an instance, `self` aside.
+pub(crate) fn has_instance_params(sig: &Sig, is_method: bool) -> bool {
+    sig.params
+        .iter()
+        .skip(usize::from(is_method))
+        .any(|(_, t)| matches!(t, Ty::Class(_)))
+}
+
+/// The items whose result is an instance on every path: each `return`
+/// hands back a constructor call, `self`, or the result of another such
+/// item, and the body cannot fall off its end. Decided together, as the
+/// greatest set consistent with itself.
+pub(crate) fn returning_instances(
+    module: &Module,
+    items: &[Item<'_>],
+) -> std::collections::HashSet<String> {
+    fn returns_of<'a>(body: &'a [py::Stmt], out: &mut Vec<Option<&'a py::Expr>>) {
+        use ruff_python_ast::visitor::{walk_stmt, Visitor};
+        struct Returns<'a, 'b> {
+            out: &'b mut Vec<Option<&'a py::Expr>>,
+        }
+        impl<'a> Visitor<'a> for Returns<'a, '_> {
+            fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+                match stmt {
+                    py::Stmt::Return(r) => self.out.push(r.value.as_deref()),
+                    // A nested function's returns are its own.
+                    py::Stmt::FunctionDef(_) | py::Stmt::ClassDef(_) => {}
+                    other => walk_stmt(self, other),
+                }
+            }
+        }
+        for s in body {
+            Returns { out }.visit_stmt(s);
+        }
+    }
+    let mut quiet: std::collections::HashSet<String> = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                module.funcs.get(&item.name).map(|s| s.ret),
+                Some(Ty::Class(_))
+            ) && terminates(&item.def.body)
+        })
+        .map(|item| item.name.clone())
+        .collect();
+    loop {
+        let demoted: Vec<String> = items
+            .iter()
+            .filter(|item| quiet.contains(&item.name))
+            .filter(|item| {
+                let mut returns = Vec::new();
+                returns_of(&item.def.body, &mut returns);
+                let self_name = item
+                    .class
+                    .and_then(|_| item.def.parameters.iter_non_variadic_params().next())
+                    .map(|p| p.parameter.name.to_string());
+                returns.is_empty()
+                    || returns.iter().any(|r| match r {
+                        None => true,
+                        Some(py::Expr::Call(c)) => match &*c.func {
+                            py::Expr::Name(n) => {
+                                let n = n.id.as_str();
+                                !(module.class_index.contains_key(n) || quiet.contains(n))
+                            }
+                            _ => true,
+                        },
+                        Some(py::Expr::Name(n)) => self_name.as_deref() != Some(n.id.as_str()),
+                        Some(_) => true,
+                    })
+            })
+            .map(|item| item.name.clone())
+            .collect();
+        if demoted.is_empty() {
+            return quiet;
+        }
+        for n in demoted {
+            quiet.remove(&n);
+        }
+    }
 }
 
 /// How a function of the program can come to raise: on its own (a
@@ -1671,7 +1766,7 @@ fn infer_locals_with(
 /// Whether control never reaches the end of `stmts`: some statement in
 /// the list leaves the function on every path. Anything not shown to
 /// leave is taken to fall through.
-fn terminates(stmts: &[py::Stmt]) -> bool {
+pub(crate) fn terminates(stmts: &[py::Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         py::Stmt::Return(_) | py::Stmt::Raise(_) => true,
         py::Stmt::If(i) => {

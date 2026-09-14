@@ -178,6 +178,14 @@ enum Produce<'a> {
     Yield(&'a py::Expr),
 }
 
+/// Something a test can settle the nullness of: a variable, or a field
+/// of a variable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    Var(InternedString),
+    Field(InternedString, String),
+}
+
 /// A lowered expression and the static type it has.
 #[derive(Clone)]
 pub(crate) struct Val {
@@ -509,6 +517,19 @@ pub(crate) struct Lowerer<'m> {
     /// at every compound statement, so it never crosses a branch or a
     /// loop back edge.
     nonnull: std::collections::HashSet<InternedString>,
+    /// Variables that hold an instance for the whole function: assigned
+    /// a constructor's result before anything reads them, and assigned
+    /// nothing else anywhere; see [`Self::always_instances`].
+    always_instance: std::collections::HashSet<InternedString>,
+    /// Fields `v.f` of a known instance `v` known not to be None where
+    /// the lowering stands, from a test the control flow has settled.
+    /// Cleared with `nonnull`, at any call (which may store to the
+    /// field), and at a store to a field of that name.
+    nonnull_fields: std::collections::HashSet<(InternedString, String)>,
+    /// Whether this is the variant of the function that takes its
+    /// instance-typed parameters to be instances; see
+    /// [`types::trusted_name`].
+    pub(crate) trusted: bool,
     /// Variables shared with nested functions. Each lives in a
     /// one-element list, the cell, that every function using it holds.
     cells: HashMap<String, InternedString>,
@@ -613,6 +634,9 @@ impl<'m> Lowerer<'m> {
             temps: 0,
             hoisted: Vec::new(),
             nonnull: std::collections::HashSet::new(),
+            always_instance: std::collections::HashSet::new(),
+            nonnull_fields: std::collections::HashSet::new(),
+            trusted: false,
             guards: true,
             cells: cells
                 .into_iter()
@@ -1236,6 +1260,7 @@ impl<'m> Lowerer<'m> {
         let span = span_of(f);
         let mut statements = prologue;
         statements.extend(self.cell_prologue(span));
+        self.always_instance = self.always_instances(&f.body);
         for s in &f.body {
             self.stmt(s, &mut statements)?;
         }
@@ -1662,11 +1687,29 @@ impl<'m> Lowerer<'m> {
         );
         if compound {
             self.nonnull.clear();
+            self.nonnull_fields.clear();
         }
         let mut own = Vec::new();
         self.stmt_into(s, &mut own)?;
         if compound {
             self.nonnull.clear();
+            self.nonnull_fields.clear();
+            // `if x is None: return` settles `x` for what follows: the
+            // only way past is the branch the test failed in.
+            if let py::Stmt::If(i) = s {
+                let leaves = |body: &[py::Stmt]| types::terminates(body);
+                if let Some((place, holds_means_instance)) = self.instance_test(&i.test) {
+                    let then_leaves = leaves(&i.body);
+                    let else_leaves = i.elif_else_clauses.len() == 1
+                        && i.elif_else_clauses[0].test.is_none()
+                        && leaves(&i.elif_else_clauses[0].body);
+                    if (then_leaves && !holds_means_instance && i.elif_else_clauses.is_empty())
+                        || (else_leaves && holds_means_instance)
+                    {
+                        self.assume_place(&place);
+                    }
+                }
+            }
         }
         // Whatever the statement's expressions hoisted runs first.
         out.append(&mut self.hoisted);
@@ -2191,7 +2234,19 @@ impl<'m> Lowerer<'m> {
         let cond = self.expr(test)?;
         let condition = Box::new(self.truthy(cond));
         out.append(&mut self.hoisted);
+        // What the test settles holds in the branch it selects.
+        let settled = self.instance_test(test);
+        let vars = self.nonnull.clone();
+        let fields = self.nonnull_fields.clone();
+        if let Some((place, true)) = &settled {
+            self.assume_place(place);
+        }
         let then_block = self.block(body, span)?;
+        self.nonnull = vars.clone();
+        self.nonnull_fields = fields.clone();
+        if let Some((place, false)) = &settled {
+            self.assume_place(place);
+        }
         let else_block = match rest.split_first() {
             None => None,
             Some((clause, tail)) => {
@@ -2209,6 +2264,8 @@ impl<'m> Lowerer<'m> {
                 }
             }
         };
+        self.nonnull = vars;
+        self.nonnull_fields = fields;
         out.push(TypedNode::new(
             TypedStatement::If(TypedIf {
                 condition,
@@ -4299,11 +4356,12 @@ impl<'m> Lowerer<'m> {
                 if sig.ret == Ty::Gen {
                     return Ok(self.start_generator(name, &sig, lowered, Vec::new(), span));
                 }
+                let target = self.call_target(name, &sig.params, &lowered);
                 let v = Val {
-                    node: call(name, lowered, sig.ret, span),
+                    node: call(&target, lowered, sig.ret, span),
                     ty: sig.ret,
                 };
-                return Ok(self.guard_named(v, name, span));
+                return Ok(self.guard_named(v, &target, span));
             }
             if name == "print" {
                 return self.print(args, keywords, span);
@@ -5772,15 +5830,273 @@ impl<'m> Lowerer<'m> {
                         .params
                         .first()
                         .is_some_and(|(p, _)| intern(p) == *name);
-                is_self || self.nonnull.contains(name)
+                // The trusted variant takes every instance-typed parameter
+                // to be one.
+                let trusted_param = self.trusted
+                    && self
+                        .sig
+                        .params
+                        .iter()
+                        .any(|(p, t)| matches!(t, Ty::Class(_)) && intern(p) == *name);
+                is_self
+                    || trusted_param
+                    || self.nonnull.contains(name)
+                    || self.always_instance.contains(name)
             }
             TypedExpression::Call(c) => match &c.callee.node {
-                TypedExpression::Variable(callee) => {
-                    callee.resolve_global().is_some_and(|n| n.ends_with("$new"))
-                }
+                TypedExpression::Variable(callee) => callee.resolve_global().is_some_and(|n| {
+                    n.ends_with("$new")
+                        || self.module.returns_instance.contains(&n)
+                        || n.strip_suffix("$trusted")
+                            .is_some_and(|base| self.module.returns_instance.contains(base))
+                }),
+                _ => false,
+            },
+            // An upcast of an instance is the same instance.
+            TypedExpression::Cast(c) => {
+                matches!(c.expr.ty, Type::Named { .. }) && self.known_instance(&c.expr)
+            }
+            TypedExpression::Field(f) => match &f.object.node {
+                TypedExpression::Variable(v) => self
+                    .nonnull_fields
+                    .iter()
+                    .any(|(var, field)| var == v && intern(field) == f.field),
                 _ => false,
             },
             _ => false,
+        }
+    }
+
+    /// What a test settles about an instance when it holds (`true`) or
+    /// fails (`false`): `x is None`, `x is not None`, `x`, `not x`, for
+    /// `x` a variable or a field of one. Returns the place and whether
+    /// the test holding means the place is an instance.
+    fn instance_test(&self, test: &py::Expr) -> Option<(Place, bool)> {
+        match test {
+            py::Expr::Compare(c) if c.ops.len() == 1 && c.comparators.len() == 1 => {
+                let holds_means_instance = match c.ops[0] {
+                    py::CmpOp::Is => false,
+                    py::CmpOp::IsNot => true,
+                    _ => return None,
+                };
+                let (place, other) = if matches!(c.comparators[0], py::Expr::NoneLiteral(_)) {
+                    (&*c.left, &c.comparators[0])
+                } else if matches!(&*c.left, py::Expr::NoneLiteral(_)) {
+                    (&c.comparators[0], &*c.left)
+                } else {
+                    return None;
+                };
+                let _ = other;
+                Some((self.place_of(place)?, holds_means_instance))
+            }
+            py::Expr::UnaryOp(u) if matches!(u.op, py::UnaryOp::Not) => {
+                let (place, holds) = self.instance_test(&u.operand)?;
+                Some((place, !holds))
+            }
+            other => {
+                // The truth of an instance is its being one, unless the
+                // class says otherwise.
+                let place = self.place_of(other)?;
+                let k = match self.place_ty(&place) {
+                    Ty::Class(k) => k as usize,
+                    _ => return None,
+                };
+                if self.module.method_sig(k, "__bool__").is_some()
+                    || self.module.method_sig(k, "__len__").is_some()
+                {
+                    return None;
+                }
+                Some((place, true))
+            }
+        }
+    }
+
+    /// A variable, or a field of a variable holding an instance.
+    fn place_of(&self, e: &py::Expr) -> Option<Place> {
+        match e {
+            py::Expr::Name(n) if self.is_variable(n.id.as_str()) => {
+                Some(Place::Var(intern(n.id.as_str())))
+            }
+            py::Expr::Attribute(a) => match &*a.value {
+                py::Expr::Name(n) if self.is_variable(n.id.as_str()) => {
+                    Some(Place::Field(intern(n.id.as_str()), a.attr.to_string()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn place_ty(&self, place: &Place) -> Ty {
+        match place {
+            Place::Var(v) => v
+                .resolve_global()
+                .map(|n| self.var_ty(&n))
+                .unwrap_or(Ty::Object),
+            Place::Field(v, f) => {
+                let Some(n) = v.resolve_global() else {
+                    return Ty::Object;
+                };
+                match self.var_ty(&n) {
+                    Ty::Class(k) => self
+                        .module
+                        .field(k as usize, f)
+                        .map(|(_, t)| t)
+                        .unwrap_or(Ty::Object),
+                    _ => Ty::Object,
+                }
+            }
+        }
+    }
+
+    /// Take `place` to hold an instance from here on. A field counts
+    /// only while its object is known to be one.
+    fn assume_place(&mut self, place: &Place) {
+        match place {
+            Place::Var(v) => {
+                self.nonnull.insert(*v);
+            }
+            Place::Field(v, f) => {
+                let object = var(*v, Ty::Object, Span::new(0, 0));
+                if self.known_instance(&object) {
+                    self.nonnull_fields.insert((*v, f.clone()));
+                }
+            }
+        }
+    }
+
+    /// The variables of `body` that hold an instance throughout: each is
+    /// first mentioned by a top-level `x = C(...)` and every other
+    /// assignment to it, anywhere in the body, is another constructor
+    /// call at the top level.
+    fn always_instances(&self, body: &[py::Stmt]) -> std::collections::HashSet<InternedString> {
+        use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+        struct Names {
+            mentioned: std::collections::HashSet<String>,
+            stored: std::collections::HashSet<String>,
+        }
+        impl<'a> Visitor<'a> for Names {
+            fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+                match stmt {
+                    py::Stmt::FunctionDef(f) => {
+                        self.stored.insert(f.name.to_string());
+                        // A nested function may write through nonlocal.
+                        walk_stmt(self, stmt);
+                    }
+                    py::Stmt::ClassDef(c) => {
+                        self.stored.insert(c.name.to_string());
+                        walk_stmt(self, stmt);
+                    }
+                    py::Stmt::Global(g) => {
+                        self.stored.extend(g.names.iter().map(|n| n.to_string()));
+                    }
+                    py::Stmt::Nonlocal(g) => {
+                        self.stored.extend(g.names.iter().map(|n| n.to_string()));
+                    }
+                    py::Stmt::Import(i) => {
+                        self.stored
+                            .extend(i.names.iter().map(|a| a.name.to_string()));
+                    }
+                    py::Stmt::ImportFrom(i) => {
+                        self.stored
+                            .extend(i.names.iter().map(|a| a.name.to_string()));
+                    }
+                    py::Stmt::Try(t) => {
+                        for h in &t.handlers {
+                            let py::ExceptHandler::ExceptHandler(h) = h;
+                            if let Some(n) = &h.name {
+                                self.stored.insert(n.to_string());
+                            }
+                        }
+                        walk_stmt(self, stmt);
+                    }
+                    _ => walk_stmt(self, stmt),
+                }
+            }
+            fn visit_expr(&mut self, expr: &'a py::Expr) {
+                if let py::Expr::Name(n) = expr {
+                    self.mentioned.insert(n.id.to_string());
+                    if !matches!(n.ctx, py::ExprContext::Load) {
+                        self.stored.insert(n.id.to_string());
+                    }
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let constructor_of = |value: &py::Expr| -> bool {
+            match value {
+                py::Expr::Call(c) => match &*c.func {
+                    py::Expr::Name(n) => {
+                        self.module.class_index.contains_key(n.id.as_str())
+                            && !self.is_variable(n.id.as_str())
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut disqualified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for s in body {
+            let mut names = Names {
+                mentioned: Default::default(),
+                stored: Default::default(),
+            };
+            names.visit_stmt(s);
+            let constructed = match s {
+                py::Stmt::Assign(a) if a.targets.len() == 1 && constructor_of(&a.value) => {
+                    match &a.targets[0] {
+                        py::Expr::Name(n) => Some(n.id.to_string()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(name) = &constructed {
+                // The value's own mentions come first; the target is
+                // bound after.
+                names.mentioned.remove(name);
+                names.stored.remove(name);
+                if !seen.contains(name) {
+                    candidates.insert(name.clone());
+                }
+                seen.insert(name.clone());
+            }
+            // Anything else assigned in this statement is not a
+            // constructor result; anything mentioned before its
+            // constructor assignment was read unbound or from elsewhere.
+            disqualified.extend(names.stored.iter().cloned());
+            for m in names.mentioned {
+                if !seen.contains(&m) {
+                    seen.insert(m.clone());
+                    disqualified.insert(m);
+                }
+            }
+        }
+        candidates
+            .difference(&disqualified)
+            .filter(|n| matches!(self.var_ty(n), Ty::Class(_)))
+            .filter(|n| !self.cells.contains_key(n.as_str()))
+            .map(|n| intern(n))
+            .collect()
+    }
+
+    /// The function a call to `name` with `args` goes to: the trusted
+    /// variant when there is one and every instance-typed argument is
+    /// known to be an instance, `name` itself otherwise.
+    fn call_target(&self, name: &str, params: &[(String, Ty)], args: &[Node]) -> String {
+        if !self.module.trusted.contains(name) {
+            return name.to_string();
+        }
+        let all_known = params
+            .iter()
+            .zip(args)
+            .all(|((_, t), a)| !matches!(t, Ty::Class(_)) || self.known_instance(a));
+        if all_known {
+            types::trusted_name(name)
+        } else {
+            name.to_string()
         }
     }
 
@@ -6012,10 +6328,30 @@ impl<'m> Lowerer<'m> {
         args: Vec<Node>,
         span: Span,
     ) -> Option<Val> {
-        let (sig, _) = self.module.method_sig(k, method)?;
+        Some(self.invoke_targeted(k, method, receiver, args, span)?.0)
+    }
+
+    /// [`Self::invoke`], also naming the function called, which a
+    /// check after the call is attributed to.
+    fn invoke_targeted(
+        &mut self,
+        k: usize,
+        method: &str,
+        receiver: Node,
+        args: Vec<Node>,
+        span: Span,
+    ) -> Option<(Val, String)> {
+        let (sig, fn_name) = self.module.method_sig(k, method)?;
         let ret = sig.ret;
+        let params = without_self(sig).params;
         let owner = self.module.method_owner(k, method)?;
         let target = self.invoke_target(k, method)?;
+        // A method nothing overrides may go to its trusted variant.
+        let target = if target == fn_name {
+            self.call_target(&fn_name, &params, &args)
+        } else {
+            target
+        };
         let receiver = self.coerce(
             Val {
                 node: receiver,
@@ -6025,10 +6361,13 @@ impl<'m> Lowerer<'m> {
         );
         let mut all = vec![receiver];
         all.extend(args);
-        Some(Val {
-            node: call(&target, all, ret, span),
-            ty: ret,
-        })
+        Some((
+            Val {
+                node: call(&target, all, ret, span),
+                ty: ret,
+            },
+            target,
+        ))
     }
 
     /// A dunder method call on typed operands, when the class chain
@@ -6051,11 +6390,10 @@ impl<'m> Lowerer<'m> {
             .zip(param_tys)
             .map(|(a, t)| self.coerce(a, t))
             .collect();
-        let v = self.invoke(k, method, receiver, args, span)?;
+        let (v, target) = self.invoke_targeted(k, method, receiver, args, span)?;
         if !self.guards {
             return Some(v);
         }
-        let target = self.invoke_target(k, method)?;
         Some(self.guard_named(v, &target, span))
     }
 
@@ -6083,11 +6421,8 @@ impl<'m> Lowerer<'m> {
         let sig = without_self(sig);
         let receiver = self.checked_instance(receiver, method, span);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
-        let v = self
-            .invoke(k, method, receiver.node, lowered, span)
-            .expect("the method was just found");
-        let target = self
-            .invoke_target(k, method)
+        let (v, target) = self
+            .invoke_targeted(k, method, receiver.node, lowered, span)
             .expect("the method was just found");
         Ok(self.guard_named(v, &target, span))
     }
