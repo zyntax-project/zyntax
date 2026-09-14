@@ -1,6 +1,2 @@
 # Programs whose memory grows with the iteration count, and the
 # git-bug issue tracking why. One per line: `<file> <issue>`.
-closures.py 1ee4ce1
-dicts.py c2b9751
-generators.py aa5cdf2
-tree.py b94b4cb

@@ -231,8 +231,9 @@ pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {
     // No Python program releases anything itself, so the compiler
-    // releases what it can prove dead.
+    // releases what it can prove dead and the collector takes the rest.
     runtime.set_automatic_release(true);
+    runtime.set_collector(zyntax_embed::Collector::MarkSweep);
     let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
     runtime.install_snapshot(snapshot)?;
     runtime.declare_entry_points([ENTRY]);

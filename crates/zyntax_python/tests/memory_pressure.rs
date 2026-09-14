@@ -13,6 +13,11 @@
 //! the git-bug issue that tracks why. A known leak that stops growing
 //! is reported too, so the list is kept honest.
 //!
+//! The collector's heap floor is lowered for the runs, so what it
+//! keeps is bounded by the live set rather than by the floor and the
+//! difference between the two runs measures leaks alone; it also makes
+//! the collector run often, which is what finds a root it misses.
+//!
 //! Peak memory is read from the child's `rusage`, which is Unix only;
 //! elsewhere the test has nothing to measure and passes.
 
@@ -29,6 +34,8 @@ const LARGE: u64 = 200_000;
 /// Growth a bounded program is allowed between the two, for the slabs
 /// its allocator takes and the noise of the process.
 const ALLOWED_GROWTH: u64 = 3 << 20;
+/// The collector's heap floor for the runs, in KB.
+const HEAP_FLOOR_KB: u64 = 512;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("pressure")
@@ -63,6 +70,7 @@ fn run(program: &Path, steps: u64) -> (i32, u64) {
         .arg("run")
         .arg(program)
         .arg(steps.to_string())
+        .env("ZYNTAX_GC_FLOOR_KB", HEAP_FLOOR_KB.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

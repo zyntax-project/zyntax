@@ -1,6 +1,6 @@
 # A small tree built, walked and dropped every step. The root is
-# released; its children are held only by the root's fields, which the
-# default release strategy does not follow.
+# released by the drop analysis; its children are held only by the root's
+# fields, which the collector reclaims.
 import sys
 
 class Node:
