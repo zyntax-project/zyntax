@@ -1873,7 +1873,20 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     //   * The promotion is idempotent — a single pass identifies
     //     every escaping Alloca and rewrites it. Running again would
     //     find zero work; no benefit to iterating.
+    // `ZYNTAX_TRACE_OPT_PHASES=1` prints each pass's time per round.
+    let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
+    let timed = |name: &str, at: &mut web_time::Instant| {
+        if trace {
+            eprintln!(
+                "[OPT] {name:<22} {:8.2} ms",
+                at.elapsed().as_secs_f64() * 1000.0
+            );
+            *at = web_time::Instant::now();
+        }
+    };
+    let mut at = web_time::Instant::now();
     let ap = alloca_promote::run_module(module);
+    timed("alloca_promote", &mut at);
     stats.alloca_promote.allocas_scanned += ap.allocas_scanned;
     stats.alloca_promote.promoted += ap.promoted;
     stats.alloca_promote.kept_on_stack += ap.kept_on_stack;
@@ -1885,6 +1898,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     // up front; it's re-run after recursive inlining (below), which
     // rewrites bodies and can expose freshly-shared pure calls.
     purity::infer_module(module);
+    timed("purity", &mut at);
 
     // Outer fixed-point: keeps iterating the whole sweep until none
     // of the passes report new work. Compounding example: inline
@@ -1902,17 +1916,6 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     // for the relaxed inliner — the relaxations open new shapes the
     // downstream passes haven't been audited against.
     const ROUND_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    // `ZYNTAX_TRACE_OPT_PHASES=1` prints each pass's time per round.
-    let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
-    let mut timed = |name: &str, at: &mut web_time::Instant| {
-        if trace {
-            eprintln!(
-                "[OPT] {name:<22} {:8.2} ms",
-                at.elapsed().as_secs_f64() * 1000.0
-            );
-            *at = web_time::Instant::now();
-        }
-    };
     for round in 0..8 {
         let round_start = web_time::Instant::now();
         let mut at = round_start;
@@ -2087,7 +2090,9 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     // constant and (for floats) the closed form is provably bit-exact,
     // so it introduces no rounding the serial loop wouldn't also
     // produce. See `affine_loop` module docs for the soundness proof.
+    at = web_time::Instant::now();
     let al = affine_loop::run_module(module);
+    timed("affine_loop", &mut at);
     stats.affine_loop.folded += al.folded;
     stats.affine_loop.loops_visited += al.loops_visited;
     stats.affine_loop.skipped_shape += al.skipped_shape;
@@ -2106,6 +2111,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     // run inside the sweep for now (transition period — see module
     // docs).
     let av = auto_vectorize::run_module(module);
+    timed("auto_vectorize", &mut at);
     stats.auto_vectorize.vectorized += av.vectorized;
     stats.auto_vectorize.loops_visited += av.loops_visited;
     stats.auto_vectorize.rejected_shape += av.rejected_shape;
@@ -2137,6 +2143,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     // backend and holds a register for the whole loop, which is what
     // pushes the register allocator into spilling a real one.
     let pp = phi_prune::run_module(module);
+    timed("phi_prune", &mut at);
     stats.phi_prune.removed += pp.removed;
     stats.phi_prune.rounds = stats.phi_prune.rounds.max(pp.rounds);
 
@@ -2151,9 +2158,11 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         stats.recursive_inline.skipped_too_many_sites += ri.skipped_too_many_sites;
         stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
     }
+    timed("recursive_inline", &mut at);
     // The copies come with the callee's block seams; fold them before
     // anything reads the shape.
     let cs = cfg_simplify::run_module(module);
+    timed("cfg_simplify", &mut at);
     stats.cfg_simplify.merged += cs.merged;
     stats.cfg_simplify.threaded += cs.threaded;
 
@@ -2167,10 +2176,13 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     //   * `cse` collapses any remaining duplicate that already sits in a
     //     dominance relationship.
     purity::infer_module(module);
+    timed("purity", &mut at);
     let pcp = pure_call_pre::run_module(module);
+    timed("pure_call_pre", &mut at);
     stats.pure_call_pre.hoisted += pcp.hoisted;
     stats.pure_call_pre.groups_visited += pcp.groups_visited;
     let post_ri_cse = cse::eliminate_module(module);
+    timed("cse", &mut at);
     stats.cse.eliminated += post_ri_cse.eliminated;
     stats.cse.rewrites += post_ri_cse.rewrites;
 
@@ -2188,6 +2200,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     //     first marks every valid shape; the drop_insert pass can
     //     then add Free calls without those marks getting lost.
     let tc = tco::run_module(module);
+    timed("tco", &mut at);
     stats.tco.candidates_visited += tc.candidates_visited;
     stats.tco.marked += tc.marked;
 
@@ -2210,6 +2223,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     }
 
     let di = drop_insert::run_module(module);
+    timed("drop_insert", &mut at);
     stats.drop_insert.mallocs_scanned += di.mallocs_scanned;
     stats.drop_insert.frees_inserted += di.frees_inserted;
     stats.drop_insert.escapes_skipped += di.escapes_skipped;
@@ -2224,6 +2238,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     } else {
         boxes::BoxStats::default()
     };
+    timed("boxes", &mut at);
     stats.boxes.expanded += br.expanded;
     stats.boxes.made += br.made;
     stats.boxes.released += br.released;
@@ -2235,6 +2250,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         let cs = cse::eliminate_module(module);
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
+        timed("licm+cse", &mut at);
     }
 
     stats

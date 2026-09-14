@@ -140,12 +140,34 @@ impl DropStats {
 /// Run the drop-site pass over every function in `module`.
 pub fn run_module(module: &mut HirModule) -> DropStats {
     let mut total = DropStats::default();
+    let t0 = std::time::Instant::now();
     let facts = ModuleFacts::build(module);
+    let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
+    if tprof {
+        eprintln!(
+            "[drop-time] facts {:.2} ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let mut times: Vec<(f64, String)> = Vec::new();
     for func in module.functions_to_optimize() {
         if func.is_external {
             continue;
         }
+        let t = std::time::Instant::now();
         total.combine(run_function(func, &facts));
+        if tprof {
+            times.push((
+                t.elapsed().as_secs_f64() * 1000.0,
+                func.name.resolve_global().unwrap_or_default(),
+            ));
+        }
+    }
+    if tprof {
+        times.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        for (t, n) in times.iter().take(8) {
+            eprintln!("[drop-time] {t:.2} ms {n}");
+        }
     }
     total
 }
@@ -249,19 +271,69 @@ impl ModuleFacts {
         // A function returning a callee's result that is itself an
         // argument returns its own parameter, so this grows until it
         // stops; owned-returning functions likewise.
+        let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
+        let t = std::time::Instant::now();
+        let mut rounds = 0;
         loop {
+            rounds += 1;
             let returned = functions_returning_params(module, &facts);
             if returned == facts.returns_param {
                 break;
             }
             facts.returns_param = returned;
         }
+        if tprof {
+            eprintln!(
+                "[drop-time] returns_param {:.2} ms in {rounds} rounds over {} functions",
+                t.elapsed().as_secs_f64() * 1000.0,
+                module.functions.len()
+            );
+        }
+        // Owned-returning functions, to a fixed point. A function's
+        // answer reads only its callees' facts, so after the first pass
+        // only the callers of whoever changed are asked again.
+        let t = std::time::Instant::now();
+        let mut rounds = 0;
+        let callees = callees_of(module);
+        let mut dirty: Vec<HirId> = module
+            .functions
+            .iter()
+            .filter(|(_, f)| !f.is_external)
+            .map(|(key, _)| *key)
+            .collect();
         loop {
-            let owned = functions_returning_owned_storage(module, &facts);
-            if owned.len() == facts.returns_owned.len() {
+            rounds += 1;
+            let mut changed: Vec<HirId> = Vec::new();
+            for key in &dirty {
+                let Some(func) = module.functions.get(key) else {
+                    continue;
+                };
+                let owned = returns_owned_storage(func, &facts);
+                let was = facts.returns_owned.contains(key);
+                if owned != was {
+                    if owned {
+                        facts.returns_owned.insert(*key);
+                    } else {
+                        facts.returns_owned.remove(key);
+                    }
+                    changed.push(*key);
+                }
+            }
+            if changed.is_empty() {
                 break;
             }
-            facts.returns_owned = owned;
+            dirty = callees
+                .iter()
+                .filter(|(_, called)| called.iter().any(|c| changed.contains(c)))
+                .map(|(key, _)| *key)
+                .filter(|key| module.functions.get(key).is_some_and(|f| !f.is_external))
+                .collect();
+        }
+        if tprof {
+            eprintln!(
+                "[drop-time] returns_owned {:.2} ms in {rounds} rounds",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
         }
         if trace_enabled() {
             let mut names: Vec<String> = facts
@@ -881,7 +953,7 @@ fn functions_returning_params(
     out
 }
 
-/// Functions whose result is storage the caller owns.
+/// Whether `func`'s result is storage the caller owns.
 ///
 /// Deliberately strict, because being wrong here releases something the
 /// callee still refers to. A function qualifies only when it holds
@@ -889,24 +961,24 @@ fn functions_returning_params(
 /// returned, and every return hands it back. A function that sometimes
 /// returns a fresh object and sometimes one it was given fails the last
 /// condition and is left alone.
-fn functions_returning_owned_storage(
-    module: &HirModule,
-    facts: &ModuleFacts,
-) -> std::collections::HashSet<HirId> {
-    let mut owned = std::collections::HashSet::new();
-    for (key, func) in module.functions.iter() {
-        if func.is_external {
-            continue;
+///
+/// Of the module's facts this reads only what is known about the
+/// callees, so the answer stands until one of them changes.
+fn returns_owned_storage(func: &HirFunction, facts: &ModuleFacts) -> bool {
+    {
+        // A scalar result is never storage, whatever the body allocates.
+        if !func.signature.returns.iter().any(may_be_storage) {
+            return false;
         }
         let sites = collect_owned_sites(func, facts);
         if sites.is_empty() {
-            continue;
+            return false;
         }
         // More than one allocation transfers only under automatic
         // release. Off, a constructor with a branch stays untransferred,
         // which is what a program releasing by hand depends on.
         if sites.len() > 1 && !facts.automatic_release {
-            continue;
+            return false;
         }
         let name = || func.name.resolve_global().unwrap_or_default();
         // A box is released by a named symbol the caller would have to
@@ -929,7 +1001,7 @@ fn functions_returning_owned_storage(
                     name()
                 );
             }
-            continue;
+            return false;
         }
         // Every allocation that reaches a return, not one. A constructor
         // with a branch allocates in each arm and returns whichever it
@@ -969,7 +1041,7 @@ fn functions_returning_owned_storage(
                     name()
                 );
             }
-            continue;
+            return false;
         }
         // Every return hands back an allocation, or nothing: a null is
         // what an error path returns in place of one, and releasing
@@ -1002,8 +1074,9 @@ fn functions_returning_owned_storage(
             }
         }
         if returns > 0 && all_return_it {
-            owned.insert(*key);
-        } else if trace_enabled() {
+            return true;
+        }
+        if trace_enabled() {
             eprintln!(
                 "[drop] {} does not return owned storage: {} returns, all owned: {}",
                 func.name.resolve_global().unwrap_or_default(),
@@ -1011,8 +1084,58 @@ fn functions_returning_owned_storage(
                 all_return_it
             );
         }
+        false
     }
-    owned
+}
+
+/// Whether a value of `ty` can be storage a caller releases: anything
+/// but a scalar. An aggregate travels by address here and a pointer is
+/// one, so both count.
+fn may_be_storage(ty: &HirType) -> bool {
+    !matches!(
+        ty,
+        HirType::Void
+            | HirType::Bool
+            | HirType::I8
+            | HirType::I16
+            | HirType::I32
+            | HirType::I64
+            | HirType::I128
+            | HirType::U8
+            | HirType::U16
+            | HirType::U32
+            | HirType::U64
+            | HirType::U128
+            | HirType::F32
+            | HirType::F64
+            | HirType::USize
+            | HirType::ISize
+    )
+}
+
+/// The functions each function calls by id.
+fn callees_of(module: &HirModule) -> std::collections::HashMap<HirId, Vec<HirId>> {
+    module
+        .functions
+        .iter()
+        .map(|(key, func)| {
+            let mut callees: Vec<HirId> = func
+                .blocks
+                .values()
+                .flat_map(|b| b.instructions.iter())
+                .filter_map(|inst| match inst {
+                    HirInstruction::Call {
+                        callee: HirCallable::Function(id),
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            callees.sort();
+            callees.dedup();
+            (*key, callees)
+        })
+        .collect()
 }
 
 /// `ZYNTAX_TRACE_DROP=1` prints what the pass decided and why.
@@ -1065,7 +1188,22 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
     let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
     for site in mallocs {
         stats.mallocs_scanned += 1;
-        match analyze_site(func, &site, facts) {
+        let outcome = analyze_site(func, &site, facts);
+        if trace_enabled() {
+            eprintln!(
+                "[drop] {}: site {} -> {}",
+                func.name.resolve_global().unwrap_or_default(),
+                describe_value(func, site.result),
+                match &outcome {
+                    SiteOutcome::SingleBlockDrop { .. } => "released in its block",
+                    SiteOutcome::MultiBlockDrop { .. } => "released where it dies",
+                    SiteOutcome::Escaped => "escapes",
+                    SiteOutcome::MultiBlock => "live out of the function or merged",
+                    SiteOutcome::NoUse => "never read",
+                }
+            );
+        }
+        match outcome {
             SiteOutcome::SingleBlockDrop { block, after_idx } => {
                 insert_free_after(func, block, after_idx, site.result, site.release);
                 stats.frees_inserted += 1;
@@ -1499,7 +1637,12 @@ fn drop_points_transferring(
                     let e = last_use.entry(*block_id).or_insert(idx);
                     *e = (*e).max(idx);
                 }
-                UseKind::Escape => return None,
+                UseKind::Escape => {
+                    if trace_enabled() {
+                        eprintln!("[drop]   escapes through {inst:?}");
+                    }
+                    return None;
+                }
                 UseKind::None => {}
             }
         }
@@ -1511,11 +1654,19 @@ fn drop_points_transferring(
             UseKind::Use => {
                 uses_block.insert(*block_id);
             }
-            UseKind::Escape => return None,
+            UseKind::Escape => {
+                if trace_enabled() {
+                    eprintln!("[drop]   escapes through terminator {:?}", block.terminator);
+                }
+                return None;
+            }
             UseKind::None => {}
         }
     }
     if uses_block.is_empty() {
+        if trace_enabled() {
+            eprintln!("[drop]   no block reads it");
+        }
         return None;
     }
 
@@ -1578,10 +1729,18 @@ fn drop_points_transferring(
         // what is at it, so releasing first is still the right order.
         let at = match last_use.get(block_id) {
             Some(idx) => idx + 1,
-            None if *block_id == site.block && !uses_block.contains(block_id) => return None,
+            None if *block_id == site.block && !uses_block.contains(block_id) => {
+                if trace_enabled() {
+                    eprintln!("[drop]   its own block neither reads it nor passes it on");
+                }
+                return None;
+            }
             None => block.instructions.len(),
         };
         points.push(Point::After(*block_id, at.saturating_sub(1)));
+    }
+    if points.is_empty() && trace_enabled() {
+        eprintln!("[drop]   live on every path out");
     }
     (!points.is_empty()).then_some(points)
 }
@@ -1618,12 +1777,25 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
     // it was never defined. Such storage is released through the phi
     // (`release_owned_phis`), never here, so this is decided before any
     // block's instructions are read.
-    if !phis_using_any(func, &derived).is_empty()
+    let merged = phis_using_any(func, &derived);
+    if !merged.is_empty()
         || func
             .blocks
             .values()
             .any(|b| b.phis.iter().any(|p| p.result == target))
     {
+        if trace_enabled() {
+            eprintln!(
+                "[drop] {}: site {:?} reaches a phi and is left to the phi: {}",
+                func.name.resolve_global().unwrap_or_default(),
+                target,
+                merged
+                    .iter()
+                    .map(|p| describe_value(func, *p))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
         return SiteOutcome::MultiBlock;
     }
 
@@ -1657,9 +1829,10 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
         }
 
         // Terminator. A `Return` carrying `target` is an escape.
-        // A `CondBranch` / `Switch` using it as the discriminator
-        // is a normal use, but the value flows into successor
-        // blocks → multi-block.
+        // A `CondBranch` / `Switch` deciding on it (a null check, say)
+        // is a normal use, but the value flows into successor blocks,
+        // so it dies where the liveness walk says, as any other value
+        // read past its block does.
         match derived
             .iter()
             .map(|d| classify_terminator_use(&block.terminator, *d))
@@ -1667,13 +1840,14 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
         {
             UseKind::None => {}
             UseKind::Use => {
-                had_any_use = true;
-                if *block_id != site.block {
-                    return SiteOutcome::MultiBlock;
-                }
-                // Terminator-use in the malloc's own block — the
-                // value flows to successors via the branch.
-                return SiteOutcome::MultiBlock;
+                return match facts
+                    .automatic_release
+                    .then(|| drop_points(func, site, &derived, facts))
+                    .flatten()
+                {
+                    Some(points) => SiteOutcome::MultiBlockDrop { points },
+                    None => SiteOutcome::MultiBlock,
+                };
             }
             UseKind::Escape => return SiteOutcome::Escaped,
         }
