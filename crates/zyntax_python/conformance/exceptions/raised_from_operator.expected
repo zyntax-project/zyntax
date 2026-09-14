@@ -1,0 +1,14 @@
+add 0
+add 1
+add 2
+caught 'NoneType' object has no attribute 'x'
+compare 0
+compare 1
+compare 2
+compare 3
+caught 'NoneType' object has no attribute 'x'
+5
+caught negative length
+2
+caught negative length
+done

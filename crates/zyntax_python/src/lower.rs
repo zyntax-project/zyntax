@@ -179,6 +179,7 @@ enum Produce<'a> {
 }
 
 /// A lowered expression and the static type it has.
+#[derive(Clone)]
 pub(crate) struct Val {
     pub(crate) node: Node,
     pub(crate) ty: Ty,
@@ -3187,8 +3188,7 @@ impl<'m> Lowerer<'m> {
     ) -> Result<Val> {
         if let Ty::Class(k) = left.ty {
             let name = types::dunder_name(op);
-            let other = self.coerce(right, Ty::Object);
-            if let Some(r) = self.dunder(k as usize, name, left.node, vec![other], span) {
+            if let Some(r) = self.dunder(k as usize, name, left.node, vec![right], span) {
                 return Ok(r);
             }
             return Err(Error::unsupported_span(
@@ -3359,12 +3359,11 @@ impl<'m> Lowerer<'m> {
             if let Some((name, _)) = dunder {
                 let right_ty = right.ty;
                 let right_node = right.node.clone();
-                let other = self.coerce(right, Ty::Object);
                 if let Some(r) = self.dunder(
                     k as usize,
                     name,
                     left.node.clone(),
-                    vec![other.clone()],
+                    vec![right.clone()],
                     span,
                 ) {
                     return Ok(self.truthy(r));
@@ -6018,14 +6017,14 @@ impl<'m> Lowerer<'m> {
         })
     }
 
-    /// A dunder method call with already-boxed operands, when the class
-    /// chain defines it.
+    /// A dunder method call on typed operands, when the class chain
+    /// defines it; checked for a raise like any other call.
     pub(crate) fn dunder(
         &mut self,
         k: usize,
         method: &str,
         receiver: Node,
-        args: Vec<Node>,
+        args: Vec<Val>,
         span: Span,
     ) -> Option<Val> {
         let (sig, _) = self.module.method_sig(k, method)?;

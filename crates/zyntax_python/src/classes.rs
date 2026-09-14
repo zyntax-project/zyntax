@@ -1027,8 +1027,11 @@ fn arith_hook(module: &Module, span: Span) -> TypedFunction {
                 if module.method_sig(c, name).is_none() {
                     continue;
                 }
-                let Some(result) = lowerer.dunder(c, name, obj.clone(), vec![b.clone()], span)
-                else {
+                let other = lower::Val {
+                    node: b.clone(),
+                    ty: Ty::Object,
+                };
+                let Some(result) = lowerer.dunder(c, name, obj.clone(), vec![other], span) else {
                     continue;
                 };
                 let boxed = lowerer.coerce(result, Ty::Object);
